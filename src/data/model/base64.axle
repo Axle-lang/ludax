@@ -1,0 +1,153 @@
+// base64 — RFC 4648 base64, and the `data:` URIs that carry it.
+//
+// glTF buffers and Blockbench textures travel inside JSON as base64. Decoding is forgiving about white space
+// (line breaks inside long strings are common) and about the URL-safe alphabet, and strict about the rest: a
+// character outside the alphabet, padding anywhere but at the end, or a length that cannot come from an
+// encoder is a failure, reported by the return value, never an abort.
+
+use crate::data::bytes::ByteBuf;
+use crate::data::text::DataText;
+
+const B64_CHAR_BITS : i32 = 6;
+const B64_CHAR_MASK : i32 = 63;
+const B64_BYTE_BITS : i32 = 8;
+const B64_BYTE_MASK : i32 = 255;
+// Characters per output group and the padding character, '='.
+const B64_GROUP : i32 = 4;
+const B64_PAD : i32 = 61;
+// Rounding slack for the output buffer: three source bytes make four output characters plus padding.
+const B64_ENCODE_SLACK : i32 = 8;
+
+/** Base64 coding. */
+pub class Base64 {
+    // The value of a base64 character, -1 for white space (skipped), -2 for anything else.
+    static fn digit(c : i32) : i32 {
+        if (c >= 65 && c <= 90) {
+            return c - 65;
+        }
+        if (c >= 97 && c <= 122) {
+            return c - 97 + 26;
+        }
+        if (c >= 48 && c <= 57) {
+            return c - 48 + 52;
+        }
+        if (c == 43 || c == 45) {
+            return 62;
+        }
+        if (c == 47 || c == 95) {
+            return 63;
+        }
+        if (c == 32 || c == 9 || c == 10 || c == 13) {
+            return -1;
+        }
+        return -2;
+    }
+
+    // True when `text` holds `marker` at byte offset `at`.
+    static fn matchesAt(text : string, at : i32, marker : string) : bool {
+        let m : i32 = marker.byteLength as i32;
+        for (k of 0..m) {
+            if (text.byteAt(at + k) != marker.byteAt(k)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /** Appends to `out` the bytes that `text` encodes, from byte offset `from` on; false when the text is not valid base64 (what was appended is then meaningless). */
+    pub static fn decodeFrom(text : string, from : i32, out : ByteBuf) : bool {
+        let n : i32 = text.byteLength as i32;
+        let mut acc : i32 = 0;
+        let mut bits : i32 = 0;
+        let mut pad : i32 = 0;
+        let mut chars : i32 = 0;
+        for (i of from..n) {
+            let c : i32 = text.byteAt(i) as i32;
+            if (c == B64_PAD) {
+                pad = pad + 1;
+                continue;
+            }
+            let d : i32 = Base64::digit(c);
+            if (d == -1) {
+                continue;
+            }
+            if (d == -2 || pad > 0) {
+                return false;
+            }
+            chars = chars + 1;
+            acc = (acc << B64_CHAR_BITS) | d;
+            bits = bits + B64_CHAR_BITS;
+            if (bits >= B64_BYTE_BITS) {
+                bits = bits - B64_BYTE_BITS;
+                out.push((acc >> bits) & B64_BYTE_MASK);
+                acc = acc & ((1 << bits) - 1);
+            }
+        }
+        if (chars % B64_GROUP == 1 || pad > 2) {
+            return false;
+        }
+        if (pad > 0 && (chars + pad) % B64_GROUP != 0) {
+            return false;
+        }
+        return true;
+    }
+
+    /** Appends to `out` the bytes `text` encodes; false when it is not valid base64. */
+    pub static fn decode(text : string, out : ByteBuf) : bool {
+        return Base64::decodeFrom(text, 0, out);
+    }
+
+    /** `bytes` as base64 text with padding. */
+    pub static fn encode(bytes : ByteBuf) : string {
+        let alphabet : string = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let out : ByteBuf = new ByteBuf(bytes.len() * B64_GROUP / 3 + B64_ENCODE_SLACK);
+        let n : i32 = bytes.len();
+        let mut i : i32 = 0;
+        while (i < n) {
+            let b0 : i32 = bytes.get(i);
+            let b1 : i32 = bytes.getOr(i + 1, 0);
+            let b2 : i32 = bytes.getOr(i + 2, 0);
+            out.push(alphabet.byteAt((b0 >> 2) & B64_CHAR_MASK) as i32);
+            out.push(alphabet.byteAt(((b0 << 4) | (b1 >> 4)) & B64_CHAR_MASK) as i32);
+            if (i + 1 < n) {
+                out.push(alphabet.byteAt(((b1 << 2) | (b2 >> 6)) & B64_CHAR_MASK) as i32);
+            } else {
+                out.push(B64_PAD);
+            }
+            if (i + 2 < n) {
+                out.push(alphabet.byteAt(b2 & B64_CHAR_MASK) as i32);
+            } else {
+                out.push(B64_PAD);
+            }
+            i = i + 3;
+        }
+        return DataText::fromBytes(out, 0, out.len());
+    }
+
+    /**
+     * Where the base64 payload of a `data:` URI starts (just after `;base64,`), or -1 when `uri` is not a
+     * base64 data URI.
+     */
+    pub static fn dataUriStart(uri : string) : i32 {
+        let n : i32 = uri.byteLength as i32;
+        let head : string = "data:";
+        let headLen : i32 = head.byteLength as i32;
+        if (n < headLen) {
+            return -1;
+        }
+        for (i of 0..headLen) {
+            if (uri.byteAt(i) != head.byteAt(i)) {
+                return -1;
+            }
+        }
+
+        let marker : string = ";base64,";
+        let m : i32 = marker.byteLength as i32;
+        for (at of headLen..(n - m + 1)) {
+            if (Base64::matchesAt(uri, at, marker)) {
+                return at + m;
+            }
+        }
+        return -1;
+    }
+}

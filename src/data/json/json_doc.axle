@@ -1,0 +1,451 @@
+// json_doc — a JSON document as an arena of nodes.
+//
+// Axle cannot keep a tree of classes in a container, so a document is a set of parallel arrays: node `i` has a
+// kind, a number, a text (as a `StringId` of the document's interner), a key (when it is a member of an
+// object) and links to its first and last child and its next sibling. A `JsonValue` is just the index of a
+// node; every question is asked of the `JsonDoc` that owns it. A value belongs to one document and, once
+// attached, to one parent.
+//
+// Objects keep their members in insertion order, so writing a document back gives the same key order that
+// was read or built. A key that occurs twice in parsed text is kept twice (RFC 8259 allows it); `field`
+// answers with the last, the rule of every mainstream implementation. Questions about the wrong kind never
+// abort: they answer the fallback (`0`, `false`, `""`, the none value), and `kind` says what a value is.
+
+use crate::core::collections::vec::Vec;
+use crate::core::id::string_id::{StringId, StringInterner};
+
+// The ends of the i32 range as doubles, so `intOr` can refuse a number that would trap in the cast.
+const JSON_INT_MIN : f64 = -2147483648.0;
+const JSON_INT_MAX : f64 = 2147483647.0;
+
+// The largest finite double; a number outside it is an infinity, which JSON cannot spell.
+const JSON_FINITE_MAX : f64 = 1.7976931348623157e308;
+
+/** The six kinds of JSON value. */
+pub enum JsonKind : i8 {
+    Null = 0,
+    Bool = 1,
+    Number = 2,
+    String = 3,
+    Array = 4,
+    Object = 5,
+
+    /** The kind with code `n`; anything unknown answers Null. */
+    pub static fn fromCode(n : i32) : JsonKind {
+        return match n {
+            1 => JsonKind::Bool,
+            2 => JsonKind::Number,
+            3 => JsonKind::String,
+            4 => JsonKind::Array,
+            5 => JsonKind::Object,
+            _ => JsonKind::Null,
+        };
+    }
+
+    /** The kind's name, for messages. */
+    pub fn label(self) : string {
+        return match self {
+            JsonKind::Null => "null",
+            JsonKind::Bool => "boolean",
+            JsonKind::Number => "number",
+            JsonKind::String => "string",
+            JsonKind::Array => "array",
+            JsonKind::Object => "object",
+        };
+    }
+}
+
+/** A handle to one value of a `JsonDoc`; the none value stands for "absent". */
+pub struct JsonValue {
+    /** The node index in the owning document, or -1 for none. */
+    pub raw : i32;
+
+    /** The value that is not there: what `field` answers for a missing member. */
+    pub static fn none() : JsonValue {
+        return JsonValue { raw: -1 };
+    }
+
+    /** True for the none value. */
+    pub fn isNone(self) : bool {
+        return self.raw < 0;
+    }
+}
+
+/** A JSON document: the arena of nodes, a root, and the error of a failed parse. */
+pub class JsonDoc {
+    kinds  : Vec<i32>;
+    nums   : Vec<f64>;
+    texts  : Vec<i32>;
+    keys   : Vec<i32>;
+    first  : Vec<i32>;
+    last   : Vec<i32>;
+    next   : Vec<i32>;
+    counts : Vec<i32>;
+    owners : Vec<i32>;
+    names  : StringInterner;
+    top    : i32 = -1;
+    err    : string;
+
+    // Cursor of the last `at` walk, so reading one array front to back costs a step per element instead of a
+    // scan from the head each time.
+    curOf   : i32 = -1;
+    curAt   : i32 = 0;
+    curNode : i32 = -1;
+
+    /** An empty document with no root. */
+    constructor() {
+        self.kinds = new Vec<i32>();
+        self.nums = new Vec<f64>();
+        self.texts = new Vec<i32>();
+        self.keys = new Vec<i32>();
+        self.first = new Vec<i32>();
+        self.last = new Vec<i32>();
+        self.next = new Vec<i32>();
+        self.counts = new Vec<i32>();
+        self.owners = new Vec<i32>();
+        self.names = new StringInterner();
+        self.err = "";
+    }
+
+    /** True when the document holds no error (a parse succeeded, or it was built in code). */
+    pub fn ok(self) : bool {
+        return self.err.byteLength == 0;
+    }
+
+    /** Why a parse failed, with line and column, or an empty string. */
+    pub fn error(self) : string {
+        return self.err;
+    }
+
+    /** Records a failure; used by the parser. */
+    pub(crate) fn fail(mut self, message : string) : void {
+        self.err = message;
+        self.top = -1;
+    }
+
+    /** How many nodes the document holds, reachable or not. */
+    pub fn nodeCount(self) : i32 {
+        return self.kinds.len();
+    }
+
+    /** The root value, or none when the document is empty or failed to parse. */
+    pub fn root(self) : JsonValue {
+        return JsonValue { raw: self.top };
+    }
+
+    /** Makes `v` the root. */
+    pub fn setRoot(mut self, v : JsonValue) : void {
+        if (self.valid(v)) {
+            self.top = v.raw;
+        }
+    }
+
+    fn valid(self, v : JsonValue) : bool {
+        return v.raw >= 0 && v.raw < self.kinds.len();
+    }
+
+    fn alloc(mut self, kind : JsonKind) : JsonValue {
+        let at : i32 = self.kinds.len();
+        self.kinds.push(kind as i32);
+        self.nums.push(0.0);
+        self.texts.push(-1);
+        self.keys.push(-1);
+        self.first.push(-1);
+        self.last.push(-1);
+        self.next.push(-1);
+        self.counts.push(0);
+        self.owners.push(-1);
+        return JsonValue { raw: at };
+    }
+
+    // ---- reading ----
+
+    /** What kind of value `v` is; the none value reads as Null. */
+    pub fn kind(self, v : JsonValue) : JsonKind {
+        if (!self.valid(v)) {
+            return JsonKind::Null;
+        }
+        return JsonKind::fromCode(self.kinds.get(v.raw));
+    }
+
+    /** True when `v` is a null (or absent). */
+    pub fn isNull(self, v : JsonValue) : bool {
+        return self.kind(v) == JsonKind::Null;
+    }
+
+    /** True when `v` is a number. */
+    pub fn isNumber(self, v : JsonValue) : bool {
+        return self.kind(v) == JsonKind::Number;
+    }
+
+    /** True when `v` is a string. */
+    pub fn isString(self, v : JsonValue) : bool {
+        return self.kind(v) == JsonKind::String;
+    }
+
+    /** True when `v` is a boolean. */
+    pub fn isBool(self, v : JsonValue) : bool {
+        return self.kind(v) == JsonKind::Bool;
+    }
+
+    /** True when `v` is an array. */
+    pub fn isArray(self, v : JsonValue) : bool {
+        return self.kind(v) == JsonKind::Array;
+    }
+
+    /** True when `v` is an object. */
+    pub fn isObject(self, v : JsonValue) : bool {
+        return self.kind(v) == JsonKind::Object;
+    }
+
+    /** The boolean in `v`; false for any other kind. */
+    pub fn asBool(self, v : JsonValue) : bool {
+        return self.boolOr(v, false);
+    }
+
+    /** The boolean in `v`, or `fallback` when `v` is not a boolean. */
+    pub fn boolOr(self, v : JsonValue, fallback : bool) : bool {
+        if (!self.isBool(v)) {
+            return fallback;
+        }
+        return self.nums.get(v.raw) != 0.0;
+    }
+
+    /** The number in `v`; 0 for any other kind. */
+    pub fn asNumber(self, v : JsonValue) : f64 {
+        return self.numberOr(v, 0.0);
+    }
+
+    /** The number in `v`, or `fallback` when `v` is not a number. */
+    pub fn numberOr(self, v : JsonValue, fallback : f64) : f64 {
+        if (!self.isNumber(v)) {
+            return fallback;
+        }
+        return self.nums.get(v.raw);
+    }
+
+    /** The number in `v` truncated to a whole number, or `fallback` when `v` is not a number or does not fit. */
+    pub fn intOr(self, v : JsonValue, fallback : i32) : i32 {
+        if (!self.isNumber(v)) {
+            return fallback;
+        }
+        let x : f64 = self.nums.get(v.raw);
+        if (x < JSON_INT_MIN || x > JSON_INT_MAX) {
+            return fallback;
+        }
+        return x as i32;
+    }
+
+    /** The text of the string `v` (borrowed from the document; copy it to keep it); "" for any other kind. */
+    pub fn asString(self, v : JsonValue) : string {
+        return self.stringOr(v, "");
+    }
+
+    /** The text of the string `v`, or `fallback` when `v` is not a string. */
+    pub fn stringOr(self, v : JsonValue, fallback : string) : string {
+        if (!self.isString(v)) {
+            return fallback;
+        }
+        return self.names.name(StringId { raw: self.texts.get(v.raw) });
+    }
+
+    /** How many elements an array has or members an object has; 0 for every other kind. */
+    pub fn len(self, v : JsonValue) : i32 {
+        let kind : JsonKind = self.kind(v);
+        if (kind != JsonKind::Array && kind != JsonKind::Object) {
+            return 0;
+        }
+        return self.counts.get(v.raw);
+    }
+
+    /** The `i`-th element of an array or the value of the `i`-th member of an object; none outside. */
+    pub fn at(mut self, v : JsonValue, i : i32) : JsonValue {
+        if (i < 0 || i >= self.len(v)) {
+            return JsonValue::none();
+        }
+        let mut node : i32 = self.first.get(v.raw);
+        let mut j : i32 = 0;
+        if (self.curOf == v.raw && self.curAt <= i) {
+            node = self.curNode;
+            j = self.curAt;
+        }
+        while (j < i) {
+            node = self.next.get(node);
+            j = j + 1;
+        }
+        self.curOf = v.raw;
+        self.curAt = i;
+        self.curNode = node;
+        return JsonValue { raw: node };
+    }
+
+    /** The first element or member of an array or object, or none; with `nextSibling` it walks the children without the cost of `at`. */
+    pub fn firstChild(self, v : JsonValue) : JsonValue {
+        if (self.len(v) == 0) {
+            return JsonValue::none();
+        }
+        return JsonValue { raw: self.first.get(v.raw) };
+    }
+
+    /** The element or member after `v` in its parent, or none at the end (or when `v` has no parent). */
+    pub fn nextSibling(self, v : JsonValue) : JsonValue {
+        if (!self.valid(v)) {
+            return JsonValue::none();
+        }
+        return JsonValue { raw: self.next.get(v.raw) };
+    }
+
+    /** The key under which the object member `v` is stored (borrowed); "" when `v` is not a member of an object. */
+    pub fn keyOf(self, v : JsonValue) : string {
+        if (!self.valid(v) || self.keys.get(v.raw) < 0) {
+            return "";
+        }
+        return self.names.name(StringId { raw: self.keys.get(v.raw) });
+    }
+
+    /** The key of the `i`-th member of an object (borrowed); "" for anything else. */
+    pub fn keyAt(mut self, v : JsonValue, i : i32) : string {
+        let m : JsonValue = self.at(v, i);
+        if (m.isNone() || !self.isObject(v)) {
+            return "";
+        }
+        return self.names.name(StringId { raw: self.keys.get(m.raw) });
+    }
+
+    /** The value of member `name` of an object (the last, if the text repeated it); none when there is none. */
+    pub fn field(self, v : JsonValue, name : string) : JsonValue {
+        if (!self.isObject(v)) {
+            return JsonValue::none();
+        }
+        let id : StringId = self.names.find(name);
+        if (id.isNone()) {
+            return JsonValue::none();
+        }
+        let mut found : i32 = -1;
+        let mut node : i32 = self.first.get(v.raw);
+        while (node >= 0) {
+            if (self.keys.get(node) == id.raw) {
+                found = node;
+            }
+            node = self.next.get(node);
+        }
+        return JsonValue { raw: found };
+    }
+
+    /** True when the object `v` has a member `name`. */
+    pub fn has(self, v : JsonValue, name : string) : bool {
+        return !self.field(v, name).isNone();
+    }
+
+    // ---- building ----
+
+    /** A new null value. */
+    pub fn newNull(mut self) : JsonValue {
+        return self.alloc(JsonKind::Null);
+    }
+
+    /** A new boolean. */
+    pub fn newBool(mut self, b : bool) : JsonValue {
+        let v : JsonValue = self.alloc(JsonKind::Bool);
+        if (b) {
+            self.nums.set(v.raw, 1.0);
+        }
+        return v;
+    }
+
+    /** A new number; a NaN or infinity is not JSON and becomes a null. */
+    pub fn newNumber(mut self, x : f64) : JsonValue {
+        if (x != x || x > JSON_FINITE_MAX || x < -JSON_FINITE_MAX) {
+            return self.alloc(JsonKind::Null);
+        }
+        let v : JsonValue = self.alloc(JsonKind::Number);
+        self.nums.set(v.raw, x);
+        return v;
+    }
+
+    /** A new string. */
+    pub fn newString(mut self, s : string) : JsonValue {
+        let v : JsonValue = self.alloc(JsonKind::String);
+        let id : StringId = self.names.intern(s);
+        self.texts.set(v.raw, id.raw);
+        return v;
+    }
+
+    /** A new empty array. */
+    pub fn newArray(mut self) : JsonValue {
+        return self.alloc(JsonKind::Array);
+    }
+
+    /** A new empty object. */
+    pub fn newObject(mut self) : JsonValue {
+        return self.alloc(JsonKind::Object);
+    }
+
+    /** Appends `child` to the array `arr`; false (and nothing changes) when `arr` is not an array or `child` is not free. */
+    pub fn push(mut self, arr : JsonValue, child : JsonValue) : bool {
+        if (!self.isArray(arr) || !self.attachable(child)) {
+            return false;
+        }
+        self.link(arr.raw, child.raw);
+        return true;
+    }
+
+    /**
+     * Sets member `key` of the object `obj` to `child`. A member of that name is replaced in place (it keeps
+     * its position); otherwise the member goes last. False when `obj` is not an object or `child` is not free.
+     */
+    pub fn set(mut self, obj : JsonValue, key : string, child : JsonValue) : bool {
+        if (!self.isObject(obj) || !self.attachable(child)) {
+            return false;
+        }
+        let id : StringId = self.names.intern(key);
+        let old : JsonValue = self.field(obj, key);
+        if (old.isNone()) {
+            self.keys.set(child.raw, id.raw);
+            self.link(obj.raw, child.raw);
+            return true;
+        }
+        self.kinds.set(old.raw, self.kinds.get(child.raw));
+        self.nums.set(old.raw, self.nums.get(child.raw));
+        self.texts.set(old.raw, self.texts.get(child.raw));
+        self.first.set(old.raw, self.first.get(child.raw));
+        self.last.set(old.raw, self.last.get(child.raw));
+        self.counts.set(old.raw, self.counts.get(child.raw));
+        self.owners.set(child.raw, old.raw);
+        self.curOf = -1;
+        return true;
+    }
+
+    // A node can be attached when it exists, has no parent yet and is not the root.
+    fn attachable(self, child : JsonValue) : bool {
+        return self.valid(child) && child.raw != self.top && self.owners.get(child.raw) < 0;
+    }
+
+    fn link(mut self, parent : i32, child : i32) : void {
+        let tail : i32 = self.last.get(parent);
+        if (tail < 0) {
+            self.first.set(parent, child);
+        } else {
+            self.next.set(tail, child);
+        }
+        self.last.set(parent, child);
+        self.counts.set(parent, self.counts.get(parent) + 1);
+        self.owners.set(child, parent);
+        self.curOf = -1;
+    }
+
+    /** Appends the freshly made `child` to `parent`, keyed by `key` when it is an object member; used by the parser, which knows the child is free. */
+    pub(crate) fn attach(
+        mut self,
+        parent : JsonValue,
+        child : JsonValue,
+        key : string,
+        isMember : bool
+    ) : void {
+        if (isMember) {
+            let id : StringId = self.names.intern(key);
+            self.keys.set(child.raw, id.raw);
+        }
+        self.link(parent.raw, child.raw);
+    }
+}

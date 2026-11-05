@@ -1,0 +1,162 @@
+// text — strings and UTF-8 bytes: the conversions the file formats need.
+//
+// Axle strings are UTF-8 byte strings, while every file format of the data layer is read from a `ByteBuf`. This
+// file is the bridge: bytes to a string, a string to bytes, one code point to its bytes, and the check that a
+// run of bytes is well-formed UTF-8 (shortest forms only, no surrogates, nothing above U+10FFFF), which the
+// strict formats (JSON) demand and the lenient ones (names inside a model) do not.
+//
+// Nothing here trusts its input. A malformed byte run reads back with U+FFFD in place of the bad sequence, and
+// a code point that cannot be encoded is written as U+FFFD, so an importer never has to check first.
+
+use std::text::bytesToString;
+
+use crate::data::bytes::ByteBuf;
+
+/** The largest Unicode code point, U+10FFFF. */
+const TEXT_MAX_CODE_POINT : i32 = 0x10FFFF;
+
+/** The first UTF-16 surrogate value; a surrogate is not a code point and never encodes. */
+const TEXT_SURROGATE_FIRST : i32 = 0xD800;
+
+/** The last UTF-16 surrogate value. */
+const TEXT_SURROGATE_LAST : i32 = 0xDFFF;
+
+/** The low end of the range a UTF-8 continuation byte may fall in. */
+const TEXT_CONT_MIN : i32 = 0x80;
+
+/** The high end of the range a UTF-8 continuation byte may fall in. */
+const TEXT_CONT_MAX : i32 = 0xBF;
+
+/** Spare room for `toBytes`, so an append right after it does not grow the buffer. */
+const TEXT_ROOM_SLACK : i32 = 16;
+
+/** Conversions between strings and bytes. */
+pub class DataText {
+    /** The string made of bytes `from..to` of `b`, read as UTF-8 (malformed sequences become U+FFFD). */
+    pub static fn fromBytes(b : ByteBuf, from : i32, to : i32) : string {
+        let n : i32 = to - from;
+        if (n <= 0) {
+            return "";
+        }
+        let mut raw : i8[] = malloc<i8>(n as i64);
+        for (i of 0..n) {
+            raw[i] = b.get(from + i) as i8;
+        }
+        return bytesToString(raw, n as i64);
+    }
+
+    /** A copy of `text` that owns its bytes; use it before keeping a string that was only borrowed (from a JSON document, say). */
+    pub static fn copy(text : string) : string {
+        let b : ByteBuf = DataText::toBytes(text);
+        return DataText::fromBytes(b, 0, b.len());
+    }
+
+    /** The UTF-8 bytes of `text` in a new buffer. */
+    pub static fn toBytes(text : string) : ByteBuf {
+        let out : ByteBuf = new ByteBuf(text.byteLength as i32 + TEXT_ROOM_SLACK);
+        out.pushText(text);
+        return out;
+    }
+
+    /** Appends the UTF-8 form of the code point `cp` (1 to 4 bytes); a value that is not a code point gives U+FFFD. */
+    pub static fn pushCodePoint(out : ByteBuf, cp : i32) : void {
+        if (cp < 0 || cp > TEXT_MAX_CODE_POINT || (cp >= TEXT_SURROGATE_FIRST && cp <= TEXT_SURROGATE_LAST)) {
+            DataText::pushReplacement(out);
+            return;
+        }
+        if (cp < 0x80) {
+            out.push(cp);
+            return;
+        }
+        if (cp < 0x800) {
+            out.push(0xC0 | (cp >> 6));
+            out.push(0x80 | (cp & 63));
+            return;
+        }
+        if (cp < 0x10000) {
+            out.push(0xE0 | (cp >> 12));
+            out.push(0x80 | ((cp >> 6) & 63));
+            out.push(0x80 | (cp & 63));
+            return;
+        }
+        out.push(0xF0 | (cp >> 18));
+        out.push(0x80 | ((cp >> 12) & 63));
+        out.push(0x80 | ((cp >> 6) & 63));
+        out.push(0x80 | (cp & 63));
+    }
+
+    /**
+     * How many bytes the UTF-8 sequence starting at `at` takes (1 to 4), or 0 when the bytes there are not
+     * well-formed UTF-8 or run past `to`.
+     */
+    pub static fn sequenceLength(b : ByteBuf, at : i32, to : i32) : i32 {
+        if (at < 0 || at >= to || to > b.len()) {
+            return 0;
+        }
+
+        let lead : i32 = b.get(at);
+        if (lead < 0x80) {
+            return 1;
+        }
+
+        let mut n : i32 = 0;
+        let mut lo : i32 = TEXT_CONT_MIN;
+        let mut hi : i32 = TEXT_CONT_MAX;
+        if (lead >= 0xC2 && lead <= 0xDF) {
+            n = 2;
+        } else if (lead >= 0xE0 && lead <= 0xEF) {
+            n = 3;
+            if (lead == 0xE0) {
+                lo = 0xA0; // below A0 the sequence encodes a code point that fits in two bytes
+            }
+            if (lead == 0xED) {
+                hi = 0x9F; // above 9F the sequence encodes a surrogate
+            }
+        } else if (lead >= 0xF0 && lead <= 0xF4) {
+            n = 4;
+            if (lead == 0xF0) {
+                lo = 0x90; // below 90 the sequence encodes a code point that fits in three bytes
+            }
+            if (lead == 0xF4) {
+                hi = 0x8F; // above 8F the sequence encodes a value beyond U+10FFFF
+            }
+        } else {
+            return 0; // C0 and C1 start overlong forms; F5 and above are past the end
+        }
+        if (at + n > to) {
+            return 0;
+        }
+
+        let second : i32 = b.get(at + 1);
+        if (second < lo || second > hi) {
+            return 0;
+        }
+        for (k of 2..n) {
+            let cont : i32 = b.get(at + k);
+            if (cont < TEXT_CONT_MIN || cont > TEXT_CONT_MAX) {
+                return 0;
+            }
+        }
+        return n;
+    }
+
+    /** True when bytes `from..to` of `b` are well-formed UTF-8. */
+    pub static fn isValidUtf8(b : ByteBuf, from : i32, to : i32) : bool {
+        let mut at : i32 = from;
+        while (at < to) {
+            let n : i32 = DataText::sequenceLength(b, at, to);
+            if (n == 0) {
+                return false;
+            }
+            at = at + n;
+        }
+        return true;
+    }
+
+    // Appends U+FFFD, the replacement character, so a caller has one way to write "this was not text".
+    static fn pushReplacement(out : ByteBuf) : void {
+        out.push(0xEF);
+        out.push(0xBF);
+        out.push(0xBD);
+    }
+}

@@ -1,0 +1,438 @@
+// inflate — decompresses a zlib stream (RFC 1950 around RFC 1951 deflate).
+//
+// What PNG stores its pixels in. The decoder follows the shape of zlib's reference `puff`: bits are read one
+// byte at a time, and a Huffman code is decoded by walking code lengths, so no lookup table is built and the
+// code is short enough to check against the specification line by line. A damaged or truncated stream sets
+// `failed` and stops; it never reads outside the input or grows the output without limit (`maxOutput`).
+
+use crate::data::bytes::{ByteBuf, adler32};
+
+// The block kinds a deflate header can name.
+const INFLATE_STORED : i32 = 0;
+const INFLATE_FIXED : i32 = 1;
+const INFLATE_DYNAMIC : i32 = 2;
+
+// The shortest well-formed zlib stream: a two-byte header and a four-byte Adler sum.
+const INFLATE_MIN_STREAM : i32 = 6;
+
+// The literal/length code that closes a block, and the first code that stands for a match length.
+const INFLATE_END_OF_BLOCK : i32 = 256;
+const INFLATE_FIRST_LENGTH : i32 = 257;
+
+// The most length and distance codes a dynamic block may define.
+const INFLATE_MAX_LENGTHS : i32 = 286;
+const INFLATE_MAX_DISTANCES : i32 = 30;
+
+/** One decompression: feed it a stream with `zlib`, then read `output()`. */
+pub class Inflater {
+    src      : ByteBuf;
+    pos      : i32 = 0;
+    end      : i32 = 0;
+    bitBuf   : i32 = 0;
+    bitCount : i32 = 0;
+    out      : ByteBuf;
+    limit    : i32;
+    bad      : bool = false;
+    lenCount : i32[];
+    lenSym   : i32[];
+    dstCount : i32[];
+    dstSym   : i32[];
+    lengths  : i32[];
+    lenBase  : i32[];
+    lenExtra : i32[];
+    dstBase  : i32[];
+    dstExtra : i32[];
+
+    /** An inflater that refuses to produce more than `maxOutput` bytes (a guard against bombs). */
+    constructor(maxOutput : i32) {
+        self.limit = maxOutput;
+        self.src = new ByteBuf(16);
+        self.out = new ByteBuf(1024);
+        self.lenCount = malloc<i32>(16);
+        self.lenSym = malloc<i32>(288);
+        self.dstCount = malloc<i32>(16);
+        self.dstSym = malloc<i32>(30);
+        self.lengths = malloc<i32>(320);
+        self.lenBase = malloc<i32>(29);
+        self.lenExtra = malloc<i32>(29);
+        self.dstBase = malloc<i32>(30);
+        self.dstExtra = malloc<i32>(30);
+
+        // Length codes 257..285: a base length and the number of extra bits that follow it.
+        let mut base : i32 = 3;
+        for (i of 0..29) {
+            self.lenBase[i] = base;
+            let mut extra : i32 = 0;
+            if (i >= 8 && i < 28) {
+                extra = (i - 4) / 4;
+            }
+            self.lenExtra[i] = extra;
+            base = base + (1 << extra);
+        }
+        // Code 285 is the length 258 on its own.
+        self.lenBase[28] = 258;
+        self.lenExtra[28] = 0;
+
+        // Distance codes 0..29: likewise a base distance and its extra bits.
+        let mut d : i32 = 1;
+        for (i of 0..30) {
+            self.dstBase[i] = d;
+            let mut extra : i32 = 0;
+            if (i >= 4) {
+                extra = (i - 2) / 2;
+            }
+            self.dstExtra[i] = extra;
+            d = d + (1 << extra);
+        }
+    }
+
+    /** True when the last stream was damaged, truncated or too big. */
+    pub fn failed(self) : bool {
+        return self.bad;
+    }
+
+    /** What the last stream decompressed to. */
+    pub fn output(self) : ByteBuf {
+        return self.out;
+    }
+
+    /** Decompresses the zlib stream in bytes `from..to` of `data`; false (see `failed`) when it is not a good one. */
+    pub fn zlib(mut self, data : ByteBuf, from : i32, to : i32) : bool {
+        // A private copy: the stream is only borrowed for the call.
+        self.src = new ByteBuf(to - from + 16);
+        self.src.pushRange(data, from, to);
+        self.pos = 0;
+        self.end = to - from;
+        self.bitBuf = 0;
+        self.bitCount = 0;
+        self.out = new ByteBuf(4096);
+        self.bad = false;
+
+        if (to - from < INFLATE_MIN_STREAM) {
+            return self.fail();
+        }
+        // Header: method 8 (deflate), a checksum divisible by 31, and no preset dictionary.
+        let cmf : i32 = data.get(from);
+        let flg : i32 = data.get(from + 1);
+        if ((cmf & 15) != 8 || ((cmf << 8) | flg) % 31 != 0 || (flg & 32) != 0) {
+            return self.fail();
+        }
+
+        self.pos = 2;
+        let mut last : i32 = 0;
+        while (last == 0 && !self.bad) {
+            last = self.bits(1);
+            let kind : i32 = self.bits(2);
+            if (kind == INFLATE_STORED) {
+                self.stored();
+            } else if (kind == INFLATE_FIXED) {
+                self.fixed();
+            } else if (kind == INFLATE_DYNAMIC) {
+                self.dynamic();
+            } else {
+                self.bad = true;
+            }
+        }
+        if (self.bad) {
+            return false;
+        }
+
+        // The Adler sum follows the last byte of the deflate data.
+        self.bitBuf = 0;
+        self.bitCount = 0;
+        if (self.pos + 4 > self.end || self.src.be32(self.pos) != adler32(self.out, 0, self.out.len())) {
+            return self.fail();
+        }
+        return true;
+    }
+
+    fn fail(mut self) : bool {
+        self.bad = true;
+        return false;
+    }
+
+    // The next `need` bits, least significant first; a stream that ends inside them fails.
+    fn bits(mut self, need : i32) : i32 {
+        let mut val : i32 = self.bitBuf;
+        while (self.bitCount < need) {
+            if (self.pos >= self.end) {
+                self.bad = true;
+                return 0;
+            }
+            val = val | (self.src.get(self.pos) << self.bitCount);
+            self.pos = self.pos + 1;
+            self.bitCount = self.bitCount + 8;
+        }
+        self.bitBuf = val >>> need;
+        self.bitCount = self.bitCount - need;
+        return val & ((1 << need) - 1);
+    }
+
+    // A stored block: LEN and its complement, then LEN raw bytes.
+    fn stored(mut self) : void {
+        self.bitBuf = 0;
+        self.bitCount = 0;
+        if (self.pos + 4 > self.end) {
+            self.bad = true;
+            return;
+        }
+        let len : i32 = self.src.get(self.pos) | (self.src.get(self.pos + 1) << 8);
+        let inv : i32 = self.src.get(self.pos + 2) | (self.src.get(self.pos + 3) << 8);
+        if (len != (inv ^ 65535)) {
+            self.bad = true;
+            return;
+        }
+
+        self.pos = self.pos + 4;
+        if (self.pos + len > self.end || self.out.len() + len > self.limit) {
+            self.bad = true;
+            return;
+        }
+        for (i of 0..len) {
+            self.out.push(self.src.get(self.pos + i));
+        }
+        self.pos = self.pos + len;
+    }
+
+    // Builds the decoding tables of a canonical code from `n` code lengths at `lengths[at..]`; returns the number
+    // of unused codes (negative: over-subscribed, positive: incomplete).
+    fn construct(mut self, count : i32[], symbol : i32[], at : i32, n : i32) : i32 {
+        for (l of 0..16) {
+            count[l] = 0;
+        }
+        for (s of 0..n) {
+            count[self.lengths[at + s]] = count[self.lengths[at + s]] + 1;
+        }
+        if (count[0] == n) {
+            return 0;
+        }
+
+        // Every level must have room for the codes it names.
+        let mut left : i32 = 1;
+        for (l of 1..16) {
+            left = left << 1;
+            left = left - count[l];
+            if (left < 0) {
+                return left;
+            }
+        }
+
+        // Offsets of each length's first symbol, then a stable pass that fills them in.
+        let mut offs : i32[] = malloc<i32>(16);
+        offs[1] = 0;
+        for (l of 1..15) {
+            offs[l + 1] = offs[l] + count[l];
+        }
+        for (s of 0..n) {
+            if (self.lengths[at + s] != 0) {
+                symbol[offs[self.lengths[at + s]]] = s;
+                offs[self.lengths[at + s]] = offs[self.lengths[at + s]] + 1;
+            }
+        }
+        return left;
+    }
+
+    // The next symbol of the code described by `count` and `symbol`, or -1 for a bad code or a short stream.
+    fn decode(mut self, count : i32[], symbol : i32[]) : i32 {
+        let mut code : i32 = 0;
+        let mut first : i32 = 0;
+        let mut index : i32 = 0;
+        for (len of 1..16) {
+            code = code | self.bits(1);
+            if (self.bad) {
+                return -1;
+            }
+            let c : i32 = count[len];
+            if (code - c < first) {
+                return symbol[index + (code - first)];
+            }
+            index = index + c;
+            first = (first + c) << 1;
+            code = code << 1;
+        }
+        return -1;
+    }
+
+    // The fixed tables of RFC 1951 section 3.2.6.
+    fn fixed(mut self) : void {
+        for (s of 0..144) {
+            self.lengths[s] = 8;
+        }
+        for (s of 144..256) {
+            self.lengths[s] = 9;
+        }
+        for (s of 256..280) {
+            self.lengths[s] = 7;
+        }
+        for (s of 280..288) {
+            self.lengths[s] = 8;
+        }
+        self.construct(self.lenCount, self.lenSym, 0, 288);
+
+        for (s of 0..30) {
+            self.lengths[s] = 5;
+        }
+        self.construct(self.dstCount, self.dstSym, 0, 30);
+
+        self.codes();
+    }
+
+    // A dynamic block: the two code tables and the lengths of their symbols are read from the stream.
+    fn dynamic(mut self) : void {
+        let lengthCount : i32 = self.bits(5) + 257;
+        let distanceCount : i32 = self.bits(5) + 1;
+        let codeCount : i32 = self.bits(4) + 4;
+        if (self.bad || lengthCount > INFLATE_MAX_LENGTHS || distanceCount > INFLATE_MAX_DISTANCES) {
+            self.bad = true;
+            return;
+        }
+
+        // The order in which the code-length code's own lengths are stored.
+        let mut order : i32[] = malloc<i32>(19);
+        order[0] = 16;
+        order[1] = 17;
+        order[2] = 18;
+        order[3] = 0;
+        order[4] = 8;
+        order[5] = 7;
+        order[6] = 9;
+        order[7] = 6;
+        order[8] = 10;
+        order[9] = 5;
+        order[10] = 11;
+        order[11] = 4;
+        order[12] = 12;
+        order[13] = 3;
+        order[14] = 13;
+        order[15] = 2;
+        order[16] = 14;
+        order[17] = 1;
+        order[18] = 15;
+        for (i of 0..19) {
+            self.lengths[i] = 0;
+        }
+        for (i of 0..codeCount) {
+            self.lengths[order[i]] = self.bits(3);
+        }
+        if (self.bad) {
+            return;
+        }
+
+        // The code-length code lives in the front of lenCount/lenSym; the real codes replace it below.
+        let mut clCount : i32[] = malloc<i32>(16);
+        let mut clSym : i32[] = malloc<i32>(19);
+        if (self.construct(clCount, clSym, 0, 19) != 0) {
+            self.bad = true;
+            return;
+        }
+
+        // The symbols of the two real codes, with repeats of 3..138 packed as their own codes.
+        let total : i32 = lengthCount + distanceCount;
+        let mut idx : i32 = 0;
+        let mut lens : i32[] = malloc<i32>(320);
+        while (idx < total) {
+            let sym : i32 = self.decode(clCount, clSym);
+            if (sym < 0) {
+                self.bad = true;
+                return;
+            }
+            if (sym < 16) {
+                lens[idx] = sym;
+                idx = idx + 1;
+                continue;
+            }
+
+            let mut prev : i32 = 0;
+            let mut rep : i32 = 0;
+            if (sym == 16) {
+                if (idx == 0) {
+                    self.bad = true;
+                    return;
+                }
+                prev = lens[idx - 1];
+                rep = 3 + self.bits(2);
+            } else if (sym == 17) {
+                rep = 3 + self.bits(3);
+            } else {
+                rep = 11 + self.bits(7);
+            }
+            if (self.bad || idx + rep > total) {
+                self.bad = true;
+                return;
+            }
+            for (r of 0..rep) {
+                lens[idx] = prev;
+                idx = idx + 1;
+            }
+        }
+        if (lens[INFLATE_END_OF_BLOCK] == 0) {
+            self.bad = true;
+            return;
+        }
+
+        for (i of 0..lengthCount) {
+            self.lengths[i] = lens[i];
+        }
+        let unusedLen : i32 = self.construct(self.lenCount, self.lenSym, 0, lengthCount);
+        if (unusedLen < 0 || (unusedLen > 0 && lengthCount - self.lenCount[0] != 1)) {
+            self.bad = true;
+            return;
+        }
+
+        for (i of 0..distanceCount) {
+            self.lengths[i] = lens[lengthCount + i];
+        }
+        let unusedDist : i32 = self.construct(self.dstCount, self.dstSym, 0, distanceCount);
+        if (unusedDist < 0 || (unusedDist > 0 && distanceCount - self.dstCount[0] != 1)) {
+            self.bad = true;
+            return;
+        }
+
+        self.codes();
+    }
+
+    // Decodes literals and matches with the tables in lenCount/lenSym and dstCount/dstSym until end-of-block.
+    fn codes(mut self) : void {
+        while (!self.bad) {
+            let sym : i32 = self.decode(self.lenCount, self.lenSym);
+            if (sym < 0) {
+                self.bad = true;
+                return;
+            }
+            if (sym < INFLATE_END_OF_BLOCK) {
+                if (self.out.len() >= self.limit) {
+                    self.bad = true;
+                    return;
+                }
+                self.out.push(sym);
+                continue;
+            }
+            if (sym == INFLATE_END_OF_BLOCK) {
+                return;
+            }
+
+            let s : i32 = sym - INFLATE_FIRST_LENGTH;
+            if (s >= 29) {
+                self.bad = true;
+                return;
+            }
+            let len : i32 = self.lenBase[s] + self.bits(self.lenExtra[s]);
+            let ds : i32 = self.decode(self.dstCount, self.dstSym);
+            if (ds < 0 || ds >= 30) {
+                self.bad = true;
+                return;
+            }
+            let dist : i32 = self.dstBase[ds] + self.bits(self.dstExtra[ds]);
+            if (self.bad || dist > self.out.len() || self.out.len() + len > self.limit) {
+                self.bad = true;
+                return;
+            }
+
+            // A match may overlap what it produces, so read as it is written.
+            let from : i32 = self.out.len() - dist;
+            for (k of 0..len) {
+                self.out.push(self.out.get(from + k));
+            }
+        }
+    }
+}

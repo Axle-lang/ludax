@@ -1,0 +1,494 @@
+// bbmodel_import — Blockbench (`.bbmodel`) models to a `ModelAsset`.
+//
+// A Blockbench file is JSON: a list of `elements` (cubes with `from`, `to`, an `origin` to rotate about, a
+// `rotation` in degrees, and up to six `faces` each with a `uv` rectangle in texture pixels and a `texture`
+// number), an `outliner` that arranges them in groups (each with its own origin and rotation), and
+// `textures` whose pixels are embedded as base64 PNG `data:` URIs.
+//
+// The result is one mesh with one primitive per texture (plus one for faces without), all transforms of the
+// element and of every group above it baked into the vertices, so nothing needs a node hierarchy to draw.
+// Coordinates are Blockbench's divided by 16 (a block is one unit), Y up, north is -Z. Each face has four
+// vertices in the order top-left, top-right, bottom-right, bottom-left as seen from outside; `uv` rectangle
+// corners go to those vertices (v counts down the picture), and a face `rotation` of 90, 180 or 270 turns
+// the picture clockwise on the face. Rotation order is Z, then Y, then X applied last to first, like the editor.
+// When the model has textures, faces whose `texture` is null are not drawn; elements that are not cubes
+// (free meshes, locators) are skipped with a warning.
+
+use crate::core::collections::string_map::StringMap;
+use crate::core::math::mat4::Mat4;
+use crate::core::math::scalar::DEG2RAD;
+use crate::core::math::vec2::Vec2;
+use crate::core::math::vec3::Vec3;
+use crate::data::bytes::ByteBuf;
+use crate::data::image::image::Image;
+use crate::data::image::png::PngCodec;
+use crate::data::json::json_doc::{JsonDoc, JsonValue};
+use crate::data::json::json_parse::JsonParser;
+use crate::data::model::base64::Base64;
+use crate::data::model::mesh::Mesh;
+use crate::data::model::model_asset::{ModelAsset, ModelMaterial, ModelMesh, ModelNode};
+use crate::data::slots::DataSlots;
+use crate::data::text::DataText;
+use crate::data::vfs::vfs::Vfs;
+use crate::data::vfs::vfs_path::VfsPath;
+
+// Blockbench units per world unit.
+const BB_SCALE : f32 = 0.0625;
+
+// A cube has six faces, each a rectangle of four corners; a face rotation quarter-turn is 90 degrees.
+const BB_FACE_COUNT : i32 = 6;
+const BB_FACE_CORNERS : i32 = 4;
+const BB_FACE_TURN_DEGREES : i32 = 90;
+
+/** Reads Blockbench models. */
+pub class BbModelImporter {
+    doc      : JsonDoc;
+    model    : ModelAsset;
+    byUuid   : StringMap<i32>;
+    pieces   : DataSlots<Mesh>;
+    texW     : ByteBuf;
+    texH     : ByteBuf;
+    resW     : f32 = 16.0;
+    resH     : f32 = 16.0;
+    texCount : i32 = 0;
+    emitted  : i32 = 0;
+    err      : string;
+
+    constructor(own doc : JsonDoc) {
+        self.doc = doc;
+        self.model = new ModelAsset();
+        self.byUuid = new StringMap<i32>();
+        self.pieces = new DataSlots<Mesh>();
+        self.texW = new ByteBuf(16);
+        self.texH = new ByteBuf(16);
+        self.err = "";
+    }
+
+    /** Imports the `.bbmodel` at `path` of `vfs`. */
+    pub static fn load(vfs : Vfs, path : string) : ModelAsset {
+        try {
+            let bytes : ByteBuf = vfs.read(path);
+            return BbModelImporter::fromBytes(bytes, vfs, VfsPath::parent(VfsPath::normalize(path)));
+        } catch e : IOException {
+            let failed : ModelAsset = new ModelAsset();
+            failed.fail(e.message);
+            return failed;
+        }
+    }
+
+    /** Imports a model from the bytes of a `.bbmodel`; textures without embedded pixels are looked up in `baseDir` of `vfs`. */
+    pub static fn fromBytes(bytes : ByteBuf, vfs : Vfs, baseDir : string) : ModelAsset {
+        let doc : JsonDoc = JsonParser::parseBytes(bytes);
+        if (!doc.ok()) {
+            let failed : ModelAsset = new ModelAsset();
+            failed.fail("JSON: ${doc.error()}");
+            return failed;
+        }
+        let rootOk : bool = doc.isObject(doc.root());
+        let importer : BbModelImporter = new BbModelImporter(doc);
+        if (!rootOk) {
+            importer.model.fail("the model root is not an object");
+            return importer.model;
+        }
+        importer.run(vfs, baseDir);
+        if (importer.err.byteLength > 0) {
+            importer.model.fail(importer.err);
+        }
+        return importer.model;
+    }
+
+    fn fail(mut self, why : string) : void {
+        if (self.err.byteLength == 0) {
+            self.err = why;
+        }
+    }
+
+    fn run(mut self, vfs : Vfs, baseDir : string) : void {
+        let top : JsonValue = self.doc.root();
+        self.model.name = DataText::copy(self.doc.stringOr(self.doc.field(top, "name"), ""));
+        let res : JsonValue = self.doc.field(top, "resolution");
+        self.resW = self.doc.numberOr(self.doc.field(res, "width"), 16.0) as f32;
+        self.resH = self.doc.numberOr(self.doc.field(res, "height"), 16.0) as f32;
+        if (self.resW < 1.0 || self.resH < 1.0) {
+            self.fail("the resolution is not positive");
+            return;
+        }
+        self.textures(top, vfs, baseDir);
+        if (self.err.byteLength > 0) {
+            return;
+        }
+        // One material and one mesh piece per texture, plus one for faces without a texture.
+        let textures : JsonValue = self.doc.field(top, "textures");
+        let mats : i32 = self.texCount + 1;
+        for (m of 0..mats) {
+            self.pieces.push(new Mesh());
+            let mut name : string = "untextured";
+            if (m < self.texCount) {
+                name = self.doc.stringOr(
+                    self.doc.field(self.doc.at(textures, m), "name"),
+                    "texture ${m}"
+                );
+            }
+            let mut mat : ModelMaterial = new ModelMaterial(name);
+            mat.metallic = 0.0;
+            mat.roughness = 1.0;
+            if (m < self.texCount) {
+                mat.baseColorTexture = m;
+            }
+            self.model.addMaterial(mat);
+        }
+        let elements : JsonValue = self.doc.field(top, "elements");
+        if (!self.doc.isArray(elements) || self.doc.len(elements) == 0) {
+            self.fail("the model has no elements");
+            return;
+        }
+        let mut el : JsonValue = self.doc.firstChild(elements);
+        let mut index : i32 = 0;
+        while (!el.isNone()) {
+            let uuid : string = self.doc.stringOr(self.doc.field(el, "uuid"), "");
+            if (uuid.byteLength > 0) {
+                self.byUuid.put(uuid, index);
+            }
+            el = self.doc.nextSibling(el);
+            index = index + 1;
+        }
+        let outliner : JsonValue = self.doc.field(top, "outliner");
+        if (self.doc.len(outliner) > 0) {
+            self.walk(outliner, Mat4::identity());
+        } else {
+            for (i of 0..self.doc.len(elements)) {
+                self.cube(self.doc.at(elements, i), i, Mat4::identity());
+            }
+        }
+        if (self.err.byteLength > 0) {
+            return;
+        }
+        if (self.emitted == 0) {
+            self.fail("the model has no cube faces to draw");
+            return;
+        }
+        let mut mesh : ModelMesh = new ModelMesh(self.model.name);
+        for (m of 0..mats) {
+            let piece : Mesh = self.pieces.get(m);
+            if (piece.vertexCount() > 0) {
+                piece.computeTangents();
+                mesh.addPrimitive(piece, m);
+            }
+        }
+        let meshIndex : i32 = self.model.addMesh(mesh);
+        let mut node : ModelNode = new ModelNode(self.model.name);
+        node.mesh = meshIndex;
+        let nodeIndex : i32 = self.model.addNode(node);
+        self.model.addRoot(nodeIndex);
+    }
+
+    // ---- textures ----
+
+    fn textures(mut self, top : JsonValue, vfs : Vfs, baseDir : string) : void {
+        let list : JsonValue = self.doc.field(top, "textures");
+        let n : i32 = self.doc.len(list);
+        for (i of 0..n) {
+            let t : JsonValue = self.doc.at(list, i);
+            let source : string = self.doc.stringOr(self.doc.field(t, "source"), "");
+            let name : string = self.doc.stringOr(self.doc.field(t, "name"), "");
+            let data : ByteBuf = new ByteBuf(16);
+            let mut have : bool = false;
+            if (source.byteLength > 0) {
+                if (Base64::dataUriStart(source) < 0
+                    || !Base64::decodeFrom(source, Base64::dataUriStart(source), data)) {
+                    self.fail("texture ${i} does not hold valid base64 pixels");
+                    return;
+                }
+                have = true;
+            } else if (name.byteLength > 0 && !VfsPath::escapes(baseDir + "/" + name)) {
+                let path : string = VfsPath::join(baseDir, name);
+                try {
+                    let read : ByteBuf = vfs.read(path);
+                    data.pushRange(read, 0, read.len());
+                    self.model.noteFile(path);
+                    have = true;
+                } catch e : IOException {
+                    have = false;
+                }
+            }
+            let mut img : Image = new Image(0, 0);
+            if (have) {
+                let codec : PngCodec = new PngCodec();
+                img = codec.decode(data);
+                if (img.isEmpty()) {
+                    self.fail("texture ${i} is not a valid PNG: ${codec.error()}");
+                    return;
+                }
+            } else {
+                self.model.warn("texture ${i} has no pixels in the file");
+            }
+            self.texW.pushLe32((self.doc.numberOr(self.doc.field(t, "uv_width"), self.resW as f64)) as i32);
+            self.texH.pushLe32((self.doc.numberOr(self.doc.field(t, "uv_height"), self.resH as f64)) as i32);
+            self.model.addTexture(img);
+            self.texCount = self.texCount + 1;
+        }
+    }
+
+    // ---- the outliner ----
+
+    // Three numbers from the array `key` of `v`; `fallback` when it is absent; an error when it is present but not three numbers.
+    fn vec3(mut self, v : JsonValue, key : string, fallback : Vec3, what : string) : Vec3 {
+        let a : JsonValue = self.doc.field(v, key);
+        if (a.isNone()) {
+            return fallback;
+        }
+        if (!self.doc.isArray(a) || self.doc.len(a) != 3) {
+            self.fail("${what}: ${key} must be an array of three numbers");
+            return fallback;
+        }
+        let x : JsonValue = self.doc.firstChild(a);
+        let y : JsonValue = self.doc.nextSibling(x);
+        let z : JsonValue = self.doc.nextSibling(y);
+        if (!self.doc.isNumber(x) || !self.doc.isNumber(y) || !self.doc.isNumber(z)) {
+            self.fail("${what}: ${key} must hold numbers");
+            return fallback;
+        }
+        return Vec3 {
+            x: self.doc.asNumber(x) as f32,
+            y: self.doc.asNumber(y) as f32,
+            z: self.doc.asNumber(z) as f32,
+        };
+    }
+
+    fn rotationAbout(self, pivot : Vec3, degrees : Vec3) : Mat4 {
+        let rx : Mat4 = Mat4::rotationX(degrees.x * DEG2RAD);
+        let ry : Mat4 = Mat4::rotationY(degrees.y * DEG2RAD);
+        let rz : Mat4 = Mat4::rotationZ(degrees.z * DEG2RAD);
+        let r : Mat4 = rz.mul(ry).mul(rx);
+        return Mat4::translation(pivot).mul(r).mul(Mat4::translation(pivot.negated()));
+    }
+
+    // Visits the entries of an outliner list: uuid strings (cubes) and group objects (with their own children).
+    fn walk(mut self, list : JsonValue, parent : Mat4) : void {
+        let mut entry : JsonValue = self.doc.firstChild(list);
+        while (!entry.isNone() && self.err.byteLength == 0) {
+            if (self.doc.isString(entry)) {
+                let slot : i32 = self.byUuid.getOr(self.doc.asString(entry), -1);
+                if (slot < 0) {
+                    self.fail("the outliner names an element that does not exist");
+                    return;
+                }
+                self.cube(self.doc.at(self.doc.field(self.doc.root(), "elements"), slot), slot, parent);
+            } else if (self.doc.isObject(entry)) {
+                let pivot : Vec3 = self.vec3(entry, "origin", Vec3::zero(), "a group");
+                let angles : Vec3 = self.vec3(entry, "rotation", Vec3::zero(), "a group");
+                let m : Mat4 = parent.mul(self.rotationAbout(pivot, angles));
+                self.walk(self.doc.field(entry, "children"), m);
+            } else {
+                self.fail("the outliner holds something that is neither a group nor an element");
+                return;
+            }
+            entry = self.doc.nextSibling(entry);
+        }
+    }
+
+    // ---- cubes ----
+
+    // The face names in the order their vertices are written.
+    static fn faceName(i : i32) : string {
+        return match i {
+            0 => "north",
+            1 => "east",
+            2 => "south",
+            3 => "west",
+            4 => "up",
+            _ => "down",
+        };
+    }
+
+    fn cube(mut self, el : JsonValue, index : i32, parent : Mat4) : void {
+        let what : string = "element ${index}";
+        let kind : string = self.doc.stringOr(self.doc.field(el, "type"), "cube");
+        if (kind != "cube") {
+            self.model.warn("${what}: a ${kind} element was skipped");
+            return;
+        }
+        let from0 : Vec3 = self.vec3(el, "from", Vec3::zero(), what);
+        let to0 : Vec3 = self.vec3(el, "to", Vec3::zero(), what);
+        if (!self.doc.has(el, "from") || !self.doc.has(el, "to")) {
+            self.fail("${what} needs both from and to");
+            return;
+        }
+        let grow : Vec3 = Vec3::splat(self.doc.numberOr(self.doc.field(el, "inflate"), 0.0) as f32);
+        let lo : Vec3 = from0.minus(grow);
+        let hi : Vec3 = to0.plus(grow);
+        let pivot : Vec3 = self.vec3(el, "origin", Vec3::zero(), what);
+        let angles : Vec3 = self.vec3(el, "rotation", Vec3::zero(), what);
+        if (self.err.byteLength > 0) {
+            return;
+        }
+        let m : Mat4 = parent.mul(self.rotationAbout(pivot, angles));
+        let faces : JsonValue = self.doc.field(el, "faces");
+        for (f of 0..BB_FACE_COUNT) {
+            let face : JsonValue = self.doc.field(faces, BbModelImporter::faceName(f));
+            if (!self.doc.isObject(face)) {
+                continue;
+            }
+            self.faceOf(face, f, lo, hi, m, what);
+            if (self.err.byteLength > 0) {
+                return;
+            }
+        }
+    }
+
+    // The four corners (top-left, top-right, bottom-right, bottom-left) of face `f` of the box lo..hi, seen from outside.
+    fn corner(self, f : i32, k : i32, lo : Vec3, hi : Vec3) : Vec3 {
+        // north, east, south, west, up, down
+        if (f == 0) {
+            if (k == 0) {
+                return Vec3 { x: hi.x, y: hi.y, z: lo.z };
+            }
+            if (k == 1) {
+                return Vec3 { x: lo.x, y: hi.y, z: lo.z };
+            }
+            if (k == 2) {
+                return Vec3 { x: lo.x, y: lo.y, z: lo.z };
+            }
+            return Vec3 { x: hi.x, y: lo.y, z: lo.z };
+        }
+        if (f == 1) {
+            if (k == 0) {
+                return Vec3 { x: hi.x, y: hi.y, z: hi.z };
+            }
+            if (k == 1) {
+                return Vec3 { x: hi.x, y: hi.y, z: lo.z };
+            }
+            if (k == 2) {
+                return Vec3 { x: hi.x, y: lo.y, z: lo.z };
+            }
+            return Vec3 { x: hi.x, y: lo.y, z: hi.z };
+        }
+        if (f == 2) {
+            if (k == 0) {
+                return Vec3 { x: lo.x, y: hi.y, z: hi.z };
+            }
+            if (k == 1) {
+                return Vec3 { x: hi.x, y: hi.y, z: hi.z };
+            }
+            if (k == 2) {
+                return Vec3 { x: hi.x, y: lo.y, z: hi.z };
+            }
+            return Vec3 { x: lo.x, y: lo.y, z: hi.z };
+        }
+        if (f == 3) {
+            if (k == 0) {
+                return Vec3 { x: lo.x, y: hi.y, z: lo.z };
+            }
+            if (k == 1) {
+                return Vec3 { x: lo.x, y: hi.y, z: hi.z };
+            }
+            if (k == 2) {
+                return Vec3 { x: lo.x, y: lo.y, z: hi.z };
+            }
+            return Vec3 { x: lo.x, y: lo.y, z: lo.z };
+        }
+        if (f == 4) {
+            if (k == 0) {
+                return Vec3 { x: lo.x, y: hi.y, z: lo.z };
+            }
+            if (k == 1) {
+                return Vec3 { x: hi.x, y: hi.y, z: lo.z };
+            }
+            if (k == 2) {
+                return Vec3 { x: hi.x, y: hi.y, z: hi.z };
+            }
+            return Vec3 { x: lo.x, y: hi.y, z: hi.z };
+        }
+        if (k == 0) {
+            return Vec3 { x: lo.x, y: lo.y, z: hi.z };
+        }
+        if (k == 1) {
+            return Vec3 { x: hi.x, y: lo.y, z: hi.z };
+        }
+        if (k == 2) {
+            return Vec3 { x: hi.x, y: lo.y, z: lo.z };
+        }
+        return Vec3 { x: lo.x, y: lo.y, z: lo.z };
+    }
+
+    fn normalOf(self, f : i32) : Vec3 {
+        return match f {
+            0 => Vec3 { x: 0.0, y: 0.0, z: -1.0 },
+            1 => Vec3 { x: 1.0, y: 0.0, z: 0.0 },
+            2 => Vec3 { x: 0.0, y: 0.0, z: 1.0 },
+            3 => Vec3 { x: -1.0, y: 0.0, z: 0.0 },
+            4 => Vec3 { x: 0.0, y: 1.0, z: 0.0 },
+            _ => Vec3 { x: 0.0, y: -1.0, z: 0.0 },
+        };
+    }
+
+    fn faceOf(mut self, face : JsonValue, f : i32, lo : Vec3, hi : Vec3, m : Mat4, what : string) : void {
+        let uv : JsonValue = self.doc.field(face, "uv");
+        if (uv.isNone()) {
+            return;
+        }
+        if (!self.doc.isArray(uv) || self.doc.len(uv) != 4) {
+            self.fail("${what}: a face uv must hold four numbers");
+            return;
+        }
+        let u1 : JsonValue = self.doc.firstChild(uv);
+        let v1 : JsonValue = self.doc.nextSibling(u1);
+        let u2 : JsonValue = self.doc.nextSibling(v1);
+        let v2 : JsonValue = self.doc.nextSibling(u2);
+        if (!self.doc.isNumber(u1) || !self.doc.isNumber(v1) || !self.doc.isNumber(u2)
+            || !self.doc.isNumber(v2)) {
+            self.fail("${what}: a face uv must hold four numbers");
+            return;
+        }
+        let texField : JsonValue = self.doc.field(face, "texture");
+        let mut tex : i32 = -1;
+        if (self.doc.isNumber(texField)) {
+            tex = self.doc.intOr(texField, -1);
+            if (tex < 0 || tex >= self.texCount) {
+                self.fail("${what}: a face names a texture that does not exist");
+                return;
+            }
+        } else if (self.texCount > 0) {
+            return;
+        }
+        let mut width : f32 = self.resW;
+        let mut height : f32 = self.resH;
+        let mut piece : i32 = self.texCount;
+        if (tex >= 0) {
+            width = self.texW.le32(tex * 4) as f32;
+            height = self.texH.le32(tex * 4) as f32;
+            piece = tex;
+            if (width < 1.0 || height < 1.0) {
+                self.fail("${what}: a texture has no uv size");
+                return;
+            }
+        }
+        let a : f32 = (self.doc.asNumber(u1) as f32) / width;
+        let b : f32 = (self.doc.asNumber(v1) as f32) / height;
+        let c : f32 = (self.doc.asNumber(u2) as f32) / width;
+        let d : f32 = (self.doc.asNumber(v2) as f32) / height;
+        let turns : i32 = (self.doc.intOr(self.doc.field(face, "rotation"), 0) / BB_FACE_TURN_DEGREES)
+            % BB_FACE_CORNERS;
+        let target : Mesh = self.pieces.get(piece);
+        let normal : Vec3 = m.transformVector(self.normalOf(f)).normalizedOr(self.normalOf(f));
+        let base : i32 = target.vertexCount();
+        for (k of 0..BB_FACE_CORNERS) {
+            let source : i32 = ((k - turns) % BB_FACE_CORNERS + BB_FACE_CORNERS) % BB_FACE_CORNERS;
+            let mut uvx : f32 = a;
+            let mut uvy : f32 = b;
+            if (source == 1) {
+                uvx = c;
+            } else if (source == 2) {
+                uvx = c;
+                uvy = d;
+            } else if (source == 3) {
+                uvy = d;
+            }
+            let p : Vec3 = m.transformPoint(self.corner(f, k, lo, hi)).scale(BB_SCALE);
+            target.addVertex(p, normal, Vec2 { x: uvx, y: uvy });
+        }
+        target.addTriangle(base, base + 3, base + 2);
+        target.addTriangle(base, base + 2, base + 1);
+        self.emitted = self.emitted + 1;
+    }
+}

@@ -1,0 +1,359 @@
+// gltf_scene — the node tree, skins and animations of a glTF file.
+//
+// The second half of the importer (materials and meshes are in `gltf_import`). Nodes are created first and
+// linked afterwards, so a child may be listed before its parent in the file; a node with two parents, a
+// child index that does not exist, or a loop is an error, because the tree must be a forest for everything
+// downstream to walk it. A node given as a matrix keeps that matrix and is also decomposed into translation,
+// rotation and scale. Animation samplers are checked for the right number of output values per key and for
+// key times that do not go backwards. Weight (morph target) channels are skipped with a warning.
+
+use crate::core::math::mat3::Mat3;
+use crate::core::math::mat4::Mat4;
+use crate::core::math::quat::Quat;
+use crate::core::math::transform::Transform;
+use crate::core::math::vec3::Vec3;
+use crate::data::json::json_doc::{JsonDoc, JsonValue};
+use crate::data::model::gltf_file::{GltfAccessor, GltfFile};
+use crate::data::model::model_anim::{ModelChannel, ModelClip, ModelInterp, ModelPath, ModelSkin};
+use crate::data::model::model_asset::{ModelAsset, ModelNode};
+
+// Numbers in a glTF MAT4, whether a node matrix or one inverse bind matrix.
+const GLTF_MAT4_COMPONENTS : i32 = 16;
+
+/** Builds nodes, skins and clips from a glTF file. */
+pub(crate) class GltfScene {
+    // The three numbers of the JSON array `key` of `v` into a vector, or `fallback` when it is absent or the wrong size.
+    static fn vec3Of(gf : GltfFile, v : JsonValue, key : string, fallback : Vec3) : Vec3 {
+        let doc : JsonDoc = gf.json();
+        let a : JsonValue = doc.field(v, key);
+        if (doc.len(a) != 3) {
+            return fallback;
+        }
+        let first : JsonValue = doc.firstChild(a);
+        let second : JsonValue = doc.nextSibling(first);
+        let third : JsonValue = doc.nextSibling(second);
+        return Vec3 {
+            x: doc.numberOr(first, 0.0) as f32,
+            y: doc.numberOr(second, 0.0) as f32,
+            z: doc.numberOr(third, 0.0) as f32,
+        };
+    }
+
+    // Number `i` of the array `key` of `v`, 0 if absent.
+    static fn numAt(gf : GltfFile, v : JsonValue, key : string, i : i32) : f32 {
+        let doc : JsonDoc = gf.json();
+        let mut c : JsonValue = doc.firstChild(doc.field(v, key));
+        for (k of 0..i) {
+            c = doc.nextSibling(c);
+        }
+        return doc.numberOr(c, 0.0) as f32;
+    }
+
+    /** Creates the nodes of the file in `model`, linked and checked; false (the file records why) on a malformed tree. */
+    pub(crate) static fn nodes(gf : GltfFile, model : ModelAsset) : bool {
+        let n : i32 = gf.count("nodes");
+        for (i of 0..n) {
+            let jn : JsonValue = gf.item("nodes", i);
+            let mut node : ModelNode = new ModelNode(gf.text(jn, "name", ""));
+            node.mesh = gf.int(jn, "mesh", -1);
+            node.skin = gf.int(jn, "skin", -1);
+            if (node.mesh >= model.meshCount() || node.mesh < -1) {
+                gf.fail("node ${i} names a mesh that does not exist");
+                return false;
+            }
+            if (gf.json().len(gf.json().field(jn, "matrix")) == GLTF_MAT4_COMPONENTS) {
+                let mut m : Mat4 = Mat4 {};
+                m.m00 = GltfScene::numAt(gf, jn, "matrix", 0);
+                m.m10 = GltfScene::numAt(gf, jn, "matrix", 1);
+                m.m20 = GltfScene::numAt(gf, jn, "matrix", 2);
+                m.m30 = GltfScene::numAt(gf, jn, "matrix", 3);
+                m.m01 = GltfScene::numAt(gf, jn, "matrix", 4);
+                m.m11 = GltfScene::numAt(gf, jn, "matrix", 5);
+                m.m21 = GltfScene::numAt(gf, jn, "matrix", 6);
+                m.m31 = GltfScene::numAt(gf, jn, "matrix", 7);
+                m.m02 = GltfScene::numAt(gf, jn, "matrix", 8);
+                m.m12 = GltfScene::numAt(gf, jn, "matrix", 9);
+                m.m22 = GltfScene::numAt(gf, jn, "matrix", 10);
+                m.m32 = GltfScene::numAt(gf, jn, "matrix", 11);
+                m.m03 = GltfScene::numAt(gf, jn, "matrix", 12);
+                m.m13 = GltfScene::numAt(gf, jn, "matrix", 13);
+                m.m23 = GltfScene::numAt(gf, jn, "matrix", 14);
+                m.m33 = GltfScene::numAt(gf, jn, "matrix", 15);
+                node.matrix = m;
+                node.hasMatrix = true;
+                node.local = GltfScene::decompose(m);
+            } else {
+                let t : Vec3 = GltfScene::vec3Of(gf, jn, "translation", Vec3::zero());
+                let s : Vec3 = GltfScene::vec3Of(gf, jn, "scale", Vec3::splat(1.0));
+                let mut q : Quat = Quat::identity();
+                if (gf.json().len(gf.json().field(jn, "rotation")) == 4) {
+                    q = Quat {
+                        x: GltfScene::numAt(gf, jn, "rotation", 0),
+                        y: GltfScene::numAt(gf, jn, "rotation", 1),
+                        z: GltfScene::numAt(gf, jn, "rotation", 2),
+                        w: GltfScene::numAt(gf, jn, "rotation", 3),
+                    };
+                    if (q.lengthSquared() > (0.000001 as f32)) {
+                        q = q.normalized();
+                    } else {
+                        q = Quat::identity();
+                    }
+                }
+                node.local = Transform::make(t, q, s);
+            }
+            model.addNode(node);
+        }
+        for (i of 0..n) {
+            let jn : JsonValue = gf.item("nodes", i);
+            let kids : JsonValue = gf.json().field(jn, "children");
+            let mut kid : JsonValue = gf.json().firstChild(kids);
+            while (!kid.isNone()) {
+                let c : i32 = gf.json().intOr(kid, -1);
+                if (c < 0 || c >= n || c == i) {
+                    gf.fail("node ${i} lists a child that does not exist");
+                    return false;
+                }
+                if (model.node(c).parent >= 0) {
+                    gf.fail("node ${c} has more than one parent");
+                    return false;
+                }
+                let mut child : ModelNode = model.node(c);
+                child.parent = i;
+                let mut owner : ModelNode = model.node(i);
+                owner.children.push(c);
+                kid = gf.json().nextSibling(kid);
+            }
+        }
+        for (i of 0..n) {
+            let mut at : i32 = i;
+            let mut steps : i32 = 0;
+            while (at >= 0 && steps <= n) {
+                at = model.node(at).parent;
+                steps = steps + 1;
+            }
+            if (steps > n) {
+                gf.fail("the node tree contains a loop");
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // Translation, rotation and scale of an affine matrix (shear is dropped; a mirrored matrix gets a negative x scale).
+    static fn decompose(m : Mat4) : Transform {
+        let c0 : Vec3 = Vec3 { x: m.m00, y: m.m10, z: m.m20 };
+        let c1 : Vec3 = Vec3 { x: m.m01, y: m.m11, z: m.m21 };
+        let c2 : Vec3 = Vec3 { x: m.m02, y: m.m12, z: m.m22 };
+        let mut sx : f32 = c0.length();
+        let sy : f32 = c1.length();
+        let sz : f32 = c2.length();
+        if (c0.cross(c1).dot(c2) < 0.0) {
+            sx = -sx;
+        }
+        let r0 : Vec3 = c0.normalizedOr(Vec3::unitX());
+        let r1 : Vec3 = c1.normalizedOr(Vec3::unitY());
+        let r2 : Vec3 = c2.normalizedOr(Vec3::unitZ());
+        let mut rot : Mat3 = Mat3 {};
+        let mut flip : f32 = 1.0;
+        if (sx < 0.0) {
+            flip = -1.0;
+        }
+        rot.m00 = r0.x * flip;
+        rot.m10 = r0.y * flip;
+        rot.m20 = r0.z * flip;
+        rot.m01 = r1.x;
+        rot.m11 = r1.y;
+        rot.m21 = r1.z;
+        rot.m02 = r2.x;
+        rot.m12 = r2.y;
+        rot.m22 = r2.z;
+        let q : Quat = Quat::fromMat3(rot).normalized();
+        return Transform::make(Vec3 { x: m.m03, y: m.m13, z: m.m23 }, q, Vec3 { x: sx, y: sy, z: sz });
+    }
+
+    /** Chooses the root nodes: those of the default scene, or all nodes without a parent when there are no scenes. */
+    pub(crate) static fn scenes(gf : GltfFile, model : ModelAsset) : bool {
+        let sceneCount : i32 = gf.count("scenes");
+        if (sceneCount == 0) {
+            for (i of 0..model.nodeCount()) {
+                if (model.node(i).parent < 0) {
+                    model.addRoot(i);
+                }
+            }
+            return true;
+        }
+        let mut which : i32 = gf.int(gf.root(), "scene", 0);
+        if (which < 0 || which >= sceneCount) {
+            gf.fail("the default scene does not exist");
+            return false;
+        }
+        let sc : JsonValue = gf.item("scenes", which);
+        let mut kid : JsonValue = gf.json().firstChild(gf.json().field(sc, "nodes"));
+        while (!kid.isNone()) {
+            let c : i32 = gf.json().intOr(kid, -1);
+            if (c < 0 || c >= model.nodeCount()) {
+                gf.fail("the scene lists a node that does not exist");
+                return false;
+            }
+            model.addRoot(c);
+            kid = gf.json().nextSibling(kid);
+        }
+        return true;
+    }
+
+    /** Creates the skins of the file. */
+    pub(crate) static fn skins(gf : GltfFile, model : ModelAsset) : bool {
+        let n : i32 = gf.count("skins");
+        for (i of 0..n) {
+            let js : JsonValue = gf.item("skins", i);
+            let mut skin : ModelSkin = new ModelSkin(gf.text(js, "name", ""));
+            let mut j : JsonValue = gf.json().firstChild(gf.json().field(js, "joints"));
+            while (!j.isNone()) {
+                let node : i32 = gf.json().intOr(j, -1);
+                if (node < 0 || node >= model.nodeCount()) {
+                    gf.fail("skin ${i} names a joint that does not exist");
+                    return false;
+                }
+                skin.joints.push(node);
+                j = gf.json().nextSibling(j);
+            }
+            if (skin.joints.len() == 0) {
+                gf.fail("skin ${i} has no joints");
+                return false;
+            }
+            skin.skeleton = gf.int(js, "skeleton", -1);
+            if (gf.json().has(js, "inverseBindMatrices")) {
+                let acc : GltfAccessor = gf.readAccessor(gf.int(js, "inverseBindMatrices", -1));
+                if (!gf.ok()) {
+                    return false;
+                }
+                if (acc.comps() != GLTF_MAT4_COMPONENTS || acc.count() < skin.joints.len()) {
+                    gf.fail("skin ${i} has too few inverse bind matrices");
+                    return false;
+                }
+                for (e of 0..skin.joints.len()) {
+                    for (c of 0..GLTF_MAT4_COMPONENTS) {
+                        skin.inverseBind.push(acc.real(e, c));
+                    }
+                }
+            } else {
+                for (e of 0..skin.joints.len()) {
+                    let ident : Mat4 = Mat4::identity();
+                    skin.inverseBind.push(ident.m00);
+                    skin.inverseBind.push(ident.m10);
+                    skin.inverseBind.push(ident.m20);
+                    skin.inverseBind.push(ident.m30);
+                    skin.inverseBind.push(ident.m01);
+                    skin.inverseBind.push(ident.m11);
+                    skin.inverseBind.push(ident.m21);
+                    skin.inverseBind.push(ident.m31);
+                    skin.inverseBind.push(ident.m02);
+                    skin.inverseBind.push(ident.m12);
+                    skin.inverseBind.push(ident.m22);
+                    skin.inverseBind.push(ident.m32);
+                    skin.inverseBind.push(ident.m03);
+                    skin.inverseBind.push(ident.m13);
+                    skin.inverseBind.push(ident.m23);
+                    skin.inverseBind.push(ident.m33);
+                }
+            }
+            model.addSkin(skin);
+        }
+        for (i of 0..model.nodeCount()) {
+            if (model.node(i).skin >= model.skinCount() || model.node(i).skin < -1) {
+                gf.fail("node ${i} names a skin that does not exist");
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /** Creates the animation clips of the file. */
+    pub(crate) static fn animations(gf : GltfFile, model : ModelAsset) : bool {
+        let n : i32 = gf.count("animations");
+        for (i of 0..n) {
+            let ja : JsonValue = gf.item("animations", i);
+            let clip : ModelClip = new ModelClip(gf.text(ja, "name", ""));
+            let samplers : JsonValue = gf.json().field(ja, "samplers");
+            let mut ch : JsonValue = gf.json().firstChild(gf.json().field(ja, "channels"));
+            while (!ch.isNone()) {
+                let target : JsonValue = gf.json().field(ch, "target");
+                let pathText : string = gf.text(target, "path", "");
+                let node : i32 = gf.int(target, "node", -1);
+                let sIndex : i32 = gf.int(ch, "sampler", -1);
+                if (pathText == "weights") {
+                    model.warn("animation ${i}: a morph target weight channel was skipped");
+                    ch = gf.json().nextSibling(ch);
+                    continue;
+                }
+                if (node < 0) {
+                    ch = gf.json().nextSibling(ch);
+                    continue;
+                }
+                if (node >= model.nodeCount()) {
+                    gf.fail("animation ${i} animates a node that does not exist");
+                    return false;
+                }
+                let mut path : ModelPath = ModelPath::Translation;
+                if (pathText == "rotation") {
+                    path = ModelPath::Rotation;
+                } else if (pathText == "scale") {
+                    path = ModelPath::Scale;
+                } else if (pathText != "translation") {
+                    gf.fail("animation ${i} animates the unknown property ${pathText}");
+                    return false;
+                }
+                if (sIndex < 0 || sIndex >= gf.json().len(samplers)) {
+                    gf.fail("animation ${i} uses a sampler that does not exist");
+                    return false;
+                }
+                let sampler : JsonValue = gf.json().at(samplers, sIndex);
+                let interpText : string = gf.text(sampler, "interpolation", "LINEAR");
+                let mut interp : ModelInterp = ModelInterp::Linear;
+                if (interpText == "STEP") {
+                    interp = ModelInterp::Step;
+                } else if (interpText == "CUBICSPLINE") {
+                    interp = ModelInterp::CubicSpline;
+                } else if (interpText != "LINEAR") {
+                    gf.fail("animation ${i} has the unknown interpolation ${interpText}");
+                    return false;
+                }
+                let times : GltfAccessor = gf.readAccessor(gf.int(sampler, "input", -1));
+                if (!gf.ok()) {
+                    return false;
+                }
+                let values : GltfAccessor = gf.readAccessor(gf.int(sampler, "output", -1));
+                if (!gf.ok()) {
+                    return false;
+                }
+                let width : i32 = path.width();
+                let mut valuesPerKey : i32 = 1;
+                if (interp == ModelInterp::CubicSpline) {
+                    valuesPerKey = 3;
+                }
+                if (times.comps() != 1 || values.comps() != width
+                    || values.count() != times.count() * valuesPerKey) {
+                    gf.fail("animation ${i} has a sampler whose input and output sizes do not agree");
+                    return false;
+                }
+                let channel : ModelChannel = new ModelChannel(node, path, interp);
+                for (k of 0..times.count()) {
+                    channel.times.push(times.real(k, 0));
+                }
+                for (k of 0..values.count()) {
+                    for (c of 0..width) {
+                        channel.values.push(values.real(k, c));
+                    }
+                }
+                if (!channel.isConsistent()) {
+                    gf.fail("animation ${i} has key times that go backwards");
+                    return false;
+                }
+                clip.addChannel(channel);
+                ch = gf.json().nextSibling(ch);
+            }
+            model.addClip(clip);
+        }
+        return true;
+    }
+}

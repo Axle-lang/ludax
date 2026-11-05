@@ -1,0 +1,463 @@
+// wav — the RIFF/WAVE codec: bytes to an `AudioClip` and back.
+//
+// Decoding accepts PCM at 8 (unsigned), 16, 24 and 32 bits (signed) and IEEE float at 32 bits, any channel count
+// up to 64, with a plain or a WAVE_FORMAT_EXTENSIBLE `fmt ` chunk. Chunks are walked by their declared sizes with
+// the RIFF pad byte after an odd one; chunks it does not know (LIST, fact, cue, ...) are skipped. Input is
+// untrusted, so every size is checked against what the buffer really holds and a bad file comes back as an error
+// message in the result, never as an abort or an out-of-range read. Encoding writes 16-bit PCM or 32-bit float;
+// more than two channels are written with an EXTENSIBLE header, which is what players expect there.
+
+use crate::data::audio::clip::AudioClip;
+
+/** Most channels a file may declare. */
+pub const WAV_MAX_CHANNELS : i32 = 64;
+
+/** Highest sample rate a file may declare. */
+pub const WAV_MAX_RATE : i32 = 1000000;
+
+// The format tags of the `fmt ` chunk.
+const WAV_FORMAT_PCM : i32 = 1;
+const WAV_FORMAT_FLOAT : i32 = 3;
+const WAV_FORMAT_EXTENSIBLE : i32 = 65534;
+
+// The size of a plain PCM and a plain float `fmt ` body, and of the EXTENSIBLE one that carries a GUID.
+const WAV_FMT_PCM : i32 = 16;
+const WAV_FMT_FLOAT : i32 = 18;
+const WAV_FMT_EXTENSIBLE : i32 = 40;
+
+// A chunk is an 8-byte header (size and tag) around its body, and a file starts with 12 bytes of RIFF header.
+const WAV_CHUNK_HEAD : i32 = 8;
+const WAV_RIFF_HEAD : i32 = 12;
+
+/** The outcome of decoding: the clip, or an error message when the bytes were not an acceptable WAVE file. */
+pub class WavResult {
+    ok      : bool = false;
+    message : string = "";
+    audio   : AudioClip;
+
+    constructor(good : bool, message : string, own audio : AudioClip) {
+        self.ok = good;
+        self.message = message;
+        self.audio = audio;
+    }
+
+    /** True when the file decoded. */
+    pub fn isOk(self) : bool {
+        return self.ok;
+    }
+
+    /** Why decoding failed; empty on success. */
+    pub fn error(self) : string {
+        return self.message;
+    }
+
+    /** The decoded clip (an empty clip when decoding failed). */
+    pub fn clip(self) : AudioClip {
+        return self.audio;
+    }
+}
+
+/** An encoded file: `size` valid bytes at the start of `bytes`. */
+pub class WavFile {
+    /** The file contents; read only the first `size` bytes. */
+    pub bytes : i8[];
+
+    /** How many bytes of `bytes` are the file. */
+    pub size : i32 = 0;
+
+    constructor(bytes : i8[], size : i32) {
+        self.bytes = bytes;
+        self.size = size;
+    }
+}
+
+/** Decodes and encodes WAVE files. */
+pub class WavCodec {
+    /** Decodes the first `length` bytes of `data`. Failure is reported in the result. */
+    pub static fn decode(data : i8[], length : i32) : WavResult {
+        let mut none : AudioClip = new AudioClip(1, 1, 0);
+        if (length < WAV_RIFF_HEAD) {
+            return new WavResult(false, "wav: shorter than a RIFF header", none);
+        }
+        if (!WavCodec::isTag(data, 0, "RIFF") || !WavCodec::isTag(data, 8, "WAVE")) {
+            return new WavResult(false, "wav: not a RIFF/WAVE file", none);
+        }
+
+        let riff : i64 = WavCodec::u32At(data, 4);
+        if (riff + 8 > length as i64) {
+            return new WavResult(false, "wav: truncated, the RIFF size is larger than the file", none);
+        }
+        let end : i64 = riff + 8;
+        if (end < WAV_RIFF_HEAD as i64) {
+            return new WavResult(false, "wav: RIFF size too small", none);
+        }
+
+        let mut pos : i64 = WAV_RIFF_HEAD as i64;
+        let mut haveFmt : bool = false;
+        let mut code : i32 = 0;
+        let mut channels : i32 = 0;
+        let mut rate : i32 = 0;
+        let mut bits : i32 = 0;
+        let mut align : i32 = 0;
+
+        // Walk the chunks by their declared sizes, skipping the pad byte after an odd one.
+        while (pos + WAV_CHUNK_HEAD as i64 <= end) {
+            let size : i64 = WavCodec::u32At(data, (pos + 4) as i32);
+            let body : i64 = pos + WAV_CHUNK_HEAD as i64;
+            if (body + size > end) {
+                return new WavResult(
+                    false,
+                    "wav: truncated, the chunk at offset ${pos} is larger than the file",
+                    none
+                );
+            }
+
+            if (WavCodec::isTag(data, pos as i32, "fmt ")) {
+                if (size < WAV_FMT_PCM as i64) {
+                    return new WavResult(false, "wav: fmt chunk too small", none);
+                }
+                let b : i32 = body as i32;
+                code = WavCodec::u16At(data, b);
+                channels = WavCodec::u16At(data, b + 2);
+                rate = WavCodec::u32At(data, b + 4) as i32;
+                align = WavCodec::u16At(data, b + 12);
+                bits = WavCodec::u16At(data, b + 14);
+
+                // An EXTENSIBLE chunk carries the real format tag after the base fields.
+                if (code == WAV_FORMAT_EXTENSIBLE) {
+                    if (size < WAV_FMT_EXTENSIBLE as i64) {
+                        return new WavResult(false, "wav: extensible fmt chunk too small", none);
+                    }
+                    code = WavCodec::u16At(data, b + 24);
+                }
+                haveFmt = true;
+
+                let bad : string = WavCodec::checkFormat(code, channels, rate, bits, align);
+                if (bad != "") {
+                    return new WavResult(false, bad, none);
+                }
+            } else if (WavCodec::isTag(data, pos as i32, "data")) {
+                if (!haveFmt) {
+                    return new WavResult(false, "wav: data chunk before fmt chunk", none);
+                }
+                let frames : i32 = (size / align as i64) as i32;
+                let mut clip : AudioClip = new AudioClip(rate, channels, frames);
+                WavCodec::readSamples(data, body as i32, code, bits, clip);
+                return new WavResult(true, "", clip);
+            }
+            pos = body + size + (size & 1);
+        }
+
+        if (!haveFmt) {
+            return new WavResult(false, "wav: no fmt chunk", none);
+        }
+        return new WavResult(false, "wav: no data chunk", none);
+    }
+
+    /** 16-bit PCM, little endian: exactly what `decode` reads back for samples that are multiples of 1/32768. */
+    pub static fn encode16(clip : AudioClip) : WavFile {
+        return WavCodec::encodeWith(clip, 16);
+    }
+
+    /** 32-bit IEEE float: lossless for `f32` samples. */
+    pub static fn encodeFloat(clip : AudioClip) : WavFile {
+        return WavCodec::encodeWith(clip, 32);
+    }
+
+    // Format sanity: only what readSamples understands, and a block alignment that agrees with the layout.
+    static fn checkFormat(code : i32, channels : i32, rate : i32, bits : i32, align : i32) : string {
+        if (channels < 1 || channels > WAV_MAX_CHANNELS) {
+            return "wav: unsupported channel count ${channels}";
+        }
+        if (rate < 1 || rate > WAV_MAX_RATE) {
+            return "wav: unsupported sample rate ${rate}";
+        }
+        if (code == WAV_FORMAT_PCM) {
+            if (bits != 8 && bits != 16 && bits != 24 && bits != 32) {
+                return "wav: unsupported PCM bit depth ${bits}";
+            }
+        } else if (code == WAV_FORMAT_FLOAT) {
+            if (bits != 32) {
+                return "wav: unsupported float bit depth ${bits}";
+            }
+        } else {
+            return "wav: unsupported format code ${code}";
+        }
+        if (align != channels * (bits / 8)) {
+            return "wav: block alignment disagrees with channels and bit depth";
+        }
+        return "";
+    }
+
+    static fn readSamples(data : i8[], at : i32, code : i32, bits : i32, clip : AudioClip) : void {
+        let total : i32 = clip.frames * clip.channels;
+        let width : i32 = bits / 8;
+        for (i of 0..total) {
+            let p : i32 = at + i * width;
+            let mut v : f32 = 0.0;
+            if (code == WAV_FORMAT_FLOAT) {
+                v = WavCodec::floatFromBits(WavCodec::u32At(data, p) as i32);
+            } else if (bits == 8) {
+                // 8-bit PCM is unsigned, centred on 128.
+                v = ((WavCodec::byteAt(data, p) - 128) as f32) / (128.0 as f32);
+            } else if (bits == 16) {
+                let raw : i32 = WavCodec::u16At(data, p);
+                v = ((raw - ((raw & 32768) << 1)) as f32) / (32768.0 as f32);
+            } else if (bits == 24) {
+                let raw : i32 = WavCodec::byteAt(data, p) | (WavCodec::byteAt(data, p + 1) << 8)
+                    | (WavCodec::byteAt(data, p + 2) << 16);
+                v = ((raw - ((raw & 8388608) << 1)) as f32) / (8388608.0 as f32);
+            } else {
+                v = ((WavCodec::u32At(data, p) as i32) as f64 / 2147483648.0) as f32;
+            }
+            clip.samples[i as i64] = v;
+        }
+    }
+
+    static fn encodeWith(clip : AudioClip, bits : i32) : WavFile {
+        let extensible : bool = clip.channels > 2;
+        let isFloat : bool = bits == 32;
+        let fmtSize : i32 = WavCodec::fmtSize(isFloat, extensible);
+        let factSize : i32 = WavCodec::factSize(isFloat);
+
+        let width : i32 = bits / 8;
+        let dataBytes : i32 = clip.frames * clip.channels * width;
+        let header : i32 = WAV_RIFF_HEAD + WAV_CHUNK_HEAD + fmtSize + factSize + WAV_CHUNK_HEAD;
+        let total : i32 = header + dataBytes + (dataBytes & 1);
+        let mut out : i8[] = malloc<i8>((total + 1) as i64);
+        for (i of 0..total + 1) {
+            out[i as i64] = 0 as i8;
+        }
+
+        WavCodec::putTag(out, 0, "RIFF");
+        WavCodec::putU32(out, 4, total - 8);
+        WavCodec::putTag(out, 8, "WAVE");
+
+        // The fmt chunk: the base WAVEFORMATEX fields, then the EXTENSIBLE extension when it is needed.
+        let fmtAt : i32 = WAV_RIFF_HEAD + WAV_CHUNK_HEAD;
+        WavCodec::putTag(out, WAV_RIFF_HEAD, "fmt ");
+        WavCodec::putU32(out, WAV_RIFF_HEAD + 4, fmtSize);
+
+        let mut code : i32 = WAV_FORMAT_PCM;
+        if (isFloat) {
+            code = WAV_FORMAT_FLOAT;
+        }
+        let mut tagCode : i32 = code;
+        if (extensible) {
+            tagCode = WAV_FORMAT_EXTENSIBLE;
+        }
+
+        WavCodec::putU16(out, fmtAt, tagCode);
+        WavCodec::putU16(out, fmtAt + 2, clip.channels);
+        WavCodec::putU32(out, fmtAt + 4, clip.rate);
+        WavCodec::putU32(out, fmtAt + 8, clip.rate * clip.channels * width);
+        WavCodec::putU16(out, fmtAt + 12, clip.channels * width);
+        WavCodec::putU16(out, fmtAt + 14, bits);
+
+        let mut at : i32 = fmtAt + fmtSize;
+        if (extensible) {
+            WavCodec::putU16(out, fmtAt + 16, 22);
+            WavCodec::putU16(out, fmtAt + 18, bits);
+            WavCodec::putU32(out, fmtAt + 20, 0);
+            WavCodec::putU16(out, fmtAt + 24, code);
+            // The rest of KSDATAFORMAT_SUBTYPE_xxx: 00000000-0010-8000-00AA00389B71.
+            let tail : i32 = fmtAt + 26;
+            WavCodec::putU16(out, tail, 0);
+            WavCodec::putU16(out, tail + 2, 16);
+            WavCodec::putU16(out, tail + 4, 128);
+            out[(tail + 6) as i64] = 0 as i8;
+            out[(tail + 7) as i64] = 170 as i8;
+            out[(tail + 8) as i64] = 0 as i8;
+            out[(tail + 9) as i64] = 56 as i8;
+            out[(tail + 10) as i64] = 155 as i8;
+            out[(tail + 11) as i64] = 113 as i8;
+        } else if (isFloat) {
+            WavCodec::putU16(out, fmtAt + 16, 0);
+        }
+
+        // A float file carries a fact chunk with the frame count.
+        if (isFloat) {
+            WavCodec::putTag(out, at, "fact");
+            WavCodec::putU32(out, at + 4, 4);
+            WavCodec::putU32(out, at + 8, clip.frames);
+            at = at + WavCodec::factChunkSize();
+        }
+
+        WavCodec::putTag(out, at, "data");
+        WavCodec::putU32(out, at + 4, dataBytes);
+        at = at + WAV_CHUNK_HEAD;
+        WavCodec::writeSamples(out, clip, at, isFloat);
+
+        return new WavFile(out, total);
+    }
+
+    // The size of the `fmt ` body the chosen encoding needs.
+    static fn fmtSize(isFloat : bool, extensible : bool) : i32 {
+        if (extensible) {
+            return WAV_FMT_EXTENSIBLE;
+        }
+        if (isFloat) {
+            return WAV_FMT_FLOAT;
+        }
+        return WAV_FMT_PCM;
+    }
+
+    // The size of the `fact` chunk a float file carries, or 0 when it carries none.
+    static fn factSize(isFloat : bool) : i32 {
+        if (isFloat) {
+            return WavCodec::factChunkSize();
+        }
+        return 0;
+    }
+
+    // A `fact` chunk is its 8-byte header around a 4-byte frame count.
+    static fn factChunkSize() : i32 {
+        return WAV_CHUNK_HEAD + 4;
+    }
+
+    // Writes every sample at `at`, 16-bit PCM or 32-bit float as asked.
+    static fn writeSamples(out : i8[], clip : AudioClip, at : i32, isFloat : bool) : void {
+        let count : i32 = clip.frames * clip.channels;
+        for (i of 0..count) {
+            let v : f32 = clip.samples[i as i64];
+            if (isFloat) {
+                WavCodec::putU32(out, at + i * 4, WavCodec::floatBits(v));
+            } else {
+                let mut q : i32 = WavCodec::roundHalfAway(v * 32768.0);
+                if (q > 32767) {
+                    q = 32767;
+                }
+                if (q < -32768) {
+                    q = -32768;
+                }
+                WavCodec::putU16(out, at + i * 2, q & 65535);
+            }
+        }
+    }
+
+    // The nearest whole number, halves away from zero.
+    static fn roundHalfAway(x : f32) : i32 {
+        let wide : f64 = x as f64;
+        if (wide >= 0.0) {
+            return (wide + 0.5) as i32;
+        }
+        return 0 - ((0.0 - wide + 0.5) as i32);
+    }
+
+    // 2^k exactly, for k in -149..127, by repeated squaring.
+    static fn pow2(k : i32) : f64 {
+        let mut n : i32 = k;
+        if (k < 0) {
+            n = 0 - k;
+        }
+        let mut base : f64 = 2.0;
+        if (k < 0) {
+            base = 0.5;
+        }
+        let mut r : f64 = 1.0;
+        while (n > 0) {
+            if ((n & 1) == 1) {
+                r = r * base;
+            }
+            base = base * base;
+            n = n >> 1;
+        }
+        return r;
+    }
+
+    // The IEEE-754 binary32 value of a bit pattern; infinities and NaNs read as 0 (a sample cannot be them).
+    static fn floatFromBits(bits : i32) : f32 {
+        let e : i32 = (bits >>> 23) & 255;
+        let m : i32 = bits & 8388607;
+        if (e == 255) {
+            return 0.0;
+        }
+        let mut v : f64 = 0.0;
+        if (e == 0) {
+            v = m as f64 * WavCodec::pow2(-149);
+        } else {
+            v = (1.0 + m as f64 / 8388608.0) * WavCodec::pow2(e - 127);
+        }
+        if (bits < 0) {
+            v = 0.0 - v;
+        }
+        return v as f32;
+    }
+
+    // The IEEE-754 binary32 bit pattern of `x`; non-finite values are written as 0.
+    static fn floatBits(x : f32) : i32 {
+        let wide : f64 = x as f64;
+        if (!(wide == wide) || wide == 0.0 || wide > 340282346638528859811704183484516925440.0
+            || wide < -340282346638528859811704183484516925440.0) {
+            return 0;
+        }
+        let neg : bool = wide < 0.0;
+        let mut a : f64 = wide;
+        if (neg) {
+            a = 0.0 - wide;
+        }
+
+        // Normalise to 1 <= a < 2, tracking the exponent; a subnormal stays below 1 and is scaled directly.
+        let whole : f64 = a;
+        let mut e : i32 = 0;
+        while (a >= 2.0) {
+            a = a * 0.5;
+            e = e + 1;
+        }
+        while (a < 1.0) {
+            a = a * 2.0;
+            e = e - 1;
+        }
+        let mut field : i32 = 0;
+        if (e < -126) {
+            field = (whole * WavCodec::pow2(149)) as i32;
+        } else {
+            field = ((e + 127) << 23) | (((a - 1.0) * 8388608.0) as i32);
+        }
+        if (neg) {
+            field = field | (1 << 31);
+        }
+        return field;
+    }
+
+    static fn byteAt(data : i8[], at : i32) : i32 {
+        return (data[at as i64] as i32) & 255;
+    }
+
+    static fn u16At(data : i8[], at : i32) : i32 {
+        return WavCodec::byteAt(data, at) | (WavCodec::byteAt(data, at + 1) << 8);
+    }
+
+    // An unsigned 32-bit little-endian value, as an i64 so sizes above 2^31 stay positive.
+    static fn u32At(data : i8[], at : i32) : i64 {
+        let lo : i64 = WavCodec::u16At(data, at) as i64;
+        let hi : i64 = WavCodec::u16At(data, at + 2) as i64;
+        return lo | (hi << 16);
+    }
+
+    // Whether the four bytes at `at` spell `name`.
+    static fn isTag(data : i8[], at : i32, name : string) : bool {
+        for (i of 0..4) {
+            if (WavCodec::byteAt(data, at + i) != (name.charAt(i) as i32)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    static fn putTag(out : i8[], at : i32, s : string) : void {
+        for (i of 0..4) {
+            out[(at + i) as i64] = s.charAt(i) as i8;
+        }
+    }
+
+    static fn putU16(out : i8[], at : i32, v : i32) : void {
+        out[at as i64] = (v & 255) as i8;
+        out[(at + 1) as i64] = ((v >> 8) & 255) as i8;
+    }
+
+    static fn putU32(out : i8[], at : i32, v : i32) : void {
+        WavCodec::putU16(out, at, v & 65535);
+        WavCodec::putU16(out, at + 2, (v >>> 16) & 65535);
+    }
+}

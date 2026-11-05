@@ -1,0 +1,527 @@
+// gltf_file — the container of a glTF 2.0 model: its JSON, its binary buffers, and typed reads of accessors.
+//
+// A `.gltf` is JSON whose buffers are base64 `data:` URIs or separate files; a `.glb` wraps the same JSON and
+// one binary chunk in a small header. This class opens either, loads every buffer (external ones through the
+// `Vfs`, so a model can sit in an archive), and answers `readAccessor`: the numbers an accessor describes,
+// decoded from their component type (signed and unsigned 8, 16 and 32-bit integers, f32), optionally
+// normalised, honouring the buffer view's byte stride.
+//
+// Everything a file claims is checked against what is there before it is trusted: buffer lengths against the
+// bytes read, buffer views against buffers, accessors against views, counts against a ceiling. A violation is
+// an error with a reason (`error()`), never an out-of-range read. Sparse accessors and accessors without a
+// buffer view are refused with a message, not silently misread.
+
+use crate::data::bytes::ByteBuf;
+use crate::data::json::json_doc::{JsonDoc, JsonValue};
+use crate::data::json::json_parse::JsonParser;
+use crate::data::model::base64::Base64;
+use crate::data::model::ieee::Ieee;
+use crate::data::model::model_asset::ModelAsset;
+use crate::data::slots::DataSlots;
+use crate::data::text::DataText;
+use crate::data::vfs::vfs::Vfs;
+use crate::data::vfs::vfs_path::VfsPath;
+
+// The most elements one accessor may claim, a guard against a file that asks for a gigabyte of floats.
+const GLTF_MAX_ELEMENTS : i32 = 33554432;
+
+// The component types of glTF accessors (OpenGL's enum values).
+const GLTF_BYTE : i32 = 5120;
+const GLTF_UNSIGNED_BYTE : i32 = 5121;
+const GLTF_SHORT : i32 = 5122;
+const GLTF_UNSIGNED_SHORT : i32 = 5123;
+const GLTF_UNSIGNED_INT : i32 = 5125;
+const GLTF_FLOAT : i32 = 5126;
+// VEC4 is the widest plain vector; anything above it is a matrix.
+const GLTF_MAX_VECTOR_COMPS : i32 = 4;
+
+// The GLB header is magic, version and total length; then one header per chunk. Chunk kinds are
+// four-character codes read little-endian: "JSON" and "BIN\0".
+const GLTF_GLB_VERSION : i32 = 2;
+const GLTF_GLB_HEADER : i32 = 12;
+const GLTF_GLB_CHUNK_HEADER : i32 = 8;
+const GLTF_GLB_MIN_LENGTH : i32 = 20;
+const GLTF_GLB_ALIGN : i32 = 4;
+const GLTF_CHUNK_JSON : i32 = 0x4E4F534A;
+const GLTF_CHUNK_BIN : i32 = 0x004E4942;
+
+/** The numbers read from one accessor: `count` elements of `comps` components each. */
+pub(crate) class GltfAccessor {
+    nElems : i32;
+    nComps : i32;
+    reals  : f32[];
+    wholes : i32[];
+
+    /** An accessor result holding `count` elements of `comps` components. */
+    constructor(count : i32, comps : i32) {
+        self.nElems = count;
+        self.nComps = comps;
+        let total : i64 = (count as i64) * (comps as i64) + 1;
+        self.reals = malloc<f32>(total);
+        self.wholes = malloc<i32>(total);
+    }
+
+    /** How many elements. */
+    pub(crate) fn count(self) : i32 {
+        return self.nElems;
+    }
+
+    /** How many components per element. */
+    pub(crate) fn comps(self) : i32 {
+        return self.nComps;
+    }
+
+    /** Component `c` of element `e` as a float (normalised if the accessor said so). */
+    pub(crate) fn real(self, e : i32, c : i32) : f32 {
+        return self.reals[(e as i64) * (self.nComps as i64) + (c as i64)];
+    }
+
+    /** Component `c` of element `e` as the integer stored (an unsigned 32-bit value above 2^31 reads negative). */
+    pub(crate) fn whole(self, e : i32, c : i32) : i32 {
+        return self.wholes[(e as i64) * (self.nComps as i64) + (c as i64)];
+    }
+
+    /** Stores component `c` of element `e` as both its float and its integer form. */
+    pub(crate) fn put(mut self, e : i32, c : i32, r : f32, w : i32) : void {
+        let at : i64 = (e as i64) * (self.nComps as i64) + (c as i64);
+        self.reals[at] = r;
+        self.wholes[at] = w;
+    }
+}
+
+/** An opened glTF or GLB file. */
+pub(crate) class GltfFile {
+    doc    : JsonDoc;
+    top    : JsonValue;
+    bufs   : DataSlots<ByteBuf>;
+    sizes  : ByteBuf;
+    bin    : ByteBuf;
+    hasBin : bool = false;
+    err    : string;
+
+    constructor(own doc : JsonDoc) {
+        self.top = doc.root();
+        self.doc = doc;
+        self.bufs = new DataSlots<ByteBuf>();
+        self.sizes = new ByteBuf(16);
+        self.bin = new ByteBuf(16);
+        self.err = "";
+    }
+
+    /** True while nothing has gone wrong. */
+    pub(crate) fn ok(self) : bool {
+        return self.err.byteLength == 0;
+    }
+
+    /** What went wrong first. */
+    pub(crate) fn error(self) : string {
+        return self.err;
+    }
+
+    /** Records a failure (the first one is kept). */
+    pub(crate) fn fail(mut self, why : string) : void {
+        if (self.err.byteLength == 0) {
+            self.err = why;
+        }
+    }
+
+    /** The parsed JSON document. */
+    pub(crate) fn json(self) : JsonDoc {
+        return self.doc;
+    }
+
+    /** The root object of the JSON. */
+    pub(crate) fn root(self) : JsonValue {
+        return self.top;
+    }
+
+    /** Opens the bytes of a `.gltf` (JSON text) or `.glb` (binary container). */
+    pub(crate) static fn open(bytes : ByteBuf) : GltfFile {
+        let mut jsonFrom : i32 = 0;
+        let mut jsonTo : i32 = bytes.len();
+        let mut binFrom : i32 = -1;
+        let mut binTo : i32 = -1;
+        let mut why : string = "";
+        if (bytes.tagAt(0, "glTF")) {
+            if (bytes.len() < GLTF_GLB_MIN_LENGTH) {
+                why = "the GLB header is cut short";
+            } else if (bytes.le32(4) != GLTF_GLB_VERSION) {
+                why = "only GLB version 2 is supported";
+            } else {
+                let total : i32 = bytes.le32(8);
+                if (total < GLTF_GLB_MIN_LENGTH || total > bytes.len()) {
+                    why = "the GLB length does not match the file";
+                } else {
+                    let mut at : i32 = GLTF_GLB_HEADER;
+                    let mut sawJson : bool = false;
+                    while (at + GLTF_GLB_CHUNK_HEADER <= total && why.byteLength == 0) {
+                        let size : i32 = bytes.le32(at);
+                        let kind : i32 = bytes.le32(at + 4);
+                        let body : i32 = at + GLTF_GLB_CHUNK_HEADER;
+                        if (size < 0 || size > total - body) {
+                            why = "a GLB chunk runs past the end of the file";
+                        } else if (kind == GLTF_CHUNK_JSON && !sawJson) {
+                            sawJson = true;
+                            jsonFrom = body;
+                            jsonTo = body + size;
+                        } else if (kind == GLTF_CHUNK_BIN && binFrom < 0) {
+                            binFrom = body;
+                            binTo = body + size;
+                        }
+                        at = body + ((size + GLTF_GLB_ALIGN - 1) / GLTF_GLB_ALIGN) * GLTF_GLB_ALIGN;
+                    }
+                    if (why.byteLength == 0 && !sawJson) {
+                        why = "the GLB has no JSON chunk";
+                    }
+                }
+            }
+        }
+        let slice : ByteBuf = new ByteBuf(jsonTo - jsonFrom + 16);
+        if (why.byteLength == 0) {
+            slice.pushRange(bytes, jsonFrom, jsonTo);
+        }
+        let doc : JsonDoc = JsonParser::parseBytes(slice);
+        let parsed : bool = doc.ok();
+        let parseError : string = doc.error();
+        let mut file : GltfFile = new GltfFile(doc);
+        if (why.byteLength > 0) {
+            file.fail(why);
+        } else if (!parsed) {
+            file.fail("JSON: ${parseError}");
+        } else if (!file.doc.isObject(file.top)) {
+            file.fail("the glTF root is not an object");
+        }
+        if (binFrom >= 0 && file.ok()) {
+            file.bin.pushRange(bytes, binFrom, binTo);
+            file.hasBin = true;
+        }
+        return file;
+    }
+
+    // ---- JSON helpers ----
+
+    /** How many elements the root array `key` has (0 if absent). */
+    pub(crate) fn count(self, key : string) : i32 {
+        return self.doc.len(self.doc.field(self.top, key));
+    }
+
+    /** Element `i` of the root array `key`, or none. */
+    pub(crate) fn item(mut self, key : string, i : i32) : JsonValue {
+        return self.doc.at(self.doc.field(self.top, key), i);
+    }
+
+    /** A whole number field of `v`, or `fallback`. */
+    pub(crate) fn int(self, v : JsonValue, key : string, fallback : i32) : i32 {
+        return self.doc.intOr(self.doc.field(v, key), fallback);
+    }
+
+    /** A number field of `v`, or `fallback`. */
+    pub(crate) fn num(self, v : JsonValue, key : string, fallback : f64) : f64 {
+        return self.doc.numberOr(self.doc.field(v, key), fallback);
+    }
+
+    /** A string field of `v` (borrowed), or `fallback`. */
+    pub(crate) fn text(self, v : JsonValue, key : string, fallback : string) : string {
+        return self.doc.stringOr(self.doc.field(v, key), fallback);
+    }
+
+    // ---- buffers ----
+
+    // Turns %XX escapes of a URI into bytes.
+    static fn unescape(uri : string) : string {
+        let out : ByteBuf = new ByteBuf(uri.byteLength as i32 + 4);
+        let n : i32 = uri.byteLength as i32;
+        let mut i : i32 = 0;
+        while (i < n) {
+            let c : i32 = uri.byteAt(i) as i32;
+            if (c == 37 && i + 2 < n && GltfFile::hex(uri.byteAt(i + 1) as i32) >= 0
+                && GltfFile::hex(uri.byteAt(i + 2) as i32) >= 0) {
+                out.push(GltfFile::hex(uri.byteAt(i + 1) as i32) * 16
+                    + GltfFile::hex(uri.byteAt(i + 2) as i32));
+                i = i + 3;
+            } else {
+                out.push(c);
+                i = i + 1;
+            }
+        }
+        return DataText::fromBytes(out, 0, out.len());
+    }
+
+    static fn hex(c : i32) : i32 {
+        if (c >= 48 && c <= 57) {
+            return c - 48;
+        }
+        if (c >= 97 && c <= 102) {
+            return c - 87;
+        }
+        if (c >= 65 && c <= 70) {
+            return c - 55;
+        }
+        return -1;
+    }
+
+    /**
+     * Loads every buffer: `data:` URIs are decoded, other URIs are read from `vfs` relative to `baseDir`, and
+     * a buffer without a URI is the GLB binary chunk. `external` receives each file read, for the caller to
+     * record as a dependency. False (see `error`) on any failure.
+     */
+    pub(crate) fn loadBuffers(mut self, vfs : Vfs, baseDir : string, external : ModelAsset) : bool {
+        let n : i32 = self.count("buffers");
+        for (i of 0..n) {
+            let b : JsonValue = self.item("buffers", i);
+            let declared : i32 = self.int(b, "byteLength", -1);
+            if (declared < 0) {
+                self.fail("buffer ${i} has no valid byteLength");
+                return false;
+            }
+
+            let uri : string = self.text(b, "uri", "");
+            let data : ByteBuf = new ByteBuf(declared + 16);
+            let payload : i32 = Base64::dataUriStart(uri);
+            if (uri.byteLength == 0) {
+                if (i != 0 || !self.hasBin) {
+                    self.fail("buffer ${i} has no uri and there is no GLB binary chunk for it");
+                    return false;
+                }
+                data.pushRange(self.bin, 0, self.bin.len());
+            } else if (payload >= 0) {
+                if (!Base64::decodeFrom(uri, payload, data)) {
+                    self.fail("buffer ${i} holds invalid base64");
+                    return false;
+                }
+            } else {
+                let name : string = GltfFile::unescape(uri);
+                let path : string = VfsPath::join(baseDir, name);
+                if (VfsPath::escapes(baseDir + "/" + name)) {
+                    self.fail("buffer ${i} names a file outside the root: ${uri}");
+                    return false;
+                }
+                try {
+                    let read : ByteBuf = vfs.read(path);
+                    data.pushRange(read, 0, read.len());
+                } catch e : IOException {
+                    self.fail("buffer ${i} cannot be read: ${e.message}");
+                    return false;
+                }
+                external.noteFile(path);
+            }
+            if (data.len() < declared) {
+                self.fail("buffer ${i} is shorter than its byteLength");
+                return false;
+            }
+            self.bufs.push(data);
+            self.sizes.pushLe32(declared);
+        }
+        return true;
+    }
+
+    /** The loaded bytes of buffer `i` and its declared length are checked by `readAccessor`; this is the count. */
+    pub(crate) fn bufferCount(self) : i32 {
+        return self.bufs.len();
+    }
+
+    /** The bytes of buffer view `v` as a new buffer (for images stored in a view); empty with an error recorded when it is not valid. */
+    pub(crate) fn viewBytes(mut self, v : i32) : ByteBuf {
+        let out : ByteBuf = new ByteBuf(16);
+        let view : JsonValue = self.item("bufferViews", v);
+        if (view.isNone()) {
+            self.fail("buffer view ${v} does not exist");
+            return out;
+        }
+        let b : i32 = self.int(view, "buffer", -1);
+        let off : i32 = self.int(view, "byteOffset", 0);
+        let len : i32 = self.int(view, "byteLength", -1);
+        if (b < 0 || b >= self.bufs.len() || off < 0 || len < 0 || off > self.sizes.le32(b * 4) - len) {
+            self.fail("buffer view ${v} lies outside its buffer");
+            return out;
+        }
+        out.pushRange(self.bufs.get(b), off, off + len);
+        return out;
+    }
+
+    // ---- accessors ----
+
+    // Bytes of one component of the glTF component type, or 0 for an unknown type.
+    static fn compSize(t : i32) : i32 {
+        if (t == GLTF_BYTE || t == GLTF_UNSIGNED_BYTE) {
+            return 1;
+        }
+        if (t == GLTF_SHORT || t == GLTF_UNSIGNED_SHORT) {
+            return 2;
+        }
+        if (t == GLTF_UNSIGNED_INT || t == GLTF_FLOAT) {
+            return 4;
+        }
+        return 0;
+    }
+
+    // Components of an accessor type name, or 0.
+    static fn compCount(t : string) : i32 {
+        if (t == "SCALAR") {
+            return 1;
+        }
+        if (t == "VEC2") {
+            return 2;
+        }
+        if (t == "VEC3") {
+            return 3;
+        }
+        if (t == "VEC4" || t == "MAT2") {
+            return 4;
+        }
+        if (t == "MAT3") {
+            return 9;
+        }
+        if (t == "MAT4") {
+            return 16;
+        }
+        return 0;
+    }
+
+    /** The values of accessor `index`; when the accessor is invalid the result is empty (count 0) and `error()` says why. */
+    pub(crate) fn readAccessor(mut self, index : i32) : GltfAccessor {
+        let empty : GltfAccessor = new GltfAccessor(0, 1);
+        let a : JsonValue = self.item("accessors", index);
+        if (a.isNone()) {
+            self.fail("accessor ${index} does not exist");
+            return empty;
+        }
+
+        let tag : string = "accessor ${index}";
+        let ctype : i32 = self.int(a, "componentType", 0);
+        let csize : i32 = GltfFile::compSize(ctype);
+        let comps : i32 = GltfFile::compCount(self.text(a, "type", ""));
+        let count : i32 = self.int(a, "count", -1);
+        let normalized : bool = self.doc.boolOr(self.doc.field(a, "normalized"), false);
+        if (csize == 0 || comps == 0 || count < 0) {
+            self.fail("${tag} has an invalid componentType, type or count");
+            return empty;
+        }
+        if (self.doc.has(a, "sparse")) {
+            self.fail("${tag} is sparse, which is not supported");
+            return empty;
+        }
+        if (!self.doc.has(a, "bufferView")) {
+            self.fail("${tag} has no bufferView, which is not supported");
+            return empty;
+        }
+        if (comps > GLTF_MAX_VECTOR_COMPS && ctype != GLTF_FLOAT) {
+            self.fail("${tag} is a matrix of integers, which is not supported");
+            return empty;
+        }
+        if (count > GLTF_MAX_ELEMENTS / comps) {
+            self.fail("${tag} claims too many elements");
+            return empty;
+        }
+
+        let v : i32 = self.int(a, "bufferView", -1);
+        let view : JsonValue = self.item("bufferViews", v);
+        if (view.isNone()) {
+            self.fail("${tag} names a buffer view that does not exist");
+            return empty;
+        }
+        let b : i32 = self.int(view, "buffer", -1);
+        if (b < 0 || b >= self.bufs.len()) {
+            self.fail("buffer view ${v} names a buffer that does not exist");
+            return empty;
+        }
+        let viewOff : i32 = self.int(view, "byteOffset", 0);
+        let viewLen : i32 = self.int(view, "byteLength", -1);
+        let mut stride : i32 = self.int(view, "byteStride", 0);
+        let accOff : i32 = self.int(a, "byteOffset", 0);
+        let elem : i32 = csize * comps;
+        if (stride == 0) {
+            stride = elem;
+        }
+        let bufLen : i32 = self.sizes.le32(b * 4);
+        if (viewOff < 0 || viewLen < 0 || accOff < 0 || stride < elem
+            || (viewOff as i64) + (viewLen as i64) > (bufLen as i64)) {
+            self.fail("${tag} has a buffer view that does not fit its buffer");
+            return empty;
+        }
+        if (count > 0) {
+            let need : i64 = (accOff as i64) + (stride as i64) * ((count - 1) as i64) + (elem as i64);
+            if (need > (viewLen as i64)) {
+                self.fail("${tag} reads past the end of its buffer view");
+                return empty;
+            }
+        }
+        let data : ByteBuf = self.bufs.get(b);
+        let out : GltfAccessor = new GltfAccessor(count, comps);
+        for (e of 0..count) {
+            let base : i32 = viewOff + accOff + e * stride;
+            for (c of 0..comps) {
+                let at : i32 = base + c * csize;
+                let mut whole : i32 = 0;
+                let mut real : f32 = 0.0;
+                if (ctype == GLTF_FLOAT) {
+                    let bits : i32 = data.le32(at);
+                    if (!Ieee::isFinite(bits)) {
+                        self.fail("${tag} holds a value that is not a finite number");
+                        return empty;
+                    }
+                    real = Ieee::toF32(bits);
+                    whole = real as i32;
+                } else {
+                    whole = GltfFile::intComponent(data, at, ctype);
+                    real = whole as f32;
+                    if (normalized) {
+                        real = GltfFile::normalize(ctype, real);
+                    }
+                }
+                out.put(e, c, real, whole);
+            }
+        }
+        return out;
+    }
+
+    // The integer stored in the component at `at`, sign-extended where the type is signed.
+    static fn intComponent(data : ByteBuf, at : i32, ctype : i32) : i32 {
+        if (ctype == GLTF_BYTE) {
+            let v : i32 = data.get(at);
+            if (v >= 128) {
+                return v - 256;
+            }
+            return v;
+        }
+        if (ctype == GLTF_UNSIGNED_BYTE) {
+            return data.get(at);
+        }
+        if (ctype == GLTF_SHORT) {
+            let v : i32 = data.get(at) | (data.get(at + 1) << 8);
+            if (v >= 32768) {
+                return v - 65536;
+            }
+            return v;
+        }
+        if (ctype == GLTF_UNSIGNED_SHORT) {
+            return data.get(at) | (data.get(at + 1) << 8);
+        }
+        return data.le32(at);
+    }
+
+    // An integer component mapped to the [-1, 1] the file asks for; unsigned types map to [0, 1].
+    static fn normalize(ctype : i32, real : f32) : f32 {
+        if (ctype == GLTF_BYTE) {
+            let v : f32 = real / (127.0 as f32);
+            if (v < (-1.0 as f32)) {
+                return -1.0;
+            }
+            return v;
+        }
+        if (ctype == GLTF_UNSIGNED_BYTE) {
+            return real / (255.0 as f32);
+        }
+        if (ctype == GLTF_SHORT) {
+            let v : f32 = real / (32767.0 as f32);
+            if (v < (-1.0 as f32)) {
+                return -1.0;
+            }
+            return v;
+        }
+        if (ctype == GLTF_UNSIGNED_SHORT) {
+            return real / (65535.0 as f32);
+        }
+        return real;
+    }
+}

@@ -1,0 +1,220 @@
+// vfs_path — logical paths of the virtual file system.
+//
+// A logical path names a file the same way on every machine: segments separated by `/` (a `\` is read as
+// one), no drive, no leading slash, no `.` or empty segment, and no `..` (it is resolved while the path is
+// normalised). A path that would climb above the root (`../x`, `a/../../x`) is refused rather than clamped:
+// silently turning it into `x` would let a damaged or hostile asset reference read a file it never named.
+// The root itself is the empty path. Case matters; nothing here touches the disk.
+
+use crate::core::collections::vec::Vec;
+use crate::data::bytes::ByteBuf;
+use crate::data::text::DataText;
+
+// The ASCII bytes that give a path its structure.
+const VFS_SLASH : i32 = 47;
+const VFS_BACKSLASH : i32 = 92;
+const VFS_DOT : i32 = 46;
+
+// The range of upper-case ASCII, and the bit that makes a letter lower case.
+const VFS_UPPER_A : i32 = 65;
+const VFS_UPPER_Z : i32 = 90;
+const VFS_LOWER_BIT : i32 = 32;
+
+/** Operations on logical paths. */
+pub class VfsPath {
+    // Writes the normalised bytes of `path` into `out`; false when the path climbs above the root.
+    static fn walk(path : string, out : ByteBuf) : bool {
+        let stack : Vec<i32> = new Vec<i32>();
+        let n : i32 = path.byteLength as i32;
+        let mut start : i32 = 0;
+
+        // The pass over `n + 1` ends the last segment as if a separator followed it.
+        for (i of 0..(n + 1)) {
+            let last : bool = i == n;
+            if (!last) {
+                let c : i32 = path.byteAt(i) as i32;
+                if (c != VFS_SLASH && c != VFS_BACKSLASH) {
+                    continue;
+                }
+            }
+
+            let len : i32 = i - start;
+            let dot : bool = len == 1 && (path.byteAt(start) as i32) == VFS_DOT;
+            let dotDot : bool = len == 2 && (path.byteAt(start) as i32) == VFS_DOT
+                && (path.byteAt(start + 1) as i32) == VFS_DOT;
+            if (dotDot) {
+                if (stack.isEmpty()) {
+                    return false;
+                }
+                out.truncate(stack.pop());
+            } else if (len > 0 && !dot) {
+                stack.push(out.len());
+                if (out.len() > 0) {
+                    out.push(VFS_SLASH);
+                }
+                for (k of start..i) {
+                    out.push(path.byteAt(k) as i32);
+                }
+            }
+            start = i + 1;
+        }
+        return true;
+    }
+
+    /** True when `path` would climb above the root (and so names nothing). */
+    pub static fn escapes(path : string) : bool {
+        let scratch : ByteBuf = new ByteBuf(32);
+        return !VfsPath::walk(path, scratch);
+    }
+
+    /** The normalised form of `path`; "" is the root. A path that escapes the root also gives "": ask `escapes` first. */
+    pub static fn normalize(path : string) : string {
+        let out : ByteBuf = new ByteBuf(32);
+        if (!VfsPath::walk(path, out)) {
+            return "";
+        }
+        return DataText::fromBytes(out, 0, out.len());
+    }
+
+    /** `name` below `dir`, normalised (`join("a/b", "../c")` is `a/c`). */
+    pub static fn join(dir : string, name : string) : string {
+        return VfsPath::normalize("${dir}/${name}");
+    }
+
+    /** The last segment of a normalised path: `a/b.png` gives `b.png`. */
+    pub static fn fileName(path : string) : string {
+        let n : i32 = path.byteLength as i32;
+        let mut cut : i32 = 0;
+        for (i of 0..n) {
+            if ((path.byteAt(i) as i32) == VFS_SLASH) {
+                cut = i + 1;
+            }
+        }
+        return VfsPath::tail(path, cut);
+    }
+
+    /** Everything before the last segment of a normalised path: `a/b/c.png` gives `a/b`; "" for a top-level name. */
+    pub static fn parent(path : string) : string {
+        let n : i32 = path.byteLength as i32;
+        let mut cut : i32 = -1;
+        for (i of 0..n) {
+            if ((path.byteAt(i) as i32) == VFS_SLASH) {
+                cut = i;
+            }
+        }
+        if (cut < 0) {
+            return "";
+        }
+        return VfsPath::head(path, cut);
+    }
+
+    /** The extension of the last segment in lower case, with its dot (`.png`); "" when there is none. */
+    pub static fn extension(path : string) : string {
+        let name : string = VfsPath::fileName(path);
+        let n : i32 = name.byteLength as i32;
+        let mut dot : i32 = -1;
+        for (i of 0..n) {
+            if ((name.byteAt(i) as i32) == VFS_DOT) {
+                dot = i;
+            }
+        }
+        // A dot at position 0 names a hidden file, not an extension.
+        if (dot <= 0) {
+            return "";
+        }
+
+        let out : ByteBuf = new ByteBuf(8);
+        for (i of dot..n) {
+            let mut c : i32 = name.byteAt(i) as i32;
+            if (c >= VFS_UPPER_A && c <= VFS_UPPER_Z) {
+                c = c + VFS_LOWER_BIT;
+            }
+            out.push(c);
+        }
+        return DataText::fromBytes(out, 0, out.len());
+    }
+
+    /** True when `path` is `dir` or lies below it (`dir` "" is the root, which holds everything). Both normalised. */
+    pub static fn isUnder(dir : string, path : string) : bool {
+        let dn : i32 = dir.byteLength as i32;
+        let pn : i32 = path.byteLength as i32;
+        if (dn == 0) {
+            return true;
+        }
+        if (pn < dn) {
+            return false;
+        }
+        for (i of 0..dn) {
+            if (dir.byteAt(i) != path.byteAt(i)) {
+                return false;
+            }
+        }
+        return pn == dn || (path.byteAt(dn) as i32) == VFS_SLASH;
+    }
+
+    /** `path` seen from `dir`: `relative("a", "a/b/c")` is `b/c`. The caller has checked `isUnder`. */
+    pub static fn relative(dir : string, path : string) : string {
+        let dn : i32 = dir.byteLength as i32;
+        let pn : i32 = path.byteLength as i32;
+        if (dn == 0) {
+            return path;
+        }
+        if (pn <= dn + 1) {
+            return "";
+        }
+        return VfsPath::tail(path, dn + 1);
+    }
+
+    /** The first segment of a relative path: `b` for `b/c` and for `b`. */
+    pub static fn firstSegment(rel : string) : string {
+        let n : i32 = rel.byteLength as i32;
+        let mut stop : i32 = n;
+        for (i of 0..n) {
+            if (stop == n && (rel.byteAt(i) as i32) == VFS_SLASH) {
+                stop = i;
+            }
+        }
+        return VfsPath::head(rel, stop);
+    }
+
+    /** True when a relative path has more than one segment. */
+    pub static fn hasMore(rel : string) : bool {
+        let n : i32 = rel.byteLength as i32;
+        for (i of 0..n) {
+            if ((rel.byteAt(i) as i32) == VFS_SLASH) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** Byte-wise ordering of two paths: negative, zero or positive. */
+    pub static fn compare(a : string, b : string) : i32 {
+        let an : i32 = a.byteLength as i32;
+        let bn : i32 = b.byteLength as i32;
+        let mut n : i32 = an;
+        if (bn < n) {
+            n = bn;
+        }
+        for (i of 0..n) {
+            let x : i32 = a.byteAt(i) as i32;
+            let y : i32 = b.byteAt(i) as i32;
+            if (x != y) {
+                return x - y;
+            }
+        }
+        return an - bn;
+    }
+
+    // The bytes of `s` up to `stop`.
+    static fn head(s : string, stop : i32) : string {
+        let b : ByteBuf = DataText::toBytes(s);
+        return DataText::fromBytes(b, 0, stop);
+    }
+
+    // The bytes of `s` from `from` to the end.
+    static fn tail(s : string, from : i32) : string {
+        let b : ByteBuf = DataText::toBytes(s);
+        return DataText::fromBytes(b, from, b.len());
+    }
+}

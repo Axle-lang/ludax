@@ -1,0 +1,473 @@
+// png — reads and writes PNG files.
+//
+// Reading takes every non-interlaced PNG: grey, grey + alpha, palette (with transparency), RGB and RGBA at the
+// bit depths the standard allows (16-bit samples are cut to their high byte). Chunk checksums are verified, the
+// pixel data is bounded by the size the header promises, and a bad file gives an empty `Image` and a message in
+// `error()`, never an abort. Writing produces an RGB image when no pixel is translucent and RGBA otherwise,
+// one adaptive filter per row (the one with the smallest sum of magnitudes), deflated by `Deflater`.
+
+use crate::data::bytes::{ByteBuf, Crc32};
+use crate::data::image::deflate::Deflater;
+use crate::data::image::image::Image;
+use crate::data::image::inflate::Inflater;
+
+// The largest side and the largest pixel count a file may declare.
+const PNG_MAX_SIDE : i32 = 16384;
+const PNG_MAX_PIXELS : i32 = 67108864;
+
+// The eight signature bytes, the four bytes of a chunk's length and tag, and the twelve bytes a chunk adds
+// around its body.
+const PNG_SIGNATURE_BYTES : i32 = 8;
+const PNG_CHUNK_HEAD : i32 = 8;
+const PNG_CHUNK_OVERHEAD : i32 = 12;
+
+// A header needs the eight signature bytes, the twelve bytes of chunk overhead and a 13-byte IHDR body, written
+// out because a top-level constant must be a literal.
+const PNG_MIN_FILE : i32 = 33;
+
+// Channel values are bytes; filters 0..4 exist; and a filter's cost is the largest i32 to start from.
+const PNG_CHANNEL_MAX : i32 = 255;
+const PNG_FILTER_COUNT : i32 = 5;
+const PNG_FILTER_COST_MAX : i32 = 2147483647;
+
+/** A PNG reader and writer. */
+pub class PngCodec {
+    crc : Crc32;
+    err : string;
+
+    /** A codec; it keeps a checksum table, so reuse one for many files. */
+    constructor() {
+        self.crc = new Crc32();
+        self.err = "";
+    }
+
+    /** Why the last `decode` failed, or an empty string when it did not. */
+    pub fn error(self) : string {
+        return self.err;
+    }
+
+    fn failed(mut self, why : string) : Image {
+        self.err = why;
+        return new Image(0, 0);
+    }
+
+    /** The image in `file`, or an empty image (see `error`). */
+    pub fn decode(mut self, file : ByteBuf) : Image {
+        self.err = "";
+        if (file.len() < PNG_MIN_FILE || !PngCodec::hasSignature(file)) {
+            return self.failed("not a PNG file");
+        }
+
+        let mut w : i32 = 0;
+        let mut h : i32 = 0;
+        let mut depth : i32 = 0;
+        let mut kind : i32 = 0;
+        let mut seenHeader : bool = false;
+        let palette : ByteBuf = new ByteBuf(16);
+        let trns : ByteBuf = new ByteBuf(16);
+        let idat : ByteBuf = new ByteBuf(file.len());
+
+        // Walk the chunks, collecting the header, palette, transparency and pixel data; unknown ones are skipped.
+        let mut at : i32 = PNG_SIGNATURE_BYTES;
+        let mut ended : bool = false;
+        while (!ended && at + PNG_CHUNK_OVERHEAD <= file.len()) {
+            let len : i32 = file.be32(at);
+            if (len < 0 || at + PNG_CHUNK_OVERHEAD + len > file.len()) {
+                return self.failed("a chunk runs past the end of the file");
+            }
+            if (self.crc.sum(file, at + 4, at + PNG_CHUNK_HEAD + len)
+                != file.be32(at + PNG_CHUNK_HEAD + len)) {
+                return self.failed("a chunk has a bad checksum");
+            }
+
+            let body : i32 = at + PNG_CHUNK_HEAD;
+            if (file.tagAt(at + 4, "IHDR")) {
+                if (len != 13) {
+                    return self.failed("bad header");
+                }
+                w = file.be32(body);
+                h = file.be32(body + 4);
+                depth = file.get(body + 8);
+                kind = file.get(body + 9);
+                if (file.get(body + 10) != 0 || file.get(body + 11) != 0) {
+                    return self.failed("unknown compression or filter method");
+                }
+                if (file.get(body + 12) != 0) {
+                    return self.failed("interlaced PNG files are not supported");
+                }
+                seenHeader = true;
+            } else if (file.tagAt(at + 4, "PLTE")) {
+                palette.pushRange(file, body, body + len);
+            } else if (file.tagAt(at + 4, "tRNS")) {
+                trns.pushRange(file, body, body + len);
+            } else if (file.tagAt(at + 4, "IDAT")) {
+                idat.pushRange(file, body, body + len);
+            } else if (file.tagAt(at + 4, "IEND")) {
+                ended = true;
+            }
+            at = at + PNG_CHUNK_OVERHEAD + len;
+        }
+
+        if (!seenHeader || idat.len() == 0) {
+            return self.failed("no header or no pixel data");
+        }
+        let channels : i32 = PngCodec::channelsOf(kind);
+        if (channels == 0 || !PngCodec::depthOk(kind, depth)) {
+            return self.failed("unsupported colour type or bit depth");
+        }
+        if (w < 1 || h < 1 || w > PNG_MAX_SIDE || h > PNG_MAX_SIDE || w * h > PNG_MAX_PIXELS) {
+            return self.failed("the image is too large or empty");
+        }
+
+        // Inflate to one filter-type byte plus one row of samples per row.
+        let rowBytes : i32 = (w * channels * depth + 7) / 8;
+        let inf : Inflater = new Inflater((rowBytes + 1) * h);
+        if (!inf.zlib(idat, 0, idat.len())) {
+            return self.failed("the pixel data is damaged");
+        }
+        let raw : ByteBuf = inf.output();
+        if (raw.len() != (rowBytes + 1) * h) {
+            return self.failed("the pixel data has the wrong size");
+        }
+
+        let step : i32 = (channels * depth + 7) / 8;
+        if (!PngCodec::unfilter(raw, rowBytes, h, step)) {
+            return self.failed("a row has an unknown filter");
+        }
+        if (kind == 3 && palette.len() < 3) {
+            return self.failed("a palette image has no palette");
+        }
+
+        return PngCodec::toImage(raw, w, h, kind, depth, rowBytes, palette, trns);
+    }
+
+    static fn hasSignature(file : ByteBuf) : bool {
+        for (i of 0..PNG_SIGNATURE_BYTES) {
+            if (file.get(i) != PngCodec::signature(i)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    static fn channelsOf(kind : i32) : i32 {
+        return match kind {
+            0 => 1,
+            2 => 3,
+            3 => 1,
+            4 => 2,
+            6 => 4,
+            _ => 0,
+        };
+    }
+
+    static fn depthOk(kind : i32, depth : i32) : bool {
+        if (kind == 0) {
+            return depth == 1 || depth == 2 || depth == 4 || depth == 8 || depth == 16;
+        }
+        if (kind == 3) {
+            return depth == 1 || depth == 2 || depth == 4 || depth == 8;
+        }
+        return depth == 8 || depth == 16;
+    }
+
+    // Undoes the per-row filters in place; false for a filter type above 4.
+    static fn unfilter(raw : ByteBuf, rowBytes : i32, h : i32, step : i32) : bool {
+        for (y of 0..h) {
+            let start : i32 = y * (rowBytes + 1);
+            let ft : i32 = raw.get(start);
+            if (ft > 4) {
+                return false;
+            }
+
+            // For each byte: a is the pixel to the left, b the one above, c the one above-left.
+            let row : i32 = start + 1;
+            let up : i32 = row - rowBytes - 1;
+            for (i of 0..rowBytes) {
+                let mut a : i32 = 0;
+                let mut b : i32 = 0;
+                let mut c : i32 = 0;
+                if (i >= step) {
+                    a = raw.get(row + i - step);
+                }
+                if (y > 0) {
+                    b = raw.get(up + i);
+                    if (i >= step) {
+                        c = raw.get(up + i - step);
+                    }
+                }
+                raw.set(row + i, raw.get(row + i) + PngCodec::predict(ft, a, b, c));
+            }
+        }
+        return true;
+    }
+
+    // What filter `ft` subtracts: nothing, the left byte, the byte above, their mean, or the Paeth choice.
+    static fn predict(ft : i32, a : i32, b : i32, c : i32) : i32 {
+        return match ft {
+            1 => a,
+            2 => b,
+            3 => (a + b) / 2,
+            4 => PngCodec::paeth(a, b, c),
+            _ => 0,
+        };
+    }
+
+    // The neighbour closest to p = a + b - c, ties going to a, then b.
+    static fn paeth(a : i32, b : i32, c : i32) : i32 {
+        let p : i32 = a + b - c;
+        let mut pa : i32 = p - a;
+        let mut pb : i32 = p - b;
+        let mut pc : i32 = p - c;
+        if (pa < 0) {
+            pa = -pa;
+        }
+        if (pb < 0) {
+            pb = -pb;
+        }
+        if (pc < 0) {
+            pc = -pc;
+        }
+        if (pa <= pb && pa <= pc) {
+            return a;
+        }
+        if (pb <= pc) {
+            return b;
+        }
+        return c;
+    }
+
+    // Sample number `idx` of a row: a byte, the high byte of a 16-bit value, or `depth` bits of a byte.
+    static fn sample(raw : ByteBuf, row : i32, idx : i32, depth : i32) : i32 {
+        if (depth == 8) {
+            return raw.get(row + idx);
+        }
+        if (depth == 16) {
+            return raw.get(row + idx * 2);
+        }
+        let bitAt : i32 = idx * depth;
+        let byte : i32 = raw.get(row + bitAt / 8);
+        return (byte >>> (8 - depth - (bitAt % 8))) & ((1 << depth) - 1);
+    }
+
+    // Turns the unfiltered samples of one row into a packed pixel.
+    static fn pixel(
+        raw : ByteBuf,
+        row : i32,
+        x : i32,
+        kind : i32,
+        depth : i32,
+        palette : ByteBuf,
+        trns : ByteBuf
+    ) : i32 {
+        if (kind == 0) {
+            let mut v : i32 = PngCodec::sample(raw, row, x, depth);
+            if (depth < 8) {
+                v = v * 255 / ((1 << depth) - 1);
+            }
+            return Image::pack(v, v, v, PNG_CHANNEL_MAX);
+        }
+        if (kind == 2) {
+            return Image::pack(
+                PngCodec::sample(raw, row, x * 3, depth),
+                PngCodec::sample(raw, row, x * 3 + 1, depth),
+                PngCodec::sample(raw, row, x * 3 + 2, depth),
+                PNG_CHANNEL_MAX
+            );
+        }
+        if (kind == 3) {
+            let idx : i32 = PngCodec::sample(raw, row, x, depth);
+            if (idx * 3 + 2 >= palette.len()) {
+                return Image::pack(0, 0, 0, PNG_CHANNEL_MAX);
+            }
+            return Image::pack(
+                palette.get(idx * 3),
+                palette.get(idx * 3 + 1),
+                palette.get(idx * 3 + 2),
+                trns.getOr(idx, PNG_CHANNEL_MAX)
+            );
+        }
+        if (kind == 4) {
+            let g : i32 = PngCodec::sample(raw, row, x * 2, depth);
+            return Image::pack(g, g, g, PngCodec::sample(raw, row, x * 2 + 1, depth));
+        }
+        return Image::pack(
+            PngCodec::sample(raw, row, x * 4, depth),
+            PngCodec::sample(raw, row, x * 4 + 1, depth),
+            PngCodec::sample(raw, row, x * 4 + 2, depth),
+            PngCodec::sample(raw, row, x * 4 + 3, depth)
+        );
+    }
+
+    // Assembles the unfiltered rows into an image, one pixel at a time.
+    static fn toImage(
+        raw : ByteBuf,
+        w : i32,
+        h : i32,
+        kind : i32,
+        depth : i32,
+        rowBytes : i32,
+        palette : ByteBuf,
+        trns : ByteBuf
+    ) : Image {
+        let mut img : Image = new Image(w, h);
+        for (y of 0..h) {
+            let row : i32 = y * (rowBytes + 1) + 1;
+            for (x of 0..w) {
+                img.set(x, y, PngCodec::pixel(raw, row, x, kind, depth, palette, trns));
+            }
+        }
+        return img;
+    }
+
+    /** The PNG file of `img`. An empty image gives an empty buffer. */
+    pub fn encode(mut self, img : Image) : ByteBuf {
+        let out : ByteBuf = new ByteBuf(1024);
+        if (img.isEmpty()) {
+            return out;
+        }
+        let w : i32 = img.width();
+        let h : i32 = img.height();
+
+        // Drop the alpha channel when nothing needs it.
+        let mut channels : i32 = 4;
+        let mut kind : i32 = 6;
+        if (PngCodec::isOpaque(img)) {
+            channels = 3;
+            kind = 2;
+        }
+
+        let rowBytes : i32 = w * channels;
+        let plain : ByteBuf = PngCodec::plainRows(img, w, h, channels);
+        let filtered : ByteBuf = PngCodec::filteredRows(plain, rowBytes, h, channels);
+        let packed : ByteBuf = new Deflater().zlib(filtered, 0, filtered.len());
+
+        for (i of 0..PNG_SIGNATURE_BYTES) {
+            out.push(PngCodec::signature(i));
+        }
+
+        let header : ByteBuf = new ByteBuf(16);
+        header.pushBe32(w);
+        header.pushBe32(h);
+        header.push(8);
+        header.push(kind);
+        header.push(0);
+        header.push(0);
+        header.push(0);
+
+        self.chunk(out, "IHDR", header);
+        self.chunk(out, "IDAT", packed);
+        self.chunk(out, "IEND", new ByteBuf(16));
+        return out;
+    }
+
+    static fn isOpaque(img : Image) : bool {
+        for (y of 0..img.height()) {
+            for (x of 0..img.width()) {
+                if (Image::alpha(img.get(x, y)) != PNG_CHANNEL_MAX) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    // The rows as they will be stored, unfiltered.
+    static fn plainRows(img : Image, w : i32, h : i32, channels : i32) : ByteBuf {
+        let rowBytes : i32 = w * channels;
+        let plain : ByteBuf = new ByteBuf(rowBytes * h + 16);
+        plain.resize(rowBytes * h);
+        for (y of 0..h) {
+            for (x of 0..w) {
+                let p : i32 = img.get(x, y);
+                let at : i32 = y * rowBytes + x * channels;
+                plain.set(at, Image::red(p));
+                plain.set(at + 1, Image::green(p));
+                plain.set(at + 2, Image::blue(p));
+                if (channels == 4) {
+                    plain.set(at + 3, Image::alpha(p));
+                }
+            }
+        }
+        return plain;
+    }
+
+    // Filters each row with the type whose residuals are smallest in magnitude, and writes type byte then row.
+    static fn filteredRows(plain : ByteBuf, rowBytes : i32, h : i32, step : i32) : ByteBuf {
+        let filtered : ByteBuf = new ByteBuf((rowBytes + 1) * h + 16);
+        for (y of 0..h) {
+            let row : i32 = y * rowBytes;
+
+            let mut best : i32 = 0;
+            let mut bestCost : i32 = PNG_FILTER_COST_MAX;
+            for (ft of 0..PNG_FILTER_COUNT) {
+                let mut cost : i32 = 0;
+                for (i of 0..rowBytes) {
+                    let d : i32 = PngCodec::residual(plain, ft, row, i, y, rowBytes, step);
+                    // A residual is a signed byte: 128..255 means a small negative difference.
+                    if (d < 128) {
+                        cost = cost + d;
+                    } else {
+                        cost = cost + 256 - d;
+                    }
+                }
+                if (cost < bestCost) {
+                    bestCost = cost;
+                    best = ft;
+                }
+            }
+
+            filtered.push(best);
+            for (i of 0..rowBytes) {
+                filtered.push(PngCodec::residual(plain, best, row, i, y, rowBytes, step));
+            }
+        }
+        return filtered;
+    }
+
+    static fn signature(i : i32) : i32 {
+        return match i {
+            0 => 137,
+            1 => 80,
+            2 => 78,
+            3 => 71,
+            4 => 13,
+            5 => 10,
+            6 => 26,
+            _ => 10,
+        };
+    }
+
+    // Byte `i` of row `y` after filter `ft` (the difference to its prediction, modulo 256).
+    static fn residual(
+        plain : ByteBuf,
+        ft : i32,
+        row : i32,
+        i : i32,
+        y : i32,
+        rowBytes : i32,
+        step : i32
+    ) : i32 {
+        let mut a : i32 = 0;
+        let mut b : i32 = 0;
+        let mut c : i32 = 0;
+        if (i >= step) {
+            a = plain.get(row + i - step);
+        }
+        if (y > 0) {
+            b = plain.get(row - rowBytes + i);
+            if (i >= step) {
+                c = plain.get(row - rowBytes + i - step);
+            }
+        }
+        return (plain.get(row + i) - PngCodec::predict(ft, a, b, c)) & 255;
+    }
+
+    fn chunk(mut self, out : ByteBuf, tag : string, body : ByteBuf) : void {
+        out.pushBe32(body.len());
+        let start : i32 = out.len();
+        out.pushText(tag);
+        out.pushRange(body, 0, body.len());
+        out.pushBe32(self.crc.sum(out, start, out.len()));
+    }
+}
