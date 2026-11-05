@@ -1,0 +1,227 @@
+// checks — what prism verifies about its own picture, and says out loud.
+//
+// A picture can look right and be wrong, so the example states what must hold and prints each statement with its
+// verdict: the graph is valid and culled its unused pass; extraction culled exactly the decoys; the command stream
+// survives a trip through bytes; a second render on another number of threads is the same bits; the stage moved
+// 4000 km away gives the same picture (the f64 world, f32 renderer promise); no pixel is NaN or negative; a floor
+// pixel in the sphere's shadow is explained as blocked while its lit neighbour is not. The failure count is the
+// exit status.
+//
+// The thresholds are the example's promises, not the library's: a mean radiance band that rejects black and blown
+// out frames, a shadow that must be visibly darker, and a far-away picture that may differ in a few pixels but not
+// in most of them. Each is named so the check text and the constant cannot drift apart.
+
+use ludax::{ByteBuf, Camera, CmdCodec, CmdStream, CpuExplain, DVec3, Image, LightExplain, LightReason, Vec3};
+
+use crate::app::frame::{PrismFrame, PRISM_HDR, PRISM_WINDOW};
+use crate::scene::stage::PrismStage;
+
+// A pixel radiance above this is treated as blown out (or not a number).
+const CHECK_MAX_RADIANCE : f32 = 100000.0;
+
+// The mean radiance band that says the picture is neither black nor blown out.
+const CHECK_MEAN_MIN : f64 = 0.05;
+const CHECK_MEAN_MAX : f64 = 3.0;
+
+// Pixels within this many levels still count as the same picture; the far-away stage may move fewer than one
+// in `CHECK_FAR_ONE_IN` pixels.
+const CHECK_LEVEL_TOLERANCE : i32 = 1;
+const CHECK_FAR_ONE_IN : i32 = 200;
+
+// A floor surface faces up: its normal's y must be at least this.
+const CHECK_FLOOR_NORMAL : f32 = 0.99;
+
+// The shadowed floor must be darker than this fraction of the lit floor.
+const CHECK_SHADOW_RATIO : f32 = 0.7;
+
+// The open-floor sample is this far left of the shadow sample, this far above the bottom edge.
+const CHECK_OPEN_OFFSET_X : i32 = 90;
+const CHECK_OPEN_MARGIN_Y : i32 = 14;
+
+// Three decoys are placed outside the camera's frustum.
+const CHECK_DECOYS : i32 = 3;
+
+/** Counts and prints verdicts. */
+pub class PrismChecks {
+    /** How many statements failed. */
+    pub failed : i32 = 0;
+
+    /** How many were made. */
+    pub total : i32 = 0;
+
+    /** An empty tally. */
+    constructor() {}
+
+    /** States `what`; prints ok or FAIL. */
+    pub fn check(mut self, what : string, ok : bool) : void {
+        self.total = self.total + 1;
+        if (ok) {
+            println("prism: ok    ${what}");
+        } else {
+            self.failed = self.failed + 1;
+            println("prism: FAIL  ${what}");
+        }
+    }
+
+    /** The structure of the frame: graph, extraction, stream. */
+    pub fn structure(mut self, stage : PrismStage, f : PrismFrame) : void {
+        self.check("the render graph is valid", f.plan.isValid());
+        self.check(
+            "three passes run (bvh, forward, resolve) in dependency order",
+            f.plan.runCount() == 3 && f.graph.passName(f.plan.passAt(0)) == "bvh"
+                && f.graph.passName(f.plan.passAt(1)) == "forward"
+                && f.graph.passName(f.plan.passAt(2)) == "resolve"
+        );
+        self.check(
+            "the pass nobody needs (luminance-meter) is culled",
+            f.plan.culledCount() == 1 && f.graph.passName(f.plan.culledAt(0)) == "luminance-meter"
+        );
+        self.check(
+            "extraction considered every drawn entity and culled the 3 decoys by frustum",
+            f.scene.consideredCount() == stage.drawn && f.scene.culledCount() == CHECK_DECOYS
+                && f.scene.instanceCount() == stage.drawn - CHECK_DECOYS
+        );
+        self.check(
+            "the scene holds the sun and the lamp as lights in physical units",
+            f.scene.lightCount() == 2
+        );
+
+        let bytes : ByteBuf = CmdCodec::encode(f.stream);
+        let back : CmdStream = new CmdStream();
+        self.check(
+            "the command stream round-trips through ${bytes.len()} bytes",
+            CmdCodec::decode(bytes, back) == "" && back.equals(f.stream)
+        );
+
+        let submitted : i64 = f.costs.trianglesSubmitted(1);
+        let rasterised : i64 = f.costs.trianglesRasterised(1);
+        self.check(
+            "the forward pass drew all the triangles it was given (${submitted} submitted, ${rasterised}"
+                + " rasterised)",
+            submitted > 0 && rasterised > 0
+        );
+    }
+
+    /** Pixels: finite, non-negative, and the picture is not empty. */
+    pub fn pixels(mut self, f : PrismFrame, w : i32, h : i32) : void {
+        let mut bad : i32 = 0;
+        let mut sum : f64 = 0.0;
+        for (y of 0..h) {
+            for (x of 0..w) {
+                let v : Vec3 = f.renderer.hdrAt(PRISM_HDR, x, y);
+                if (!(v.x >= 0.0) || !(v.y >= 0.0) || !(v.z >= 0.0) || v.x > CHECK_MAX_RADIANCE
+                    || v.y > CHECK_MAX_RADIANCE
+                    || v.z > CHECK_MAX_RADIANCE) {
+                    bad = bad + 1;
+                }
+                sum = sum + ((v.x + v.y + v.z) as f64) / 3.0;
+            }
+        }
+
+        let mean : f64 = sum / ((w * h) as f64);
+        println("prism: mean scene radiance of the picture: ${mean}");
+        self.check("every pixel is finite and non-negative", bad == 0);
+        self.check(
+            "the picture is neither black nor blown out (mean radiance between 0.05 and 3)",
+            mean > CHECK_MEAN_MIN && mean < CHECK_MEAN_MAX
+        );
+    }
+
+    /** The picture rendered on another thread count has the same bits. */
+    pub fn threads(mut self, a : PrismFrame, b : PrismFrame, w : i32, h : i32) : void {
+        let mut same : bool = true;
+        for (y of 0..h) {
+            for (x of 0..w) {
+                let p : Vec3 = a.renderer.hdrAt(PRISM_HDR, x, y);
+                let q : Vec3 = b.renderer.hdrAt(PRISM_HDR, x, y);
+                if (p.x != q.x || p.y != q.y || p.z != q.z) {
+                    same = false;
+                }
+            }
+        }
+        self.check(
+            "the picture is bit-identical on 1 thread and on many (every float of the HDR buffer)",
+            same
+        );
+        self.check(
+            "and so are the 8-bit pixels",
+            a.renderer.picture(PRISM_WINDOW).same(b.renderer.picture(PRISM_WINDOW))
+        );
+    }
+
+    /** The stage moved far from the origin renders the same picture. */
+    pub fn largeWorld(mut self, near : PrismFrame, far : PrismFrame, w : i32, h : i32) : void {
+        let mut off : i32 = 0;
+        let pa : Image = near.renderer.picture(PRISM_WINDOW);
+        let pb : Image = far.renderer.picture(PRISM_WINDOW);
+        for (y of 0..h) {
+            for (x of 0..w) {
+                let d : i32 = Image::red(pa.get(x, y)) - Image::red(pb.get(x, y));
+                if (d > CHECK_LEVEL_TOLERANCE || d < -CHECK_LEVEL_TOLERANCE) {
+                    off = off + 1;
+                }
+            }
+        }
+
+        println("prism: stage moved by (4000000, 0, -3000000) m: ${off} of ${w * h} pixels differ by more"
+            + " than one level");
+        self.check(
+            "the same stage 5000 km from the origin renders the same picture (camera-relative f32)",
+            off * CHECK_FAR_ONE_IN < w * h
+        );
+    }
+
+    /** A pixel in the sphere's shadow is explained as blocked; one in the open is lit by the sun. */
+    pub fn shadow(mut self, stage : PrismStage, f : PrismFrame, w : i32, h : i32) : void {
+        let cam : Camera = stage.camera((w as f32) / (h as f32));
+        let travel : Vec3 = f.scene.light(1).direction;
+
+        // The point on the floor where the line from the middle front sphere's centre along the sun's rays arrives.
+        let centre : Vec3 = Vec3::make(0.0, 0.8, 3.4);
+        let t : f32 = centre.y / -travel.y;
+        let shade : Vec3 = centre.plus(travel.scale(t));
+        let world : DVec3 = stage.offset.plus(DVec3::make(shade.x as f64, 0.0, shade.z as f64));
+        let projected : Vec3 = cam.viewProjection().projectPoint(cam.relativePoint(world));
+        let x1 : i32 = ((projected.x * (0.5 as f32) + (0.5 as f32)) * (w as f32)) as i32;
+        let y1 : i32 = ((projected.y * (0.5 as f32) + (0.5 as f32)) * (h as f32)) as i32;
+
+        // A floor pixel in the open: near the bottom of the picture, under the lamp's glare but clear of every shadow.
+        let x2 : i32 = x1 - CHECK_OPEN_OFFSET_X;
+        let y2 : i32 = h - CHECK_OPEN_MARGIN_Y;
+        self.check(
+            "both pixels are inside the picture",
+            x1 >= 0 && x1 < w && y1 >= 0 && y1 < h && x2 >= 0 && x2 < w && y2 >= 0 && y2 < h
+        );
+        if (x1 < 0 || x1 >= w || y1 < 0 || y1 >= h) {
+            return;
+        }
+
+        println("prism: explaining floor pixels in the sphere's shadow (${x1}, ${y1}) and in the open"
+            + " (${x2}, ${y2})");
+        println(CpuExplain::report(f.renderer, x1, y1));
+        println(CpuExplain::report(f.renderer, x2, y2));
+        self.check(
+            "both pixels show the floor (an opaque surface facing up)",
+            CpuExplain::hasSurface(f.renderer, x1, y1) && CpuExplain::hasSurface(f.renderer, x2, y2)
+                && f.renderer.sampleAt(x1, y1).surface.normal.y > CHECK_FLOOR_NORMAL
+                && f.renderer.sampleAt(x2, y2).surface.normal.y > CHECK_FLOOR_NORMAL
+        );
+
+        let inShade : LightExplain = CpuExplain::pixel(f.renderer, x1, y1);
+        let inOpen : LightExplain = CpuExplain::pixel(f.renderer, x2, y2);
+        // Light 1 is the sun (extraction order follows the component store: the lamp was added first).
+        self.check(
+            "LightExplain: the sun is blocked at the shadow pixel and reaches the open one",
+            inShade.light(1).reason == LightReason::Shadow && inOpen.light(1).reason == LightReason::None
+        );
+        self.check(
+            "LightExplain: its parts add up to the renderer's colour, bit for bit (difference "
+                + "${inShade.difference()})",
+            inShade.difference() == 0.0 && inOpen.difference() == 0.0
+        );
+
+        let hs : Vec3 = f.renderer.hdrAt(PRISM_HDR, x1, y1);
+        let ho : Vec3 = f.renderer.hdrAt(PRISM_HDR, x2, y2);
+        self.check("the shadowed floor is darker than the lit floor", hs.y < CHECK_SHADOW_RATIO * ho.y);
+    }
+}

@@ -1,0 +1,161 @@
+// overlay — the F3 debug panel: frame time, entity counts, the profiler's ranking and the last log lines.
+//
+// It reads the engine's own instruments rather than keeping any of its own: scope timings come from Ludax's
+// `Profiler` (the last finished frame, most expensive first), the log lines from the `MemorySink` behind the
+// game's `Logger`, and the frame-time graph from a `Ring` of recent frame lengths. Frame times are
+// the only thing that differs from run to run, so nothing in the simulation may read them.
+
+use ludax::{Ring, LogRecord, ProfileEntry};
+use smalt::{Frame, Rect, Color};
+
+use crate::core::config::{BULLET_CAPACITY, PARTICLE_CAPACITY};
+use crate::core::palette::{PAL_TEXT, PAL_TEXT_DIM, PAL_ACCENT};
+use crate::gfx::typeface::Typeface;
+use crate::sim::world::World;
+
+/** Frames of history in the graph. */
+const HISTORY : i32 = 120;
+
+/** Left edge of the panel: the view is 960 wide and the panel 336 from its right edge. */
+const PANEL_X : i32 = 624;
+
+/** Top edge of the panel. */
+const PANEL_Y : i32 = 70;
+
+/** Width of the panel. */
+const PANEL_W : i32 = 320;
+
+/** Height of the panel. */
+const PANEL_H : i32 = 440;
+
+/** Height of one text line. */
+const LINE : i32 = 15;
+
+/** Profiler rows shown. */
+const ROWS : i32 = 9;
+
+/** Log lines shown. */
+const LOG_LINES : i32 = 5;
+
+/** Nanoseconds per millisecond, as a real. */
+const NANOS_PER_MS : f64 = 1000000.0;
+
+/** Colour of the frame-time line and its fill. */
+const GRAPH_INK : i32 = 0x6FE3FF;
+const GRAPH_FILL : i32 = 0x14303C;
+
+/** Fallback top of the frame-time graph, in microseconds, when every sample is tiny. */
+const GRAPH_FLOOR : i32 = 8000;
+
+/** Background of the panel and of the graph inside it. */
+const PANEL_FILL : i32 = 0x05070F;
+const GRAPH_BG : i32 = 0x0A0E1A;
+
+/** The debug panel. */
+pub class Overlay {
+    frames  : Ring<i32>;
+    samples : i32[];
+
+    /** An empty history. */
+    constructor() {
+        self.frames = new Ring<i32>(HISTORY);
+        self.samples = malloc<i32>(HISTORY as i64);
+    }
+
+    /** Records how long the last frame took, in microseconds. */
+    pub fn record(mut self, micros : i32) : void {
+        self.frames.pushOverwrite(micros);
+    }
+
+    /** Draws the panel. */
+    pub fn draw(mut self, f : Frame, kit : Typeface, w : World, fps : f64) : void {
+        f.shade(Rect::make(PANEL_X, PANEL_Y, PANEL_W, PANEL_H), PANEL_FILL, 7, 10);
+        f.border(Rect::make(PANEL_X, PANEL_Y, PANEL_W, PANEL_H), Color::scale(PAL_TEXT_DIM, 1, 2));
+        let x : i32 = PANEL_X + 10;
+        let mut y : i32 = PANEL_Y + 8;
+        kit.text(f, x, y, "DEBUG  F3", 1, PAL_ACCENT);
+        y = y + LINE + 2;
+        y = self.counters(f, kit, w, fps, x, y);
+        y = self.graph(f, kit, x, y);
+        y = self.profile(f, kit, w, x, y);
+        self.logLines(f, kit, w, x, y);
+    }
+
+    // The numbers that say how busy the world is.
+    fn counters(self, f : Frame, kit : Typeface, w : World, fps : f64, x : i32, top : i32) : i32 {
+        let mut y : i32 = top;
+        let mut pen : i32 = kit.text(f, x, y, "fps ", 1, PAL_TEXT_DIM);
+        kit.fixed(f, pen, y, fps, 1, 1, PAL_TEXT);
+        kit.plain(f, x + 110, y, "tick ", w.tickCount, 1, PAL_TEXT);
+        y = y + LINE;
+        pen = kit.plain(f, x, y, "entities ", w.entities.len() as i64, 1, PAL_TEXT);
+        kit.plain(f, pen, y, " / slots ", w.entities.slotCount() as i64, 1, PAL_TEXT_DIM);
+        y = y + LINE;
+        pen = kit.plain(f, x, y, "bullets ", w.bullets.count() as i64, 1, PAL_TEXT);
+        kit.plain(f, pen, y, " / ", BULLET_CAPACITY as i64, 1, PAL_TEXT_DIM);
+        y = y + LINE;
+        pen = kit.plain(f, x, y, "particles ", w.fx.field.pool.count() as i64, 1, PAL_TEXT);
+        kit.plain(f, pen, y, " / ", PARTICLE_CAPACITY as i64, 1, PAL_TEXT_DIM);
+        y = y + LINE;
+        pen = kit.plain(f, x, y, "grid proxies ", w.grid.count() as i64, 1, PAL_TEXT);
+        kit.plain(f, x + 150, y, "queued spawns ", w.director.pending() as i64, 1, PAL_TEXT);
+        y = y + LINE;
+        kit.plain(f, x, y, "seed ", w.seed as i64, 1, PAL_TEXT_DIM);
+        return y + LINE + 4;
+    }
+
+    // The frame-length graph, newest frame at the right.
+    fn graph(mut self, f : Frame, kit : Typeface, x : i32, top : i32) : i32 {
+        let n : i32 = self.frames.len();
+        let mut worst : i32 = GRAPH_FLOOR;
+        for (i of 0..n) {
+            let v : i32 = self.frames.get(i);
+            self.samples[i as i64] = v;
+            if (v > worst) {
+                worst = v;
+            }
+        }
+        kit.text(f, x, top, "frame time (us)", 1, PAL_TEXT_DIM);
+        let box : Rect = Rect::make(x, top + LINE, PANEL_W - 20, 44);
+        f.fillRect(box, GRAPH_BG);
+        f.spark(box, self.samples, n, 0, worst, GRAPH_INK, GRAPH_FILL);
+        kit.plain(f, x + PANEL_W - 90, top, "max ", worst as i64, 1, PAL_TEXT_DIM);
+        return top + LINE + 44 + 8;
+    }
+
+    // The profiler's ranking: name, inclusive and self milliseconds, calls.
+    fn profile(self, f : Frame, kit : Typeface, w : World, x : i32, top : i32) : i32 {
+        let prof = w.tm.prof;
+        kit.text(f, x, top, "scope", 1, PAL_TEXT_DIM);
+        kit.right(f, x + 210, top, "incl ms", 1, PAL_TEXT_DIM);
+        kit.right(f, x + 270, top, "self", 1, PAL_TEXT_DIM);
+        kit.right(f, x + 300, top, "n", 1, PAL_TEXT_DIM);
+        let mut y : i32 = top + LINE;
+        let rows : i32 = prof.entryCount().min(ROWS);
+        for (rank of 0..rows) {
+            let e : ProfileEntry = prof.entry(rank);
+            kit.text(f, x, y, w.tm.names.name(e.scope), 1, PAL_TEXT);
+            self.millis(f, kit, x + 150, y, e.inclusiveNanos, PAL_TEXT);
+            self.millis(f, kit, x + 225, y, e.selfNanos, PAL_TEXT_DIM);
+            kit.numberRight(f, x + 300, y, e.calls as i64, 1, PAL_TEXT_DIM);
+            y = y + LINE;
+        }
+        return y + 6;
+    }
+
+    fn millis(self, f : Frame, kit : Typeface, x : i32, y : i32, nanos : i64, ink : i32) : void {
+        kit.fixed(f, x, y, (nanos as f64) / NANOS_PER_MS, 3, 1, ink);
+    }
+
+    // The newest log lines, oldest first.
+    fn logLines(self, f : Frame, kit : Typeface, w : World, x : i32, top : i32) : void {
+        kit.text(f, x, top, "log", 1, PAL_TEXT_DIM);
+        let sink = w.tm.log.sink();
+        let shown : i32 = sink.count().min(LOG_LINES);
+        let first : i32 = sink.count() - shown;
+        for (i of 0..shown) {
+            let r : LogRecord = sink.at(first + i);
+            kit.text(f, x, top + LINE * (i + 1), r.message, 1, PAL_TEXT);
+        }
+    }
+}

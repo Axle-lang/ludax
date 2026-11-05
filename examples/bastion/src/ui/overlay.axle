@@ -1,0 +1,194 @@
+// overlay — 2-D drawing that belongs to places in the 3-D world: health bars, gold labels, range rings.
+//
+// Each item is positioned by projecting a world point through the same view the culling and picking use, so
+// a bar sits over its enemy exactly where the pointer would hit it. Everything is clipped to the frame by the
+// frame itself; a point behind the camera is simply skipped.
+
+use ludax::{Vec2, sin, cos, TAU};
+use smalt::{Frame, Rect};
+
+use crate::app::game::Game;
+use crate::gfx::view::ScreenPoint;
+use crate::sim::commands::Verdict;
+use crate::sim::config::START_LIVES;
+use crate::sim::grid::Grid;
+use crate::sim::stats::{EnemyKind, enemyStats, towerStats};
+use crate::sim::units::{Enemy, Fx, FxKind, Tower};
+use crate::ui::palette::{C_BAR_BACK, C_GOLD, C_SHADOW, C_GREEN, C_RED, C_ICE, C_ACCENT};
+use crate::ui::pen::Pen;
+
+/** Segments of a range ring. */
+const RING_SEGMENTS : i32 = 48;
+
+/** Rounding steps a line may take before it is abandoned, so a bad pair cannot spin forever. */
+const LINE_GUARD : i32 = 4000;
+
+/** Width of the base's life bar. */
+const BASE_BAR_WIDTH : i32 = 60;
+
+/** Draws every label that hangs over the board. */
+pub fn drawWorldLabels(f : Frame, pen : Pen, g : Game, verdict : Verdict) : void {
+    drawRange(f, g, verdict);
+    drawHealthBars(f, g);
+    drawCoinLabels(f, pen, g);
+    drawBaseLives(f, pen, g);
+}
+
+// Health bars over enemies that are hurt, and over the big ones always.
+fn drawHealthBars(f : Frame, g : Game) : void {
+    let world = g.world;
+    for (slot of 0..world.enemies.slotCount()) {
+        if (!world.enemies.isLiveAt(slot)) {
+            continue;
+        }
+        let e : Enemy = world.enemies.valueAt(slot);
+        let big : bool = e.kind == EnemyKind::Brute || e.kind == EnemyKind::Boss;
+        if (e.health >= e.maxHealth && !big) {
+            continue;
+        }
+        let r : f32 = enemyStats(e.kind).radius;
+        let at : ScreenPoint = g.view.project(e.pos.x, r * 2.0 + 0.3, e.pos.y);
+        if (!at.visible) {
+            continue;
+        }
+        let frozen : bool = world.slows.has(world.enemies.idAt(slot).index);
+        healthBar(f, at.x, at.y, barWidth(e.kind), e.health, e.maxHealth, frozen);
+    }
+}
+
+// Bar widths grow with the size of the enemy.
+fn barWidth(kind : EnemyKind) : i32 {
+    return match kind {
+        EnemyKind::Grunt => 26,
+        EnemyKind::Runner => 22,
+        EnemyKind::Brute => 36,
+        EnemyKind::Boss => 56,
+    };
+}
+
+// One bar centred on (`cx`, `y`): dark back, a fill coloured by how much is left, and a blue edge when slowed.
+fn healthBar(f : Frame, cx : i32, y : i32, width : i32, health : i32, maxHealth : i32, frozen : bool) : void {
+    let left : i32 = cx - width / 2;
+    let filled : i32 = width * health / maxHealth;
+    if (filled < 1 && health > 0) {
+        return;
+    }
+    f.fillRect(Rect::make(left - 1, y - 1, width + 2, 6), C_SHADOW);
+    f.fillRect(Rect::make(left, y, width, 4), C_BAR_BACK);
+    let mut ink : i32 = C_GREEN;
+    if (health * 4 < maxHealth) {
+        ink = C_RED;
+    } else if (health * 2 < maxHealth) {
+        ink = C_GOLD;
+    }
+    f.fillRect(Rect::make(left, y, filled, 4), ink);
+    if (frozen) {
+        f.hLine(left, y + 4, width, C_ICE);
+    }
+}
+
+// The "+4" labels that float up from kills.
+fn drawCoinLabels(f : Frame, pen : Pen, g : Game) : void {
+    for (d of 0..g.world.fx.len()) {
+        let fx : Fx = g.world.fx.valueAt(d);
+        if (fx.kind != FxKind::Coin) {
+            continue;
+        }
+        let at : ScreenPoint = g.view.project(fx.pos.x, fx.pos.y, fx.pos.z);
+        if (at.visible) {
+            let after : i32 = pen.shadowed(f, at.x - 8, at.y - 6, "+", C_GOLD, C_SHADOW);
+            pen.number(f, after, at.y - 6, fx.value as i64, C_GOLD);
+        }
+    }
+}
+
+// Lives above the keep.
+fn drawBaseLives(f : Frame, pen : Pen, g : Game) : void {
+    let c = Grid::centerOf(Grid::goalTile());
+    let at : ScreenPoint = g.view.project(c.x, 2.0, c.y);
+    if (!at.visible) {
+        return;
+    }
+    healthBar(f, at.x, at.y, BASE_BAR_WIDTH, g.world.lives, START_LIVES, false);
+    pen.centred(f, at.x, at.y - 18, "BASE", C_ICE);
+}
+
+// The range of the selected tower, or of the design about to be built at the hovered tile.
+fn drawRange(f : Frame, g : Game, verdict : Verdict) : void {
+    let mut tile : i32 = -1;
+    let mut range : f32 = 0.0;
+    let mut ink : i32 = C_ACCENT;
+    if (!g.ui.selected.isNone() && g.world.towers.has(g.ui.selected)) {
+        let t : Tower = g.world.towers.get(g.ui.selected);
+        tile = t.tile;
+        range = towerStats(t.kind, t.level).range;
+    } else if (g.ui.building && g.ui.hoverTile >= 0) {
+        tile = g.ui.hoverTile;
+        range = towerStats(g.ui.kind, 1).range;
+        if (verdict != Verdict::Done) {
+            ink = C_RED;
+        }
+    }
+    if (tile < 0) {
+        return;
+    }
+    ring(f, g, Grid::centerOf(tile), range, ink);
+}
+
+// A circle on the ground, drawn as a closed polyline of projected points.
+fn ring(f : Frame, g : Game, centre : Vec2, radius : f32, ink : i32) : void {
+    let mut prev : ScreenPoint = g.view.project(centre.x + radius, 0.05, centre.y);
+    for (i of 1..=RING_SEGMENTS) {
+        let angle : f32 = TAU * i as f32 / RING_SEGMENTS as f32;
+        let next : ScreenPoint = g.view.project(
+            centre.x + cos(angle) * radius,
+            0.05,
+            centre.y + sin(angle) * radius
+        );
+        if (prev.visible && next.visible) {
+            line(f, prev.x, prev.y, next.x, next.y, ink);
+        }
+        prev = next;
+    }
+}
+
+// Bresenham's line.
+fn line(f : Frame, x0 : i32, y0 : i32, x1 : i32, y1 : i32, ink : i32) : void {
+    let mut x : i32 = x0;
+    let mut y : i32 = y0;
+    let dx : i32 = absInt(x1 - x0);
+    let dy : i32 = 0 - absInt(y1 - y0);
+    let mut stepX : i32 = 1;
+    if (x0 > x1) {
+        stepX = -1;
+    }
+    let mut stepY : i32 = 1;
+    if (y0 > y1) {
+        stepY = -1;
+    }
+    let mut err : i32 = dx + dy;
+    let mut guard : i32 = 0;
+    while (guard < LINE_GUARD) {
+        f.plot(x, y, ink);
+        if (x == x1 && y == y1) {
+            return;
+        }
+        let doubled : i32 = 2 * err;
+        if (doubled >= dy) {
+            err = err + dy;
+            x = x + stepX;
+        }
+        if (doubled <= dx) {
+            err = err + dx;
+            y = y + stepY;
+        }
+        guard = guard + 1;
+    }
+}
+
+fn absInt(v : i32) : i32 {
+    if (v < 0) {
+        return 0 - v;
+    }
+    return v;
+}

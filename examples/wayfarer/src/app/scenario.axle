@@ -1,0 +1,204 @@
+// scenario — the whole demonstration, built from one seed.
+//
+// A dungeon of rooms and corridors. Eight agents, in four pairs: the two of a pair start in each other's goal
+// room and so meet head on somewhere along the way. Each agent's route is an A* path over the grid, pulled
+// straight by line-of-sight smoothing; the same trips are also planned over a navigation mesh of the map for
+// comparison, and one flow field serves everyone heading for the walker's goal. Agent 0 is the walker: a
+// skeleton playing a procedural walk whose root motion moves it along its path.
+//
+// Rooms are paired by index so that the two of every pair are half the room list apart: with eight rooms the
+// pair's members are four apart, and a one-room map folds the offset back to a neighbour. The routes are planned
+// once, at construction; `run` only advances the crowd, which keeps a second run from the same seed an exact
+// replay rather than a re-plan that could disagree.
+
+use ludax::{
+    GridMap, GridPath, GridPathfinder, FlowField, NavMesh, NavMeshGrid, NavPath, SteerAgent, Vec2, atan2
+};
+
+use crate::sim::crowd::Crowd;
+use crate::sim::walker_agent::WalkerAgent;
+use crate::world::dungeon::Dungeon;
+
+/** How many agents walk the map. */
+pub const SCN_AGENTS : i32 = 8;
+
+/** The fixed time step of the simulation, a thirtieth of a second. */
+pub const SCN_DT : f32 = 0.033333335;
+
+// Limits of every agent, in cells per second and cells per second squared, and their body radius in cells.
+const SCN_SPEED : f32 = 2.2;
+const SCN_ACCEL : f32 = 9.0;
+const SCN_RADIUS : f32 = 0.3;
+
+// The dungeon's size and room count, and the offset from a cell's corner to its middle.
+const SCN_WIDTH : i32 = 64;
+const SCN_HEIGHT : i32 = 44;
+const SCN_ROOMS : i32 = 8;
+const SCN_HALF : f32 = 0.5;
+
+/** The map, the routes, the crowd and the walker. */
+pub class Scenario {
+    world     : Dungeon;
+    mesh      : NavMesh;
+    people    : Crowd;
+    biped     : WalkerAgent;
+    field     : FlowField;
+    raw       : GridPath[];
+    smooth    : GridPath[];
+    funnel    : NavPath[];
+    startRoom : i32[];
+    goalRoom  : i32[];
+    steps     : i32 = 0;
+
+    /** Generates the dungeon for `seed` and plans every route. */
+    constructor(seed : u64) {
+        self.world = new Dungeon(SCN_WIDTH, SCN_HEIGHT, SCN_ROOMS, seed);
+        let map : GridMap = self.world.map();
+        map.setDiagonal(true);
+        self.mesh = NavMeshGrid::build(map, 1.0);
+        self.people = new Crowd(SCN_AGENTS, SCN_WIDTH as f32, SCN_HEIGHT as f32);
+        self.raw = malloc<GridPath>(SCN_AGENTS as i64);
+        self.smooth = malloc<GridPath>(SCN_AGENTS as i64);
+        self.funnel = malloc<NavPath>(SCN_AGENTS as i64);
+        self.startRoom = malloc<i32>(SCN_AGENTS as i64);
+        self.goalRoom = malloc<i32>(SCN_AGENTS as i64);
+        self.field = new FlowField(map);
+
+        let mut finder : GridPathfinder = new GridPathfinder(map);
+        for (i of 0..SCN_AGENTS) {
+            self.planAgent(i, map, finder);
+        }
+
+        let heading : f32 = Scenario::firstHeading(self.smooth[0]);
+        self.biped = new WalkerAgent(heading);
+        let wx : i32 = self.world.centerX(self.goalRoom[0]);
+        let wy : i32 = self.world.centerY(self.goalRoom[0]);
+        self.field.rebuildFor(map, wx, wy);
+    }
+
+    // Pairs agent `i` with a room and plans its three routes; the other half of the pair walks the reverse trip.
+    fn planAgent(mut self, i : i32, map : GridMap, finder : GridPathfinder) : void {
+        let rooms : i32 = self.world.roomCount();
+        let pair : i32 = i / 2;
+        let a : i32 = pair % rooms;
+        let mut b : i32 = (pair + rooms / 2) % rooms;
+        if (b == a) {
+            b = (a + 1) % rooms;
+        }
+
+        let mut from : i32 = a;
+        let mut to : i32 = b;
+        if (i % 2 == 1) {
+            from = b;
+            to = a;
+        }
+        self.startRoom[i] = from;
+        self.goalRoom[i] = to;
+
+        // The grid path, its smoothed form, and the mesh funnel path over the same endpoints.
+        let sx : i32 = self.world.centerX(from);
+        let sy : i32 = self.world.centerY(from);
+        let gx : i32 = self.world.centerX(to);
+        let gy : i32 = self.world.centerY(to);
+        let path : GridPath = finder.find(map, sx, sy, gx, gy);
+        let fine : GridPath = path.smoothed(map);
+        let px : f32 = (sx as f32) + SCN_HALF;
+        let py : f32 = (sy as f32) + SCN_HALF;
+        self.funnel[i] = self.mesh.findPath(px, py, (gx as f32) + SCN_HALF, (gy as f32) + SCN_HALF);
+
+        // The crowd wants its own copy of the corners as x, y pairs.
+        let mut pts : f32[] = malloc<f32>((fine.len() * 2 + 2) as i64);
+        for (k of 0..fine.len()) {
+            pts[k * 2] = (fine.xAt(k) as f32) + SCN_HALF;
+            pts[k * 2 + 1] = (fine.yAt(k) as f32) + SCN_HALF;
+        }
+
+        let start : SteerAgent = SteerAgent {
+            pos: Vec2::make(px, py),
+            maxSpeed: SCN_SPEED,
+            maxAccel: SCN_ACCEL,
+            radius: SCN_RADIUS,
+        };
+        self.people.place(i, start);
+        if (fine.found() && fine.len() > 1) {
+            self.people.setPath(i, pts, fine.len());
+        }
+        self.raw[i] = path;
+        self.smooth[i] = fine;
+    }
+
+    // The direction from the first corner of `path` to its second; a path with no segment has no direction.
+    static fn firstHeading(path : GridPath) : f32 {
+        if (path.len() <= 1) {
+            return 0.0;
+        }
+        let dx : f32 = (path.xAt(1) - path.xAt(0)) as f32;
+        let dy : f32 = (path.yAt(1) - path.yAt(0)) as f32;
+        return atan2(dy, dx);
+    }
+
+    /** Runs the simulation until everyone has arrived or `maxSteps` steps have passed; returns the steps taken. */
+    pub fn run(mut self, maxSteps : i32) : i32 {
+        let map : GridMap = self.world.map();
+        while (self.steps < maxSteps && !self.people.allArrived()) {
+            self.people.update(map, SCN_DT, self.biped, true);
+            self.steps = self.steps + 1;
+        }
+        return self.steps;
+    }
+
+    /** The dungeon. */
+    pub fn dungeon(self) : Dungeon {
+        return self.world;
+    }
+
+    /** The navigation mesh made from the dungeon. */
+    pub fn navmesh(self) : NavMesh {
+        return self.mesh;
+    }
+
+    /** The crowd (agent 0 is the walker). */
+    pub fn crowd(self) : Crowd {
+        return self.people;
+    }
+
+    /** The walker. */
+    pub fn walker(self) : WalkerAgent {
+        return self.biped;
+    }
+
+    /** The flow field towards the walker's goal. */
+    pub fn flow(self) : FlowField {
+        return self.field;
+    }
+
+    /** The raw A* path of agent `i`. */
+    pub fn rawPath(self, i : i32) : GridPath {
+        return self.raw[i];
+    }
+
+    /** The smoothed path of agent `i`. */
+    pub fn smoothPath(self, i : i32) : GridPath {
+        return self.smooth[i];
+    }
+
+    /** The navigation mesh path of agent `i`. */
+    pub fn meshPath(self, i : i32) : NavPath {
+        return self.funnel[i];
+    }
+
+    /** The room agent `i` starts in. */
+    pub fn fromRoom(self, i : i32) : i32 {
+        return self.startRoom[i];
+    }
+
+    /** The room agent `i` is going to. */
+    pub fn toRoom(self, i : i32) : i32 {
+        return self.goalRoom[i];
+    }
+
+    /** Steps run so far. */
+    pub fn stepsRun(self) : i32 {
+        return self.steps;
+    }
+}

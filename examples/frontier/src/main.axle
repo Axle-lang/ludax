@@ -1,0 +1,273 @@
+// frontier — an open-world drive on the runtime and openworld layers, with no window.
+//
+// A scripted driver takes a car across a generated open world that is streamed in cells around it, completes a
+// three-stage mission and a follow-up, and does so under the engine's main loop with a fake clock. The program
+// plays the same drive three times and says what it checked:
+//
+//   1. at a steady 60 frames a second, recording the input of every step to a tape;
+//   2. with irregular frames (2 to 45 ms, and the odd long hitch) — it must end in exactly the same state;
+//   3. replaying the tape (saved to bytes and loaded back) under yet another pacing — the same state again.
+//
+// It also checks that the streamed world stays small however far the car goes, that nothing it spawned leaks, that
+// the mission and its follow-up completed with their rewards, and that the car never ended a step inside the
+// ground. It draws a map of the first run into `frontier.png`. The exit status is the number of checks that failed.
+
+use ludax::{
+    ByteBuf, CellStreamer, DataFiles, Image, InputTape, MissionBoard, MISSION_COMPLETED, Scheduler, SkyState,
+    WeatherState, VehicleParams
+};
+
+use crate::gfx::map::{FrontierMap, MapView};
+use crate::sim::game::FrontierGame;
+use crate::sim::run::{PlayStats, frontierPlay};
+use crate::sim::systems::{FrontierSystems, Sys};
+
+// The pacing seeds: 0 is the steady clock, anything else seeds an irregular one. The three runs use different
+// ones so equal results cannot be an artefact of equal frame lengths.
+const FRONTIER_PACING_STEADY : i32 = 0;
+const FRONTIER_PACING_IRREGULAR : i32 = 11;
+const FRONTIER_PACING_REPLAY : i32 = 23;
+
+// The most cells that may be active at once, and the image the first run is drawn into.
+const FRONTIER_ACTIVE_BOUND : i32 = 100;
+const FRONTIER_IMAGE_W : i32 = 900;
+const FRONTIER_IMAGE_H : i32 = 800;
+
+// The world window the map covers: 1 km across and 600 m down, at 2.8 m a pixel.
+const FRONTIER_VIEW_X : f64 = 500.0;
+const FRONTIER_VIEW_Z : f64 = 300.0;
+const FRONTIER_VIEW_SCALE : f64 = 2.8;
+
+const FRONTIER_PNG : string = "frontier.png";
+
+/** Prints one check and answers 1 when it failed. */
+fn frontierCheck(name : string, ok : bool) : i32 {
+    if (ok) {
+        println("  ok    ${name}");
+        return 0;
+    }
+    println("  FAIL  ${name}");
+    return 1;
+}
+
+fn main() : i32 ! IOException {
+    let mut failed : i32 = 0;
+    println("frontier: driving the same mission three times");
+
+    let gameA : FrontierGame = new FrontierGame(new InputTape(), false);
+    let statsA : PlayStats = frontierPlay(gameA, FRONTIER_PACING_STEADY);
+    println("  run A, steady 60 fps:      ${statsA.ticks} steps in ${statsA.frames} frames");
+
+    let gameB : FrontierGame = new FrontierGame(new InputTape(), false);
+    let statsB : PlayStats = frontierPlay(gameB, FRONTIER_PACING_IRREGULAR);
+    println("  run B, irregular frames:   ${statsB.ticks} steps in ${statsB.frames} frames,"
+        + " at most ${statsB.mostSteps} steps in one frame");
+
+    let bytes : ByteBuf = gameA.sys.tape.toBytes();
+    let loaded : InputTape = InputTape::fromBytes(bytes);
+    let tapeOk : bool = loaded.ok() && loaded.sameAs(gameA.sys.tape);
+    let gameC : FrontierGame = new FrontierGame(loaded, true);
+    let statsC : PlayStats = frontierPlay(gameC, FRONTIER_PACING_REPLAY);
+    println("  run C, replay of the tape: ${statsC.ticks} steps in ${statsC.frames} frames,"
+        + " tape of ${bytes.len()} bytes");
+
+    let a : FrontierSystems = gameA.sys;
+    let b : FrontierSystems = gameB.sys;
+    let c : FrontierSystems = gameC.sys;
+    let hashA : i64 = a.stateHash();
+
+    // The map shows the end of run A, with its streamed cells and props still alive.
+    let img : Image = new Image(FRONTIER_IMAGE_W, FRONTIER_IMAGE_H);
+    let view : MapView = MapView {
+        minX: 0.0 - FRONTIER_VIEW_X,
+        minZ: 0.0 - FRONTIER_VIEW_Z,
+        scale: FRONTIER_VIEW_SCALE,
+    };
+    FrontierMap::draw(img, view, a);
+    DataFiles::savePng(FRONTIER_PNG, img);
+    println("frontier: wrote ${FRONTIER_PNG}");
+    println("");
+
+    failed = failed + frontierDeterminism(a, b, c, statsA, statsB, hashA, tapeOk);
+    failed = failed + frontierStreaming(a);
+    failed = failed + frontierMission(a);
+    failed = failed + frontierVehicle(a);
+    failed = failed + frontierScheduler(gameA, a);
+    if (failed == 0) {
+        println("frontier: all checks passed");
+    } else {
+        println("frontier: ${failed} checks failed");
+    }
+    return failed;
+}
+
+// The three runs must agree, however the frames were paced and whether the input came from the driver or the tape.
+fn frontierDeterminism(
+    a : FrontierSystems,
+    b : FrontierSystems,
+    c : FrontierSystems,
+    statsA : PlayStats,
+    statsB : PlayStats,
+    hashA : i64,
+    tapeOk : bool
+) : i32 {
+    let mut failed : i32 = 0;
+    println("determinism");
+    failed = failed + frontierCheck("the missions were completed in run A", a.completedAt > 0 && a.done);
+    failed = failed
+        + frontierCheck(
+            "steady and irregular pacing ran the same number of steps (${a.ticks})",
+            a.ticks == b.ticks
+        );
+    failed = failed
+        + frontierCheck(
+            "the pacings really differed (${statsA.frames} vs ${statsB.frames} frames)",
+            statsA.frames != statsB.frames && statsB.mostSteps > 1
+        );
+    failed = failed + frontierCheck("both ended in the same state (hash ${hashA})", hashA == b.stateHash());
+    failed = failed + frontierCheck("the recorded tape survives bytes and back unchanged", tapeOk);
+    failed = failed
+        + frontierCheck("the tape holds one snapshot per step", a.tape.length() as i64 == a.ticks);
+    failed = failed
+        + frontierCheck(
+            "replaying the tape ends in the same state again",
+            hashA == c.stateHash() && a.ticks == c.ticks
+        );
+    failed = failed
+        + frontierCheck("the replay was driven by the tape, not the driver", c.replay && !a.replay);
+    println("");
+    return failed;
+}
+
+// The world streams: only cells near the car stay alive, but the car visits far more of them.
+fn frontierStreaming(a : FrontierSystems) : i32 {
+    let mut failed : i32 = 0;
+    println("streaming");
+    failed = failed
+        + frontierCheck(
+            "at most ${FRONTIER_ACTIVE_BOUND} cells active at once (peak ${a.peakCells})",
+            a.peakCells <= FRONTIER_ACTIVE_BOUND && a.peakCells > 20
+        );
+    failed = failed
+        + frontierCheck(
+            "the car crossed far more cells than were ever active together (${a.everActive.len()} visited)",
+            a.everActive.len() > a.peakCells * 2
+        );
+    failed = failed
+        + frontierCheck(
+            "entities stay bounded (peak ${a.streamer.peakEntityCount()})",
+            a.streamer.peakEntityCount() <= FRONTIER_ACTIVE_BOUND * 6
+        );
+    failed = failed
+        + frontierCheck(
+            "the scene holds the car and what is registered, nothing else",
+            a.scene.count() == 1 + a.streamer.entityCount()
+        );
+    failed = failed
+        + frontierCheck(
+            "spawned minus removed is what is alive (${a.streamer.totalSpawned()} spawned over the drive)",
+            a.streamer.totalSpawned() - a.streamer.totalRemoved() == a.streamer.entityCount() as i64
+        );
+
+    a.streamer.clear(a.scene);
+    failed = failed
+        + frontierCheck(
+            "clearing the streamer leaves only the car: no leaked entities",
+            a.scene.count() == 1 && a.streamer.totalSpawned() == a.streamer.totalRemoved()
+        );
+    println("");
+    return failed;
+}
+
+// The mission text parsed, both missions completed, and the rewards and flags were posted.
+fn frontierMission(a : FrontierSystems) : i32 {
+    let mut failed : i32 = 0;
+    println("mission");
+    let board : MissionBoard = a.board;
+    failed = failed + frontierCheck("the mission text read without a problem", a.missionProblems() == 0);
+    failed = failed
+        + frontierCheck(
+            "the three-stage mission is completed (at step ${a.completedAt})",
+            board.statusOf("frontier_run") == MISSION_COMPLETED
+        );
+    failed = failed
+        + frontierCheck(
+            "so is the debrief that started itself",
+            board.statusOf("debrief") == MISSION_COMPLETED
+        );
+
+    let gold : i64 = board.rewardTotal("gold");
+    let standing : i64 = board.rewardTotal("standing");
+    failed = failed
+        + frontierCheck(
+            "the rewards were paid (gold ${gold}, standing ${standing})",
+            gold == 500 && standing == 1
+        );
+    failed = failed
+        + frontierCheck(
+            "three crates were collected and the cargo unloaded",
+            a.crates == 3 && a.unloaded && board.flag("unloaded")
+        );
+    failed = failed
+        + frontierCheck("the mission state saves to bytes and loads into a fresh board", frontierSaveLoad(a));
+    println("");
+    return failed;
+}
+
+// The car drove, and no wheel mount was left under the ground at the end of a step.
+fn frontierVehicle(a : FrontierSystems) : i32 {
+    let mut failed : i32 = 0;
+    println("vehicle");
+    let params : VehicleParams = a.params;
+    failed = failed + frontierCheck("the car drove ${a.distance} m", a.distance > 3000.0);
+    failed = failed
+        + frontierCheck(
+            "no wheel mount ended a step inside the ground (lowest ${a.minClearance} m,"
+                + " stop at ${params.minGap})",
+            a.minClearance >= params.minGap - 0.000000001
+        );
+    println("");
+    return failed;
+}
+
+// The scheduler resolved the declared constraints to the expected order and ran every system every step; the
+// sky and weather advanced with the clock.
+fn frontierScheduler(game : FrontierGame, a : FrontierSystems) : i32 {
+    let mut failed : i32 = 0;
+    println("scheduler and sky");
+    let sched : Scheduler = game.sched;
+    println("  order: ${sched.orderText()}");
+    for (i of 0..sched.count()) {
+        let id : i32 = sched.orderAt(i);
+        println("  ${sched.nameOf(id)}: ${sched.runCount(id)} runs, ${sched.totalCostOf(id)} work units,"
+            + " ${sched.overBudgetCount(id)} over budget");
+    }
+
+    failed = failed
+        + frontierCheck(
+            "the declared constraints gave the expected order",
+            sched.orderText() == "clock > input > vehicle > stream > missions"
+        );
+    failed = failed
+        + frontierCheck(
+            "every system ran once per step",
+            sched.runCount(0) == a.ticks && sched.runCount(4) == a.ticks
+        );
+
+    let sky : SkyState = a.sky.state();
+    let weather : WeatherState = a.weather.state();
+    println("  sky at the end: time of day ${sky.timeOfDay}, daylight ${sky.daylight};"
+        + " weather changed ${a.weather.changeCount()} times, now cloud cover ${weather.cloud}");
+    println("");
+    return failed;
+}
+
+/** Saves the mission state, loads it into a board made from the same text, and compares. */
+fn frontierSaveLoad(a : FrontierSystems) : bool {
+    let bytes : ByteBuf = a.board.save();
+    let fresh : FrontierGame = new FrontierGame(new InputTape(), false);
+    let other : MissionBoard = fresh.sys.board;
+    let before : i64 = other.stateHash();
+    let message : string = other.load(bytes);
+    return message == "" && other.stateHash() == a.board.stateHash() && before != other.stateHash();
+}

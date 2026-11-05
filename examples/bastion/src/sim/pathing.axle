@@ -1,0 +1,285 @@
+// pathing — A* over the tile grid, and the route book that remembers the answers.
+//
+// `Pathfinder` finds a shortest route between two tiles with eight-way movement (a diagonal step costs 14,
+// a straight one 10, and a diagonal may not cut the corner of a blocked tile). The open list is a ludax
+// `Heap` keyed by f = g + h, the closed list a `BitSet`; equal keys leave the heap in push order, so the
+// route is the same on every run.
+//
+// `RouteBook` sits in front of it for the enemies: it keeps, for each tile, the next tile on the way to the
+// goal, asks the pathfinder only for tiles it has not answered yet, and forgets everything when the map
+// changes. Re-pathing after the player builds is therefore "bump the version"; each enemy asks again when it
+// reaches its next tile.
+
+use ludax::{BitSet, Heap, Vec};
+
+use crate::sim::grid::Grid;
+
+/** Cost of a straight step. */
+const COST_STRAIGHT : i32 = 10;
+
+/** Cost of a diagonal step. */
+const COST_DIAGONAL : i32 = 14;
+
+/** Marks a tile whose next step has not been worked out yet. */
+const ROUTE_UNKNOWN : i32 = -2;
+
+/** Marks a tile with no way to the goal. */
+const ROUTE_NONE : i32 = -1;
+
+/** Cost standing in for "not reached yet"; no real route comes near it. */
+const PATH_INFINITY : i32 = 1000000;
+
+// Walks the parent links back from `to` and writes the route in travel order.
+fn routeFromParents(parent : i32[], from : i32, to : i32, out : Vec<i32>) : void {
+    let mut at : i32 = to;
+    while (at != from) {
+        out.push(at);
+        at = parent[at];
+    }
+    out.push(from);
+    let n : i32 = out.len();
+    for (i of 0..n / 2) {
+        out.swap(i, n - 1 - i);
+    }
+}
+
+/** Finds shortest tile routes; owns its scratch arrays so a search allocates nothing. */
+pub class Pathfinder {
+    cost    : i32[];
+    parent  : i32[];
+    closed  : BitSet;
+    open    : Heap<i32>;
+    visited : BitSet;
+    queue   : Vec<i32>;
+
+    /** A pathfinder sized for the map. */
+    constructor() {
+        let n : i64 = Grid::tileCount() as i64;
+        self.cost = malloc<i32>(n);
+        self.parent = malloc<i32>(n);
+        self.closed = new BitSet(Grid::tileCount());
+        self.open = new Heap<i32>();
+        self.visited = new BitSet(Grid::tileCount());
+        self.queue = new Vec<i32>();
+    }
+
+    /**
+     * The tiles from `from` to `to` inclusive, appended to `out` (which is cleared first). Returns false and
+     * leaves `out` empty when `to` cannot be reached. `from` and `to` are allowed to be blocked themselves;
+     * only the tiles between them must be free.
+     */
+    pub fn find(mut self, blocked : BitSet, from : i32, to : i32, out : Vec<i32>) : bool {
+        out.clear();
+        self.closed.clearAll();
+        self.open.clear();
+        for (t of 0..Grid::tileCount()) {
+            self.cost[t] = PATH_INFINITY;
+            self.parent[t] = -1;
+        }
+        self.cost[from] = 0;
+        self.open.push(Pathfinder::heuristic(from, to) as i64, from);
+        while (!self.open.isEmpty()) {
+            let at : i32 = self.open.pop();
+            if (self.closed.has(at)) {
+                continue;
+            }
+            self.closed.set(at);
+            if (at == to) {
+                routeFromParents(self.parent, from, to, out);
+                return true;
+            }
+            self.expand(blocked, at, to);
+        }
+        return false;
+    }
+
+    /** True when some route joins `from` to `to` over free tiles (a flood fill, cheaper than `find`). */
+    pub fn canReach(mut self, blocked : BitSet, from : i32, to : i32) : bool {
+        self.floodFrom(blocked, to);
+        return self.visited.has(from);
+    }
+
+    /**
+     * Fills `reached` with every tile that can walk to `goal`: the set the player must not cut an enemy off
+     * from. `reached` is cleared first.
+     */
+    pub fn reachableFrom(mut self, blocked : BitSet, goal : i32, reached : BitSet) : void {
+        self.floodFrom(blocked, goal);
+        reached.clearAll();
+        reached.unionWith(self.visited);
+    }
+
+    // Breadth-first fill from `start` over unblocked tiles into `visited`; the start itself counts as free.
+    fn floodFrom(mut self, blocked : BitSet, start : i32) : void {
+        self.visited.clearAll();
+        self.queue.clear();
+        self.visited.set(start);
+        self.queue.push(start);
+        let mut head : i32 = 0;
+        while (head < self.queue.len()) {
+            let at : i32 = self.queue.get(head);
+            head = head + 1;
+            for (d of 0..8) {
+                let next : i32 = Pathfinder::neighbour(blocked, at, d);
+                if (next >= 0 && !self.visited.has(next)) {
+                    self.visited.set(next);
+                    self.queue.push(next);
+                }
+            }
+        }
+    }
+
+    // Relaxes the neighbours of `at`.
+    fn expand(mut self, blocked : BitSet, at : i32, to : i32) : void {
+        for (d of 0..8) {
+            let next : i32 = Pathfinder::neighbour(blocked, at, d);
+            if (next < 0 || self.closed.has(next)) {
+                continue;
+            }
+            let mut stepCost : i32 = COST_STRAIGHT;
+            if (d >= 4) {
+                stepCost = COST_DIAGONAL;
+            }
+            let g : i32 = self.cost[at] + stepCost;
+            if (g < self.cost[next]) {
+                self.cost[next] = g;
+                self.parent[next] = at;
+                self.open.push((g + Pathfinder::heuristic(next, to)) as i64, next);
+            }
+        }
+    }
+
+    // Octile distance: the cost of the best route if nothing were in the way. Admissible and consistent.
+    static fn heuristic(a : i32, b : i32) : i32 {
+        let mut dx : i32 = Grid::colOf(a) - Grid::colOf(b);
+        let mut dz : i32 = Grid::rowOf(a) - Grid::rowOf(b);
+        if (dx < 0) {
+            dx = 0 - dx;
+        }
+        if (dz < 0) {
+            dz = 0 - dz;
+        }
+        let mut lo : i32 = dx;
+        let mut hi : i32 = dz;
+        if (lo > hi) {
+            lo = dz;
+            hi = dx;
+        }
+        return COST_DIAGONAL * lo + COST_STRAIGHT * (hi - lo);
+    }
+
+    // The tile reached from `at` by direction `d` (0-3 straight, 4-7 diagonal), or -1 if it is off the map,
+    // blocked, or a diagonal that would cut a blocked corner.
+    static fn neighbour(blocked : BitSet, at : i32, d : i32) : i32 {
+        let dx : i32 = Pathfinder::stepX(d);
+        let dz : i32 = Pathfinder::stepZ(d);
+        let x : i32 = Grid::colOf(at) + dx;
+        let z : i32 = Grid::rowOf(at) + dz;
+        if (!Grid::inside(x, z) || blocked.has(Grid::index(x, z))) {
+            return -1;
+        }
+        if (d >= 4) {
+            let across : i32 = Grid::index(Grid::colOf(at) + dx, Grid::rowOf(at));
+            let along : i32 = Grid::index(Grid::colOf(at), Grid::rowOf(at) + dz);
+            if (blocked.has(across) || blocked.has(along)) {
+                return -1;
+            }
+        }
+        return Grid::index(x, z);
+    }
+
+    static fn stepX(d : i32) : i32 {
+        return match d {
+            0 => 1,
+            1 => -1,
+            4 => 1,
+            5 => -1,
+            6 => 1,
+            7 => -1,
+            _ => 0,
+        };
+    }
+
+    static fn stepZ(d : i32) : i32 {
+        return match d {
+            2 => 1,
+            3 => -1,
+            4 => 1,
+            5 => 1,
+            6 => -1,
+            7 => -1,
+            _ => 0,
+        };
+    }
+}
+
+/** Remembers the next step toward the goal for every tile asked about since the map last changed. */
+pub class RouteBook {
+    finder   : Pathfinder;
+    next     : i32[];
+    scratch  : Vec<i32>;
+    version  : i32 = 0;
+    searches : i32 = 0;
+
+    /** An empty book with its own pathfinder. */
+    constructor() {
+        self.finder = new Pathfinder();
+        self.next = malloc<i32>(Grid::tileCount() as i64);
+        self.scratch = new Vec<i32>();
+        self.forgetAll();
+    }
+
+    /** The pathfinder the book asks, for callers that need a search of their own (build checks, map making). */
+    pub fn finder(self) : Pathfinder {
+        return self.finder;
+    }
+
+    /** How many times the map has changed; the HUD shows it as the "paths" counter. */
+    pub fn version(self) : i32 {
+        return self.version;
+    }
+
+    /** How many A* searches have run in total. */
+    pub fn searchCount(self) : i32 {
+        return self.searches;
+    }
+
+    /** Throws every remembered step away because the map changed. */
+    pub fn invalidate(mut self) : void {
+        self.version = self.version + 1;
+        self.forgetAll();
+    }
+
+    /**
+     * The tile an enemy standing on `tile` should walk to next, or -1 when it has no way to the goal.
+     * The goal tile itself answers -1.
+     */
+    pub fn nextStep(mut self, grid : Grid, tile : i32) : i32 {
+        if (tile == Grid::goalTile()) {
+            return ROUTE_NONE;
+        }
+        if (self.next[tile] == ROUTE_UNKNOWN) {
+            self.solve(grid, tile);
+        }
+        return self.next[tile];
+    }
+
+    // One search from `tile`; every tile on the found route learns its own next step, because the rest of a
+    // shortest route is itself a shortest route.
+    fn solve(mut self, grid : Grid, tile : i32) : void {
+        self.searches = self.searches + 1;
+        if (!self.finder.find(grid.blockedSet(), tile, Grid::goalTile(), self.scratch)) {
+            self.next[tile] = ROUTE_NONE;
+            return;
+        }
+        for (i of 0..self.scratch.len() - 1) {
+            self.next[self.scratch.get(i)] = self.scratch.get(i + 1);
+        }
+    }
+
+    fn forgetAll(mut self) : void {
+        for (t of 0..Grid::tileCount()) {
+            self.next[t] = ROUTE_UNKNOWN;
+        }
+    }
+}

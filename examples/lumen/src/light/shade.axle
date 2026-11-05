@@ -1,0 +1,287 @@
+// shade — the light that arrives at a surface point and what the surface sends back.
+//
+// Nothing here is left to chance, which is what keeps a picture of a still world still. Every term is kept apart
+// so the debug views can show it alone and so the sum can be checked:
+//
+//   direct   the sun and the moon through the soft shadow the light engine baked for the cell (read smoothly
+//            from the volume, so a shadow edge is the same on every frame), the cloud deck shading the ground,
+//            and the lamps as point lights with a hard shadow ray each and GGX highlights
+//   ambient  the sky dome's SH9 through the baked sky access and the baked bounce tint (a red roof tints the
+//            snow beside it), and the flooded block light as fill
+//   emitted  what the block radiates (lanterns, lava, crystals)
+//
+// The BRDF, the light geometry and the unit conventions are Ludax's `render/light`; the baked terms are the
+// light engine's, copied into `lightvol`; this file only combines them.
+
+use ludax::{
+    Ray, Vec3, LightSource, LightMaterial, LightAlphaMode, LightDiffuseModel, LightDfg, LightPrepared,
+    LightIncident, LightBrdfTerms, LightReason, lightPrepare, lightBrdf, lightIncidence, sin, saturate, max,
+    PI
+};
+
+use crate::light::lamps::LAMP_NEAR_MAX;
+use crate::light::lightvol::LumenLightSample;
+use crate::light::sky::{LumenSky, lumenCloudCover, lumenCloudDistance};
+use crate::render::env::LumenEnv;
+use crate::render::point::LumenPoint;
+use crate::world::blocks::LumenBlock;
+
+/** How strongly the flooded block light fills a surface (radiance of a white wall one cell from a lamp). */
+const SHADE_FLOOD : f32 = 0.3;
+
+/** The share of the dome that reaches a point whose sky access is zero: a fully enclosed place still sees some. */
+const SHADE_ACCESS_FLOOR : f32 = 0.35;
+
+/** The sky body is above the horizon by more than this (a body below it lights nothing). */
+const SHADE_HORIZON : f32 = -0.04;
+
+/** What the densest cloud deck removes from a sky body's light. */
+const SHADE_CLOUD_REMOVE : f32 = 0.78;
+
+/** How far off a surface the light volume is sampled, so the probe is in air, not in the wall. */
+const SHADE_PROBE : f32 = 0.55;
+
+/** A lamp dimmer than this contributes nothing a surface could show. */
+const SHADE_LAMP_MIN : f32 = 0.0005;
+
+/** Above this night factor the moon is worth a shadow ray. */
+const SHADE_NIGHT : f32 = 0.05;
+
+/** The shaded point, term by term. */
+pub struct LumenLit {
+    /** Sun, moon and lamps. */
+    pub direct : Vec3 = Vec3 { x: 0.0, y: 0.0, z: 0.0 };
+
+    /** Sky, bounce tint and flooded block light. */
+    pub ambient : Vec3 = Vec3 { x: 0.0, y: 0.0, z: 0.0 };
+
+    /** What the surface emits. */
+    pub emitted : Vec3 = Vec3 { x: 0.0, y: 0.0, z: 0.0 };
+
+    /** The sum. */
+    pub fn total(self) : Vec3 {
+        return self.direct.plus(self.ambient).plus(self.emitted);
+    }
+}
+
+// The share of the dome a probe sees: its flooded sky above the floor that no wall can remove.
+fn shSkyShare(l : LumenLightSample) : f32 {
+    return l.sky * (SHADE_ACCESS_FLOOR + ((1.0 as f32) - SHADE_ACCESS_FLOOR) * l.access);
+}
+
+/** A repeating, moving pattern of bright lines: light focused by waves onto the lake bed. */
+pub fn lumenCaustic(x : f32, z : f32, t : f32) : f32 {
+    let a : f32 = sin(x * (1.3 as f32) + t * (1.1 as f32)
+        + sin(z * (0.9 as f32) + t * (0.7 as f32)) * (1.5 as f32));
+    let b : f32 = sin(z * (1.1 as f32) - t * (0.9 as f32) + sin(x * (0.8 as f32) + t) * (1.4 as f32));
+    let v : f32 = (1.0 as f32) - shAbs(a * b);
+    let v2 : f32 = v * v;
+    return (0.3 as f32) + (2.6 as f32) * v2 * v2;
+}
+
+fn shAbs(v : f32) : f32 {
+    if (v < 0.0) {
+        return -v;
+    }
+    return v;
+}
+
+/**
+ * How much of a body in the sky is left after the cloud deck: the clouds shade the ground by moving over it, so
+ * a point's light depends on the cover where its ray to the body crosses the deck.
+ */
+pub fn lumenCloudShade(from : Vec3, toward : Vec3, deck : f32) : f32 {
+    let reach : f32 = lumenCloudDistance(from.y, toward.y);
+    if (reach <= 0.0) {
+        return 1.0;
+    }
+    let cover : f32 = lumenCloudCover(from.x + toward.x * reach, from.z + toward.z * reach, deck);
+    return (1.0 as f32) - SHADE_CLOUD_REMOVE * cover;
+}
+
+// The direct light of one sky body (sun or moon) on the point, through the baked soft shadow `baked`.
+fn shBody(
+    env : Shared<LumenEnv>,
+    light : LightSource,
+    pt : LumenPoint,
+    prepared : LightPrepared,
+    view : Vec3,
+    baked : f32
+) : Vec3 {
+    let toward : Vec3 = light.direction.negated();
+    if (toward.y < SHADE_HORIZON || light.intensity < 0.00001 || baked <= 0.0) {
+        return Vec3::zero();
+    }
+    let inc : LightIncident = lightIncidence(light, pt.pos, pt.n, pt.ng, pt.layer, 0);
+    if (inc.reason != LightReason::None) {
+        return Vec3::zero();
+    }
+    let vis : f32 = baked * lumenCloudShade(pt.pos, toward, env.time);
+    let brdf : LightBrdfTerms = lightBrdf(prepared, pt.n, view, inc.toLight);
+    let incoming : Vec3 = light.color.scale(inc.irradiance * vis);
+    let mut lit : Vec3 = brdf.diffuse.plus(brdf.specular).times(incoming);
+    if (env.scene.at(pt.pos.x as i32, (pt.pos.y + 0.5) as i32, pt.pos.z as i32) == LumenBlock::Water.id()) {
+        lit = lit.scale(lumenCaustic(pt.pos.x, pt.pos.z, env.time));
+    }
+    return lit;
+}
+
+// The direct light of the lamps around the point: the bucketed lamps that reach it and the far reaching ones.
+fn shLamps(
+    env : Shared<LumenEnv>,
+    pt : LumenPoint,
+    prepared : LightPrepared,
+    view : Vec3,
+    near : i32[]
+) : Vec3 {
+    let mut sum : Vec3 = Vec3::zero();
+    let found : i32 = env.lamps.near(pt.pos, near, LAMP_NEAR_MAX);
+    let from : Vec3 = pt.pos.plus(pt.ng.scale(0.004));
+    for (k of 0..found) {
+        if (env.lamps.reaches(near[k as i64], pt.pos)) {
+            sum = sum.plus(shLamp(env, near[k as i64], pt, prepared, view, from));
+        }
+    }
+    for (k of 0..env.lamps.far.len()) {
+        if (env.lamps.reaches(env.lamps.far.get(k), pt.pos)) {
+            sum = sum.plus(shLamp(env, env.lamps.far.get(k), pt, prepared, view, from));
+        }
+    }
+    return sum;
+}
+
+// One lamp on one point: the spec's flicker, layers and reach through `lightIncidence`, then, if the lamp wants a
+// shadow, a ray that ignores the obstacle classes the lamp's light passes through.
+fn shLamp(
+    env : Shared<LumenEnv>,
+    index : i32,
+    pt : LumenPoint,
+    prepared : LightPrepared,
+    view : Vec3,
+    from : Vec3
+) : Vec3 {
+    let light : LightSource = env.lamps.lightAt(index, env.time);
+    let inc : LightIncident = lightIncidence(light, pt.pos, pt.n, pt.ng, pt.layer, 0);
+    if (inc.reason != LightReason::None || inc.irradiance < SHADE_LAMP_MIN) {
+        return Vec3::zero();
+    }
+    let mut seen : Vec3 = Vec3::splat(1.0);
+    if (env.lamps.castsShadow(index)) {
+        let delta : Vec3 = light.position.minus(from);
+        let dist : f32 = delta.length();
+        let dir : Vec3 = delta.scale((1.0 as f32) / max(dist, 0.001));
+        let ray : Ray = Ray::make(from, dir);
+        seen = env.scene.visibility(ray, dist - 0.9, env.lamps.specs.get(index).pass.bits);
+        if (seen.maxComponent() <= 0.0) {
+            return Vec3::zero();
+        }
+    }
+    let brdf : LightBrdfTerms = lightBrdf(prepared, pt.n, view, inc.toLight);
+    return brdf.diffuse.plus(brdf.specular).times(light.color.scale(inc.irradiance)).times(seen);
+}
+
+/**
+ * The radiance a Lambertian surface of `albedo` and normal `n` at `p` shows under the baked light alone: the
+ * cheap shading of what is seen in a reflection or through water, where nobody can tell the difference.
+ * `caustic` modulates the sun under water by the pattern of the waves above.
+ */
+pub fn lumenSimpleSurface(
+    env : Shared<LumenEnv>,
+    p : Vec3,
+    n : Vec3,
+    albedo : Vec3,
+    emit : Vec3,
+    caustic : bool
+) : Vec3 {
+    let probe : LumenLightSample = env.vol.sample(
+        env.scene,
+        p.x + n.x * SHADE_PROBE,
+        p.y + n.y * SHADE_PROBE,
+        p.z + n.z * SHADE_PROBE
+    );
+    let sky : LumenSky = env.sky;
+    let mut tint : Vec3 = Vec3::splat(1.0);
+    if (env.settings.bounce) {
+        tint = probe.tint;
+    }
+    let mut light : Vec3 = sky.dome.irradiance(n).scale(shSkyShare(probe)).times(tint);
+    light = light.plus(probe.block.scale(SHADE_FLOOD));
+    let sunCos : f32 = n.dot(sky.sunDir);
+    if (sunCos > 0.0 && sky.sunDir.y > SHADE_HORIZON) {
+        let mut sun : Vec3 = sky.sunIrr.scale(probe.sun * lumenCloudShade(p, sky.sunDir, env.time) * sunCos
+            / PI);
+        if (caustic) {
+            sun = sun.scale(lumenCaustic(p.x, p.z, env.time));
+        }
+        light = light.plus(sun);
+    }
+    let moonCos : f32 = n.dot(sky.moonDir);
+    if (moonCos > 0.0 && sky.moonDir.y > SHADE_HORIZON && sky.night > 0.2) {
+        light = light.plus(sky.moonIrr.scale(probe.sun * moonCos / PI));
+    }
+    return albedo.times(light).plus(emit);
+}
+
+/**
+ * Shades `pt` seen along the unit vector `view` (pointing at the eye). `reflected` is the radiance along the mirror
+ * direction when the caller traced it (`traced` true), for smooth surfaces. `near` is scratch space for 16 lamp
+ * indices.
+ */
+pub fn lumenShade(
+    env : Shared<LumenEnv>,
+    pt : LumenPoint,
+    view : Vec3,
+    traced : bool,
+    reflected : Vec3,
+    near : i32[]
+) : LumenLit {
+    let sky : LumenSky = env.sky;
+    let material : LightMaterial = LightMaterial {
+        baseColor: pt.albedo,
+        metallic: pt.metal,
+        roughness: pt.rough,
+        occlusion: 1.0,
+        alphaMode: LightAlphaMode::Opaque,
+        diffuseModel: LightDiffuseModel::Lambert,
+    };
+    let nv : f32 = max(pt.n.dot(view), 0.0001);
+    let dfg : LightDfg = env.dfg.lookup(nv, pt.rough);
+    let prepared : LightPrepared = lightPrepare(material, dfg);
+    let probe : LumenLightSample = env.vol.sample(
+        env.scene,
+        pt.pos.x + pt.ng.x * SHADE_PROBE,
+        pt.pos.y + pt.ng.y * SHADE_PROBE,
+        pt.pos.z + pt.ng.z * SHADE_PROBE
+    );
+    let mut lit : LumenLit = LumenLit {};
+    lit.emitted = pt.emissive;
+
+    // Direct: the two sky bodies through their baked shadow, then the lamps.
+    let mut direct : Vec3 = shBody(env, sky.sun, pt, prepared, view, probe.sun);
+    if (sky.night > SHADE_NIGHT) {
+        direct = direct.plus(shBody(env, sky.moon, pt, prepared, view, probe.sun));
+    }
+    if (env.settings.lamps) {
+        direct = direct.plus(shLamps(env, pt, prepared, view, near));
+    }
+    lit.direct = direct;
+
+    // Ambient: the dome through the sky light and the access, in the colour of what the sky rays hit.
+    let mut tint : Vec3 = Vec3::splat(1.0);
+    if (env.settings.bounce) {
+        tint = probe.tint;
+    }
+    let domeLight : Vec3 = sky.dome.irradiance(pt.n).scale(shSkyShare(probe)).times(tint);
+    let open : f32 = probe.sky * probe.access;
+    let mut ambient : Vec3 = prepared.diffuse.times(domeLight);
+    let mut specularIn : Vec3 = sky
+        .prefiltered(pt.n.negated().plus(view.scale((2.0 as f32) * nv)).normalized(), pt.rough)
+        .scale(open * probe.access);
+    if (traced) {
+        specularIn = reflected;
+    }
+    ambient = ambient.plus(prepared.specularAlbedo.times(specularIn));
+    ambient = ambient.plus(prepared.diffuse.times(probe.block).scale(SHADE_FLOOD));
+    lit.ambient = ambient;
+    return lit;
+}

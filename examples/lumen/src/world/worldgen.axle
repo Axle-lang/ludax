@@ -1,0 +1,639 @@
+// worldgen — the valley: its land, buildings, trees, cave and lamps, all generated from a cell function.
+//
+// A lake under a snowy mountain, a lit cabin and pier, a forest, a watch tower and a crystal cave with a lava
+// pool. Everything is a function of the cell, so the world is the same on every run. The composition is meant
+// to show the light: open water for reflections, snow and sand for bounce, deep shade under the pines, warm
+// lanterns against a cold dusk sky, and a cave lit only by coloured stone.
+
+use ludax::{Vec3, VoxelGrid, LightShadowMode, smoothstep, min, max};
+
+use crate::world::blocks::{LumenBlock, LumenObstacle, LumenLayer, LumenObstacles, LumenLayers};
+use crate::world::lampspec::{LumenLampSpec, LumenLampBook};
+use crate::world::noise::{lnFbm2, lnUnit};
+
+/** Width and depth of the world in cells. */
+pub const WORLD_XZ : i32 = 320;
+
+/** Height of the world in cells. */
+pub const WORLD_Y : i32 = 64;
+
+/** The water surface: the top cell of the lake is at this height. */
+pub const WORLD_SEA : i32 = 13;
+
+/** Where the original valley sits in the world: its south-west corner, in cells. The valley is 160 cells across. */
+pub const WORLD_VALLEY : i32 = 80;
+
+// The valley's cabin and tower, at their valley coordinates (112, 50) and (137, 96) plus WORLD_VALLEY.
+const CABIN_X : i32 = 192;
+const CABIN_Z : i32 = 130;
+const TOWER_X : i32 = 217;
+const TOWER_Z : i32 = 176;
+
+/** The level cabins stand on. */
+const PAD_Y : i32 = 17;
+
+/** How many more cabins and towers the land around the valley has. */
+const SITE_CABINS : i32 = 4;
+const SITE_TOWERS : i32 = 2;
+
+fn wgDist(ax : f32, az : f32, bx : f32, bz : f32) : f32 {
+    let dx : f32 = ax - bx;
+    let dz : f32 = az - bz;
+    return (dx * dx + dz * dz).sqrt();
+}
+
+// The outer cabins and towers, by number: the places the land is levelled for them and the trees keep clear of.
+fn siteCabinX(i : i32) : i32 {
+    if (i == 0) {
+        return 160;
+    }
+    if (i == 1) {
+        return 44;
+    }
+    if (i == 2) {
+        return 276;
+    }
+    return 160;
+}
+
+fn siteCabinZ(i : i32) : i32 {
+    if (i == 0) {
+        return 44;
+    }
+    if (i == 1) {
+        return 170;
+    }
+    if (i == 2) {
+        return 150;
+    }
+    return 276;
+}
+
+fn siteTowerX(i : i32) : i32 {
+    if (i == 0) {
+        return 52;
+    }
+    return 270;
+}
+
+fn siteTowerZ(i : i32) : i32 {
+    if (i == 0) {
+        return 60;
+    }
+    return 272;
+}
+
+// True when (x, z) lies within `r` cells of a cabin or a tower of the world.
+fn nearSite(x : i32, z : i32, r : f32) : bool {
+    let fx : f32 = x as f32;
+    let fz : f32 = z as f32;
+    if (wgDist(fx, fz, CABIN_X as f32, CABIN_Z as f32) < r + (6.0 as f32)
+        || wgDist(fx, fz, TOWER_X as f32, TOWER_Z as f32) < r) {
+        return true;
+    }
+    for (i of 0..SITE_CABINS) {
+        if (wgDist(fx, fz, siteCabinX(i) as f32, siteCabinZ(i) as f32) < r + (6.0 as f32)) {
+            return true;
+        }
+    }
+    for (i of 0..SITE_TOWERS) {
+        if (wgDist(fx, fz, siteTowerX(i) as f32, siteTowerZ(i) as f32) < r) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// The valley's own ground (the map this world grew around): hills, the mountain in the north-west, the lake in the
+// south and a ring of crests with an opening to the east and one to the south. (lx, lz) are valley coordinates.
+fn valleyHeight(lx : f32, lz : f32) : f32 {
+    let n : f32 = lnFbm2(lx * (0.028 as f32), lz * (0.028 as f32), 5, 1);
+    let mut h : f32 = (10.0 as f32) + n * (15.0 as f32);
+    let mountain : f32 = smoothstep(0.0, 1.0, (1.0 as f32) - wgDist(lx, lz, 40.0, 40.0) / (44.0 as f32));
+    h = h + mountain * (34.0 as f32);
+    let lake : f32 = smoothstep(0.0, 1.0, (1.0 as f32) - wgDist(lx, lz, 90.0, 94.0) / (34.0 as f32));
+    h = h - lake * (15.0 as f32);
+    let rim : f32 = smoothstep(0.7, 1.0, max(wgAbs(lx - 80.0), wgAbs(lz - 80.0)) / (80.0 as f32));
+    let mut gate : f32 = 1.0;
+    if (lx > 56.0) {
+        gate = min(gate, smoothstep(6.0, 18.0, wgAbs(lz - 80.0)));
+    }
+    if (lz > 56.0) {
+        gate = min(gate, smoothstep(6.0, 18.0, wgAbs(lx - 80.0)));
+    }
+    return h + rim * gate * (36.0 as f32);
+}
+
+// The land beyond the valley: rolling hills, ranges of ridged mountains where a slow noise says so, and lakes in the
+// low basins. (x, z) are world coordinates.
+fn outerHeight(x : f32, z : f32) : f32 {
+    let mut h : f32 = (12.0 as f32) + lnFbm2(x * (0.012 as f32), z * (0.012 as f32), 5, 77) * (26.0 as f32);
+    let ridge : f32 = (1.0 as f32)
+        - wgAbs((2.0 as f32) * lnFbm2(x * (0.006 as f32), z * (0.006 as f32), 4, 91) - (1.0 as f32));
+    let range : f32 = smoothstep(0.52, 0.82, lnFbm2(x * (0.004 as f32), z * (0.004 as f32), 3, 123));
+    h = h + ridge * ridge * range * (44.0 as f32);
+    let basin : f32 = lnFbm2(x * (0.007 as f32) + (9.0 as f32), z * (0.007 as f32) - (3.0 as f32), 3, 55);
+    h = h - ((1.0 as f32) - smoothstep(0.3, 0.42, basin)) * (22.0 as f32);
+    return h;
+}
+
+/** The ground height at column (x, z) before any building, in cells. */
+pub fn worldHeight(x : i32, z : i32) : i32 {
+    let fx : f32 = x as f32;
+    let fz : f32 = z as f32;
+    let lx : f32 = fx - (WORLD_VALLEY as f32);
+    let lz : f32 = fz - (WORLD_VALLEY as f32);
+    let reach : f32 = max(wgAbs(lx - 80.0), wgAbs(lz - 80.0));
+    let outer : f32 = outerHeight(fx, fz);
+    let mut h : f32 = outer;
+    if (reach < 108.0) {
+        let valley : f32 = valleyHeight(lx, lz);
+        h = valley + (outer - valley) * smoothstep(84.0, 108.0, reach);
+    }
+    // The edge of the world is a wall of mountains, so the view never ends in nothing.
+    let half : f32 = (WORLD_XZ as f32) * (0.5 as f32);
+    let edge : f32 = max(wgAbs(fx - half), wgAbs(fz - half)) / half;
+    h = h + smoothstep(0.8, 1.0, edge) * (30.0 as f32);
+    let pad : f32 = smoothstep(
+        0.0,
+        1.0,
+        (1.0 as f32) - (wgDist(fx, fz, CABIN_X as f32, CABIN_Z as f32) - 9.0) / (9.0 as f32)
+    );
+    h = h + ((PAD_Y as f32) - (1.0 as f32) - h) * pad;
+    let hill : f32 = smoothstep(
+        0.0,
+        1.0,
+        (1.0 as f32) - (wgDist(fx, fz, TOWER_X as f32, TOWER_Z as f32) - 3.0) / (9.0 as f32)
+    );
+    h = h + ((WORLD_SEA + 8) as f32 - h) * hill;
+    for (i of 0..SITE_CABINS) {
+        let w : f32 = smoothstep(
+            0.0,
+            1.0,
+            (1.0 as f32) - (wgDist(fx, fz, siteCabinX(i) as f32, siteCabinZ(i) as f32) - 9.0) / (9.0 as f32)
+        );
+        h = h + ((PAD_Y as f32) - (1.0 as f32) - h) * w;
+    }
+    for (i of 0..SITE_TOWERS) {
+        let w : f32 = smoothstep(
+            0.0,
+            1.0,
+            (1.0 as f32) - (wgDist(fx, fz, siteTowerX(i) as f32, siteTowerZ(i) as f32) - 3.0) / (9.0 as f32)
+        );
+        h = h + ((WORLD_SEA + 8) as f32 - h) * w;
+    }
+    // The sum of ranges, the rim and the edge wall can rise past the top of the world: above 40 cells the ground
+    // eases toward the ceiling instead of being cut off flat by it.
+    if (h > 40.0) {
+        let over : f32 = h - (40.0 as f32);
+        h = (40.0 as f32) + (21.0 as f32) * over / (over + (28.0 as f32));
+    }
+    let ground : i32 = h as i32;
+    if (ground < 3) {
+        return 3;
+    }
+    return ground;
+}
+
+fn wgAbs(v : f32) : f32 {
+    if (v < 0.0) {
+        return -v;
+    }
+    return v;
+}
+
+/**
+ * Writes the world into `grid` and the lamps it places into `lamps`. Chunks are created for the whole volume
+ * first so every cell exists.
+ */
+pub fn worldBuild(grid : Shared<VoxelGrid>, lamps : LumenLampBook) : void {
+    for (cy of 0..(WORLD_Y / 16)) {
+        for (cz of 0..(WORLD_XZ / 16)) {
+            for (cx of 0..(WORLD_XZ / 16)) {
+                grid.ensureChunk(cx, cy, cz);
+            }
+        }
+    }
+    for (z of 0..WORLD_XZ) {
+        for (x of 0..WORLD_XZ) {
+            terrainColumn(grid, x, z);
+        }
+    }
+    carveCave(grid);
+
+    // Trees on a five-cell lattice, each jittered within its cell.
+    for (z of 0..(WORLD_XZ / 5)) {
+        for (x of 0..(WORLD_XZ / 5)) {
+            tree(grid, x * 5, z * 5);
+        }
+    }
+    cabin(grid, lamps, CABIN_X, CABIN_Z);
+    pier(grid, lamps, CABIN_X, CABIN_Z);
+    tower(grid, lamps, TOWER_X, TOWER_Z);
+    plaza(grid);
+    lanternPath(grid, lamps, CABIN_X, CABIN_Z, TOWER_X, TOWER_Z);
+    for (i of 0..SITE_CABINS) {
+        cabin(grid, lamps, siteCabinX(i), siteCabinZ(i));
+        pier(grid, lamps, siteCabinX(i), siteCabinZ(i));
+        let t : i32 = i % SITE_TOWERS;
+        lanternPath(grid, lamps, siteCabinX(i), siteCabinZ(i), siteTowerX(t), siteTowerZ(t));
+    }
+    for (i of 0..SITE_TOWERS) {
+        tower(grid, lamps, siteTowerX(i), siteTowerZ(i));
+    }
+}
+
+fn terrainColumn(grid : Shared<VoxelGrid>, x : i32, z : i32) : void {
+    let h : i32 = worldHeight(x, z);
+    for (y of 0..(h + 1)) {
+        let mut id : i32 = LumenBlock::Stone.id();
+        if (y >= h - 3 && y > 0) {
+            if (h <= WORLD_SEA + 1) {
+                id = LumenBlock::Sand.id();
+            } else if (h >= 44) {
+                id = LumenBlock::Snow.id();
+            } else if (h >= 35) {
+                id = LumenBlock::Stone.id();
+            } else if (y == h) {
+                id = LumenBlock::Grass.id();
+            } else {
+                id = LumenBlock::Dirt.id();
+            }
+        }
+        if (y == h && h >= 38 && h < 44 && lnUnit(x, 0, z, 5) < (0.35 as f32)) {
+            id = LumenBlock::Snow.id();
+        }
+        grid.setBlock(x, y, z, id);
+    }
+    for (y of (h + 1)..(WORLD_SEA + 1)) {
+        grid.setBlock(x, y, z, LumenBlock::Water.id());
+    }
+}
+
+fn carveBall(grid : Shared<VoxelGrid>, cx : f32, cy : f32, cz : f32, r : f32) : void {
+    let x0 : i32 = (cx - r) as i32;
+    let x1 : i32 = (cx + r) as i32 + 1;
+    let mut y0 : i32 = (cy - r) as i32;
+    let y1 : i32 = (cy + r) as i32 + 1;
+    let z0 : i32 = (cz - r) as i32;
+    let z1 : i32 = (cz + r) as i32 + 1;
+    if (y0 < 2) {
+        y0 = 2;
+    }
+    for (z of z0..z1) {
+        for (y of y0..y1) {
+            for (x of x0..x1) {
+                let dx : f32 = (x as f32) + (0.5 as f32) - cx;
+                let dy : f32 = (y as f32) + (0.5 as f32) - cy;
+                let dz : f32 = (z as f32) + (0.5 as f32) - cz;
+                if (dx * dx + dy * dy + dz * dz < r * r) {
+                    grid.setBlock(x, y, z, 0);
+                }
+            }
+        }
+    }
+}
+
+// A tunnel from the mountain's flank into a chamber with a lava pool and crystal clusters. The coordinates are the
+// valley's, shifted to where the valley is.
+fn carveCave(grid : Shared<VoxelGrid>) : void {
+    let o : f32 = WORLD_VALLEY as f32;
+    let oi : i32 = WORLD_VALLEY;
+    let chamberY : f32 = 25.0;
+    for (i of 0..26) {
+        let t : f32 = (i as f32) / (25.0 as f32);
+        let px : f32 = o + (66.0 as f32) + ((42.0 as f32) - (66.0 as f32)) * t;
+        let pz : f32 = o + (68.0 as f32) + ((46.0 as f32) - (68.0 as f32)) * t;
+        let py : f32 = (21.0 as f32) + (chamberY - (21.0 as f32)) * t;
+        carveBall(grid, px, py, pz, (2.6 as f32) + (3.8 as f32) * t * t);
+    }
+    carveBall(grid, o + (42.0 as f32), chamberY + 2.0, o + (46.0 as f32), 9.0);
+    for (z of (oi + 36)..(oi + 58)) {
+        for (x of (oi + 32)..(oi + 54)) {
+            let d : f32 = wgDist(x as f32 + 0.5, z as f32 + 0.5, o + (42.0 as f32), o + (48.0 as f32));
+            if (d < 5.2 && grid.blockAt(x, 19, z) != 0) {
+                grid.setBlock(x, 19, z, LumenBlock::Lava.id());
+            }
+        }
+    }
+    for (z of (oi + 32)..(oi + 62)) {
+        for (y of 12..40) {
+            for (x of (oi + 28)..(oi + 58)) {
+                if (grid.blockAt(x, y, z) == LumenBlock::Stone.id() && lnUnit(x, y, z, 77) < (0.07 as f32)
+                    && crystalSpot(x, y, z)) {
+                    let open : bool = grid.blockAt(x, y + 1, z) == 0 || grid.blockAt(x + 1, y, z) == 0
+                        || grid.blockAt(x, y, z + 1) == 0
+                        || grid.blockAt(x, y - 1, z) == 0;
+                    if (open) {
+                        let mut id : i32 = LumenBlock::CrystalBlue.id();
+                        if (lnUnit(x, y, z, 78) < (0.45 as f32)) {
+                            id = LumenBlock::CrystalPink.id();
+                        }
+                        grid.setBlock(x, y, z, id);
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Crystals grow only inside the mountain: within reach of the chamber or of the tunnel's inner half.
+fn crystalSpot(x : i32, y : i32, z : i32) : bool {
+    let dx : f32 = (x as f32) - ((WORLD_VALLEY + 42) as f32);
+    let dy : f32 = (y as f32) - (27.0 as f32);
+    let dz : f32 = (z as f32) - ((WORLD_VALLEY + 46) as f32);
+    return dx * dx + dy * dy + dz * dz < (11.5 as f32) * (11.5 as f32);
+}
+
+fn tree(grid : Shared<VoxelGrid>, gx : i32, gz : i32) : void {
+    let x : i32 = gx + (lnUnit(gx, 1, gz, 201) * (4.0 as f32)) as i32;
+    let z : i32 = gz + (lnUnit(gx, 2, gz, 202) * (4.0 as f32)) as i32;
+    let h : i32 = worldHeight(x, z);
+    if (h < WORLD_SEA + 3 || h > 32 || grid.blockAt(x, h, z) != LumenBlock::Grass.id()) {
+        return;
+    }
+    let density : f32 = lnFbm2(x as f32 * (0.05 as f32), z as f32 * (0.05 as f32), 3, 9);
+    if (density < (0.42 as f32) || lnUnit(x, 3, z, 203) > (0.8 as f32)) {
+        return;
+    }
+    if (nearSite(x, z, 8.0)) {
+        return;
+    }
+    let kind : f32 = lnUnit(x, 4, z, 204);
+    let trunk : i32 = 4 + (lnUnit(x, 5, z, 205) * (4.0 as f32)) as i32;
+    let mut log : i32 = LumenBlock::Log.id();
+    if (kind > (0.8 as f32)) {
+        log = LumenBlock::Birch.id();
+    }
+    for (i of 1..(trunk + 1)) {
+        grid.setBlock(x, h + i, z, log);
+    }
+    if (kind < (0.5 as f32)) {
+        pine(grid, x, h + trunk, z, trunk);
+    } else {
+        blob(grid, x, h + trunk, z, 2 + (lnUnit(x, 6, z, 206) * (2.0 as f32)) as i32);
+    }
+}
+
+fn blob(grid : Shared<VoxelGrid>, cx : i32, cy : i32, cz : i32, r : i32) : void {
+    for (dz of -r..(r + 1)) {
+        for (dy of -r..(r + 1)) {
+            for (dx of -r..(r + 1)) {
+                let d : f32 = ((dx * dx + dy * dy * 2 + dz * dz) as f32).sqrt();
+                if (d <= (r as f32) + (0.3 as f32) && grid.blockAt(cx + dx, cy + dy, cz + dz) == 0) {
+                    grid.setBlock(cx + dx, cy + dy, cz + dz, LumenBlock::Leaves.id());
+                }
+            }
+        }
+    }
+}
+
+fn pine(grid : Shared<VoxelGrid>, cx : i32, topY : i32, cz : i32, trunk : i32) : void {
+    let layers : i32 = trunk + 1;
+    for (i of 0..layers) {
+        let y : i32 = topY + 1 - i;
+        let r : i32 = 1 + (i * 3) / layers;
+        let top : bool = i == 0;
+        for (dz of -r..(r + 1)) {
+            for (dx of -r..(r + 1)) {
+                let corner : bool = wgAbs((dx * dx + dz * dz) as f32) > (r * r) as f32 + 0.5;
+                if (!corner && !(top && (dx != 0 || dz != 0)) && grid.blockAt(cx + dx, y, cz + dz) == 0) {
+                    grid.setBlock(cx + dx, y, cz + dz, LumenBlock::Leaves.id());
+                }
+            }
+        }
+    }
+}
+
+fn boxFill(
+    grid : Shared<VoxelGrid>,
+    x0 : i32,
+    y0 : i32,
+    z0 : i32,
+    x1 : i32,
+    y1 : i32,
+    z1 : i32,
+    id : i32
+) : void {
+    for (z of z0..z1) {
+        for (y of y0..y1) {
+            for (x of x0..x1) {
+                grid.setBlock(x, y, z, id);
+            }
+        }
+    }
+}
+
+// An 11 x 9 cabin with log corners, glass windows, a stepped roof, a lantern inside and a porch light.
+fn cabin(grid : Shared<VoxelGrid>, lamps : LumenLampBook, cx : i32, cz : i32) : void {
+    let x0 : i32 = cx - 5;
+    let x1 : i32 = cx + 6;
+    let z0 : i32 = cz - 4;
+    let z1 : i32 = cz + 5;
+    let y0 : i32 = PAD_Y;
+    boxFill(grid, x0 - 1, y0 - 3, z0 - 1, x1 + 1, y0, z1 + 1, LumenBlock::Cobble.id());
+    boxFill(grid, x0, y0, z0, x1, y0 + 1, z1, LumenBlock::Planks.id());
+    boxFill(grid, x0, y0 + 1, z0, x1, y0 + 5, z1, LumenBlock::Planks.id());
+    boxFill(grid, x0 + 1, y0 + 1, z0 + 1, x1 - 1, y0 + 5, z1 - 1, 0);
+    // A log at each of the four corners, from the floor to the eaves. The inner names avoid shadowing the cabin's
+    // own (cx, cz), which the windows and the lantern below still need.
+    for (y of (y0 + 1)..(y0 + 5)) {
+        for (c of 0..4) {
+            let mut lx : i32 = x0;
+            let mut lz : i32 = z0;
+            if (c % 2 == 1) {
+                lx = x1 - 1;
+            }
+            if (c >= 2) {
+                lz = z1 - 1;
+            }
+            grid.setBlock(lx, y, lz, LumenBlock::Log.id());
+        }
+    }
+    for (wx of 0..2) {
+        let px : i32 = x0 + 3 + wx * 4;
+        boxFill(grid, px, y0 + 2, z0, px + 2, y0 + 4, z0 + 1, LumenBlock::Glass.id());
+        boxFill(grid, px, y0 + 2, z1 - 1, px + 2, y0 + 4, z1, LumenBlock::Glass.id());
+    }
+    boxFill(grid, x0, y0 + 2, cz - 1, x0 + 1, y0 + 4, cz + 2, LumenBlock::Glass.id());
+    boxFill(grid, cx - 1, y0 + 1, z1 - 1, cx + 1, y0 + 3, z1, 0);
+    for (i of 0..6) {
+        boxFill(
+            grid,
+            x0 - 1 + i,
+            y0 + 5 + i,
+            z0 - 1 + i,
+            x1 + 1 - i,
+            y0 + 6 + i,
+            z1 + 1 - i,
+            LumenBlock::Roof.id()
+        );
+    }
+    boxFill(grid, x0 + 7, y0 + 6, z0 + 2, x0 + 9, y0 + 11, z0 + 4, LumenBlock::Cobble.id());
+    grid.setBlock(cx, y0 + 4, cz, LumenBlock::Lantern.id());
+    // A candle-warm lamp that flickers, lights the house and the ground but never the foliage outside.
+    lamps.add(LumenLampSpec {
+        x: cx,
+        y: y0 + 4,
+        z: cz,
+        colour: Vec3 { x: 1.0, y: 0.72, z: 0.38 },
+        candela: 16000.0,
+        range: 15.0,
+        flicker: 0.05,
+        pace: 9.0,
+        fill: 230,
+        exclude: LumenLayers::only(LumenLayer::Foliage),
+    });
+    boxFill(grid, x0 + 1, y0 + 1, z0 + 1, x0 + 3, y0 + 2, z0 + 4, LumenBlock::WoolWhite.id());
+    boxFill(grid, x0 + 1, y0 + 1, z0 + 4, x0 + 3, y0 + 2, z0 + 5, LumenBlock::WoolRed.id());
+    grid.setBlock(x1 - 2, y0 + 1, z0 + 1, LumenBlock::Gold.id());
+    grid.setBlock(cx - 3, y0 + 1, z1, LumenBlock::Log.id());
+    grid.setBlock(cx - 3, y0 + 2, z1, LumenBlock::Lantern.id());
+    porchLamp(lamps, cx - 3, y0 + 2, z1);
+    grid.setBlock(cx + 3, y0 + 1, z1, LumenBlock::Log.id());
+    grid.setBlock(cx + 3, y0 + 2, z1, LumenBlock::Lantern.id());
+    porchLamp(lamps, cx + 3, y0 + 2, z1);
+}
+
+// An amber porch lantern: it shines through the leaves of the trees around the cabin.
+fn porchLamp(lamps : LumenLampBook, x : i32, y : i32, z : i32) : void {
+    lamps.add(LumenLampSpec {
+        x: x,
+        y: y,
+        z: z,
+        colour: Vec3 { x: 1.0, y: 0.62, z: 0.28 },
+        candela: 11000.0,
+        range: 19.0,
+        flicker: 0.02,
+        fill: 210,
+        pass: LumenObstacles::only(LumenObstacle::Foliage),
+    });
+}
+
+// A wooden pier running south from the cabin into the lake, with a lantern on a post every few planks.
+fn pier(grid : Shared<VoxelGrid>, lamps : LumenLampBook, cx : i32, cz : i32) : void {
+    for (z of (cz + 5)..(cz + 38)) {
+        let h : i32 = worldHeight(cx, z);
+        if (h < WORLD_SEA + 1) {
+            boxFill(grid, cx - 1, WORLD_SEA, z, cx + 2, WORLD_SEA + 1, z + 1, LumenBlock::Planks.id());
+            if (z % 5 == 0) {
+                for (px of 0..2) {
+                    let x : i32 = cx - 1 + px * 2;
+                    grid.setBlock(x, WORLD_SEA + 1, z, LumenBlock::Log.id());
+                    grid.setBlock(x, WORLD_SEA + 2, z, LumenBlock::Log.id());
+                    grid.setBlock(x, WORLD_SEA + 3, z, LumenBlock::Lantern.id());
+                    // Cold sea-green lamps along the pier: a different colour from every other lantern.
+                    lamps.add(LumenLampSpec {
+                        x: x,
+                        y: WORLD_SEA + 3,
+                        z: z,
+                        colour: Vec3 { x: 0.35, y: 0.9, z: 0.85 },
+                        candela: 7000.0,
+                        range: 17.0,
+                        fill: 170,
+                    });
+                }
+            }
+        }
+    }
+}
+
+fn tower(grid : Shared<VoxelGrid>, lamps : LumenLampBook, tx : i32, tz : i32) : void {
+    let base : i32 = WORLD_SEA + 8;
+    for (y of base..(base + 22)) {
+        for (dz of -3..4) {
+            for (dx of -3..4) {
+                let edge : bool = dx == -3 || dx == 3 || dz == -3 || dz == 3;
+                if (edge && !(dx == 3 && dz == 0 && y < base + 3)) {
+                    let mut id : i32 = LumenBlock::Cobble.id();
+                    if (y % 6 == 3 && (dx == 0 || dz == 0)) {
+                        id = LumenBlock::Glass.id();
+                    }
+                    grid.setBlock(tx + dx, y, tz + dz, id);
+                }
+            }
+        }
+    }
+    boxFill(grid, tx - 4, base + 22, tz - 4, tx + 5, base + 23, tz + 5, LumenBlock::Cobble.id());
+    boxFill(grid, tx - 1, base + 23, tz - 1, tx + 2, base + 26, tz + 2, LumenBlock::Glass.id());
+    boxFill(grid, tx, base + 24, tz, tx + 1, base + 25, tz + 1, LumenBlock::Beacon.id());
+    // The beacon reaches the whole valley, through its own glass and through the trees below it.
+    lamps.add(LumenLampSpec {
+        x: tx,
+        y: base + 24,
+        z: tz,
+        colour: Vec3 { x: 1.0, y: 0.93, z: 0.78 },
+        candela: 520000.0,
+        radius: 0.9,
+        range: 90.0,
+        fill: 1023,
+        pass: LumenObstacles::only(LumenObstacle::Glass).with(LumenObstacle::Foliage),
+    });
+    for (i of 0..5) {
+        boxFill(
+            grid,
+            tx - 2 + i / 2,
+            base + 26 + i,
+            tz - 2 + i / 2,
+            tx + 3 - i / 2,
+            base + 27 + i,
+            tz + 3 - i / 2,
+            LumenBlock::Roof.id()
+        );
+    }
+}
+
+// A little plaza of polished stone at the foot of the pier: gold cubes and mirror panels for reflections.
+fn plaza(grid : Shared<VoxelGrid>) : void {
+    let y : i32 = PAD_Y - 1;
+    boxFill(grid, CABIN_X - 14, y, CABIN_Z + 7, CABIN_X - 6, y + 1, CABIN_Z + 13, LumenBlock::Cobble.id());
+    boxFill(
+        grid,
+        CABIN_X - 13,
+        y + 1,
+        CABIN_Z + 12,
+        CABIN_X - 7,
+        y + 4,
+        CABIN_Z + 13,
+        LumenBlock::Mirror.id()
+    );
+    boxFill(grid, CABIN_X - 12, y + 1, CABIN_Z + 8, CABIN_X - 10, y + 3, CABIN_Z + 10, LumenBlock::Gold.id());
+    grid.setBlock(CABIN_X - 8, y + 1, CABIN_Z + 9, LumenBlock::Ice.id());
+    grid.setBlock(CABIN_X - 8, y + 2, CABIN_Z + 9, LumenBlock::Ice.id());
+}
+
+// Lanterns on log posts along the path from (ax, az) toward (bx, bz), one every nine cells or so.
+fn lanternPath(
+    grid : Shared<VoxelGrid>,
+    lamps : LumenLampBook,
+    ax : i32,
+    az : i32,
+    bx : i32,
+    bz : i32
+) : void {
+    let length : f32 = wgDist(ax as f32, az as f32, bx as f32, bz as f32);
+    let count : i32 = (length / (9.0 as f32)) as i32 + 2;
+    for (i of 0..count) {
+        let t : f32 = (i as f32) / ((count - 1) as f32);
+        // Six cells east of the straight line, so the path leaves the pier and the cabin's side clear.
+        let x : i32 = (ax as f32 + ((bx - ax) as f32) * t) as i32 + 6;
+        let z : i32 = (az as f32 + ((bz - az) as f32) * t) as i32;
+        let h : i32 = worldHeight(x, z);
+        if (h > WORLD_SEA + 1 && grid.blockAt(x, h + 1, z) == 0) {
+            grid.setBlock(x, h + 1, z, LumenBlock::Log.id());
+            grid.setBlock(x, h + 2, z, LumenBlock::Lantern.id());
+            lamps.add(LumenLampSpec {
+                x: x,
+                y: h + 2,
+                z: z,
+                colour: Vec3 { x: 1.0, y: 0.58, z: 0.26 },
+                candela: 8000.0,
+                range: 18.0,
+                flicker: 0.03,
+                pace: (6.0 as f32) + (i as f32) * (0.7 as f32),
+                fill: 190,
+                shadows: LightShadowMode::Ray,
+            });
+        }
+    }
+}

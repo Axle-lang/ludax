@@ -1,0 +1,272 @@
+// lightvol — the baked light of the world as dense volumes the renderer can read from any thread.
+//
+// This is how voxel-axle lights a world, and why it does not shimmer: the light is not found per pixel by
+// chance, it is found per cell by the light engine and read back smoothly. The engine floods the lamps' block
+// light through the voxels and bakes, for the thin shell of air cells beside every solid block, how much of the
+// sky a cell sees, what colour the sky rays hit (the bounce) and how much of the sun's disc it sees (a soft
+// shadow). Reading that back is a trilinear blend of the cells around a point, so the picture of a still world
+// is exactly the same every frame and the light moves smoothly across a face.
+//
+// The engine answers a point query with a hash lookup of the chunk, and a cell outside its stored shell is baked
+// on the spot with state shared by all callers, which is right for a mesher and wrong for sixty thousand pixels
+// read in parallel. So the flood and the shell are copied into three flat `i32` volumes, one word per cell:
+//
+//   light  red | green | blue (10 bits each, so lamps that overlap can pass one lamp block) | shell flag
+//   cover  sky access | bounce tint red | green | blue (8 bits each)
+//   sky    flooded sky light | sun visibility (8 bits each)
+//
+// Reads are trilinear over the eight cells around the point. Solid cells are left out and the remaining weights
+// renormalised, so a point beside a wall is not darkened by the wall's own zero (the rule the engine's
+// `pointSample` follows); the baked terms are read only from cells of the shell, which are the ones that were
+// baked.
+//
+// The sun term depends on where the sun is. When the time of day moves, `bakeSun` re-bakes a slice of the shell
+// toward the new direction each frame, as voxel-axle does, so shadows glide instead of jumping.
+
+use ludax::{Vec3, VoxLightWorld, VoxBakeSettings, VoxJobList, VoxelGrid};
+
+use crate::world::noise::lnFloor;
+use crate::world::scene::LumenScene;
+
+// 1 / 255: one step of an 8-bit channel, the unit of the baked terms.
+const LV_UNIT : f32 = 0.003921569;
+
+// The top bit of a light word: this cell belongs to the baked shell.
+const LV_SHELL : i32 = 1073741824;
+
+// How far a sun ray reaches while baking: across the valley to the highest ridge.
+const LV_SUN_REACH : f32 = 520.0;
+
+/** The light at a point. */
+pub struct LumenLightSample {
+    /** Block light per channel, 1 = a lamp block's own strength; lamps that overlap add past it. */
+    pub block : Vec3 = Vec3 { x: 0.0, y: 0.0, z: 0.0 };
+
+    /** Flooded sky light, 0..1. */
+    pub sky : f32 = 1.0;
+
+    /** Share of the sky the point sees, 0..1. */
+    pub access : f32 = 1.0;
+
+    /** The mean colour the sky rays hit: the hue of the bounce. */
+    pub tint : Vec3 = Vec3 { x: 1.0, y: 1.0, z: 1.0 };
+
+    /** Share of the sun's (or the moon's) disc the point sees, 0..1: a soft shadow. */
+    pub sun : f32 = 1.0;
+}
+
+/** One slice of a sun bake: the world and scene, which sun, how soft, and the cells to do. */
+pub struct SunBake {
+    /** The light world whose shell is baked. */
+    world : VoxLightWorld;
+
+    /** The scene the baked cells are copied into. */
+    scene : LumenScene;
+
+    /** Unit direction towards the sun (or the moon). */
+    direction : Vec3;
+
+    /** Angular radius of the disc, in radians. */
+    halfAngle : f32;
+
+    /** Rays per shell cell. */
+    rays : i32;
+
+    /** First shell cell of the slice. */
+    from : i32;
+
+    /** How many cells the slice holds. */
+    count : i32;
+}
+
+/** The dense light volumes. */
+pub class LumenLight {
+    sx     : i32;
+    sy     : i32;
+    sz     : i32;
+    light  : i32[];
+    cover  : i32[];
+    sunSky : i32[];
+
+    /** Floods the lamps, bakes the sky terms with `workers` threads and copies it all into volumes. */
+    constructor(world : VoxLightWorld, scene : LumenScene, workers : i32) {
+        self.sx = scene.sx;
+        self.sy = scene.sy;
+        self.sz = scene.sz;
+        let n : i64 = (self.sx as i64) * self.sy * self.sz;
+        self.light = malloc<i32>(n);
+        self.cover = malloc<i32>(n);
+        self.sunSky = malloc<i32>(n);
+        world.rebuildLight();
+        world.rebuildSurface();
+        let count : i32 = world.surface.count();
+        let jobs : VoxJobList = world.baker.jobs();
+        jobs.ensure(count);
+        for (i of 0..count) {
+            jobs.set(i, i);
+        }
+        let s : VoxBakeSettings = world.settings();
+        world.baker.bakeSky(s, count, workers > 1);
+        for (y of 0..self.sy) {
+            for (z of 0..self.sz) {
+                for (x of 0..self.sx) {
+                    self.copyCell(world, scene, x, y, z);
+                }
+            }
+        }
+    }
+
+    fn copyCell(mut self, world : VoxLightWorld, scene : LumenScene, x : i32, y : i32, z : i32) : void {
+        let at : i64 = scene.index(x, y, z);
+        let id : i32 = world.grid.cellId(x, y, z);
+        let r : i32 = lvClamp(world.flood.blockLevel(id, 0));
+        let g : i32 = lvClamp(world.flood.blockLevel(id, 1));
+        let b : i32 = lvClamp(world.flood.blockLevel(id, 2));
+        let ordinal : i32 = world.surface.ordinalOf(id);
+        let mut shell : i32 = 0;
+        let mut access : i32 = 255;
+        let mut tr : i32 = 255;
+        let mut tg : i32 = 255;
+        let mut tb : i32 = 255;
+        if (ordinal >= 0) {
+            shell = LV_SHELL;
+            access = world.surface.access(ordinal) & 255;
+            tr = world.surface.tint(ordinal, 0) & 255;
+            tg = world.surface.tint(ordinal, 1) & 255;
+            tb = world.surface.tint(ordinal, 2) & 255;
+        }
+        self.light[at] = r | (g << 10) | (b << 20) | shell;
+        self.cover[at] = access | (tr << 8) | (tg << 16) | (tb << 24);
+        self.sunSky[at] = (world.flood.skyLevel(id) & 255) | (255 << 8);
+    }
+
+    /** How many cells the shell holds: the work of a full sun bake. */
+    pub fn shellSize(self, world : VoxLightWorld) : i32 {
+        return world.surface.count();
+    }
+
+    /**
+     * Re-bakes the sun term of `count` cells of the shell starting at `from` (wrapping) toward the sun of the
+     * job, and copies it into the volume. Returns the cell to continue from.
+     */
+    pub fn bakeSun(mut self, job : SunBake) : i32 {
+        let mut s : VoxBakeSettings = job.world.settings();
+        s.sunDirection = job.direction;
+        s.sunHalfAngle = job.halfAngle;
+        s.sunRays = job.rays;
+        s.reach = LV_SUN_REACH;
+        job.world.configure(s);
+        let n : i32 = job.world.surface.count();
+        if (n == 0) {
+            return 0;
+        }
+        let next : i32 = job.world.bakeSunSlice(job.from, job.count, true);
+        let mut take : i32 = job.count;
+        if (take > n) {
+            take = n;
+        }
+        for (i of 0..take) {
+            let ordinal : i32 = (job.from + i) % n;
+            let id : i32 = job.world.surface.cellAt(ordinal);
+            let cx : i32 = job.world.grid.cellX(id);
+            let cy : i32 = job.world.grid.cellY(id);
+            let cz : i32 = job.world.grid.cellZ(id);
+            // A shell cell may lie outside the world the renderer copied (above its ceiling): nothing reads it.
+            if (job.scene.inside(cx, cy, cz)) {
+                let at : i64 = job.scene.index(cx, cy, cz);
+                self.sunSky[at] = (self.sunSky[at] & 255) | ((job.world.surface.sun(ordinal) & 255) << 8);
+            }
+        }
+        return next;
+    }
+
+    /** The light at the world point (px, py, pz). */
+    pub fn sample(self, scene : LumenScene, px : f32, py : f32, pz : f32) : LumenLightSample {
+        let gx : f32 = px - (0.5 as f32);
+        let gy : f32 = py - (0.5 as f32);
+        let gz : f32 = pz - (0.5 as f32);
+        let ix : i32 = lnFloor(gx);
+        let iy : i32 = lnFloor(gy);
+        let iz : i32 = lnFloor(gz);
+        let tx : f32 = gx - ix as f32;
+        let ty : f32 = gy - iy as f32;
+        let tz : f32 = gz - iz as f32;
+
+        let mut wsum : f32 = 0.0;
+        let mut wbaked : f32 = 0.0;
+        let mut r : f32 = 0.0;
+        let mut g : f32 = 0.0;
+        let mut b : f32 = 0.0;
+        let mut sky : f32 = 0.0;
+        let mut sun : f32 = 0.0;
+        let mut access : f32 = 0.0;
+        let mut tr : f32 = 0.0;
+        let mut tg : f32 = 0.0;
+        let mut tb : f32 = 0.0;
+        for (k of 0..8) {
+            let ox : i32 = k & 1;
+            let oy : i32 = (k >> 1) & 1;
+            let oz : i32 = (k >> 2) & 1;
+            let mut w : f32 = tx;
+            if (ox == 0) {
+                w = (1.0 as f32) - tx;
+            }
+            if (oy == 0) {
+                w = w * ((1.0 as f32) - ty);
+            } else {
+                w = w * ty;
+            }
+            if (oz == 0) {
+                w = w * ((1.0 as f32) - tz);
+            } else {
+                w = w * tz;
+            }
+            let cx : i32 = ix + ox;
+            let cy : i32 = iy + oy;
+            let cz : i32 = iz + oz;
+            if (w > 0.0 && scene.inside(cx, cy, cz) && !scene.isSolid(cx, cy, cz)) {
+                let at : i64 = scene.index(cx, cy, cz);
+                let l : i32 = self.light[at];
+                let ss : i32 = self.sunSky[at];
+                r = r + w * (l & 1023) as f32;
+                g = g + w * ((l >>> 10) & 1023) as f32;
+                b = b + w * ((l >>> 20) & 1023) as f32;
+                sky = sky + w * (ss & 255) as f32;
+                wsum = wsum + w;
+                if ((l & LV_SHELL) != 0) {
+                    let c : i32 = self.cover[at];
+                    sun = sun + w * ((ss >>> 8) & 255) as f32;
+                    access = access + w * (c & 255) as f32;
+                    tr = tr + w * ((c >>> 8) & 255) as f32;
+                    tg = tg + w * ((c >>> 16) & 255) as f32;
+                    tb = tb + w * ((c >>> 24) & 255) as f32;
+                    wbaked = wbaked + w;
+                }
+            }
+        }
+        if (wsum < (0.0001 as f32)) {
+            return LumenLightSample {};
+        }
+
+        let k : f32 = LV_UNIT / wsum;
+        let mut out : LumenLightSample = LumenLightSample {
+            block: Vec3 { x: r * k, y: g * k, z: b * k },
+            sky: sky * k,
+        };
+        if (wbaked > (0.0001 as f32)) {
+            let kb : f32 = LV_UNIT / wbaked;
+            out.sun = sun * kb;
+            out.access = access * kb;
+            out.tint = Vec3 { x: tr * kb, y: tg * kb, z: tb * kb };
+        }
+        return out;
+    }
+}
+
+// The most a cell of the volume can hold per channel: four lamp blocks' worth.
+fn lvClamp(v : i32) : i32 {
+    if (v > 1023) {
+        return 1023;
+    }
+    return v;
+}

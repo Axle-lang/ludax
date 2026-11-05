@@ -1,0 +1,193 @@
+// world — the state of one game: everything the systems read and write, and the reset that starts a run.
+//
+// The world owns everything the simulation reads or writes: the entity slab with its component sets, the
+// bullet pool, the effects, the collision grid, the ship, the score, the wave director, the log and the one
+// random stream that decides every outcome. `step::Step::tick` runs the systems in a fixed order, so the same
+// seed and the same inputs always lead to the same state, which `Checksum` condenses into one number.
+//
+// Entities live in a `Slab` and are named by generation-checked `EntityId`s: an id kept after its entity died
+// is refused instead of reaching whatever took the slot. Components that only some kinds carry sit in
+// `SparseSet`s keyed by the slab index.
+
+use ludax::{Pcg32, Slab, SparseSet, EntityId, Vec, Map};
+
+use crate::app::telemetry::Telemetry;
+use crate::core::config::{BULLET_CAPACITY, OVER_DELAY_TICKS};
+use crate::core::types::{Entity, Brain, Bullet, Kind, Sfx};
+use crate::sim::director::Director;
+use crate::sim::fx::Fx;
+use crate::sim::grid::SpatialGrid;
+use crate::sim::pool::Pool;
+use crate::sim::score::Score;
+use crate::sim::ship::Ship;
+use crate::sim::stars::Starfield;
+
+/** Initial room of the per-tick sound and query buffers. */
+const WORLD_SOUND_ROOM : i32 = 32;
+
+/** One game: every piece of simulated state. */
+pub class World {
+    /** The one random stream behind every decision of the simulation. */
+    pub rng : Pcg32;
+
+    /** Rocks, drones, gunships and pick-ups. */
+    pub entities : Slab<Entity>;
+
+    /** Thinking state of drones and gunships, keyed by slab index. */
+    pub brains : SparseSet<Brain>;
+
+    /** Ticks left before a pick-up expires, keyed by slab index. */
+    pub lifetimes : SparseSet<i32>;
+
+    /** The ship's shots and the enemies' bolts. */
+    pub bullets : Pool<Bullet>;
+
+    /** Sparks, popups and shake. */
+    pub fx : Fx;
+
+    /** The collision grid, rebuilt every tick. */
+    pub grid : SpatialGrid;
+
+    /** The player's ship. */
+    pub ship : Ship;
+
+    /** Points and combo. */
+    pub score : Score;
+
+    /** Decides what arrives and when. */
+    pub director : Director;
+
+    /** The parallax stars. */
+    pub stars : Starfield;
+
+    /** How many of each kind the player destroyed, keyed by `Kind as i32`. */
+    pub tally : Map<i32, i32>;
+
+    /** Sounds requested this tick; the audio layer drains it. */
+    pub sounds : Vec<Sfx>;
+
+    /** Profiler and log. */
+    pub tm : Telemetry;
+
+    /** Reused buffer for grid query results. */
+    pub near : Vec<i32>;
+
+    /** Ticks simulated in this game. */
+    pub tickCount : i64 = 0;
+
+    /** True for the title screen's ambient world: rocks drift, there is no ship and no waves. */
+    pub attract : bool = false;
+
+    /** Ticks since the last life was lost, counting towards the game-over screen. */
+    pub overTimer : i32 = 0;
+
+    /** The seed this game started with. */
+    pub seed : u64 = 0;
+
+    /** A world for `seed` that owns the telemetry it reports to. */
+    constructor(seed : u64, own tm : Telemetry) {
+        self.seed = seed;
+        self.tm = tm;
+        self.rng = new Pcg32(seed, 1);
+        self.entities = new Slab<Entity>();
+        self.brains = new SparseSet<Brain>();
+        self.lifetimes = new SparseSet<i32>();
+        self.bullets = new Pool<Bullet>(BULLET_CAPACITY, Bullet {});
+        self.fx = new Fx(seed);
+        self.grid = new SpatialGrid();
+        self.ship = new Ship();
+        self.score = new Score();
+        self.director = new Director();
+        self.stars = new Starfield(seed);
+        self.tally = new Map<i32, i32>();
+        self.sounds = new Vec<Sfx>(WORLD_SOUND_ROOM);
+        self.near = new Vec<i32>(WORLD_SOUND_ROOM);
+    }
+
+    /** Starts a game from `seed`; `attract` makes it the ship-less title backdrop. */
+    pub fn reset(mut self, seed : u64, attract : bool) : void {
+        self.seed = seed;
+        self.rng = new Pcg32(seed, 1);
+        self.entities = new Slab<Entity>();
+        self.brains.clear();
+        self.lifetimes.clear();
+        self.bullets.clear();
+        self.fx.reset(seed);
+        self.score.reset();
+        self.director.reset();
+        self.stars.scatter(seed);
+        self.tally.clear();
+        self.sounds.clear();
+        self.tickCount = 0;
+        self.overTimer = 0;
+        self.attract = attract;
+        self.ship.alive = false;
+        self.ship.lives = 0;
+        self.ship.respawn = 0;
+        self.ship.shield = 0;
+        self.ship.rapid = 0;
+        self.ship.spread = 0;
+        if (!attract) {
+            self.ship.start();
+        }
+    }
+
+    /** Stops the effect workers; call once at exit. */
+    pub fn close(mut self) : void {
+        self.fx.close();
+    }
+
+    /** Stores an entity and returns the id that names it. */
+    pub fn add(mut self, e : Entity) : EntityId {
+        return self.entities.insert(e);
+    }
+
+    /** Removes an entity and its components. False when the id was already stale. */
+    pub fn remove(mut self, id : EntityId) : bool {
+        if (!self.entities.remove(id)) {
+            return false;
+        }
+        self.brains.remove(id.index);
+        self.lifetimes.remove(id.index);
+        return true;
+    }
+
+    /** Asks the audio layer to play `s`. */
+    pub fn sound(mut self, s : Sfx) : void {
+        self.sounds.push(s);
+    }
+
+    /** How many hostile entities (rocks, drones, gunships) are alive. */
+    pub fn enemyCount(self) : i32 {
+        let mut n : i32 = 0;
+        for (slot of 0..self.entities.slotCount()) {
+            if (self.entities.isLiveAt(slot)) {
+                let e : Entity = self.entities.valueAt(slot);
+                if (e.kind != Kind::Pickup) {
+                    n = n + 1;
+                }
+            }
+        }
+        return n;
+    }
+
+    /** True once the last life is gone and the wreck has had its moment. */
+    pub fn isOver(self) : bool {
+        let wrecked : bool = self.ship.lives <= 0 && !self.ship.alive;
+        return !self.attract && wrecked && self.overTimer >= OVER_DELAY_TICKS;
+    }
+
+    /** Records that the player destroyed something of `kind`. */
+    pub fn tallyKill(mut self, kind : Kind) : void {
+        let key : i32 = kind as i32;
+        self.tally.put(key, self.tally.getOr(key, 0) + 1);
+    }
+
+    /** Closes a tick: counts towards game over once the last life is gone, and advances the clock. */
+    pub fn finishTick(mut self) : void {
+        if (!self.attract && self.ship.lives <= 0 && !self.ship.alive) {
+            self.overTimer = self.overTimer + 1;
+        }
+        self.tickCount = self.tickCount + 1;
+    }
+}

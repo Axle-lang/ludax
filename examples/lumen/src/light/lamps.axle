@@ -1,0 +1,166 @@
+// lamps — the world's lamps as point lights, built from their specs.
+//
+// The flood gives each lamp a smooth, wall-aware fill; a point light adds what the flood cannot, a crisp shadow
+// and a specular highlight. Every number comes from the lamp's `LumenLampSpec`, so two lanterns can differ in
+// colour, strength, reach, flicker, the obstacles they shine through, the surfaces they light and how their
+// shadow is found. Lamps that reach 20 cells or less are sorted into buckets of 20 cells so a surface asks for
+// the 27 buckets around it instead of every lamp in the valley (nothing that can light it is missed); lamps that
+// reach farther are kept in a short list that is always tested.
+
+use ludax::{Vec3, Vec, LightSource, LightShadowMode, max, min};
+
+use crate::world::lampspec::{LumenLampSpec, LumenLampBook};
+use crate::world::scene::LumenScene;
+
+/** The irradiance below which a lamp is ignored: a thousandth of the sun's, invisible under it. */
+const LAMP_FAINT : f32 = 0.0008;
+
+/** Size of a bucket in cells; also the largest reach of a bucketed lamp. */
+pub const LAMP_BUCKET : i32 = 20;
+
+/** How many nearby lamps a shading call asks for: the caller's scratch array must hold this many. */
+pub const LAMP_NEAR_MAX : i32 = 16;
+
+/** All point lights of the world. */
+pub class LumenLamps {
+    /** The light of lamp `i`, at full strength. */
+    pub lights : Vec<LightSource>;
+
+    /** The spec lamp `i` was built from. */
+    pub specs : Vec<LumenLampSpec>;
+
+    /** The indices of the lamps that reach farther than a bucket. */
+    pub far : Vec<i32>;
+
+    // Four numbers per lamp: the emitter's position and the square of its reach, so `reaches` copies nothing.
+    reach  : f32[];
+    nx     : i32;
+    ny     : i32;
+    nz     : i32;
+    starts : i32[];
+    items  : i32[];
+
+    /** Builds the lights of the lamps in `book` for a world of the size of `scene`. */
+    constructor(scene : LumenScene, book : LumenLampBook) {
+        self.lights = new Vec<LightSource>();
+        self.specs = new Vec<LumenLampSpec>();
+        self.far = new Vec<i32>();
+        self.reach = malloc<f32>((book.len() as i64) * 4 + 4);
+        self.nx = scene.sx / LAMP_BUCKET + 1;
+        self.ny = scene.sy / LAMP_BUCKET + 1;
+        self.nz = scene.sz / LAMP_BUCKET + 1;
+        for (i of 0..book.len()) {
+            let s : LumenLampSpec = book.get(i);
+            self.specs.push(s);
+            let at : Vec3 = Vec3 {
+                x: s.x as f32 + (0.5 as f32),
+                y: s.y as f32 + (0.5 as f32),
+                z: s.z as f32 + (0.5 as f32),
+            };
+            let mut light : LightSource = LightSource::point(s.colour, s.candela, at, s.radius, s.range);
+            light.includeLayers = s.include.bits;
+            light.excludeLayers = s.exclude.bits;
+            light.shadowMode = s.shadows;
+            light.isStatic = true;
+            self.lights.push(light);
+            self.reach[(i * 4) as i64] = light.position.x;
+            self.reach[(i * 4 + 1) as i64] = light.position.y;
+            self.reach[(i * 4 + 2) as i64] = light.position.z;
+            // Reach is the lamp's range, or less where its light has fallen below what a surface could show.
+            let faint : f32 = light.intensity / LAMP_FAINT;
+            self.reach[(i * 4 + 3) as i64] = min(s.range * s.range, faint);
+            if (s.range > (LAMP_BUCKET as f32)) {
+                self.far.push(i);
+            }
+        }
+        // Bucket the short-reaching lamps with a counting sort: counts, then prefix sums, then one pass to fill.
+        let buckets : i32 = self.nx * self.ny * self.nz;
+        self.starts = malloc<i32>((buckets + 1) as i64);
+        self.items = malloc<i32>((self.lights.len() + 1) as i64);
+        let mut counts : i32[] = malloc<i32>((buckets + 1) as i64);
+        for (i of 0..(buckets + 1)) {
+            counts[i as i64] = 0;
+            self.starts[i as i64] = 0;
+        }
+        for (i of 0..self.lights.len()) {
+            if (self.specs.get(i).range <= (LAMP_BUCKET as f32)) {
+                let b : i32 = self.bucketOf(self.lights.get(i).position);
+                counts[b as i64] = counts[b as i64] + 1;
+            }
+        }
+        let mut run : i32 = 0;
+        for (i of 0..buckets) {
+            self.starts[i as i64] = run;
+            run = run + counts[i as i64];
+            counts[i as i64] = 0;
+        }
+        self.starts[buckets as i64] = run;
+        for (i of 0..self.lights.len()) {
+            if (self.specs.get(i).range <= (LAMP_BUCKET as f32)) {
+                let b : i32 = self.bucketOf(self.lights.get(i).position);
+                self.items[(self.starts[b as i64] + counts[b as i64]) as i64] = i;
+                counts[b as i64] = counts[b as i64] + 1;
+            }
+        }
+    }
+
+    fn bucketOf(self, p : Vec3) : i32 {
+        return self.bucketAt(p.x as i32 / LAMP_BUCKET, p.y as i32 / LAMP_BUCKET, p.z as i32 / LAMP_BUCKET);
+    }
+
+    fn bucketAt(self, bx : i32, by : i32, bz : i32) : i32 {
+        return (by * self.nz + bz) * self.nx + bx;
+    }
+
+    /** The light of lamp `i` at animation time `time`: its strength scaled by the flicker. */
+    pub fn lightAt(self, i : i32, time : f32) : LightSource {
+        let s : LumenLampSpec = self.specs.get(i);
+        let mut light : LightSource = self.lights.get(i);
+        if (s.flicker > 0.0) {
+            let wave : f32 = ludax::sin(time * s.pace + i as f32 * (1.7 as f32)) * (0.6 as f32)
+                + ludax::sin(time * s.pace * (2.3 as f32) + i as f32) * (0.4 as f32);
+            light.intensity = light.intensity * max((1.0 as f32) + s.flicker * wave, 0.0);
+        }
+        return light;
+    }
+
+    /** True when `p` is within the reach of lamp `i`: a test that copies nothing, made before the light is built. */
+    pub fn reaches(self, i : i32, p : Vec3) : bool {
+        let dx : f32 = self.reach[(i * 4) as i64] - p.x;
+        let dy : f32 = self.reach[(i * 4 + 1) as i64] - p.y;
+        let dz : f32 = self.reach[(i * 4 + 2) as i64] - p.z;
+        return dx * dx + dy * dy + dz * dz < self.reach[(i * 4 + 3) as i64];
+    }
+
+    /** True when lamp `i` traces a shadow ray (`None` shines through everything). */
+    pub fn castsShadow(self, i : i32) : bool {
+        return self.specs.get(i).shadows != LightShadowMode::None;
+    }
+
+    /** Writes the indices of the bucketed lamps around `p` into `out` (at most `room`) and returns how many. */
+    pub fn near(self, p : Vec3, out : i32[], room : i32) : i32 {
+        let cx : i32 = p.x as i32 / LAMP_BUCKET;
+        let cy : i32 = p.y as i32 / LAMP_BUCKET;
+        let cz : i32 = p.z as i32 / LAMP_BUCKET;
+        let mut n : i32 = 0;
+        for (dz of -1..2) {
+            for (dy of -1..2) {
+                for (dx of -1..2) {
+                    let bx : i32 = cx + dx;
+                    let by : i32 = cy + dy;
+                    let bz : i32 = cz + dz;
+                    if (bx >= 0 && bx < self.nx && by >= 0 && by < self.ny && bz >= 0 && bz < self.nz) {
+                        let b : i32 = self.bucketAt(bx, by, bz);
+                        for (k of self.starts[b as i64]..self.starts[(b + 1) as i64]) {
+                            if (n < room) {
+                                out[n as i64] = self.items[k as i64];
+                                n = n + 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return n;
+    }
+}

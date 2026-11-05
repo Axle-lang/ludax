@@ -1,0 +1,177 @@
+// walker — a biped skeleton, a procedural walk and idle clip, and an animator that blends them.
+//
+// Eight bones: hips, spine, and for each leg a thigh, a shin and a foot. The model faces +Z with +Y up. The walk
+// clip is generated, not authored: one second per cycle, the thighs swinging in opposite phase, the shins
+// bending while their leg swings forward, the hips bobbing twice per cycle and travelling `WALK_STRIDE` units
+// along +Z, which makes the hips' own motion the root motion that drives the character over the map. Two
+// footstep markers sit at the moments the feet land.
+//
+// The idle clip only breathes, and it loops in two seconds rather than the walk's one: the state machine plays
+// it at a floor speed so an idle walker still animates, and a slower cycle keeps the breathing unhurried.
+
+use ludax::{
+    Skeleton, Transform, Vec3, Quat, Interp, Vec3Track, QuatTrack, AnimationClip, Animator, AnimTransition,
+    AnimCond
+};
+use ludax::{sin, cos, TAU};
+
+/** Units the hips travel along the walk clip's one-second cycle. */
+pub const WALK_STRIDE : f32 = 1.2;
+
+/** The marker id of a footstep of the left foot. */
+pub const STEP_LEFT : i32 = 1;
+
+/** The marker id of a footstep of the right foot. */
+pub const STEP_RIGHT : i32 = 2;
+
+/** Bone indices of the walker. */
+pub const BONE_HIPS : i32 = 0;
+
+/** The spine bone. */
+pub const BONE_SPINE : i32 = 1;
+
+/** The left thigh. */
+pub const BONE_THIGH_L : i32 = 2;
+
+/** The left shin. */
+pub const BONE_SHIN_L : i32 = 3;
+
+/** The left foot. */
+pub const BONE_FOOT_L : i32 = 4;
+
+/** The right thigh. */
+pub const BONE_THIGH_R : i32 = 5;
+
+/** The right shin. */
+pub const BONE_SHIN_R : i32 = 6;
+
+/** The right foot. */
+pub const BONE_FOOT_R : i32 = 7;
+
+// How many bones the skeleton has, and how many keys sample each procedural track.
+const WALK_BONES : i32 = 8;
+const WALK_KEYS : i32 = 17;
+
+// The walk's shape: thigh swing, knee bend, hip bob, and the moments in the cycle when the feet land.
+const WALK_SWING : f32 = 0.55;
+const WALK_KNEE : f32 = 0.9;
+const WALK_BOB : f32 = 0.03;
+const WALK_STEP_LEFT_AT : f32 = 0.25;
+const WALK_STEP_RIGHT_AT : f32 = 0.75;
+
+// The speed parameter's hysteresis: walk above the first, return to idle below the second.
+const WALK_GAIT_ON : f32 = 0.1;
+const WALK_GAIT_OFF : f32 = 0.05;
+
+// The cross-fade lasts a quarter second, in either direction.
+const WALK_FADE : f32 = 0.25;
+
+// The idle clip: a two-second loop of three keys, with a five-degree lean of the spine at its middle.
+const IDLE_BONES : i32 = 1;
+const IDLE_KEYS : i32 = 3;
+const IDLE_SECONDS : f32 = 2.0;
+const IDLE_LEAN : f32 = 0.05;
+
+/** Builds the walker's skeleton, clips and animator. */
+pub class WalkerRig {
+    /** The skeleton: hips at 1 unit height, legs 0.9 long, arranged left and right of the hips. */
+    pub static fn skeleton() : Skeleton {
+        let mut s : Skeleton = new Skeleton(WALK_BONES);
+        s.addBone("hips", -1, Transform::fromTranslation(Vec3::make(0.0, 1.0, 0.0)));
+        s.addBone("spine", BONE_HIPS, Transform::fromTranslation(Vec3::make(0.0, 0.5, 0.0)));
+        s.addBone("thigh.L", BONE_HIPS, Transform::fromTranslation(Vec3::make(-0.15, 0.0, 0.0)));
+        s.addBone("shin.L", BONE_THIGH_L, Transform::fromTranslation(Vec3::make(0.0, -0.45, 0.0)));
+        s.addBone("foot.L", BONE_SHIN_L, Transform::fromTranslation(Vec3::make(0.0, -0.45, 0.0)));
+        s.addBone("thigh.R", BONE_HIPS, Transform::fromTranslation(Vec3::make(0.15, 0.0, 0.0)));
+        s.addBone("shin.R", BONE_THIGH_R, Transform::fromTranslation(Vec3::make(0.0, -0.45, 0.0)));
+        s.addBone("foot.R", BONE_SHIN_R, Transform::fromTranslation(Vec3::make(0.0, -0.45, 0.0)));
+        return s;
+    }
+
+    /** The one-second looping walk cycle (see the file header). */
+    pub static fn walkClip() : AnimationClip {
+        let mut clip : AnimationClip = new AnimationClip("walk", WALK_BONES, true);
+        let mut hips : Vec3Track = new Vec3Track(Interp::Linear, WALK_KEYS);
+        let mut thighL : QuatTrack = new QuatTrack(Interp::Linear, WALK_KEYS);
+        let mut thighR : QuatTrack = new QuatTrack(Interp::Linear, WALK_KEYS);
+        let mut shinL : QuatTrack = new QuatTrack(Interp::Linear, WALK_KEYS);
+        let mut shinR : QuatTrack = new QuatTrack(Interp::Linear, WALK_KEYS);
+        for (k of 0..WALK_KEYS) {
+            let t : f32 = (k as f32) / ((WALK_KEYS - 1) as f32);
+            let phase : f32 = TAU * t;
+            let z : f32 = WALK_STRIDE * t;
+            hips.setKey(k, t, Vec3::make(0.0, (1.0 as f32) + WALK_BOB * cos(phase * (2.0 as f32)), z));
+
+            // Rotating a downward leg about +X by a negative angle swings the foot forward (+Z).
+            thighL.setKey(k, t, Quat::fromAxisAngle(Vec3::unitX(), -WALK_SWING * sin(phase)));
+            thighR.setKey(k, t, Quat::fromAxisAngle(Vec3::unitX(), WALK_SWING * sin(phase)));
+            shinL.setKey(
+                k,
+                t,
+                Quat::fromAxisAngle(Vec3::unitX(), WALK_KNEE * WalkerRig::positive(cos(phase)))
+            );
+            shinR.setKey(
+                k,
+                t,
+                Quat::fromAxisAngle(Vec3::unitX(), WALK_KNEE * WalkerRig::positive(-cos(phase)))
+            );
+        }
+        clip.addChannel(BONE_HIPS, hips, QuatTrack::none(), Vec3Track::none());
+        clip.addChannel(BONE_THIGH_L, Vec3Track::none(), thighL, Vec3Track::none());
+        clip.addChannel(BONE_THIGH_R, Vec3Track::none(), thighR, Vec3Track::none());
+        clip.addChannel(BONE_SHIN_L, Vec3Track::none(), shinL, Vec3Track::none());
+        clip.addChannel(BONE_SHIN_R, Vec3Track::none(), shinR, Vec3Track::none());
+        clip.addEvent(WALK_STEP_LEFT_AT, STEP_LEFT);
+        clip.addEvent(WALK_STEP_RIGHT_AT, STEP_RIGHT);
+        return clip;
+    }
+
+    /** A two-second breathing loop: the spine leans a few degrees and back. */
+    pub static fn idleClip() : AnimationClip {
+        let mut clip : AnimationClip = new AnimationClip("idle", IDLE_BONES, true);
+        let mut spine : QuatTrack = new QuatTrack(Interp::Linear, IDLE_KEYS);
+        spine.setKey(0, 0.0, Quat::identity());
+        spine.setKey(1, IDLE_SECONDS * (0.5 as f32), Quat::fromAxisAngle(Vec3::unitX(), IDLE_LEAN));
+        spine.setKey(2, IDLE_SECONDS, Quat::identity());
+        clip.addChannel(BONE_SPINE, Vec3Track::none(), spine, Vec3Track::none());
+        return clip;
+    }
+
+    /**
+     * An animator for `skeleton` with idle and walk states, fading between them over a quarter second as the
+     * float parameter `speed` rises above its gait threshold or falls below the return one. The hips are its
+     * root bone, so the clip's hip travel becomes the walker's root motion.
+     */
+    pub static fn animator(skeleton : Skeleton) : Animator {
+        let mut anim : Animator = new Animator(skeleton);
+        anim.addState("idle", WalkerRig::idleClip(), 1.0);
+        anim.addState("walk", WalkerRig::walkClip(), 1.0);
+        anim.declare("speed", 0.0);
+        anim.addTransition(AnimTransition {
+            from: 0,
+            to: 1,
+            duration: WALK_FADE,
+            cond: AnimCond::Greater,
+            param: 0,
+            threshold: WALK_GAIT_ON,
+        });
+        anim.addTransition(AnimTransition {
+            from: 1,
+            to: 0,
+            duration: WALK_FADE,
+            cond: AnimCond::Less,
+            param: 0,
+            threshold: WALK_GAIT_OFF,
+        });
+        anim.setRootBone(BONE_HIPS);
+        return anim;
+    }
+
+    // The knee only bends one way; the swing's negative half is straight leg.
+    static fn positive(v : f32) : f32 {
+        if (v > 0.0) {
+            return v;
+        }
+        return 0.0;
+    }
+}

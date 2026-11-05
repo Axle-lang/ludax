@@ -1,0 +1,570 @@
+// texture — the 16 x 16 pixel look of every block, computed rather than stored.
+//
+// A block face is a grid of 16 x 16 texels. Each texel has an albedo, a height (the shader turns height
+// differences between neighbouring texels into a normal, so the surface is bumpy the way a resource pack's
+// normal maps are) and a glow factor that scales the block's emission (lava flows, crystals sparkle). The
+// patterns are noise functions of the texel and the block id, so every face of every block is the same on
+// every run and there are no image files to load.
+
+use ludax::{Vec2, Vec3, sin, min};
+
+use crate::world::blocks::{LumenBlock, BlockPalette, BLOCK_COUNT};
+use crate::world::noise::{lnUnit, lnValue2, lnFloor};
+
+/** What one texel looks like. */
+pub struct LumenTexel {
+    /** Linear albedo. */
+    pub albedo : Vec3 = Vec3 { x: (1.0 as f32), y: (1.0 as f32), z: (1.0 as f32) };
+
+    /** Relief, 0 (a groove) to 1 (a ridge). */
+    pub height : f32 = (0.5 as f32);
+
+    /** Multiplier of the block's emission. */
+    pub glow : f32 = (1.0 as f32);
+}
+
+/**
+ * The texel (ix | iy << 8) of the face `face` (0 +x, 1 -x, 2 +y, 3 -y, 4 +z, 5 -z) at the point whose
+ * fractional position inside its cell is (fx, fy, fz). The v axis points up on side faces.
+ */
+pub fn lumenTexelAt(face : i32, fx : f32, fy : f32, fz : f32) : i32 {
+    let mut u : f32 = fx;
+    let mut v : f32 = fy;
+    if (face < 2) {
+        u = fz;
+        if (face == 0) {
+            u = (1.0 as f32) - fz;
+        }
+    } else if (face < 4) {
+        v = fz;
+    } else {
+        if (face == 5) {
+            u = (1.0 as f32) - fx;
+        }
+    }
+    let mut ix : i32 = (u * (16.0 as f32)) as i32;
+    let mut iy : i32 = (v * (16.0 as f32)) as i32;
+    if (ix < 0) {
+        ix = 0;
+    }
+    if (ix > 15) {
+        ix = 15;
+    }
+    if (iy < 0) {
+        iy = 0;
+    }
+    if (iy > 15) {
+        iy = 15;
+    }
+    return ix | (iy << 8);
+}
+
+/**
+ * The place of the point whose fractional position inside its cell is (fx, fy, fz) on face `face`, in texel units:
+ * (u, v) in 0..16, the same mapping as `lumenTexelAt` without the rounding, so a sampler can interpolate.
+ */
+pub fn lumenTexelUv(face : i32, fx : f32, fy : f32, fz : f32) : Vec2 {
+    let mut u : f32 = fx;
+    let mut v : f32 = fy;
+    if (face < 2) {
+        u = fz;
+        if (face == 0) {
+            u = (1.0 as f32) - fz;
+        }
+    } else if (face < 4) {
+        v = fz;
+    } else if (face == 5) {
+        u = (1.0 as f32) - fx;
+    }
+    return Vec2 { x: u * (16.0 as f32), y: v * (16.0 as f32) };
+}
+
+/** True where a leaf block is a hole, so light and eyes pass through. */
+pub fn lumenLeafHole(texel : i32) : bool {
+    // Holes are two texels across, so they stay resolvable to twice the distance before they turn to noise.
+    return lnUnit((texel & 255) >> 1, (texel >> 8) >> 1, 7, 91) < (0.32 as f32);
+}
+
+/** True on the wooden frame of a glass block; the rest is clear. */
+pub fn lumenGlassFrame(texel : i32) : bool {
+    let ix : i32 = texel & 255;
+    let iy : i32 = texel >> 8;
+    return ix == 0 || ix == 15 || iy == 0 || iy == 15 || ix == 7 || ix == 8 || iy == 7 || iy == 8;
+}
+
+fn txShade(base : Vec3, k : f32) : Vec3 {
+    return base.scale(k);
+}
+
+fn txStone(base : Vec3, ix : i32, iy : i32, salt : i32) : LumenTexel {
+    let n : f32 = lnUnit(ix, iy, salt, 11);
+    let crack : f32 = lnValue2(ix as f32 * (0.55 as f32), iy as f32 * (0.55 as f32), 5 + salt);
+    let mut k : f32 = (0.78 as f32) + (0.34 as f32) * n;
+    let mut h : f32 = (0.35 as f32) + (0.5 as f32) * n;
+    if (crack < (0.3 as f32)) {
+        k = k * (0.7 as f32);
+        h = (0.12 as f32);
+    }
+    return LumenTexel { albedo: txShade(base, k), height: h };
+}
+
+fn txCobble(base : Vec3, ix : i32, iy : i32) : LumenTexel {
+    let cell : f32 = lnUnit(ix / 5, iy / 4 + (ix / 5) % 2, 3, 17);
+    let edge : bool = ix % 5 == 0 || iy % 4 == 0;
+    let n : f32 = lnUnit(ix, iy, 4, 19);
+    let mut k : f32 = (0.65 as f32) + (0.5 as f32) * cell + (0.1 as f32) * n;
+    let mut h : f32 = (0.55 as f32) + (0.25 as f32) * cell;
+    if (edge) {
+        k = k * (0.55 as f32);
+        h = (0.05 as f32);
+    }
+    return LumenTexel { albedo: txShade(base, k), height: h };
+}
+
+fn txGrassTop(base : Vec3, ix : i32, iy : i32) : LumenTexel {
+    let n : f32 = lnUnit(ix, iy, 9, 23);
+    let blade : f32 = lnValue2(ix as f32 * (0.8 as f32), iy as f32 * (0.8 as f32), 29);
+    let k : f32 = (0.62 as f32) + (0.6 as f32) * n * blade + (0.2 as f32) * blade;
+    return LumenTexel { albedo: txShade(base, k), height: (0.3 as f32) + (0.6 as f32) * n };
+}
+
+fn txDirt(base : Vec3, ix : i32, iy : i32, salt : i32) : LumenTexel {
+    let n : f32 = lnUnit(ix, iy, salt, 31);
+    let mut k : f32 = (0.75 as f32) + (0.4 as f32) * n;
+    let mut h : f32 = (0.3 as f32) + (0.5 as f32) * n;
+    if (n > (0.93 as f32)) {
+        k = (1.25 as f32);
+        h = (0.95 as f32);
+    }
+    return LumenTexel { albedo: txShade(base, k), height: h };
+}
+
+fn txLog(base : Vec3, face : i32, ix : i32, iy : i32) : LumenTexel {
+    if (face == 2 || face == 3) {
+        let dx : f32 = (ix as f32) - (7.5 as f32);
+        let dy : f32 = (iy as f32) - (7.5 as f32);
+        let r : f32 = (dx * dx + dy * dy).sqrt();
+        let ring : f32 = ((sin(r * (1.9 as f32)) * (0.5 as f32)) + (0.5 as f32));
+        let mut k : f32 = (0.8 as f32) + (0.45 as f32) * ring;
+        if (ix == 0 || ix == 15 || iy == 0 || iy == 15) {
+            k = (0.55 as f32);
+        }
+        return LumenTexel { albedo: txShade(base, k), height: (0.4 as f32) + (0.3 as f32) * ring };
+    }
+    let streak : f32 = lnUnit(ix, 0, 5, 37);
+    let n : f32 = lnUnit(ix, iy, 6, 41);
+    let k : f32 = (0.55 as f32) + (0.6 as f32) * streak + (0.1 as f32) * n;
+    return LumenTexel { albedo: txShade(base, k), height: (0.2 as f32) + (0.7 as f32) * streak };
+}
+
+fn txPlanks(base : Vec3, ix : i32, iy : i32) : LumenTexel {
+    let board : i32 = iy / 4;
+    let shift : i32 = (board * 7) % 16;
+    let seam : bool = iy % 4 == 0 || (ix + shift) % 16 == 0;
+    let tone : f32 = lnUnit(board, (ix + shift) / 16, 2, 43);
+    let grain : f32 = lnUnit(ix, iy, 8, 47);
+    let mut k : f32 = (0.8 as f32) + (0.3 as f32) * tone + (0.08 as f32) * grain;
+    let mut h : f32 = (0.6 as f32);
+    if (seam) {
+        k = k * (0.55 as f32);
+        h = (0.05 as f32);
+    }
+    return LumenTexel { albedo: txShade(base, k), height: h };
+}
+
+fn txRoof(base : Vec3, ix : i32, iy : i32) : LumenTexel {
+    let row : i32 = iy / 4;
+    let shingle : i32 = (ix + (row % 2) * 4) / 8;
+    let tone : f32 = lnUnit(row, shingle, 12, 53);
+    let mut k : f32 = (0.7 as f32) + (0.5 as f32) * tone;
+    let mut h : f32 = (0.5 as f32) + (0.1 as f32) * tone;
+    if (iy % 4 == 0 || (ix + (row % 2) * 4) % 8 == 0) {
+        k = k * (0.5 as f32);
+        h = (0.05 as f32);
+    }
+    return LumenTexel { albedo: txShade(base, k), height: h };
+}
+
+fn txLeaves(base : Vec3, ix : i32, iy : i32) : LumenTexel {
+    let n : f32 = lnUnit(ix, iy, 14, 59);
+    let k : f32 = (0.55 as f32) + (0.7 as f32) * n;
+    return LumenTexel { albedo: txShade(base, k), height: (0.3 as f32) + (0.6 as f32) * n };
+}
+
+fn txLava(base : Vec3, ix : i32, iy : i32, time : f32) : LumenTexel {
+    let a : f32 = lnValue2(ix as f32 * (0.35 as f32) + time * (0.35 as f32), iy as f32 * (0.35 as f32), 61);
+    let b : f32 = lnValue2(ix as f32 * (0.5 as f32), iy as f32 * (0.5 as f32) - time * (0.25 as f32), 67);
+    let heat : f32 = a * b * (2.2 as f32);
+    let crust : bool = heat < (0.42 as f32);
+    let mut glow : f32 = (0.4 as f32) + (1.6 as f32) * heat;
+    let mut k : f32 = (1.0 as f32);
+    if (crust) {
+        glow = (0.12 as f32);
+        k = (0.25 as f32);
+    }
+    return LumenTexel { albedo: txShade(base, k), height: (0.3 as f32) + (0.4 as f32) * heat, glow: glow };
+}
+
+fn txCrystal(base : Vec3, ix : i32, iy : i32, time : f32) : LumenTexel {
+    let facet : f32 = lnUnit((ix + iy) / 3, (ix - iy + 16) / 3, 16, 71);
+    let mut glow : f32 = (0.55 as f32) + (0.7 as f32) * facet;
+    if ((ix * 3 + iy * 5) % 11 == 0) {
+        glow = glow + (0.6 as f32) + (0.4 as f32) * sin(time * (2.0 as f32) + ix as f32);
+    }
+    return LumenTexel {
+        albedo: txShade(base, (0.7 as f32) + (0.5 as f32) * facet),
+        height: (0.4 as f32) + (0.5 as f32) * facet,
+        glow: glow,
+    };
+}
+
+fn txLantern(base : Vec3, ix : i32, iy : i32, time : f32) : LumenTexel {
+    // The lantern shares the pane grid of a glass block: a frame around the outside and a cross through it.
+    let frame : bool = lumenGlassFrame(ix | (iy << 8));
+    if (frame) {
+        return LumenTexel { albedo: txShade(base, (0.18 as f32)), height: (0.8 as f32), glow: (0.12 as f32) };
+    }
+    let flick : f32 = (1.0 as f32) + (0.08 as f32) * sin(time * (9.0 as f32) + (ix + iy * 3) as f32);
+    let core : f32 = lnUnit(ix, iy, 18, 73);
+    return LumenTexel {
+        albedo: txShade(base, (1.0 as f32)),
+        height: (0.5 as f32),
+        glow: ((0.8 as f32) + (0.4 as f32) * core) * flick,
+    };
+}
+
+fn txFlat(base : Vec3, ix : i32, iy : i32, salt : i32, spread : f32, relief : f32) : LumenTexel {
+    let n : f32 = lnUnit(ix, iy, salt, 79);
+    return LumenTexel {
+        albedo: txShade(base, (1.0 as f32) - spread + spread * (2.0 as f32) * n),
+        height: (0.5 as f32) + relief * (n - (0.5 as f32)),
+    };
+}
+
+fn txWool(base : Vec3, ix : i32, iy : i32) : LumenTexel {
+    let weave : f32 = ((ix + iy) % 2) as f32;
+    let n : f32 = lnUnit(ix, iy, 20, 83);
+    return LumenTexel {
+        albedo: txShade(base, (0.88 as f32) + (0.1 as f32) * weave + (0.06 as f32) * n),
+        height: (0.4 as f32) + (0.3 as f32) * weave,
+    };
+}
+
+fn txSand(base : Vec3, ix : i32, iy : i32) : LumenTexel {
+    let n : f32 = lnUnit(ix, iy, 21, 89);
+    let ripple : f32 = lnValue2(ix as f32 * (0.4 as f32), iy as f32 * (0.9 as f32), 97);
+    return LumenTexel {
+        albedo: txShade(base, (0.86 as f32) + (0.14 as f32) * n + (0.1 as f32) * ripple),
+        height: (0.4 as f32) + (0.3 as f32) * ripple,
+    };
+}
+
+/**
+ * The texel (ix, iy) of face `face` of block `id`. `time` animates lava, crystals and lanterns; the block id and
+ * face vary the pattern so two faces do not look cloned.
+ */
+pub fn lumenTexel(pal : BlockPalette, id : i32, face : i32, ix : i32, iy : i32, time : f32) : LumenTexel {
+    let base : Vec3 = pal.albedoOf(id);
+    let salt : i32 = id * 8 + face;
+    if (id == LumenBlock::Stone.id()) {
+        return txStone(base, ix, iy, salt);
+    }
+    if (id == LumenBlock::Cobble.id()) {
+        return txCobble(base, ix, iy);
+    }
+    if (id == LumenBlock::Grass.id()) {
+        if (face == 2) {
+            return txGrassTop(base, ix, iy);
+        }
+        if (face == 3) {
+            return txDirt(pal.albedoOf(LumenBlock::Dirt.id()), ix, iy, 3);
+        }
+        let ragged : i32 = 13 + (lnUnit(ix, 0, 25, 101) * (3.0 as f32)) as i32 - 1;
+        if (iy >= ragged) {
+            return txGrassTop(base, ix, iy);
+        }
+        return txDirt(pal.albedoOf(LumenBlock::Dirt.id()), ix, iy, 3);
+    }
+    if (id == LumenBlock::Dirt.id()) {
+        return txDirt(base, ix, iy, 3);
+    }
+    if (id == LumenBlock::Sand.id()) {
+        return txSand(base, ix, iy);
+    }
+    if (id == LumenBlock::Log.id() || id == LumenBlock::Birch.id()) {
+        let mut t : LumenTexel = txLog(base, face, ix, iy);
+        if (id == LumenBlock::Birch.id() && face < 2 || id == LumenBlock::Birch.id() && face > 3) {
+            let fleck : f32 = lnUnit(ix, iy / 2, 27, 103);
+            if (fleck > (0.82 as f32)) {
+                t.albedo = base.scale(0.25);
+            }
+        }
+        return t;
+    }
+    if (id == LumenBlock::Planks.id()) {
+        return txPlanks(base, ix, iy);
+    }
+    if (id == LumenBlock::Roof.id()) {
+        return txRoof(base, ix, iy);
+    }
+    if (id == LumenBlock::Leaves.id()) {
+        return txLeaves(base, ix, iy);
+    }
+    if (id == LumenBlock::Lava.id()) {
+        return txLava(base, ix, iy, time);
+    }
+    if (id == LumenBlock::CrystalBlue.id() || id == LumenBlock::CrystalPink.id()) {
+        return txCrystal(base, ix, iy, time);
+    }
+    if (id == LumenBlock::Lantern.id()) {
+        return txLantern(base, ix, iy, time);
+    }
+    if (id == LumenBlock::Snow.id()) {
+        return txFlat(base, ix, iy, salt, (0.03 as f32), (0.25 as f32));
+    }
+    if (id == LumenBlock::WoolWhite.id() || id == LumenBlock::WoolRed.id()) {
+        return txWool(base, ix, iy);
+    }
+    if (id == LumenBlock::Glass.id() || id == LumenBlock::Ice.id()) {
+        return txPlanks(pal.albedoOf(LumenBlock::Planks.id()), ix, iy);
+    }
+    if (id == LumenBlock::Beacon.id()) {
+        return LumenTexel {
+            albedo: base,
+            height: (0.5 as f32),
+            glow: (0.9 as f32) + (0.2 as f32) * lnUnit(ix, iy, 30, 107),
+        };
+    }
+    return txFlat(base, ix, iy, salt, (0.06 as f32), (0.4 as f32));
+}
+
+/**
+ * Every static texel of every block face, computed once and kept as a mip chain (16 x 16, 8 x 8, 4 x 4, 2 x 2, 1),
+ * each level the 2 x 2 average of the one before it in linear light. A texel costs a handful of hashes, so the
+ * faces are tabulated; and a chain is what stops a distant texture shimmering: when a pixel covers several texels
+ * the sampler reads the level whose texels are about a pixel across, instead of whichever texel the ray happened
+ * to land on (this is voxel-axle's mipmapping, and for the same reason). Blocks whose texels move with time (lava,
+ * crystals, lanterns) are not tabulated and are computed on demand.
+ */
+pub class LumenAtlas {
+    albedo : f32[];
+    glow   : f32[];
+    relief : f32[];
+    moving : bool[];
+
+    /** The atlas of `pal`'s blocks at time zero. */
+    constructor(pal : BlockPalette) {
+        let tiles : i64 = (BLOCK_COUNT as i64) * 6;
+        self.albedo = malloc<f32>(tiles * ATLAS_TILE * 3);
+        self.glow = malloc<f32>(tiles * ATLAS_TILE);
+        self.relief = malloc<f32>(tiles * 512);
+        self.moving = malloc<bool>(BLOCK_COUNT as i64);
+        for (b of 0..BLOCK_COUNT) {
+            self.moving[b as i64] = b == LumenBlock::Lava.id() || b == LumenBlock::CrystalBlue.id()
+                || b == LumenBlock::CrystalPink.id()
+                || b == LumenBlock::Lantern.id();
+            for (f of 0..6) {
+                let tile : i64 = (b * 6 + f) as i64;
+                for (iy of 0..16) {
+                    for (ix of 0..16) {
+                        let t : LumenTexel = lumenTexel(pal, b, f, ix, iy, 0.0);
+                        let at : i64 = tile * ATLAS_TILE + (iy * 16 + ix) as i64;
+                        self.albedo[at * 3] = t.albedo.x;
+                        self.albedo[at * 3 + 1] = t.albedo.y;
+                        self.albedo[at * 3 + 2] = t.albedo.z;
+                        self.glow[at] = t.glow;
+                        let r : i64 = tile * 256 + (iy * 16 + ix) as i64;
+                        self.relief[r * 2] = lumenTexel(pal, b, f, atlasClamp(ix + 1), iy, 0.0).height
+                            - lumenTexel(pal, b, f, atlasClamp(ix - 1), iy, 0.0).height;
+                        self.relief[r * 2 + 1] = lumenTexel(pal, b, f, ix, atlasClamp(iy + 1), 0.0).height
+                            - lumenTexel(pal, b, f, ix, atlasClamp(iy - 1), 0.0).height;
+                    }
+                }
+                for (level of 1..5) {
+                    let size : i32 = 16 >> level;
+                    let from : i32 = 16 >> (level - 1);
+                    for (y of 0..size) {
+                        for (x of 0..size) {
+                            let at : i64 = tile * ATLAS_TILE + (atlasOffset(level) + y * size + x) as i64;
+                            let mut r : f32 = 0.0;
+                            let mut g : f32 = 0.0;
+                            let mut bl : f32 = 0.0;
+                            let mut e : f32 = 0.0;
+                            for (k of 0..4) {
+                                let src : i64 = tile * ATLAS_TILE
+                                    + (atlasOffset(level - 1) + (y * 2 + k / 2) * from + x * 2
+                                        + k % 2) as i64;
+                                r = r + self.albedo[src * 3];
+                                g = g + self.albedo[src * 3 + 1];
+                                bl = bl + self.albedo[src * 3 + 2];
+                                e = e + self.glow[src];
+                            }
+                            self.albedo[at * 3] = r * (0.25 as f32);
+                            self.albedo[at * 3 + 1] = g * (0.25 as f32);
+                            self.albedo[at * 3 + 2] = bl * (0.25 as f32);
+                            self.glow[at] = e * (0.25 as f32);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * The colour of the point (u, v) (texel units, 0..16) of face `face` of block `id` at animation time `time`,
+     * read at mip level `lod` (0 is the full texture, each step halves it; fractions blend two levels). Up close
+     * (lod 0) a texel is a crisp square; further, the levels are read bilinearly.
+     */
+    pub fn sample(
+        self,
+        pal : BlockPalette,
+        id : i32,
+        face : i32,
+        u : f32,
+        v : f32,
+        time : f32,
+        lod : f32
+    ) : LumenTexel {
+        if (self.moving[id as i64]) {
+            return lumenTexel(pal, id, face, atlasClamp(u as i32), atlasClamp(v as i32), time);
+        }
+        let tile : i64 = ((id * 6 + face) as i64);
+        if (lod <= 0.0) {
+            return self.nearest(tile, atlasClamp(u as i32), atlasClamp(v as i32));
+        }
+        let mut level : i32 = lod as i32;
+        if (level > 3) {
+            level = 3;
+        }
+        let mix : f32 = min(lod - level as f32, 1.0);
+        let mut a : LumenTexel = self.nearest(tile, atlasClamp(u as i32), atlasClamp(v as i32));
+        if (level > 0) {
+            a = self.bilinear(tile, level, u, v);
+        }
+        let b : LumenTexel = self.bilinear(tile, level + 1, u, v);
+        return LumenTexel {
+            albedo: a.albedo.lerp(b.albedo, mix),
+            height: 0.5,
+            glow: a.glow + (b.glow - a.glow) * mix,
+        };
+    }
+
+    /**
+     * How the relief rises across the texel (ix, iy) along u (x) and along v (y): the height differences that tilt
+     * the normal. The relief is detail of the size of a texel, so it fades out as the texel shrinks below a pixel.
+     */
+    pub fn relief(
+        self,
+        pal : BlockPalette,
+        id : i32,
+        face : i32,
+        ix : i32,
+        iy : i32,
+        time : f32,
+        lod : f32
+    ) : Vec2 {
+        let keep : f32 = (1.0 as f32) - min(lod, 1.0);
+        if (keep <= 0.0) {
+            return Vec2 { x: 0.0, y: 0.0 };
+        }
+        if (self.moving[id as i64]) {
+            let du : f32 = lumenTexel(pal, id, face, atlasClamp(ix + 1), iy, time).height
+                - lumenTexel(pal, id, face, atlasClamp(ix - 1), iy, time).height;
+            let dv : f32 = lumenTexel(pal, id, face, ix, atlasClamp(iy + 1), time).height
+                - lumenTexel(pal, id, face, ix, atlasClamp(iy - 1), time).height;
+            return Vec2 { x: du * keep, y: dv * keep };
+        }
+        let r : i64 = ((id * 6 + face) as i64) * 256 + (iy * 16 + ix) as i64;
+        return Vec2 { x: self.relief[r * 2] * keep, y: self.relief[r * 2 + 1] * keep };
+    }
+
+    fn nearest(self, tile : i64, ix : i32, iy : i32) : LumenTexel {
+        let at : i64 = tile * ATLAS_TILE + (iy * 16 + ix) as i64;
+        return LumenTexel {
+            albedo: Vec3 { x: self.albedo[at * 3], y: self.albedo[at * 3 + 1], z: self.albedo[at * 3 + 2] },
+            height: 0.5,
+            glow: self.glow[at],
+        };
+    }
+
+    // Bilinear read of mip level `level` of a tile at (u, v) in texel units of the full texture.
+    fn bilinear(self, tile : i64, level : i32, u : f32, v : f32) : LumenTexel {
+        let size : i32 = 16 >> level;
+        let scale : f32 = (size as f32) * (0.0625 as f32);
+        let fu : f32 = u * scale - (0.5 as f32);
+        let fv : f32 = v * scale - (0.5 as f32);
+        let mut x0 : i32 = lnFloor(fu);
+        let mut y0 : i32 = lnFloor(fv);
+        let tx : f32 = fu - x0 as f32;
+        let ty : f32 = fv - y0 as f32;
+        let mut x1 : i32 = x0 + 1;
+        let mut y1 : i32 = y0 + 1;
+        x0 = atlasLimit(x0, size);
+        x1 = atlasLimit(x1, size);
+        y0 = atlasLimit(y0, size);
+        y1 = atlasLimit(y1, size);
+        let base : i64 = tile * ATLAS_TILE + atlasOffset(level) as i64;
+        let a : i64 = base + (y0 * size + x0) as i64;
+        let b : i64 = base + (y0 * size + x1) as i64;
+        let c : i64 = base + (y1 * size + x0) as i64;
+        let d : i64 = base + (y1 * size + x1) as i64;
+        let top : Vec3 = Vec3 {
+            x: self.albedo[a * 3],
+            y: self.albedo[a * 3 + 1],
+            z: self.albedo[a * 3 + 2],
+        }.lerp(Vec3 { x: self.albedo[b * 3], y: self.albedo[b * 3 + 1], z: self.albedo[b * 3 + 2] }, tx);
+        let bottom : Vec3 = Vec3 {
+            x: self.albedo[c * 3],
+            y: self.albedo[c * 3 + 1],
+            z: self.albedo[c * 3 + 2],
+        }.lerp(Vec3 { x: self.albedo[d * 3], y: self.albedo[d * 3 + 1], z: self.albedo[d * 3 + 2] }, tx);
+        let glowTop : f32 = self.glow[a] + (self.glow[b] - self.glow[a]) * tx;
+        let glowBottom : f32 = self.glow[c] + (self.glow[d] - self.glow[c]) * tx;
+        return LumenTexel {
+            albedo: top.lerp(bottom, ty),
+            height: 0.5,
+            glow: glowTop + (glowBottom - glowTop) * ty,
+        };
+    }
+}
+
+/** Texels in one tile of the atlas: the 16 x 16 texture and its four coarser levels. */
+const ATLAS_TILE : i32 = 341;
+
+// Where mip level `level` starts in a tile: 256, 64, 16, 4 and 1 texels.
+fn atlasOffset(level : i32) : i32 {
+    if (level == 0) {
+        return 0;
+    }
+    if (level == 1) {
+        return 256;
+    }
+    if (level == 2) {
+        return 320;
+    }
+    if (level == 3) {
+        return 336;
+    }
+    return 340;
+}
+
+fn atlasClamp(v : i32) : i32 {
+    if (v < 0) {
+        return 0;
+    }
+    if (v > 15) {
+        return 15;
+    }
+    return v;
+}
+
+// A texel index kept inside a level of `size` texels: a face does not wrap onto its neighbour.
+fn atlasLimit(v : i32, size : i32) : i32 {
+    if (v < 0) {
+        return 0;
+    }
+    if (v >= size) {
+        return size - 1;
+    }
+    return v;
+}

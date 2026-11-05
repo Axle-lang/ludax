@@ -1,0 +1,288 @@
+// crowd — agents that follow their paths and steer round each other.
+//
+// Every agent owns a path (a list of corners over the map) and follows it with `Steering::followPath` and
+// `arrive`; a push away from close neighbours (`separation`, with neighbours found by a `NeighborGrid`) is added
+// to its acceleration. All accelerations of a step are computed from the positions at its start, then applied,
+// so the result does not depend on the order of the agents. Walls are not part of steering: after the move an
+// agent that ended inside a wall slides along it (x only, then y only, else it stays).
+//
+// Agent 0 can be a `WalkerAgent`: it is steered like the others, but its position is advanced by the root motion
+// of its animation instead of by the velocity integrator. The crowd keeps the walker's committed position, not
+// the root motion's predicted one, so a wall cannot make a footstep land inside rock.
+
+use ludax::{GridMap, SteerAgent, PathFollow, Steering, NeighborGrid, Vec2};
+
+use crate::sim::walker_agent::WalkerAgent;
+
+// Corners a path may have, and positions kept for the trails drawn on the map.
+const CROWD_MAX_CORNERS : i32 = 48;
+const CROWD_MAX_TRAIL : i32 = 600;
+
+// How far ahead of itself an agent aims along its path, how close to the end counts as arrived, how far the
+// push of a neighbour reaches, and how strongly it counts against following the path.
+const CROWD_LOOK_AHEAD : f32 = 1.4;
+const CROWD_REACH : f32 = 0.35;
+const CROWD_ARRIVE_RADIUS : f32 = 1.5;
+const CROWD_SEPARATION_RANGE : f32 = 1.8;
+const CROWD_SEPARATION_WEIGHT : f32 = 2.5;
+
+// Every fourth step leaves a trail point, and a crowd's closest approach starts at "no measurement".
+const CROWD_TRAIL_EVERY : i32 = 4;
+const CROWD_FAR : f32 = 1000000.0;
+
+// The checksum folds positions at this scale into a FNV-style 64-bit product, reduced to a prime modulus.
+const CROWD_HASH_SCALE : f32 = 4096.0;
+const CROWD_HASH_SEED : i64 = 1469598103;
+const CROWD_HASH_PRIME : i64 = 1099511;
+const CROWD_HASH_MODULUS : i64 = 4294967291;
+
+/** A group of agents moving over a map. */
+pub class Crowd {
+    n        : i32;
+    agents   : SteerAgent[];
+    corners  : f32[];
+    cornerN  : i32[];
+    segment  : i32[];
+    arrived  : i32[];
+    trail    : f32[];
+    trailN   : i32[];
+    xs       : f32[];
+    ys       : f32[];
+    accel    : Vec2[];
+    grid     : NeighborGrid;
+    tick     : i32 = 0;
+    tightest : f32 = CROWD_FAR;
+    scratchI : i32[];
+    scratchX : f32[];
+    scratchY : f32[];
+
+    /** A crowd of `count` agents over an area `width` x `height` units. */
+    constructor(count : i32, width : f32, height : f32) {
+        self.n = count;
+        self.agents = malloc<SteerAgent>(count as i64);
+        self.corners = malloc<f32>((count * CROWD_MAX_CORNERS * 2) as i64);
+        self.cornerN = malloc<i32>(count as i64);
+        self.segment = malloc<i32>(count as i64);
+        self.arrived = malloc<i32>(count as i64);
+        self.trail = malloc<f32>((count * CROWD_MAX_TRAIL * 2) as i64);
+        self.trailN = malloc<i32>(count as i64);
+        self.xs = malloc<f32>(count as i64);
+        self.ys = malloc<f32>(count as i64);
+        self.accel = malloc<Vec2>(count as i64);
+        self.grid = new NeighborGrid(0.0, 0.0, width, height, CROWD_SEPARATION_RANGE);
+        self.scratchI = malloc<i32>(count as i64);
+        self.scratchX = malloc<f32>(count as i64);
+        self.scratchY = malloc<f32>(count as i64);
+        for (i of 0..count) {
+            self.agents[i] = SteerAgent {};
+            self.cornerN[i] = 0;
+            self.segment[i] = 0;
+            self.arrived[i] = 1;
+            self.trailN[i] = 0;
+            self.accel[i] = Vec2::zero();
+        }
+    }
+
+    /** Places agent `i` in the given state; an agent with no path yet counts as arrived. */
+    pub fn place(mut self, i : i32, start : SteerAgent) : void {
+        self.agents[i] = start;
+    }
+
+    /** Gives agent `i` the path through the `count` corners (x, y pairs in `pts`); it sets off at once. */
+    pub fn setPath(mut self, i : i32, pts : f32[], count : i32) : void {
+        let mut m : i32 = count;
+        if (m > CROWD_MAX_CORNERS) {
+            m = CROWD_MAX_CORNERS;
+        }
+        for (k of 0..(m * 2)) {
+            self.corners[i * CROWD_MAX_CORNERS * 2 + k] = pts[k];
+        }
+        self.cornerN[i] = m;
+        self.segment[i] = 0;
+        self.arrived[i] = 0;
+    }
+
+    /** How many agents there are. */
+    pub fn count(self) : i32 {
+        return self.n;
+    }
+
+    /** Agent `i` as it is now. */
+    pub fn agent(self, i : i32) : SteerAgent {
+        return self.agents[i];
+    }
+
+    /** True when agent `i` reached the end of its path. */
+    pub fn hasArrived(self, i : i32) : bool {
+        return self.arrived[i] != 0;
+    }
+
+    /** True when every agent has arrived. */
+    pub fn allArrived(self) : bool {
+        for (i of 0..self.n) {
+            if (self.arrived[i] == 0) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /** The smallest distance between the centres of two agents seen so far. */
+    pub fn closestApproach(self) : f32 {
+        return self.tightest;
+    }
+
+    /** How many positions were recorded in the trail of agent `i`. */
+    pub fn trailLength(self, i : i32) : i32 {
+        return self.trailN[i];
+    }
+
+    /** The x of trail position `k` of agent `i`. */
+    pub fn trailX(self, i : i32, k : i32) : f32 {
+        return self.trail[(i * CROWD_MAX_TRAIL + k) * 2];
+    }
+
+    /** The y of trail position `k` of agent `i`. */
+    pub fn trailY(self, i : i32, k : i32) : f32 {
+        return self.trail[(i * CROWD_MAX_TRAIL + k) * 2 + 1];
+    }
+
+    /** Folds every position into a number: equal for two runs that behaved identically. */
+    pub fn checksum(self) : i64 {
+        let mut h : i64 = CROWD_HASH_SEED;
+        for (i of 0..self.n) {
+            let px : i64 = (self.agents[i].pos.x * CROWD_HASH_SCALE) as i64;
+            let py : i64 = (self.agents[i].pos.y * CROWD_HASH_SCALE) as i64;
+            h = (h * CROWD_HASH_PRIME + px) % CROWD_HASH_MODULUS;
+            h = (h * CROWD_HASH_PRIME + py) % CROWD_HASH_MODULUS;
+        }
+        return h;
+    }
+
+    /** Advances everyone by `dt` seconds. `walker` drives agent 0 when `walkerDrives` is true. */
+    pub fn update(mut self, map : GridMap, dt : f32, walker : WalkerAgent, walkerDrives : bool) : void {
+        // Snapshot the positions first: every wish below reads the same start-of-step world.
+        for (i of 0..self.n) {
+            self.xs[i] = self.agents[i].pos.x;
+            self.ys[i] = self.agents[i].pos.y;
+        }
+        self.grid.rebuild(self.xs, self.ys, self.n);
+
+        // Steering decides, then movement applies, so the agent order cannot matter.
+        for (i of 0..self.n) {
+            self.accel[i] = self.wish(i);
+        }
+
+        for (i of 0..self.n) {
+            let a : SteerAgent = self.agents[i];
+            let mut moved : SteerAgent = a;
+            if (i == 0 && walkerDrives) {
+                moved = walker.advance(a, self.accel[i], dt);
+            } else {
+                moved = Steering::step(a, self.accel[i], dt);
+            }
+            self.agents[i] = Crowd::slide(map, a, moved);
+            if (i == 0 && walkerDrives) {
+                walker.commit(self.agents[i].pos.x, self.agents[i].pos.y);
+            }
+        }
+
+        self.tick = self.tick + 1;
+        self.measure();
+    }
+
+    // What agent `i` asks of its legs: follow the path, keep clear of neighbours, or stand still once arrived.
+    fn wish(mut self, i : i32) : Vec2 {
+        let a : SteerAgent = self.agents[i];
+        let mut seek : Vec2 = Steering::toward(a, Vec2::zero());
+        if (self.arrived[i] == 0) {
+            let base : i32 = i * CROWD_MAX_CORNERS * 2;
+            let mut pts : f32[] = malloc<f32>((self.cornerN[i] * 2) as i64);
+            for (k of 0..(self.cornerN[i] * 2)) {
+                pts[k] = self.corners[base + k];
+            }
+
+            let follow : PathFollow = Steering::followPath(
+                a,
+                pts,
+                self.cornerN[i],
+                self.segment[i],
+                CROWD_LOOK_AHEAD,
+                CROWD_REACH
+            );
+            self.segment[i] = follow.segment;
+            if (follow.done) {
+                self.arrived[i] = 1;
+            } else {
+                seek = Steering::arrive(a, follow.target, CROWD_ARRIVE_RADIUS);
+            }
+        }
+
+        // Neighbours are gathered from the start-of-step grid; `at` marks this agent so it is not pushed by itself.
+        let m : i32 = self.grid.gather(a.pos.x, a.pos.y, CROWD_SEPARATION_RANGE, self.scratchI, self.n);
+        let mut at : i32 = -1;
+        for (k of 0..m) {
+            self.scratchX[k] = self.xs[self.scratchI[k]];
+            self.scratchY[k] = self.ys[self.scratchI[k]];
+            if (self.scratchI[k] == i) {
+                at = k;
+            }
+        }
+        let away : Vec2 = Steering::separation(
+            a,
+            self.scratchX,
+            self.scratchY,
+            m,
+            at,
+            CROWD_SEPARATION_RANGE
+        );
+        return Steering::limit(seek.plus(away.scale(CROWD_SEPARATION_WEIGHT)), a.maxAccel);
+    }
+
+    // The agent after a move from `before` to `after`, kept out of the walls.
+    static fn slide(map : GridMap, before : SteerAgent, after : SteerAgent) : SteerAgent {
+        if (map.isWalkable(after.pos.x as i32, after.pos.y as i32)) {
+            return after;
+        }
+
+        // Sliding keeps the velocity on the free axis, so a wall does not eat the whole step.
+        let tryX : Vec2 = Vec2 { x: after.pos.x, y: before.pos.y };
+        if (map.isWalkable(tryX.x as i32, tryX.y as i32)) {
+            return Crowd::moved(after, tryX, Vec2 { x: after.vel.x, y: 0.0 });
+        }
+        let tryY : Vec2 = Vec2 { x: before.pos.x, y: after.pos.y };
+        if (map.isWalkable(tryY.x as i32, tryY.y as i32)) {
+            return Crowd::moved(after, tryY, Vec2 { x: 0.0, y: after.vel.y });
+        }
+        return Crowd::moved(after, before.pos, Vec2::zero());
+    }
+
+    // `after` with a new position and velocity; its limits and radius are unchanged.
+    static fn moved(after : SteerAgent, pos : Vec2, vel : Vec2) : SteerAgent {
+        return SteerAgent {
+            pos: pos,
+            vel: vel,
+            maxSpeed: after.maxSpeed,
+            maxAccel: after.maxAccel,
+            radius: after.radius,
+        };
+    }
+
+    // Records the closest approach and, every few steps, a trail point for each agent that is still moving.
+    fn measure(mut self) : void {
+        for (i of 0..self.n) {
+            for (j of (i + 1)..self.n) {
+                let d : f32 = self.agents[i].pos.distance(self.agents[j].pos);
+                if (d < self.tightest && (self.arrived[i] == 0 || self.arrived[j] == 0)) {
+                    self.tightest = d;
+                }
+            }
+            if (self.tick % CROWD_TRAIL_EVERY == 0 && self.trailN[i] < CROWD_MAX_TRAIL) {
+                let at : i32 = (i * CROWD_MAX_TRAIL + self.trailN[i]) * 2;
+                self.trail[at] = self.agents[i].pos.x;
+                self.trail[at + 1] = self.agents[i].pos.y;
+                self.trailN[i] = self.trailN[i] + 1;
+            }
+        }
+    }
+}

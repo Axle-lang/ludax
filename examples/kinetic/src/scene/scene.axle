@@ -1,0 +1,228 @@
+// scene — the demo world: a ramp, a pyramid of boxes, balls dropped around it and a swinging chain.
+//
+// Everything is built from a seed with an explicit Pcg32, so the same call always builds the same world. The
+// scene keeps the handles it needs to look at afterwards: the pyramid boxes, the balls, the slider on the ramp
+// and the chain with its joints. Units are metres; the picture is a side view, so everything lives near z = 0.
+//
+// The chain's pivot, link count and bob offset are public because the check in `main` measures the bob against
+// the chain's reach: the number there must come from the same place the chain is built, not be copied.
+
+use ludax::BodyDesc;
+use ludax::DQuat;
+use ludax::DVec3;
+use ludax::EntityId;
+use ludax::Pcg32;
+use ludax::PhysicsSettings;
+use ludax::PhysicsWorld;
+use ludax::Shape;
+use ludax::Vec;
+use ludax::cosD;
+use ludax::dynamicBody;
+use ludax::sinD;
+use ludax::staticBody;
+
+/** The x of the chain's fixed pivot, metres. */
+pub const SCENE_CHAIN_PIVOT_X : f64 = 8.0;
+
+/** The y of the chain's fixed pivot, metres. */
+pub const SCENE_CHAIN_PIVOT_Y : f64 = 7.5;
+
+// How many capsule links hang from the pivot; the bob is not one of them.
+const SCENE_CHAIN_LINKS : i32 = 4;
+
+// How far past the last link's end the bob's centre hangs, metres.
+const SCENE_CHAIN_BOB_OFFSET : f64 = 0.3;
+
+// The chain is released this far from vertical, radians: 60 degrees.
+const SCENE_CHAIN_RELEASE : f64 = 1.0471975511965976;
+
+// The radius and half-length of one capsule link, metres.
+const SCENE_LINK_RADIUS : f64 = 0.08;
+const SCENE_LINK_HALF : f64 = 0.42;
+
+// The bob's radius, metres.
+const SCENE_BOB_RADIUS : f64 = 0.3;
+
+// The ground plane's height and the side walls' distance from it, metres.
+const SCENE_GROUND_Y : f64 = 0.0;
+const SCENE_WALL_DEPTH : f64 = 1.2;
+const SCENE_WALL_LEFT : f64 = -9.5;
+const SCENE_WALL_RIGHT : f64 = -11.5;
+
+// The ramp leans this far, radians (about 20 degrees), and both it and the slider have this friction.
+const SCENE_RAMP_TILT : f64 = -0.35;
+const SCENE_RAMP_FRICTION : f64 = 0.3;
+
+// The pyramid's cell size and the gap that keeps its boxes from starting in contact, metres.
+const SCENE_PYRAMID_SIDE : f64 = 0.5;
+const SCENE_PYRAMID_GAP : f64 = 0.01;
+
+/** The demo world and the handles into it. */
+pub class Scene {
+    /** The simulation. */
+    pub world : PhysicsWorld;
+
+    /** The boxes of the pyramid, bottom row first. */
+    pub pyramid : Vec<EntityId>;
+
+    /** The balls dropped around the pyramid. */
+    pub balls : Vec<EntityId>;
+
+    /** The box that slides down the ramp. */
+    pub slider : EntityId;
+
+    /** The links of the chain, then its bob. */
+    pub chain : Vec<EntityId>;
+
+    /** The ball-socket joints of the chain, from the pivot down. */
+    pub joints : Vec<i32>;
+
+    /** The positions of the pyramid boxes when they were placed (x, y, z per box). */
+    pub pyramidAt : Vec<f64>;
+
+    /** The distance from the pivot to the middle of the bob at rest, metres. */
+    pub static fn reach() : f64 {
+        return (SCENE_CHAIN_LINKS as f64) + SCENE_CHAIN_BOB_OFFSET;
+    }
+
+    /** Builds the scene; `seed` varies the ball positions. */
+    constructor(seed : u64) {
+        self.world = new PhysicsWorld(PhysicsSettings {});
+        self.pyramid = new Vec<EntityId>();
+        self.balls = new Vec<EntityId>();
+        self.chain = new Vec<EntityId>();
+        self.joints = new Vec<i32>();
+        self.pyramidAt = new Vec<f64>();
+        self.slider = EntityId::none();
+
+        self.world.addBody(staticBody(Shape::plane(DVec3::unitY(), SCENE_GROUND_Y), DVec3::zero()));
+        // Four walls keep the side view honest: nothing wanders off in depth or out of the picture.
+        let back : DVec3 = DVec3::make(0.0, 0.0, -1.0);
+        let front : DVec3 = DVec3::make(0.0, 0.0, 1.0);
+        let left : DVec3 = DVec3::make(1.0, 0.0, 0.0);
+        let right : DVec3 = DVec3::make(-1.0, 0.0, 0.0);
+        self.world.addBody(staticBody(Shape::plane(back, 0.0 - SCENE_WALL_DEPTH), DVec3::zero()));
+        self.world.addBody(staticBody(Shape::plane(front, 0.0 - SCENE_WALL_DEPTH), DVec3::zero()));
+        self.world.addBody(staticBody(Shape::plane(left, SCENE_WALL_LEFT), DVec3::zero()));
+        self.world.addBody(staticBody(Shape::plane(right, SCENE_WALL_RIGHT), DVec3::zero()));
+
+        self.buildRamp();
+        self.buildPyramid();
+        self.buildBalls(seed);
+        self.buildChain();
+    }
+
+    // A tilted plank, low end to the right, with a box on it that slides (friction 0.3 < tan 20 degrees) and
+    // two balls that roll.
+    fn buildRamp(mut self) : void {
+        let mut plank : BodyDesc = staticBody(
+            Shape::cuboid(2.5, 0.1, 1.0),
+            DVec3::make(-6.0, 1.6, 0.0)
+        );
+        plank.rotation = DQuat::fromAxisAngle(DVec3::unitZ(), SCENE_RAMP_TILT);
+        plank.friction = SCENE_RAMP_FRICTION;
+        self.world.addBody(plank);
+
+        // Points along the top face: u along the plank, n out of it.
+        let u : DVec3 = DVec3::make(cosD(SCENE_RAMP_TILT), sinD(SCENE_RAMP_TILT), 0.0);
+        let n : DVec3 = DVec3::make(0.0 - sinD(SCENE_RAMP_TILT), cosD(SCENE_RAMP_TILT), 0.0);
+        let origin : DVec3 = DVec3::make(-6.0, 1.6, 0.0).plus(n.scale(0.1));
+
+        let mut box : BodyDesc = dynamicBody(
+            Shape::cuboid(0.3, 0.3, 0.3),
+            origin.plus(u.scale(-1.8)).plus(n.scale(0.302)),
+            2.0
+        );
+        box.rotation = DQuat::fromAxisAngle(DVec3::unitZ(), SCENE_RAMP_TILT);
+        box.friction = SCENE_RAMP_FRICTION;
+        self.slider = self.world.addBody(box);
+
+        for (i of 0..2) {
+            let mut ball : BodyDesc = dynamicBody(
+                Shape::sphere(0.25),
+                origin.plus(u.scale(-0.4 + 0.9 * (i as f64))).plus(n.scale(0.26)),
+                1.0
+            );
+            ball.friction = 0.6;
+            ball.restitution = 0.2;
+            self.balls.push(self.world.addBody(ball));
+        }
+    }
+
+    // Five rows of boxes (5, 4, 3, 2, 1) centred on x = 4.
+    fn buildPyramid(mut self) : void {
+        for (row of 0..5) {
+            let count : i32 = 5 - row;
+            for (k of 0..count) {
+                let offset : f64 = (k as f64) - ((count - 1) as f64) * 0.5;
+                let x : f64 = 4.0 + offset * (SCENE_PYRAMID_SIDE + SCENE_PYRAMID_GAP);
+                let y : f64 = SCENE_PYRAMID_SIDE * 0.5 + (row as f64) * (SCENE_PYRAMID_SIDE + 0.002);
+                let mut d : BodyDesc = dynamicBody(
+                    Shape::cuboid(
+                        SCENE_PYRAMID_SIDE * 0.5,
+                        SCENE_PYRAMID_SIDE * 0.5,
+                        SCENE_PYRAMID_SIDE * 0.5
+                    ),
+                    DVec3::make(x, y, 0.0),
+                    1.0
+                );
+                d.friction = 0.6;
+                self.pyramid.push(self.world.addBody(d));
+                self.pyramidAt.push(x);
+                self.pyramidAt.push(y);
+                self.pyramidAt.push(0.0);
+            }
+        }
+    }
+
+    // Balls dropped from different heights left of the pyramid, a few rolling toward it.
+    fn buildBalls(mut self, seed : u64) : void {
+        let rng : Pcg32 = new Pcg32(seed, 3);
+        for (i of 0..6) {
+            let x : f64 = -1.5 + (i as f64) * 0.7 + (rng.nextF64() - 0.5) * 0.3;
+            let y : f64 = 4.0 + (i as f64) * 0.9 + rng.nextF64() * 0.5;
+            let mut d : BodyDesc = dynamicBody(
+                Shape::sphere(0.22),
+                DVec3::make(x, y, (rng.nextF64() - 0.5) * 0.1),
+                0.8
+            );
+            d.restitution = 0.55;
+            d.friction = 0.4;
+            d.linearVelocity = DVec3::make(0.5 + 0.5 * rng.nextF64(), 0.0, 0.0);
+            self.balls.push(self.world.addBody(d));
+        }
+    }
+
+    // Four capsule links and a heavy bob, hung from a fixed pivot and let go 60 degrees from the vertical.
+    fn buildChain(mut self) : void {
+        let pivot : DVec3 = DVec3::make(SCENE_CHAIN_PIVOT_X, SCENE_CHAIN_PIVOT_Y, 0.0);
+        let dir : DVec3 = DVec3::make(
+            0.0 - sinD(SCENE_CHAIN_RELEASE),
+            0.0 - cosD(SCENE_CHAIN_RELEASE),
+            0.0
+        );
+
+        let mut prev : EntityId = EntityId::none();
+        for (i of 0..SCENE_CHAIN_LINKS) {
+            let centre : DVec3 = pivot.plus(dir.scale((i as f64) + 0.5));
+            let mut link : BodyDesc = dynamicBody(
+                Shape::capsule(SCENE_LINK_RADIUS, SCENE_LINK_HALF),
+                centre,
+                0.5
+            );
+            link.rotation = DQuat::fromTo(DVec3::unitY(), dir);
+            let id : EntityId = self.world.addBody(link);
+
+            let anchor : DVec3 = pivot.plus(dir.scale(i as f64));
+            self.joints.push(self.world.addBallSocket(prev, id, anchor));
+            self.chain.push(id);
+            prev = id;
+        }
+
+        let bobCentre : DVec3 = pivot.plus(dir.scale(Scene::reach()));
+        let bob : EntityId = self.world.addBody(dynamicBody(Shape::sphere(SCENE_BOB_RADIUS), bobCentre, 3.0));
+        let anchor : DVec3 = pivot.plus(dir.scale(SCENE_CHAIN_LINKS as f64));
+        self.joints.push(self.world.addBallSocket(prev, bob, anchor));
+        self.chain.push(bob);
+    }
+}

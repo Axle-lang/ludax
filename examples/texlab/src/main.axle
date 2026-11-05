@@ -1,0 +1,118 @@
+// texlab — the data layer and the texture builder, end to end, with no window.
+//
+// It draws four patterns in code, saves one as a PNG with ludax's own encoder, reads it back through the image
+// cache and checks it is the same picture, builds mip-mapped textures in linear light, and writes two sheets: the
+// mip chain of the brick pattern, and a floor receding to the horizon read three ways (nearest, bilinear,
+// trilinear). Open the PNGs to see what the filters do; the numbers it prints are the checks.
+//
+// The panels share one view and differ only in texture and filter; the moss panel is larger because it is the
+// only one whose picture is not in a row of three.
+
+use ludax::{DataFiles, Image, ImageAssets, PngCodec, ByteBuf, Texture, TextureWrap};
+
+use crate::pattern::patterns::{patternBricks, patternChecker, patternMoss, patternLeaves};
+use crate::view::floor::{FloorFilter, FloorView, floorPanel};
+use crate::view::sheet::{sheetMips, sheetRow};
+
+/** The panels of the filter comparison are this wide, pixels. */
+const TEXLAB_PANEL_W : i32 = 320;
+
+/** ...and this tall. */
+const TEXLAB_PANEL_H : i32 = 240;
+
+/** The moss panel is shown larger because it is on its own. */
+const TEXLAB_MOSS_W : i32 = 640;
+
+/** ...and this tall. */
+const TEXLAB_MOSS_H : i32 = 360;
+
+/** Pixels per texel in the mip sheet: level 0 is 128 pixels across. */
+const TEXLAB_MIP_SCALE : i32 = 2;
+
+/** The checker's 1 x 1 mip is the average in linear light; anything outside this band is an encoded average. */
+const TEXLAB_CHECKER_MEAN_MIN : i32 = 170;
+const TEXLAB_CHECKER_MEAN_MAX : i32 = 176;
+
+/** The leaf's green must beat its red by this much for the cut-out colour to have survived. */
+const TEXLAB_LEAF_GREEN_MARGIN : i32 = 40;
+
+// One filter panel of `tex`, at the common size.
+fn texlabPanel(tex : Texture, filter : FloorFilter) : Image {
+    let view : FloorView = FloorView { width: TEXLAB_PANEL_W, height: TEXLAB_PANEL_H, scroll: 0.0 };
+    return floorPanel(tex, view, filter);
+}
+
+fn main() : i32 ! IOException {
+    let bricks : Image = patternBricks();
+
+    // A PNG round trip through the disk and the cache.
+    let codec : PngCodec = new PngCodec();
+    let file : ByteBuf = codec.encode(bricks);
+    DataFiles::savePng("texlab-bricks.png", bricks);
+    let cache : ImageAssets = new ImageAssets();
+    let id : i32 = cache.load("texlab-bricks.png");
+    let back : Image = cache.get(id);
+    let mut failures : i32 = 0;
+
+    let pixelBytes : i32 = bricks.width() * bricks.height() * 4;
+    println("texlab: bricks.png is ${file.len()} bytes for ${pixelBytes} bytes of pixels");
+    if (id < 0 || !back.same(bricks)) {
+        println("texlab: FAIL the picture read back is not the picture written (${cache.lastError()})");
+        failures = failures + 1;
+    } else {
+        println("texlab: the picture read back is the picture written");
+    }
+
+    // Mip chains: every level is built in linear light.
+    let brickTex : Texture = new Texture(bricks, TextureWrap::Repeat);
+    let checker : Texture = new Texture(patternChecker(), TextureWrap::Repeat);
+    let moss : Texture = new Texture(patternMoss(), TextureWrap::Repeat);
+    let leaves : Texture = new Texture(patternLeaves(), TextureWrap::Clamp);
+
+    let levels : i32 = brickTex.levels();
+    let finestW : i32 = brickTex.width(0);
+    let finestH : i32 = brickTex.height(0);
+    let coarsestW : i32 = brickTex.width(levels - 1);
+    let coarsestH : i32 = brickTex.height(levels - 1);
+    println("texlab: ${levels} mip levels from ${finestW} x ${finestH} down to ${coarsestW} x ${coarsestH}");
+    DataFiles::savePng("texlab-mips.png", sheetMips(brickTex, TEXLAB_MIP_SCALE));
+
+    // The mean of the checker (sRGB 235 and 20): averaging in linear light gives sRGB 173, averaging the encoded values 127.
+    let coarsest : i32 = checker.levels() - 1;
+    let mean : i32 = Image::red(checker.levelImage(coarsest).get(0, 0));
+    println("texlab: the checker's 1 x 1 mip is sRGB ${mean} (173 is right; 127 would be an average of encoded values)");
+    if (mean < TEXLAB_CHECKER_MEAN_MIN || mean > TEXLAB_CHECKER_MEAN_MAX) {
+        println("texlab: FAIL the mip chain is not averaged in linear light");
+        failures = failures + 1;
+    }
+
+    // A leaf cut-out keeps its green at the top of the chain instead of fading to grey with its transparent texels.
+    let top : Image = leaves.levelImage(leaves.levels() - 1);
+    let topPixel : i32 = top.get(0, 0);
+    let red : i32 = Image::red(topPixel);
+    let green : i32 = Image::green(topPixel);
+    let blue : i32 = Image::blue(topPixel);
+    let alpha : i32 = Image::alpha(topPixel);
+    println("texlab: the leaves' 1 x 1 mip is rgba(${red}, ${green}, ${blue}, ${alpha})");
+    if (green < red + TEXLAB_LEAF_GREEN_MARGIN) {
+        println("texlab: FAIL the cut-out's colour bled");
+        failures = failures + 1;
+    }
+
+    let nearest : Image = texlabPanel(checker, FloorFilter::Nearest);
+    let bilinear : Image = texlabPanel(checker, FloorFilter::Bilinear);
+    let trilinear : Image = texlabPanel(checker, FloorFilter::Trilinear);
+    DataFiles::savePng("texlab-floor-checker.png", sheetRow(nearest, bilinear, trilinear));
+
+    let brickRow : Image = sheetRow(
+        texlabPanel(brickTex, FloorFilter::Nearest),
+        texlabPanel(brickTex, FloorFilter::Bilinear),
+        texlabPanel(brickTex, FloorFilter::Trilinear)
+    );
+    DataFiles::savePng("texlab-floor-bricks.png", brickRow);
+
+    let mossView : FloorView = FloorView { width: TEXLAB_MOSS_W, height: TEXLAB_MOSS_H, scroll: 0.0 };
+    DataFiles::savePng("texlab-floor-moss.png", floorPanel(moss, mossView, FloorFilter::Trilinear));
+    println("texlab: wrote texlab-mips.png, texlab-floor-checker.png, texlab-floor-bricks.png and texlab-floor-moss.png");
+    return failures;
+}

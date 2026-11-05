@@ -1,0 +1,265 @@
+// input — mapping keys, mouse buttons and the wheel onto the game.
+//
+// `handleEvent` takes one smalt `Event` and changes the `Game`; it is the only door the keyboard and mouse
+// have, which is why the smoke test's bot can play by building the same events a person would cause. Camera
+// keys are different: they are *held*, so they are read as axes once a frame (`readHeld`) rather than as events.
+
+use smalt::{Event, EventKind, Events, Scancode, MouseButton};
+
+use crate::app::actions::{chooseKind, clickMap, upgradeSelected, sellSelected, callWave};
+use crate::app::game::Game;
+use crate::ui::layout::Layout;
+use crate::ui::state::Screen;
+
+/** Radians of orbit per pixel of right-button drag. */
+const ORBIT_PER_PIXEL : f32 = 0.0075;
+
+/** Tiles of pan per pixel of middle-button drag, per unit of camera distance. */
+const PAN_PER_PIXEL : f32 = 0.0016;
+
+/** Tiles of zoom per wheel notch. */
+const ZOOM_PER_NOTCH : f32 = 1.4;
+
+/** Tiles per second the camera pans, per unit of camera distance. */
+const PAN_SPEED : f32 = 0.55;
+
+/** Radians per second of keyboard orbit. */
+const TURN_SPEED : f32 = 1.4;
+
+/** Tiles per second of keyboard zoom. */
+const ZOOM_SPEED : f32 = 9.0;
+
+/** Radians per second of keyboard tilt (R/F). */
+const TILT_SPEED : f32 = 0.8;
+
+/** Pitch movement as a share of yaw movement during a right-drag. */
+const ORBIT_PITCH_RATIO : f32 = 0.7;
+
+/** Pointer pixels a right-drag may cover and still count as a click. */
+const DRAG_CLICK_PIXELS : i32 = 5;
+
+/** The camera keys currently held, as axes from -1 to 1. */
+pub struct Held {
+    /** Pan away from (+) or toward (-) the camera. */
+    pub forward : f32;
+
+    /** Pan right (+) or left (-). */
+    pub right : f32;
+
+    /** Orbit counter-clockwise (+) or clockwise (-). */
+    pub turn : f32;
+
+    /** Tip the camera up (+) or down (-). */
+    pub tilt : f32;
+
+    /** Zoom out (+) or in (-). */
+    pub zoom : f32;
+
+    /** Nothing held. */
+    pub static fn none() : Held {
+        return Held { forward: 0.0, right: 0.0, turn: 0.0, tilt: 0.0, zoom: 0.0 };
+    }
+}
+
+/** Reads the camera keys from the keyboard state. */
+pub fn readHeld(events : Events) : Held {
+    return Held {
+        forward: axis(events, Scancode::W, Scancode::S) + axis(events, Scancode::Up, Scancode::Down),
+        right: axis(events, Scancode::D, Scancode::A) + axis(events, Scancode::Right, Scancode::Left),
+        turn: axis(events, Scancode::Q, Scancode::E),
+        tilt: axis(events, Scancode::R, Scancode::F),
+        zoom: axis(events, Scancode::Minus, Scancode::Equals)
+            + axis(events, Scancode::PageDown, Scancode::PageUp),
+    };
+}
+
+// +1 while `plus` is down, -1 while `minus` is, 0 for neither or both.
+fn axis(events : Events, plus : Scancode, minus : Scancode) : f32 {
+    let mut v : f32 = 0.0;
+    if (events.isKeyDown(plus)) {
+        v = v + (1.0 as f32);
+    }
+    if (events.isKeyDown(minus)) {
+        v = v - (1.0 as f32);
+    }
+    return v;
+}
+
+/** Moves the camera by what is held for `dt` seconds. */
+pub fn applyHeld(g : Game, h : Held, dt : f32) : void {
+    let reach : f32 = g.rig.reach() * PAN_SPEED * dt;
+    g.rig.pan(h.forward * reach, h.right * reach);
+    g.rig.orbit(h.turn * TURN_SPEED * dt, h.tilt * TILT_SPEED * dt);
+    g.rig.zoom(h.zoom * ZOOM_SPEED * dt);
+}
+
+/** Applies one event to the game; false when the player asked to quit. */
+pub fn handleEvent(g : Game, e : Event) : bool {
+    match e.kind {
+        EventKind::Quit => {
+            return false;
+        },
+        EventKind::KeyDown => {
+            if (!e.repeat) {
+                return keyPressed(g, e.scancode);
+            }
+        },
+        EventKind::MouseMotion => {
+            pointerMoved(g, e);
+        },
+        EventKind::MouseButtonDown => {
+            buttonPressed(g, e);
+        },
+        EventKind::MouseButtonUp => {
+            if (e.button == MouseButton::Right) {
+                if (g.ui.orbiting && g.ui.dragged < DRAG_CLICK_PIXELS && g.screen == Screen::Playing) {
+                    g.ui.clearChoice();
+                }
+                g.ui.orbiting = false;
+            }
+        },
+        EventKind::MouseWheel => {
+            g.rig.zoom(0.0 - e.wheel as f32 * ZOOM_PER_NOTCH);
+        },
+        _ => {},
+    }
+    return true;
+}
+
+// Key presses, by screen. False asks to quit.
+fn keyPressed(g : Game, key : Scancode) : bool {
+    if (key == Scancode::F3) {
+        g.ui.showDebug = !g.ui.showDebug;
+        g.probe.profiler.setEnabled(g.ui.showDebug);
+        return true;
+    }
+    if (key == Scancode::M) {
+        g.ui.muted = !g.ui.muted;
+        return true;
+    }
+    return match g.screen {
+        Screen::Title => titleKey(g, key),
+        Screen::Playing => playKey(g, key),
+        Screen::Paused => pausedKey(g, key),
+        Screen::GameOver => overKey(g, key),
+    };
+}
+
+fn titleKey(g : Game, key : Scancode) : bool {
+    if (key == Scancode::Escape) {
+        return false;
+    }
+    if (key == Scancode::Return || key == Scancode::Space) {
+        g.begin();
+    }
+    return true;
+}
+
+fn playKey(g : Game, key : Scancode) : bool {
+    if (key == Scancode::Num1) {
+        chooseKind(g, 0);
+    } else if (key == Scancode::Num2) {
+        chooseKind(g, 1);
+    } else if (key == Scancode::Num3) {
+        chooseKind(g, 2);
+    } else if (key == Scancode::U) {
+        upgradeSelected(g);
+    } else if (key == Scancode::X || key == Scancode::Delete) {
+        sellSelected(g);
+    } else if (key == Scancode::Space) {
+        callWave(g);
+    } else if (key == Scancode::P) {
+        g.togglePause();
+    } else if (key == Scancode::Escape) {
+        if (g.ui.building || !g.ui.selected.isNone()) {
+            g.ui.clearChoice();
+        } else {
+            g.togglePause();
+        }
+    }
+    return true;
+}
+
+fn pausedKey(g : Game, key : Scancode) : bool {
+    if (key == Scancode::P || key == Scancode::Escape || key == Scancode::Return) {
+        g.togglePause();
+    } else if (key == Scancode::T) {
+        g.toTitle();
+    }
+    return true;
+}
+
+fn overKey(g : Game, key : Scancode) : bool {
+    if (key == Scancode::Return || key == Scancode::Space) {
+        g.begin();
+    } else if (key == Scancode::Escape || key == Scancode::T) {
+        g.toTitle();
+    }
+    return true;
+}
+
+// Mouse motion: remember the pointer, and turn it into camera motion while a drag button is held.
+fn pointerMoved(g : Game, e : Event) : void {
+    g.ui.mouseX = e.x;
+    g.ui.mouseY = e.y;
+    if (g.ui.orbiting) {
+        g.rig.orbit(e.dx as f32 * ORBIT_PER_PIXEL, e.dy as f32 * ORBIT_PER_PIXEL * ORBIT_PITCH_RATIO);
+        g.ui.dragged = g.ui.dragged + abs32(e.dx) + abs32(e.dy);
+    }
+}
+
+// Mouse buttons: right starts an orbit drag; left clicks the interface or the map.
+fn buttonPressed(g : Game, e : Event) : void {
+    g.ui.mouseX = e.x;
+    g.ui.mouseY = e.y;
+    if (e.button == MouseButton::Right) {
+        g.ui.orbiting = true;
+        g.ui.dragged = 0;
+        return;
+    }
+    if (e.button != MouseButton::Left) {
+        return;
+    }
+    if (g.screen == Screen::Title || g.screen == Screen::GameOver) {
+        g.begin();
+        return;
+    }
+    if (g.screen != Screen::Playing) {
+        return;
+    }
+    let lay : Layout = Layout::forWindow(g.width, g.height);
+    if (clickInterface(g, lay, e.x, e.y)) {
+        return;
+    }
+    clickMap(g);
+}
+
+// A click on a button or card; true when it hit one (or the bars, which swallow map clicks).
+fn clickInterface(g : Game, lay : Layout, x : i32, y : i32) : bool {
+    for (slot of 0..3) {
+        if (lay.buildButton(slot).contains(x, y)) {
+            chooseKind(g, slot);
+            return true;
+        }
+    }
+    if (lay.call.contains(x, y)) {
+        callWave(g);
+        return true;
+    }
+    if (!g.ui.selected.isNone() && lay.card.contains(x, y)) {
+        if (lay.upgrade.contains(x, y)) {
+            upgradeSelected(g);
+        } else if (lay.sell.contains(x, y)) {
+            sellSelected(g);
+        }
+        return true;
+    }
+    return lay.coversBars(x, y);
+}
+
+fn abs32(v : i32) : i32 {
+    if (v < 0) {
+        return 0 - v;
+    }
+    return v;
+}

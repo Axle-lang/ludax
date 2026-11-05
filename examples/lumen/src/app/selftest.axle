@@ -1,0 +1,334 @@
+// selftest — checks of the renderer against things that must be true, run with `--selftest`.
+//
+// A picture cannot be asserted pixel by pixel, but its ingredients can: the flat world must agree with the
+// light engine's own ray walker, a lamp's colour must survive from its spec to the light volume, a pass mask
+// must let exactly its classes through, the sky lookup must agree with the integral it caches, and a frame must
+// be the same bit for bit whatever the number of threads. The exit status is the number of checks that failed.
+
+use ludax::{Checks, Pcg32, Ray, Vec3, DRay, DVec3, LightSky, LightSource, VoxRayTracer};
+
+use crate::app::session::{LumenSession, LumenShot};
+use crate::light::lightvol::LumenLightSample;
+use crate::render::settings::LumenView;
+use crate::world::blocks::{LumenBlock, LumenObstacle, LumenObstacles, LumenLayer, LumenLayers};
+use crate::world::lampspec::LumenLampSpec;
+use crate::world::scene::{LumenScene, LumenHit};
+
+// The picture every check renders: small enough to be quick, large enough to hold every kind of surface.
+const TEST_W : i32 = 96;
+const TEST_H : i32 = 54;
+const TEST_THREADS : i32 = 4;
+
+/** The checks. */
+pub class LumenSelfTest {
+    /** Runs every check and returns how many failed. */
+    pub static fn run() : i32 {
+        let c : Checks = new Checks();
+        let a : LumenSession = new LumenSession(TEST_THREADS, TEST_W, TEST_H, 1);
+        // The frame is rendered first: the random streams follow the frame number, so a comparison needs both
+        // sessions to have drawn the same frames.
+        let hdrA : f32[] = LumenSelfTest::render(a);
+        LumenSelfTest::walker(c, a);
+        LumenSelfTest::visibility(c, a);
+        LumenSelfTest::bakedSun(c, a);
+        LumenSelfTest::lamps(c, a);
+        LumenSelfTest::passes(c, a);
+        LumenSelfTest::sky(c, a);
+        a.close();
+        let b : LumenSession = new LumenSession(1, TEST_W, TEST_H, 1);
+        let hdrB : f32[] = LumenSelfTest::render(b);
+        let n : i64 = (TEST_W as i64) * (TEST_H as i64) * 3;
+        let mut differ : i32 = 0;
+        for (i of 0..n) {
+            if (hdrA[i] != hdrB[i]) {
+                differ = differ + 1;
+            }
+        }
+        c.sameInt("a frame is identical on 4 threads and on 1 (values that differ)", differ, 0);
+        c.that("the frame is not black", LumenSelfTest::brightest(hdrA, n) > 0.01);
+        b.close();
+        println("lumen selftest: ${c.count()} checks, ${c.misses()} failed");
+        return c.misses();
+    }
+
+    // Three passes of the first viewpoint, as the radiance picture: enough for a warmed history, and the same
+    // frame number for both sessions.
+    static fn render(mut s : LumenSession) : f32[] {
+        s.goTo(LumenSession::shot(1));
+        s.env.settings.view = LumenView::Final;
+        for (k of 0..3) {
+            s.pass();
+        }
+        let n : i64 = (TEST_W as i64) * (TEST_H as i64) * 3;
+        let mut copy : f32[] = malloc<f32>(n);
+        for (i of 0..n) {
+            copy[i] = s.frame.hdr[i];
+        }
+        return copy;
+    }
+
+    static fn brightest(h : f32[], n : i64) : f32 {
+        let mut m : f32 = 0.0;
+        for (i of 0..n) {
+            if (h[i] > m) {
+                m = h[i];
+            }
+        }
+        return m;
+    }
+
+    // The flat walker and the engine's walker must agree on whether a ray reaches an opaque block.
+    static fn walker(c : Checks, s : LumenSession) : void {
+        let scene : LumenScene = s.env.scene;
+        let tracer : VoxRayTracer = new VoxRayTracer();
+        let r : Pcg32 = new Pcg32(5, 9);
+        let mut tested : i32 = 0;
+        let mut wrong : i32 = 0;
+        for (k of 0..3000) {
+            let ox : f32 = (4.0 as f32) + r.nextF32() * ((scene.sx - 8) as f32);
+            let oz : f32 = (4.0 as f32) + r.nextF32() * ((scene.sz - 8) as f32);
+            let oy : f32 = (20.0 as f32) + r.nextF32() * (30.0 as f32);
+            let dx : f32 = r.nextF32() - (0.5 as f32);
+            let dy : f32 = r.nextF32() - (0.5 as f32);
+            let dz : f32 = r.nextF32() - (0.5 as f32);
+            let len : f32 = (dx * dx + dy * dy + dz * dz).sqrt();
+            if (len > 0.05 && !scene.isSolid(ox as i32, oy as i32, oz as i32)) {
+                let dir : Vec3 = Vec3 { x: dx / len, y: dy / len, z: dz / len };
+                let ray : DRay = DRay::make(
+                    DVec3::make(ox as f64, oy as f64, oz as f64),
+                    DVec3::make(dir.x as f64, dir.y as f64, dir.z as f64)
+                );
+                tracer.trace(s.engine().grid, s.engine().table, ray, 60.0);
+                let sight : Ray = Ray::make(Vec3::make(ox, oy, oz), dir);
+                let hit : LumenHit = scene.trace(sight, 60.0, true, 0);
+                let f : f64 = tracer.fraction();
+                if (f < 0.0001 || f > 0.9999) {
+                    tested = tested + 1;
+                    if ((f < 0.5) != hit.hit) {
+                        wrong = wrong + 1;
+                    }
+                }
+            }
+        }
+        c.that("enough rays were comparable (${tested})", tested > 500);
+        // A ray grazing a block edge may fall either side in f32 and f64: one in a thousand is that, more is a bug.
+        c.that(
+            "the flat walker and the engine's walker agree on opaque hits (${wrong} disagreements of ${tested})",
+            wrong * 1000 <= tested
+        );
+    }
+
+    // The lean occlusion walk and the full walk must agree on whether something opaque is in the way, for rays
+    // of every length and direction: a shadow ray that lets the sun through a mountain is the worst bug a
+    // renderer of light can have.
+    static fn visibility(c : Checks, s : LumenSession) : void {
+        let scene : LumenScene = s.env.scene;
+        let r : Pcg32 = new Pcg32(21, 4);
+        let mut tested : i32 = 0;
+        let mut wrong : i32 = 0;
+        let mut blocked : i32 = 0;
+        for (k of 0..6000) {
+            let ox : f32 = (2.0 as f32) + r.nextF32() * ((scene.sx - 4) as f32);
+            let oz : f32 = (2.0 as f32) + r.nextF32() * ((scene.sx - 4) as f32);
+            let oy : f32 = (1.0 as f32) + r.nextF32() * (60.0 as f32);
+            let dx : f32 = r.nextF32() - (0.5 as f32);
+            let dy : f32 = r.nextF32() - (0.5 as f32);
+            let dz : f32 = r.nextF32() - (0.5 as f32);
+            let len : f32 = (dx * dx + dy * dy + dz * dz).sqrt();
+            if (len > 0.05 && !scene.isSolid(ox as i32, oy as i32, oz as i32)) {
+                let d : Vec3 = Vec3 { x: dx / len, y: dy / len, z: dz / len };
+                let ray : Ray = Ray::make(Vec3::make(ox, oy, oz), d);
+                let hit : LumenHit = scene.trace(ray, 400.0, true, 0);
+                let seen : Vec3 = scene.visibility(ray, 400.0, 0);
+                let a : bool = hit.hit;
+                let b : bool = seen.maxComponent() <= 0.0;
+                tested = tested + 1;
+                if (a) {
+                    blocked = blocked + 1;
+                }
+                if (a != b) {
+                    wrong = wrong + 1;
+                }
+            }
+        }
+        c.that("enough rays were tested (${tested}, ${blocked} blocked)", tested > 3000 && blocked > 500);
+        c.sameInt(
+            "the lean walk and the full walk agree on whether a ray is blocked (disagreements)",
+            wrong,
+            0
+        );
+    }
+
+    // The sun's shadow baked by the light engine into the volume must agree with a ray cast from the same place:
+    // where the volume says the sun is hidden a ray finds something in the way, and where it says the sun is
+    // seen a ray finds the sky. The two measure the same thing (one with 40 rays over the disc, one with one), so
+    // they may differ in the penumbra, not elsewhere.
+    static fn bakedSun(c : Checks, s : LumenSession) : void {
+        s.goTo(LumenSession::shot(3));
+        s.setDay(0.5);
+        LumenSelfTest::agree(c, s, "at noon");
+        // Moving the sun re-bakes a slice of the shell each frame; once the frames have run the volume must
+        // describe the new sun and not the old one.
+        s.setDay(0.33);
+        // A world this size has a shell of hundreds of thousands of cells, a slice a frame.
+        let mut frames : i32 = 0;
+        while (s.sunStale && frames < 600) {
+            s.pass();
+            frames = frames + 1;
+        }
+        c.that("the re-bake toward the new sun has finished", !s.sunStale);
+        LumenSelfTest::agree(c, s, "after the sun moved");
+        s.goTo(LumenShot { x: 53.0, y: 23.4, z: 56.0, yaw: 0.0, pitch: 0.0, day: 0.33 });
+        LumenSelfTest::agree(c, s, "after a full bake at the same sun");
+    }
+
+    static fn agree(c : Checks, s : LumenSession, when : string) : void {
+        let scene : LumenScene = s.env.scene;
+        let toward : Vec3 = s.env.sky.sunDir;
+        let r : Pcg32 = new Pcg32(33, 8);
+        let mut sunny : i32 = 0;
+        let mut shaded : i32 = 0;
+        let mut wrong : i32 = 0;
+        for (k of 0..30000) {
+            let x : i32 = 3 + (r.nextF32() * ((scene.sx - 6) as f32)) as i32;
+            let z : i32 = 3 + (r.nextF32() * ((scene.sx - 6) as f32)) as i32;
+            let top : i32 = scene.columnTop(x, z);
+            if (top > 12 && top < 55 && scene.at(x, top, z) != LumenBlock::Water.id()) {
+                let px : f32 = x as f32 + (0.5 as f32);
+                let pz : f32 = z as f32 + (0.5 as f32);
+                let probe : LumenLightSample = s.env.vol.sample(scene, px, top as f32 + (1.55 as f32), pz);
+                // The engine bakes from the middle of the cell, so the ray starts there too.
+                let probeRay : Ray = Ray::make(
+                    Vec3::make(px, top as f32 + (1.5 as f32), pz),
+                    Vec3::make(toward.x, toward.y, toward.z)
+                );
+                let seen : Vec3 = scene.visibility(probeRay, 400.0, 0);
+                let baked : bool = probe.sun > 0.5;
+                let ray : bool = seen.maxComponent() > 0.5;
+                if (probe.sun > 0.92 && ray) {
+                    sunny = sunny + 1;
+                } else if (probe.sun < 0.08 && !ray) {
+                    shaded = shaded + 1;
+                } else if ((probe.sun > 0.92 && !ray) || (probe.sun < 0.08 && ray)) {
+                    wrong = wrong + 1;
+                }
+            }
+        }
+        c.that(
+            "the baked sun has both lit and shaded ground in it, ${when} (${sunny} lit, ${shaded} shaded)",
+            sunny > 200 && shaded > 30
+        );
+        c.that(
+            "where the volume is sure (lit or shaded) a ray agrees, ${when}, to within 3 per cent (${wrong} of ${sunny + shaded + wrong} disagree)",
+            wrong * 33 < sunny + shaded + wrong
+        );
+    }
+
+    // A lamp's colour reaches the light volume, and its layers reach the light.
+    static fn lamps(c : Checks, s : LumenSession) : void {
+        let book = s.env.lamps;
+        let mut teal : i32 = -1;
+        let mut candle : i32 = -1;
+        for (i of 0..book.specs.len()) {
+            // The last teal lamp is the farthest out on the pier, away from the warm lamps of the cabin.
+            let spec : LumenLampSpec = book.specs.get(i);
+            if (spec.colour.x < 0.5 && spec.colour.y > 0.8) {
+                teal = i;
+            }
+            if (candle < 0 && spec.exclude.bits != 0) {
+                candle = i;
+            }
+        }
+        c.that("a teal pier lamp and a candle lamp exist", teal >= 0 && candle >= 0);
+        let t : LumenLampSpec = book.specs.get(teal);
+        let near : LumenLightSample = s.env.vol.sample(
+            s.env.scene,
+            t.x as f32 + 1.5,
+            t.y as f32 + 0.5,
+            t.z as f32 + 0.5
+        );
+        c.that(
+            "the teal lamp's fill is teal: more green than red",
+            near.block.y > near.block.x * (1.5 as f32)
+        );
+        c.that("and it is not dark", near.block.y > 0.05);
+        let candleLight : LightSource = book.lights.get(candle);
+        c.that(
+            "the candle lamp lights terrain",
+            candleLight.mayLight(LumenLayers::only(LumenLayer::Terrain).bits, 0)
+        );
+        c.that("and never foliage", !candleLight.mayLight(LumenLayers::only(LumenLayer::Foliage).bits, 0));
+        let far : i32 = book.far.get(0);
+        c.that(
+            "the beacon is a far lamp that goes through glass and leaves",
+            book.specs.get(far).pass.has(LumenObstacle::Glass)
+                && book.specs.get(far).pass.has(LumenObstacle::Foliage)
+        );
+    }
+
+    // A ray straight down onto a leaf stops there, unless it is told to ignore foliage.
+    static fn passes(c : Checks, s : LumenSession) : void {
+        let scene : LumenScene = s.env.scene;
+        let mut found : bool = false;
+        let mut lx : i32 = 0;
+        let mut ly : i32 = 0;
+        let mut lz : i32 = 0;
+        for (z of 0..scene.sz) {
+            for (x of 0..scene.sx) {
+                if (!found) {
+                    let top : i32 = scene.columnTop(x, z);
+                    if (top >= 0 && scene.at(x, top, z) == LumenBlock::Leaves.id() && top < 60) {
+                        found = true;
+                        lx = x;
+                        ly = top;
+                        lz = z;
+                    }
+                }
+            }
+        }
+        c.that("the world has a tree", found);
+        let from : f32 = (ly + 3) as f32;
+        let down : Ray = Ray::make(
+            Vec3::make(lx as f32 + 0.5, from, lz as f32 + 0.5),
+            Vec3::make(0.0, -1.0, 0.0)
+        );
+        let stopped : LumenHit = scene.trace(down, 80.0, true, 0);
+        c.that("a ray down onto a treetop stops in the foliage or a leaf hole", stopped.hit);
+        let through : LumenHit = scene.trace(
+            down,
+            80.0,
+            true,
+            LumenObstacles::only(LumenObstacle::Foliage).bits
+        );
+        c.that(
+            "the same ray ignoring foliage never stops at a leaf",
+            through.hit && through.block != LumenBlock::Leaves.id()
+        );
+    }
+
+    // The cached sky agrees with the integral it caches, away from the sun's glow.
+    static fn sky(c : Checks, s : LumenSession) : void {
+        s.setDay(0.5);
+        let real : LightSky = LightSky::atDayTime(0.5, 0.25);
+        let r : Pcg32 = new Pcg32(11, 2);
+        let mut worst : f32 = 0.0;
+        for (k of 0..200) {
+            let a : f32 = r.nextF32() * (6.2831 as f32);
+            let e : f32 = (0.1 as f32) + r.nextF32() * (1.2 as f32);
+            let dir : Vec3 = Vec3 {
+                x: ludax::sin(a) * ludax::cos(e),
+                y: ludax::sin(e),
+                z: ludax::cos(a) * ludax::cos(e),
+            };
+            if (dir.dot(real.sunDirection()) < (0.9 as f32)) {
+                let want : Vec3 = real.skyRadiance(dir);
+                let got : Vec3 = s.env.sky.base(dir);
+                let err : f32 = ludax::abs(got.y - want.y) / (want.y + (0.01 as f32));
+                if (err > worst) {
+                    worst = err;
+                }
+            }
+        }
+        c.that("the sky map is within 6 per cent of the integral (worst ${worst})", worst < (0.06 as f32));
+    }
+}

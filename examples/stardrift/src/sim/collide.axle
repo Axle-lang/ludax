@@ -1,0 +1,134 @@
+// collide — files everything in the grid and decides who touched whom.
+//
+// Each tick the grid is cleared and refilled with a proxy per entity. The ship's shots, which are many and
+// small, ask the grid for the few entities near them instead of testing all of them; the ship does the same
+// for rocks, ships and pick-ups. Enemy bolts only ever matter to the ship, so they are a distance test
+// against it. A proxy remembers the generation of its entity, and `Slab.has` rejects a proxy whose entity was
+// destroyed earlier in the same pass (a rock split by one shot cannot be hit by the next one).
+
+use ludax::EntityId;
+
+use crate::core::config::{SHIP_RADIUS, SHOT_RADIUS, BOLT_RADIUS};
+use crate::core::types::{Entity, Bullet, Kind, Layer};
+use crate::sim::combat::Combat;
+use crate::sim::grid::Proxy;
+use crate::sim::world::World;
+
+/** Resolves collisions. */
+pub class Collide {
+    /** Rebuilds the grid and runs every collision test of the tick. */
+    pub static fn run(w : World) : void {
+        Collide::rebuild(w);
+        Collide::shotsAgainstEnemies(w);
+        if (w.ship.alive) {
+            Collide::shipAgainstWorld(w);
+            Collide::boltsAgainstShip(w);
+        }
+    }
+
+    // A rebuild is cheap enough to do every tick, which keeps the grid and the slab from drifting apart.
+    static fn rebuild(w : World) : void {
+        w.grid.clear();
+
+        for (slot of 0..w.entities.slotCount()) {
+            if (w.entities.isLiveAt(slot)) {
+                let id : EntityId = w.entities.idAt(slot);
+                let e : Entity = w.entities.valueAt(slot);
+                w.grid.insert(Proxy {
+                    x: e.x,
+                    y: e.y,
+                    r: e.radius,
+                    layer: Collide::layerOf(e.kind),
+                    index: id.index,
+                    generation: id.generation,
+                });
+            }
+        }
+    }
+
+    // The collision layer a kind belongs to.
+    static fn layerOf(kind : Kind) : Layer {
+        return match kind {
+            Kind::Pickup => Layer::Pickup,
+            _ => Layer::Enemy,
+        };
+    }
+
+    // Every ship shot hits at most one enemy and is used up by it.
+    static fn shotsAgainstEnemies(w : World) : void {
+        let mut slot : i32 = w.bullets.first();
+        while (slot >= 0) {
+            let next : i32 = w.bullets.next(slot);
+            let b : Bullet = w.bullets.get(slot);
+            if (!b.hostile) {
+                let hit : EntityId = Collide::firstEnemyAt(w, b.x, b.y, SHOT_RADIUS);
+                if (!hit.isNone()) {
+                    Combat::hurt(w, hit, 1, b.x, b.y);
+                    w.bullets.release(slot);
+                }
+            }
+            slot = next;
+        }
+    }
+
+    // The nearest candidate from the grid that overlaps the circle and is still alive, or the none id.
+    static fn firstEnemyAt(w : World, x : f32, y : f32, r : f32) : EntityId {
+        w.grid.query(x, y, r, w.near);
+        for (k of 0..w.near.len()) {
+            let p : Proxy = w.grid.proxy(w.near.get(k));
+            if (p.layer == Layer::Enemy && Collide::overlaps(p, x, y, r)) {
+                let id : EntityId = EntityId::make(p.index, p.generation);
+                if (w.entities.has(id)) {
+                    return id;
+                }
+            }
+        }
+        return EntityId::none();
+    }
+
+    static fn overlaps(p : Proxy, x : f32, y : f32, r : f32) : bool {
+        let dx : f32 = p.x - x;
+        let dy : f32 = p.y - y;
+        let reach : f32 = p.r + r;
+        return dx * dx + dy * dy <= reach * reach;
+    }
+
+    // The ship against rocks and ships (it is hurt) and pick-ups (it collects them).
+    static fn shipAgainstWorld(w : World) : void {
+        let mut s = w.ship;
+        w.grid.query(s.x, s.y, SHIP_RADIUS, w.near);
+
+        let mut k : i32 = 0;
+        while (k < w.near.len() && s.alive) {
+            let p : Proxy = w.grid.proxy(w.near.get(k));
+            let id : EntityId = EntityId::make(p.index, p.generation);
+            if (Collide::overlaps(p, s.x, s.y, SHIP_RADIUS) && w.entities.has(id)) {
+                match p.layer {
+                    Layer::Enemy => Combat::shipRamsInto(w, id),
+                    Layer::Pickup => Combat::collect(w, id),
+                }
+            }
+            k = k + 1;
+        }
+    }
+
+    // Enemy bolts are used up by the ship.
+    static fn boltsAgainstShip(w : World) : void {
+        let mut s = w.ship;
+        let reach : f32 = SHIP_RADIUS + BOLT_RADIUS;
+        let mut slot : i32 = w.bullets.first();
+        while (slot >= 0) {
+            let next : i32 = w.bullets.next(slot);
+            let b : Bullet = w.bullets.get(slot);
+            let dx : f32 = b.x - s.x;
+            let dy : f32 = b.y - s.y;
+            if (b.hostile && s.alive && dx * dx + dy * dy <= reach * reach) {
+                w.bullets.release(slot);
+                if (s.invuln <= 0) {
+                    Combat::hitShip(w);
+                }
+            }
+            slot = next;
+        }
+    }
+}

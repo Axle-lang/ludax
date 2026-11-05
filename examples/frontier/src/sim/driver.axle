@@ -1,0 +1,182 @@
+// driver — the scripted driver: where to steer and how hard to press, from the car and the route alone.
+//
+// A pure function of the vehicle's state and which waypoint it is heading for, so a run needs no input device
+// and is exactly repeatable. It steers straight at the waypoint, slows in turns, slows to a walking pace at
+// depots and brakes to a stop at the outpost, where it waits a second and a half before going on. The answer
+// is three numbers; the game puts them on the input axes (so they can be recorded to a tape) and reads them
+// back through the action map like any other input.
+//
+// The driver never sees the terrain: the vehicle model and the car's own motion are the only feedback, which is
+// why every speed target has a distance and a current-speed term rather than a look-ahead path.
+
+use ludax::{VehicleState, atan2D, sqrtD, wrapAngleD};
+
+use crate::world::route::{Route, StopKind};
+
+// How long the car waits at the outpost, in ticks (1.5 s at 60 Hz).
+const DRIVER_DWELL : i32 = 90;
+
+// Steering: gain on the heading error, top cruise speed, and how much a turn cuts it.
+const DRIVER_STEER_GAIN : f64 = 1.6;
+const DRIVER_TOP_SPEED : f64 = 20.0;
+const DRIVER_TURN_SLOW : f64 = 0.55;
+
+// A depot approach is a linear slowdown; a halt or home approach brakes on the square root of the distance.
+const DRIVER_SLOW_BASE : f64 = 8.0;
+const DRIVER_SLOW_GAIN : f64 = 0.12;
+const DRIVER_BRAKE_GAIN : f64 = 10.0;
+const DRIVER_BRAKE_GAP : f64 = 8.0;
+const DRIVER_BRAKE_RANGE : f64 = 100000.0;
+
+// Pedal gains, the speed error that starts braking, and the speed counted as stopped.
+const DRIVER_THROTTLE_GAIN : f64 = 0.4;
+const DRIVER_BRAKE_PEDAL : f64 = 0.3;
+const DRIVER_BRAKE_LEAD : f64 = 0.5;
+const DRIVER_STOPPED : f64 = 0.4;
+
+// How close a waypoint must be to count as visited, and how slow the car must be for a halt or home.
+const DRIVER_PASS_RADIUS : f64 = 18.0;
+const DRIVER_HALT_RADIUS : f64 = 10.0;
+const DRIVER_HALT_SPEED : f64 = 0.4;
+const DRIVER_HOME_RADIUS : f64 = 12.0;
+const DRIVER_HOME_SPEED : f64 = 0.5;
+
+/** Which waypoint the driver is heading for, and how long it has waited there. */
+pub struct DriverState {
+    /** The waypoint number. */
+    pub wp : i32;
+
+    /** Ticks spent stopped at a halt. */
+    pub dwell : i32;
+}
+
+/** Steering and pedals, each from -1 to 1 (pedals 0 to 1). */
+pub struct DriverCommand {
+    /** The wheel. */
+    pub steer : f64;
+
+    /** Accelerator. */
+    pub throttle : f64;
+
+    /** Brake. */
+    pub brake : f64;
+}
+
+/** The scripted driver. */
+pub class Driver {
+    /** Where the driver starts: heading for waypoint 1. */
+    pub static fn begin() : DriverState {
+        return DriverState { wp: 1, dwell: 0 };
+    }
+
+    // `v` limited to `lo`..`hi`.
+    static fn clamp1(v : f64, lo : f64, hi : f64) : f64 {
+        if (v < lo) {
+            return lo;
+        }
+        if (v > hi) {
+            return hi;
+        }
+        return v;
+    }
+
+    /** What the driver does this step. */
+    pub static fn command(route : Route, s : VehicleState, d : DriverState) : DriverCommand {
+        if (d.wp >= route.count()) {
+            return DriverCommand { steer: 0.0, throttle: 0.0, brake: 1.0 };
+        }
+
+        // Aim at the waypoint, turning harder the larger the error.
+        let dx : f64 = route.x(d.wp) - s.x;
+        let dz : f64 = route.z(d.wp) - s.z;
+        let dist : f64 = sqrtD(dx * dx + dz * dz);
+        let err : f64 = wrapAngleD(atan2D(dz, dx) - s.yaw);
+        let steer : f64 = Driver::clamp1(err * DRIVER_STEER_GAIN, 0.0 - 1.0, 1.0);
+
+        let mut off : f64 = err;
+        if (off < 0.0) {
+            off = 0.0 - off;
+        }
+        let mut target : f64 = DRIVER_TOP_SPEED * (1.0 - DRIVER_TURN_SLOW * Driver::clamp1(off, 0.0, 1.0));
+
+        // The waypoint kind decides how close to it the car should be going.
+        let kind : StopKind = route.kind(d.wp);
+        let slowing : f64 = DRIVER_SLOW_BASE + DRIVER_SLOW_GAIN * dist;
+        let braking : f64 = sqrtD(DRIVER_BRAKE_GAIN
+            * Driver::clamp1(dist - DRIVER_BRAKE_GAP, 0.0, DRIVER_BRAKE_RANGE));
+        target = match kind {
+            StopKind::Depot => Driver::low(target, slowing),
+            StopKind::Halt => Driver::low(target, braking),
+            StopKind::Home => Driver::low(target, braking),
+            StopKind::Pass => target,
+        };
+        if (kind == StopKind::Halt && d.dwell > 0) {
+            target = 0.0;
+        }
+
+        let throttle : f64 = Driver::clamp1((target - s.vf) * DRIVER_THROTTLE_GAIN, 0.0, 1.0);
+        let mut brake : f64 = 0.0;
+        if (s.vf > target + DRIVER_BRAKE_LEAD) {
+            brake = Driver::clamp1((s.vf - target) * DRIVER_BRAKE_PEDAL, 0.0, 1.0);
+        }
+        if (target == 0.0 && s.vf < DRIVER_STOPPED) {
+            brake = 1.0;
+        }
+        return DriverCommand { steer: steer, throttle: throttle, brake: brake };
+    }
+
+    static fn low(a : f64, b : f64) : f64 {
+        if (a < b) {
+            return a;
+        }
+        return b;
+    }
+
+    /** The driver's state after this step: on to the next waypoint once the car has arrived. */
+    pub static fn next(route : Route, s : VehicleState, d : DriverState) : DriverState {
+        if (d.wp >= route.count()) {
+            return d;
+        }
+        let dx : f64 = route.x(d.wp) - s.x;
+        let dz : f64 = route.z(d.wp) - s.z;
+        let dist : f64 = sqrtD(dx * dx + dz * dz);
+        let mut speed : f64 = s.vf;
+        if (speed < 0.0) {
+            speed = 0.0 - speed;
+        }
+        let kind : StopKind = route.kind(d.wp);
+        return match kind {
+            StopKind::Halt => Driver::halt(d, dist, speed),
+            StopKind::Home => Driver::home(d, dist, speed),
+            StopKind::Depot => Driver::pass(d, dist),
+            StopKind::Pass => Driver::pass(d, dist),
+        };
+    }
+
+    // A drive-through waypoint is done as soon as the car is near it.
+    static fn pass(d : DriverState, dist : f64) : DriverState {
+        if (dist < DRIVER_PASS_RADIUS) {
+            return DriverState { wp: d.wp + 1, dwell: 0 };
+        }
+        return d;
+    }
+
+    // The outpost needs the car stopped: count the dwell ticks once it is, then move on.
+    static fn halt(d : DriverState, dist : f64, speed : f64) : DriverState {
+        if (d.dwell > 0 || (dist < DRIVER_HALT_RADIUS && speed < DRIVER_HALT_SPEED)) {
+            if (d.dwell + 1 >= DRIVER_DWELL) {
+                return DriverState { wp: d.wp + 1, dwell: 0 };
+            }
+            return DriverState { wp: d.wp, dwell: d.dwell + 1 };
+        }
+        return d;
+    }
+
+    // Home is complete once the car is near it and all but stopped.
+    static fn home(d : DriverState, dist : f64, speed : f64) : DriverState {
+        if (dist < DRIVER_HOME_RADIUS && speed < DRIVER_HOME_SPEED) {
+            return DriverState { wp: d.wp + 1, dwell: 0 };
+        }
+        return d;
+    }
+}

@@ -1,0 +1,158 @@
+// run — plays the orrery for a number of ticks, under whatever frame pacing the caller says.
+//
+// The point of a fixed step is that the simulation cannot tell how fast the screen is: frames of 16.7 ms and
+// frames of random length between 1 and 45 ms bank their time into the same whole number of 60 Hz ticks, and the
+// tick is a function of its number alone. `orreryRun` plays both ways and returns a checksum of the final state
+// so `main` can compare them. At tick 300 the planet with moons is destroyed, subtree and all.
+
+use ludax::{ComponentStore, DVec3, EntityId, FixedStep, Image, Pcg32, SpatialGrid, Vec, combineHash};
+
+use crate::sim::bodies::{Body, Orrery};
+use crate::sim::systems::{orbitSystem, encounterSystem};
+
+/** The simulation runs at this many ticks a second. */
+const ORRERY_HZ : i32 = 60;
+
+/** A frame that arrives very late may catch up at most this many ticks, so one stall cannot spiral. */
+const ORRERY_MAX_STEPS : i32 = 100;
+
+/** The tick at which the host planet is destroyed. */
+pub const ORRERY_DOOM_TICK : i64 = 300;
+
+/** A steady frame is one sixtieth of a second, in nanoseconds. */
+const ORRERY_FRAME_NANOS : i64 = 16666667;
+
+/** Uneven frames are at least one millisecond... */
+const ORRERY_FRAME_MIN_NANOS : i64 = 1000000;
+
+/** ...and less than this many nanoseconds longer than that, so at most 45 ms. */
+const ORRERY_FRAME_SPREAD_NANOS : u32 = 44000000;
+
+/** Nanoseconds in a second. */
+const ORRERY_NANOS_PER_SECOND : i64 = 1000000000;
+
+/** Positions are hashed at this scale: a millionth of a world unit. */
+const ORRERY_HASH_SCALE : f64 = 1000000.0;
+
+/** The seed the checksum starts from, so an empty scene still hashes. */
+const ORRERY_HASH_SEED : i64 = 17;
+
+/** The picture's half-width in world units; the comet's orbit at 36 fits with room to spare. */
+const ORRERY_VIEW_RADIUS : f64 = 84.0;
+
+/** A canvas narrower than this is not a picture: trail drawing is skipped. */
+const ORRERY_CANVAS_MIN : i32 = 8;
+
+/** A trail dot is drawn every this many ticks. */
+const ORRERY_TRAIL_EVERY : i64 = 2;
+
+/** What a run ended with. */
+pub struct OrreryResult {
+    /** A hash of every living body's final position. */
+    pub checksum : i64;
+
+    /** Ticks simulated. */
+    pub ticks : i64;
+
+    /** Entities alive at the end. */
+    pub alive : i32;
+
+    /** Pair-ticks in which two bodies touched. */
+    pub encounters : i32;
+
+    /** Entities destroyed with the host planet. */
+    pub lost : i32;
+
+    /** Frames the pacing took to deliver those ticks. */
+    pub frames : i32;
+}
+
+/** Runs `totalTicks` ticks; `pacing` 0 is steady 60 frames a second, any other number seeds uneven frames. Draws trails on `canvas` if it has room. */
+pub fn orreryRun(totalTicks : i32, pacing : i32, canvas : Image) : OrreryResult {
+    let o : Orrery = new Orrery();
+    let fixed : FixedStep = FixedStep::atHertz(ORRERY_HZ, ORRERY_MAX_STEPS);
+    let rng : Pcg32 = new Pcg32(pacing as u64, 1);
+    let grid : SpatialGrid = new SpatialGrid(4.0);
+    let found : Vec<i64> = new Vec<i64>();
+    let target : i64 = totalTicks as i64;
+    let mut encounters : i32 = 0;
+    let mut lost : i32 = 0;
+    let mut frames : i32 = 0;
+
+    while (fixed.ticks() < target) {
+        let mut frameNanos : i64 = ORRERY_FRAME_NANOS;
+        if (pacing != 0) {
+            frameNanos = ORRERY_FRAME_MIN_NANOS + (rng.nextBelow(ORRERY_FRAME_SPREAD_NANOS) as i64);
+        }
+        fixed.advanceNanos(frameNanos);
+        frames = frames + 1;
+
+        while (fixed.ticks() < target && fixed.takeStep()) {
+            let seconds : f64 = (fixed.ticks() as f64) * (fixed.stepLength() as f64)
+                / (ORRERY_NANOS_PER_SECOND as f64);
+            orbitSystem(o, seconds);
+
+            if (fixed.ticks() == ORRERY_DOOM_TICK) {
+                lost = o.scene().destroy(o.hostPlanet());
+                o.orbits().sweep(o.scene().entities());
+                o.bodies().sweep(o.scene().entities());
+            }
+
+            encounters = encounters + encounterSystem(o, grid, found);
+            if (fixed.ticks() % ORRERY_TRAIL_EVERY == 0) {
+                orreryTrail(o, canvas);
+            }
+        }
+    }
+
+    return OrreryResult {
+        checksum: orreryChecksum(o),
+        ticks: fixed.ticks(),
+        alive: o.scene().count(),
+        encounters: encounters,
+        lost: lost,
+        frames: frames,
+    };
+}
+
+// A hash of where every living body is, in the store's order, positions rounded to a millionth of a unit.
+fn orreryChecksum(o : Orrery) : i64 {
+    let bodies : ComponentStore<Body> = o.bodies();
+    let mut h : i64 = ORRERY_HASH_SEED;
+    for (d of 0..bodies.len()) {
+        let e : EntityId = bodies.entityAt(d);
+        if (!o.scene().isAlive(e)) {
+            continue;
+        }
+        let p : DVec3 = o.position(e);
+        h = combineHash(h, e.bits());
+        h = combineHash(h, (p.x * ORRERY_HASH_SCALE) as i64);
+        h = combineHash(h, (p.y * ORRERY_HASH_SCALE) as i64);
+        h = combineHash(h, (p.z * ORRERY_HASH_SCALE) as i64);
+    }
+    return h;
+}
+
+// One dot per living body at its place, seen from above, in the body's colour.
+fn orreryTrail(o : Orrery, canvas : Image) : void {
+    if (canvas.width() < ORRERY_CANVAS_MIN) {
+        return;
+    }
+
+    let bodies : ComponentStore<Body> = o.bodies();
+    let scale : f64 = (canvas.width() as f64) / ORRERY_VIEW_RADIUS;
+    for (d of 0..bodies.len()) {
+        let e : EntityId = bodies.entityAt(d);
+        if (!o.scene().isAlive(e)) {
+            continue;
+        }
+        let p : DVec3 = o.position(e);
+        let x : i32 = (canvas.width() / 2) + (p.x * scale) as i32;
+        let y : i32 = (canvas.height() / 2) + (p.z * scale) as i32;
+        let colour : i32 = bodies.valueAt(d).colour;
+        canvas.set(x, y, colour);
+        canvas.set(x + 1, y, colour);
+        canvas.set(x, y + 1, colour);
+        canvas.set(x + 1, y + 1, colour);
+    }
+}

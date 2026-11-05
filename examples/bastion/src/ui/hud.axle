@@ -1,0 +1,250 @@
+// hud — the heads-up display: the figures bar, the build dock, the selected tower's card and the messages.
+//
+// Drawn over the finished 3-D frame through smalt's `Frame`. Every rectangle comes from `Layout`, the same
+// rectangles the mouse is tested against, and every colour from `palette`. Nothing here changes the game.
+
+use smalt::{Frame, Rect, Color};
+
+use crate::app::game::Game;
+use crate::sim::commands::sellValue;
+use crate::sim::config::{TICK_HZ, MAX_LEVEL, EARLY_BONUS_PER_SECOND};
+use crate::sim::stats::{TowerKind, EnemyKind, towerStats, TowerStats};
+use crate::sim::units::Tower;
+use crate::ui::layout::{Layout, BAR_H};
+use crate::ui::palette::{C_PANEL, C_EDGE, C_TEXT, C_DIM, C_GOLD, C_RED, C_GREEN, C_ACCENT, C_ICE, C_SHADOW};
+use crate::ui::pen::Pen;
+
+/** Draws the whole heads-up display for a running or paused game. */
+pub fn drawHud(f : Frame, pen : Pen, g : Game, lay : Layout) : void {
+    drawTopBar(f, pen, g, lay);
+    drawDock(f, pen, g, lay);
+    drawCard(f, pen, g, lay);
+    drawToast(f, pen, g, lay);
+    drawHints(f, pen, lay);
+}
+
+/** Draws a raised panel with a thin edge. */
+pub fn panel(f : Frame, r : Rect) : void {
+    f.fillRound(r, 8, C_PANEL);
+    f.roundBorder(r, 8, C_EDGE);
+}
+
+// A button: darker when it cannot be used, outlined in `edge`.
+fn button(f : Frame, r : Rect, edge : i32, enabled : bool) : void {
+    let mut fill : i32 = Color::mix(C_PANEL, edge, 1, 7);
+    if (!enabled) {
+        fill = Color::mix(C_PANEL, 0x000000, 1, 3);
+    }
+    f.fillRound(r, 8, fill);
+    f.roundBorder(r, 8, edge);
+}
+
+// Gold, lives, wave, score, best.
+fn drawTopBar(f : Frame, pen : Pen, g : Game, lay : Layout) : void {
+    f.fillRect(lay.top, C_PANEL);
+    f.hLine(0, BAR_H - 1, g.width, C_EDGE);
+    pen.text(f, 14, 12, "BASTION", C_ACCENT);
+    f.disc(118, 20, 8, C_GOLD);
+    f.ring(118, 20, 8, 0x8A6A10);
+    pen.figure(f, 134, 8, g.world.gold as i64, C_GOLD);
+    f.disc(258, 20, 8, C_RED);
+    pen.figure(f, 274, 8, g.world.lives as i64, C_TEXT);
+    let after : i32 = pen.labelled(f, 358, 12, "Wave ", g.world.wave as i64, C_TEXT);
+    waveStatus(f, pen, g, after + 10);
+    pen.right(f, g.width - 150, 12, "Score", C_DIM);
+    pen.figure(f, g.width - 140, 8, g.world.score as i64, C_TEXT);
+    pen.right(f, g.width - 12, 12, "", C_DIM);
+    pen.labelled(f, g.width - 70, 12, "Best ", g.best as i64, C_DIM);
+}
+
+// "incoming" while enemies are still being released, a countdown otherwise.
+fn waveStatus(f : Frame, pen : Pen, g : Game, x : i32) : void {
+    if (g.world.spawning) {
+        let left : i32 = g.world.plan.len() - g.world.planCursor;
+        let after : i32 = pen.labelled(f, x, 12, "- ", left as i64, C_RED);
+        pen.text(f, after, 12, " still to arrive", C_RED);
+        return;
+    }
+    let seconds : i32 = g.world.countdown / TICK_HZ;
+    let after : i32 = pen.text(f, x, 12, "- next in ", C_DIM);
+    let after2 : i32 = pen.number(f, after, 12, seconds as i64, C_DIM);
+    pen.text(f, after2, 12, " s", C_DIM);
+}
+
+// The three build buttons and the wave call.
+fn drawDock(f : Frame, pen : Pen, g : Game, lay : Layout) : void {
+    f.fillRect(lay.dock, C_PANEL);
+    f.hLine(0, lay.dock.y, g.width, C_EDGE);
+    for (slot of 0..3) {
+        buildButton(f, pen, g, lay.buildButton(slot), slot);
+    }
+    callButton(f, pen, g, lay);
+}
+
+// One build button: key, name, cost, and a swatch in the tower's colour.
+fn buildButton(f : Frame, pen : Pen, g : Game, r : Rect, slot : i32) : void {
+    let kind : TowerKind = TowerKind::fromSlot(slot);
+    let cost : i32 = towerStats(kind, 1).cost;
+    let affordable : bool = g.world.gold >= cost;
+    let chosen : bool = g.ui.building && g.ui.kind == kind;
+    let mut edge : i32 = C_EDGE;
+    if (chosen) {
+        edge = C_ACCENT;
+    }
+    button(f, r, edge, affordable);
+    f.fillRound(Rect::make(r.x + 8, r.y + 8, 8, r.h - 16), 3, swatch(kind));
+    pen.labelled(f, r.x + 24, r.y + 8, "", (slot + 1) as i64, C_DIM);
+    pen.text(f, r.x + 40, r.y + 8, kind.label(), C_TEXT);
+    let mut ink : i32 = C_GOLD;
+    if (!affordable) {
+        ink = C_RED;
+    }
+    let after : i32 = pen.number(f, r.x + 24, r.y + 30, cost as i64, ink);
+    pen.text(f, after + 4, r.y + 30, "gold", C_DIM);
+}
+
+/** The colour that stands for a tower design in the interface. */
+pub fn swatch(kind : TowerKind) : i32 {
+    return match kind {
+        TowerKind::Arrow => 0xC49A5A,
+        TowerKind::Cannon => 0x8A8A94,
+        TowerKind::Frost => 0x7FD8FF,
+    };
+}
+
+// "Space: call wave" with the bonus it pays, and a count of what the next wave holds.
+fn callButton(f : Frame, pen : Pen, g : Game, lay : Layout) : void {
+    let r : Rect = lay.call;
+    let ready : bool = !g.world.spawning;
+    let mut edge : i32 = C_EDGE;
+    if (ready) {
+        edge = C_GREEN;
+    }
+    button(f, r, edge, ready);
+    pen.text(f, r.x + 12, r.y + 8, "SPACE  call next wave", C_TEXT);
+    if (!ready) {
+        pen.text(f, r.x + 12, r.y + 30, "a wave is arriving", C_DIM);
+        return;
+    }
+    let bonus : i32 = g.world.countdown / TICK_HZ * EARLY_BONUS_PER_SECOND;
+    let mut x : i32 = pen.text(f, r.x + 12, r.y + 30, "bonus ", C_DIM);
+    x = pen.number(f, x, r.y + 30, bonus as i64, C_GOLD);
+    x = pen.text(f, x + 8, r.y + 30, "next: ", C_DIM);
+    drawPreview(f, pen, g, x, r.y + 30);
+}
+
+// The mix of the coming wave as short counts: `7g 3r 1b`.
+fn drawPreview(f : Frame, pen : Pen, g : Game, x : i32, y : i32) : void {
+    let mut shown : i32 = 0;
+    let mut pos : i32 = x;
+    for (k of 0..4) {
+        let mut n : i32 = 0;
+        for (i of 0..g.world.upcoming.len()) {
+            if (g.world.upcoming.get(i) == k) {
+                n = n + 1;
+            }
+        }
+        // Three counts are the most that fit before the button's edge.
+        if (n > 0 && shown < 3) {
+            pos = pen.number(f, pos, y, n as i64, C_TEXT);
+            pos = pen.text(f, pos, y, previewLetter(k), C_DIM) + 4;
+            shown = shown + 1;
+        }
+    }
+}
+
+fn previewLetter(kind : i32) : string {
+    return match EnemyKind::fromIndex(kind) {
+        EnemyKind::Grunt => "g",
+        EnemyKind::Runner => "r",
+        EnemyKind::Brute => "B",
+        EnemyKind::Boss => "BOSS",
+    };
+}
+
+// The selected tower: level, numbers, and the upgrade and sell buttons.
+fn drawCard(f : Frame, pen : Pen, g : Game, lay : Layout) : void {
+    if (g.ui.selected.isNone() || !g.world.towers.has(g.ui.selected)) {
+        return;
+    }
+    let t : Tower = g.world.towers.get(g.ui.selected);
+    let s : TowerStats = towerStats(t.kind, t.level);
+    let r : Rect = lay.card;
+    panel(f, r);
+    f.fillRound(Rect::make(r.x + 10, r.y + 12, 8, 26), 3, swatch(t.kind));
+    pen.text(f, r.x + 26, r.y + 10, "${t.kind.label()} tower", C_TEXT);
+    let after : i32 = pen.labelled(f, r.x + 26, r.y + 28, "level ", t.level as i64, C_DIM);
+    pen.labelled(f, after, r.y + 28, " / ", MAX_LEVEL as i64, C_DIM);
+    pen.labelled(f, r.x + 12, r.y + 52, "damage  ", s.damage as i64, C_TEXT);
+    let rangeEnd : i32 = pen.text(f, r.x + 12, r.y + 70, "range   ", C_TEXT);
+    pen.tenths(f, rangeEnd, r.y + 70, (s.range * 10.0) as i64, C_TEXT);
+    let rateEnd : i32 = pen.text(f, r.x + 12, r.y + 88, "shots/s ", C_TEXT);
+    pen.tenths(f, rateEnd, r.y + 88, (600 / s.cooldown) as i64, C_TEXT);
+    drawCardEffect(f, pen, r, s);
+    cardButtons(f, pen, g, lay, t, s);
+}
+
+// The kind's special: blast radius, or slow strength.
+fn drawCardEffect(f : Frame, pen : Pen, r : Rect, s : TowerStats) : void {
+    if (s.splash > 0.0) {
+        let end : i32 = pen.text(f, r.x + 110, r.y + 52, "blast ", C_DIM);
+        pen.tenths(f, end, r.y + 52, (s.splash * 10.0) as i64, C_DIM);
+    }
+    if (s.slowPercent > 0) {
+        let end : i32 = pen.number(f, r.x + 110, r.y + 52, s.slowPercent as i64, C_ICE);
+        pen.text(f, end, r.y + 52, "% slow", C_ICE);
+    }
+}
+
+fn cardButtons(f : Frame, pen : Pen, g : Game, lay : Layout, t : Tower, s : TowerStats) : void {
+    let maxed : bool = t.level >= MAX_LEVEL;
+    let canPay : bool = !maxed && g.world.gold >= s.upgradeCost;
+    let mut edge : i32 = C_EDGE;
+    if (canPay) {
+        edge = C_GREEN;
+    }
+    button(f, lay.upgrade, edge, canPay);
+    if (maxed) {
+        pen.inside(f, lay.upgrade, "MAX", C_DIM);
+    } else {
+        pen.text(f, lay.upgrade.x + 8, lay.upgrade.y + 3, "U  upgrade", C_TEXT);
+        let mut ink : i32 = C_GOLD;
+        if (!canPay) {
+            ink = C_RED;
+        }
+        pen.number(f, lay.upgrade.x + 8, lay.upgrade.y + 18, s.upgradeCost as i64, ink);
+    }
+    button(f, lay.sell, C_EDGE, true);
+    pen.text(f, lay.sell.x + 8, lay.sell.y + 3, "X  sell", C_TEXT);
+    let after : i32 = pen.text(f, lay.sell.x + 8, lay.sell.y + 18, "+", C_GOLD);
+    pen.number(f, after, lay.sell.y + 18, sellValue(g.world.towers.get(g.ui.selected)) as i64, C_GOLD);
+}
+
+// The message line above the dock.
+fn drawToast(f : Frame, pen : Pen, g : Game, lay : Layout) : void {
+    if (g.ui.toastFrames <= 0) {
+        return;
+    }
+    let mut ink : i32 = C_TEXT;
+    if (g.ui.toastBad) {
+        ink = C_RED;
+    }
+    let w : i32 = pen.width(g.ui.toast) + 28;
+    let r : Rect = Rect::make((g.width - w) / 2, lay.dock.y - 38, w, 28);
+    panel(f, r);
+    pen.centred(f, g.width / 2, r.y + 6, g.ui.toast, ink);
+}
+
+// A reminder of the controls under the figures bar.
+fn drawHints(f : Frame, pen : Pen, lay : Layout) : void {
+    let y : i32 = BAR_H + 8;
+    pen.shadowed(f, 12, y, "WASD pan   Q/E turn   R/F tilt   wheel zoom   right-drag orbit", C_DIM, C_SHADOW);
+    pen.shadowed(
+        f,
+        12,
+        y + 16,
+        "1 2 3 build   click tower: U upgrade, X sell   P pause   F3 debug   M mute",
+        C_DIM,
+        C_SHADOW
+    );
+}

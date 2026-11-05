@@ -1,0 +1,156 @@
+// enemies — walking, slowing, leaking and dying.
+//
+// Enemies hop from tile middle to tile middle. On arrival one asks the route book for its next tile; the
+// book answers from memory or runs A* once, and forgets everything when the player builds, so a changed map
+// is noticed one tile later. Reaching the base costs lives and removes the walker. Deaths are collected after
+// the shots have landed (`reapEnemies`) so a kill is paid out exactly once whoever dealt it.
+
+use ludax::{EntityId, Vec2, Vec3, atan2};
+
+use crate::audio::cues::Cue;
+use crate::sim::grid::Grid;
+use crate::sim::stats::enemyStats;
+use crate::sim::units::{Enemy, Slow, FxKind, FxSpawn};
+use crate::sim::world::World;
+
+/** Slow strengths are stored as 0..100; this turns one into a speed factor. */
+const ENEMY_PERCENT_SCALE : f32 = 100.0;
+
+/** Distance below which an enemy has reached its target tile. */
+const ENEMY_ARRIVE_EPSILON : f32 = 0.0001;
+
+/** Moves every enemy one tick and ages the slows. */
+pub fn stepEnemies(w : World) : void {
+    w.doomed.clear();
+    for (slot of 0..w.enemies.slotCount()) {
+        if (w.enemies.isLiveAt(slot)) {
+            walk(w, w.enemies.idAt(slot));
+        }
+    }
+    removeDoomed(w);
+    ageSlows(w);
+}
+
+/** Pays out and removes every enemy whose health has run out. */
+pub fn reapEnemies(w : World) : void {
+    w.doomed.clear();
+    for (slot of 0..w.enemies.slotCount()) {
+        if (w.enemies.isLiveAt(slot) && w.enemies.valueAt(slot).health <= 0) {
+            payBounty(w, w.enemies.valueAt(slot));
+            w.doomed.push(w.enemies.idAt(slot).bits());
+        }
+    }
+    removeDoomed(w);
+}
+
+// One enemy's tick.
+fn walk(w : World, id : EntityId) : void {
+    let mut e : Enemy = w.enemies.get(id);
+    e.age = e.age + 1;
+    let target : Vec2 = Grid::centerOf(e.toTile);
+    let toGo : Vec2 = target.minus(e.pos);
+    let remaining : f32 = toGo.length();
+    let step : f32 = speedOf(w, id, e);
+    if (remaining > ENEMY_ARRIVE_EPSILON) {
+        e.heading = atan2(toGo.y, toGo.x);
+    }
+    if (remaining > step) {
+        e.pos = e.pos.plus(toGo.scale(step / remaining));
+        e.walked = e.walked + step;
+        w.enemies.set(id, e);
+        return;
+    }
+    e.walked = e.walked + remaining;
+    e.pos = target;
+    e.fromTile = e.toTile;
+    if (e.fromTile == Grid::goalTile()) {
+        leak(w, e);
+        w.doomed.push(id.bits());
+        return;
+    }
+    let next : i32 = w.routes.nextStep(w.grid, e.fromTile);
+    if (next >= 0) {
+        e.toTile = next;
+    }
+    w.enemies.set(id, e);
+}
+
+// Speed this tick after the enemy's slow, if any.
+fn speedOf(w : World, id : EntityId, e : Enemy) : f32 {
+    let base : f32 = enemyStats(e.kind).speed;
+    let slow = w.slows.getOr(id.index, Slow { percent: 0, ticks: 0 });
+    return base * ((100 - slow.percent) as f32) / ENEMY_PERCENT_SCALE;
+}
+
+// The base takes damage; the lives may run out.
+fn leak(w : World, e : Enemy) : void {
+    w.lives = w.lives - enemyStats(e.kind).leakDamage;
+    w.raise(Cue::Leak);
+    w.spawnFx(FxSpawn {
+        kind: FxKind::Leak,
+        pos: Vec3::make(e.pos.x, 0.5, e.pos.y),
+        vel: Vec3::zero(),
+        life: 24,
+        value: 0,
+    });
+    if (w.lives <= 0) {
+        w.lives = 0;
+        w.lost = true;
+        w.raise(Cue::GameOver);
+    }
+}
+
+// Gold and score for a kill, with a coin label and a few sparks.
+fn payBounty(w : World, e : Enemy) : void {
+    let stats = enemyStats(e.kind);
+    w.gold = w.gold + stats.bounty;
+    w.score = w.score + stats.points;
+    w.kills = w.kills + 1;
+    w.raise(Cue::Kill);
+    let at : Vec3 = Vec3::make(e.pos.x, 0.6, e.pos.y);
+    w.spawnFx(FxSpawn {
+        kind: FxKind::Coin,
+        pos: at,
+        vel: Vec3::make(0.0, 0.012, 0.0),
+        life: 50,
+        value: stats.bounty,
+    });
+    for (i of 0..6) {
+        let vx : f32 = w.fxRng.rangeF32(-0.03, 0.03);
+        let vz : f32 = w.fxRng.rangeF32(-0.03, 0.03);
+        let vy : f32 = w.fxRng.rangeF32(0.02, 0.06);
+        w.spawnFx(FxSpawn {
+            kind: FxKind::Spark,
+            pos: at,
+            vel: Vec3::make(vx, vy, vz),
+            life: 26,
+            value: 0,
+        });
+    }
+}
+
+// Removes the enemies listed in `doomed`, with their slow effects.
+fn removeDoomed(w : World) : void {
+    for (i of 0..w.doomed.len()) {
+        let id : EntityId = EntityId::fromBits(w.doomed.get(i));
+        w.slows.remove(id.index);
+        w.enemies.remove(id);
+    }
+    w.doomed.clear();
+}
+
+// Counts every slow down and drops the ones that ran out.
+fn ageSlows(w : World) : void {
+    w.doomedKeys.clear();
+    for (d of 0..w.slows.len()) {
+        let mut s = w.slows.valueAt(d);
+        s.ticks = s.ticks - 1;
+        w.slows.setValueAt(d, s);
+        if (s.ticks <= 0) {
+            w.doomedKeys.push(w.slows.keyAt(d));
+        }
+    }
+    for (i of 0..w.doomedKeys.len()) {
+        w.slows.remove(w.doomedKeys.get(i));
+    }
+}

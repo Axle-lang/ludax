@@ -1,0 +1,207 @@
+// sound — the game's sound effects: the recipes, and playing them through smalt's mixer.
+//
+// Every effect has a few variants with slightly different pitch, so a rapid volley does not repeat one sample
+// like a machine. The recipes are built with `Synth`, written to short-lived WAV files, loaded into a smalt
+// `SoundBank` per effect and the files deleted again. Which variant plays is picked from a `Pcg32` of the
+// audio layer's own: sound is presentation, and nothing the simulation does depends on it.
+//
+// If the machine has no audio device the mixer does not open and the whole layer quietly becomes a no-op, so
+// a headless run needs no special case.
+
+use std::ffi::libc::fs;
+
+use ludax::{Pcg32, Vec};
+use smalt::{Mixer, SoundBank};
+
+use crate::audio::synth::{Synth, Wav, Wave};
+use crate::core::types::Sfx;
+
+/** Variants generated per effect. */
+const VARIANTS : i32 = 3;
+
+/** Number of distinct effects. */
+const EFFECTS : i32 = 8;
+
+/** Playback volume of everything, 0 to 1. */
+const MASTER : f64 = 0.55;
+
+/** Base name of the temporary files. */
+const TEMP_NAME : string = ".stardrift-sfx.wav";
+
+/** Relative pitch change between two variants of one effect. */
+const PITCH_STEP : f64 = 0.12;
+
+/** The sound effects and the device that plays them. */
+pub class Sound {
+    /** The mixer; the program's main loop pumps it on a thread of its own when it is open. */
+    pub mixer : Mixer;
+
+    /** Whether there is a device to play on. */
+    pub enabled : bool = false;
+
+    /** Whether the player turned sound off with M. */
+    pub muted : bool = false;
+
+    shoot  : SoundBank;
+    hit    : SoundBank;
+    boom   : SoundBank;
+    big    : SoundBank;
+    pickup : SoundBank;
+    wave   : SoundBank;
+    death  : SoundBank;
+    nova   : SoundBank;
+    rng    : Pcg32;
+
+    /** Opens the audio device and, when there is one, synthesises every effect. */
+    constructor() {
+        self.mixer = new Mixer();
+        self.rng = new Pcg32(99, 9);
+        self.shoot = new SoundBank(VARIANTS);
+        self.hit = new SoundBank(VARIANTS);
+        self.boom = new SoundBank(VARIANTS);
+        self.big = new SoundBank(VARIANTS);
+        self.pickup = new SoundBank(VARIANTS);
+        self.wave = new SoundBank(1);
+        self.death = new SoundBank(1);
+        self.nova = new SoundBank(1);
+        self.enabled = self.mixer.isOpen();
+        if (self.enabled) {
+            self.build();
+        }
+    }
+
+    /** Stops the device and frees the clips. Stop and join the pump thread first. */
+    pub fn close(self) : void {
+        self.mixer.close();
+        self.shoot.close();
+        self.hit.close();
+        self.boom.close();
+        self.big.close();
+        self.pickup.close();
+        self.wave.close();
+        self.death.close();
+        self.nova.close();
+    }
+
+    /** Flips the mute switch. */
+    pub fn toggleMute(mut self) : void {
+        self.muted = !self.muted;
+    }
+
+    /** Plays effect `s` unless sound is off. */
+    pub fn play(mut self, s : Sfx) : void {
+        if (!self.enabled || self.muted) {
+            return;
+        }
+        let roll : f64 = self.rng.nextF64();
+        match s {
+            Sfx::Shoot => self.shoot.playRand(self.mixer, roll, MASTER * 0.5),
+            Sfx::Hit => self.hit.playRand(self.mixer, roll, MASTER * 0.6),
+            Sfx::Boom => self.boom.playRand(self.mixer, roll, MASTER * 0.9),
+            Sfx::BigBoom => self.big.playRand(self.mixer, roll, MASTER),
+            Sfx::Pickup => self.pickup.playRand(self.mixer, roll, MASTER * 0.8),
+            Sfx::Wave => self.wave.playRand(self.mixer, roll, MASTER * 0.8),
+            Sfx::Death => self.death.playRand(self.mixer, roll, MASTER),
+            Sfx::Nova => self.nova.playRand(self.mixer, roll, MASTER),
+        }
+    }
+
+    // Synthesises every effect and loads it into its bank.
+    fn build(mut self) : void {
+        let noise : Pcg32 = new Pcg32(5, 5);
+        for (v of 0..VARIANTS) {
+            let pitch : f64 = 1.0 + PITCH_STEP * ((v - 1) as f64);
+            Sound::install(self.shoot, Sound::shootSound(pitch));
+            Sound::install(self.hit, Sound::hitSound(noise, pitch));
+            Sound::install(self.boom, Sound::boomSound(noise, 0.32, 0.86 * pitch, 1.0));
+            Sound::install(self.big, Sound::boomSound(noise, 0.7, 0.93 * pitch, 1.2));
+            Sound::install(self.pickup, Sound::arpeggio(pitch));
+        }
+        Sound::install(self.wave, Sound::waveSound());
+        Sound::install(self.death, Sound::deathSound(noise));
+        Sound::install(self.nova, Sound::novaSound(noise));
+    }
+
+    // Writes `samples` to the temporary file, loads it into `bank` and deletes it.
+    static fn install(bank : SoundBank, samples : Vec<i32>) : void {
+        if (Wav::write(TEMP_NAME, samples)) {
+            bank.add(TEMP_NAME);
+        }
+        fs::remove(TEMP_NAME);
+    }
+
+    // A square wave sliding down: the classic laser.
+    static fn shootSound(pitch : f64) : Vec<i32> {
+        return Synth::sweep(Wave::Square, 1250.0 * pitch, 260.0 * pitch, 0.13, 4.0, 0.30);
+    }
+
+    // A click of noise over a short low thud.
+    static fn hitSound(noise : Pcg32, pitch : f64) : Vec<i32> {
+        let out : Vec<i32> = Synth::noise(noise, 0.06, 0.2, 5.0, 0.35);
+        Synth::mixIn(out, Synth::sweep(Wave::Sine, 260.0 * pitch, 110.0, 0.08, 4.0, 0.5), 0);
+        return out;
+    }
+
+    // Dull rumbling noise with a falling sub-bass tone under it.
+    static fn boomSound(noise : Pcg32, seconds : f64, smooth : f64, gain : f64) : Vec<i32> {
+        let out : Vec<i32> = Synth::noise(noise, seconds, smooth, 3.5, 0.9 * gain);
+        Synth::mixIn(out, Synth::sweep(Wave::Sine, 150.0, 38.0, seconds, 3.0, 0.8 * gain), 0);
+        return out;
+    }
+
+    // Three rising notes.
+    static fn arpeggio(pitch : f64) : Vec<i32> {
+        let out : Vec<i32> = Synth::sweep(
+            Wave::Square,
+            523.0 * pitch,
+            523.0 * pitch,
+            0.07,
+            2.0,
+            0.22
+        );
+        let second : Vec<i32> = Synth::sweep(
+            Wave::Square,
+            659.0 * pitch,
+            659.0 * pitch,
+            0.07,
+            2.0,
+            0.22
+        );
+        let third : Vec<i32> = Synth::sweep(
+            Wave::Square,
+            784.0 * pitch,
+            784.0 * pitch,
+            0.16,
+            3.0,
+            0.22
+        );
+        Synth::mixIn(out, second, Synth::frames(0.07));
+        Synth::mixIn(out, third, Synth::frames(0.14));
+        return out;
+    }
+
+    // Two sliding tones announcing a wave.
+    static fn waveSound() : Vec<i32> {
+        let out : Vec<i32> = Synth::sweep(Wave::Saw, 220.0, 440.0, 0.35, 2.0, 0.22);
+        Synth::mixIn(
+            out,
+            Synth::sweep(Wave::Saw, 330.0, 660.0, 0.35, 2.0, 0.18),
+            Synth::frames(0.08)
+        );
+        return out;
+    }
+
+    // A long falling growl and an explosion.
+    static fn deathSound(noise : Pcg32) : Vec<i32> {
+        let out : Vec<i32> = Sound::boomSound(noise, 0.9, 0.95, 1.2);
+        Synth::mixIn(out, Synth::sweep(Wave::Saw, 520.0, 50.0, 0.8, 3.0, 0.35), 0);
+        return out;
+    }
+
+    // A rising sweep that breaks into noise.
+    static fn novaSound(noise : Pcg32) : Vec<i32> {
+        let out : Vec<i32> = Synth::sweep(Wave::Sine, 200.0, 1400.0, 0.4, 0.5, 0.5);
+        Synth::mixIn(out, Synth::noise(noise, 0.7, 0.6, 2.5, 0.7), Synth::frames(0.3));
+        return out;
+    }
+}

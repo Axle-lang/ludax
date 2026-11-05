@@ -1,0 +1,148 @@
+// game — the game as a whole: the screens, the current run, the camera and the clocks.
+//
+// `Game` ties the simulation (`World`) to everything around it: which screen is showing, the orbit camera,
+// the interface state, the fixed-step clock that turns frame time into simulation ticks, the log and the
+// profiler. It contains no drawing and no window code, which is what lets the smoke test drive a whole run
+// with nothing but this class.
+
+use ludax::{FixedStep, Logger, MemorySink, LogLevel, nanosToSeconds};
+
+use crate::app::probe::Probe;
+use crate::gfx::rig::Rig;
+use crate::gfx::view::View;
+use crate::sim::config::{TICK_HZ, MAX_TICKS_PER_FRAME, VIEW_W, VIEW_H};
+use crate::sim::sim::stepWorldTimed;
+use crate::sim::world::World;
+use crate::ui::state::{Screen, UiState};
+
+/** Lines the in-game log keeps. */
+const LOG_LINES : i32 = 48;
+
+/** The state of the whole game across runs. */
+pub class Game {
+    /** Which screen is showing. */
+    pub(crate) screen : Screen = Screen::Title;
+
+    /** The current run. */
+    pub(crate) world : World;
+
+    /** The orbit camera. */
+    pub(crate) rig : Rig;
+
+    /** The camera's matrices for this frame. */
+    pub(crate) view : View;
+
+    /** The interface's own state. */
+    pub(crate) ui : UiState;
+
+    /** Turns frame time into whole simulation ticks. */
+    pub(crate) fixed : FixedStep;
+
+    /** The profiler and its scopes. */
+    pub(crate) probe : Probe;
+
+    /** What happened, newest last, for the F3 overlay. */
+    pub(crate) log : Logger<MemorySink>;
+
+    /** The best score this session. */
+    pub(crate) best : i32 = 0;
+
+    /** The seed the first run uses. */
+    pub(crate) baseSeed : u64;
+
+    /** True when every run uses exactly `baseSeed` (the `--seed` flag). */
+    pub(crate) seedLocked : bool;
+
+    /** Runs started so far; changes whenever a new world is made. */
+    pub(crate) runSerial : i32 = 0;
+
+    /** Window width in pixels. */
+    pub(crate) width : i32 = VIEW_W;
+
+    /** Window height in pixels. */
+    pub(crate) height : i32 = VIEW_H;
+
+    /** Frames shown, for animation that must not touch the simulation. */
+    pub(crate) frames : i32 = 0;
+
+    /** A game on the title screen with a world already made, so the board shows behind the menu. */
+    constructor(seed : u64, locked : bool) {
+        self.baseSeed = seed;
+        self.seedLocked = locked;
+        self.world = new World(seed);
+        self.rig = new Rig();
+        self.view = new View();
+        self.ui = new UiState();
+        self.fixed = FixedStep::atHertz(TICK_HZ, MAX_TICKS_PER_FRAME);
+        self.probe = new Probe();
+        self.log = new Logger<MemorySink>(new MemorySink(LOG_LINES), LogLevel::Info);
+        self.log.info("game", "seed ${seed.toString()}");
+    }
+
+    /** Starts a fresh run and shows the playfield. */
+    pub fn begin(mut self) : void {
+        self.runSerial = self.runSerial + 1;
+        let mut seed : u64 = self.baseSeed;
+        if (!self.seedLocked) {
+            seed = self.baseSeed + self.runSerial as u64 - 1;
+        }
+        self.world = new World(seed);
+        self.rig.reset();
+        self.ui.clearChoice();
+        self.screen = Screen::Playing;
+
+        self.log.info("game", "run ${self.runSerial.toString()} seed ${seed.toString()}");
+    }
+
+    /** Back to the title screen (the finished world stays on show). */
+    pub fn toTitle(mut self) : void {
+        self.screen = Screen::Title;
+        self.ui.clearChoice();
+    }
+
+    /** Pauses a running game or resumes a paused one. */
+    pub fn togglePause(mut self) : void {
+        if (self.screen == Screen::Playing) {
+            self.screen = Screen::Paused;
+        } else if (self.screen == Screen::Paused) {
+            self.screen = Screen::Playing;
+        }
+    }
+
+    /** Feeds `frameNanos` of real time to the simulation, which takes as many whole ticks as it is owed. */
+    pub fn advance(mut self, frameNanos : i64) : void {
+        if (self.screen != Screen::Playing) {
+            return;
+        }
+
+        self.fixed.advanceNanos(frameNanos);
+        let token : i32 = self.probe.profiler.begin(self.probe.sim);
+        while (self.fixed.takeStep()) {
+            self.tickOnce();
+        }
+        self.probe.profiler.end(token);
+        self.log.setFrame(self.world.tick as i64);
+    }
+
+    /** Runs exactly one simulation tick, whatever the clock says (the smoke test's way in). */
+    pub fn tickOnce(mut self) : void {
+        stepWorldTimed(self.world, self.probe);
+        if (self.world.lost && self.screen == Screen::Playing) {
+            self.screen = Screen::GameOver;
+            if (self.world.score > self.best) {
+                self.best = self.world.score;
+            }
+            self.log.warn("game", "the bastion fell at wave ${self.world.wave}");
+        }
+    }
+
+    /** Recomputes the camera for the current window size. */
+    pub fn updateView(mut self) : void {
+        self.view.update(self.rig, self.width, self.height);
+    }
+
+    /** Simulated seconds in the current run. */
+    pub fn runSeconds(self) : f64 {
+        return nanosToSeconds(self.world.tick as i64 * self.fixed.stepLength());
+    }
+}

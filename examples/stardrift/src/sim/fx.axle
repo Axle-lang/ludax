@@ -1,0 +1,295 @@
+// fx — particles, shockwaves, score popups and screen shake: everything that is only there to look good.
+//
+// The effects still run inside the fixed step and draw their numbers from their own `Pcg32` stream, so a
+// run with a given seed produces the same sparks every time and the checksum can cover them. Integrating a
+// thousand particles is independent work per particle, so the pool is walked by a `JobPool`: each chunk of
+// slots is updated by a `ParticleKernel` that writes only the slots it was given, which makes the result the
+// same with one worker or eight. Freeing the burnt-out ones touches the shared free list and therefore runs
+// serially afterwards.
+
+use ludax::{Pcg32, JobPool, RangeKernel, sin, cos, TAU};
+
+use crate::core::config::{
+    PARTICLE_CAPACITY, POPUP_CAPACITY, SHAKE_MAX, SHAKE_DECAY, PARTICLE_GRAIN, DT
+};
+use crate::core::types::{Particle, Popup};
+use crate::sim::pool::Pool;
+
+/** Colour of the hottest part of an explosion. */
+const FX_WHITE : i32 = 0xFFF4D0;
+
+/** Colour of the body of an explosion. */
+const FX_ORANGE : i32 = 0xFF9830;
+
+/** Colour of the cooling tail of an explosion. */
+const FX_RED : i32 = 0xD02818;
+
+/** How many tints a spark can pick from, and the fragment of velocity it keeps per tick. */
+const FX_TINT_CHOICES : i32 = 4;
+const SPARK_DRAG : f32 = 0.965;
+
+/** Explosion sparks per unit of power, and the constant extra. */
+const BLAST_SPARKS_PER_POWER : f32 = 16.0;
+const BLAST_SPARKS_BASE : i32 = 8;
+
+/** Range of a spark's speed, and how much of it power adds. */
+const FX_SPARK_SLOW : f32 = 30.0;
+const FX_SPARK_FAST : f32 = 150.0;
+const FX_SPARK_POWER : f32 = 70.0;
+
+/** Blast power at and above which the whole screen flashes. */
+const FX_BIG_POWER : f32 = 2.5;
+
+/** Pixels a score popup rises each tick. */
+const POPUP_RISE : f32 = 0.7;
+
+/** Fraction of the screen flash kept each tick. */
+const FLASH_DECAY : f32 = 0.85;
+
+/** Ticks a score popup floats. */
+const POPUP_LIFE : i32 = 55;
+
+/**
+ * The particle pool together with the job that advances it. One object owns both because the job pool needs
+ * the kernel and the renderer needs the pool, and Axle gives a class a single owner.
+ */
+pub class ParticleField : RangeKernel {
+    /** The live particles; the renderer walks it. */
+    pub pool : Pool<Particle>;
+
+    constructor() {
+        self.pool = new Pool<Particle>(PARTICLE_CAPACITY, Particle {});
+    }
+
+    /** Moves, drags and ages the particles in slots `begin..end`. */
+    pub fn runRange(mut self, begin : i32, end : i32) : void {
+        for (slot of begin..end) {
+            if (self.pool.isLive(slot)) {
+                let mut p : Particle = self.pool.get(slot);
+                p.x = p.x + p.vx * DT;
+                p.y = p.y + p.vy * DT;
+                p.vx = p.vx * p.drag;
+                p.vy = p.vy * p.drag;
+                p.size = p.size + p.growth;
+                p.life = p.life - 1;
+                self.pool.put(slot, p);
+            }
+        }
+    }
+}
+
+/** The effects system: particle pool, popups and the shake of the camera. */
+pub class Fx {
+    /** The particles and the kernel that moves them. */
+    pub field : ParticleField;
+
+    /** The live score popups. */
+    pub popups : Pool<Popup>;
+
+    /** Horizontal screen-shake offset of the current tick, in pixels. */
+    pub shakeX : f32 = 0.0;
+
+    /** Vertical screen-shake offset of the current tick, in pixels. */
+    pub shakeY : f32 = 0.0;
+
+    /** Brightness of the full-screen flash, 0 to 1. */
+    pub flash : f32 = 0.0;
+
+    rng     : Pcg32;
+    trauma  : f32 = 0.0;
+    workers : JobPool;
+
+    /** Effects for a run, drawing their randomness from `seed`. */
+    constructor(seed : u64) {
+        self.rng = new Pcg32(seed, 3);
+        self.field = new ParticleField();
+        self.popups = new Pool<Popup>(POPUP_CAPACITY, Popup {});
+        self.workers = new JobPool(JobPool::defaultWorkers(), self.field);
+    }
+
+    /** Empties the pools and restarts the random stream for a new run. */
+    pub fn reset(mut self, seed : u64) : void {
+        self.rng = new Pcg32(seed, 3);
+        self.field.pool.clear();
+        self.popups.clear();
+        self.trauma = 0.0;
+        self.flash = 0.0;
+        self.shakeX = 0.0;
+        self.shakeY = 0.0;
+    }
+
+    /** Stops the worker threads; call once at exit. */
+    pub fn close(mut self) : void {
+        self.workers.shutdown();
+    }
+
+    /** How much the screen is shaking, 0 to 1. */
+    pub fn shakeLevel(self) : f32 {
+        return self.trauma;
+    }
+
+    /** Adds to the trauma of the screen shake, which is capped at 1. */
+    pub fn shake(mut self, amount : f32) : void {
+        self.trauma = self.trauma + amount;
+        if (self.trauma > 1.0) {
+            self.trauma = 1.0;
+        }
+    }
+
+    /** Adds to the full-screen flash. */
+    pub fn flashScreen(mut self, amount : f32) : void {
+        self.flash = self.flash + amount;
+        if (self.flash > 1.0) {
+            self.flash = 1.0;
+        }
+    }
+
+    /** A random number between `-range` and `range`, from the effects stream. */
+    pub fn jitter(mut self, range : f32) : f32 {
+        return self.rng.rangeF32(-range, range);
+    }
+
+    /** Adds one particle; silently dropped when the pool is full. */
+    pub fn emit(mut self, p : Particle) : void {
+        self.field.pool.acquire(p);
+    }
+
+    /** A spark flying off in a random direction between `slow` and `fast` pixels per second. */
+    pub fn spark(
+        mut self,
+        x : f32,
+        y : f32,
+        slow : f32,
+        fast : f32,
+        color : i32,
+        life : i32
+    ) : void {
+        let angle : f32 = self.rng.rangeF32(0.0, TAU);
+        let speed : f32 = self.rng.rangeF32(slow, fast);
+        self.sparkAt(x, y, cos(angle) * speed, sin(angle) * speed, color, life);
+    }
+
+    /** A spark with a chosen velocity; its lifetime varies a little so a burst fades unevenly. */
+    pub fn sparkAt(mut self, x : f32, y : f32, vx : f32, vy : f32, color : i32, life : i32) : void {
+        let span : i32 = life + self.rng.range(0, life / 2 + 1);
+        self.emit(Particle {
+            x: x,
+            y: y,
+            vx: vx,
+            vy: vy,
+            life: span,
+            span: span,
+            color: color,
+            drag: SPARK_DRAG,
+            size: 1.0,
+        });
+    }
+
+    /** An outline ring that grows from `size` by `growth` pixels per tick. */
+    pub fn ring(
+        mut self,
+        x : f32,
+        y : f32,
+        size : f32,
+        growth : f32,
+        color : i32,
+        life : i32
+    ) : void {
+        self.emit(Particle {
+            x: x,
+            y: y,
+            life: life,
+            span: life,
+            color: color,
+            drag: 1.0,
+            size: size,
+            growth: growth,
+            ring: true,
+        });
+    }
+
+    /**
+     * A fireball of `power` (about 1 for a small rock, 3 for a gunship): sparks in three colours, a
+     * shockwave, some shake and, for the big ones, a flash of the whole screen.
+     */
+    pub fn explosion(mut self, x : f32, y : f32, power : f32, color : i32) : void {
+        let count : i32 = (power * BLAST_SPARKS_PER_POWER) as i32 + BLAST_SPARKS_BASE;
+        for (i of 0..count) {
+            let pick : i32 = self.rng.range(0, FX_TINT_CHOICES);
+            let mut tint : i32 = FX_ORANGE;
+            if (pick == 0) {
+                tint = FX_WHITE;
+            } else if (pick == 1) {
+                tint = color;
+            } else if (pick == 2) {
+                tint = FX_RED;
+            }
+            self.spark(x, y, FX_SPARK_SLOW, FX_SPARK_FAST + power * FX_SPARK_POWER, tint, 22);
+        }
+        self.ring(x, y, 4.0, 1.5 + power * 1.2, FX_WHITE, 16 + (power as i32) * 3);
+        self.shake(0.12 * power);
+        if (power >= FX_BIG_POWER) {
+            self.flashScreen(0.18);
+        }
+    }
+
+    /** Floats `value` up from (`x`, `y`) with the multiplier it was scored at. */
+    pub fn popup(mut self, x : f32, y : f32, value : i32, multiplier : i32) : void {
+        self.popups.acquire(Popup {
+            x: x,
+            y: y,
+            value: value,
+            life: POPUP_LIFE,
+            multiplier: multiplier,
+        });
+    }
+
+    /** Advances particles (in parallel), popups, shake and flash by one tick. */
+    pub fn update(mut self) : void {
+        if (self.field.pool.count() > 0) {
+            self.workers.run(self.field.pool.capacity(), PARTICLE_GRAIN);
+        }
+        let mut slot : i32 = self.field.pool.first();
+        while (slot >= 0) {
+            let next : i32 = self.field.pool.next(slot);
+            if (self.field.pool.get(slot).life <= 0) {
+                self.field.pool.release(slot);
+            }
+            slot = next;
+        }
+
+        self.updatePopups();
+        self.updateShake();
+    }
+
+    fn updatePopups(mut self) : void {
+        let mut slot : i32 = self.popups.first();
+        while (slot >= 0) {
+            let next : i32 = self.popups.next(slot);
+            let mut p : Popup = self.popups.get(slot);
+            p.y = p.y - POPUP_RISE;
+            p.life = p.life - 1;
+            if (p.life <= 0) {
+                self.popups.release(slot);
+            } else {
+                self.popups.put(slot, p);
+            }
+            slot = next;
+        }
+    }
+
+    // Shake grows with the square of the trauma, so a small tremor is nearly still and a big hit is violent.
+    fn updateShake(mut self) : void {
+        let strength : f32 = self.trauma * self.trauma * SHAKE_MAX;
+        self.shakeX = self.rng.rangeF32(-1.0, 1.0) * strength;
+        self.shakeY = self.rng.rangeF32(-1.0, 1.0) * strength;
+        self.trauma = self.trauma * SHAKE_DECAY;
+        if (self.trauma < 0.01) {
+            self.trauma = 0.0;
+        }
+        self.flash = self.flash * FLASH_DECAY;
+        if (self.flash < 0.01) {
+            self.flash = 0.0;
+        }
+    }
+}

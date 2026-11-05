@@ -1,0 +1,206 @@
+// synth — builds the game's sound effects from arithmetic, and writes them as WAV files smalt can load.
+//
+// Nothing is recorded: each effect is a few oscillators and a noise source shaped by an envelope. Noise comes
+// from a `Pcg32`, so the samples are the same on every run and every machine, and the oscillators use
+// Ludax's own sine rather than libm. smalt only loads sounds from files, so `Wav::write` puts the samples
+// in a short-lived file that the caller loads and deletes.
+
+use std::ffi::libc::fs;
+
+use ludax::{Pcg32, Vec, sinD, TAU_D};
+
+/** Sample rate of the generated sounds; it matches the mixer's, so loading does no resampling. */
+const SYNTH_RATE : i32 = 44100;
+
+/** Largest sample value of a 16-bit signal. */
+const SYNTH_PEAK : f64 = 32000.0;
+
+/** Limits of a signed 16-bit sample, for clipping on the way out. */
+const SYNTH_CLIP_HIGH : i32 = 32767;
+const SYNTH_CLIP_LOW : i32 = -32768;
+
+/** Fraction of a sound spent fading in, which removes the click of a hard start. */
+const SYNTH_ATTACK : f64 = 0.01;
+
+/** Bytes in the WAV header. */
+const WAV_HEADER : i64 = 44;
+
+/** Shapes of oscillator. */
+pub enum Wave : i8 {
+    /** A pure tone. */
+    Sine,
+
+    /** A hollow, buzzy tone. */
+    Square,
+
+    /** A bright, harsh tone. */
+    Saw,
+}
+
+/** Sample builders. */
+pub class Synth {
+    /** Samples in `seconds`. */
+    pub static fn frames(seconds : f64) : i32 {
+        return (seconds * (SYNTH_RATE as f64)) as i32;
+    }
+
+    /** One cycle position `phase` (0 to 1) of the wave `kind`, from -1 to 1. */
+    pub static fn osc(kind : Wave, phase : f64) : f64 {
+        return match kind {
+            Wave::Sine => sinD(phase * TAU_D),
+            Wave::Square => Synth::squareOf(phase),
+            Wave::Saw => 2.0 * phase - 1.0,
+        };
+    }
+
+    static fn squareOf(phase : f64) : f64 {
+        if (phase < 0.5) {
+            return 1.0;
+        }
+        return -1.0;
+    }
+
+    /**
+     * A tone that glides from `from` to `to` Hz over `seconds`, fading out exponentially: `decay` is how many
+     * e-folds of loudness are lost by the end (3 is nearly silent).
+     */
+    pub static fn sweep(
+        kind : Wave,
+        from : f64,
+        to : f64,
+        seconds : f64,
+        decay : f64,
+        gain : f64
+    ) : Vec<i32> {
+        let n : i32 = Synth::frames(seconds);
+        let out : Vec<i32> = new Vec<i32>(n);
+        let mut phase : f64 = 0.0;
+        for (i of 0..n) {
+            let t : f64 = (i as f64) / (n as f64);
+            let hz : f64 = from + (to - from) * t;
+            phase = phase + hz / (SYNTH_RATE as f64);
+            phase = phase - phase.floor();
+            let level : f64 = Synth::fade(t, decay) * gain;
+            out.push((Synth::osc(kind, phase) * level * SYNTH_PEAK) as i32);
+        }
+        return out;
+    }
+
+    // Exponential fade with a few samples of fade-in so the start does not click.
+    static fn fade(t : f64, decay : f64) : f64 {
+        let attack : f64 = SYNTH_ATTACK;
+        let mut level : f64 = (-decay * t).exp();
+        if (t < attack) {
+            level = level * t / attack;
+        }
+        return level;
+    }
+
+    /**
+     * Filtered noise: white noise smoothed by a one-pole low-pass (`smooth` close to 1 is dull and rumbling,
+     * 0 is hissing), faded out over `seconds`.
+     */
+    pub static fn noise(
+        rng : Pcg32,
+        seconds : f64,
+        smooth : f64,
+        decay : f64,
+        gain : f64
+    ) : Vec<i32> {
+        let n : i32 = Synth::frames(seconds);
+        let out : Vec<i32> = new Vec<i32>(n);
+        let mut held : f64 = 0.0;
+        for (i of 0..n) {
+            let t : f64 = (i as f64) / (n as f64);
+            let white : f64 = rng.nextF64() * 2.0 - 1.0;
+            held = held * smooth + white * (1.0 - smooth);
+            out.push((held * Synth::fade(t, decay) * gain * SYNTH_PEAK * 2.0) as i32);
+        }
+        return out;
+    }
+
+    /** Adds `other` onto `base`, starting `offset` samples in; `base` grows if needed. */
+    pub static fn mixIn(base : Vec<i32>, other : Vec<i32>, offset : i32) : void {
+        while (base.len() < offset + other.len()) {
+            base.push(0);
+        }
+        for (i of 0..other.len()) {
+            base.set(offset + i, base.get(offset + i) + other.get(i));
+        }
+    }
+}
+
+/** Writes WAV files. */
+pub class Wav {
+    /** Writes `samples` as a mono 16-bit PCM file at `path`; answers whether it landed. */
+    pub static fn write(path : string, samples : Vec<i32>) : bool {
+        let dataBytes : i64 = (samples.len() as i64) * 2;
+        let mut buf : i8[] = malloc<i8>(WAV_HEADER + dataBytes);
+        Wav::header(buf, dataBytes);
+
+        for (i of 0..samples.len()) {
+            let mut v : i32 = samples.get(i);
+            if (v > SYNTH_CLIP_HIGH) {
+                v = SYNTH_CLIP_HIGH;
+            }
+            if (v < SYNTH_CLIP_LOW) {
+                v = SYNTH_CLIP_LOW;
+            }
+            let at : i64 = WAV_HEADER + (i as i64) * 2;
+            buf[at] = (v & 255) as i8;
+            buf[at + 1] = ((v >> 8) & 255) as i8;
+        }
+        let stream = fs::fopen(path, "wb");
+        if (Wav::isNil(stream)) {
+            return false;
+        }
+        fs::fwrite(Wav::bytes(buf), 1, WAV_HEADER + dataBytes, stream);
+        fs::fclose(stream);
+        return true;
+    }
+
+    // The RIFF/WAVE header of a mono, 16-bit, `SYNTH_RATE` Hz file with `dataBytes` of samples.
+    static fn header(buf : i8[], dataBytes : i64) : void {
+        Wav::tag(buf, 0, "RIFF");
+        Wav::put32(buf, 4, (36 + dataBytes) as i32);
+        Wav::tag(buf, 8, "WAVE");
+        Wav::tag(buf, 12, "fmt ");
+        Wav::put32(buf, 16, 16);
+        Wav::put16(buf, 20, 1);
+        Wav::put16(buf, 22, 1);
+        Wav::put32(buf, 24, SYNTH_RATE);
+        Wav::put32(buf, 28, SYNTH_RATE * 2);
+        Wav::put16(buf, 32, 2);
+        Wav::put16(buf, 34, 16);
+        Wav::tag(buf, 36, "data");
+        Wav::put32(buf, 40, dataBytes as i32);
+    }
+
+    static fn tag(buf : i8[], at : i64, s : string) : void {
+        for (i of 0..4) {
+            buf[at + i] = s.byteAt(i) as i8;
+        }
+    }
+
+    static fn put16(buf : i8[], at : i64, v : i32) : void {
+        buf[at] = (v & 255) as i8;
+        buf[at + 1] = ((v >> 8) & 255) as i8;
+    }
+
+    static fn put32(buf : i8[], at : i64, v : i32) : void {
+        Wav::put16(buf, at, v & 65535);
+        Wav::put16(buf, at + 2, (v >> 16) & 65535);
+    }
+
+    static fn bytes(buf : i8[]) : ptr {
+        unsafe {
+            return buf as ptr;
+        }
+    }
+
+    static fn isNil(p : ptr) : bool {
+        unsafe {
+            return (p as i64) == 0;
+        }
+    }
+}

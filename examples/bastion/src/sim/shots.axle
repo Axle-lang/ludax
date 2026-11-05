@@ -1,0 +1,135 @@
+// shots — flying projectiles and what they do on arrival.
+//
+// A shot homes on its target; if the target dies on the way it flies on to where it was last seen. An arrow
+// or frost bolt hurts only its target and only if it is still alive; a cannon shell explodes where it lands
+// and hurts everything near, less toward the edge of the blast. Frost bolts also lay a slow on the enemy,
+// which only ever gets stronger or longer, never weaker, when hit again.
+
+use ludax::{EntityId, Vec2, Vec3};
+
+use crate::audio::cues::Cue;
+use crate::sim::config::SHOT_HEIGHT;
+use crate::sim::stats::{TowerKind, enemyStats};
+use crate::sim::units::{Shot, Enemy, Slow, FxKind, FxSpawn};
+use crate::sim::world::World;
+
+/** Fraction of a tile at which a shot counts as having arrived. */
+const ARRIVE_SLACK : f32 = 0.06;
+
+/** Height of a shell's arc at the middle of its flight, in tiles. */
+const SHELL_ARC : f32 = 1.2;
+
+/** Shortest start distance for which a shell arcs; below it the arc would divide by ~zero. */
+const SHELL_MIN_RANGE : f32 = 0.01;
+
+/** One tick for every shot. */
+pub fn stepShots(w : World) : void {
+    w.doomedKeys.clear();
+    for (d of 0..w.shots.len()) {
+        let mut s : Shot = w.shots.valueAt(d);
+        if (advance(w, s, d)) {
+            w.doomedKeys.push(w.shots.keyAt(d));
+        }
+    }
+    for (i of 0..w.doomedKeys.len()) {
+        let key : i32 = w.doomedKeys.get(i);
+        w.shots.remove(key);
+        w.shotIds.destroy(w.shotIds.idAt(key));
+    }
+}
+
+// Moves the shot stored at dense position `d`; true when it has arrived and must be removed.
+fn advance(w : World, shot : Shot, d : i32) : bool {
+    let mut s : Shot = shot;
+    if (w.enemies.has(s.target)) {
+        s.aimAt = w.enemies.get(s.target).pos;
+    }
+    let toGo : Vec2 = s.aimAt.minus(s.pos);
+    let remaining : f32 = toGo.length();
+    if (remaining <= s.speed + ARRIVE_SLACK) {
+        s.pos = s.aimAt;
+        land(w, s);
+        return true;
+    }
+    s.pos = s.pos.plus(toGo.scale(s.speed / remaining));
+    s.height = heightAt(s, remaining);
+    w.shots.setValueAt(d, s);
+    return false;
+}
+
+// Flat flight for bolts, a parabola for shells.
+fn heightAt(s : Shot, remaining : f32) : f32 {
+    if (s.kind != TowerKind::Cannon || s.startDistance < SHELL_MIN_RANGE) {
+        return SHOT_HEIGHT;
+    }
+    let mut f : f32 = (1.0 as f32) - remaining / s.startDistance;
+    if (f < 0.0) {
+        f = 0.0;
+    }
+    return SHOT_HEIGHT + SHELL_ARC * 4.0 * f * (1.0 - f);
+}
+
+// The shot reaches its end point.
+fn land(w : World, s : Shot) : void {
+    if (s.splash > 0.0) {
+        explode(w, s);
+        return;
+    }
+    if (w.enemies.has(s.target)) {
+        hurt(w, s.target, s.damage);
+        if (s.slowPercent > 0) {
+            applySlow(w, s.target, s.slowPercent, s.slowTicks);
+        }
+        w.spawnFx(FxSpawn {
+            kind: FxKind::Spark,
+            pos: Vec3::make(s.pos.x, 0.7, s.pos.y),
+            vel: Vec3::make(0.0, 0.03, 0.0),
+            life: 10,
+            value: 0,
+        });
+    }
+}
+
+// A blast: everything within the radius takes damage that falls off to half at the rim.
+fn explode(w : World, s : Shot) : void {
+    w.raise(Cue::Explode);
+    let ringSize : i32 = (s.splash * 100.0) as i32;
+    w.spawnFx(FxSpawn {
+        kind: FxKind::Ring,
+        pos: Vec3::make(s.pos.x, 0.05, s.pos.y),
+        vel: Vec3::zero(),
+        life: 18,
+        value: ringSize,
+    });
+    for (slot of 0..w.enemies.slotCount()) {
+        if (!w.enemies.isLiveAt(slot)) {
+            continue;
+        }
+        let e : Enemy = w.enemies.valueAt(slot);
+        let reach : f32 = s.splash + enemyStats(e.kind).radius;
+        let dist : f32 = e.pos.distance(s.pos);
+        if (dist <= reach) {
+            let share : i32 = (100.0 - 50.0 * dist / reach) as i32;
+            hurt(w, w.enemies.idAt(slot), s.damage * share / 100);
+        }
+    }
+}
+
+fn hurt(w : World, id : EntityId, amount : i32) : void {
+    let mut e : Enemy = w.enemies.get(id);
+    e.health = e.health - amount;
+    w.enemies.set(id, e);
+}
+
+fn applySlow(w : World, id : EntityId, percent : i32, ticks : i32) : void {
+    let old : Slow = w.slows.getOr(id.index, Slow { percent: 0, ticks: 0 });
+    let mut strongest : i32 = percent;
+    if (old.percent > strongest) {
+        strongest = old.percent;
+    }
+    let mut longest : i32 = ticks;
+    if (old.ticks > longest) {
+        longest = old.ticks;
+    }
+    w.slows.insert(id.index, Slow { percent: strongest, ticks: longest });
+}

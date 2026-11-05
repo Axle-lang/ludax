@@ -1,0 +1,203 @@
+// enemies — what rocks, drones, gunships and pick-ups do between collisions.
+//
+// Each kind has its own behaviour and `match` picks it. Rocks drift and wrap around the field. Drones home on
+// the ship, wobbling, and keep their distance from one another by asking the collision grid who is close.
+// Gunships circle the ship at a distance and fire aimed bolts. Pick-ups bob about until they expire.
+
+use ludax::{EntityId, Vec2, sin, cos, sqrt, atan2};
+
+use crate::core::config::{
+    FIELD_W, FIELD_H, DT, DRONE_SPEED, DRONE_STEER, DRONE_SPACING, GUNSHIP_SPEED, GUNSHIP_ORBIT,
+    GUNSHIP_RELOAD, HALF, ONE, EPS
+};
+use crate::core::types::{Entity, Brain, Kind, Layer};
+use crate::sim::shots::Shots;
+use crate::sim::world::World;
+
+/** How far past the edge a wrapping rock travels before it reappears on the other side. */
+const WRAP_MARGIN : f32 = 6.0;
+
+/** Sideways wobble of a drone's course, pixels per second. */
+const WOBBLE : f32 = 55.0;
+
+/** Rate at which the wobble phase advances per tick. */
+const WOBBLE_RATE : f32 = 0.11;
+
+/** Strength of the push between drones that are too close. */
+const SEPARATION : f32 = 140.0;
+
+/** How sharply a gunship's velocity follows what it wants. */
+const GUNSHIP_STEER : f32 = 0.05;
+
+/** Half-width of the dead band around the orbit distance. */
+const ORBIT_BAND : f32 = 35.0;
+
+/** Spread of a gunship's aim in radians. */
+const AIM_ERROR : f32 = 0.09;
+
+/** Extra random ticks added to a gunship's reload. */
+const RELOAD_JITTER : i32 = 25;
+
+/** Rotation of a floating pick-up, radians per second. */
+const PICKUP_SPIN : f32 = 2.2;
+
+/** Runs the behaviour of every entity. */
+pub class Enemies {
+    /** Moves every entity for one tick. */
+    pub static fn update(w : World) : void {
+        for (slot of 0..w.entities.slotCount()) {
+            if (w.entities.isLiveAt(slot)) {
+                let id : EntityId = w.entities.idAt(slot);
+                let mut e : Entity = w.entities.valueAt(slot);
+                if (e.flash > 0) {
+                    e.flash = e.flash - 1;
+                }
+                let next : Entity = match e.kind {
+                    Kind::Rock => Enemies::rock(e),
+                    Kind::Drone => Enemies::drone(w, id, e),
+                    Kind::Gunship => Enemies::gunship(w, id, e),
+                    Kind::Pickup => Enemies::pickup(w, id, e),
+                };
+                w.entities.set(id, next);
+            }
+        }
+    }
+
+    // Where hostile ships aim: the ship while it flies, the middle of the field otherwise.
+    static fn target(w : World) : Vec2 {
+        if (w.ship.alive) {
+            return Vec2::make(w.ship.x, w.ship.y);
+        }
+        return Vec2::make(FIELD_W * HALF, FIELD_H * HALF);
+    }
+
+    // Drift, spin and wrap around the field.
+    static fn rock(src : Entity) : Entity {
+        let mut e : Entity = src;
+        e.x = e.x + e.vx * DT;
+        e.y = e.y + e.vy * DT;
+        e.angle = e.angle + e.spin * DT;
+        let edge : f32 = e.radius + WRAP_MARGIN;
+        if (e.x < -edge) {
+            e.x = FIELD_W + edge;
+        } else if (e.x > FIELD_W + edge) {
+            e.x = -edge;
+        }
+        if (e.y < -edge) {
+            e.y = FIELD_H + edge;
+        } else if (e.y > FIELD_H + edge) {
+            e.y = -edge;
+        }
+        return e;
+    }
+
+    // Steer towards the target, wobbling sideways, and stay clear of whatever is close.
+    static fn drone(w : World, id : EntityId, src : Entity) : Entity {
+        let mut e : Entity = src;
+        let mut brain : Brain = w.brains.get(id.index);
+        brain.phase = brain.phase + WOBBLE_RATE;
+
+        let at : Vec2 = Enemies::target(w);
+        let dx : f32 = at.x - e.x;
+        let dy : f32 = at.y - e.y;
+        let dist : f32 = sqrt(dx * dx + dy * dy) + EPS;
+        let wobble : f32 = sin(brain.phase) * WOBBLE;
+        let wantX : f32 = dx / dist * DRONE_SPEED - dy / dist * wobble;
+        let wantY : f32 = dy / dist * DRONE_SPEED + dx / dist * wobble;
+        e.vx = e.vx + (wantX - e.vx) * DRONE_STEER;
+        e.vy = e.vy + (wantY - e.vy) * DRONE_STEER;
+        let push : Vec2 = Enemies::separation(w, id, e);
+        e.vx = e.vx + push.x;
+        e.vy = e.vy + push.y;
+        e.x = e.x + e.vx * DT;
+        e.y = e.y + e.vy * DT;
+        e.angle = atan2(e.vy, e.vx);
+        w.brains.insert(id.index, brain);
+        return e;
+    }
+
+    // The velocity change that pushes `e` away from every enemy the grid says is within `DRONE_SPACING`.
+    static fn separation(w : World, id : EntityId, e : Entity) : Vec2 {
+        let mut push : Vec2 = Vec2::zero();
+        w.grid.query(e.x, e.y, DRONE_SPACING, w.near);
+        for (k of 0..w.near.len()) {
+            let p = w.grid.proxy(w.near.get(k));
+            if (p.layer == Layer::Enemy && p.index != id.index) {
+                let ox : f32 = e.x - p.x;
+                let oy : f32 = e.y - p.y;
+                let d : f32 = sqrt(ox * ox + oy * oy) + EPS;
+                let limit : f32 = DRONE_SPACING + p.r;
+                if (d < limit) {
+                    let strength : f32 = (ONE - d / limit) * SEPARATION * DT;
+                    push.addIn(Vec2::make(ox / d * strength, oy / d * strength));
+                }
+            }
+        }
+        return push;
+    }
+
+    // Circle the target at a distance, close in or back off as needed, and shoot when the gun is ready.
+    static fn gunship(w : World, id : EntityId, src : Entity) : Entity {
+        let mut e : Entity = src;
+        let mut brain : Brain = w.brains.get(id.index);
+        let at : Vec2 = Enemies::target(w);
+        let dx : f32 = at.x - e.x;
+        let dy : f32 = at.y - e.y;
+        let dist : f32 = sqrt(dx * dx + dy * dy) + EPS;
+        let nx : f32 = dx / dist;
+        let ny : f32 = dy / dist;
+        let mut radial : f32 = 0.0;
+        if (dist > GUNSHIP_ORBIT + ORBIT_BAND) {
+            radial = ONE;
+        } else if (dist < GUNSHIP_ORBIT - ORBIT_BAND) {
+            radial = -ONE;
+        }
+        let wantX : f32 = (nx * radial - ny * brain.orbit) * GUNSHIP_SPEED;
+        let wantY : f32 = (ny * radial + nx * brain.orbit) * GUNSHIP_SPEED;
+        e.vx = e.vx + (wantX - e.vx) * GUNSHIP_STEER;
+        e.vy = e.vy + (wantY - e.vy) * GUNSHIP_STEER;
+        e.x = e.x + e.vx * DT;
+        e.y = e.y + e.vy * DT;
+        e.angle = atan2(dy, dx);
+        brain.reload = brain.reload - 1;
+        if (brain.reload <= 0 && w.ship.alive) {
+            let aim : f32 = e.angle + w.rng.rangeF32(-AIM_ERROR, AIM_ERROR);
+            Shots::fireBolt(w, e.x + cos(aim) * e.radius, e.y + sin(aim) * e.radius, aim);
+            brain.reload = GUNSHIP_RELOAD + w.rng.range(0, RELOAD_JITTER);
+        }
+        w.brains.insert(id.index, brain);
+        return e;
+    }
+
+    // Float about, bounce off the walls and expire when the timer runs out.
+    static fn pickup(w : World, id : EntityId, src : Entity) : Entity {
+        let mut e : Entity = src;
+        e.x = e.x + e.vx * DT;
+        e.y = e.y + e.vy * DT;
+        e.angle = e.angle + PICKUP_SPIN * DT;
+        if (e.x < e.radius || e.x > FIELD_W - e.radius) {
+            e.vx = -e.vx;
+            e.x = Enemies::clampTo(e.x, e.radius, FIELD_W - e.radius);
+        }
+        if (e.y < e.radius || e.y > FIELD_H - e.radius) {
+            e.vy = -e.vy;
+            e.y = Enemies::clampTo(e.y, e.radius, FIELD_H - e.radius);
+        }
+        let left : i32 = w.lifetimes.getOr(id.index, 0) - 1;
+        w.lifetimes.insert(id.index, left);
+        if (left <= 0) {
+            w.remove(id);
+        }
+        return e;
+    }
+
+    static fn clampTo(v : f32, lo : f32, hi : f32) : f32 {
+        if (v < lo) {
+            return lo;
+        }
+        if (v > hi) {
+            return hi;
+        }
+        return v;
+    }
+}

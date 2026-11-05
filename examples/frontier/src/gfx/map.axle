@@ -1,0 +1,278 @@
+// map — the frontier seen from above, drawn into an `Image`.
+//
+// Each pixel is shaded from the terrain height (a hill-shaded relief, lit from the north-west). On top: the
+// cells that were ever activated in a tint, the cells active at the end brighter with their outline, the
+// streamed props as dots, the route the car took (coloured by the stage of the mission it was in), and the
+// waypoints as squares. Drawing is plain integer pixel work on the `Image`; there is no window.
+//
+// The relief samples the height at two points either side of a pixel and takes their difference: the light
+// comes from the north-west (negative x, negative z), so a surface facing that way is brighter. The whole map is
+// a diagnostic, not a renderer, so every colour is a flat tint blended once.
+
+use ludax::{Cells, EntityId, Image, DTransform, Vec};
+
+use crate::sim::systems::FrontierSystems;
+use crate::world::route::{Route, StopKind};
+use crate::world::terrain::FrontierTerrain;
+
+// The relief's base brightness, height and slope gains, the clamp that keeps it readable, and the sample offset.
+const MAP_RELIEF_BASE : f64 = 125.0;
+const MAP_RELIEF_HEIGHT : f64 = 6.0;
+const MAP_RELIEF_SLOPE : f64 = 420.0;
+const MAP_RELIEF_MIN : f64 = 30.0;
+const MAP_RELIEF_MAX : f64 = 230.0;
+const MAP_SAMPLE : f64 = 6.0;
+const MAP_SLOPE_GAIN : f64 = 0.05;
+
+// How strongly the two cell layers tint the ground, and the outline strength of the end-of-run cells.
+const MAP_CELL_ALPHA : i32 = 70;
+const MAP_ACTIVE_ALPHA : i32 = 48;
+const MAP_OUTLINE_ALPHA : i32 = 200;
+
+// The template numbers the streamed props are drawn by: trees first, then rocks, then everything else.
+const MAP_KIND_TREE : i32 = 0;
+const MAP_KIND_ROCK : i32 = 1;
+
+/** An 8-bit RGB colour for the map. */
+pub struct MapColor {
+    /** Red. */
+    pub r : i32 = 0;
+
+    /** Green. */
+    pub g : i32 = 0;
+
+    /** Blue. */
+    pub b : i32 = 0;
+
+    /** The colour of the three channels. */
+    pub static fn make(r : i32, g : i32, b : i32) : MapColor {
+        return MapColor { r: r, g: g, b: b };
+    }
+}
+
+/** The map, its size in pixels and the world window it shows. */
+pub struct MapView {
+    /** World x at the left edge. */
+    pub minX : f64;
+
+    /** World z at the top edge. */
+    pub minZ : f64;
+
+    /** Metres per pixel. */
+    pub scale : f64;
+}
+
+/** Draws maps. */
+pub class FrontierMap {
+    static fn put(img : Image, x : i32, y : i32, color : MapColor) : void {
+        if (x >= 0 && y >= 0 && x < img.width() && y < img.height()) {
+            img.set(x, y, Image::pack(color.r, color.g, color.b, 255));
+        }
+    }
+
+    static fn blend(img : Image, x : i32, y : i32, color : MapColor, alpha : i32) : void {
+        if (x >= 0 && y >= 0 && x < img.width() && y < img.height()) {
+            let p : i32 = img.get(x, y);
+            let nr : i32 = (Image::red(p) * (255 - alpha) + color.r * alpha) / 255;
+            let ng : i32 = (Image::green(p) * (255 - alpha) + color.g * alpha) / 255;
+            let nb : i32 = (Image::blue(p) * (255 - alpha) + color.b * alpha) / 255;
+            img.set(x, y, Image::pack(nr, ng, nb, 255));
+        }
+    }
+
+    static fn square(img : Image, cx : i32, cy : i32, half : i32, color : MapColor) : void {
+        for (dy of (0 - half)..(half + 1)) {
+            for (dx of (0 - half)..(half + 1)) {
+                FrontierMap::put(img, cx + dx, cy + dy, color);
+            }
+        }
+    }
+
+    static fn line(img : Image, x0 : i32, y0 : i32, x1 : i32, y1 : i32, color : MapColor) : void {
+        let mut dx : i32 = x1 - x0;
+        let mut dy : i32 = y1 - y0;
+        let mut steps : i32 = dx;
+        if (steps < 0) {
+            steps = 0 - steps;
+        }
+        let mut ady : i32 = dy;
+        if (ady < 0) {
+            ady = 0 - ady;
+        }
+        if (ady > steps) {
+            steps = ady;
+        }
+        if (steps == 0) {
+            FrontierMap::put(img, x0, y0, color);
+            return;
+        }
+
+        for (i of 0..steps + 1) {
+            let x : i32 = x0 + (dx * i + (steps / 2)) / steps;
+            let y : i32 = y0 + (dy * i + (steps / 2)) / steps;
+            FrontierMap::put(img, x, y, color);
+            FrontierMap::put(img, x + 1, y, color);
+        }
+    }
+
+    /** Draws the whole map for the finished game `sys` onto `img`. */
+    pub static fn draw(img : Image, view : MapView, sys : FrontierSystems) : void {
+        FrontierMap::relief(img, view, sys.ground);
+        FrontierMap::cells(img, view, sys);
+        FrontierMap::props(img, view, sys);
+        FrontierMap::trail(img, view, sys);
+        FrontierMap::waypoints(img, view, sys.route);
+        FrontierMap::car(img, view, sys);
+        FrontierMap::legend(img);
+    }
+
+    // Hill-shaded relief: the difference between two samples across the pixel gives the slope.
+    static fn relief(img : Image, view : MapView, terrain : FrontierTerrain) : void {
+        let w : i32 = img.width();
+        let h : i32 = img.height();
+        for (py of 0..h) {
+            for (px of 0..w) {
+                let x : f64 = view.minX + (px as f64) * view.scale;
+                let z : f64 = view.minZ + (py as f64) * view.scale;
+                let height : f64 = terrain.heightAt(x, z);
+                let slope : f64 = (terrain.heightAt(x - MAP_SAMPLE, z - MAP_SAMPLE)
+                    - terrain.heightAt(x + MAP_SAMPLE, z + MAP_SAMPLE))
+                    * MAP_SLOPE_GAIN;
+                let mut lum : f64 = MAP_RELIEF_BASE + height * MAP_RELIEF_HEIGHT + slope * MAP_RELIEF_SLOPE;
+                if (lum < MAP_RELIEF_MIN) {
+                    lum = MAP_RELIEF_MIN;
+                }
+                if (lum > MAP_RELIEF_MAX) {
+                    lum = MAP_RELIEF_MAX;
+                }
+                let l : i32 = lum as i32;
+                let color : MapColor = MapColor::make(l * 70 / 100, l * 85 / 100, l * 62 / 100);
+                FrontierMap::put(img, px, py, color);
+            }
+        }
+    }
+
+    // Cells ever active, then those active at the end.
+    static fn cells(img : Image, view : MapView, sys : FrontierSystems) : void {
+        let size : f64 = sys.part.cellSize();
+        let visited : MapColor = MapColor::make(40, 90, 255);
+        let active : MapColor = MapColor::make(255, 230, 90);
+        let mut slot : i32 = sys.everActive.first();
+        while (slot >= 0) {
+            let key : i64 = sys.everActive.keyAt(slot);
+            FrontierMap::cell(img, view, size, key, visited, MAP_CELL_ALPHA, false);
+            slot = sys.everActive.next(slot);
+        }
+        for (i of 0..sys.streamer.activeCount()) {
+            let key : i64 = sys.streamer.activeKeyAt(i);
+            FrontierMap::cell(img, view, size, key, active, MAP_ACTIVE_ALPHA, true);
+        }
+    }
+
+    // Props the streamer holds at the end.
+    static fn props(img : Image, view : MapView, sys : FrontierSystems) : void {
+        let tree : MapColor = MapColor::make(15, 80, 20);
+        let rock : MapColor = MapColor::make(200, 200, 205);
+        let prop : MapColor = MapColor::make(150, 90, 40);
+        for (d of 0..sys.streamer.entityCount()) {
+            let id : EntityId = sys.streamer.memberAt(d);
+            let t : DTransform = sys.scene.localTransform(id);
+            let px : i32 = ((t.translation.x - view.minX) / view.scale) as i32;
+            let py : i32 = ((t.translation.z - view.minZ) / view.scale) as i32;
+            let kind : i32 = sys.streamer.templateOf(sys.scene, id);
+            if (kind == MAP_KIND_TREE) {
+                FrontierMap::square(img, px, py, 1, tree);
+            } else if (kind == MAP_KIND_ROCK) {
+                FrontierMap::square(img, px, py, 1, rock);
+            } else {
+                FrontierMap::square(img, px, py, 1, prop);
+            }
+        }
+    }
+
+    // The route driven, coloured by the stage the mission was in.
+    static fn trail(img : Image, view : MapView, sys : FrontierSystems) : void {
+        let trail : Vec<f64> = sys.trail;
+        let n : i32 = trail.len() / 2;
+        for (i of 1..n) {
+            let stage : i32 = sys.trailStage.get(i);
+            let x0 : i32 = ((trail.get(2 * i - 2) - view.minX) / view.scale) as i32;
+            let y0 : i32 = ((trail.get(2 * i - 1) - view.minZ) / view.scale) as i32;
+            let x1 : i32 = ((trail.get(2 * i) - view.minX) / view.scale) as i32;
+            let y1 : i32 = ((trail.get(2 * i + 1) - view.minZ) / view.scale) as i32;
+            FrontierMap::line(img, x0, y0, x1, y1, FrontierMap::stageColor(stage));
+        }
+    }
+
+    // The colour of the route at a mission stage: supplies orange, delivery magenta, return cyan.
+    static fn stageColor(stage : i32) : MapColor {
+        return match stage {
+            0 => MapColor::make(255, 140, 20),
+            1 => MapColor::make(240, 60, 200),
+            _ => MapColor::make(40, 230, 240),
+        };
+    }
+
+    // Waypoints, dark square first so the kind's colour reads on any background.
+    static fn waypoints(img : Image, view : MapView, route : Route) : void {
+        let marker : MapColor = MapColor::make(10, 10, 10);
+        let depot : MapColor = MapColor::make(255, 200, 0);
+        let halt : MapColor = MapColor::make(230, 40, 40);
+        let home : MapColor = MapColor::make(60, 220, 90);
+        let pass : MapColor = MapColor::make(235, 235, 235);
+        for (i of 0..route.count()) {
+            let px : i32 = ((route.x(i) - view.minX) / view.scale) as i32;
+            let py : i32 = ((route.z(i) - view.minZ) / view.scale) as i32;
+            let kind : StopKind = route.kind(i);
+            FrontierMap::square(img, px, py, 7, marker);
+            match kind {
+                StopKind::Depot => FrontierMap::square(img, px, py, 5, depot),
+                StopKind::Halt => FrontierMap::square(img, px, py, 5, halt),
+                StopKind::Home => FrontierMap::square(img, px, py, 5, home),
+                StopKind::Pass => FrontierMap::square(img, px, py, 3, pass),
+            }
+        }
+    }
+
+    // Where the car ended.
+    static fn car(img : Image, view : MapView, sys : FrontierSystems) : void {
+        let ex : i32 = ((sys.car.x - view.minX) / view.scale) as i32;
+        let ey : i32 = ((sys.car.z - view.minZ) / view.scale) as i32;
+        FrontierMap::square(img, ex, ey, 4, MapColor::make(255, 255, 255));
+        FrontierMap::square(img, ex, ey, 2, MapColor::make(0, 0, 0));
+    }
+
+    // The three stage colours, so the map reads without the mission text.
+    static fn legend(img : Image) : void {
+        FrontierMap::square(img, 16, 16, 6, FrontierMap::stageColor(0));
+        FrontierMap::square(img, 16, 34, 6, FrontierMap::stageColor(1));
+        FrontierMap::square(img, 16, 52, 6, FrontierMap::stageColor(2));
+    }
+
+    // Tints one cell, optionally outlined.
+    static fn cell(
+        img : Image,
+        view : MapView,
+        size : f64,
+        key : i64,
+        color : MapColor,
+        alpha : i32,
+        outline : bool
+    ) : void {
+        let x0 : i32 = (((Cells::keyX(key) as f64) * size - view.minX) / view.scale) as i32;
+        let z0 : i32 = (((Cells::keyZ(key) as f64) * size - view.minZ) / view.scale) as i32;
+        let side : i32 = (size / view.scale) as i32;
+        for (dy of 0..side) {
+            for (dx of 0..side) {
+                let edge : bool = dx == 0 || dy == 0 || dx == side - 1 || dy == side - 1;
+                if (outline && edge) {
+                    FrontierMap::blend(img, x0 + dx, z0 + dy, color, MAP_OUTLINE_ALPHA);
+                } else if (!outline) {
+                    FrontierMap::blend(img, x0 + dx, z0 + dy, color, alpha);
+                } else {
+                    FrontierMap::blend(img, x0 + dx, z0 + dy, color, alpha / 3);
+                }
+            }
+        }
+    }
+}

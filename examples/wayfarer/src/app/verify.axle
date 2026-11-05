@@ -1,0 +1,473 @@
+// verify — what the example checks about itself, and prints.
+//
+// Each stage compares the engine's answer with something independent: breadth-first search for path lengths, a
+// flow field for A* costs, straight-line distance and the polyline through doorway midpoints for mesh paths,
+// the walker's own footstep markers for its stride, and a second run of the whole simulation for determinism.
+//
+// The checks are deliberately loose where the engine only promises a range (a footstep within a fade, a path
+// no longer than the visibility graph) and exact only where the answer is an integer the oracle can repeat.
+// A failing check never stops the stage: every verdict is printed, and the count is the program's exit status.
+
+use ludax::{
+    Checks, GridMap, GridPath, GridPathfinder, GridLine, FlowField, NavMesh, NavPath, Skeleton, Pose, Vec3,
+    TwoBoneIk, SteerAgent, NAV_STEP_ORTHO
+};
+
+use crate::anim::walker::{WALK_STRIDE, BONE_THIGH_R, BONE_SHIN_R, BONE_FOOT_R};
+use crate::app::scenario::{Scenario, SCN_AGENTS};
+use crate::sim::crowd::Crowd;
+use crate::sim::walker_agent::WalkerAgent;
+use crate::world::dungeon::Dungeon;
+
+// The tolerance for two float lengths that should agree, and for a matrix or point that should be exact.
+const VERIFY_EPS : f32 = 0.001;
+const VERIFY_TOL : f32 = 0.0001;
+const VERIFY_NEAR_UNIT : f32 = 0.9999;
+
+// The crowd must finish inside this budget, and no two centres may come closer than this.
+const VERIFY_STEP_BUDGET : i32 = 5000;
+const VERIFY_MIN_APPROACH : f32 = 0.25;
+
+// Room pairs compared with breadth-first search: a lower bound proves the oracle visited the whole map.
+const VERIFY_MIN_PAIRS : i32 = 20;
+
+// The square crate dropped on the route, and the cap on steps when following the flow field.
+const VERIFY_CRATE : i32 = 2;
+const VERIFY_FLOW_GUARD : i32 = 2000;
+
+// The walk clip has two footstep markers per cycle; a fade can lose or gain a few.
+const VERIFY_STEPS_PER_CYCLE : f32 = 2.0;
+const VERIFY_STEP_SLACK : i32 = 4;
+
+// Root motion should cover roughly the path length, within these factors.
+const VERIFY_PATH_LOW : f32 = 0.8;
+const VERIFY_PATH_HIGH : f32 = 1.6;
+
+// The hip-to-foot distance of the rig, and the tolerance for placing the foot or reaching it.
+const VERIFY_LEG : f32 = 0.9;
+const VERIFY_LEG_EPS : f32 = 0.0001;
+
+// A grid cell has four orthogonal neighbours, and `-1` marks a cell BFS has not seen.
+const VERIFY_DIRECTIONS : i32 = 4;
+const VERIFY_UNSEEN : i32 = -1;
+
+/** The checks of the example. */
+pub class Verify {
+    /** Runs every stage on a scenario that has already been simulated; `again` is a second run from the same seed. */
+    pub static fn run(c : Checks, s : Scenario, again : Scenario) : void {
+        Verify::map(c, s);
+        Verify::grid(c, s);
+        Verify::smoothing(c, s);
+        Verify::mesh(c, s);
+        Verify::flow(c, s);
+        Verify::dynamic(c, s);
+        Verify::crowd(c, s, again);
+        Verify::walker(c, s);
+        Verify::rig(c, s);
+    }
+
+    static fn map(c : Checks, s : Scenario) : void {
+        let d : Dungeon = s.dungeon();
+        let map : GridMap = d.map();
+        let mut open : i32 = 0;
+        let mut mud : i32 = 0;
+        for (y of 0..map.height()) {
+            for (x of 0..map.width()) {
+                if (map.isWalkable(x, y)) {
+                    open = open + 1;
+                }
+                if (map.costAt(x, y) > 1) {
+                    mud = mud + 1;
+                }
+            }
+        }
+
+        let rooms : i32 = d.roomCount();
+        println("map: ${map.width()} x ${map.height()}, ${rooms} rooms, ${open} open cells, ${mud} of mud");
+        c.that("the generator placed eight rooms", rooms >= 8);
+        c.that("some cells are mud", mud > 0);
+
+        // A flow field from the first room must reach every other one; a corridor may cost more than one.
+        let mut field : FlowField = new FlowField(map);
+        field.rebuildFor(map, d.centerX(0), d.centerY(0));
+        let mut all : bool = true;
+        for (i of 0..rooms) {
+            if (!field.reachable(d.centerX(i), d.centerY(i))) {
+                all = false;
+            }
+        }
+        c.that("every room can be reached from the first one", all);
+    }
+
+    // A copy of the open cells with plain cost 1 and no diagonals, so that breadth-first search is the oracle.
+    static fn plain(map : GridMap) : GridMap {
+        let mut copy : GridMap = new GridMap(map.width(), map.height());
+        for (y of 0..map.height()) {
+            for (x of 0..map.width()) {
+                copy.setBlocked(x, y, !map.isWalkable(x, y));
+            }
+        }
+        return copy;
+    }
+
+    static fn bfs(map : GridMap, sx : i32, sy : i32, gx : i32, gy : i32) : i32 {
+        let w : i32 = map.width();
+        let n : i32 = w * map.height();
+        let mut dist : i32[] = malloc<i32>(n as i64);
+        let mut queue : i32[] = malloc<i32>(n as i64);
+        for (i of 0..n) {
+            dist[i] = VERIFY_UNSEEN;
+        }
+
+        let mut head : i32 = 0;
+        let mut tail : i32 = 1;
+        queue[0] = sy * w + sx;
+        dist[sy * w + sx] = 0;
+        while (head < tail) {
+            let at : i32 = queue[head];
+            head = head + 1;
+            for (k of 0..VERIFY_DIRECTIONS) {
+                let nx : i32 = at % w + GridMap::dirX(k);
+                let ny : i32 = at / w + GridMap::dirY(k);
+                if (map.isWalkable(nx, ny) && dist[ny * w + nx] == VERIFY_UNSEEN) {
+                    dist[ny * w + nx] = dist[at] + 1;
+                    queue[tail] = ny * w + nx;
+                    tail = tail + 1;
+                }
+            }
+        }
+        return dist[gy * w + gx];
+    }
+
+    static fn grid(c : Checks, s : Scenario) : void {
+        let d : Dungeon = s.dungeon();
+        let flat : GridMap = Verify::plain(d.map());
+        let mut finder : GridPathfinder = new GridPathfinder(flat);
+        let mut same : bool = true;
+        let mut pairs : i32 = 0;
+        for (i of 0..d.roomCount()) {
+            for (j of (i + 1)..d.roomCount()) {
+                let p : GridPath = finder.find(flat, d.centerX(i), d.centerY(i), d.centerX(j), d.centerY(j));
+                let steps : i32 = Verify::bfs(flat, d.centerX(i), d.centerY(i), d.centerX(j), d.centerY(j));
+                if (!p.found() || p.cost() != steps * NAV_STEP_ORTHO) {
+                    same = false;
+                }
+                pairs = pairs + 1;
+            }
+        }
+
+        println("a*: ${pairs} room pairs compared with breadth-first search");
+        c.that(
+            "A* finds exactly the breadth-first length between every pair of rooms",
+            same && pairs > VERIFY_MIN_PAIRS
+        );
+    }
+
+    static fn smoothing(c : Checks, s : Scenario) : void {
+        let map : GridMap = s.dungeon().map();
+        let mut found : bool = true;
+        let mut clear : bool = true;
+        let mut shorter : bool = true;
+        let mut rawLen : f32 = 0.0;
+        let mut fineLen : f32 = 0.0;
+        for (i of 0..SCN_AGENTS) {
+            let raw : GridPath = s.rawPath(i);
+            let fine : GridPath = s.smoothPath(i);
+            if (!raw.found() || !fine.found()) {
+                found = false;
+                continue;
+            }
+            rawLen = rawLen + raw.length();
+            fineLen = fineLen + fine.length();
+            if (fine.length() > raw.length() + VERIFY_EPS || fine.len() > raw.len()) {
+                shorter = false;
+            }
+
+            // Every straight segment must actually be in sight, or the smoothing cut a corner through rock.
+            for (k of 1..fine.len()) {
+                if (!GridLine::clear(map, fine.xAt(k - 1), fine.yAt(k - 1), fine.xAt(k), fine.yAt(k), 4)) {
+                    clear = false;
+                }
+            }
+        }
+
+        println("smoothing: ${rawLen} cells of raw paths became ${fineLen}");
+        c.that("every agent has an A* path and a smoothed one", found);
+        c.that("smoothing never lengthens a path or adds corners", shorter);
+        c.that("every segment of a smoothed path is in clear sight", clear);
+        c.that("smoothing removed most corners", fineLen < rawLen);
+    }
+
+    static fn mesh(c : Checks, s : Scenario) : void {
+        let map : GridMap = s.dungeon().map();
+        let mesh : NavMesh = s.navmesh();
+        let mut open : i32 = 0;
+        for (y of 0..map.height()) {
+            for (x of 0..map.width()) {
+                if (map.isWalkable(x, y)) {
+                    open = open + 1;
+                }
+            }
+        }
+
+        let polygons : i32 = mesh.polygonCount();
+        let doorways : i32 = mesh.portalCount() / 2;
+        println("navmesh: ${polygons} polygons cover ${open} cells, ${doorways} doorways");
+        c.that("the mesh has far fewer polygons than the grid has cells", polygons * 3 < open);
+
+        let mut found : bool = true;
+        let mut tight : bool = true;
+        let mut straight : bool = true;
+        for (i of 0..SCN_AGENTS) {
+            let path : NavPath = s.meshPath(i);
+            if (!path.found()) {
+                found = false;
+                continue;
+            }
+            if (path.length() > path.corridorLength() + VERIFY_EPS) {
+                tight = false;
+            }
+            if (!Verify::meshAtLeastStraight(s, i, path)) {
+                straight = false;
+            }
+
+            let grid : GridPath = s.smoothPath(i);
+            println("  agent ${i}: grid ${grid.length()}, mesh funnel ${path.length()},"
+                + " through doorway midpoints ${path.corridorLength()}"
+                + " (${path.polygonsCrossed()} polygons)");
+        }
+
+        c.that("the mesh finds a route for every agent", found);
+        c.that("every funnel path is no longer than the line through the doorway midpoints", tight);
+        c.that("and no shorter than the straight line", straight);
+    }
+
+    // A mesh path can never beat the straight line between the rooms it joins.
+    static fn meshAtLeastStraight(s : Scenario, i : i32, path : NavPath) : bool {
+        let d : Dungeon = s.dungeon();
+        let dx : f32 = ((d.centerX(s.toRoom(i)) - d.centerX(s.fromRoom(i))) as f32);
+        let dy : f32 = ((d.centerY(s.toRoom(i)) - d.centerY(s.fromRoom(i))) as f32);
+        return path.length() + VERIFY_EPS >= (dx * dx + dy * dy).sqrt();
+    }
+
+    static fn flow(c : Checks, s : Scenario) : void {
+        let map : GridMap = s.dungeon().map();
+        let field : FlowField = s.flow();
+        let d : Dungeon = s.dungeon();
+        let a : GridPath = s.rawPath(0);
+        c.sameInt(
+            "the flow field's cost at agent 0's start is the cost of its A* path",
+            field.costAt(d.centerX(s.fromRoom(0)), d.centerY(s.fromRoom(0))) as i64,
+            a.cost() as i64
+        );
+
+        // The field is a table: walking it reproduces a path of the same cost.
+        let mut x : i32 = d.centerX(s.fromRoom(0));
+        let mut y : i32 = d.centerY(s.fromRoom(0));
+        let gx : i32 = d.centerX(s.toRoom(0));
+        let gy : i32 = d.centerY(s.toRoom(0));
+        let mut paid : i32 = 0;
+        let mut guard : i32 = 0;
+        while ((x != gx || y != gy) && guard < VERIFY_FLOW_GUARD) {
+            let dx : i32 = field.stepX(x, y);
+            let dy : i32 = field.stepY(x, y);
+            paid = paid + map.stepCost(x, y, dx, dy);
+            x = x + dx;
+            y = y + dy;
+            guard = guard + 1;
+        }
+
+        c.that("following the field's arrows reaches the goal", x == gx && y == gy);
+        c.sameInt("and pays exactly the A* cost", paid as i64, a.cost() as i64);
+    }
+
+    static fn dynamic(c : Checks, s : Scenario) : void {
+        let map : GridMap = s.dungeon().map();
+        let field : FlowField = s.flow();
+        let a : GridPath = s.rawPath(0);
+        c.that("before any change the flow field is current", !field.isStale(map));
+
+        // Drop a crate across the middle of the route and re-plan around it.
+        let mut finder : GridPathfinder = new GridPathfinder(map);
+        let mid : i32 = 2;
+        let bx : i32 = a.xAt(mid);
+        let by : i32 = a.yAt(mid);
+        map.blockRect(bx, by, VERIFY_CRATE, VERIFY_CRATE);
+        c.that("a 2 x 2 crate on the route makes the flow field stale", field.isStale(map));
+
+        let d : Dungeon = s.dungeon();
+        let detour : GridPath = finder.find(
+            map,
+            d.centerX(s.fromRoom(0)),
+            d.centerY(s.fromRoom(0)),
+            d.centerX(s.toRoom(0)),
+            d.centerY(s.toRoom(0))
+        );
+        let mut clear : bool = true;
+        for (k of 0..detour.len()) {
+            if (detour.xAt(k) >= bx && detour.xAt(k) < bx + VERIFY_CRATE && detour.yAt(k) >= by
+                && detour.yAt(k) < by + VERIFY_CRATE) {
+                clear = false;
+            }
+        }
+        c.that("the new route, if any, keeps clear of the crate", clear);
+        c.that("and costs at least as much as before", !detour.found() || detour.cost() >= a.cost());
+
+        // Removing the crate must bring the original cost and length back.
+        map.unblockRect(bx, by, VERIFY_CRATE, VERIFY_CRATE);
+        let back : GridPath = finder.find(
+            map,
+            d.centerX(s.fromRoom(0)),
+            d.centerY(s.fromRoom(0)),
+            d.centerX(s.toRoom(0)),
+            d.centerY(s.toRoom(0))
+        );
+        c.that(
+            "remove the crate and the original route returns",
+            back.found() && back.cost() == a.cost() && back.len() == a.len()
+        );
+
+        let mut around : string = "none";
+        if (detour.found()) {
+            around = "${detour.cost()}";
+        }
+        println("dynamic obstacle: route cost ${a.cost()} -> ${around} with a crate on it -> ${back.cost()}"
+            + " with it gone");
+    }
+
+    static fn crowd(c : Checks, s : Scenario, again : Scenario) : void {
+        let crowd : Crowd = s.crowd();
+        let steps : i32 = s.stepsRun();
+        let approach : f32 = crowd.closestApproach();
+        println("crowd: ${SCN_AGENTS} agents arrived after ${steps} steps, closest approach ${approach}");
+
+        c.that("every agent reached the end of its path", crowd.allArrived());
+        c.that("within the step budget", steps < VERIFY_STEP_BUDGET);
+        c.that("agents that met head on never stood on top of each other", approach > VERIFY_MIN_APPROACH);
+
+        let mut inside : bool = true;
+        let map : GridMap = s.dungeon().map();
+        for (i of 0..SCN_AGENTS) {
+            let a : SteerAgent = crowd.agent(i);
+            if (!map.isWalkable(a.pos.x as i32, a.pos.y as i32)) {
+                inside = false;
+            }
+        }
+        c.that("and all stand on open cells", inside);
+
+        c.that(
+            "a second run from the same seed takes the same number of steps",
+            again.stepsRun() == steps
+        );
+        c.sameInt(
+            "and ends with every position identical (checksum)",
+            again.crowd().checksum(),
+            crowd.checksum()
+        );
+    }
+
+    static fn walker(c : Checks, s : Scenario) : void {
+        let w : WalkerAgent = s.walker();
+        let covered : f32 = w.distanceCovered();
+        let stride : f32 = covered / WALK_STRIDE;
+        let expected : i32 = (stride * VERIFY_STEPS_PER_CYCLE) as i32;
+        println("walker: root motion carried it ${covered} cells = ${stride} cycles;"
+            + " footsteps left ${w.leftSteps()}, right ${w.rightSteps()}");
+
+        let total : i32 = w.leftSteps() + w.rightSteps();
+        c.that("the walker took footsteps", total > 10);
+
+        let mut gap : i32 = total - expected;
+        if (gap < 0) {
+            gap = -gap;
+        }
+        c.that(
+            "two footstep markers per cycle of the clip, to within the fade in and out",
+            gap <= VERIFY_STEP_SLACK
+        );
+
+        let mut diff : i32 = w.leftSteps() - w.rightSteps();
+        if (diff < 0) {
+            diff = -diff;
+        }
+        c.that("left and right feet alternate", diff <= 1);
+
+        let path : GridPath = s.smoothPath(0);
+        c.that(
+            "it covered about the length of its path",
+            covered > path.length() * VERIFY_PATH_LOW && covered < path.length() * VERIFY_PATH_HIGH
+        );
+        c.that("every footstep mark is on an open cell", Verify::marksOnFloor(s));
+    }
+
+    static fn marksOnFloor(s : Scenario) : bool {
+        let w : WalkerAgent = s.walker();
+        let map : GridMap = s.dungeon().map();
+        for (k of 0..w.markCount()) {
+            if (!map.isWalkable(w.markX(k) as i32, w.markY(k) as i32)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    static fn rig(c : Checks, s : Scenario) : void {
+        let skeleton : Skeleton = s.walker().skeleton();
+        c.that("the bind pose skins every vertex to itself", Verify::bindPoseIsIdentity(skeleton));
+
+        // Plant the right foot on a point the leg can reach, and then on one it cannot.
+        let mut pose : Pose = Pose::bindOf(skeleton);
+        pose.update(skeleton);
+        let reach : Vec3 = Vec3::make(0.2, 0.25, 0.3);
+        let ok : bool = TwoBoneIk::solve(
+            pose,
+            skeleton,
+            BONE_THIGH_R,
+            BONE_SHIN_R,
+            BONE_FOOT_R,
+            reach,
+            false,
+            Vec3::zero()
+        );
+        let foot : Vec3 = pose.modelTransform(skeleton, BONE_FOOT_R).translation;
+        c.that("the IK puts the foot on a reachable point", ok && foot.distance(reach) < VERIFY_EPS);
+
+        let far : Vec3 = Vec3::make(0.15, -3.0, 0.0);
+        let stretched : bool = TwoBoneIk::solve(
+            pose,
+            skeleton,
+            BONE_THIGH_R,
+            BONE_SHIN_R,
+            BONE_FOOT_R,
+            far,
+            false,
+            Vec3::zero()
+        );
+        let hip : Vec3 = pose.modelTransform(skeleton, BONE_THIGH_R).translation;
+        let end : Vec3 = pose.modelTransform(skeleton, BONE_FOOT_R).translation;
+        c.that(
+            "and stretches the leg straight, 0.9 long, towards one it cannot",
+            !stretched && end.distance(hip) > VERIFY_LEG - VERIFY_LEG_EPS
+                && end.distance(hip) < VERIFY_LEG + VERIFY_LEG_EPS
+        );
+    }
+
+    // A pose that has not been posed must skin every bone to itself: unit axes, no translation.
+    static fn bindPoseIsIdentity(skeleton : Skeleton) : bool {
+        let mut pose : Pose = Pose::bindOf(skeleton);
+        pose.update(skeleton);
+        for (b of 0..skeleton.boneCount()) {
+            let m = pose.skinMatrix(b);
+            if (m.m00 < VERIFY_NEAR_UNIT || m.m11 < VERIFY_NEAR_UNIT || m.m22 < VERIFY_NEAR_UNIT
+                || m.m03 > VERIFY_TOL
+                || m.m13 > VERIFY_TOL
+                || m.m23 > VERIFY_TOL
+                || m.m03 < -VERIFY_TOL
+                || m.m13 < -VERIFY_TOL
+                || m.m23 < -VERIFY_TOL) {
+                return false;
+            }
+        }
+        return true;
+    }
+}

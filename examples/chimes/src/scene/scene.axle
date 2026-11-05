@@ -1,0 +1,189 @@
+// scene — the six-second script: a siren flying past the listener, music with a crossfade, and a flurry of bells.
+//
+// The script is driven by frame count alone. The engine renders in chunks of `CHUNK` frames; before each chunk the
+// script starts whatever is due, moves the siren to where it is at the middle of the chunk, and gives the engine
+// its velocity, which is what makes the Doppler shift. Nothing here reads a clock, so two runs are identical.
+
+use ludax::{Vec3, AudioEngine, AudioClip, AudioPlay, AudioEmitter, AudioAttenuation, AudioInterp};
+use ludax::AUDIO_BUS_AMBIENT;
+
+use crate::sounds::kit::{Kit, KIT_RATE};
+
+/** Frames rendered between two script updates. */
+const CHUNK : i32 = 256;
+
+/** Length of the scene in seconds. */
+pub const SCENE_SECONDS : i32 = 6;
+
+/** Speed of the siren, metres per second. */
+pub const SIREN_SPEED : f32 = 40.0;
+
+/** Sideways distance at which the siren passes the listener, metres. */
+pub const SIREN_OFFSET : f32 = 5.0;
+
+/** Most sounds the engine mixes at once in this scene. */
+pub const SCENE_VOICES : i32 = 6;
+
+// The siren starts this far to the listener's left, metres.
+const SIREN_START_X : f32 = -120.0;
+
+// The siren is at full volume inside this distance, metres.
+const SIREN_NEAR : f32 = 5.0;
+
+// And silent beyond this one, metres.
+const SIREN_FAR : f32 = 400.0;
+
+// The second music pad takes over this far into the scene, seconds.
+const MUSIC_SWAP_SECONDS : f32 = 3.0;
+
+// The bell flurry arrives this far in, seconds.
+const BURST_SECONDS : f32 = 4.5;
+
+// How many bells the flurry rings at once.
+const BURST_BELLS : i32 = 8;
+
+// How many notes the tune has.
+const TUNE_LENGTH : i32 = 6;
+
+// The flurry spreads its bells over this many pan positions.
+const BURST_PANS : i32 = 4;
+
+/** What happened during a render, for the checks to look at. */
+pub class SceneStats {
+    /** Sounds cut off to make room. */
+    pub stolen : i32 = 0;
+
+    /** Sounds refused because nothing was less important. */
+    pub refused : i32 = 0;
+
+    /** The most voices in use at any chunk boundary. */
+    pub busiest : i32 = 0;
+
+    /** True if the first music pad had ended by the time the second had been playing a full crossfade. */
+    pub oldGone : bool = false;
+
+    /** True if the second music pad was still playing at the end. */
+    pub newLives : bool = false;
+}
+
+/** The script. */
+pub class ChimeScene {
+    /** Where the siren is `t` seconds in: it flies along x at SIREN_SPEED, starting 120 m to the left of the listener. */
+    pub static fn sirenX(t : f32) : f32 {
+        return SIREN_SPEED * t + SIREN_START_X;
+    }
+
+    // The siren as an emitter at time `t`.
+    static fn sirenEmitter(t : f32) : AudioEmitter {
+        let mut e : AudioEmitter = AudioEmitter {};
+        e.position = Vec3 { x: ChimeScene::sirenX(t), y: 0.0, z: -SIREN_OFFSET };
+        e.velocity = Vec3 { x: SIREN_SPEED, y: 0.0, z: 0.0 };
+        e.minDistance = SIREN_NEAR;
+        e.maxDistance = SIREN_FAR;
+        e.model = AudioAttenuation::Inverse;
+        return e;
+    }
+
+    // The tune: (time in seconds, pentatonic degree) for the single bells.
+    static fn tuneTime(i : i32) : f32 {
+        return match i {
+            0 => 0.5,
+            1 => 1.0,
+            2 => 1.6,
+            3 => 2.1,
+            4 => 2.6,
+            _ => 3.4,
+        };
+    }
+
+    static fn tuneNote(i : i32) : i32 {
+        return match i {
+            0 => 0,
+            1 => 2,
+            2 => 3,
+            3 => 4,
+            4 => 2,
+            _ => 1,
+        };
+    }
+
+    /** Renders the scene as a stereo clip. With `sirenOnly` only the siren plays: the dry signal the Doppler check measures. */
+    pub static fn render(sirenOnly : bool, mut stats : SceneStats) : AudioClip {
+        let mut e : AudioEngine = new AudioEngine(KIT_RATE, SCENE_VOICES);
+        let kit : Kit = Kit::load(e);
+        let total : i32 = SCENE_SECONDS * KIT_RATE;
+        let mut out : AudioClip = new AudioClip(KIT_RATE, 2, total);
+        let mut buf : f32[] = malloc<f32>((CHUNK * 2 + 2) as i64);
+
+        let mut siren : AudioPlay = AudioPlay::forClip(kit.siren);
+        siren.looping = true;
+        siren.spatial = true;
+        siren.priority = 5;
+        siren.bus = AUDIO_BUS_AMBIENT;
+        siren.interp = AudioInterp::Cubic;
+        siren.emitter = ChimeScene::sirenEmitter(0.0);
+        let sirenHandle : i32 = e.play(siren);
+
+        let mut padOne : i32 = -1;
+        let mut padTwo : i32 = -1;
+        if (!sirenOnly) {
+            padOne = e.playMusic(Kit::track(kit.padA), 0.5);
+        }
+        let mut tune : i32 = 0;
+        let mut burst : bool = false;
+        let mut crossed : bool = false;
+
+        let mut at : i32 = 0;
+        while (at < total) {
+            let mut n : i32 = total - at;
+            if (n > CHUNK) {
+                n = CHUNK;
+            }
+            let t : f32 = (at as f32) / (KIT_RATE as f32);
+
+            if (!sirenOnly) {
+                if (!crossed && t >= MUSIC_SWAP_SECONDS) {
+                    crossed = true;
+                    padTwo = e.playMusic(Kit::track(kit.padB), 1.0);
+                }
+                while (tune < TUNE_LENGTH && t >= ChimeScene::tuneTime(tune)) {
+                    let mut p : AudioPlay = AudioPlay::forClip(kit.bell(ChimeScene::tuneNote(tune)));
+                    p.priority = 2;
+                    p.pan = ((tune % 3) as f32 - (1.0 as f32)) * (0.5 as f32);
+                    p.gain = 0.7;
+                    e.play(p);
+                    tune = tune + 1;
+                }
+                if (!burst && t >= BURST_SECONDS) {
+                    burst = true;
+                    // Eight bells in one instant: more than the pool can hold, so the least important are cut off.
+                    for (k of 0..BURST_BELLS) {
+                        let mut p : AudioPlay = AudioPlay::forClip(kit.bell(k));
+                        p.priority = 1 + k / 4;
+                        p.pan = ((k % BURST_PANS) as f32 - (1.5 as f32)) * (0.5 as f32);
+                        p.gain = 0.5;
+                        e.play(p);
+                    }
+                }
+            }
+
+            // The siren at the middle of this chunk.
+            let mid : f32 = t + ((n as f32) * (0.5 as f32)) / (KIT_RATE as f32);
+            e.setEmitter(sirenHandle, ChimeScene::sirenEmitter(mid));
+            e.render(buf, n);
+            for (i of 0..n * 2) {
+                out.samples[(at * 2 + i) as i64] = buf[i as i64];
+            }
+            if (e.activeVoices() > stats.busiest) {
+                stats.busiest = e.activeVoices();
+            }
+            at = at + n;
+        }
+
+        stats.stolen = e.stolenCount();
+        stats.refused = e.refusedCount();
+        stats.oldGone = padTwo > 0 && !e.isPlaying(padOne);
+        stats.newLives = padTwo > 0 && e.isPlaying(padTwo);
+        return out;
+    }
+}

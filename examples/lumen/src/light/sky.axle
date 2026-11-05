@@ -1,0 +1,418 @@
+// sky — the sky of one moment: a radiance map, the sun and the moon as lights, the dome's SH9 and the stars.
+//
+// Ludax's `LightSky` integrates single scattering along a view ray, which is the right answer and too slow to
+// ask once per pixel. So when the time of day changes, the sky's radiance is evaluated over a latitude-
+// longitude grid, in parallel, and every ray afterwards is a bilinear lookup. Blurred copies of the grid
+// stand in for a prefiltered environment: a rough surface reads the blurry one, a mirror the sharp one.
+//
+// The real moon is a million times fainter than the sun, which a camera with a fixed exposure shows as black.
+// Games lift it; here the lift is one named constant (`SKY_MOON_LIFT`) applied to the moon's light, to the
+// moon's scattered sky and to the dome, so the night keeps its physics and only its scale is chosen.
+
+use ludax::{
+    max, Vec2, Vec3, LightSky, LightSource, LightSh9, JobPool, RangeKernel, sin, cos, asin, atan2, saturate,
+    smoothstep, PI, TAU
+};
+
+use crate::world::noise::{lnFbm2, lnUnit, lnFloor, lnValue2};
+
+// The radiance grid and its two blurred levels, in directions: azimuth wraps, elevation is clamped.
+const SKY_W : i32 = 128;
+const SKY_H : i32 = 64;
+const SKY_MID_W : i32 = 32;
+const SKY_MID_H : i32 = 16;
+const SKY_LOW_W : i32 = 8;
+const SKY_LOW_H : i32 = 4;
+
+/** The real moon's share of the sun's light, and the factor games lift it by. */
+const SKY_MOON_RATIO : f32 = 0.0000025;
+const SKY_MOON_LIFT : f32 = 26000.0;
+
+/** Angular radii, in radians, of the discs drawn in the sky (the sun is drawn a little larger than life). */
+const SKY_SUN_RADIUS : f32 = 0.012;
+const SKY_MOON_RADIUS : f32 = 0.017;
+
+/** The roughness below which a surface reads the sharp sky, and below which it reads the middle blur. */
+const SKY_ROUGH_SHARP : f32 = 0.18;
+const SKY_ROUGH_MID : f32 = 0.5;
+
+/** The height of the cloud deck, in cells. */
+const CLOUD_HEIGHT : f32 = 150.0;
+
+/** The height the cloud deck is seen from, whatever the eye's own. */
+const SKY_CLOUD_EYE : f32 = 24.0;
+
+/** Cells per radian of the fine grid the stars are placed on, and the hash level above which a cell holds one. */
+const SKY_STAR_FREQ : f32 = 260.0;
+const SKY_STAR_CHANCE : f32 = 0.9975;
+
+/** Width of the smooth edge of a drawn disc, in cosine units. */
+const SKY_DISC_EDGE : f32 = 0.00002;
+
+/**
+ * Cloud cover in 0..1 at the point (x, z) of the deck at time `t` seconds. The wind carries the pattern about a cell
+ * a second: a deck of clouds drifts, it does not race (it used to move thirty times faster than that, and since the
+ * clock only runs while the camera does, it sped away at every turn of the head).
+ */
+pub fn lumenCloudCover(x : f32, z : f32, t : f32) : f32 {
+    let n : f32 = lnFbm2(
+        x * (0.011 as f32) + t * (0.012 as f32),
+        z * (0.011 as f32) + t * (0.004 as f32),
+        5,
+        301
+    );
+    return smoothstep(0.5, 0.78, n);
+}
+
+/** How far up a ray from height `y` must go to meet the cloud deck, or -1 when it cannot. */
+pub fn lumenCloudDistance(y : f32, dirY : f32) : f32 {
+    if (dirY < (0.02 as f32) || y >= CLOUD_HEIGHT) {
+        return -1.0;
+    }
+    return (CLOUD_HEIGHT - y) / dirY;
+}
+
+/** Fills the radiance grid, one row of directions per job. */
+pub class SkyKernel : RangeKernel {
+    /** The radiance grid, three interleaved channels per direction. */
+    pub lut : f32[];
+
+    day   : LightSky;
+    night : LightSky;
+
+    /** A kernel with an empty grid. */
+    constructor() {
+        self.lut = malloc<f32>((SKY_W as i64) * SKY_H * 3);
+        self.day = LightSky::atDayTime(0.5, 0.2);
+        self.night = new LightSky(Vec3::unitY(), 2.0, 0.25);
+    }
+
+    /** Points the kernel at the sky of `dayTime`. */
+    pub fn configure(mut self, dayTime : f64, tilt : f32) : void {
+        self.day = LightSky::atDayTime(dayTime, tilt);
+        self.night = new LightSky(self.day.moonDirection(), 2.0, 0.25);
+    }
+
+    /** Evaluates rows `begin` up to `end` of the grid. */
+    pub fn runRange(mut self, begin : i32, end : i32) : void {
+        let tint : Vec3 = Vec3 { x: 0.8, y: 0.9, z: 1.15 };
+        for (row of begin..end) {
+            let elev : f32 = (((row as f32) + (0.5 as f32)) / (SKY_H as f32) - (0.5 as f32)) * PI;
+            for (col of 0..SKY_W) {
+                let az : f32 = (((col as f32) + (0.5 as f32)) / (SKY_W as f32)) * TAU;
+                let dir : Vec3 = lumenSkyDirection(az, elev);
+                let by_day : Vec3 = self.day.skyRadiance(dir);
+                let by_moon : Vec3 = self.night
+                    .skyRadiance(dir)
+                    .times(tint)
+                    .scale(SKY_MOON_RATIO * (SKY_MOON_LIFT - (1.0 as f32)));
+                let c : Vec3 = by_day.plus(by_moon);
+                let at : i64 = ((row * SKY_W + col) * 3) as i64;
+                self.lut[at] = c.x;
+                self.lut[at + 1] = c.y;
+                self.lut[at + 2] = c.z;
+            }
+        }
+    }
+}
+
+/** The unit direction at azimuth `az` (0..tau, from +z toward +x) and elevation `elev` (-pi/2..pi/2). */
+pub fn lumenSkyDirection(az : f32, elev : f32) : Vec3 {
+    let ce : f32 = cos(elev);
+    return Vec3 { x: sin(az) * ce, y: sin(elev), z: cos(az) * ce };
+}
+
+/** The sky at one moment of the day. */
+pub class LumenSky {
+    kernel : SkyKernel;
+    pool   : JobPool;
+    mid    : f32[];
+    low    : f32[];
+    real   : LightSky;
+
+    /** The sun as a light, lifted nothing. */
+    pub sun : LightSource;
+
+    /** The moon as a light, lifted by `SKY_MOON_LIFT`. */
+    pub moon : LightSource;
+
+    /** Unit direction toward the sun. */
+    pub sunDir : Vec3;
+
+    /** Unit direction toward the moon. */
+    pub moonDir : Vec3;
+
+    /** The sun's irradiance at the ground. */
+    pub sunIrr : Vec3;
+
+    /** The moon's irradiance, lifted by `SKY_MOON_LIFT`. */
+    pub moonIrr : Vec3;
+
+    /** The sky dome as nine spherical-harmonic bands, for ambient light. */
+    pub dome : LightSh9;
+
+    /** Time of day this sky was computed for, 0..1. */
+    pub dayTime : f64;
+
+    /** How much of the night sky is showing: 0 day, 1 night. */
+    pub night : f32;
+
+    /** Animation time, for the twinkle and the cloud drift. */
+    pub time : f32;
+
+    /** A sky computed by `workers` threads (at least 1), set to noon. */
+    constructor(workers : i32) {
+        self.kernel = new SkyKernel();
+        self.pool = new JobPool(workers, self.kernel);
+        self.mid = malloc<f32>((SKY_MID_W as i64) * SKY_MID_H * 3);
+        self.low = malloc<f32>((SKY_LOW_W as i64) * SKY_LOW_H * 3);
+        self.real = LightSky::atDayTime(0.5, 0.2);
+        self.sun = self.real.sunLight();
+        self.moon = self.real.moonLight();
+        self.sunDir = self.real.sunDirection();
+        self.moonDir = self.real.moonDirection();
+        self.sunIrr = self.real.sunIrradiance();
+        self.moonIrr = self.real.moonIrradiance();
+        self.dome = LightSh9::zero();
+        self.dayTime = 0.5;
+        self.night = 0.0;
+        self.time = 0.0;
+        self.set(0.5);
+    }
+
+    /** Stops the worker threads. */
+    pub fn close(mut self) : void {
+        self.pool.shutdown();
+    }
+
+    /** Recomputes everything for time of day `dayTime` in 0..1 (0.25 sunrise, 0.5 noon, 0.75 sunset). */
+    pub fn set(mut self, dayTime : f64) : void {
+        self.dayTime = dayTime;
+        let tilt : f32 = 0.25;
+        self.kernel.configure(dayTime, tilt);
+        self.real = LightSky::atDayTime(dayTime, tilt);
+        if (!self.pool.run(SKY_H, 2)) {
+            self.kernel.runRange(0, SKY_H);
+        }
+        self.blur(self.kernel.lut, SKY_W, SKY_H, self.mid, SKY_MID_W, SKY_MID_H);
+        self.blur(self.kernel.lut, SKY_W, SKY_H, self.low, SKY_LOW_W, SKY_LOW_H);
+        self.sunDir = self.real.sunDirection();
+        self.moonDir = self.real.moonDirection();
+        self.sunIrr = self.real.sunIrradiance();
+        self.moonIrr = self.real.moonIrradiance().scale(SKY_MOON_LIFT);
+        self.sun = self.real.sunLight();
+        self.moon = self.real.moonLight();
+        self.moon.intensity = self.moon.intensity * SKY_MOON_LIFT;
+        let nightSky : LightSky = new LightSky(self.moonDir, 2.0, 0.25);
+        let moonDome : LightSh9 = nightSky
+            .ambient(12)
+            .scaled(SKY_MOON_RATIO * (SKY_MOON_LIFT - (1.0 as f32)));
+        self.dome = self.real.ambient(12).plus(moonDome);
+        self.night = saturate((0.12 as f32) - self.sunDir.y * (4.0 as f32));
+    }
+
+    // Box-downsamples the grid `src` to `dw` x `dh` in `dst`: wrapping in azimuth, clamped in elevation.
+    fn blur(self, src : f32[], sw : i32, sh : i32, dst : f32[], dw : i32, dh : i32) : void {
+        let bx : i32 = sw / dw;
+        let by : i32 = sh / dh;
+        for (j of 0..dh) {
+            for (i of 0..dw) {
+                let mut r : f32 = 0.0;
+                let mut g : f32 = 0.0;
+                let mut b : f32 = 0.0;
+                for (v of 0..by) {
+                    for (u of 0..bx) {
+                        let at : i64 = (((j * by + v) * sw + i * bx + u) * 3) as i64;
+                        r = r + src[at];
+                        g = g + src[at + 1];
+                        b = b + src[at + 2];
+                    }
+                }
+                let k : f32 = (1.0 as f32) / ((bx * by) as f32);
+                let o : i64 = ((j * dw + i) * 3) as i64;
+                dst[o] = r * k;
+                dst[o + 1] = g * k;
+                dst[o + 2] = b * k;
+            }
+        }
+    }
+
+    // The place of `dir` on the radiance grid as (u, v) in 0..1: azimuth around, elevation up. Two inverse
+    // trigonometric calls, so a lookup that reads several levels works this out once.
+    fn gridPlace(self, dir : Vec3) : Vec2 {
+        let mut az : f32 = atan2(dir.x, dir.z);
+        if (az < 0.0) {
+            az = az + TAU;
+        }
+        let el : f32 = asin(saturate((dir.y + (1.0 as f32)) * (0.5 as f32)) * (2.0 as f32) - (1.0 as f32));
+        return Vec2 { x: az / TAU, y: el / PI + (0.5 as f32) };
+    }
+
+    // Bilinear lookup in a grid of w x h cells at the place (u, v).
+    fn look(self, grid : f32[], w : i32, h : i32, place : Vec2) : Vec3 {
+        let fx : f32 = place.x * (w as f32) - (0.5 as f32);
+        let mut fy : f32 = place.y * (h as f32) - (0.5 as f32);
+        if (fy < 0.0) {
+            fy = 0.0;
+        }
+        if (fy > (h - 1) as f32) {
+            fy = (h - 1) as f32;
+        }
+        let x0 : i32 = lnFloor(fx);
+        let y0 : i32 = lnFloor(fy);
+        let tx : f32 = fx - x0 as f32;
+        let ty : f32 = fy - y0 as f32;
+        let xa : i32 = (x0 + w) % w;
+        let xb : i32 = (x0 + 1 + w) % w;
+        let mut y1 : i32 = y0 + 1;
+        if (y1 >= h) {
+            y1 = h - 1;
+        }
+        let a : Vec3 = self.texel(grid, w, xa, y0).lerp(self.texel(grid, w, xb, y0), tx);
+        let b : Vec3 = self.texel(grid, w, xa, y1).lerp(self.texel(grid, w, xb, y1), tx);
+        return a.lerp(b, ty);
+    }
+
+    fn texel(self, grid : f32[], w : i32, x : i32, y : i32) : Vec3 {
+        let at : i64 = ((y * w + x) * 3) as i64;
+        return Vec3 { x: grid[at], y: grid[at + 1], z: grid[at + 2] };
+    }
+
+    /** The radiance of the sky towards `dir` without sun, moon, stars or clouds (the grid itself). */
+    pub fn base(self, dir : Vec3) : Vec3 {
+        return self.look(self.kernel.lut, SKY_W, SKY_H, self.gridPlace(dir));
+    }
+
+    /** The environment's radiance along `dir` as a surface of perceptual `roughness` reflects it. */
+    pub fn prefiltered(self, dir : Vec3, roughness : f32) : Vec3 {
+        let place : Vec2 = self.gridPlace(dir);
+        let sharp : Vec3 = self.look(self.kernel.lut, SKY_W, SKY_H, place);
+        if (roughness < SKY_ROUGH_SHARP) {
+            return sharp;
+        }
+        let mid : Vec3 = self.look(self.mid, SKY_MID_W, SKY_MID_H, place);
+        if (roughness < SKY_ROUGH_MID) {
+            return sharp.lerp(mid, (roughness - SKY_ROUGH_SHARP) / (SKY_ROUGH_MID - SKY_ROUGH_SHARP));
+        }
+        let low : Vec3 = self.look(self.low, SKY_LOW_W, SKY_LOW_H, place);
+        return mid.lerp(low, saturate((roughness - SKY_ROUGH_MID) / SKY_ROUGH_MID));
+    }
+
+    /**
+     * What an eye over (`eyeX`, `eyeZ`) sees along `dir` in the sky: the radiance map, the two discs, the stars and
+     * the cloud deck; and, below the horizon, the ground beyond the world's edge.
+     */
+    pub fn view(self, dir : Vec3, eyeX : f32, eyeZ : f32) : Vec3 {
+        let mut c : Vec3 = self.base(dir);
+        if (dir.y < 0.0) {
+            c = self.ground(dir);
+        }
+        let sunCos : f32 = dir.dot(self.sunDir);
+        let sunLimit : f32 = cos(SKY_SUN_RADIUS);
+        if (sunCos > sunLimit) {
+            let s : f32 = sin(SKY_SUN_RADIUS);
+            let edge : f32 = smoothstep(sunLimit, sunLimit + SKY_DISC_EDGE, sunCos);
+            c = c.plus(self.sunIrr.scale(edge / (PI * s * s)));
+        }
+        let moonCos : f32 = dir.dot(self.moonDir);
+        let moonLimit : f32 = cos(SKY_MOON_RADIUS);
+        if (moonCos > moonLimit) {
+            c = c.plus(self.moonDisc(dir));
+        }
+        if (self.night > 0.0 && dir.y > 0.0) {
+            c = c.plus(self.stars(dir).scale(self.night));
+        }
+        // The deck is seen from a fixed height, not the eye's: flying up must not bring the clouds closer and make
+        // them sweep faster, as a plane much farther than the world would not.
+        let reach : f32 = lumenCloudDistance(SKY_CLOUD_EYE, dir.y);
+        if (reach > 0.0) {
+            let px : f32 = eyeX + dir.x * reach;
+            let pz : f32 = eyeZ + dir.z * reach;
+            let cover : f32 = lumenCloudCover(px, pz, self.time);
+            if (cover > 0.0) {
+                c = self.cloud(c, dir, px, pz, cover);
+            }
+        }
+        return c;
+    }
+
+    /**
+     * The colour of the air along `dir`, what a distant surface dissolves into. It is the sky near the horizon in
+     * that direction, except around the sun, where the sky is the sun's own glare: there the air takes the dome's
+     * smooth ambient colour instead, so a mountain between you and the sun is hazed, not lit up by a sun it hides.
+     */
+    pub fn haze(self, dir : Vec3) : Vec3 {
+        let flat : Vec3 = Vec3 { x: dir.x, y: dir.y * (0.25 as f32) + (0.05 as f32), z: dir.z }.normalized();
+        let sky : Vec3 = self.base(flat);
+        let near : f32 = saturate((flat.dot(self.sunDir) - (0.55 as f32)) / (0.4 as f32));
+        if (near <= 0.0) {
+            return sky;
+        }
+        return sky.lerp(self.dome.irradiance(flat).scale((0.9 as f32)), near);
+    }
+
+    // The ground below the horizon, past the rim of the valley: a dim earth lit by the sun and the dome, fading
+    // into the horizon's own colour within a few degrees. The radiance map below the horizon holds the sky mirrored
+    // (which carries the sun's glare), and drawn there it puts a halo of the sun under the horizon, where no ray
+    // can reach.
+    fn ground(self, dir : Vec3) : Vec3 {
+        let horizon : Vec3 = self.base(Vec3 { x: dir.x, y: 0.02, z: dir.z }.normalized());
+        let lit : Vec3 = self.sunIrr
+            .scale(max(self.sunDir.y, 0.0) / PI)
+            .plus(self.moonIrr.scale(max(self.moonDir.y, 0.0) / PI))
+            .plus(self.dome.irradiance(Vec3::unitY()));
+        let earth : Vec3 = Vec3 { x: 0.13, y: 0.15, z: 0.1 }.times(lit);
+        return horizon.lerp(earth, saturate(-dir.y * (14.0 as f32)));
+    }
+
+    // A full moon with a few dark seas: the disc is darkened where low-frequency noise is high.
+    fn moonDisc(self, dir : Vec3) : Vec3 {
+        let s : f32 = sin(SKY_MOON_RADIUS);
+        let t1 : Vec3 = self.moonDir.anyPerpendicular().normalized();
+        let t2 : Vec3 = self.moonDir.cross(t1);
+        let a : f32 = dir.dot(t1) / SKY_MOON_RADIUS;
+        let b : f32 = dir.dot(t2) / SKY_MOON_RADIUS;
+        let sea : f32 = lnValue2(a * (2.6 as f32) + (9.0 as f32), b * (2.6 as f32) + (4.0 as f32), 311);
+        let crater : f32 = lnValue2(a * (9.0 as f32) + (2.0 as f32), b * (9.0 as f32), 313);
+        let shade : f32 = (1.0 as f32) - (0.55 as f32) * smoothstep(0.45, 0.7, sea) - (0.18 as f32) * crater;
+        return self.moonIrr.scale(shade / (PI * s * s));
+    }
+
+    // Points of light: one cell of a fine direction grid in a few hundred holds a star.
+    fn stars(self, dir : Vec3) : Vec3 {
+        let cx : i32 = lnFloor(dir.x * SKY_STAR_FREQ);
+        let cy : i32 = lnFloor(dir.y * SKY_STAR_FREQ);
+        let cz : i32 = lnFloor(dir.z * SKY_STAR_FREQ);
+        let h : f32 = lnUnit(cx, cy, cz, 331);
+        if (h < SKY_STAR_CHANCE) {
+            return Vec3::zero();
+        }
+        let k : f32 = (h - SKY_STAR_CHANCE) / ((1.0 as f32) - SKY_STAR_CHANCE);
+        let warm : f32 = lnUnit(cx, cy, cz, 332);
+        let twinkle : f32 = (0.75 as f32)
+            + (0.25 as f32) * sin(self.time * (3.0 as f32) + warm * (40.0 as f32));
+        let tint : Vec3 = Vec3 { x: 0.8, y: 0.9, z: 1.2 }.lerp(Vec3 { x: 1.2, y: 0.95, z: 0.7 }, warm);
+        return tint.scale(k * k * twinkle * (0.9 as f32));
+    }
+
+    // Shades the cloud deck seen along `dir` and blends it over the sky behind it. The deck is lit from the
+    // sun's side: thickness toward the sun darkens it, an edge facing the sun glows (a silver lining).
+    fn cloud(self, behind : Vec3, dir : Vec3, px : f32, pz : f32, cover : f32) : Vec3 {
+        let toward : f32 = lumenCloudCover(
+            px + self.sunDir.x * (14.0 as f32),
+            pz + self.sunDir.z * (14.0 as f32),
+            self.time
+        );
+        let thick : f32 = saturate(toward - cover + (0.55 as f32));
+        let sunLit : Vec3 = self.sunIrr
+            .scale(saturate(self.sunDir.y * (3.0 as f32)) / PI)
+            .scale((0.25 as f32) + (0.9 as f32) * ((1.0 as f32) - thick));
+        let moonLit : Vec3 = self.moonIrr
+            .scale(saturate(self.moonDir.y * (3.0 as f32)) / PI)
+            .scale((0.5 as f32));
+        let sky : Vec3 = self.base(Vec3::unitY()).scale((1.1 as f32));
+        let lit : Vec3 = sunLit.plus(moonLit).plus(sky).times(Vec3 { x: 0.97, y: 0.97, z: 1.0 });
+        let fade : f32 = saturate(dir.y * (6.0 as f32));
+        return behind.lerp(lit, cover * fade * (0.92 as f32));
+    }
+}

@@ -1,0 +1,142 @@
+// bot — a scripted pilot for the `--smoke` run.
+//
+// It reads the world the way a player reads the screen and answers with the same four buttons: turn towards
+// the nearest threat, fire when lined up, thrust to close in or to get away, and detour for a power-up when
+// nothing is close. It also presses Enter on the title and game-over screens. It is a pure function of the
+// world, so the run it plays is as reproducible as the simulation itself.
+
+use ludax::{EntityId, atan2, sqrt, wrapAngle, PI};
+
+use crate::app::controls::Command;
+use crate::app::game::{Game, Mode};
+use crate::core::config::{OVER_DELAY_TICKS, FIELD_W, FIELD_H, HALF};
+use crate::core::types::{Entity, Input, Kind};
+use crate::sim::ship::Ship;
+use crate::sim::world::World;
+
+/** Angle within which the bot fires, in radians. */
+const AIM_TOLERANCE : f32 = 0.18;
+
+/** Angle under which the bot stops turning. */
+const TURN_DEADBAND : f32 = 0.06;
+
+/** Distance under which a threat makes the bot flee instead of attack. */
+const DANGER : f32 = 120.0;
+
+/** Distance within which a power-up is worth a detour. */
+const DETOUR : f32 = 320.0;
+
+/** Ticks the bot lets the title and game-over screens sit before pressing Enter. */
+const MENU_WAIT : i64 = 40;
+
+/** Angle within which the bot keeps thrusting while it flees. */
+const FLEE_CONE : f32 = 0.5;
+
+/** Multiple of `DANGER` beyond which the bot closes in while firing. */
+const ENGAGE_FACTOR : f32 = 2.0;
+
+/** A distance farther than any in the field, used as "nothing found". */
+const BOT_FAR : f32 = 1000000.0;
+
+/** The scripted pilot. */
+pub class Bot {
+    /** The key press the bot makes this tick, if any. */
+    pub static fn command(g : Game) : Command {
+        return match g.mode {
+            Mode::Title => Bot::afterWait(g.uiTicks > MENU_WAIT),
+            Mode::Over => Bot::afterWait(g.world.overTimer > OVER_DELAY_TICKS + (MENU_WAIT as i32)),
+            _ => Command::None,
+        };
+    }
+
+    static fn afterWait(ready : bool) : Command {
+        if (ready) {
+            return Command::Confirm;
+        }
+        return Command::None;
+    }
+
+    /** The ship controls the bot holds this tick. */
+    pub static fn decide(g : Game) : Input {
+        let w : World = g.world;
+        let s : Ship = w.ship;
+        if (!s.alive) {
+            return Input {};
+        }
+        let threat : EntityId = Bot::nearest(w, false);
+        let prize : EntityId = Bot::nearest(w, true);
+
+        if (!threat.isNone() && Bot::distance(s, w.entities.get(threat)) < DANGER) {
+            return Bot::flee(s, w.entities.get(threat));
+        }
+        if (!prize.isNone() && Bot::distance(s, w.entities.get(prize)) < DETOUR) {
+            return Bot::approach(s, w.entities.get(prize), false);
+        }
+        if (threat.isNone()) {
+            return Bot::wander(s);
+        }
+        return Bot::approach(s, w.entities.get(threat), true);
+    }
+
+    // The closest hostile entity (or the closest pick-up when `prizes`), or the none id.
+    static fn nearest(w : World, prizes : bool) : EntityId {
+        let mut best : EntityId = EntityId::none();
+        let mut bestD : f32 = BOT_FAR;
+        for (slot of 0..w.entities.slotCount()) {
+            if (w.entities.isLiveAt(slot)) {
+                let e : Entity = w.entities.valueAt(slot);
+                if ((e.kind == Kind::Pickup) == prizes) {
+                    let d : f32 = Bot::distance(w.ship, e);
+                    if (d < bestD) {
+                        bestD = d;
+                        best = w.entities.idAt(slot);
+                    }
+                }
+            }
+        }
+        return best;
+    }
+
+    static fn distance(s : Ship, e : Entity) : f32 {
+        let dx : f32 = e.x - s.x;
+        let dy : f32 = e.y - s.y;
+        return sqrt(dx * dx + dy * dy);
+    }
+
+    // How far the ship must turn, in radians, to point at (`x`, `y`).
+    static fn error(s : Ship, x : f32, y : f32) : f32 {
+        return wrapAngle(atan2(y - s.y, x - s.x) - s.angle);
+    }
+
+    // Turns by the sign of `err` unless it is already close.
+    static fn steer(err : f32, thrust : bool, fire : bool) : Input {
+        return Input {
+            left: err < -TURN_DEADBAND,
+            right: err > TURN_DEADBAND,
+            thrust: thrust,
+            fire: fire,
+        };
+    }
+
+    // Aim at the target; shoot when lined up; drift in only while the target is far.
+    static fn approach(s : Ship, e : Entity, shoot : bool) : Input {
+        let err : f32 = Bot::error(s, e.x, e.y);
+        let lined : bool = err < AIM_TOLERANCE && err > -AIM_TOLERANCE;
+        let far : bool = Bot::distance(s, e) > DANGER * ENGAGE_FACTOR;
+        return Bot::steer(err, lined && (far || !shoot), shoot && lined);
+    }
+
+    // Turn tail and run, firing back when the target happens to be in the sights.
+    static fn flee(s : Ship, e : Entity) : Input {
+        let away : f32 = wrapAngle(Bot::error(s, e.x, e.y) + PI);
+        let toward : f32 = Bot::error(s, e.x, e.y);
+        let lined : bool = toward < AIM_TOLERANCE && toward > -AIM_TOLERANCE;
+        return Bot::steer(away, away < FLEE_CONE && away > -FLEE_CONE, lined);
+    }
+
+    // With nothing to do, drift back towards the middle of the field.
+    static fn wander(s : Ship) : Input {
+        let err : f32 = Bot::error(s, FIELD_W * HALF, FIELD_H * HALF);
+        return Bot::steer(err, false, false);
+    }
+}

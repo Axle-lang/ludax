@@ -1,0 +1,338 @@
+// window — the interactive front end: fly through the valley and watch the picture converge.
+//
+// Click the window to capture the mouse (the pointer is hidden and pinned, so you can turn as far as you like);
+// Escape releases it, and Escape again quits. Keys follow the usual games: WASD move, Space rises, Shift sneaks
+// down, Ctrl sprints.
+//
+// While you move, turn or change the time, every frame is a quick preview. Stop, and each frame adds one
+// sample per pixel to the picture: soft shadows, the traced bounce and the light shafts settle over a second
+// or two and the renderer rests at the sample limit. The animation clock (water, lava, clouds, flames) runs
+// only while you are moving, so a still picture is also a frozen, converging one.
+
+use ludax::JobPool;
+use smalt::{
+    Platform, PlatformError, WindowDesc, Clock, Events, Event, EventKind, Scancode, Surface, Bmp, BitmapFont,
+    Face, Frame, FramePacer
+};
+
+use crate::app::headless::LumenHeadless;
+use crate::app::options::Options;
+use crate::app::session::LumenSession;
+use crate::render::settings::{LumenSettings, LumenView, lumenViewNext, lumenViewName};
+use crate::world::worldgen::WORLD_XZ;
+
+// Walking and sprinting speed in cells a second, and the radians of turn a mouse pixel buys.
+const WALK : f32 = 22.0;
+const SPRINT : f32 = 110.0;
+const TURN : f32 = 0.0032;
+
+// Time of day a second of Q/E, and how much of that the automatic clock advances.
+const DAY_RATE : f64 = 0.05;
+const AUTO_DAY_RATE : f64 = 0.4;
+
+// The ceiling the fly camera may reach, just under the world's own.
+const FLY_TOP : f32 = 62.0;
+
+const FRAME_RATE : i32 = 60;
+const WINDOW_W : i32 = 640;
+const WINDOW_H : i32 = 360;
+const WINDOW_SCALE : i32 = 2;
+
+// The overlay: white ink with a one-pixel black shadow, legible on any picture.
+const INK : i32 = 16777215;
+const SHADOW_INK : i32 = 0;
+const OVERLAY_X : i32 = 10;
+const OVERLAY_Y : i32 = 20;
+const OVERLAY_LEADING : i32 = 20;
+const OVERLAY_SHADOW : i32 = 1;
+
+// How quickly the displayed frame rate follows the measured one.
+const FPS_EASE : f32 = 0.1;
+
+// Minutes in a day, for the clock the overlay shows.
+const MINUTES_PER_DAY : f64 = 1440.0;
+const MINUTES_PER_HOUR : i32 = 60;
+
+// What the window's keys and mouse have switched on. It is a class because the event handler and the frame
+// loop must see the same state; the session owns everything about the picture.
+class LumenUi {
+    /** False once the window has asked to close. */
+    pub running : bool = true;
+
+    /** True while the pointer is captured for mouse look. */
+    pub captured : bool = false;
+
+    /** True while the camera's vertical axis is inverted. */
+    pub inverted : bool = false;
+
+    /** True while the heads-up display is drawn. */
+    pub hud : bool = true;
+
+    /** True while the day cycle advances on its own. */
+    pub autoDay : bool = false;
+}
+
+/** The window. */
+pub class LumenApp {
+    /** Runs the window until it is closed. */
+    pub static fn run(o : Options) : i32 {
+        try {
+            return LumenApp::play(o);
+        } catch e : PlatformError {
+            println(e.message);
+            return 1;
+        }
+    }
+
+    static fn play(o : Options) : i32 ! PlatformError {
+        let mut w : i32 = o.width;
+        let mut h : i32 = o.height;
+        let mut scale : i32 = o.scale;
+        if (w == 0) {
+            w = WINDOW_W;
+            h = WINDOW_H;
+            if (scale < WINDOW_SCALE) {
+                scale = WINDOW_SCALE;
+            }
+        }
+        let mut workers : i32 = o.threads;
+        if (workers < 1) {
+            workers = JobPool::defaultWorkers();
+        }
+        let mut session : LumenSession = new LumenSession(workers, w, h, scale);
+        session.goTo(LumenSession::shot(o.shot));
+        if (o.time >= 0.0) {
+            session.setDay(o.time);
+        }
+        session.env.settings.view = LumenHeadless::view(o.view);
+
+        let platform = new Platform();
+        defer platform.close();
+        let win = platform.open(WindowDesc { title: "Lumen", w: session.outW, h: session.outH });
+        defer win.close();
+        let clock = new Clock();
+        defer clock.close();
+        let events = new Events();
+        defer events.close();
+        let screen = new Surface(session.outW, session.outH);
+        defer screen.close();
+        let font : BitmapFont = BitmapFont::baked(Face::Ui);
+        let pacer = new FramePacer(FRAME_RATE);
+
+        let mut ui : LumenUi = new LumenUi();
+        let mut animation : f32 = 0.0;
+        let mut fps : f32 = 0.0;
+        while (ui.running && win.isOpen()) {
+            let dt : f32 = pacer.tick(clock) as f32;
+            events.pump(win, clock);
+            while (events.hasNext()) {
+                LumenApp::handleEvent(ui, events.next(), session, events, screen);
+            }
+            if (ui.captured) {
+                let flip : f32 = LumenApp::turnSign(ui.inverted);
+                session.cam.yaw = session.cam.yaw + (events.mouseDX() as f32) * TURN;
+                session.cam.pitch = session.cam.pitch - (events.mouseDY() as f32) * TURN * flip;
+            }
+            LumenApp::fly(session, events, dt);
+            let mut moved : bool = session.dirty;
+            let dayStep : f64 = DAY_RATE * (dt as f64);
+            if (events.isKeyDown(Scancode::Q)) {
+                session.setDay(session.day - dayStep);
+                moved = true;
+            }
+            if (events.isKeyDown(Scancode::E)) {
+                session.setDay(session.day + dayStep);
+                moved = true;
+            }
+            if (ui.autoDay) {
+                session.setDay(session.day + dayStep * AUTO_DAY_RATE);
+                moved = true;
+            }
+            if (!session.cam.same(session.frame.cam)) {
+                moved = true;
+            }
+            if (moved) {
+                animation = animation + dt;
+                session.env.setTime(animation);
+            }
+            if (!win.minimised()) {
+                if (session.pass()) {
+                    session.show(screen.pixels(), dt, false);
+                    if (dt > 0.0) {
+                        fps = fps + ((1.0 as f32) / dt - fps) * FPS_EASE;
+                    }
+                    if (ui.hud) {
+                        LumenApp::overlay(screen.frame(), font, session, fps);
+                    }
+                    screen.present(win);
+                }
+            }
+        }
+        session.close();
+        return 0;
+    }
+
+    // One event: quitting, mouse capture, the view keys and the one-key toggles.
+    static fn handleEvent(
+        mut ui : LumenUi,
+        e : Event,
+        session : LumenSession,
+        events : Events,
+        screen : Surface
+    ) : void {
+        if (e.kind == EventKind::Quit) {
+            ui.running = false;
+            return;
+        }
+        if (e.kind == EventKind::MouseButtonDown && !ui.captured) {
+            ui.captured = true;
+            events.setRelativeMouse(true);
+            return;
+        }
+        if (e.kind != EventKind::KeyDown || e.repeat) {
+            return;
+        }
+
+        if (e.scancode == Scancode::Escape) {
+            if (ui.captured) {
+                ui.captured = false;
+                events.setRelativeMouse(false);
+            } else {
+                ui.running = false;
+            }
+        } else if (e.scancode == Scancode::I) {
+            ui.inverted = !ui.inverted;
+        } else if (e.scancode == Scancode::T) {
+            ui.autoDay = !ui.autoDay;
+        } else if (e.scancode == Scancode::H) {
+            ui.hud = !ui.hud;
+        } else if (e.scancode == Scancode::F12) {
+            if (Bmp::write("lumen.bmp", screen.frame())) {
+                println("wrote lumen.bmp");
+            }
+        } else {
+            LumenApp::toggle(session, e.scancode);
+        }
+    }
+
+    // Movement keys: WASD along the view's horizontal heading, Space and Ctrl for height, Shift to sprint.
+    static fn fly(mut session : LumenSession, events : Events, dt : f32) : void {
+        let mut speed : f32 = WALK;
+        if (events.isKeyDown(Scancode::LeftControl)) {
+            speed = SPRINT;
+        }
+        let step : f32 = speed * dt;
+        let sy : f32 = ludax::sin(session.cam.yaw);
+        let cy : f32 = ludax::cos(session.cam.yaw);
+        let mut dx : f32 = 0.0;
+        let mut dz : f32 = 0.0;
+        if (events.isKeyDown(Scancode::W)) {
+            dx = dx + sy;
+            dz = dz - cy;
+        }
+        if (events.isKeyDown(Scancode::S)) {
+            dx = dx - sy;
+            dz = dz + cy;
+        }
+        if (events.isKeyDown(Scancode::D)) {
+            dx = dx + cy;
+            dz = dz + sy;
+        }
+        if (events.isKeyDown(Scancode::A)) {
+            dx = dx - cy;
+            dz = dz - sy;
+        }
+        session.cam.x = session.cam.x + dx * step;
+        session.cam.z = session.cam.z + dz * step;
+        if (events.isKeyDown(Scancode::Space)) {
+            session.cam.y = session.cam.y + step;
+        }
+        if (events.isKeyDown(Scancode::LeftShift)) {
+            session.cam.y = session.cam.y - step;
+        }
+        session.cam.keepInside(WORLD_XZ as f32, FLY_TOP);
+    }
+
+    // The vertical turn: 1 as usual, -1 when inverted.
+    static fn turnSign(on : bool) : f32 {
+        if (on) {
+            return -1.0;
+        }
+        return 1.0;
+    }
+
+    // The one-key toggles and viewpoints.
+    static fn toggle(mut session : LumenSession, key : Scancode) : void {
+        let mut s : LumenSettings = session.env.settings;
+        if (key == Scancode::Num1) {
+            session.goTo(LumenSession::shot(1));
+        } else if (key == Scancode::Num2) {
+            session.goTo(LumenSession::shot(2));
+        } else if (key == Scancode::Num3) {
+            session.goTo(LumenSession::shot(3));
+        } else if (key == Scancode::Num4) {
+            session.goTo(LumenSession::shot(4));
+        } else if (key == Scancode::V) {
+            s.view = lumenViewNext(s.view);
+        } else if (key == Scancode::B) {
+            s.bounce = !s.bounce;
+        } else if (key == Scancode::L) {
+            s.lamps = !s.lamps;
+        } else if (key == Scancode::G) {
+            s.godRays = !s.godRays;
+        } else if (key == Scancode::F) {
+            if (s.fog > 0.0) {
+                s.fog = 0.0;
+            } else {
+                s.fog = 1.0;
+            }
+        } else if (key == Scancode::O) {
+            if (s.bloom > 0.0) {
+                s.bloom = 0.0;
+            } else {
+                s.bloom = 0.55;
+            }
+        } else if (key == Scancode::X) {
+            s.autoExposure = !s.autoExposure;
+        } else if (key == Scancode::R) {
+            s.denoise = !s.denoise;
+        }
+        session.dirty = true;
+    }
+
+    // Status text in the corner: time, samples, speed and what is switched on.
+    static fn overlay(f : Frame, font : BitmapFont, session : LumenSession, fps : f32) : void {
+        let s : LumenSettings = session.env.settings;
+        let total : i32 = (session.day * MINUTES_PER_DAY) as i32;
+        let hh : i32 = total / MINUTES_PER_HOUR;
+        let mm : i32 = total % MINUTES_PER_HOUR;
+        let mut pad : string = "";
+        if (mm < 10) {
+            pad = "0";
+        }
+        let still : i32 = session.frame.still;
+        let maxSamples : i32 = s.maxSamples;
+        let fpsShown : i32 = fps as i32;
+        let exposure : i32 = session.frame.post.exposure as i32;
+        let view : string = lumenViewName(s.view);
+        let bounce : string = LumenApp::flag(s.bounce);
+        let lamps : string = LumenApp::flag(s.lamps);
+        let shafts : string = LumenApp::flag(s.godRays);
+        let bloom : string = LumenApp::flag(s.bloom > 0.0);
+
+        let line1 : string = "${hh}:${pad}${mm}   ${still}/${maxSamples} frames   ${fpsShown} fps   exposure ${exposure}";
+        let line2 : string = "view ${view}  bounce ${bounce}  lamps ${lamps}  shafts ${shafts}  bloom ${bloom}";
+        let y2 : i32 = OVERLAY_Y + OVERLAY_LEADING;
+        font.draw(f, OVERLAY_X + OVERLAY_SHADOW, OVERLAY_Y + OVERLAY_SHADOW, line1, SHADOW_INK);
+        font.draw(f, OVERLAY_X, OVERLAY_Y, line1, INK);
+        font.draw(f, OVERLAY_X + OVERLAY_SHADOW, y2 + OVERLAY_SHADOW, line2, SHADOW_INK);
+        font.draw(f, OVERLAY_X, y2, line2, INK);
+    }
+
+    static fn flag(on : bool) : string {
+        if (on) {
+            return "on";
+        }
+        return "off";
+    }
+}

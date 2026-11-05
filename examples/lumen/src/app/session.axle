@@ -1,0 +1,427 @@
+// session — the valley, its light and its picture, built once and driven by either front end.
+//
+// Start-up does the work that never repeats: generate the world, copy it flat, flood the lamps, bake the sky
+// access of every surface cell, compute the first sky. After that a frame is `pass` (draw one pass into the
+// radiance picture) and `show` (expose, bloom and write pixels). The window and the headless renderer differ
+// only in who calls them and what is done with the pixels.
+
+use ludax::{nowNanos, nanosToMillis, VoxelGrid, VoxLightWorld, VoxLightCurve, JobPool, max};
+
+use crate::light::lamps::LumenLamps;
+use crate::light::lightvol::{LumenLight, SunBake};
+use crate::light::sky::LumenSky;
+use crate::render::camera::LumenCamera;
+use crate::render::env::LumenEnv;
+use crate::render::frame::{LumenFrame, LumenStage, FRAME_FILTERS};
+use crate::render::post::LumenPass;
+use crate::render::settings::{LumenSettings, LumenView};
+use crate::world::lampspec::{LumenLampSpec, LumenLampBook};
+use crate::world::scene::LumenScene;
+use crate::world::worldgen::{worldBuild, WORLD_XZ, WORLD_Y, WORLD_VALLEY};
+
+/** Rays a cell bakes toward the sun's disc, and how many cells of the shell a re-bake toward a new sun does a frame. */
+const SUN_RAYS : i32 = 40;
+const SUN_SLICE_CELLS : i32 = 24000;
+
+/** The flood's falloff curve, in cells: full near, gone by the second value. */
+const LIGHT_CURVE_FROM : f32 = 2.0;
+const LIGHT_CURVE_TO : f32 = 40.0;
+
+/** Rays a flooded cell casts. */
+const LIGHT_RAYS : i32 = 40;
+
+/** The brightness of a fully lit light shaft, as a share of the sun's own irradiance. */
+const RAY_STRENGTH : f32 = 0.1;
+
+/** How much of the eye's own sky access a light shaft needs to show. */
+const RAY_OPEN_GAIN : f32 = 1.6;
+
+/** How far along the sun direction a point is projected to find the sun's place in the picture. */
+const SUN_PROJECT_DIST : f32 = 1000.0;
+
+/** The ceiling a moved camera is lifted under when it lands inside the ground. */
+const SESSION_TOP : f32 = 60.0;
+
+/** How many timed stages `spent` holds: trace, temporal, filter and resolve. */
+const SESSION_STAGES : i32 = 4;
+
+/** How many frames of history a pixel keeps while the picture is changing: short, so nothing lags or smears. */
+const HISTORY_MOVING : f32 = 3.0;
+
+/** How far inside its pixel a sample may land: the whole pixel when the picture holds still (that is what
+ * anti-aliases it), a quarter while it moves, where a jittering edge would crawl. */
+const JITTER_MOVING : f32 = 0.25;
+
+/** A viewpoint: where the camera is, where it looks, and the time of day that suits it. */
+pub struct LumenShot {
+    /** World x of the eye. */
+    pub x : f32 = 0.0;
+
+    /** World y of the eye. */
+    pub y : f32 = 0.0;
+
+    /** World z of the eye. */
+    pub z : f32 = 0.0;
+
+    /** Heading in radians. */
+    pub yaw : f32 = 0.0;
+
+    /** Elevation in radians. */
+    pub pitch : f32 = 0.0;
+
+    /** Time of day in 0..1. */
+    pub day : f64 = 0.5;
+}
+
+/** The whole renderer. */
+pub class LumenSession {
+    light : VoxLightWorld;
+
+    /** The world, its light and the settings every stage reads. */
+    pub env : Shared<LumenEnv>;
+
+    /** The picture and the kernel that draws, filters and displays it. */
+    pub frame : LumenFrame;
+
+    pool : JobPool;
+
+    /** The camera the user moves; the frame copies it when it changes. */
+    pub cam : LumenCamera;
+
+    /** True when something other than the camera changed and the picture must start over. */
+    pub dirty : bool = true;
+
+    /** Nanoseconds spent so far in each stage of the frame (trace, temporal, filter, resolve), for `--bench`. */
+    pub spent : i64[];
+
+    /** True while the sun's shadows are being re-baked toward a new direction, a slice a frame. */
+    pub sunStale : bool = false;
+
+    /** The shell cell the next slice of the re-bake starts at, and how many cells have been done. */
+    sunCursor : i32 = 0;
+    sunDone   : i32 = 0;
+
+    /** True when the lighting changed gently (the sun moved): history is kept, but short. */
+    pub soft : bool = false;
+
+    /** Time of day in 0..1. */
+    pub day : f64 = 0.5;
+
+    /** Output width in pixels. */
+    pub outW : i32;
+
+    /** Output height in pixels. */
+    pub outH : i32;
+
+    /** Builds the world and starts `workers` threads for a picture of `w` by `h` shown at `scale`. */
+    constructor(workers : i32, w : i32, h : i32, scale : i32) {
+        let grid : Shared<VoxelGrid> = new shared VoxelGrid();
+        let began : i64 = nowNanos();
+        println("lumen: building a world of ${WORLD_XZ} x ${WORLD_Y} x ${WORLD_XZ} cells...");
+        let book : LumenLampBook = new LumenLampBook();
+        worldBuild(grid, book);
+        let scene : LumenScene = new LumenScene(grid, WORLD_XZ, WORLD_Y, WORLD_XZ, new BlockPalette());
+        self.light = new VoxLightWorld(
+            grid,
+            lumenLightTable(),
+            new shared VoxLightCurve(LIGHT_CURVE_FROM, LIGHT_CURVE_TO),
+            LIGHT_RAYS,
+            workers
+        );
+        let built : f64 = nanosToMillis(nowNanos() - began) / 1000.0;
+        println("lumen: world built (${built} s); flooding the lamps and baking the sky...");
+        LumenSession::fill(self.light, book);
+        let vol : LumenLight = new LumenLight(self.light, scene, workers);
+        let lamps : LumenLamps = new LumenLamps(scene, book);
+        let baked : f64 = nanosToMillis(nowNanos() - began) / 1000.0;
+        println("lumen: light baked (${baked} s)");
+        let sky : LumenSky = new LumenSky(workers);
+        self.env = new shared LumenEnv(scene, vol, sky, lamps);
+        self.frame = new LumenFrame(self.env, w, h, scale);
+        self.pool = new JobPool(workers, self.frame);
+        self.cam = new LumenCamera(86.0, 24.0, 128.0, 0.2, -0.1, 1.15);
+        self.spent = malloc<i64>(SESSION_STAGES as i64);
+        for (i of 0..SESSION_STAGES) {
+            self.spent[i] = 0;
+        }
+        self.outW = w * scale;
+        self.outH = h * scale;
+        self.frame.cam.copyFrom(self.cam);
+        self.bakeSunNow();
+    }
+
+    // Gives the flood each lamp as an emitter of its own: the colour of the spec at the strength of its fill, and
+    // the obstacle classes its light goes through.
+    static fn fill(light : VoxLightWorld, book : LumenLampBook) : void {
+        for (i of 0..book.len()) {
+            let s : LumenLampSpec = book.get(i);
+            let peak : f32 = max(s.colour.maxComponent(), 0.0001);
+            let k : f32 = (s.fill as f32) / peak;
+            light.setEmitter(
+                s.x,
+                s.y,
+                s.z,
+                (s.colour.x * k) as i32,
+                (s.colour.y * k) as i32,
+                (s.colour.z * k) as i32,
+                s.pass.bits
+            );
+        }
+    }
+
+    /** The light engine the volumes were baked from. */
+    pub fn engine(self) : VoxLightWorld {
+        return self.light;
+    }
+
+    // The direction the shadows are baked toward: the sun by day, the moon by night.
+    fn bakedDirection(self) : Vec3 {
+        let sky : LumenSky = self.env.sky;
+        if (sky.sunDir.y >= sky.moonDir.y) {
+            return sky.sunDir;
+        }
+        return sky.moonDir;
+    }
+
+    // Bakes `count` shell cells from `from` toward the current sun; returns the cell to continue from.
+    fn bakeSlice(mut self, from : i32, count : i32) : i32 {
+        let s : LumenSettings = self.env.settings;
+        return self.env.vol.bakeSun(SunBake {
+            world: self.light,
+            scene: self.env.scene,
+            direction: self.bakedDirection(),
+            halfAngle: s.sunSoftness,
+            rays: SUN_RAYS,
+            from: from,
+            count: count,
+        });
+    }
+
+    // Bakes the sun's shadows for the whole shell now: at start-up and when jumping to a viewpoint.
+    fn bakeSunNow(mut self) : void {
+        let n : i32 = self.env.vol.shellSize(self.light);
+        self.bakeSlice(0, n);
+        self.sunStale = false;
+        self.sunCursor = 0;
+        self.sunDone = 0;
+    }
+
+    // Re-bakes one slice of the shell toward the new sun, as voxel-axle's `bakeSunSlice` does for shadows that glide.
+    fn bakeSunSlice(mut self) : void {
+        let n : i32 = self.env.vol.shellSize(self.light);
+        let mut slice : i32 = SUN_SLICE_CELLS;
+        if (slice > n) {
+            slice = n;
+        }
+        self.sunCursor = self.bakeSlice(self.sunCursor, slice);
+        self.sunDone = self.sunDone + slice;
+        if (self.sunDone >= n) {
+            self.sunStale = false;
+        }
+    }
+
+    /** Stops every thread. */
+    pub fn close(mut self) : void {
+        self.pool.shutdown();
+        self.env.sky.close();
+        self.light.close();
+    }
+
+    /** The four hero viewpoints: the lake at dusk, the cabin and pier, the crystal cave, the tower at night. */
+    pub static fn shot(i : i32) : LumenShot {
+        // The viewpoints are in the valley's own coordinates; the valley sits at WORLD_VALLEY.
+        let v : f32 = WORLD_VALLEY as f32;
+        return match i {
+            2 => LumenShot {
+                x: v + (112.0 as f32),
+                y: 20.0,
+                z: v + (100.0 as f32),
+                yaw: 0.0,
+                pitch: 0.04,
+                day: 0.79,
+            },
+            3 => LumenShot {
+                x: v + (53.0 as f32),
+                y: 23.4,
+                z: v + (56.0 as f32),
+                yaw: -0.84,
+                pitch: 0.08,
+                day: 0.5,
+            },
+            4 => LumenShot {
+                x: v + (100.0 as f32),
+                y: 22.0,
+                z: v + (100.0 as f32),
+                yaw: 1.46,
+                pitch: 0.12,
+                day: 0.02,
+            },
+            _ => LumenShot {
+                x: v + (86.0 as f32),
+                y: 19.0,
+                z: v + (120.0 as f32),
+                yaw: 0.15,
+                pitch: 0.03,
+                day: 0.74,
+            },
+        };
+    }
+
+    /** Moves the camera and the clock to a viewpoint. */
+    pub fn goTo(mut self, s : LumenShot) : void {
+        self.cam.x = s.x;
+        self.cam.y = s.y;
+        self.cam.z = s.z;
+        self.cam.yaw = s.yaw;
+        self.cam.pitch = s.pitch;
+        let scene : LumenScene = self.env.scene;
+        while (scene.isSolid(s.x as i32, self.cam.y as i32, s.z as i32) && self.cam.y < SESSION_TOP) {
+            self.cam.y = self.cam.y + (1.0 as f32);
+        }
+        self.setDay(s.day);
+        self.bakeSunNow();
+        self.dirty = true;
+    }
+
+    /** Sets the time of day (0 midnight, 0.25 sunrise, 0.5 noon, 0.75 sunset). */
+    pub fn setDay(mut self, day : f64) : void {
+        let mut d : f64 = day;
+        while (d >= 1.0) {
+            d = d - 1.0;
+        }
+        while (d < 0.0) {
+            d = d + 1.0;
+        }
+        self.day = d;
+        self.env.sky.set(d);
+        self.soft = true;
+        self.sunStale = true;
+        self.sunDone = 0;
+    }
+
+    /**
+     * Draws one frame: trace, blend with the history, filter, put the albedo back. Returns true when the picture
+     * changed and should be shown; false when it has settled and nothing moved.
+     */
+    pub fn pass(mut self) : bool {
+        let aspect : f32 = (self.frame.w as f32) / (self.frame.h as f32);
+        self.cam.aim(aspect);
+        if (self.sunStale) {
+            self.bakeSunSlice();
+            self.soft = true;
+        }
+        let moved : bool = !self.cam.same(self.frame.cam);
+        let changing : bool = moved || self.dirty || self.soft;
+        let settings : LumenSettings = self.env.settings;
+        if (!changing && self.frame.still >= settings.maxSamples) {
+            return false;
+        }
+        self.frame.cam.copyFrom(self.cam);
+        self.frame.cam.aim(aspect);
+        if (self.dirty) {
+            self.frame.fresh = true;
+        }
+        self.frame.sameCam = !moved;
+        self.frame.denoise = settings.denoise;
+        if (changing) {
+            self.frame.limit = HISTORY_MOVING;
+            self.frame.jitter = JITTER_MOVING;
+            self.frame.still = 0;
+        } else {
+            self.frame.limit = settings.maxSamples as f32;
+            self.frame.jitter = 1.0;
+            self.frame.still = self.frame.still + 1;
+        }
+        self.dirty = false;
+        self.soft = false;
+        self.stage(LumenStage::Trace);
+        self.stage(LumenStage::Temporal);
+        if (settings.denoise) {
+            self.stage(LumenStage::Filter);
+        }
+        self.stage(LumenStage::Resolve);
+        self.frame.rayGain = self.rayGain();
+        self.frame.sunPixel = self.sunPixel();
+        self.stage(LumenStage::Rays);
+        self.frame.finish();
+        return true;
+    }
+
+    // Where the sun lies in the picture, in pixels; z is positive when it is in front of the camera.
+    fn sunPixel(self) : Vec3 {
+        let eye : Vec3 = self.cam.eye();
+        let q : Vec3 = self.frame.cam.project(eye.plus(self.env.sky.sunDir.scale(SUN_PROJECT_DIST)));
+        return Vec3 { x: q.x * (self.frame.w as f32), y: q.y * (self.frame.h as f32), z: q.z };
+    }
+
+    // What the light shafts add: the sun's irradiance as a colour, faded in as the sun clears the horizon, off at
+    // night, in a cave, or when the setting is off.
+    fn rayGain(self) : Vec3 {
+        let sky : LumenSky = self.env.sky;
+        if (!self.env.settings.godRays || self.env.settings.fog <= 0.0 || sky.sunDir.y <= 0.0) {
+            return Vec3::zero();
+        }
+        let eye : Vec3 = self.cam.eye();
+        let open : f32 = saturate(self.env.vol.sample(self.env.scene, eye.x, eye.y, eye.z).sky
+            * RAY_OPEN_GAIN);
+        return sky.sunIrr.scale(RAY_STRENGTH * saturate(sky.sunDir.y * (8.0 as f32)) * open);
+    }
+
+    // Runs one stage of the frame over the pool; the filter is three passes.
+    fn stage(mut self, stage : LumenStage) : void {
+        let started : i64 = nowNanos();
+        self.frame.stage = stage;
+        self.runStage(stage);
+        let slot : i64 = match stage {
+            LumenStage::Trace => 0,
+            LumenStage::Temporal => 1,
+            LumenStage::Filter => 2,
+            _ => 3,
+        };
+        self.spent[slot] = self.spent[slot] + (nowNanos() - started);
+    }
+
+    fn runStage(mut self, stage : LumenStage) : void {
+        if (stage == LumenStage::Filter) {
+            for (k of 0..FRAME_FILTERS) {
+                self.frame.round = k;
+                self.run(self.frame.rows(), 2);
+            }
+            return;
+        }
+        self.run(self.frame.rows(), 2);
+    }
+
+    /** Turns the radiance picture into pixels (`outW * outH` words). */
+    pub fn show(mut self, pixels : i32[], seconds : f32, instant : bool) : void {
+        let s : LumenSettings = self.env.settings;
+        self.frame.post.adapt(self.frame.hdr, s, seconds, instant);
+        self.frame.post.raw = s.view == LumenView::Raw;
+        self.frame.stage = LumenStage::Display;
+        if (s.bloom > 0.0 && !self.frame.post.raw) {
+            self.display(LumenPass::Bright);
+            self.display(LumenPass::BlurAcross);
+            self.display(LumenPass::BlurDown);
+            self.frame.post.coarse();
+        }
+        self.display(LumenPass::Compose);
+        self.display(LumenPass::Pack);
+        let out : i32[] = self.frame.post.out;
+        for (i of 0..((self.outW as i64) * self.outH)) {
+            pixels[i] = out[i];
+        }
+    }
+
+    // One display pass over the pool.
+    fn display(mut self, pass : LumenPass) : void {
+        self.frame.pass = pass;
+        self.run(self.frame.post.rowsOf(pass), 4);
+    }
+
+    // Runs the kernel over `rows` rows in chunks of `grain`; on this thread if the pool is gone.
+    fn run(mut self, rows : i32, grain : i32) : void {
+        if (!self.pool.run(rows, grain)) {
+            self.frame.runRange(0, rows);
+        }
+    }
+}
