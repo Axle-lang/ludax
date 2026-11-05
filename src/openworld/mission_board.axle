@@ -1,0 +1,671 @@
+// mission_board — the play state of missions: a state machine per mission fed by a queue of events.
+//
+// Each mission is Locked (a prerequisite is not completed), Available (it could be started), Active (a stage
+// is open), Completed or Failed. The game does not poke the machine; it tells the board what happened —
+// the player is here, one wolf is dead, a crate was picked up, the escortee died, the gate was opened (a flag)
+// — as events, and calls `update(dt)` once per simulation step. `update` runs the events in the order they
+// were posted, then lets the time pass, and everything that follows (a stage finishing, the next stage
+// opening, a mission completing and paying its rewards, a dependent mission becoming available or starting
+// itself) happens inside that call, in a fixed order, so a run is a function of the definitions, the events
+// and the time steps alone. Time is whole nanoseconds, as in `FixedStep`.
+//
+// Order inside `update`: queued events (each may finish objectives, fail a mission or finish a stage), then
+// time (stage timers, then time-limit failures — so a mission that finishes in the same step its time runs out
+// has finished), then prerequisites are re-checked. Things worth telling the player are appended to a list of
+// notes, which the game reads and clears.
+//
+// The whole state saves to bytes and loads back (`save`/`load`); the bytes carry a fingerprint of the
+// definitions and a checksum, and a load that does not match changes nothing.
+
+use crate::core::collections::map::Map;
+use crate::core::collections::vec::Vec;
+use crate::data::bytes::ByteBuf;
+use crate::openworld::mission_book::{
+    BookObjective, MissionBook, FAIL_DEATH, FAIL_FLAG, FAIL_TIMEOUT, OBJ_COLLECT, OBJ_ESCORT, OBJ_FLAG,
+    OBJ_KILL, OBJ_REACH, OBJ_TIMER
+};
+use crate::openworld::mission_raw::{MissionRaw, ObjectiveRaw};
+use crate::openworld::mission_save::MissionSave;
+
+/** Mission status: a prerequisite is not completed. */
+pub const MISSION_LOCKED : i32 = 0;
+
+/** Mission status: can be started. */
+pub const MISSION_AVAILABLE : i32 = 1;
+
+/** Mission status: a stage is open. */
+pub const MISSION_ACTIVE : i32 = 2;
+
+/** Mission status: done. */
+pub const MISSION_COMPLETED : i32 = 3;
+
+/** Mission status: lost. */
+pub const MISSION_FAILED : i32 = 4;
+
+/** Note: a mission started (`mission`). */
+pub const NOTE_STARTED : i8 = 0;
+
+/** Note: an objective was done (`mission`, `a` is its index within the stage). */
+pub const NOTE_OBJECTIVE : i8 = 1;
+
+/** Note: a stage was finished (`mission`, `a` is the stage index). */
+pub const NOTE_STAGE : i8 = 2;
+
+/** Note: a mission was completed (`mission`). */
+pub const NOTE_COMPLETED : i8 = 3;
+
+/** Note: a mission failed (`mission`, `a` is a `FAILED_...` reason). */
+pub const NOTE_FAILED : i8 = 4;
+
+/** Note: a reward was paid (`mission`, `a` is the word id of the reward, `b` the amount). */
+pub const NOTE_REWARD : i8 = 5;
+
+/** Note: a mission became available (`mission`). */
+pub const NOTE_AVAILABLE : i8 = 6;
+
+/** Failure reason: the time limit ran out. */
+pub const FAILED_TIMEOUT : i32 = 0;
+
+/** Failure reason: a fail flag was set. */
+pub const FAILED_FLAG : i32 = 1;
+
+/** Failure reason: something that had to live died. */
+pub const FAILED_DEATH : i32 = 2;
+
+/** Failure reason: the escorted one died. */
+pub const FAILED_ESCORT : i32 = 3;
+
+const EV_POSITION : i8 = 0;
+const EV_ESCORT : i8 = 1;
+const EV_KILL : i8 = 2;
+const EV_COLLECT : i8 = 3;
+const EV_DEATH : i8 = 4;
+const EV_FLAG : i8 = 5;
+
+// The play-state hash is FNV-1a 64 over the saved bytes.
+const BOARD_HASH_SEED : i64 = 1469598103934665603;
+const BOARD_HASH_PRIME : i64 = 1099511628211;
+
+struct MissionEvent {
+    kind   : i8;
+    key    : i32;
+    amount : i32;
+    x      : f64;
+    z      : f64;
+}
+
+/** One thing worth telling the player. */
+pub struct MissionNote {
+    /** `NOTE_STARTED` and friends. */
+    pub kind : i8;
+
+    /** The mission it is about. */
+    pub mission : i32;
+
+    /** Kind-specific number (see the `NOTE_` constants). */
+    pub a : i32;
+
+    /** Kind-specific amount. */
+    pub b : i64;
+}
+
+/** The state of every mission of a book. */
+pub class MissionBoard {
+    book     : MissionBook;
+    status   : Vec<i32>;
+    stage    : Vec<i32>;
+    elapsed  : Vec<i64>;
+    inStage  : Vec<i64>;
+    objDone  : Vec<bool>;
+    objCount : Vec<i32>;
+    flags    : Map<i32, bool>;
+    paid     : Map<i32, i64>;
+    queue    : Vec<MissionEvent>;
+    notes    : Vec<MissionNote>;
+    known    : i32 = 0;
+    fp       : i64 = 0;
+
+    /**
+     * A board over `book`, which it takes over: finish and `validate` the book first. Missions without
+     * prerequisites are available at once (and `auto` ones start).
+     */
+    constructor(own book : MissionBook) {
+        self.book = book;
+        self.known = self.book.wordCount();
+        self.fp = self.book.fingerprint();
+        self.status = new Vec<i32>();
+        self.stage = new Vec<i32>();
+        self.elapsed = new Vec<i64>();
+        self.inStage = new Vec<i64>();
+        self.objDone = new Vec<bool>();
+        self.objCount = new Vec<i32>();
+        self.flags = new Map<i32, bool>();
+        self.paid = new Map<i32, i64>();
+        self.queue = new Vec<MissionEvent>();
+        self.notes = new Vec<MissionNote>();
+        for (m of 0..self.book.missionCount()) {
+            self.status.push(MISSION_LOCKED);
+            self.stage.push(0);
+            self.elapsed.push(0);
+            self.inStage.push(0);
+        }
+        for (o of 0..self.book.totalObjectives()) {
+            self.objDone.push(false);
+            self.objCount.push(0);
+        }
+        self.refresh();
+    }
+
+    /** The definitions. */
+    pub fn definitions(self) : MissionBook {
+        return self.book;
+    }
+
+    // ---- driving ----
+
+    /** Starts mission `name` if it is available; false otherwise. */
+    pub fn start(mut self, name : string) : bool {
+        let m : i32 = self.book.indexOf(name);
+        if (m < 0 || self.status.get(m) != MISSION_AVAILABLE) {
+            return false;
+        }
+        self.begin(m);
+        return true;
+    }
+
+    /** Puts a failed mission back to available so it can be tried again; false if it did not fail. */
+    pub fn retry(mut self, name : string) : bool {
+        let m : i32 = self.book.indexOf(name);
+        if (m < 0 || self.status.get(m) != MISSION_FAILED) {
+            return false;
+        }
+        self.reset(m);
+        self.status.set(m, MISSION_AVAILABLE);
+        self.note(NOTE_AVAILABLE, m, 0, 0);
+        return true;
+    }
+
+    /** Tells the board where the player is. */
+    pub fn postPosition(mut self, x : f64, z : f64) : void {
+        self.queue.push(MissionEvent { kind: EV_POSITION, key: 0 - 1, amount: 0, x: x, z: z });
+    }
+
+    /** Tells the board where the escorted `who` is. */
+    pub fn postEscort(mut self, who : string, x : f64, z : f64) : void {
+        self.queue.push(MissionEvent { kind: EV_ESCORT, key: self.book.word(who), amount: 0, x: x, z: z });
+    }
+
+    /** Tells the board that `count` of `kind` were killed. */
+    pub fn postKill(mut self, kind : string, count : i32) : void {
+        self.queue.push(MissionEvent {
+            kind: EV_KILL,
+            key: self.book.word(kind),
+            amount: count,
+            x: 0.0,
+            z: 0.0,
+        });
+    }
+
+    /** Tells the board that `count` of `kind` were collected. */
+    pub fn postCollect(mut self, kind : string, count : i32) : void {
+        self.queue.push(MissionEvent {
+            kind: EV_COLLECT,
+            key: self.book.word(kind),
+            amount: count,
+            x: 0.0,
+            z: 0.0,
+        });
+    }
+
+    /** Tells the board that `who` died. */
+    pub fn postDeath(mut self, who : string) : void {
+        self.queue.push(MissionEvent { kind: EV_DEATH, key: self.book.word(who), amount: 0, x: 0.0, z: 0.0 });
+    }
+
+    /** Sets flag `name` (it stays set). */
+    pub fn postFlag(mut self, name : string) : void {
+        self.queue.push(MissionEvent { kind: EV_FLAG, key: self.book.word(name), amount: 0, x: 0.0, z: 0.0 });
+    }
+
+    /** How many events wait for the next `update`. */
+    pub fn pendingEvents(self) : i32 {
+        return self.queue.len();
+    }
+
+    /** Runs the queued events, then lets `dtNanos` nanoseconds pass. */
+    pub fn update(mut self, dtNanos : i64) : void {
+        let mut dt : i64 = dtNanos;
+        if (dt < 0) {
+            dt = 0;
+        }
+        let waiting : i32 = self.queue.len();
+        for (i of 0..waiting) {
+            self.handle(self.queue.get(i));
+        }
+        self.queue.clear();
+        for (m of 0..self.book.missionCount()) {
+            if (self.status.get(m) != MISSION_ACTIVE) {
+                continue;
+            }
+            self.elapsed.set(m, self.elapsed.get(m) + dt);
+            self.inStage.set(m, self.inStage.get(m) + dt);
+            self.timers(m);
+            self.advance(m);
+            if (self.status.get(m) == MISSION_ACTIVE) {
+                self.checkTimeouts(m);
+            }
+        }
+        self.refresh();
+    }
+
+    // ---- the machine ----
+
+    fn note(mut self, kind : i8, mission : i32, a : i32, b : i64) : void {
+        self.notes.push(MissionNote { kind: kind, mission: mission, a: a, b: b });
+    }
+
+    // Clears the play state of one mission.
+    fn reset(mut self, m : i32) : void {
+        self.stage.set(m, 0);
+        self.elapsed.set(m, 0);
+        self.inStage.set(m, 0);
+        for (s of 0..self.book.stageCount(m)) {
+            let first : i32 = self.book.firstObjective(m, s);
+            for (j of 0..self.book.objectiveCount(m, s)) {
+                self.objDone.set(first + j, false);
+                self.objCount.set(first + j, 0);
+            }
+        }
+    }
+
+    fn begin(mut self, m : i32) : void {
+        self.reset(m);
+        self.status.set(m, MISSION_ACTIVE);
+        self.note(NOTE_STARTED, m, 0, 0);
+        self.enter(m);
+        self.advance(m);
+    }
+
+    // The current stage has just opened: objectives that need no event may already be done.
+    fn enter(mut self, m : i32) : void {
+        self.inStage.set(m, 0);
+        let s : i32 = self.stage.get(m);
+        let first : i32 = self.book.firstObjective(m, s);
+        for (j of 0..self.book.objectiveCount(m, s)) {
+            let o : BookObjective = self.book.objectiveAt(first + j);
+            if (o.kind == OBJ_FLAG && self.flags.has(o.key)) {
+                self.finish(m, first + j, j);
+            }
+            if (o.kind == OBJ_TIMER && o.nanos == 0) {
+                self.finish(m, first + j, j);
+            }
+        }
+    }
+
+    fn finish(mut self, m : i32, objective : i32, indexInStage : i32) : void {
+        if (!self.objDone.get(objective)) {
+            self.objDone.set(objective, true);
+            self.note(NOTE_OBJECTIVE, m, indexInStage, 0);
+        }
+    }
+
+    // Opens following stages while the current one is complete; completes the mission after the last.
+    fn advance(mut self, m : i32) : void {
+        while (self.status.get(m) == MISSION_ACTIVE) {
+            let s : i32 = self.stage.get(m);
+            let first : i32 = self.book.firstObjective(m, s);
+            let mut complete : bool = true;
+            for (j of 0..self.book.objectiveCount(m, s)) {
+                if (!self.objDone.get(first + j) && !self.book.objectiveAt(first + j).optional) {
+                    complete = false;
+                }
+            }
+            if (!complete) {
+                return;
+            }
+            self.note(NOTE_STAGE, m, s, 0);
+            if (s + 1 >= self.book.stageCount(m)) {
+                self.complete(m);
+                return;
+            }
+            self.stage.set(m, s + 1);
+            self.enter(m);
+        }
+    }
+
+    fn complete(mut self, m : i32) : void {
+        self.status.set(m, MISSION_COMPLETED);
+        self.note(NOTE_COMPLETED, m, 0, 0);
+        for (i of 0..self.book.rewardCount(m)) {
+            let key : i32 = self.book.rewardWord(m, i);
+            let amount : i64 = self.book.rewardAmount(m, i);
+            self.paid.put(key, self.paid.getOr(key, 0) + amount);
+            self.note(NOTE_REWARD, m, key, amount);
+        }
+    }
+
+    fn fail(mut self, m : i32, reason : i32) : void {
+        self.status.set(m, MISSION_FAILED);
+        self.note(NOTE_FAILED, m, reason, 0);
+    }
+
+    // Time passing: stage timers.
+    fn timers(mut self, m : i32) : void {
+        let s : i32 = self.stage.get(m);
+        let first : i32 = self.book.firstObjective(m, s);
+        for (j of 0..self.book.objectiveCount(m, s)) {
+            let o : BookObjective = self.book.objectiveAt(first + j);
+            if (o.kind == OBJ_TIMER && self.inStage.get(m) >= o.nanos) {
+                self.finish(m, first + j, j);
+            }
+        }
+    }
+
+    fn checkTimeouts(mut self, m : i32) : void {
+        for (i of 0..self.book.failCount(m)) {
+            if (self.book.failKind(m, i) == FAIL_TIMEOUT
+                && self.elapsed.get(m) >= self.book.failNanos(m, i)) {
+                self.fail(m, FAILED_TIMEOUT);
+                return;
+            }
+        }
+    }
+
+    // One event, offered to every active mission in order.
+    fn handle(mut self, e : MissionEvent) : void {
+        if (e.kind == EV_FLAG) {
+            self.flags.put(e.key, true);
+        }
+        for (m of 0..self.book.missionCount()) {
+            if (self.status.get(m) != MISSION_ACTIVE) {
+                continue;
+            }
+            if (self.failsOn(m, e)) {
+                continue;
+            }
+            let s : i32 = self.stage.get(m);
+            let first : i32 = self.book.firstObjective(m, s);
+            for (j of 0..self.book.objectiveCount(m, s)) {
+                if (self.status.get(m) != MISSION_ACTIVE) {
+                    break;
+                }
+                self.offer(m, first + j, j, e);
+            }
+            self.advance(m);
+        }
+    }
+
+    // Failure conditions the event triggers. True when the mission failed.
+    fn failsOn(mut self, m : i32, e : MissionEvent) : bool {
+        for (i of 0..self.book.failCount(m)) {
+            let kind : i32 = self.book.failKind(m, i);
+            if (kind == FAIL_FLAG && e.kind == EV_FLAG && self.book.failWord(m, i) == e.key) {
+                self.fail(m, FAILED_FLAG);
+                return true;
+            }
+            if (kind == FAIL_DEATH && e.kind == EV_DEATH && self.book.failWord(m, i) == e.key) {
+                self.fail(m, FAILED_DEATH);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // One event against one objective of the open stage.
+    fn offer(mut self, m : i32, objective : i32, j : i32, e : MissionEvent) : void {
+        let o : BookObjective = self.book.objectiveAt(objective);
+        if (self.objDone.get(objective)) {
+            return;
+        }
+        if (o.kind == OBJ_REACH && e.kind == EV_POSITION && MissionBoard::inside(o, e.x, e.z)) {
+            self.finish(m, objective, j);
+        } else if (o.kind == OBJ_ESCORT && e.kind == EV_ESCORT && e.key == o.key
+            && MissionBoard::inside(o, e.x, e.z)) {
+            self.finish(m, objective, j);
+        } else if (o.kind == OBJ_ESCORT && e.kind == EV_DEATH && e.key == o.key) {
+            self.fail(m, FAILED_ESCORT);
+        } else if ((o.kind == OBJ_KILL && e.kind == EV_KILL)
+            || (o.kind == OBJ_COLLECT && e.kind == EV_COLLECT)) {
+            if (e.key == o.key && e.amount > 0) {
+                let mut have : i32 = self.objCount.get(objective) + e.amount;
+                if (have > o.target) {
+                    have = o.target;
+                }
+                self.objCount.set(objective, have);
+                if (have >= o.target) {
+                    self.finish(m, objective, j);
+                }
+            }
+        } else if (o.kind == OBJ_FLAG && e.kind == EV_FLAG && e.key == o.key) {
+            self.finish(m, objective, j);
+        }
+    }
+
+    static fn inside(o : BookObjective, x : f64, z : f64) : bool {
+        let dx : f64 = x - o.x;
+        let dz : f64 = z - o.z;
+        return dx * dx + dz * dz <= o.radius * o.radius;
+    }
+
+    // Unlocks missions whose prerequisites are completed and starts the `auto` ones.
+    fn refresh(mut self) : void {
+        let mut again : bool = true;
+        while (again) {
+            again = false;
+            for (m of 0..self.book.missionCount()) {
+                if (self.status.get(m) == MISSION_LOCKED && self.prerequisitesDone(m)) {
+                    self.status.set(m, MISSION_AVAILABLE);
+                    self.note(NOTE_AVAILABLE, m, 0, 0);
+                    again = true;
+                }
+                if (self.status.get(m) == MISSION_AVAILABLE && self.book.isAuto(m)) {
+                    self.begin(m);
+                    again = true;
+                }
+            }
+        }
+    }
+
+    fn prerequisitesDone(self, m : i32) : bool {
+        for (r of 0..self.book.requirementCount(m)) {
+            let t : i32 = self.book.missionOfWord(self.book.requirementWord(m, r));
+            if (t < 0 || self.status.get(t) != MISSION_COMPLETED) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // ---- questions ----
+
+    /** The status (`MISSION_LOCKED`...) of mission `name`, or -1 when there is none. */
+    pub fn statusOf(self, name : string) : i32 {
+        let m : i32 = self.book.indexOf(name);
+        if (m < 0) {
+            return 0 - 1;
+        }
+        return self.status.get(m);
+    }
+
+    /** The status of mission number `m`. */
+    pub fn statusAt(self, m : i32) : i32 {
+        return self.status.getOr(m, 0 - 1);
+    }
+
+    /** The open stage of mission `name` (its stage count once completed), or -1 when there is no such mission. */
+    pub fn stageOf(self, name : string) : i32 {
+        let m : i32 = self.book.indexOf(name);
+        if (m < 0) {
+            return 0 - 1;
+        }
+        if (self.status.get(m) == MISSION_COMPLETED) {
+            return self.book.stageCount(m);
+        }
+        return self.stage.get(m);
+    }
+
+    /** True when objective `j` of the open stage of mission `name` is done. */
+    pub fn objectiveDone(self, name : string, j : i32) : bool {
+        let m : i32 = self.book.indexOf(name);
+        if (m < 0) {
+            return false;
+        }
+        let s : i32 = self.stage.get(m);
+        if (j < 0 || j >= self.book.objectiveCount(m, s)) {
+            return false;
+        }
+        return self.objDone.get(self.book.firstObjective(m, s) + j);
+    }
+
+    /** The count so far of objective `j` of the open stage of mission `name` (kills or collects). */
+    pub fn objectiveCount(self, name : string, j : i32) : i32 {
+        let m : i32 = self.book.indexOf(name);
+        if (m < 0) {
+            return 0;
+        }
+        let s : i32 = self.stage.get(m);
+        if (j < 0 || j >= self.book.objectiveCount(m, s)) {
+            return 0;
+        }
+        return self.objCount.get(self.book.firstObjective(m, s) + j);
+    }
+
+    /** Nanoseconds mission `name` has been active (since it was started). */
+    pub fn elapsedNanos(self, name : string) : i64 {
+        let m : i32 = self.book.indexOf(name);
+        if (m < 0) {
+            return 0;
+        }
+        return self.elapsed.get(m);
+    }
+
+    /** True when flag `name` has been set. */
+    pub fn flag(self, name : string) : bool {
+        let w : i32 = self.book.findWord(name);
+        return w >= 0 && self.flags.has(w);
+    }
+
+    /** The total paid so far of reward `what`. */
+    pub fn rewardTotal(self, what : string) : i64 {
+        let w : i32 = self.book.findWord(what);
+        if (w < 0) {
+            return 0;
+        }
+        return self.paid.getOr(w, 0);
+    }
+
+    /** How many missions are active. */
+    pub fn activeCount(self) : i32 {
+        let mut n : i32 = 0;
+        for (m of 0..self.status.len()) {
+            if (self.status.get(m) == MISSION_ACTIVE) {
+                n = n + 1;
+            }
+        }
+        return n;
+    }
+
+    /** How many notes are waiting to be read. */
+    pub fn noteCount(self) : i32 {
+        return self.notes.len();
+    }
+
+    /** Note `i`. */
+    pub fn noteAt(self, i : i32) : MissionNote {
+        return self.notes.get(i);
+    }
+
+    /** Forgets the notes that have been read. */
+    pub fn clearNotes(mut self) : void {
+        self.notes.clear();
+    }
+
+    /** A hash of the whole play state, for tests and desync checks. */
+    pub fn stateHash(self) : i64 {
+        let b : ByteBuf = MissionSave::save(self);
+        let mut h : i64 = BOARD_HASH_SEED;
+        for (i of 0..b.len()) {
+            h = (h ^ (b.get(i) as i64)) * BOARD_HASH_PRIME;
+        }
+        return h;
+    }
+
+    // ---- for the save format (mission_save) ----
+
+    /** The definitions' fingerprint, fixed when the board was made. */
+    pub(crate) fn fingerprintValue(self) : i64 {
+        return self.fp;
+    }
+
+    /** How many words the definitions had when the board was made; flags and rewards with higher ids are not saved. */
+    pub(crate) fn knownWords(self) : i32 {
+        return self.known;
+    }
+
+    /** The raw state of mission `m`. */
+    pub(crate) fn rawMission(self, m : i32) : MissionRaw {
+        return MissionRaw {
+            status: self.status.get(m),
+            stage: self.stage.get(m),
+            elapsed: self.elapsed.get(m),
+            inStage: self.inStage.get(m),
+        };
+    }
+
+    /** Overwrites the raw state of mission `m`. */
+    pub(crate) fn setRawMission(mut self, m : i32, r : MissionRaw) : void {
+        self.status.set(m, r.status);
+        self.stage.set(m, r.stage);
+        self.elapsed.set(m, r.elapsed);
+        self.inStage.set(m, r.inStage);
+    }
+
+    /** The raw progress of objective `o`. */
+    pub(crate) fn rawObjective(self, o : i32) : ObjectiveRaw {
+        return ObjectiveRaw { count: self.objCount.get(o), done: self.objDone.get(o) };
+    }
+
+    /** Overwrites the raw progress of objective `o`. */
+    pub(crate) fn setRawObjective(mut self, o : i32, r : ObjectiveRaw) : void {
+        self.objCount.set(o, r.count);
+        self.objDone.set(o, r.done);
+    }
+
+    /** True when the word `w` is a flag that is set. */
+    pub(crate) fn isFlagWord(self, w : i32) : bool {
+        return self.flags.has(w);
+    }
+
+    /** The amount paid under word `w`, or -1 when nothing was. */
+    pub(crate) fn paidWord(self, w : i32) : i64 {
+        return self.paid.getOr(w, 0 - 1);
+    }
+
+    /** Forgets every flag, payment, queued event and note. */
+    pub(crate) fn clearLoose(mut self) : void {
+        self.flags.clear();
+        self.paid.clear();
+        self.queue.clear();
+        self.notes.clear();
+    }
+
+    /** Sets flag word `w`. */
+    pub(crate) fn setFlagWord(mut self, w : i32) : void {
+        self.flags.put(w, true);
+    }
+
+    /** Records the amount paid under word `w`. */
+    pub(crate) fn setPaidWord(mut self, w : i32, amount : i64) : void {
+        self.paid.put(w, amount);
+    }
+
+    /** The saved form of this board (see `MissionSave`). */
+    pub fn save(self) : ByteBuf {
+        return MissionSave::save(self);
+    }
+
+    /** Restores a saved state; "" on success, else what was wrong (and nothing changed). */
+    pub fn load(mut self, b : ByteBuf) : string {
+        return MissionSave::load(self, b);
+    }
+}

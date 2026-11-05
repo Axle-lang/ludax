@@ -1,0 +1,404 @@
+// vehicle_model — an arcade car as a pure function: (parameters, state, input, ground) -> next state.
+//
+// The model keeps nothing between calls. `step` takes the state the car was in and the driver's input and
+// returns the state `dt` seconds later, so a fixed step makes a run a function of the starting state and the
+// list of inputs: replays, ghosts and netcode are all the same thing. It uses only `sinD`/`cosD`/`sqrtD`
+// and arithmetic, never the platform's libm, so the answer is the same on every machine.
+//
+// What it models, and how plainly:
+//   - Engine: a torque curve through gears (automatic, with a shift delay and a rev limiter) to a drive force
+//     at the road; the driven wheels' grip caps it.
+//   - Brakes, air drag (quadratic), rolling resistance and the pull of slopes act against motion and can bring
+//     the car to rest but never push it backwards.
+//   - Steering: the angle shrinks with speed; the yaw rate follows the kinematic bicycle `v tan(delta) / L`, and
+//     is held below what the tyres can corner at, so a car pushed too hard understeers.
+//   - Tyres: sideways slip is pulled out at a rate limited by what grip is left after the longitudinal force
+//     (the friction circle); asked for more, the car slides (`sliding`, `slip`). Downforce adds grip with speed.
+//     The handbrake leaves little sideways grip, which is how you drift.
+//   - Suspension: four springs and dampers at the corners, whose lengths come from the ground height under
+//     each wheel, give heave, pitch and roll. A bump stop and a final clamp keep every mount at least
+//     `minGap` above the ground at the end of every step, however fast the car arrives: no tunnelling.
+// The whole step runs `substeps` times at a fraction of `dt`.
+
+use crate::core::math::scalar::{absD, maxD, minD, clampD};
+use crate::core::math::trig::{sinD, cosD, sqrtD};
+use crate::openworld::terrain::GroundHeight;
+use crate::openworld::vehicle_params::VehicleParams;
+use crate::openworld::vehicle_state::{VehicleInput, VehicleState};
+
+/** Gravity in metres per second squared. */
+const VEH_G : f64 = 9.81;
+
+// Radians per second to revolutions per minute: 60 / (2 pi).
+const VEH_RAD_PER_SEC_TO_RPM : f64 = 9.549296585513721;
+
+// A stand-in for "no value" in a minimum or maximum over the wheels.
+const VEH_HUGE : f64 = 1000000.0;
+
+// Wheels, the share of the car each carries, and how much harder the bump stop pushes past full travel.
+const VEH_WHEELS : i32 = 4;
+const VEH_WHEEL_SHARE : f64 = 0.25;
+const VEH_BUMP_STIFFNESS : f64 = 10.0;
+
+// The handbrake adds this share of the full braking force.
+const VEH_HANDBRAKE_BRAKE : f64 = 0.25;
+
+// Steering and grip limits.
+const VEH_GRIP_USE : f64 = 0.95;
+const VEH_YAW_MIN_SPEED : f64 = 0.5;
+const VEH_SLIDE_MARGIN : f64 = 1.0001;
+
+// The body stops tilting beyond this angle, and a slip ratio is measured above this speed.
+const VEH_TILT_MAX : f64 = 0.6;
+const VEH_SLIP_FLOOR : f64 = 1.0;
+
+// Below this forward speed a selected reverse gear engages (and above it, the car is still rolling forwards).
+const VEH_REVERSE_FORWARD : f64 = 1.0;
+
+// One wheel-load pass: how many wheels touch, the spring forces and their moments, and the ground under them.
+struct VehicleLoad {
+    contacts : i32 = 0;
+    fsum     : f64 = 0.0;
+    mPitch   : f64 = 0.0;
+    mRoll    : f64 = 0.0;
+    hFront   : f64 = 0.0;
+    hRear    : f64 = 0.0;
+    hLeft    : f64 = 0.0;
+    hRight   : f64 = 0.0;
+}
+
+/** The vehicle model's functions. */
+pub class VehicleModel {
+    /** A car at rest on `ground` at (`x`, `z`), heading `yaw`, springs settled under its own weight. */
+    pub static fn placeAtRest(
+        p : VehicleParams,
+        x : f64,
+        z : f64,
+        yaw : f64,
+        ground : GroundHeight
+    ) : VehicleState {
+        let c : f64 = cosD(yaw);
+        let s : f64 = sinD(yaw);
+        let mut hSum : f64 = 0.0;
+        for (i of 0..VEH_WHEELS) {
+            let fo : f64 = VehicleModel::wheelAhead(p, i);
+            let lo : f64 = VehicleModel::wheelSide(p, i);
+            hSum = hSum + ground.heightAt(x + c * fo - s * lo, z + s * fo + c * lo);
+        }
+        let sag : f64 = p.mass * VEH_G / (4.0 * p.springK);
+        return VehicleState {
+            x: x,
+            y: hSum * 0.25 + p.restLength - sag,
+            z: z,
+            yaw: yaw,
+            vf: 0.0,
+            vl: 0.0,
+            vy: 0.0,
+            yawRate: 0.0,
+            pitch: 0.0,
+            roll: 0.0,
+            pitchRate: 0.0,
+            rollRate: 0.0,
+            steerAngle: 0.0,
+            gear: 1,
+            shiftLeft: 0.0,
+            rpm: p.idleRpm,
+            slip: 0.0,
+            sliding: false,
+            wheelsDown: 4,
+        };
+    }
+
+    /** Distance of wheel `i` ahead of the centre of mass (wheels 0 and 1 are the front ones). */
+    pub static fn wheelAhead(p : VehicleParams, i : i32) : f64 {
+        if (i < 2) {
+            return p.wheelBase * 0.5;
+        }
+        return 0.0 - p.wheelBase * 0.5;
+    }
+
+    /** Distance of wheel `i` along the sideways axis (even wheels on the negative side). */
+    pub static fn wheelSide(p : VehicleParams, i : i32) : f64 {
+        if ((i & 1) == 0) {
+            return 0.0 - p.halfTrack;
+        }
+        return p.halfTrack;
+    }
+
+    /** The smallest height of any wheel mount above the ground under it; the model keeps this at `minGap` or more. */
+    pub static fn clearance(p : VehicleParams, s : VehicleState, ground : GroundHeight) : f64 {
+        let c : f64 = cosD(s.yaw);
+        let sn : f64 = sinD(s.yaw);
+        let mut low : f64 = VEH_HUGE;
+        for (i of 0..VEH_WHEELS) {
+            let fo : f64 = VehicleModel::wheelAhead(p, i);
+            let lo : f64 = VehicleModel::wheelSide(p, i);
+            let gap : f64 = s.y + s.pitch * fo + s.roll * lo
+                - ground.heightAt(s.x + c * fo - sn * lo, s.z + sn * fo + c * lo);
+            low = minD(low, gap);
+        }
+        return low;
+    }
+
+    // One pass over the four wheels: spring forces, their moments and the ground height under each.
+    static fn loads(
+        p : VehicleParams,
+        s : VehicleState,
+        ground : GroundHeight,
+        c : f64,
+        sn : f64,
+        vwx : f64,
+        vwz : f64,
+        h : f64
+    ) : VehicleLoad {
+        let travel : f64 = p.restLength - p.minGap;
+        let mut load : VehicleLoad = VehicleLoad {};
+        for (i of 0..VEH_WHEELS) {
+            let fo : f64 = VehicleModel::wheelAhead(p, i);
+            let lo : f64 = VehicleModel::wheelSide(p, i);
+            let wx : f64 = s.x + c * fo - sn * lo;
+            let wz : f64 = s.z + sn * fo + c * lo;
+            let hg : f64 = ground.heightAt(wx, wz);
+            let hn : f64 = ground.heightAt(wx + vwx * h, wz + vwz * h);
+            let hdot : f64 = (hn - hg) / h;
+            if (fo > 0.0) {
+                load.hFront = load.hFront + hg;
+            } else {
+                load.hRear = load.hRear + hg;
+            }
+            if (lo < 0.0) {
+                load.hLeft = load.hLeft + hg;
+            } else {
+                load.hRight = load.hRight + hg;
+            }
+            let compression : f64 = p.restLength - (s.y + s.pitch * fo + s.roll * lo - hg);
+            if (compression > 0.0) {
+                load.contacts = load.contacts + 1;
+                let closing : f64 = 0.0 - (s.vy + s.pitchRate * fo + s.rollRate * lo - hdot);
+                let mut f : f64 = p.springK * compression + p.damperC * closing;
+                if (compression > travel) {
+                    f = f + p.springK * VEH_BUMP_STIFFNESS * (compression - travel);
+                }
+                f = maxD(f, 0.0);
+                load.fsum = load.fsum + f;
+                load.mPitch = load.mPitch + f * fo;
+                load.mRoll = load.mRoll + f * lo;
+            }
+        }
+        return load;
+    }
+
+    /** Advances the car by `dt` seconds (in `substeps` pieces). Answers the new state; `s` is not changed. */
+    pub static fn step(
+        p : VehicleParams,
+        s : VehicleState,
+        input : VehicleInput,
+        ground : GroundHeight,
+        dt : f64
+    ) : VehicleState {
+        if (dt <= 0.0) {
+            return s;
+        }
+        let n : i32 = vehMaxI(p.substeps, 1);
+        let h : f64 = dt / (n as f64);
+        let mut cur : VehicleState = s;
+        for (k of 0..n) {
+            cur = VehicleModel::piece(p, cur, input, ground, h);
+        }
+        return cur;
+    }
+
+    // One substep of length h.
+    static fn piece(
+        p : VehicleParams,
+        s : VehicleState,
+        input : VehicleInput,
+        ground : GroundHeight,
+        h : f64
+    ) : VehicleState {
+        let c : f64 = cosD(s.yaw);
+        let sn : f64 = sinD(s.yaw);
+        let vwx : f64 = s.vf * c - s.vl * sn;
+        let vwz : f64 = s.vf * sn + s.vl * c;
+        let load : VehicleLoad = VehicleModel::loads(p, s, ground, c, sn, vwx, vwz, h);
+        let onGround : bool = load.contacts > 0;
+        let share : f64 = (load.contacts as f64) * VEH_WHEEL_SHARE;
+        let slopeLong : f64 = ((load.hFront - load.hRear) * 0.5) / p.wheelBase;
+        let slopeSide : f64 = ((load.hRight - load.hLeft) * 0.5) / (2.0 * p.halfTrack);
+
+        // Gearbox.
+        let mut gear : i32 = s.gear;
+        let mut shiftLeft : f64 = maxD(s.shiftLeft - h, 0.0);
+        if (input.reverse && s.vf <= VEH_REVERSE_FORWARD) {
+            gear = 0 - 1;
+        } else if (!input.reverse && gear < 0) {
+            gear = 1;
+            shiftLeft = 0.0;
+        }
+        if (gear > 0 && shiftLeft <= 0.0) {
+            let engine : f64 = p.rpmAt(gear, s.vf);
+            if (engine > p.upshiftRpm && gear < p.gearCount()) {
+                gear = gear + 1;
+                shiftLeft = p.shiftTime;
+            } else if (engine < p.downshiftRpm && gear > 1) {
+                gear = gear - 1;
+                shiftLeft = p.shiftTime * 0.5;
+            }
+        }
+        let mut ratio : f64 = p.reverseRatio;
+        if (gear > 0) {
+            ratio = p.ratio(gear);
+        }
+        let wheelRpm : f64 = absD(s.vf) / p.wheelRadius * ratio * p.finalDrive * VEH_RAD_PER_SEC_TO_RPM;
+
+        // Forces along the car.
+        let speedAbs : f64 = absD(s.vf);
+        let normal : f64 = (p.mass * VEH_G + p.downforce(speedAbs)) * share;
+        let pedal : f64 = clampD(input.throttle, 0.0, 1.0);
+        let mut drive : f64 = 0.0;
+        let wrongWay : bool = input.reverse && s.vf > VEH_REVERSE_FORWARD;
+        let backLimit : bool = gear < 0 && s.vf <= 0.0 - p.reverseMax;
+        if (onGround && shiftLeft <= 0.0 && wheelRpm < p.redlineRpm && !wrongWay && !backLimit) {
+            let launching : f64 = maxD(wheelRpm, p.launchRpm);
+            drive = pedal * p.torqueAt(launching) * ratio * p.finalDrive * p.driveEfficiency / p.wheelRadius;
+            let cap : f64 = p.grip * normal * p.driveShare;
+            drive = minD(drive, cap);
+            if (gear < 0) {
+                drive = 0.0 - drive;
+            }
+        }
+        let mut brakeAsk : f64 = clampD(input.brake, 0.0, 1.0) * p.brakeForce;
+        if (input.handbrake) {
+            brakeAsk = brakeAsk + VEH_HANDBRAKE_BRAKE * p.brakeForce;
+        }
+        let brake : f64 = minD(brakeAsk, p.grip * normal);
+        let drag : f64 = p.dragForce(speedAbs);
+        let rolling : f64 = p.rollingForce() * share;
+        let mut slopeX : f64 = 0.0;
+        let mut slopeY : f64 = 0.0;
+        if (onGround) {
+            slopeX = 0.0 - p.mass * VEH_G * slopeLong;
+            slopeY = 0.0 - p.mass * VEH_G * slopeSide;
+        }
+        let pushed : f64 = s.vf + ((drive + slopeX) / p.mass + s.yawRate * s.vl) * h;
+        let slowing : f64 = (brake + drag + rolling) / p.mass * h;
+        let vf2 : f64 = pushed - vehSign(pushed) * minD(absD(pushed), slowing);
+
+        // Sideways: grip left after the longitudinal force, the friction circle.
+        let mut latGrip : f64 = p.grip * normal;
+        if (input.handbrake) {
+            latGrip = latGrip * p.handbrakeGrip;
+        }
+        let used : f64 = minD(absD(drive) + brake, p.grip * normal);
+        let fyMax : f64 = sqrtD(maxD(latGrip * latGrip - used * used, 0.0));
+        let wantDv : f64 = 0.0 - s.vl * p.lateralStiffness * h;
+        let capDv : f64 = fyMax / p.mass * h;
+        let mut tireDv : f64 = 0.0;
+        let mut sliding : bool = false;
+        if (onGround) {
+            tireDv = clampD(wantDv, 0.0 - capDv, capDv);
+            sliding = absD(wantDv) > capDv * VEH_SLIDE_MARGIN && absD(wantDv) > 0.0;
+        }
+        let vl2 : f64 = s.vl + tireDv + slopeY / p.mass * h - s.yawRate * s.vf * h;
+
+        // Steering and yaw.
+        let wheel : f64 = clampD(input.steer, 0.0 - 1.0, 1.0);
+        let ratioV : f64 = speedAbs / p.steerSpeedRef;
+        let want : f64 = wheel * p.maxSteer / (1.0 + ratioV * ratioV);
+        let angle : f64 = s.steerAngle + clampD(want - s.steerAngle, 0.0 - p.steerRate * h, p.steerRate * h);
+        let mut yawRate2 : f64 = s.yawRate;
+        if (onGround) {
+            let turn : f64 = vf2 * (sinD(angle) / cosD(angle)) / p.wheelBase;
+            let limit : f64 = p.grip * normal / p.mass * VEH_GRIP_USE / maxD(absD(vf2), VEH_YAW_MIN_SPEED);
+            let target : f64 = clampD(turn, 0.0 - limit, limit);
+            yawRate2 = s.yawRate + (target - s.yawRate) * minD(1.0, p.yawResponse * h);
+        }
+        let yaw2 : f64 = s.yaw + yawRate2 * h;
+
+        // Body: heave, pitch and roll from the springs plus weight transfer.
+        let tireFx : f64 = drive - vehSign(pushed) * brake;
+        let tireFy : f64 = tireDv / h * p.mass;
+        let heaveAcc : f64 = load.fsum / p.mass - VEH_G;
+        let iy : f64 = p.mass * p.pitchRadius * p.pitchRadius;
+        let ix : f64 = p.mass * p.rollRadius * p.rollRadius;
+        let pitchAcc : f64 = (load.mPitch + tireFx * p.cgHeight * share) / iy;
+        let rollAcc : f64 = (load.mRoll + tireFy * p.cgHeight * share) / ix;
+        let vy2 : f64 = s.vy + heaveAcc * h;
+        let pitchRate2 : f64 = s.pitchRate + pitchAcc * h;
+        let rollRate2 : f64 = s.rollRate + rollAcc * h;
+
+        // Move.
+        let c2 : f64 = cosD(yaw2);
+        let s2 : f64 = sinD(yaw2);
+        let x2 : f64 = s.x + (vf2 * c2 - vl2 * s2) * h;
+        let z2 : f64 = s.z + (vf2 * s2 + vl2 * c2) * h;
+        let mut y2 : f64 = s.y + vy2 * h;
+        let mut pitch2 : f64 = s.pitch + pitchRate2 * h;
+        let mut roll2 : f64 = s.roll + rollRate2 * h;
+        let mut vyOut : f64 = vy2;
+        let mut pitchRateOut : f64 = pitchRate2;
+        let mut rollRateOut : f64 = rollRate2;
+        if (absD(pitch2) > VEH_TILT_MAX) {
+            pitch2 = clampD(pitch2, 0.0 - VEH_TILT_MAX, VEH_TILT_MAX);
+            pitchRateOut = 0.0;
+        }
+        if (absD(roll2) > VEH_TILT_MAX) {
+            roll2 = clampD(roll2, 0.0 - VEH_TILT_MAX, VEH_TILT_MAX);
+            rollRateOut = 0.0;
+        }
+
+        // The ground is solid: no mount ends the step closer than minGap, whatever happened above.
+        let mut needY : f64 = 0.0 - VEH_HUGE;
+        for (i of 0..VEH_WHEELS) {
+            let fo : f64 = VehicleModel::wheelAhead(p, i);
+            let lo : f64 = VehicleModel::wheelSide(p, i);
+            let hg : f64 = ground.heightAt(x2 + c2 * fo - s2 * lo, z2 + s2 * fo + c2 * lo);
+            needY = maxD(needY, hg + p.minGap - pitch2 * fo - roll2 * lo);
+        }
+        if (y2 < needY) {
+            y2 = needY;
+            if (vyOut < 0.0) {
+                vyOut = 0.0;
+            }
+        }
+
+        return VehicleState {
+            x: x2,
+            y: y2,
+            z: z2,
+            yaw: yaw2,
+            vf: vf2,
+            vl: vl2,
+            vy: vyOut,
+            yawRate: yawRate2,
+            pitch: pitch2,
+            roll: roll2,
+            pitchRate: pitchRateOut,
+            rollRate: rollRateOut,
+            steerAngle: angle,
+            gear: gear,
+            shiftLeft: shiftLeft,
+            rpm: maxD(wheelRpm, p.idleRpm),
+            slip: absD(vl2) / maxD(absD(vf2), VEH_SLIP_FLOOR),
+            sliding: sliding,
+            wheelsDown: load.contacts,
+        };
+    }
+}
+
+fn vehMaxI(a : i32, b : i32) : i32 {
+    if (a > b) {
+        return a;
+    }
+    return b;
+}
+
+fn vehSign(v : f64) : f64 {
+    if (v > 0.0) {
+        return 1.0;
+    }
+    if (v < 0.0) {
+        return 0.0 - 1.0;
+    }
+    return 0.0;
+}

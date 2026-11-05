@@ -1,0 +1,348 @@
+// mission_text — missions written as text, read into a `MissionBook`.
+//
+// One statement per line; blank lines and `#` comments are ignored, indentation does not matter. A mission is
+// a block closed by `end`:
+//
+//     mission deliver "Deliver the crate" auto     # `auto`: starts itself once available
+//       requires intro                              # another mission that must be completed first
+//       stage pickup
+//         collect crate 1
+//         reach 1200 300 25 optional                # `optional` after any objective: not needed for the stage
+//       stage drive
+//         escort courier 4000 2500 40
+//         timer 5.5                                 # seconds
+//         kill wolf 3
+//         flag gate_open
+//       fail timeout 600                            # seconds since the mission started
+//       fail flag alarm
+//       fail death courier
+//       reward gold 250
+//     end
+//
+// Objectives: `reach X Z RADIUS`, `kill KIND COUNT`, `collect KIND COUNT`, `timer SECONDS`,
+// `escort WHO X Z RADIUS`, `flag NAME`. Names are single words; titles are quoted. Reading goes on after a bad
+// line, so one typo reports itself with its line and column and the rest is still read; at the end the whole
+// book is validated (unknown prerequisites, loops, empty stages) and those problems are reported on the line
+// of the mission they are about.
+
+use crate::core::collections::vec::Vec;
+use crate::openworld::mission_book::{BookCheck, MissionBook};
+use crate::runtime::text::{ParseReport, TextScan, TextWords};
+
+// Whole numbers must fit the i32 fields they land in, with a margin.
+const MISSION_WHOLE_LIMIT : i64 = 2000000000;
+
+// The state of one parse.
+class MissionParser {
+    report  : ParseReport;
+    words   : TextWords;
+    line    : i32 = 0;
+    inside  : bool = false;
+    staged  : bool = false;
+    opened  : string = "";
+    headers : Vec<i32>;
+    bad     : bool = false;
+
+    constructor() {
+        self.report = new ParseReport();
+        self.words = new TextWords();
+        self.headers = new Vec<i32>();
+    }
+
+    fn problem(mut self, column : i32, message : string) : void {
+        self.report.add(self.line, column, message);
+        self.bad = true;
+    }
+
+    // Word `i` must be a decimal; answers it (0 when it is not, with a problem recorded).
+    fn number(mut self, i : i32, what : string) : f64 {
+        let w : string = self.words.text(i);
+        if (!TextScan::isDecimal(w)) {
+            self.problem(self.words.column(i), "${what} must be a number, not '${w}'");
+            return 0.0;
+        }
+        return TextScan::toDecimal(w);
+    }
+
+    // Word `i` must be a whole number.
+    fn whole(mut self, i : i32, what : string) : i32 {
+        let w : string = self.words.text(i);
+        if (!TextScan::isInt(w)) {
+            self.problem(self.words.column(i), "${what} must be a whole number, not '${w}'");
+            return 0;
+        }
+        let v : i64 = TextScan::toInt(w);
+        if (v > MISSION_WHOLE_LIMIT || v < 0 - MISSION_WHOLE_LIMIT) {
+            self.problem(self.words.column(i), "${what} is too large");
+            return 0;
+        }
+        return v as i32;
+    }
+
+    // The statement must have exactly `n` words, plus a final `optional` if `canBeOptional`. Answers whether it is marked optional.
+    fn arity(mut self, n : i32, canBeOptional : bool, usage : string) : bool {
+        let have : i32 = self.words.count();
+        if (canBeOptional && have == n + 1 && self.words.text(n) == "optional") {
+            return true;
+        }
+        if (have < n) {
+            self.problem(self.endColumn(), "expected ${usage}");
+        } else if (have > n) {
+            self.problem(self.words.column(n), "unexpected '${self.words.text(n)}' after ${usage}");
+        }
+        return false;
+    }
+
+    fn endColumn(self) : i32 {
+        let n : i32 = self.words.count();
+        return self.words.column(n - 1) + self.words.text(n - 1).byteLength as i32 + 1;
+    }
+
+    // Records the refusal of a builder call, if any.
+    fn built(mut self, book : MissionBook, ok : bool) : void {
+        if (!ok) {
+            self.problem(self.words.column(0), book.lastProblem());
+        }
+    }
+
+    fn needMission(mut self) : bool {
+        if (!self.inside) {
+            self.problem(
+                self.words.column(0),
+                "'${self.words.text(0)}' belongs inside a mission ... end block"
+            );
+            return false;
+        }
+        return true;
+    }
+
+    fn needStage(mut self) : bool {
+        if (!self.needMission()) {
+            return false;
+        }
+        if (!self.staged) {
+            self.problem(self.words.column(0), "'${self.words.text(0)}' belongs inside a stage");
+            return false;
+        }
+        return true;
+    }
+
+    fn statement(mut self, book : MissionBook, text : string) : void {
+        self.bad = false;
+        self.words = TextScan::words(text);
+        if (self.words.broken > 0) {
+            self.problem(self.words.broken, "a quote is never closed");
+            return;
+        }
+        if (self.words.count() == 0) {
+            return;
+        }
+        let key : string = self.words.text(0);
+        if (key == "mission") {
+            self.beginMission(book);
+        } else if (key == "end") {
+            if (!self.inside) {
+                self.problem(self.words.column(0), "'end' without a mission");
+            } else {
+                self.arity(1, false, "'end' alone");
+            }
+            self.inside = false;
+            self.staged = false;
+        } else if (key == "requires") {
+            if (self.needMission()) {
+                self.arity(2, false, "'requires MISSION'");
+                if (self.words.count() == 2) {
+                    self.built(book, book.requires(self.words.text(1)));
+                }
+            }
+        } else if (key == "stage") {
+            if (self.needMission()) {
+                self.arity(2, false, "'stage NAME'");
+                if (self.words.count() == 2) {
+                    self.built(book, book.beginStage(self.words.text(1)));
+                    self.staged = true;
+                }
+            }
+        } else if (key == "fail") {
+            self.failure(book);
+        } else if (key == "reward") {
+            if (self.needMission()) {
+                self.arity(3, false, "'reward NAME AMOUNT'");
+                if (self.words.count() == 3) {
+                    let amount : i32 = self.whole(2, "the amount");
+                    if (!self.bad) {
+                        self.built(book, book.reward(self.words.text(1), amount as i64));
+                    }
+                }
+            }
+        } else if (key == "reach" || key == "kill" || key == "collect" || key == "timer" || key == "escort"
+            || key == "flag") {
+            if (self.needStage()) {
+                self.objective(book, key);
+            }
+        } else {
+            self.problem(self.words.column(0), "unknown statement '${key}'");
+        }
+    }
+
+    fn beginMission(mut self, book : MissionBook) : void {
+        if (self.inside) {
+            self.problem(self.words.column(0), "mission '${self.opened}' is not closed with 'end'");
+        }
+        let n : i32 = self.words.count();
+        if (n < 2) {
+            self.problem(self.endColumn(), "expected 'mission NAME [\"Title\"] [auto]'");
+            return;
+        }
+        let mut title : string = "";
+        let mut auto : bool = false;
+        let mut haveTitle : bool = false;
+        for (i of 2..n) {
+            if (self.words.text(i) == "auto" && !auto) {
+                auto = true;
+            } else if (!haveTitle) {
+                title = self.words.text(i);
+                haveTitle = true;
+            } else {
+                self.problem(self.words.column(i), "unexpected '${self.words.text(i)}'");
+                return;
+            }
+        }
+        if (book.beginMission(self.words.text(1), title, auto)) {
+            self.inside = true;
+            self.staged = false;
+            self.opened = self.words.text(1) + "";
+            self.headers.push(self.line);
+        } else {
+            self.built(book, false);
+            self.inside = false;
+        }
+    }
+
+    fn failure(mut self, book : MissionBook) : void {
+        if (!self.needMission()) {
+            return;
+        }
+        if (self.words.count() < 3) {
+            self.problem(
+                self.endColumn(),
+                "expected 'fail timeout SECONDS', 'fail flag NAME' or 'fail death NAME'"
+            );
+            return;
+        }
+        let kind : string = self.words.text(1);
+        self.arity(3, false, "'fail ${kind} VALUE'");
+        if (self.words.count() != 3) {
+            return;
+        }
+        if (kind == "timeout") {
+            let secs : f64 = self.number(2, "the time");
+            if (!self.bad) {
+                self.built(book, book.failAfter(secs));
+            }
+        } else if (kind == "flag") {
+            self.built(book, book.failOnFlag(self.words.text(2)));
+        } else if (kind == "death") {
+            self.built(book, book.failOnDeath(self.words.text(2)));
+        } else {
+            self.problem(
+                self.words.column(1),
+                "'fail' is followed by timeout, flag or death, not '${kind}'"
+            );
+        }
+    }
+
+    fn objective(mut self, book : MissionBook, key : string) : void {
+        let mut optional : bool = false;
+        let mut made : bool = false;
+        if (key == "reach") {
+            optional = self.arity(4, true, "'reach X Z RADIUS'");
+            if (self.words.count() >= 4) {
+                let x : f64 = self.number(1, "x");
+                let z : f64 = self.number(2, "z");
+                let r : f64 = self.number(3, "the radius");
+                if (!self.bad) {
+                    self.built(book, book.reach(x, z, r));
+                    made = true;
+                }
+            }
+        } else if (key == "kill" || key == "collect") {
+            optional = self.arity(3, true, "'${key} KIND COUNT'");
+            if (self.words.count() >= 3) {
+                let n : i32 = self.whole(2, "the count");
+                if (!self.bad) {
+                    if (key == "kill") {
+                        self.built(book, book.kill(self.words.text(1), n));
+                    } else {
+                        self.built(book, book.collect(self.words.text(1), n));
+                    }
+                    made = true;
+                }
+            }
+        } else if (key == "timer") {
+            optional = self.arity(2, true, "'timer SECONDS'");
+            if (self.words.count() >= 2) {
+                let secs : f64 = self.number(1, "the time");
+                if (!self.bad) {
+                    self.built(book, book.timer(secs));
+                    made = true;
+                }
+            }
+        } else if (key == "escort") {
+            optional = self.arity(5, true, "'escort WHO X Z RADIUS'");
+            if (self.words.count() >= 5) {
+                let x : f64 = self.number(2, "x");
+                let z : f64 = self.number(3, "z");
+                let r : f64 = self.number(4, "the radius");
+                if (!self.bad) {
+                    self.built(book, book.escort(self.words.text(1), x, z, r));
+                    made = true;
+                }
+            }
+        } else {
+            optional = self.arity(2, true, "'flag NAME'");
+            if (self.words.count() >= 2) {
+                self.built(book, book.flag(self.words.text(1)));
+                made = true;
+            }
+        }
+        if (made && optional && !self.bad) {
+            self.built(book, book.markOptional());
+        }
+    }
+
+    // Reads every line, then validates the book and reports what only the whole book shows.
+    pub(crate) fn run(mut self, book : MissionBook, text : string) : ParseReport {
+        let lines : i32 = TextScan::lineCount(text);
+        for (n of 0..lines) {
+            self.line = n + 1;
+            self.statement(book, TextScan::lineAt(text, n));
+        }
+        if (self.inside) {
+            self.line = lines;
+            self.problem(1, "mission '${self.opened}' is not closed with 'end'");
+        }
+        let check : BookCheck = book.validate();
+        for (i of 0..check.count()) {
+            let m : i32 = check.missionAt(i);
+            let mut at : i32 = lines;
+            if (m >= 0 && m < self.headers.len()) {
+                at = self.headers.get(m);
+            }
+            self.report.add(at, 1, check.messageAt(i));
+        }
+        return self.report;
+    }
+}
+
+/** Reads mission definitions from text. */
+pub class MissionText {
+    /**
+     * Adds the missions written in `text` to `book`. The returned report lists every problem with its line and
+     * column; statements that were fine are in the book even when others were not.
+     */
+    pub static fn parse(book : MissionBook, text : string) : ParseReport {
+        let p : MissionParser = new MissionParser();
+        return p.run(book, text);
+    }
+}

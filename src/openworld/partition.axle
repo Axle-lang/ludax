@@ -1,0 +1,248 @@
+// partition — the world cut into square cells, each with a list of things that live in it.
+//
+// An open world is too big to exist all at once. It is divided into square cells (`cellSize` metres a side,
+// positions in f64); every cell has a content list: entity templates with positions, in the order they were
+// added. The content is data, not entities — a cell's entries become entities only while the `CellStreamer`
+// keeps that cell active, and vanish again when it lets go, so memory and entity counts follow the player,
+// not the size of the world.
+//
+// Content comes from two places. A game (or a level file) `add`s authored entries. And a cell nobody authored
+// is filled on first use by a scatter rule: `scatterPerCell` entries whose templates are picked by weight and
+// whose places come from a `Pcg32` seeded by the world seed and the cell's coordinates alone — so the same
+// cell has the same content whichever way the player arrived, the order cells are visited in changes nothing,
+// and a world needs no storage beyond its seed. Authoring must happen before a cell is first used.
+
+use crate::core::collections::map::Map;
+use crate::core::collections::vec::Vec;
+use crate::core::id::hash::{combineHash, mixI64};
+use crate::core::id::string_id::{StringId, StringInterner};
+use crate::core::math::scalar::TAU_D;
+use crate::core::math::trig::sqrtD;
+use crate::core::rng::pcg32::Pcg32;
+use crate::openworld::terrain::GroundHeight;
+
+// A cell key is the x index in the high half and the z index, biased to be unsigned, in the low half.
+const CELL_KEY_SHIFT : i64 = 32;
+const CELL_KEY_LOW_MASK : i64 = 4294967295;
+const CELL_KEY_Z_BIAS : i64 = 2147483648;
+
+/** One thing in a cell: which template, where, and which way it faces. */
+pub struct CellEntry {
+    /** The template number (see `WorldPartition::defineTemplate`). */
+    pub template : i32;
+
+    /** World position. */
+    pub x : f64;
+
+    /** Height. */
+    pub y : f64;
+
+    /** World position. */
+    pub z : f64;
+
+    /** Heading in radians about the vertical axis. */
+    pub yaw : f64;
+}
+
+/** Cell coordinates and keys. */
+pub class Cells {
+    /** The cell index along one axis of the position `p` for cells `size` metres wide (floor, so negative positions work). */
+    pub static fn index(p : f64, size : f64) : i32 {
+        let q : f64 = p / size;
+        let t : i32 = q as i32;
+        if ((t as f64) > q) {
+            return t - 1;
+        }
+        return t;
+    }
+
+    /** A single number naming cell (`cx`, `cz`); different cells never share one. */
+    pub static fn key(cx : i32, cz : i32) : i64 {
+        return (cx as i64 << CELL_KEY_SHIFT) | ((cz as i64 + CELL_KEY_Z_BIAS) & CELL_KEY_LOW_MASK);
+    }
+
+    /** The x index of a key. */
+    pub static fn keyX(key : i64) : i32 {
+        return (key >> CELL_KEY_SHIFT) as i32;
+    }
+
+    /** The z index of a key. */
+    pub static fn keyZ(key : i64) : i32 {
+        return ((key & CELL_KEY_LOW_MASK) - CELL_KEY_Z_BIAS) as i32;
+    }
+
+    /** The distance from the point (`px`, `pz`) to the nearest point of cell (`cx`, `cz`); 0 inside it. */
+    pub static fn distance(cx : i32, cz : i32, size : f64, px : f64, pz : f64) : f64 {
+        let half : f64 = size * 0.5;
+        let mut dx : f64 = px - ((cx as f64) * size + half);
+        let mut dz : f64 = pz - ((cz as f64) * size + half);
+        if (dx < 0.0) {
+            dx = 0.0 - dx;
+        }
+        if (dz < 0.0) {
+            dz = 0.0 - dz;
+        }
+        dx = dx - half;
+        dz = dz - half;
+        if (dx < 0.0) {
+            dx = 0.0;
+        }
+        if (dz < 0.0) {
+            dz = 0.0;
+        }
+        return sqrtD(dx * dx + dz * dz);
+    }
+}
+
+/** The cells of a world and what is in them. */
+pub class WorldPartition {
+    size        : f64 = 256.0;
+    seed        : i64 = 0;
+    names       : StringInterner;
+    weights     : Vec<i32>;
+    entries     : Vec<CellEntry>;
+    nextEntry   : Vec<i32>;
+    heads       : Map<i64, i32>;
+    tails       : Map<i64, i32>;
+    counts      : Map<i64, i32>;
+    filled      : Map<i64, bool>;
+    perCell     : i32 = 0;
+    totalWeight : i32 = 0;
+
+    /** A world of cells `cellSize` metres wide (at least 1) whose scatter is seeded by `seed`. */
+    constructor(cellSize : f64, seed : i64) {
+        self.size = cellSize;
+        if (cellSize < 1.0) {
+            self.size = 1.0;
+        }
+        self.seed = seed;
+        self.names = new StringInterner();
+        self.weights = new Vec<i32>();
+        self.entries = new Vec<CellEntry>();
+        self.nextEntry = new Vec<i32>();
+        self.heads = new Map<i64, i32>();
+        self.tails = new Map<i64, i32>();
+        self.counts = new Map<i64, i32>();
+        self.filled = new Map<i64, bool>();
+    }
+
+    /** The side of a cell in metres. */
+    pub fn cellSize(self) : f64 {
+        return self.size;
+    }
+
+    /** Declares a kind of thing that can stand in the world; `weight` is how often the scatter picks it (0: never). Answers its number. */
+    pub fn defineTemplate(mut self, name : string, weight : i32) : i32 {
+        let known : StringId = self.names.find(name);
+        if (!known.isNone()) {
+            return known.raw;
+        }
+        let id : StringId = self.names.intern(name);
+        let mut w : i32 = weight;
+        if (w < 0) {
+            w = 0;
+        }
+        self.weights.push(w);
+        self.totalWeight = self.totalWeight + w;
+        return id.raw;
+    }
+
+    /** How many templates are declared. */
+    pub fn templateCount(self) : i32 {
+        return self.weights.len();
+    }
+
+    /** The name of template `t`. */
+    pub fn templateName(self, t : i32) : string {
+        return self.names.name(StringId { raw: t }) + "";
+    }
+
+    /** The scatter fills each unauthored cell with this many entries (0: empty cells stay empty). */
+    pub fn setScatter(mut self, perCell : i32) : void {
+        self.perCell = perCell;
+        if (perCell < 0) {
+            self.perCell = 0;
+        }
+    }
+
+    /** Adds an authored entry; false when the template does not exist. The entry belongs to the cell containing (`x`, `z`). */
+    pub fn add(mut self, template : i32, x : f64, y : f64, z : f64, yaw : f64) : bool {
+        if (template < 0 || template >= self.weights.len()) {
+            return false;
+        }
+        let key : i64 = Cells::key(Cells::index(x, self.size), Cells::index(z, self.size));
+        self.append(key, CellEntry { template: template, x: x, y: y, z: z, yaw: yaw });
+        self.filled.put(key, true);
+        return true;
+    }
+
+    // Links an entry at the end of its cell's list.
+    fn append(mut self, key : i64, e : CellEntry) : void {
+        let at : i32 = self.entries.len();
+        self.entries.push(e);
+        self.nextEntry.push(-1);
+        if (self.heads.has(key)) {
+            self.nextEntry.set(self.tails.get(key), at);
+            self.tails.put(key, at);
+            self.counts.put(key, self.counts.get(key) + 1);
+        } else {
+            self.heads.put(key, at);
+            self.tails.put(key, at);
+            self.counts.put(key, 1);
+        }
+    }
+
+    /**
+     * Makes sure cell (`cx`, `cz`) has its content: an authored cell is left as it is; any other is filled by the
+     * scatter rule, standing on `ground`, the first time it is asked for. Cheap on later calls.
+     */
+    pub fn ensure(mut self, cx : i32, cz : i32, ground : GroundHeight) : void {
+        let key : i64 = Cells::key(cx, cz);
+        if (self.filled.has(key)) {
+            return;
+        }
+        self.filled.put(key, true);
+        if (self.perCell == 0 || self.totalWeight == 0) {
+            return;
+        }
+        let h : i64 = combineHash(combineHash(self.seed, cx as i64), cz as i64);
+        let r : Pcg32 = new Pcg32(mixI64(h) as u64, 17);
+        for (i of 0..self.perCell) {
+            let mut pick : i32 = r.nextBelow(self.totalWeight as u32) as i32;
+            let mut t : i32 = 0;
+            while (t < self.weights.len() - 1 && pick >= self.weights.get(t)) {
+                pick = pick - self.weights.get(t);
+                t = t + 1;
+            }
+            let x : f64 = (cx as f64 + r.nextF64()) * self.size;
+            let z : f64 = (cz as f64 + r.nextF64()) * self.size;
+            let yaw : f64 = r.nextF64() * TAU_D;
+            self.append(key, CellEntry { template: t, x: x, y: ground.heightAt(x, z), z: z, yaw: yaw });
+        }
+    }
+
+    /** How many entries cell `key` holds now. */
+    pub fn countIn(self, key : i64) : i32 {
+        return self.counts.getOr(key, 0);
+    }
+
+    /** The first entry number of cell `key`, or -1. Walk on with `nextIn`. */
+    pub fn firstIn(self, key : i64) : i32 {
+        return self.heads.getOr(key, -1);
+    }
+
+    /** The entry after entry `i` in the same cell, or -1. */
+    pub fn nextIn(self, i : i32) : i32 {
+        return self.nextEntry.get(i);
+    }
+
+    /** Entry number `i`. */
+    pub fn entry(self, i : i32) : CellEntry {
+        return self.entries.get(i);
+    }
+
+    /** How many entries exist in all cells that have been filled so far. */
+    pub fn totalEntries(self) : i32 {
+        return self.entries.len();
+    }
+}

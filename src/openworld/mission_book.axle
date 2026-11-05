@@ -1,0 +1,704 @@
+// mission_book — the definitions of missions: what they ask, in which order, and what they pay.
+//
+// A mission is a list of stages; a stage is a set of objectives that must all be done (except those marked
+// optional) before the next stage opens. Around that: prerequisites (missions that must be completed first),
+// rewards (named amounts granted on completion) and failure conditions (a time limit, a flag, the death of
+// something). The book holds definitions only — nothing in it changes while the game runs; the `MissionBoard`
+// holds the play state.
+//
+// Definitions are built through a cursor: `beginMission`, then `requires`/`fail...`/`reward`, then `beginStage`
+// and its objectives, then the next stage, then the next mission. Every call applies to the mission and stage
+// begun last, which is why the tables below can stay flat and contiguous. The same calls are what the text
+// format (`mission_text`) makes for you. A builder call that cannot be right (an objective before any stage, a
+// negative count, a repeated name) answers false and changes nothing; `validate` finds what only shows up when
+// the whole book is known (a prerequisite that does not exist, prerequisites that chase their own tail).
+//
+// Objective kinds: reach an area, kill N of a kind, collect N of a kind, wait for a time, escort something to
+// an area, wait for a flag. Kill and collect are about named kinds (`wolf`, `crate`); the game decides what
+// counts and tells the board with events.
+
+use crate::core::collections::vec::Vec;
+use crate::core::id::hash::{combineHash, fnv1a64};
+use crate::core::id::string_id::{StringId, StringInterner};
+use crate::core::time::clock::secondsToNanos;
+
+// The largest count or time a definition may ask for: a million of a thing, a year of seconds.
+const BOOK_MAX_COUNT : i32 = 1000000;
+const BOOK_MAX_SECONDS : f64 = 31536000.0;
+
+// A name may not hold a space, control byte, quote or comment marker.
+const BOOK_SPACE : i32 = 32;
+const BOOK_QUOTE : i32 = 34;
+const BOOK_HASH : i32 = 35;
+
+// The definitions fingerprint: FNV-1a over the tables, with positions rounded to the millimetre.
+const BOOK_HASH_SEED : i64 = 1469598103934665603;
+const BOOK_MILLI : f64 = 1000.0;
+
+/** Objective kind: be inside a circle. */
+pub const OBJ_REACH : i8 = 0;
+
+/** Objective kind: kill a number of something. */
+pub const OBJ_KILL : i8 = 1;
+
+/** Objective kind: collect a number of something. */
+pub const OBJ_COLLECT : i8 = 2;
+
+/** Objective kind: let time pass in the stage. */
+pub const OBJ_TIMER : i8 = 3;
+
+/** Objective kind: bring something to a circle alive. */
+pub const OBJ_ESCORT : i8 = 4;
+
+/** Objective kind: wait until a flag is set. */
+pub const OBJ_FLAG : i8 = 5;
+
+/** Failure kind: the mission has been active this long. */
+pub const FAIL_TIMEOUT : i32 = 0;
+
+/** Failure kind: a flag is set. */
+pub const FAIL_FLAG : i32 = 1;
+
+/** Failure kind: the named thing dies. */
+pub const FAIL_DEATH : i32 = 2;
+
+// One mission: where its parts start in the flat tables.
+struct BookMission {
+    name        : i32;
+    title       : i32;
+    auto        : bool;
+    firstStage  : i32;
+    stageCount  : i32;
+    firstReq    : i32;
+    reqCount    : i32;
+    firstReward : i32;
+    rewardCount : i32;
+    firstFail   : i32;
+    failCount   : i32;
+}
+
+struct BookStage {
+    name     : i32;
+    firstObj : i32;
+    objCount : i32;
+}
+
+/** One objective of a stage. */
+pub struct BookObjective {
+    /** `OBJ_REACH` and friends. */
+    pub kind : i8;
+
+    /** The word (kill kind, collect kind, escortee, flag) this objective is about; -1 for the others. */
+    pub key : i32;
+
+    /** Area centre, x. */
+    pub x : f64;
+
+    /** Area centre, z. */
+    pub z : f64;
+
+    /** Area radius. */
+    pub radius : f64;
+
+    /** How many to kill or collect. */
+    pub target : i32;
+
+    /** How long to wait, nanoseconds. */
+    pub nanos : i64;
+
+    /** True when the stage can finish without this objective. */
+    pub optional : bool;
+}
+
+struct BookReward {
+    key    : i32;
+    amount : i64;
+}
+
+struct BookFail {
+    kind  : i32;
+    key   : i32;
+    nanos : i64;
+}
+
+/** The problems `validate` found. */
+pub class BookCheck {
+    missions : Vec<i32>;
+    texts    : Vec<i32>;
+    words    : StringInterner;
+
+    /** No problem. */
+    constructor() {
+        self.missions = new Vec<i32>();
+        self.texts = new Vec<i32>();
+        self.words = new StringInterner();
+    }
+
+    /** Records a problem with mission `mission` (-1: the book as a whole). */
+    pub fn add(mut self, mission : i32, message : string) : void {
+        self.missions.push(mission);
+        self.texts.push(self.words.intern(message).raw);
+    }
+
+    /** How many problems. */
+    pub fn count(self) : i32 {
+        return self.missions.len();
+    }
+
+    /** True when there is none. */
+    pub fn ok(self) : bool {
+        return self.missions.len() == 0;
+    }
+
+    /** The mission problem `i` is about, or -1. */
+    pub fn missionAt(self, i : i32) : i32 {
+        return self.missions.get(i);
+    }
+
+    /** What is wrong in problem `i`. */
+    pub fn messageAt(self, i : i32) : string {
+        return self.words.name(StringId { raw: self.texts.get(i) }) + "";
+    }
+}
+
+/** A set of mission definitions. */
+pub class MissionBook {
+    words    : StringInterner;
+    missions : Vec<BookMission>;
+    stages   : Vec<BookStage>;
+    objs     : Vec<BookObjective>;
+    reqs     : Vec<i32>;
+    rewards  : Vec<BookReward>;
+    fails    : Vec<BookFail>;
+    why      : string = "";
+
+    /** An empty book. */
+    constructor() {
+        self.words = new StringInterner();
+        self.missions = new Vec<BookMission>();
+        self.stages = new Vec<BookStage>();
+        self.objs = new Vec<BookObjective>();
+        self.reqs = new Vec<i32>();
+        self.rewards = new Vec<BookReward>();
+        self.fails = new Vec<BookFail>();
+    }
+
+    // The id of a word, adding it when new.
+    pub(crate) fn word(mut self, text : string) : i32 {
+        return self.words.intern(text).raw;
+    }
+
+    /** The id of a word that definitions mention, or -1 when none does. */
+    pub fn findWord(self, text : string) : i32 {
+        return self.words.find(text).raw;
+    }
+
+    /** The text of word `id`. */
+    pub fn wordText(self, id : i32) : string {
+        return self.words.name(StringId { raw: id }) + "";
+    }
+
+    /** How many words (names and keys) the book knows. */
+    pub fn wordCount(self) : i32 {
+        return self.words.len();
+    }
+
+    /** What the last refused builder call was refused for. */
+    pub fn lastProblem(self) : string {
+        return self.why + "";
+    }
+
+    fn refuse(mut self, why : string) : bool {
+        self.why = why;
+        return false;
+    }
+
+    static fn goodName(text : string) : bool {
+        if (text.byteLength == 0) {
+            return false;
+        }
+        for (i of 0..text.byteLength as i32) {
+            let b : i32 = text.byteAt(i);
+            if (b <= BOOK_SPACE || b == BOOK_QUOTE || b == BOOK_HASH) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /** Begins a mission called `name` (no spaces, quotes or #) with a human `title`; `auto` missions start themselves once available. */
+    pub fn beginMission(mut self, name : string, title : string, auto : bool) : bool {
+        if (!MissionBook::goodName(name)) {
+            return self.refuse("a mission name must be one word without spaces, quotes or #");
+        }
+        if (self.indexOf(name) >= 0) {
+            return self.refuse("there is already a mission called '${name}'");
+        }
+        let id : i32 = self.word(name);
+        self.missions.push(BookMission {
+            name: id,
+            title: self.word(title),
+            auto: auto,
+            firstStage: self.stages.len(),
+            stageCount: 0,
+            firstReq: self.reqs.len(),
+            reqCount: 0,
+            firstReward: self.rewards.len(),
+            rewardCount: 0,
+            firstFail: self.fails.len(),
+            failCount: 0,
+        });
+        return true;
+    }
+
+    // The current mission's number, or -1 before any.
+    fn current(self) : i32 {
+        return self.missions.len() - 1;
+    }
+
+    /** The current mission cannot start before mission `other` is completed. */
+    pub fn requires(mut self, other : string) : bool {
+        if (self.current() < 0) {
+            return self.refuse("requires: no mission has begun");
+        }
+        if (!MissionBook::goodName(other)) {
+            return self.refuse("requires: needs a mission name");
+        }
+        let mut m : BookMission = self.missions.get(self.current());
+        self.reqs.push(self.word(other));
+        m.reqCount = m.reqCount + 1;
+        self.missions.set(self.current(), m);
+        return true;
+    }
+
+    /** Begins the next stage of the current mission. */
+    pub fn beginStage(mut self, name : string) : bool {
+        if (self.current() < 0) {
+            return self.refuse("stage: no mission has begun");
+        }
+        if (!MissionBook::goodName(name)) {
+            return self.refuse("a stage name must be one word without spaces, quotes or #");
+        }
+        let mut m : BookMission = self.missions.get(self.current());
+        let id : i32 = self.word(name);
+        for (i of 0..m.stageCount) {
+            if (self.stages.get(m.firstStage + i).name == id) {
+                return self.refuse("the mission already has a stage called '${name}'");
+            }
+        }
+        self.stages.push(BookStage { name: id, firstObj: self.objs.len(), objCount: 0 });
+        m.stageCount = m.stageCount + 1;
+        self.missions.set(self.current(), m);
+        return true;
+    }
+
+    // Appends an objective to the current stage.
+    fn objective(mut self, o : BookObjective) : bool {
+        if (self.current() < 0 || self.missions.get(self.current()).stageCount == 0) {
+            return self.refuse("an objective needs a stage to belong to");
+        }
+        let at : i32 = self.stages.len() - 1;
+        let mut s : BookStage = self.stages.get(at);
+        self.objs.push(o);
+        s.objCount = s.objCount + 1;
+        self.stages.set(at, s);
+        return true;
+    }
+
+    static fn blankObjective(kind : i8) : BookObjective {
+        return BookObjective {
+            kind: kind,
+            key: 0 - 1,
+            x: 0.0,
+            z: 0.0,
+            radius: 0.0,
+            target: 0,
+            nanos: 0,
+            optional: false,
+        };
+    }
+
+    /** Objective: be within `radius` metres of (`x`, `z`). */
+    pub fn reach(mut self, x : f64, z : f64, radius : f64) : bool {
+        if (!(radius > 0.0)) {
+            return self.refuse("reach: the radius must be above zero");
+        }
+        let mut o : BookObjective = MissionBook::blankObjective(OBJ_REACH);
+        o.x = x;
+        o.z = z;
+        o.radius = radius;
+        return self.objective(o);
+    }
+
+    /** Objective: kill `count` of `kind`. */
+    pub fn kill(mut self, kind : string, count : i32) : bool {
+        return self.counted(OBJ_KILL, kind, count);
+    }
+
+    /** Objective: collect `count` of `kind`. */
+    pub fn collect(mut self, kind : string, count : i32) : bool {
+        return self.counted(OBJ_COLLECT, kind, count);
+    }
+
+    fn counted(mut self, kindCode : i32, kind : string, count : i32) : bool {
+        if (!MissionBook::goodName(kind)) {
+            return self.refuse("a kind must be one word without spaces, quotes or #");
+        }
+        if (count < 1 || count > BOOK_MAX_COUNT) {
+            return self.refuse("the count must be between 1 and ${BOOK_MAX_COUNT}");
+        }
+        let mut o : BookObjective = MissionBook::blankObjective(kindCode);
+        o.key = self.word(kind);
+        o.target = count;
+        return self.objective(o);
+    }
+
+    /** Objective: `seconds` pass after the stage opens. */
+    pub fn timer(mut self, seconds : f64) : bool {
+        if (!(seconds >= 0.0) || seconds > BOOK_MAX_SECONDS) {
+            return self.refuse("timer: the time must be between 0 and a year");
+        }
+        let mut o : BookObjective = MissionBook::blankObjective(OBJ_TIMER);
+        o.nanos = secondsToNanos(seconds);
+        return self.objective(o);
+    }
+
+    /** Objective: bring `who` to within `radius` of (`x`, `z`) without it dying. */
+    pub fn escort(mut self, who : string, x : f64, z : f64, radius : f64) : bool {
+        if (!MissionBook::goodName(who)) {
+            return self.refuse("escort: needs the name of what is escorted");
+        }
+        if (!(radius > 0.0)) {
+            return self.refuse("escort: the radius must be above zero");
+        }
+        let mut o : BookObjective = MissionBook::blankObjective(OBJ_ESCORT);
+        o.key = self.word(who);
+        o.x = x;
+        o.z = z;
+        o.radius = radius;
+        return self.objective(o);
+    }
+
+    /** Objective: wait for flag `name` to be set. */
+    pub fn flag(mut self, name : string) : bool {
+        if (!MissionBook::goodName(name)) {
+            return self.refuse("a flag must be one word without spaces, quotes or #");
+        }
+        let mut o : BookObjective = MissionBook::blankObjective(OBJ_FLAG);
+        o.key = self.word(name);
+        return self.objective(o);
+    }
+
+    /** Marks the objective added last as optional. */
+    pub fn markOptional(mut self) : bool {
+        if (self.objs.len() == 0 || self.current() < 0
+            || self.stages.get(self.stages.len() - 1).objCount == 0) {
+            return self.refuse("optional: there is no objective to mark");
+        }
+        let at : i32 = self.objs.len() - 1;
+        let mut o : BookObjective = self.objs.get(at);
+        o.optional = true;
+        self.objs.set(at, o);
+        return true;
+    }
+
+    fn failure(mut self, f : BookFail) : bool {
+        if (self.current() < 0) {
+            return self.refuse("fail: no mission has begun");
+        }
+        let mut m : BookMission = self.missions.get(self.current());
+        self.fails.push(f);
+        m.failCount = m.failCount + 1;
+        self.missions.set(self.current(), m);
+        return true;
+    }
+
+    /** The current mission fails when it has been active `seconds`. */
+    pub fn failAfter(mut self, seconds : f64) : bool {
+        if (!(seconds > 0.0) || seconds > BOOK_MAX_SECONDS) {
+            return self.refuse("fail timeout: the time must be between 0 and a year");
+        }
+        return self.failure(BookFail { kind: FAIL_TIMEOUT, key: 0 - 1, nanos: secondsToNanos(seconds) });
+    }
+
+    /** The current mission fails when flag `name` is set. */
+    pub fn failOnFlag(mut self, name : string) : bool {
+        if (!MissionBook::goodName(name)) {
+            return self.refuse("fail flag: needs a flag name");
+        }
+        return self.failure(BookFail { kind: FAIL_FLAG, key: self.word(name), nanos: 0 });
+    }
+
+    /** The current mission fails when `who` dies. */
+    pub fn failOnDeath(mut self, who : string) : bool {
+        if (!MissionBook::goodName(who)) {
+            return self.refuse("fail death: needs a name");
+        }
+        return self.failure(BookFail { kind: FAIL_DEATH, key: self.word(who), nanos: 0 });
+    }
+
+    /** The current mission pays `amount` of `what` when completed. */
+    pub fn reward(mut self, what : string, amount : i64) : bool {
+        if (self.current() < 0) {
+            return self.refuse("reward: no mission has begun");
+        }
+        if (!MissionBook::goodName(what)) {
+            return self.refuse("reward: needs a name");
+        }
+        if (amount < 1) {
+            return self.refuse("reward: the amount must be above zero");
+        }
+        let mut m : BookMission = self.missions.get(self.current());
+        self.rewards.push(BookReward { key: self.word(what), amount: amount });
+        m.rewardCount = m.rewardCount + 1;
+        self.missions.set(self.current(), m);
+        return true;
+    }
+
+    // ---- reading ----
+
+    /** How many missions. */
+    pub fn missionCount(self) : i32 {
+        return self.missions.len();
+    }
+
+    /** The number of the mission called `name`, or -1. */
+    pub fn indexOf(self, name : string) : i32 {
+        let w : StringId = self.words.find(name);
+        if (w.isNone()) {
+            return 0 - 1;
+        }
+        for (i of 0..self.missions.len()) {
+            if (self.missions.get(i).name == w.raw) {
+                return i;
+            }
+        }
+        return 0 - 1;
+    }
+
+    /** The name of mission `m`. */
+    pub fn missionName(self, m : i32) : string {
+        return self.wordText(self.missions.get(m).name);
+    }
+
+    /** The title of mission `m`. */
+    pub fn missionTitle(self, m : i32) : string {
+        return self.wordText(self.missions.get(m).title);
+    }
+
+    /** True when mission `m` starts itself when available. */
+    pub fn isAuto(self, m : i32) : bool {
+        return self.missions.get(m).auto;
+    }
+
+    /** How many stages mission `m` has. */
+    pub fn stageCount(self, m : i32) : i32 {
+        return self.missions.get(m).stageCount;
+    }
+
+    /** The name of stage `s` of mission `m`. */
+    pub fn stageName(self, m : i32, s : i32) : string {
+        return self.wordText(self.stages.get(self.missions.get(m).firstStage + s).name);
+    }
+
+    /** How many objectives stage `s` of mission `m` has. */
+    pub fn objectiveCount(self, m : i32, s : i32) : i32 {
+        return self.stages.get(self.missions.get(m).firstStage + s).objCount;
+    }
+
+    /** The global number of the first objective of stage `s` of mission `m` (objectives of a stage are consecutive). */
+    pub fn firstObjective(self, m : i32, s : i32) : i32 {
+        return self.stages.get(self.missions.get(m).firstStage + s).firstObj;
+    }
+
+    /** Objective number `o` (global). */
+    pub fn objectiveAt(self, o : i32) : BookObjective {
+        return self.objs.get(o);
+    }
+
+    /** How many objectives exist in all missions. */
+    pub fn totalObjectives(self) : i32 {
+        return self.objs.len();
+    }
+
+    /** How many prerequisites mission `m` has. */
+    pub fn requirementCount(self, m : i32) : i32 {
+        return self.missions.get(m).reqCount;
+    }
+
+    /** The word id of prerequisite `i` of mission `m` (a mission name; may name no mission until `validate` says so). */
+    pub fn requirementWord(self, m : i32, i : i32) : i32 {
+        return self.reqs.get(self.missions.get(m).firstReq + i);
+    }
+
+    /** How many rewards mission `m` pays. */
+    pub fn rewardCount(self, m : i32) : i32 {
+        return self.missions.get(m).rewardCount;
+    }
+
+    /** The word id of reward `i` of mission `m`. */
+    pub fn rewardWord(self, m : i32, i : i32) : i32 {
+        return self.rewards.get(self.missions.get(m).firstReward + i).key;
+    }
+
+    /** The amount of reward `i` of mission `m`. */
+    pub fn rewardAmount(self, m : i32, i : i32) : i64 {
+        return self.rewards.get(self.missions.get(m).firstReward + i).amount;
+    }
+
+    /** How many failure conditions mission `m` has. */
+    pub fn failCount(self, m : i32) : i32 {
+        return self.missions.get(m).failCount;
+    }
+
+    /** The kind (`FAIL_TIMEOUT`...) of failure condition `i` of mission `m`. */
+    pub fn failKind(self, m : i32, i : i32) : i32 {
+        return self.fails.get(self.missions.get(m).firstFail + i).kind;
+    }
+
+    /** The word id of failure condition `i` of mission `m`, or -1 for a timeout. */
+    pub fn failWord(self, m : i32, i : i32) : i32 {
+        return self.fails.get(self.missions.get(m).firstFail + i).key;
+    }
+
+    /** The time limit of failure condition `i` of mission `m`, in nanoseconds (0 for other kinds). */
+    pub fn failNanos(self, m : i32, i : i32) : i64 {
+        return self.fails.get(self.missions.get(m).firstFail + i).nanos;
+    }
+
+    /** The mission number a prerequisite word names, or -1. */
+    pub fn missionOfWord(self, w : i32) : i32 {
+        for (i of 0..self.missions.len()) {
+            if (self.missions.get(i).name == w) {
+                return i;
+            }
+        }
+        return 0 - 1;
+    }
+
+    /** Checks what only the whole book can show: every mission has a stage, every stage something to do, prerequisites exist and do not loop. */
+    pub fn validate(self) : BookCheck {
+        let check : BookCheck = new BookCheck();
+        let n : i32 = self.missions.len();
+        for (m of 0..n) {
+            let name : string = self.missionName(m);
+            if (self.stageCount(m) == 0) {
+                check.add(m, "mission '${name}' has no stage");
+            }
+            for (s of 0..self.stageCount(m)) {
+                let mut needed : i32 = 0;
+                for (j of 0..self.objectiveCount(m, s)) {
+                    if (!self.objs.get(self.firstObjective(m, s) + j).optional) {
+                        needed = needed + 1;
+                    }
+                }
+                if (needed == 0) {
+                    let stage : string = self.stageName(m, s);
+                    check.add(m, "stage '${stage}' of mission '${name}' has no required objective");
+                }
+            }
+            for (r of 0..self.requirementCount(m)) {
+                let target : i32 = self.missionOfWord(self.requirementWord(m, r));
+                if (target < 0) {
+                    let other : string = self.wordText(self.requirementWord(m, r));
+                    check.add(m, "mission '${name}' requires '${other}', which does not exist");
+                } else if (target == m) {
+                    check.add(m, "mission '${name}' requires itself");
+                }
+            }
+        }
+        // Prerequisite loops: a mission is stuck when every way back through its prerequisites returns to it.
+        for (m of 0..n) {
+            if (!self.requiresSelf(m) && self.reaches(m, m, n)) {
+                let name : string = self.missionName(m);
+                check.add(m, "mission '${name}' is its own prerequisite through a loop");
+            }
+        }
+        return check;
+    }
+
+    // True when `target` can be reached from `from` by following prerequisites for one or more steps.
+    fn reaches(self, from : i32, target : i32, n : i32) : bool {
+        let mut seen : bool[] = malloc<bool>(n as i64);
+        for (i of 0..n) {
+            seen[i] = false;
+        }
+        let stack : Vec<i32> = new Vec<i32>();
+        stack.push(from);
+        while (!stack.isEmpty()) {
+            let m : i32 = stack.pop();
+            for (r of 0..self.requirementCount(m)) {
+                let t : i32 = self.missionOfWord(self.requirementWord(m, r));
+                if (t == target) {
+                    return true;
+                }
+                if (t >= 0 && !seen[t]) {
+                    seen[t] = true;
+                    stack.push(t);
+                }
+            }
+        }
+        return false;
+    }
+
+    // True when mission `m` lists itself as a prerequisite.
+    fn requiresSelf(self, m : i32) : bool {
+        for (r of 0..self.requirementCount(m)) {
+            if (self.missionOfWord(self.requirementWord(m, r)) == m) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** A number that changes whenever any definition changes: saved state is only loaded into a board whose book has the same one. */
+    pub fn fingerprint(self) : i64 {
+        let mut h : i64 = BOOK_HASH_SEED;
+        for (w of 0..self.words.len()) {
+            h = combineHash(h, fnv1a64(self.wordText(w)));
+        }
+        for (m of 0..self.missions.len()) {
+            let bm : BookMission = self.missions.get(m);
+            h = combineHash(h, bm.name as i64);
+            h = combineHash(h, bookBit(bm.auto));
+            h = combineHash(h, bm.stageCount as i64);
+            h = combineHash(h, bm.reqCount as i64);
+            h = combineHash(h, bm.rewardCount as i64);
+            h = combineHash(h, bm.failCount as i64);
+        }
+        for (o of 0..self.objs.len()) {
+            let b : BookObjective = self.objs.get(o);
+            h = combineHash(h, b.kind as i64);
+            h = combineHash(h, b.key as i64);
+            h = combineHash(h, (b.x * BOOK_MILLI) as i64);
+            h = combineHash(h, (b.z * BOOK_MILLI) as i64);
+            h = combineHash(h, (b.radius * BOOK_MILLI) as i64);
+            h = combineHash(h, b.target as i64);
+            h = combineHash(h, b.nanos);
+            h = combineHash(h, bookBit(b.optional));
+        }
+        for (s of 0..self.stages.len()) {
+            h = combineHash(h, self.stages.get(s).objCount as i64);
+        }
+        for (r of 0..self.reqs.len()) {
+            h = combineHash(h, self.reqs.get(r) as i64);
+        }
+        for (r of 0..self.rewards.len()) {
+            h = combineHash(h, self.rewards.get(r).key as i64);
+            h = combineHash(h, self.rewards.get(r).amount);
+        }
+        for (f of 0..self.fails.len()) {
+            h = combineHash(h, self.fails.get(f).kind as i64);
+            h = combineHash(h, self.fails.get(f).key as i64);
+            h = combineHash(h, self.fails.get(f).nanos);
+        }
+        return h;
+    }
+}
+
+fn bookBit(b : bool) : i64 {
+    if (b) {
+        return 1;
+    }
+    return 0;
+}
