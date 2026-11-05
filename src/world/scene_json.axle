@@ -1,0 +1,304 @@
+// scene_json — a scene saved to JSON and loaded back.
+//
+// The file is one object: `{"format":"ludax.scene","version":1,"entities":[...]}`. Each entity has its `name`
+// (omitted when empty), its `parent` (the index in the same list of an earlier entity, or -1), and its local
+// transform as `t` (translation), `r` (rotation quaternion x y z w) and `s` (scale). Entities are listed parents
+// first, roots in slot order and children in attach order, so loading rebuilds the same tree with the same child
+// order. Entity ids are NOT stored: a loaded scene gets fresh ones, and the file index is the stable name of an
+// entity; `SceneSave::indexOf` and `SceneLoad::entityAt` translate between the two.
+//
+// Components belong to the game. A game saves them next to the transform: `SceneSave::entityJson(i)` is the
+// object of entity `i`, and the game adds its own fields to it (`doc().set(obj, "health", ...)`) before it asks
+// for the text; after loading, `SceneLoad::entityJson(i)` gives them back with the entity they belong to. No
+// reflection is needed, and the game decides what its components look like on disk.
+
+use crate::core::collections::map::Map;
+use crate::core::collections::vec::Vec;
+use crate::core::id::entity_id::EntityId;
+use crate::core::math::dquat::DQuat;
+use crate::core::math::dtransform::DTransform;
+use crate::core::math::dvec3::DVec3;
+use crate::data::json::json_doc::{JsonDoc, JsonValue};
+use crate::data::json::json_parse::JsonParser;
+use crate::data::json::json_write::JsonWriter;
+use crate::world::scene::Scene;
+
+// The value of the `version` field this code writes and reads.
+const SCENE_JSON_VERSION : i32 = 1;
+
+/** A scene turned into a JSON document, open for the game to add its own fields before the text is made. */
+pub class SceneSave {
+    doc   : JsonDoc;
+    list  : JsonValue;
+    order : Vec<i64>;
+    index : Map<i64, i32>;
+
+    /** An empty save; use `SceneJson::save`. */
+    constructor() {
+        self.doc = new JsonDoc();
+        self.list = JsonValue::none();
+        self.order = new Vec<i64>();
+        self.index = new Map<i64, i32>();
+    }
+
+    /** The document, for adding fields to entity objects. */
+    pub fn doc(self) : JsonDoc {
+        return self.doc;
+    }
+
+    /** How many entities were saved. */
+    pub fn count(self) : i32 {
+        return self.order.len();
+    }
+
+    /** The entity saved at file index `i`. */
+    pub fn entityAt(self, i : i32) : EntityId {
+        return EntityId::fromBits(self.order.get(i));
+    }
+
+    /** The file index of `e`, or -1 when it was not saved. */
+    pub fn indexOf(self, e : EntityId) : i32 {
+        return self.index.getOr(e.bits(), -1);
+    }
+
+    /** The JSON object of the entity at file index `i`. */
+    pub fn entityJson(mut self, i : i32) : JsonValue {
+        return self.doc.at(self.list, i);
+    }
+
+    /** The whole file as compact text. */
+    pub fn text(self) : string {
+        return JsonWriter::compact(self.doc, self.doc.root());
+    }
+
+    /** The whole file indented by `indent` spaces, for people. */
+    pub fn pretty(self, indent : i32) : string {
+        return JsonWriter::pretty(self.doc, self.doc.root(), indent);
+    }
+
+    pub(crate) fn begin(mut self) : void {
+        let root : JsonValue = self.doc.newObject();
+        self.doc.set(root, "format", self.doc.newString("ludax.scene"));
+        self.doc.set(root, "version", self.doc.newNumber(SCENE_JSON_VERSION as f64));
+        self.list = self.doc.newArray();
+        self.doc.set(root, "entities", self.list);
+        self.doc.setRoot(root);
+    }
+
+    pub(crate) fn add(mut self, e : EntityId, entity : JsonValue) : void {
+        self.doc.push(self.list, entity);
+        self.index.put(e.bits(), self.order.len());
+        self.order.push(e.bits());
+    }
+}
+
+/** A scene read from JSON, with the entity each file index became. */
+pub class SceneLoad {
+    scene : Scene;
+    doc   : JsonDoc;
+    list  : JsonValue;
+    ids   : Vec<i64>;
+    err   : string;
+
+    /** An empty load; use `SceneJson::load`. */
+    constructor() {
+        self.scene = new Scene();
+        self.doc = new JsonDoc();
+        self.list = JsonValue::none();
+        self.ids = new Vec<i64>();
+        self.err = "";
+    }
+
+    /** True when the file was read whole. */
+    pub fn ok(self) : bool {
+        return self.err.byteLength == 0;
+    }
+
+    /** Why the file could not be read, or an empty string. */
+    pub fn error(self) : string {
+        return self.err;
+    }
+
+    /** The scene that was built (empty after a failure). */
+    pub fn scene(self) : Scene {
+        return self.scene;
+    }
+
+    /** How many entities the file held. */
+    pub fn count(self) : i32 {
+        return self.ids.len();
+    }
+
+    /** The entity that file index `i` became. */
+    pub fn entityAt(self, i : i32) : EntityId {
+        return EntityId::fromBits(self.ids.get(i));
+    }
+
+    /** The JSON object of file index `i`, with whatever fields the game stored in it. */
+    pub fn entityJson(mut self, i : i32) : JsonValue {
+        return self.doc.at(self.list, i);
+    }
+
+    /** The parsed document. */
+    pub fn doc(self) : JsonDoc {
+        return self.doc;
+    }
+
+    pub(crate) fn failed(mut self, why : string) : void {
+        self.err = why;
+        self.scene = new Scene();
+        self.ids.clear();
+    }
+
+    pub(crate) fn attachDoc(mut self, own d : JsonDoc, list : JsonValue) : void {
+        self.doc = d;
+        self.list = list;
+    }
+
+    pub(crate) fn push(mut self, e : EntityId) : void {
+        self.ids.push(e.bits());
+    }
+}
+
+/** Saves and loads scenes as JSON. */
+pub class SceneJson {
+    /** The scene as a document the game may extend. */
+    pub static fn save(scene : Scene) : SceneSave {
+        let out : SceneSave = new SceneSave();
+        out.begin();
+        let world = scene.entities();
+        for (slot of 0..world.slots()) {
+            let e : EntityId = world.idAt(slot);
+            if (!e.isNone() && scene.parent(e).isNone()) {
+                SceneJson::saveSubtree(scene, out, e);
+            }
+        }
+        return out;
+    }
+
+    // `root` and its descendants, parents before children, children in attach order.
+    static fn saveSubtree(scene : Scene, out : SceneSave, root : EntityId) : void {
+        let stack : Vec<i64> = new Vec<i64>();
+        stack.push(root.bits());
+        while (!stack.isEmpty()) {
+            let e : EntityId = EntityId::fromBits(stack.pop());
+            out.add(e, SceneJson::entityObject(scene, out, e));
+            let kids : Vec<i64> = new Vec<i64>();
+            let mut c : EntityId = scene.firstChild(e);
+            while (!c.isNone()) {
+                kids.push(c.bits());
+                c = scene.nextSibling(c);
+            }
+            let mut k : i32 = kids.len() - 1;
+            while (k >= 0) {
+                stack.push(kids.get(k));
+                k = k - 1;
+            }
+        }
+    }
+
+    static fn entityObject(scene : Scene, out : SceneSave, e : EntityId) : JsonValue {
+        let doc : JsonDoc = out.doc();
+        let obj : JsonValue = doc.newObject();
+        let name : string = scene.nameOfEntity(e);
+        if (name.byteLength > 0) {
+            doc.set(obj, "name", doc.newString(name));
+        }
+        doc.set(obj, "parent", doc.newNumber(out.indexOf(scene.parent(e)) as f64));
+        let t : DTransform = scene.localTransform(e);
+        doc.set(obj, "t", SceneJson::triple(doc, t.translation.x, t.translation.y, t.translation.z));
+        doc.set(obj, "r", SceneJson::quad(doc, t.rotation));
+        doc.set(obj, "s", SceneJson::triple(doc, t.scale.x, t.scale.y, t.scale.z));
+        return obj;
+    }
+
+    static fn triple(doc : JsonDoc, x : f64, y : f64, z : f64) : JsonValue {
+        let a : JsonValue = doc.newArray();
+        doc.push(a, doc.newNumber(x));
+        doc.push(a, doc.newNumber(y));
+        doc.push(a, doc.newNumber(z));
+        return a;
+    }
+
+    static fn quad(doc : JsonDoc, q : DQuat) : JsonValue {
+        let a : JsonValue = doc.newArray();
+        doc.push(a, doc.newNumber(q.x));
+        doc.push(a, doc.newNumber(q.y));
+        doc.push(a, doc.newNumber(q.z));
+        doc.push(a, doc.newNumber(q.w));
+        return a;
+    }
+
+    /** The scene in `text`; check `ok()` before using it. */
+    pub static fn load(text : string) : SceneLoad {
+        let out : SceneLoad = new SceneLoad();
+        let doc : JsonDoc = JsonParser::parse(text);
+        if (!doc.ok()) {
+            out.failed(doc.error());
+            return out;
+        }
+        let root : JsonValue = doc.root();
+        if (!doc.isObject(root) || doc.stringOr(doc.field(root, "format"), "") != "ludax.scene") {
+            out.failed("not a ludax scene file");
+            return out;
+        }
+        if (doc.intOr(doc.field(root, "version"), 0) != SCENE_JSON_VERSION) {
+            out.failed("unsupported scene version");
+            return out;
+        }
+        let list : JsonValue = doc.field(root, "entities");
+        if (!doc.isArray(list)) {
+            out.failed("the scene has no entity list");
+            return out;
+        }
+        let n : i32 = doc.len(list);
+        for (i of 0..n) {
+            let obj : JsonValue = doc.at(list, i);
+            if (!doc.isObject(obj)) {
+                out.failed("entity ${i} is not an object");
+                return out;
+            }
+            let parent : i32 = doc.intOr(doc.field(obj, "parent"), -1);
+            if (parent >= i || parent < -1) {
+                out.failed("entity ${i} names a parent that does not come before it");
+                return out;
+            }
+            let t : DTransform = SceneJson::readTransform(doc, obj);
+            // The name is copied: a string read out of a document is only borrowed from it.
+            let name : string = doc.stringOr(doc.field(obj, "name"), "") + "";
+            let mut e : EntityId = EntityId::none();
+            if (parent < 0) {
+                e = out.scene().add(name);
+                out.scene().setLocal(e, t);
+            } else {
+                e = out.scene().addChild(out.entityAt(parent), name, t);
+            }
+            out.push(e);
+        }
+        out.attachDoc(doc, list);
+        return out;
+    }
+
+    static fn readTransform(doc : JsonDoc, obj : JsonValue) : DTransform {
+        let t : JsonValue = doc.field(obj, "t");
+        let r : JsonValue = doc.field(obj, "r");
+        let s : JsonValue = doc.field(obj, "s");
+        let translation : DVec3 = DVec3::make(
+            doc.numberOr(doc.at(t, 0), 0.0),
+            doc.numberOr(doc.at(t, 1), 0.0),
+            doc.numberOr(doc.at(t, 2), 0.0)
+        );
+        let rotation : DQuat = DQuat::make(
+            doc.numberOr(doc.at(r, 0), 0.0),
+            doc.numberOr(doc.at(r, 1), 0.0),
+            doc.numberOr(doc.at(r, 2), 0.0),
+            doc.numberOr(doc.at(r, 3), 1.0)
+        );
+        let scale : DVec3 = DVec3::make(
+            doc.numberOr(doc.at(s, 0), 1.0),
+            doc.numberOr(doc.at(s, 1), 1.0),
+            doc.numberOr(doc.at(s, 2), 1.0)
+        );
+        return DTransform::make(translation, rotation, scale);
+    }
+}
