@@ -1,0 +1,500 @@
+// cpu_tris — triangle setup for the CPU rasteriser: transform, clip, snap to a sub-pixel grid, bin into tiles.
+//
+// Every triangle of every drawn instance is taken to camera-relative world space with its instance's model matrix
+// (positions) and normal matrix (normals), then to clip space with the camera's view-projection. A triangle that
+// leaves the guard band (4 screen sizes) or crosses the near plane is clipped against those five planes with
+// Sutherland-Hodgman, every attribute (position, normal, uv) interpolated linearly in clip space, which is exact for
+// attributes that are later interpolated perspective-correctly. What survives is divided by w, mapped to the screen
+// and SNAPPED to a grid of 1/256 pixel: from here on all coverage maths is integer, so coverage is exact, two
+// triangles sharing an edge agree on which side of it every pixel centre is, and the top-left rule leaves no pixel
+// covered twice or not at all.
+//
+// A triangle is stored in canonical orientation (positive signed area in the integer grid); whether it faced the
+// camera (counter-clockwise on screen, y down: negative area) is kept as a flag, because back faces are culled or
+// shaded as the back. Triangles come out in submission order and are binned into 32 x 32 pixel tiles by a counting
+// sort that keeps that order inside every tile, which is what makes the picture independent of thread count.
+
+use crate::core::math::mat3::Mat3;
+use crate::core::math::mat4::Mat4;
+use crate::core::math::vec3::Vec3;
+use crate::core::math::vec4::Vec4;
+use crate::render::scene::scene_assets::RenderAssets;
+use crate::render::scene::scene_frame::{RenderInstance, RenderScene};
+use crate::render::scene::scene_material::RenderMaterial;
+use crate::render::scene::scene_mesh::MeshData;
+
+/** Tile edge in pixels. */
+pub const CPU_TILE : i32 = 32;
+
+// The guard band: clip-space x and y may reach this many times w before a triangle is clipped.
+const CTRI_GUARD : f32 = 4.0;
+
+// Floats per work vertex: clip x y z w, position, normal, uv.
+const CTRI_V : i32 = 12;
+
+// The most vertices a triangle clipped by five planes can have.
+const CTRI_POLY : i32 = 10;
+
+/** Flag bit of a stored triangle: its material blends. */
+pub const CPU_FLAG_BLEND : i32 = 1;
+
+/** Flag bit of a stored triangle: it faces away from the camera. */
+pub const CPU_FLAG_BACK : i32 = 2;
+
+/** Screen-space triangles of one batch of draws. */
+pub class CpuTris {
+    pub(crate) width     : i32;
+    pub(crate) height    : i32;
+    pub(crate) count     : i32 = 0;
+    pub(crate) snap      : i32[];
+    pub(crate) zinv      : f32[];
+    pub(crate) attr      : f32[];
+    pub(crate) geo       : f32[];
+    pub(crate) meta      : i32[];
+    pub(crate) tilesX    : i32;
+    pub(crate) tilesY    : i32;
+    pub(crate) binStart  : i32[];
+    pub(crate) binList   : i32[];
+    pub(crate) submitted : i64 = 0;
+    pub(crate) curObject : i32 = 0;
+    pub(crate) curLayer  : i32 = 1;
+    room                 : i32 = 256;
+    work                 : f32[];
+    polyA                : f32[];
+    polyB                : f32[];
+
+    /** An empty batch for a target of `width` x `height` pixels. */
+    constructor(width : i32, height : i32) {
+        self.width = width;
+        self.height = height;
+        self.tilesX = (width + CPU_TILE - 1) / CPU_TILE;
+        self.tilesY = (height + CPU_TILE - 1) / CPU_TILE;
+        self.snap = malloc<i32>(256 * 6);
+        self.zinv = malloc<f32>(256 * 6);
+        self.attr = malloc<f32>(256 * 24);
+        self.geo = malloc<f32>(256 * 3);
+        self.meta = malloc<i32>(256 * 5);
+        self.binStart = malloc<i32>((self.tilesX * self.tilesY + 1) as i64);
+        self.binList = malloc<i32>(16);
+        self.work = malloc<f32>((3 * CTRI_V) as i64);
+        self.polyA = malloc<f32>((CTRI_POLY * CTRI_V) as i64);
+        self.polyB = malloc<f32>((CTRI_POLY * CTRI_V) as i64);
+        for (i of 0..self.tilesX * self.tilesY + 1) {
+            self.binStart[i] = 0;
+        }
+    }
+
+    /** Forgets every triangle. */
+    pub(crate) fn reset(mut self) : void {
+        self.count = 0;
+        self.submitted = 0;
+    }
+
+    fn grow(mut self) : void {
+        let bigger : i32 = self.room * 2;
+        let mut snap : i32[] = malloc<i32>((bigger * 6) as i64);
+        let mut zinv : f32[] = malloc<f32>((bigger * 6) as i64);
+        let mut attr : f32[] = malloc<f32>((bigger * 24) as i64);
+        let mut geo : f32[] = malloc<f32>((bigger * 3) as i64);
+        let mut meta : i32[] = malloc<i32>((bigger * 5) as i64);
+        for (i of 0..self.count * 6) {
+            snap[i] = self.snap[i];
+            zinv[i] = self.zinv[i];
+        }
+        for (i of 0..self.count * 24) {
+            attr[i] = self.attr[i];
+        }
+        for (i of 0..self.count * 3) {
+            geo[i] = self.geo[i];
+        }
+        for (i of 0..self.count * 5) {
+            meta[i] = self.meta[i];
+        }
+        self.snap = snap;
+        self.zinv = zinv;
+        self.attr = attr;
+        self.geo = geo;
+        self.meta = meta;
+        self.room = bigger;
+    }
+
+    /**
+     * Adds the triangles of mesh `mesh` for instances `first .. first + n` of `scene`, with material `material`.
+     * `viewProj` takes camera-relative world space to clip space. Back faces are dropped when `cullBack` is set
+     * and the material is single-sided.
+     */
+    pub(crate) fn addDraw(
+        mut self,
+        scene : RenderScene,
+        assets : Shared<RenderAssets>,
+        mesh : i32,
+        first : i32,
+        n : i32,
+        material : i32,
+        viewProj : Mat4,
+        cullBack : bool
+    ) : void {
+        let md : MeshData = assets.mesh(mesh);
+        let mat : RenderMaterial = assets.material(material);
+        let mut flags : i32 = 0;
+        if (mat.isBlended()) {
+            flags = CPU_FLAG_BLEND;
+        }
+        let skipBack : bool = cullBack && !mat.doubleSided;
+        for (k of first..first + n) {
+            let inst : RenderInstance = scene.instance(k);
+            self.curObject = inst.objectId;
+            self.curLayer = inst.layer as i32;
+            let normalMatrix : Mat3 = inst.model.upper3x3().normalMatrix();
+            for (t of 0..md.triangleCount()) {
+                for (v of 0..3) {
+                    let i : i32 = md.index(t * 3 + v);
+                    let p : Vec3 = inst.model.transformPoint(md.position(i));
+                    let nr : Vec3 = normalMatrix
+                        .transform(md.normal(i))
+                        .normalizedOr(Vec3::make(0.0, 1.0, 0.0));
+                    let clip : Vec4 = viewProj.transformVec4(Vec4 { x: p.x, y: p.y, z: p.z, w: 1.0 });
+                    let b : i32 = v * CTRI_V;
+                    self.work[b] = clip.x;
+                    self.work[b + 1] = clip.y;
+                    self.work[b + 2] = clip.z;
+                    self.work[b + 3] = clip.w;
+                    self.work[b + 4] = p.x;
+                    self.work[b + 5] = p.y;
+                    self.work[b + 6] = p.z;
+                    self.work[b + 7] = nr.x;
+                    self.work[b + 8] = nr.y;
+                    self.work[b + 9] = nr.z;
+                    self.work[b + 10] = md.uv(i).x;
+                    self.work[b + 11] = md.uv(i).y;
+                }
+                self.submitted = self.submitted + 1;
+                let a : Vec3 = Vec3::make(self.work[4], self.work[5], self.work[6]);
+                let b : Vec3 = Vec3::make(
+                    self.work[CTRI_V + 4],
+                    self.work[CTRI_V + 5],
+                    self.work[CTRI_V + 6]
+                );
+                let c : Vec3 = Vec3::make(
+                    self.work[2 * CTRI_V + 4],
+                    self.work[2 * CTRI_V + 5],
+                    self.work[2 * CTRI_V + 6]
+                );
+                let g : Vec3 = b.minus(a).cross(c.minus(a));
+                if (!(g.lengthSquared() > (0.0 as f32))) {
+                    continue;
+                }
+                self.clipAndEmit(g.normalized(), k, material, flags, skipBack);
+            }
+        }
+    }
+
+    // How far vertex `v` of a polygon buffer is inside plane `plane` (>= 0 is inside).
+    static fn side(poly : f32[], v : i32, plane : i32) : f32 {
+        let b : i32 = v * CTRI_V;
+        let w : f32 = poly[b + 3];
+        return match plane {
+            0 => poly[b + 2],
+            1 => w * CTRI_GUARD + poly[b],
+            2 => w * CTRI_GUARD - poly[b],
+            3 => w * CTRI_GUARD + poly[b + 1],
+            _ => w * CTRI_GUARD - poly[b + 1],
+        };
+    }
+
+    // Clips the work triangle against near and the guard band, then emits the fan.
+    fn clipAndEmit(
+        mut self,
+        geo : Vec3,
+        instance : i32,
+        material : i32,
+        flags : i32,
+        skipBack : bool
+    ) : void {
+        let mut inside : bool = true;
+        for (v of 0..3) {
+            for (p of 0..5) {
+                if (CpuTris::side(self.work, v, p) < (0.0 as f32)) {
+                    inside = false;
+                }
+            }
+        }
+        if (inside) {
+            self.emit(self.work, 0, 1, 2, geo, instance, material, flags, skipBack);
+            return;
+        }
+        for (i of 0..3 * CTRI_V) {
+            self.polyA[i] = self.work[i];
+        }
+        let mut n : i32 = 3;
+        let mut fromA : bool = true;
+        for (p of 0..5) {
+            let mut out : i32 = 0;
+            for (i of 0..n) {
+                let j : i32 = (i + 1) % n;
+                let di : f32 = self.sideOf(fromA, i, p);
+                let dj : f32 = self.sideOf(fromA, j, p);
+                if (di >= (0.0 as f32)) {
+                    self.copyVertex(fromA, i, out);
+                    out = out + 1;
+                }
+                if ((di >= (0.0 as f32)) != (dj >= (0.0 as f32))) {
+                    self.lerpVertex(fromA, i, j, di / (di - dj), out);
+                    out = out + 1;
+                }
+            }
+            n = out;
+            fromA = !fromA;
+            if (n < 3) {
+                return;
+            }
+        }
+        for (i of 1..n - 1) {
+            if (fromA) {
+                self.emitFan(self.polyA, i, n, geo, instance, material, flags, skipBack);
+            } else {
+                self.emitFan(self.polyB, i, n, geo, instance, material, flags, skipBack);
+            }
+        }
+    }
+
+    fn emitFan(
+        mut self,
+        poly : f32[],
+        i : i32,
+        n : i32,
+        geo : Vec3,
+        instance : i32,
+        material : i32,
+        flags : i32,
+        skipBack : bool
+    ) : void {
+        self.emit(poly, 0, i, i + 1, geo, instance, material, flags, skipBack);
+    }
+
+    // Side of vertex `v` of the current source polygon (A or B) against `plane`.
+    fn sideOf(self, fromA : bool, v : i32, plane : i32) : f32 {
+        if (fromA) {
+            return CpuTris::side(self.polyA, v, plane);
+        }
+        return CpuTris::side(self.polyB, v, plane);
+    }
+
+    // Copies vertex `i` of the source polygon to slot `out` of the other one.
+    fn copyVertex(mut self, fromA : bool, i : i32, out : i32) : void {
+        for (k of 0..CTRI_V) {
+            if (fromA) {
+                self.polyB[out * CTRI_V + k] = self.polyA[i * CTRI_V + k];
+            } else {
+                self.polyA[out * CTRI_V + k] = self.polyB[i * CTRI_V + k];
+            }
+        }
+    }
+
+    // Writes the point `t` of the way from vertex `i` to vertex `j` to slot `out` of the other polygon.
+    fn lerpVertex(mut self, fromA : bool, i : i32, j : i32, t : f32, out : i32) : void {
+        for (k of 0..CTRI_V) {
+            if (fromA) {
+                let a : f32 = self.polyA[i * CTRI_V + k];
+                self.polyB[out * CTRI_V + k] = a + (self.polyA[j * CTRI_V + k] - a) * t;
+            } else {
+                let a : f32 = self.polyB[i * CTRI_V + k];
+                self.polyA[out * CTRI_V + k] = a + (self.polyB[j * CTRI_V + k] - a) * t;
+            }
+        }
+    }
+
+    // Snaps three vertices of `poly` to the screen and stores the triangle, dropping it when it is degenerate,
+    // culled, or off screen.
+    fn emit(
+        mut self,
+        poly : f32[],
+        ia : i32,
+        ib : i32,
+        ic : i32,
+        geo : Vec3,
+        instance : i32,
+        material : i32,
+        flags : i32,
+        skipBack : bool
+    ) : void {
+        let mut sx : i32[] = malloc<i32>(3);
+        let mut sy : i32[] = malloc<i32>(3);
+        let mut z : f32[] = malloc<f32>(3);
+        let mut iw : f32[] = malloc<f32>(3);
+        for (k of 0..3) {
+            let mut v : i32 = ia;
+            if (k == 1) {
+                v = ib;
+            }
+            if (k == 2) {
+                v = ic;
+            }
+            let w : f32 = poly[v * CTRI_V + 3];
+            if (!(w > (0.000001 as f32))) {
+                return;
+            }
+            let inv : f32 = (1.0 as f32) / w;
+            iw[k] = inv;
+            z[k] = poly[v * CTRI_V + 2] * inv;
+            let fx : f32 = (poly[v * CTRI_V] * inv * (0.5 as f32) + (0.5 as f32)) * (self.width as f32)
+                * (256.0 as f32);
+            let fy : f32 = (poly[v * CTRI_V + 1] * inv * (0.5 as f32) + (0.5 as f32)) * (self.height as f32)
+                * (256.0 as f32);
+            sx[k] = CpuTris::floorI(fx + (0.5 as f32));
+            sy[k] = CpuTris::floorI(fy + (0.5 as f32));
+        }
+        let area : i64 = ((sx[1] - sx[0]) as i64) * ((sy[2] - sy[0]) as i64)
+            - ((sy[1] - sy[0]) as i64) * ((sx[2] - sx[0]) as i64);
+        if (area == 0) {
+            return;
+        }
+        let back : bool = area > 0;
+        if (back && skipBack) {
+            return;
+        }
+        let minX : i32 = CpuTris::least3(sx[0], sx[1], sx[2]);
+        let maxX : i32 = CpuTris::most3(sx[0], sx[1], sx[2]);
+        let minY : i32 = CpuTris::least3(sy[0], sy[1], sy[2]);
+        let maxY : i32 = CpuTris::most3(sy[0], sy[1], sy[2]);
+        if (maxX < 0 || maxY < 0 || (minX >> 8) >= self.width || (minY >> 8) >= self.height) {
+            return;
+        }
+        if (self.count == self.room) {
+            self.grow();
+        }
+        let t : i32 = self.count;
+        // Canonical order: positive area. A front face (negative area) swaps its last two vertices.
+        let mut o1 : i32 = 1;
+        let mut o2 : i32 = 2;
+        if (!back) {
+            o1 = 2;
+            o2 = 1;
+        }
+        for (k of 0..3) {
+            let mut src : i32 = 0;
+            if (k == 1) {
+                src = o1;
+            }
+            if (k == 2) {
+                src = o2;
+            }
+            let mut v : i32 = ia;
+            if (src == 1) {
+                v = ib;
+            }
+            if (src == 2) {
+                v = ic;
+            }
+            self.snap[t * 6 + k * 2] = sx[src];
+            self.snap[t * 6 + k * 2 + 1] = sy[src];
+            self.zinv[t * 6 + k] = z[src];
+            self.zinv[t * 6 + 3 + k] = iw[src];
+            for (a of 0..8) {
+                self.attr[t * 24 + k * 8 + a] = poly[v * CTRI_V + 4 + a];
+            }
+        }
+        self.geo[t * 3] = geo.x;
+        self.geo[t * 3 + 1] = geo.y;
+        self.geo[t * 3 + 2] = geo.z;
+        let mut f : i32 = flags;
+        if (back) {
+            f = f | CPU_FLAG_BACK;
+        }
+        self.meta[t * 5] = instance;
+        self.meta[t * 5 + 1] = material;
+        self.meta[t * 5 + 2] = f;
+        self.meta[t * 5 + 3] = self.curObject;
+        self.meta[t * 5 + 4] = self.curLayer;
+        self.count = t + 1;
+    }
+
+    static fn floorI(v : f32) : i32 {
+        let mut t : i32 = v as i32;
+        if ((t as f32) > v) {
+            t = t - 1;
+        }
+        return t;
+    }
+
+    static fn least3(a : i32, b : i32, c : i32) : i32 {
+        let mut m : i32 = a;
+        if (b < m) {
+            m = b;
+        }
+        if (c < m) {
+            m = c;
+        }
+        return m;
+    }
+
+    static fn most3(a : i32, b : i32, c : i32) : i32 {
+        let mut m : i32 = a;
+        if (b > m) {
+            m = b;
+        }
+        if (c > m) {
+            m = c;
+        }
+        return m;
+    }
+
+    // The tile range a triangle touches, as (x0, y0, x1, y1) packed in four ints written to `out`.
+    fn tileRange(self, t : i32, out : i32[]) : void {
+        let x0 : i32 = CpuTris::least3(self.snap[t * 6], self.snap[t * 6 + 2], self.snap[t * 6 + 4]) >> 8;
+        let x1 : i32 = CpuTris::most3(self.snap[t * 6], self.snap[t * 6 + 2], self.snap[t * 6 + 4]) >> 8;
+        let y0 : i32 = CpuTris::least3(self.snap[t * 6 + 1], self.snap[t * 6 + 3], self.snap[t * 6 + 5]) >> 8;
+        let y1 : i32 = CpuTris::most3(self.snap[t * 6 + 1], self.snap[t * 6 + 3], self.snap[t * 6 + 5]) >> 8;
+        out[0] = CpuTris::clampI(x0, 0, self.width - 1) / CPU_TILE;
+        out[1] = CpuTris::clampI(y0, 0, self.height - 1) / CPU_TILE;
+        out[2] = CpuTris::clampI(x1, 0, self.width - 1) / CPU_TILE;
+        out[3] = CpuTris::clampI(y1, 0, self.height - 1) / CPU_TILE;
+    }
+
+    static fn clampI(v : i32, lo : i32, hi : i32) : i32 {
+        if (v < lo) {
+            return lo;
+        }
+        if (v > hi) {
+            return hi;
+        }
+        return v;
+    }
+
+    /** Sorts the stored triangles into tile lists, keeping submission order inside each tile. */
+    pub(crate) fn bin(mut self) : void {
+        let tiles : i32 = self.tilesX * self.tilesY;
+        let mut range : i32[] = malloc<i32>(4);
+        for (i of 0..tiles + 1) {
+            self.binStart[i] = 0;
+        }
+        let mut total : i32 = 0;
+        for (t of 0..self.count) {
+            self.tileRange(t, range);
+            for (ty of range[1]..range[3] + 1) {
+                for (tx of range[0]..range[2] + 1) {
+                    self.binStart[ty * self.tilesX + tx + 1] = self.binStart[ty * self.tilesX + tx + 1] + 1;
+                    total = total + 1;
+                }
+            }
+        }
+        for (i of 0..tiles) {
+            self.binStart[i + 1] = self.binStart[i + 1] + self.binStart[i];
+        }
+        self.binList = malloc<i32>((total + 1) as i64);
+        let mut fill : i32[] = malloc<i32>((tiles + 1) as i64);
+        for (i of 0..tiles) {
+            fill[i] = self.binStart[i];
+        }
+        for (t of 0..self.count) {
+            self.tileRange(t, range);
+            for (ty of range[1]..range[3] + 1) {
+                for (tx of range[0]..range[2] + 1) {
+                    let at : i32 = ty * self.tilesX + tx;
+                    self.binList[fill[at]] = t;
+                    fill[at] = fill[at] + 1;
+                }
+            }
+        }
+    }
+}

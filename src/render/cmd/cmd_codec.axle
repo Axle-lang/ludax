@@ -1,0 +1,155 @@
+// cmd_codec — a command stream as bytes, and back.
+//
+// A recorded frame can be saved, diffed, sent to another process or replayed against a different backend, so it
+// has a wire form. Layout, all little-endian 32-bit words: the magic "LXCS", the format version, the number of
+// commands n, then n records of eight words (opcode, a, b, c, and the bit patterns of f0..f3), then a CRC-32 of
+// everything before it. `encode` is a pure function of the stream, so equal streams give equal bytes;
+// `decode` refuses a damaged or foreign buffer with a reason instead of building a half stream.
+//
+// Axle has no float-to-bits cast, so `floatBits` and `bitsFloat` take an f32 apart by repeated halving and
+// doubling, which is exact. Finite normal numbers and zero survive the round trip bit for bit; negative zero
+// reads back as zero, denormals flush to zero, and a NaN or infinity is stored as zero or the largest finite
+// number: no command has any reason to hold one.
+
+use crate::data::bytes::{ByteBuf, Crc32};
+use crate::render::cmd::cmd_stream::CmdStream;
+
+/** The format version written and accepted. */
+pub const CMD_CODEC_VERSION : i32 = 1;
+
+// "LXCS" read as a little-endian word.
+const CMDC_MAGIC : i32 = 1396922444;
+
+// The largest finite f32.
+const CMDC_MAX : f32 = 3.4028234e38;
+
+/** Serialises streams. */
+pub class CmdCodec {
+    /** The bytes of `stream`. */
+    pub static fn encode(stream : CmdStream) : ByteBuf {
+        let mut out : ByteBuf = new ByteBuf(16 + stream.count() * 32 + 8);
+        out.pushLe32(CMDC_MAGIC);
+        out.pushLe32(CMD_CODEC_VERSION);
+        out.pushLe32(stream.count());
+        for (i of 0..stream.count()) {
+            out.pushLe32(stream.code(i));
+            out.pushLe32(stream.a(i));
+            out.pushLe32(stream.b(i));
+            out.pushLe32(stream.c(i));
+            for (k of 0..4) {
+                out.pushLe32(CmdCodec::floatBits(stream.f(i, k)));
+            }
+        }
+        let crc : Crc32 = new Crc32();
+        out.pushLe32(crc.sum(out, 0, out.len()));
+        return out;
+    }
+
+    /**
+     * Reads `bytes` into `into` (which is cleared first). Returns an empty string on success, otherwise why not:
+     * a wrong magic or version, a length that does not fit, an unknown opcode or a checksum that does not match.
+     * On failure `into` is left empty.
+     */
+    pub static fn decode(bytes : ByteBuf, into : CmdStream) : string {
+        into.clear();
+        if (bytes.len() < 16) {
+            return "too short for a header";
+        }
+        if (bytes.le32(0) != CMDC_MAGIC) {
+            return "not a command stream (bad magic)";
+        }
+        if (bytes.le32(4) != CMD_CODEC_VERSION) {
+            return "unsupported version " + bytes.le32(4).toString();
+        }
+        let n : i32 = bytes.le32(8);
+        if (n < 0 || n > 100000000 || bytes.len() != 12 + n * 32 + 4) {
+            return "length does not match the command count";
+        }
+        let crc : Crc32 = new Crc32();
+        if (crc.sum(bytes, 0, bytes.len() - 4) != bytes.le32(bytes.len() - 4)) {
+            return "checksum mismatch";
+        }
+        for (i of 0..n) {
+            let at : i32 = 12 + i * 32;
+            let code : i32 = bytes.le32(at);
+            if (!CmdStream::isValidCode(code)) {
+                into.clear();
+                return "unknown opcode " + code.toString() + " in command " + i.toString();
+            }
+            into.pushRaw(
+                code,
+                bytes.le32(at + 4),
+                bytes.le32(at + 8),
+                bytes.le32(at + 12),
+                CmdCodec::bitsFloat(bytes.le32(at + 16)),
+                CmdCodec::bitsFloat(bytes.le32(at + 20)),
+                CmdCodec::bitsFloat(bytes.le32(at + 24)),
+                CmdCodec::bitsFloat(bytes.le32(at + 28))
+            );
+        }
+        return "";
+    }
+
+    /** The IEEE-754 binary32 bit pattern of `v` (see the file header for what is not preserved). */
+    pub static fn floatBits(v : f32) : i32 {
+        if (v != v) {
+            return 0;
+        }
+        let negative : bool = v < (0.0 as f32);
+        let mut x : f32 = v;
+        if (negative) {
+            x = -v;
+        }
+        if (x == (0.0 as f32)) {
+            return 0;
+        }
+        let mut sign : i32 = 0;
+        if (negative) {
+            sign = -2147483647 - 1;
+        }
+        if (x >= CMDC_MAX) {
+            return sign | 2139095039;
+        }
+        let mut e : i32 = 0;
+        while (x >= (2.0 as f32)) {
+            x = x * (0.5 as f32);
+            e = e + 1;
+        }
+        while (x < (1.0 as f32)) {
+            x = x * (2.0 as f32);
+            e = e - 1;
+        }
+        if (e < -126) {
+            return sign;
+        }
+        let mantissa : i32 = ((x - (1.0 as f32)) * (8388608.0 as f32)) as i32;
+        return sign | ((e + 127) << 23) | mantissa;
+    }
+
+    /** The f32 whose bit pattern is `bits`. */
+    pub static fn bitsFloat(bits : i32) : f32 {
+        let exponent : i32 = (bits >>> 23) & 255;
+        let mantissa : i32 = bits & 8388607;
+        let negative : bool = (bits >>> 31) == 1;
+        if (exponent == 0 || exponent == 255 && mantissa != 0) {
+            return 0.0;
+        }
+        let mut v : f32 = CMDC_MAX;
+        if (exponent != 255) {
+            v = (1.0 as f32) + (mantissa as f32) * (0.00000011920928955078125 as f32);
+            let mut e : i32 = exponent - 127;
+            while (e > 0) {
+                v = v * (2.0 as f32);
+                e = e - 1;
+            }
+            while (e < 0) {
+                v = v * (0.5 as f32);
+                e = e + 1;
+            }
+        }
+        if (negative) {
+            return -v;
+        }
+        return v;
+    }
+}

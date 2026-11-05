@@ -1,0 +1,90 @@
+// graph_record — a compiled graph and a scene become a command stream.
+//
+// The graph says which passes run and in what order; the scene says what there is to draw. `FrameRecorder::record`
+// walks the plan and, for each pass, emits BeginPass, the commands its kind needs, and EndPass:
+//   BuildAccel  builds each acceleration structure the pass writes;
+//   Forward     sets the colour (and depth) target the pass writes, clears it, and draws the scene's instances.
+//               The instance list is already sorted so equal (material, mesh) pairs are adjacent; each run becomes
+//               one BindMaterial (only when the material changes) and one DrawMesh over the run;
+//   Resolve     tone maps the colour the pass reads into the resource it writes, with the scene's exposure and knee;
+//   Custom      nothing.
+// Resource ids in the commands are the graph's resource ids; a pass id is the scope id its time is measured under.
+// An invalid plan records nothing.
+
+use crate::core::math::vec3::Vec3;
+use crate::render::cmd::cmd_stream::{CmdStream, CMD_CLEAR_COLOR, CMD_CLEAR_DEPTH};
+use crate::render::graph::graph_graph::RenderGraph;
+use crate::render::graph::graph_plan::GraphPlan;
+use crate::render::graph::graph_types::{GraphResKind, PassKind};
+use crate::render::scene::scene_frame::{RenderInstance, RenderScene};
+
+/** Turns plans into commands. */
+pub class FrameRecorder {
+    /** Records one frame of `scene` following `plan` (compiled from `g`) into `out` (cleared first); `clear` is the background colour. */
+    pub static fn record(
+        g : RenderGraph,
+        plan : GraphPlan,
+        scene : RenderScene,
+        clear : Vec3,
+        out : CmdStream
+    ) : void {
+        out.clear();
+        if (!plan.isValid()) {
+            return;
+        }
+        for (i of 0..plan.runCount()) {
+            let p : i32 = plan.passAt(i);
+            out.beginPass(p);
+            match g.passKindOf(p) {
+                PassKind::BuildAccel => FrameRecorder::accel(g, p, out),
+                PassKind::Forward => FrameRecorder::forward(g, p, scene, clear, out),
+                PassKind::Resolve => FrameRecorder::resolve(g, p, scene, out),
+                PassKind::Custom => FrameRecorder::nothing(),
+            }
+            out.endPass();
+        }
+    }
+
+    static fn nothing() : void {}
+
+    static fn accel(g : RenderGraph, p : i32, out : CmdStream) : void {
+        let r : i32 = g.firstResource(p, GraphResKind::Accel, true);
+        if (r >= 0) {
+            out.buildAccel(r);
+        }
+    }
+
+    static fn forward(g : RenderGraph, p : i32, scene : RenderScene, clear : Vec3, out : CmdStream) : void {
+        out.setTarget(
+            g.firstResource(p, GraphResKind::Color, true),
+            g.firstResource(p, GraphResKind::Depth, true)
+        );
+        out.clear(CMD_CLEAR_COLOR | CMD_CLEAR_DEPTH, clear.x, clear.y, clear.z, 1.0);
+        let n : i32 = scene.instanceCount();
+        let mut boundMaterial : i32 = -1;
+        let mut i : i32 = 0;
+        while (i < n) {
+            let first : RenderInstance = scene.instance(i);
+            let mut j : i32 = i + 1;
+            while (j < n && scene.instance(j).mesh == first.mesh
+                && scene.instance(j).material == first.material) {
+                j = j + 1;
+            }
+            if (first.material != boundMaterial) {
+                out.bindMaterial(first.material);
+                boundMaterial = first.material;
+            }
+            out.drawMesh(first.mesh, i, j - i);
+            i = j;
+        }
+    }
+
+    static fn resolve(g : RenderGraph, p : i32, scene : RenderScene, out : CmdStream) : void {
+        let source : i32 = g.firstResource(p, GraphResKind::Color, false);
+        let mut destination : i32 = g.firstResource(p, GraphResKind::Color, true);
+        if (destination < 0) {
+            destination = g.firstResource(p, GraphResKind::Texture, true);
+        }
+        out.resolve(source, destination, scene.exposure(), scene.toneKnee());
+    }
+}

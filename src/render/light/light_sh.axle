@@ -1,0 +1,230 @@
+// light_sh — second-order spherical harmonics (SH9) of an environment, and irradiance from them.
+//
+// An environment is a radiance L(w) for every direction w. Its nine SH coefficients c_i = integral L Y_i dw
+// are
+// computed by a deterministic product rule: Gauss-Legendre in cos(theta) (so no clustering at the poles)
+// and a uniform trapezoid in the azimuth, no random numbers. (LIGHTING_MATH.md names an equal-area grid; its
+// midpoint rule measured 3e-4 off on a constant, this rule 1e-6, so this is what ships.) Irradiance follows
+// Ramamoorthi & Hanrahan 2001: E(n) = sum A_l c_lm Y_lm(n) with
+// A_0 = pi, A_1 = 2 pi / 3, A_2 = pi / 4. `irradiance` returns E / pi, the radiance a white Lambertian
+// surface
+// with normal n shows under the environment: a constant L gives exactly L, which is the white-furnace law for
+// ambient light and the unit the shading functions use.
+//
+// Error (measured by the suite): a constant reproduces to 1e-6; a linear gradient a + b w.y reproduces E/pi =
+// a + (2/3) b n.y to 1e-6 (it lies in the l <= 1 band); a clamped cosine lobe (the worst case for 9 terms) is
+// within the figure the suite prints against a brute-force irradiance integral. Subset: `irradiance` and
+// `basis` are pure and in the subset; projection walks a trait object and is not.
+//
+// Differences from voxel-axle: its sky light was one scalar `skyView(n.y)`; SH9 keeps the colour and the
+// direction
+// of the whole dome (blue zenith, warm horizon, the ground's bounce) in 27 numbers.
+
+use crate::core::math::scalar::{PI, max};
+use crate::core::math::trig::{sin, cos, sqrt};
+use crate::core::math::vec3::Vec3;
+use crate::render::light::light_quadrature::LightGauss;
+
+// Real SH basis constants (Ramamoorthi & Hanrahan, table 1).
+const LSH_Y00 : f32 = 0.282094791773878;
+const LSH_Y1 : f32 = 0.488602511902920;
+const LSH_Y2A : f32 = 1.092548430592079;
+const LSH_Y2B : f32 = 0.315391565252520;
+const LSH_Y2C : f32 = 0.546274215296040;
+
+// Cosine-lobe convolution factors A_l / pi.
+const LSH_A1 : f32 = 0.666666666666667;
+const LSH_A2 : f32 = 0.25;
+
+/** Something that has a radiance in every direction: a sky, a probe, a constant, a gradient. */
+pub trait LightEnvironment {
+    /** The radiance (linear, scene units) arriving from the unit direction `dir`. */
+    fn radiance(self, dir : Vec3) : Vec3;
+}
+
+/** The simplest environment: the same radiance everywhere (the white furnace). */
+pub class LightUniformEnvironment : LightEnvironment {
+    value : Vec3;
+
+    /** An environment of constant radiance `value`. */
+    constructor(value : Vec3) {
+        self.value = value;
+    }
+
+    /** The constant. */
+    pub fn radiance(self, dir : Vec3) : Vec3 {
+        return self.value;
+    }
+}
+
+/** The nine real SH basis functions at one direction, in the order of the coefficients of `LightSh9`. */
+pub struct LightShValues {
+    /** Y00. */
+    pub y0 : f32 = 0.0;
+
+    /** Y1-1. */
+    pub y1 : f32 = 0.0;
+
+    /** Y10. */
+    pub y2 : f32 = 0.0;
+
+    /** Y11. */
+    pub y3 : f32 = 0.0;
+
+    /** Y2-2. */
+    pub y4 : f32 = 0.0;
+
+    /** Y2-1. */
+    pub y5 : f32 = 0.0;
+
+    /** Y20. */
+    pub y6 : f32 = 0.0;
+
+    /** Y21. */
+    pub y7 : f32 = 0.0;
+
+    /** Y22. */
+    pub y8 : f32 = 0.0;
+}
+
+/** Nine RGB SH coefficients, in the order Y00, Y1-1, Y10, Y11, Y2-2, Y2-1, Y20, Y21, Y22. */
+pub struct LightSh9 {
+    /** Coefficient 0. */
+    pub c0 : Vec3 = Vec3 { x: 0.0, y: 0.0, z: 0.0 };
+
+    /** Coefficient 1. */
+    pub c1 : Vec3 = Vec3 { x: 0.0, y: 0.0, z: 0.0 };
+
+    /** Coefficient 2. */
+    pub c2 : Vec3 = Vec3 { x: 0.0, y: 0.0, z: 0.0 };
+
+    /** Coefficient 3. */
+    pub c3 : Vec3 = Vec3 { x: 0.0, y: 0.0, z: 0.0 };
+
+    /** Coefficient 4. */
+    pub c4 : Vec3 = Vec3 { x: 0.0, y: 0.0, z: 0.0 };
+
+    /** Coefficient 5. */
+    pub c5 : Vec3 = Vec3 { x: 0.0, y: 0.0, z: 0.0 };
+
+    /** Coefficient 6. */
+    pub c6 : Vec3 = Vec3 { x: 0.0, y: 0.0, z: 0.0 };
+
+    /** Coefficient 7. */
+    pub c7 : Vec3 = Vec3 { x: 0.0, y: 0.0, z: 0.0 };
+
+    /** Coefficient 8. */
+    pub c8 : Vec3 = Vec3 { x: 0.0, y: 0.0, z: 0.0 };
+
+    /** All coefficients zero: black. */
+    pub static fn zero() : LightSh9 {
+        return LightSh9 {};
+    }
+
+    /** The coefficients multiplied by `k`. */
+    pub fn scaled(self, k : f32) : LightSh9 {
+        return LightSh9 {
+            c0: self.c0.scale(k),
+            c1: self.c1.scale(k),
+            c2: self.c2.scale(k),
+            c3: self.c3.scale(k),
+            c4: self.c4.scale(k),
+            c5: self.c5.scale(k),
+            c6: self.c6.scale(k),
+            c7: self.c7.scale(k),
+            c8: self.c8.scale(k),
+        };
+    }
+
+    /** The sum of two environments' coefficients. */
+    pub fn plus(self, o : LightSh9) : LightSh9 {
+        return LightSh9 {
+            c0: self.c0.plus(o.c0),
+            c1: self.c1.plus(o.c1),
+            c2: self.c2.plus(o.c2),
+            c3: self.c3.plus(o.c3),
+            c4: self.c4.plus(o.c4),
+            c5: self.c5.plus(o.c5),
+            c6: self.c6.plus(o.c6),
+            c7: self.c7.plus(o.c7),
+            c8: self.c8.plus(o.c8),
+        };
+    }
+
+    /** `radiance` seen from direction `dir` and weighted by `weight` steradians, added into the
+     * coefficients. */
+    pub fn withSample(self, dir : Vec3, radiance : Vec3, weight : f32) : LightSh9 {
+        let b : LightShValues = lightShBasisAt(dir);
+        let k : Vec3 = radiance.scale(weight);
+        return LightSh9 {
+            c0: self.c0.plus(k.scale(b.y0)),
+            c1: self.c1.plus(k.scale(b.y1)),
+            c2: self.c2.plus(k.scale(b.y2)),
+            c3: self.c3.plus(k.scale(b.y3)),
+            c4: self.c4.plus(k.scale(b.y4)),
+            c5: self.c5.plus(k.scale(b.y5)),
+            c6: self.c6.plus(k.scale(b.y6)),
+            c7: self.c7.plus(k.scale(b.y7)),
+            c8: self.c8.plus(k.scale(b.y8)),
+        };
+    }
+
+    /**
+     * Projects an environment: Gauss-Legendre with `bands` nodes in cos(theta) (exact for the degree-2 basis
+     * times
+     * a polynomial environment) and a uniform trapezoid of `2 * bands` azimuths (exact for the trigonometric
+     * degree of the basis). 32 bands (2048 samples) reproduce a constant or a gradient to 1e-6.
+     */
+    pub static fn project(env : LightEnvironment, bands : i32) : LightSh9 {
+        let rule : LightGauss = new LightGauss(bands);
+        let mut result : LightSh9 = LightSh9::zero();
+        let azimuths : i32 = bands * 2;
+        let azimuthWeight : f32 = (2.0 as f32) * PI / (azimuths as f32);
+        for (i of 0..bands) {
+            let y : f32 = rule.node(i) as f32;
+            let ring : f32 = sqrt(max((1.0 as f32) - y * y, 0.0));
+            let band : f32 = (rule.weight(i) as f32) * azimuthWeight;
+            for (k of 0..azimuths) {
+                let phi : f32 = azimuthWeight * ((k as f32) + (0.5 as f32));
+                let dir : Vec3 = Vec3::make(ring * cos(phi), y, ring * sin(phi));
+                result = result.withSample(dir, env.radiance(dir), band);
+            }
+        }
+        return result;
+    }
+
+    /**
+     * E(n) / pi: the radiance a white diffuse surface with unit normal `n` shows under this environment,
+     * clamped
+     * at 0 (the 9-term series can ring below zero next to a bright lobe).
+     */
+    pub fn irradiance(self, n : Vec3) : Vec3 {
+        let b : LightShValues = lightShBasisAt(n);
+        let sum : Vec3 = self.c0
+            .scale(b.y0)
+            .plus(self.c1.scale(b.y1 * LSH_A1))
+            .plus(self.c2.scale(b.y2 * LSH_A1))
+            .plus(self.c3.scale(b.y3 * LSH_A1))
+            .plus(self.c4.scale(b.y4 * LSH_A2))
+            .plus(self.c5.scale(b.y5 * LSH_A2))
+            .plus(self.c6.scale(b.y6 * LSH_A2))
+            .plus(self.c7.scale(b.y7 * LSH_A2))
+            .plus(self.c8.scale(b.y8 * LSH_A2));
+        return Vec3::make(max(sum.x, 0.0), max(sum.y, 0.0), max(sum.z, 0.0));
+    }
+}
+
+/** The nine real SH basis functions at the unit direction `d`. */
+pub fn lightShBasisAt(d : Vec3) : LightShValues {
+    return LightShValues {
+        y0: LSH_Y00,
+        y1: LSH_Y1 * d.y,
+        y2: LSH_Y1 * d.z,
+        y3: LSH_Y1 * d.x,
+        y4: LSH_Y2A * d.x * d.y,
+        y5: LSH_Y2A * d.y * d.z,
+        y6: LSH_Y2B * ((3.0 as f32) * d.z * d.z - (1.0 as f32)),
+        y7: LSH_Y2A * d.x * d.z,
+        y8: LSH_Y2C * (d.x * d.x - d.y * d.y),
+    };
+}

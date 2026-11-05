@@ -1,0 +1,447 @@
+// cpu_renderer — the CPU backend: executes a command stream and produces the picture. The reference oracle.
+//
+// This is the only code that knows what the commands mean on the CPU. It owns a colour buffer (linear HDR, 3 floats
+// a pixel) and a depth buffer per resource id the stream targets, a `CpuKernel` that rasterises and shades, and
+// optionally a pool of worker threads (`workers`; 0 runs the tiles on the calling thread, in order, and gives the
+// same bytes). Commands are executed in order:
+//   BeginPass / EndPass   open and close the profiler scope of the pass and give counters a pass to belong to;
+//   SetTarget, Clear      choose and clear the buffers (colour cleared to a given linear colour, depth to a value);
+//   BindMaterial          remembers the material of the following draws;
+//   DrawMesh              sets up the triangles of an instance range; they are drawn together at the next command
+//                         that is not a draw (a "flush"), so opaque triangles of a batch resolve before blended ones;
+//   BuildAccel            builds the BVH of every shadow-casting, non-blended instance of the scene and the shadow
+//                         query over it and the scene's lights;
+//   Resolve               tone maps the HDR colour of a resource into 8-bit sRGB (`Image`).
+// Everything about a frame that is not in the stream (instances, lights, environment, camera) comes from the
+// `RenderScene` passed to `execute`. A GPU backend implements the same commands; this one is what it is tested against.
+
+use crate::core::collections::vec::Vec;
+use crate::core::jobs::kernel::runSerial;
+use crate::core::jobs::pool::JobPool;
+use crate::core::math::mat4::Mat4;
+use crate::core::math::vec3::Vec3;
+use crate::core::profile::profiler::Profiler;
+use crate::data::image::image::Image;
+use crate::render::cmd::cmd_costs::PassCosts;
+use crate::render::cmd::cmd_stream::{CmdOp, CmdStream, CMD_CLEAR_COLOR, CMD_CLEAR_DEPTH};
+use crate::render::cpu::cpu_kernel::CpuKernel;
+use crate::render::cpu::cpu_shadow::CpuShadowQuery;
+use crate::render::cpu::cpu_surface::{CpuSample, CpuSurface};
+use crate::render::light::light_color::lightDisplay;
+use crate::render::light::light_shade::LightAmbientInput;
+use crate::render::light::light_source::LightSource;
+use crate::render::scene::scene_assets::RenderAssets;
+use crate::render::scene::scene_frame::{RenderInstance, RenderScene};
+use crate::render::scene::scene_mesh::MeshData;
+
+// Most resource ids a stream may target.
+const CPUR_TARGETS : i32 = 32;
+
+/** Choices of the CPU backend. */
+pub struct CpuSettings {
+    /** Worker threads for the tiles; 0 runs everything on the calling thread. The picture does not depend on it. */
+    pub workers : i32 = 0;
+
+    /** Drop triangles that face away from the camera (single-sided materials only). */
+    pub cullBackfaces : bool = true;
+
+    /** Side of the albedo table (view cosine x roughness) the shading uses. */
+    pub dfgSize : i32 = 24;
+
+    /** Quadrature order of that table. */
+    pub dfgOrder : i32 = 48;
+
+    /** Count the triangles covering each pixel (for the tests of the fill rule). */
+    pub debugCover : bool = false;
+}
+
+// The buffers of one target resource.
+class CpuTarget {
+    pub color   : f32[];
+    pub depth   : f32[];
+    pub picture : Image;
+
+    constructor(width : i32, height : i32) {
+        self.color = malloc<f32>((width * height * 3) as i64);
+        self.depth = malloc<f32>((width * height) as i64);
+        self.picture = new Image(width, height);
+        for (i of 0..width * height * 3) {
+            self.color[i] = 0.0;
+        }
+        for (i of 0..width * height) {
+            self.depth[i] = 1.0;
+        }
+    }
+}
+
+/** Executes command streams on the CPU. */
+pub class CpuRenderer {
+    kernel   : CpuKernel;
+    pool     : JobPool;
+    pooled   : bool = false;
+    width    : i32;
+    height   : i32;
+    settings : CpuSettings;
+    targets  : CpuTarget[];
+    made     : bool[];
+    scratch  : CpuTarget;
+    colorId  : i32 = -1;
+    depthId  : i32 = -1;
+    material : i32 = 0;
+    pass     : i32 = -1;
+    token    : i32 = -1;
+    pending  : bool = false;
+    flushed  : bool = false;
+    viewProj : Mat4;
+
+    /** A renderer for pictures of `width` x `height` pixels drawing the meshes, materials and textures of `assets`. */
+    constructor(width : i32, height : i32, own assets : Shared<RenderAssets>, settings : CpuSettings) {
+        self.width = width;
+        self.height = height;
+        self.settings = settings;
+        self.kernel = new CpuKernel(width, height, assets, settings.dfgSize, settings.dfgOrder);
+        self.kernel.debugCover = settings.debugCover;
+        let mut threads : i32 = settings.workers;
+        if (threads < 1) {
+            threads = 1;
+        }
+        self.pool = new JobPool(threads, self.kernel);
+        if (settings.workers > 0) {
+            self.pooled = true;
+        } else {
+            self.pool.shutdown();
+        }
+        self.targets = malloc<CpuTarget>(CPUR_TARGETS as i64);
+        self.made = malloc<bool>(CPUR_TARGETS as i64);
+        for (i of 0..CPUR_TARGETS) {
+            self.made[i] = false;
+        }
+        self.scratch = new CpuTarget(width, height);
+        self.viewProj = Mat4::identity();
+    }
+
+    /** Stops the worker threads; the renderer must not execute streams afterwards. */
+    pub fn close(mut self) : void {
+        self.pool.shutdown();
+        self.pooled = false;
+    }
+
+    // The buffers of resource `id`, made on first use; an out-of-range id gets the scratch target.
+    fn target(mut self, id : i32) : CpuTarget {
+        if (id < 0 || id >= CPUR_TARGETS) {
+            return self.scratch;
+        }
+        if (!self.made[id]) {
+            self.targets[id] = new CpuTarget(self.width, self.height);
+            self.made[id] = true;
+        }
+        return self.targets[id];
+    }
+
+    /**
+     * Executes `stream` against `scene`, adding counts to `costs` and timing every pass under scope id = pass id on
+     * `profiler` (open a frame on it first; a profiler that is disabled costs nothing). Shadows and the scene's
+     * lights come from the scene; the environment too.
+     */
+    pub fn execute(
+        mut self,
+        stream : CmdStream,
+        scene : RenderScene,
+        costs : PassCosts,
+        profiler : Profiler
+    ) : void {
+        self.prepare(scene);
+        for (i of 0..stream.count()) {
+            match stream.op(i) {
+                CmdOp::BeginPass => self.beginPass(stream.a(i), profiler, costs),
+                CmdOp::EndPass => self.endPass(profiler, costs),
+                CmdOp::SetTarget => self.setTarget(stream.a(i), stream.b(i), costs),
+                CmdOp::Clear => self.clear(
+                    stream.a(i),
+                    stream.f(i, 0),
+                    stream.f(i, 1),
+                    stream.f(i, 2),
+                    stream.f(i, 3),
+                    costs
+                ),
+                CmdOp::BindMaterial => self.bindMaterial(stream.a(i)),
+                CmdOp::DrawMesh => self.draw(scene, costs, stream.a(i), stream.b(i), stream.c(i)),
+                CmdOp::BuildAccel => self.buildAccel(scene, costs),
+                CmdOp::Resolve => self.resolve(
+                    costs,
+                    stream.a(i),
+                    stream.b(i),
+                    stream.f(i, 0),
+                    stream.f(i, 1)
+                ),
+            }
+        }
+        self.flush(costs);
+    }
+
+    // Per-frame state taken from the scene: lights, environment, camera.
+    fn prepare(mut self, scene : RenderScene) : void {
+        self.kernel.lamps.clear();
+        for (i of 0..scene.lightCount()) {
+            self.kernel.lamps.push(scene.light(i));
+        }
+        self.kernel.sky = scene.environmentSh();
+        self.kernel.skySpec = scene.environmentSpecular();
+        self.kernel.skyBelow = scene.environmentGround();
+        self.kernel.ortho = scene.camera().isOrthographic();
+        self.kernel.forward = scene.camera().forwardF32();
+        self.viewProj = scene.camera().viewProjection();
+        self.kernel.setShadows(new CpuShadowQuery(malloc<f32>(9), 0, self.kernel.lamps));
+        self.colorId = -1;
+        self.depthId = -1;
+        self.pending = false;
+        self.pass = -1;
+        self.token = -1;
+        self.kernel.tris.reset();
+    }
+
+    fn beginPass(mut self, id : i32, profiler : Profiler, costs : PassCosts) : void {
+        self.flush(costs);
+        self.pass = id;
+        self.token = profiler.begin(id);
+    }
+
+    fn endPass(mut self, profiler : Profiler, costs : PassCosts) : void {
+        self.flush(costs);
+        profiler.end(self.token);
+        self.token = -1;
+        self.pass = -1;
+    }
+
+    fn setTarget(mut self, color : i32, depth : i32, costs : PassCosts) : void {
+        self.flush(costs);
+        self.colorId = color;
+        self.depthId = depth;
+    }
+
+    fn bindMaterial(mut self, id : i32) : void {
+        self.material = id;
+    }
+
+    fn clear(mut self, flags : i32, r : f32, g : f32, b : f32, depth : f32, costs : PassCosts) : void {
+        self.flush(costs);
+        if ((flags & CMD_CLEAR_COLOR) != 0) {
+            let mut pixels : f32[] = self.target(self.colorId).color;
+            for (i of 0..self.width * self.height) {
+                pixels[i * 3] = r;
+                pixels[i * 3 + 1] = g;
+                pixels[i * 3 + 2] = b;
+            }
+        }
+        if ((flags & CMD_CLEAR_DEPTH) != 0) {
+            let mut zs : f32[] = self.depthTarget().depth;
+            for (i of 0..self.width * self.height) {
+                zs[i] = depth;
+            }
+        }
+        self.flushed = false;
+    }
+
+    // The target whose depth buffer is bound: the depth resource when there is one, else the scratch buffer.
+    fn depthTarget(mut self) : CpuTarget {
+        if (self.depthId >= 0) {
+            return self.target(self.depthId);
+        }
+        return self.scratch;
+    }
+
+    fn draw(mut self, scene : RenderScene, costs : PassCosts, mesh : i32, first : i32, count : i32) : void {
+        let assets : Shared<RenderAssets> = self.kernel.assets;
+        if (!assets.hasMesh(mesh) || !assets.hasMaterial(self.material)) {
+            return;
+        }
+        let md : MeshData = assets.mesh(mesh);
+        costs.addDraw(self.pass, (md.triangleCount() as i64) * (count as i64));
+        self.kernel.tris.addDraw(
+            scene,
+            assets,
+            mesh,
+            first,
+            count,
+            self.material,
+            self.viewProj,
+            self.settings.cullBackfaces
+        );
+        self.pending = true;
+    }
+
+    // Draws the triangles collected since the last flush into the bound target.
+    fn flush(mut self, costs : PassCosts) : void {
+        if (!self.pending) {
+            return;
+        }
+        self.pending = false;
+        let color : CpuTarget = self.target(self.colorId);
+        let depth : CpuTarget = self.depthTarget();
+        self.kernel.copyIn(color.color, depth.depth);
+        self.kernel.tris.bin();
+        self.kernel.resetCounts();
+        let tiles : i32 = self.kernel.tris.tilesX * self.kernel.tris.tilesY;
+        if (self.pooled) {
+            self.pool.run(tiles, 1);
+        } else {
+            runSerial(self.kernel, tiles, 1);
+        }
+        self.kernel.copyOut(color.color, depth.depth);
+        costs.addRasterised(self.pass, self.kernel.tris.count as i64);
+        costs.addPixels(self.pass, self.kernel.shadedTotal());
+        self.flushed = true;
+    }
+
+    // Builds the shadow BVH from the casters of the scene.
+    fn buildAccel(mut self, scene : RenderScene, costs : PassCosts) : void {
+        self.flush(costs);
+        let assets : Shared<RenderAssets> = self.kernel.assets;
+        let mut total : i32 = 0;
+        for (k of 0..scene.instanceCount()) {
+            let inst : RenderInstance = scene.instance(k);
+            if (inst.castsShadow && assets.hasMesh(inst.mesh) && assets.hasMaterial(inst.material)
+                && !assets.material(inst.material).isBlended()) {
+                total = total + assets.mesh(inst.mesh).triangleCount();
+            }
+        }
+        let mut corners : f32[] = malloc<f32>((total * 9 + 9) as i64);
+        let mut at : i32 = 0;
+        for (k of 0..scene.instanceCount()) {
+            let inst : RenderInstance = scene.instance(k);
+            if (inst.castsShadow && assets.hasMesh(inst.mesh) && assets.hasMaterial(inst.material)
+                && !assets.material(inst.material).isBlended()) {
+                let md : MeshData = assets.mesh(inst.mesh);
+                for (t of 0..md.triangleCount()) {
+                    for (v of 0..3) {
+                        let p : Vec3 = inst.model.transformPoint(md.position(md.index(t * 3 + v)));
+                        corners[at] = p.x;
+                        corners[at + 1] = p.y;
+                        corners[at + 2] = p.z;
+                        at = at + 3;
+                    }
+                }
+            }
+        }
+        self.kernel.setShadows(new CpuShadowQuery(corners, total, self.kernel.lamps));
+    }
+
+    // Tone maps resource `source` into the picture of resource `destination`.
+    fn resolve(
+        mut self,
+        costs : PassCosts,
+        source : i32,
+        destination : i32,
+        exposure : f32,
+        knee : f32
+    ) : void {
+        self.flush(costs);
+        let from : CpuTarget = self.target(source);
+        let mut picture : Image = self.target(destination).picture;
+        for (y of 0..self.height) {
+            for (x of 0..self.width) {
+                let at : i32 = (y * self.width + x) * 3;
+                let c : Vec3 = lightDisplay(
+                    Vec3::make(from.color[at], from.color[at + 1], from.color[at + 2]),
+                    exposure,
+                    knee
+                );
+                picture.set(
+                    x,
+                    y,
+                    Image::pack(
+                        CpuRenderer::byte(c.x),
+                        CpuRenderer::byte(c.y),
+                        CpuRenderer::byte(c.z),
+                        255
+                    )
+                );
+            }
+        }
+        costs.addPixels(self.pass, (self.width * self.height) as i64);
+    }
+
+    static fn byte(v : f32) : i32 {
+        let n : i32 = (v * (255.0 as f32) + (0.5 as f32)) as i32;
+        if (n < 0) {
+            return 0;
+        }
+        if (n > 255) {
+            return 255;
+        }
+        return n;
+    }
+
+    /** The picture width in pixels. */
+    pub fn pictureWidth(self) : i32 {
+        return self.width;
+    }
+
+    /** The picture height in pixels. */
+    pub fn pictureHeight(self) : i32 {
+        return self.height;
+    }
+
+    /** The linear HDR colour at pixel (x, y) of colour resource `resource`. */
+    pub fn hdrAt(mut self, resource : i32, x : i32, y : i32) : Vec3 {
+        let t : CpuTarget = self.target(resource);
+        let at : i32 = (y * self.width + x) * 3;
+        return Vec3::make(t.color[at], t.color[at + 1], t.color[at + 2]);
+    }
+
+    /** The depth at pixel (x, y) of the target that holds depth resource `resource` (0 near, 1 far). */
+    pub fn depthAt(mut self, resource : i32, x : i32, y : i32) : f32 {
+        return self.target(resource).depth[y * self.width + x];
+    }
+
+    /** The 8-bit sRGB picture that `Resolve` wrote into resource `resource`. */
+    pub fn picture(mut self, resource : i32) : Image {
+        return self.target(resource).picture;
+    }
+
+    /** How many triangles covered pixel (x, y) in the last flush (needs `debugCover`). */
+    pub fn coverAt(self, x : i32, y : i32) : i32 {
+        return self.kernel.cover[y * self.width + x];
+    }
+
+    /** The id of the triangle visible at pixel (x, y) after the last flush, or -1 for none. */
+    pub fn visibleAt(self, x : i32, y : i32) : i32 {
+        if (!self.flushed) {
+            return -1;
+        }
+        return self.kernel.vis[y * self.width + x];
+    }
+
+    /** The surface at pixel (x, y) after the last flush; `triangle` is -1 when nothing opaque is visible there. */
+    pub fn sampleAt(self, x : i32, y : i32) : CpuSample {
+        let id : i32 = self.visibleAt(x, y);
+        if (id < 0) {
+            return CpuSample {};
+        }
+        return CpuSurface::sample(
+            self.kernel.tris,
+            self.kernel.assets,
+            self.kernel.dfg,
+            id,
+            x,
+            y,
+            self.kernel.ortho,
+            self.kernel.forward
+        );
+    }
+
+    /** The lights of the last executed frame, in the order shading and `LightExplain` number them. */
+    pub fn lights(self) : Vec<LightSource> {
+        return self.kernel.lamps;
+    }
+
+    /** The environment the shading gave surface `s` in the last executed frame. */
+    pub fn ambientFor(self, s : CpuSample) : LightAmbientInput {
+        return self.kernel.ambientFor(s);
+    }
+
+    /** The shadow query of the last executed frame. */
+    pub fn shadowQuery(self) : CpuShadowQuery {
+        return self.kernel.shadows;
+    }
+}

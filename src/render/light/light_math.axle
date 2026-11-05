@@ -1,0 +1,160 @@
+// light_math — deterministic exp2, log2 and pow, and the rules of the shading subset.
+//
+// THE SHADING SUBSET. Every function of `src/render/light` that decides what a pixel looks like (units,
+// attenuation, BRDF, tone map, SH evaluation, the shading of one light) is written in a restricted piece of
+// Axle so that a later tool (`tools/axle2glsl`) can translate it to GLSL mechanically: the CPU and the GPU
+// then
+// run the same text instead of two copies kept equal by hand. The rules, checked by eye today and by the
+// translator tomorrow:
+//
+//   1. Only free `fn`s (and `static fn`s of a struct) that take and return `f32`, `i32`, `bool`, `Vec3`, or a
+//      plain `struct` of those. No `class`, no `new`, no container, no `string`, no `throw`, no recursion.
+//   2. No allocation and no side effects: a result is only ever the return value.
+//   3. Loops have constant bounds (`for` over a literal range) so they unroll.
+//   4. `match` only on enums whose variants carry no payload (they become integer constants).
+//   5. Vec3 may use: make, splat, zero, plus, minus, times, scale, dot, cross, length, lengthSquared,
+//      normalized, lerp, negated, reflect, maxComponent.
+//   6. Real literals in arithmetic are written `(0.5 as f32)` or come from a typed `const`; a bare literal is
+//      only used in a comparison or as an argument.
+//   7. The only maths intrinsics are `sqrt` (core/math/trig), `lightExp2`, `lightLog2` and `lightPow` below.
+//      The translator maps them to `sqrt`, `exp2`, `log2` and `pow`; their bodies here are the CPU definition
+//      and are computed in f64 from IEEE additions and multiplications, so the same bits come out on every
+//      machine. They are the one place a GPU result may differ (by a few ulp); the parity tests allow it.
+//   8. Float division is always guarded (Axle traps on a divide by zero; GLSL would give infinity).
+//
+// What is NOT in the subset on purpose: the light list, the explainer, the SH projection and the sky model.
+// Those walk containers and allocate; they sit beside the shading functions and call them.
+
+use crate::core::math::scalar::HUGE;
+
+// ln 2 and its inverse, to f64 precision.
+const LMATH_LN2 : f64 = 0.69314718055994530942;
+const LMATH_INV_LN2 : f64 = 1.44269504088896340736;
+
+// The f32 exponent range: 2^-126 is the smallest normal number and 2^127 close to the largest.
+const LMATH_MIN_EXP : f64 = -126.0;
+const LMATH_MAX_EXP : f64 = 127.0;
+
+// sqrt(2) and 1/sqrt(2): the mantissa is folded into [1/sqrt 2, sqrt 2) so the log series converges fast.
+const LMATH_SQRT2 : f64 = 1.41421356237309504880;
+const LMATH_HALF_SQRT2 : f64 = 0.70710678118654752440;
+
+// 2^n for a whole n, by repeated squaring (at most 10 steps for |n| <= 1023).
+fn lmathPow2Int(n : i32) : f64 {
+    let mut count : i32 = n;
+    let mut base : f64 = 2.0;
+    if (n < 0) {
+        count = 0 - n;
+        base = 0.5;
+    }
+    let mut result : f64 = 1.0;
+    for (bit of 0..11) {
+        if ((count & 1) == 1) {
+            result = result * base;
+        }
+        base = base * base;
+        count = count >> 1;
+    }
+    return result;
+}
+
+// 2^x in f64 for x in the f32 exponent range: split into a whole part and a fraction in [-1/2, 1/2], expand
+// e^(fraction * ln 2) as a Taylor series (14 terms: the truncation error is below 1e-17), scale by the whole
+// part.
+fn lmathExp2D(x : f64) : f64 {
+    let whole : i64 = x.round();
+    let frac : f64 = x - (whole as f64);
+    let t : f64 = frac * LMATH_LN2;
+    let mut term : f64 = 1.0;
+    let mut sum : f64 = 1.0;
+    for (k of 1..15) {
+        term = term * t / (k as f64);
+        sum = sum + term;
+    }
+    return sum * lmathPow2Int(whole as i32);
+}
+
+// log2 of a positive finite number in f64: fold the mantissa into [1/sqrt 2, sqrt 2) counting the halvings,
+// then
+// ln m = 2 atanh((m-1)/(m+1)) as an odd series in z (|z| <= 0.172, so 11 terms are below 1e-17).
+fn lmathLog2D(x : f64) : f64 {
+    let mut m : f64 = x;
+    let mut e : f64 = 0.0;
+    while (m >= LMATH_SQRT2) {
+        m = m * 0.5;
+        e = e + 1.0;
+    }
+    while (m < LMATH_HALF_SQRT2) {
+        m = m * 2.0;
+        e = e - 1.0;
+    }
+    let z : f64 = (m - 1.0) / (m + 1.0);
+    let z2 : f64 = z * z;
+    let mut power : f64 = z;
+    let mut sum : f64 = 0.0;
+    for (k of 0..11) {
+        sum = sum + power / ((2 * k + 1) as f64);
+        power = power * z2;
+    }
+    return e + 2.0 * sum * LMATH_INV_LN2;
+}
+
+/**
+ * 2 raised to `x` in f64 for the physical models that integrate in double precision (the sky). Zero below
+ * 2^-1000 and capped above 2^1000; the series is the one `lightExp2` uses, so both are deterministic.
+ */
+pub fn lightExp2D(x : f64) : f64 {
+    if (!(x > -1000.0)) {
+        return 0.0;
+    }
+    if (x > 1000.0) {
+        return lmathExp2D(1000.0);
+    }
+    return lmathExp2D(x);
+}
+
+/** 2 raised to `x`. Below the f32 range the answer is 0, above it the largest finite number; never NaN. */
+pub fn lightExp2(x : f32) : f32 {
+    if (!(x > -126.0)) {
+        return 0.0;
+    }
+    if (x >= 127.0) {
+        return HUGE;
+    }
+    return lmathExp2D(x as f64) as f32;
+}
+
+/** The base-2 logarithm of `x`; `-126` for zero, negatives and not-a-number so the answer is always finite.
+ * */
+pub fn lightLog2(x : f32) : f32 {
+    if (!(x > 0.0)) {
+        return -126.0;
+    }
+    if (!x.isFinite()) {
+        return 127.0;
+    }
+    return lmathLog2D(x as f64) as f32;
+}
+
+/** `x` raised to `y` for a positive `x`; zero for `x <= 0` (a base with no logarithm), one for `y == 0`. */
+pub fn lightPow(x : f32, y : f32) : f32 {
+    if (y == 0.0) {
+        return 1.0;
+    }
+    if (!(x > 0.0)) {
+        return 0.0;
+    }
+    let e : f64 = (y as f64) * lmathLog2D(x as f64);
+    if (e <= LMATH_MIN_EXP) {
+        return 0.0;
+    }
+    if (e >= LMATH_MAX_EXP) {
+        return HUGE;
+    }
+    return lmathExp2D(e) as f32;
+}
+
+/** e raised to `x`, through `lightExp2`. */
+pub fn lightExp(x : f32) : f32 {
+    return lightExp2(x * (LMATH_INV_LN2 as f32));
+}

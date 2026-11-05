@@ -1,0 +1,241 @@
+// light_shade — shading one surface point: one light's contribution, the ambient term, and their separable
+// sum.
+//
+// The rendering equation of doc/LIGHTING_MATH.md §1 for a point is Lo = Le + sum over lights of f(l,v) E_i
+// V_i
+// + ambient. Nothing is summed before it has to be: every light yields a `LightContribution` (diffuse and
+// specular
+// apart, with the reason when it contributes nothing), the lights add into `LightShadeTerms` (direct diffuse,
+// direct specular, ambient diffuse, ambient specular, emissive), and `LightDirectAmbient` (voxel-axle's
+// `FaceLight`, now RGB) is the two-number view of it that a shadow, a cloud or a debug view recombines.
+//
+// ONE CODE PATH. `lightContribution` is the only function that turns a light into radiance; `lightShade`
+// sums its
+// results and `lightExplain` (light_explain) records them. The explainer therefore cannot disagree with the
+// renderer, and the suite checks the sums bit for bit.
+//
+// AMBIENT. Diffuse ambient = diffuse albedo x SH9 irradiance/pi x occlusion; specular ambient = the albedo
+// of the
+// compensated lobe x the prefiltered radiance the caller supplies x occlusion. With a uniform environment L
+// and a
+// white material that adds up to exactly L (the white furnace), because the diffuse albedo is what the
+// specular
+// lobe leaves over (see light_brdf).
+//
+// Differences from voxel-axle: its `FaceLight` carried two scalars and one sun; here both halves are RGB, any
+// number of lights, each with its own shadow factor.
+
+use crate::core::collections::vec::Vec;
+use crate::core::math::scalar::{max, saturate};
+use crate::core::math::vec3::Vec3;
+use crate::render::light::light_brdf::{lightPrepare, lightBrdf};
+use crate::render::light::light_irradiance::{LightReason, LightIncident, lightIncidence};
+use crate::render::light::light_material::{LightMaterial, LightSurface, LightDfg, LightPrepared};
+use crate::render::light::light_material::{LightBrdfTerms};
+use crate::render::light::light_sh::LightSh9;
+use crate::render::light::light_source::LightSource;
+
+/** The direct and the ambient light of a point kept apart: a shadow removes the first, a cloud moves light
+ * between them. */
+pub struct LightDirectAmbient {
+    /** Radiance from the lights (diffuse + specular). */
+    pub direct : Vec3 = Vec3 { x: 0.0, y: 0.0, z: 0.0 };
+
+    /** Radiance from the environment (diffuse + specular). */
+    pub ambient : Vec3 = Vec3 { x: 0.0, y: 0.0, z: 0.0 };
+
+    /** Both halves summed. */
+    pub fn total(self) : Vec3 {
+        return self.direct.plus(self.ambient);
+    }
+
+    /** The same point with only the fraction `visibility` (0..1) of its direct light kept; ambient is
+     * untouched. */
+    pub fn withVisibility(self, visibility : f32) : LightDirectAmbient {
+        return LightDirectAmbient { direct: self.direct.scale(saturate(visibility)), ambient: self.ambient };
+    }
+
+    /** The share of the light that came straight from the lights, 0..1, by the largest channel (0 for
+     * black). */
+    pub fn directShare(self) : f32 {
+        let d : f32 = self.direct.maxComponent();
+        let t : f32 = d + self.ambient.maxComponent();
+        if (t < 0.000001) {
+            return 0.0;
+        }
+        return d / t;
+    }
+}
+
+/** Every term of the shading of one point, separable. */
+pub struct LightShadeTerms {
+    /** Light the surface emits itself. */
+    pub emissive : Vec3 = Vec3 { x: 0.0, y: 0.0, z: 0.0 };
+
+    /** Diffuse light summed over all lights. */
+    pub directDiffuse : Vec3 = Vec3 { x: 0.0, y: 0.0, z: 0.0 };
+
+    /** Specular light summed over all lights. */
+    pub directSpecular : Vec3 = Vec3 { x: 0.0, y: 0.0, z: 0.0 };
+
+    /** Diffuse light from the environment. */
+    pub ambientDiffuse : Vec3 = Vec3 { x: 0.0, y: 0.0, z: 0.0 };
+
+    /** Specular light from the environment. */
+    pub ambientSpecular : Vec3 = Vec3 { x: 0.0, y: 0.0, z: 0.0 };
+
+    /** The direct half. */
+    pub fn direct(self) : Vec3 {
+        return self.directDiffuse.plus(self.directSpecular);
+    }
+
+    /** The ambient half. */
+    pub fn ambient(self) : Vec3 {
+        return self.ambientDiffuse.plus(self.ambientSpecular);
+    }
+
+    /** Direct and ambient apart (emissive is counted with the ambient: it never depends on a light or a
+     * shadow). */
+    pub fn split(self) : LightDirectAmbient {
+        return LightDirectAmbient { direct: self.direct(), ambient: self.ambient().plus(self.emissive) };
+    }
+
+    /** The shaded radiance: emissive + ambient + direct, in this order (the order the explainer sums in). */
+    pub fn total(self) : Vec3 {
+        return self.emissive.plus(self.ambient()).plus(self.direct());
+    }
+}
+
+/** What one light does to one point. */
+pub struct LightContribution {
+    /** `None` when it reaches the point, otherwise why not. */
+    pub reason : LightReason = LightReason::None;
+
+    /** Cosine between the shading normal and the direction to the light's centre. */
+    pub nDotL : f32 = 0.0;
+
+    /** Window times spot cone. */
+    pub attenuation : f32 = 0.0;
+
+    /** The shadow factor that was applied, 0..1 (1 when the light was excluded before shadows were asked). */
+    pub shadow : f32 = 1.0;
+
+    /** Scalar irradiance on the point (cosine and horizon clipping included, shadow not). */
+    pub irradiance : f32 = 0.0;
+
+    /** Diffuse radiance sent to the eye by this light. */
+    pub diffuse : Vec3 = Vec3 { x: 0.0, y: 0.0, z: 0.0 };
+
+    /** Specular radiance sent to the eye by this light. */
+    pub specular : Vec3 = Vec3 { x: 0.0, y: 0.0, z: 0.0 };
+
+    /** Diffuse plus specular. */
+    pub fn rgb(self) : Vec3 {
+        return self.diffuse.plus(self.specular);
+    }
+}
+
+/** The environment a point sees: SH9 irradiance and the radiance its specular lobe reflects. */
+pub struct LightAmbientInput {
+    /** The environment's SH9 coefficients. */
+    pub sh : LightSh9 = LightSh9 {};
+
+    /** The prefiltered radiance along the reflection direction at this roughness (a probe or sky lookup). */
+    pub specular : Vec3 = Vec3 { x: 0.0, y: 0.0, z: 0.0 };
+}
+
+/** Answers "how much of light number `lightIndex` reaches this point", 0 (blocked) to 1; shadow maps, rays,
+ * baked data. */
+pub trait LightShadowQuery {
+    /** The visibility in 0..1 of light `lightIndex` from `surface`. */
+    fn visibility(self, lightIndex : i32, surface : LightSurface) : f32;
+}
+
+/** The shadow query that never blocks: every light is fully visible. */
+pub class LightNoShadows : LightShadowQuery {
+    /** The unblocked query. */
+    constructor() {}
+
+    /** Always 1. */
+    pub fn visibility(self, lightIndex : i32, surface : LightSurface) : f32 {
+        return 1.0;
+    }
+}
+
+/**
+ * What one light puts on one surface point with a given `shadow` factor (0..1, from the shadow query). A
+ * light that
+ * reaches the point but is fully shadowed reports `Shadow`. Pure: no allocation, in the shading subset.
+ */
+pub fn lightContribution(
+    light : LightSource,
+    surface : LightSurface,
+    prepared : LightPrepared,
+    shadow : f32
+) : LightContribution {
+    let incident : LightIncident = lightIncidence(
+        light,
+        surface.position,
+        surface.normal,
+        surface.geoNormal,
+        surface.layer,
+        surface.objectId
+    );
+    let mut result : LightContribution = LightContribution {
+        reason: incident.reason,
+        nDotL: incident.nDotL,
+        attenuation: incident.attenuation,
+        irradiance: incident.irradiance,
+    };
+    if (incident.reason != LightReason::None) {
+        return result;
+    }
+    let s : f32 = saturate(shadow);
+    result.shadow = s;
+    if (s <= 0.0) {
+        result.reason = LightReason::Shadow;
+        return result;
+    }
+    let brdf : LightBrdfTerms = lightBrdf(prepared, surface.normal, surface.view, incident.toLight);
+    let incoming : Vec3 = light.color.scale(incident.irradiance * s);
+    result.diffuse = brdf.diffuse.times(incoming);
+    result.specular = brdf.specular.times(incoming);
+    return result;
+}
+
+/** The ambient terms of a point: diffuse from the SH9 irradiance, specular from the supplied radiance. */
+pub fn lightAmbientTerms(
+    material : LightMaterial,
+    surface : LightSurface,
+    prepared : LightPrepared,
+    ambient : LightAmbientInput
+) : LightShadeTerms {
+    let occlusion : f32 = saturate(material.occlusion);
+    return LightShadeTerms {
+        ambientDiffuse: prepared.diffuse.times(ambient.sh.irradiance(surface.normal)).scale(occlusion),
+        ambientSpecular: prepared.specularAlbedo.times(ambient.specular).scale(occlusion),
+    };
+}
+
+/** Shades a point against a list of lights: every term kept apart. Walks the list, so it is outside the
+ * shading subset. */
+pub fn lightShade(
+    lights : Vec<LightSource>,
+    surface : LightSurface,
+    material : LightMaterial,
+    dfg : LightDfg,
+    ambient : LightAmbientInput,
+    shadows : LightShadowQuery
+) : LightShadeTerms {
+    let prepared : LightPrepared = lightPrepare(material, dfg);
+    let mut terms : LightShadeTerms = lightAmbientTerms(material, surface, prepared, ambient);
+    terms.emissive = material.emissive;
+    for (i of 0..lights.len()) {
+        let light : LightSource = lights.get(i);
+        let shadow : f32 = shadows.visibility(i, surface);
+        let c : LightContribution = lightContribution(light, surface, prepared, shadow);
+        terms.directDiffuse = terms.directDiffuse.plus(c.diffuse);
+        terms.directSpecular = terms.directSpecular.plus(c.specular);
+    }
+    return terms;
+}

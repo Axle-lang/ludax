@@ -1,0 +1,332 @@
+// graph_graph — the declaration side of the render graph: resources, passes, and who reads and writes what.
+//
+// A frame is described before it is run. Resources are declared by name (colour and depth targets, textures,
+// acceleration structures; imported ones live outside the graph, like the final picture or an asset texture), and
+// passes declare which of them they read and write, also by name. Nothing is executed or checked here; `GraphCompiler`
+// (graph_plan) validates the declaration, culls passes nobody needs, orders the rest, and measures lifetimes.
+// Names are interned in declaration order, so a resource's id is the order it was declared in and a pass's id the
+// order it was added: both are the same on every run, and every tie in the compiler is broken by those ids.
+//
+// Read/write semantics, in one place: the writers of a resource run in the order their passes were added (each
+// after the previous, so a later pass may draw over an earlier one); a pass that only reads sees the final result
+// of all writers; a pass that reads and writes the same resource sees the writers added before it.
+
+use crate::core::collections::vec::Vec;
+use crate::core::id::string_id::{StringId, StringInterner};
+use crate::render::graph::graph_types::{
+    GraphResKind, GraphFormat, PassKind, GraphIssueKind, GraphIssues, GraphNames
+};
+
+/** A render graph under construction. */
+pub class RenderGraph {
+    resNames  : StringInterner;
+    passNames : StringInterner;
+    strays    : StringInterner;
+    resKind   : Vec<i32>;
+    resFormat : Vec<i32>;
+    resWidth  : Vec<i32>;
+    resHeight : Vec<i32>;
+    resBytes  : Vec<i64>;
+    resImport : Vec<bool>;
+    resOutput : Vec<bool>;
+    passKind  : Vec<i32>;
+    edgePass  : Vec<i32>;
+    edgeRes   : Vec<i32>;
+    edgeWrite : Vec<bool>;
+    problems  : GraphIssues;
+
+    /** An empty graph. */
+    constructor() {
+        self.resNames = new StringInterner();
+        self.passNames = new StringInterner();
+        self.strays = new StringInterner();
+        self.resKind = new Vec<i32>();
+        self.resFormat = new Vec<i32>();
+        self.resWidth = new Vec<i32>();
+        self.resHeight = new Vec<i32>();
+        self.resBytes = new Vec<i64>();
+        self.resImport = new Vec<bool>();
+        self.resOutput = new Vec<bool>();
+        self.passKind = new Vec<i32>();
+        self.edgePass = new Vec<i32>();
+        self.edgeRes = new Vec<i32>();
+        self.edgeWrite = new Vec<bool>();
+        self.problems = new GraphIssues();
+    }
+
+    /**
+     * Declares an image resource of `width` x `height` pixels. `imported` resources exist outside the graph (the
+     * window's picture, a texture from disk): they are never aliased and writing one counts as a result of the frame.
+     * Returns the resource's id, or -1 when the name is already taken.
+     */
+    pub fn addImage(
+        mut self,
+        name : string,
+        kind : GraphResKind,
+        width : i32,
+        height : i32,
+        format : GraphFormat,
+        imported : bool
+    ) : i32 {
+        let mut bytes : i64 = (width as i64) * (height as i64) * (GraphNames::bytesPerPixel(format) as i64);
+        if (bytes < 0) {
+            bytes = 0;
+        }
+        return self.declare(name, kind, format, width, height, bytes, imported);
+    }
+
+    /** Declares a resource that is not an image (an acceleration structure) with a size estimate in bytes. */
+    pub fn addBuffer(mut self, name : string, kind : GraphResKind, bytes : i64, imported : bool) : i32 {
+        return self.declare(name, kind, GraphFormat::Opaque, 0, 0, bytes, imported);
+    }
+
+    fn declare(
+        mut self,
+        name : string,
+        kind : GraphResKind,
+        format : GraphFormat,
+        width : i32,
+        height : i32,
+        bytes : i64,
+        imported : bool
+    ) : i32 {
+        if (!self.resNames.find(name).isNone()) {
+            self.problems.add(GraphIssueKind::DuplicateName, "resource '" + name + "' is declared twice");
+            return -1;
+        }
+        let id : StringId = self.resNames.intern(name);
+        self.resKind.push(RenderGraph::kindCode(kind));
+        self.resFormat.push(RenderGraph::formatCode(format));
+        self.resWidth.push(width);
+        self.resHeight.push(height);
+        self.resBytes.push(bytes);
+        self.resImport.push(imported);
+        self.resOutput.push(false);
+        return id.raw;
+    }
+
+    /** Marks resource `name` as a result of the frame: the passes that produce it are never culled. */
+    pub fn markOutput(mut self, name : string) : void {
+        let id : StringId = self.resNames.find(name);
+        if (id.isNone()) {
+            self.problems.add(
+                GraphIssueKind::UnknownResource,
+                "output '" + name + "' is not a declared resource"
+            );
+            return;
+        }
+        self.resOutput.set(id.raw, true);
+    }
+
+    /** Adds a pass; returns its id, or -1 when the name is already taken. Passes run in dependency order. */
+    pub fn addPass(mut self, name : string, kind : PassKind) : i32 {
+        if (!self.passNames.find(name).isNone()) {
+            self.problems.add(GraphIssueKind::DuplicateName, "pass '" + name + "' is added twice");
+            return -1;
+        }
+        let id : StringId = self.passNames.intern(name);
+        self.passKind.push(RenderGraph::passCode(kind));
+        return id.raw;
+    }
+
+    /** Declares that pass `pass` reads resource `name`. */
+    pub fn reads(mut self, pass : i32, name : string) : void {
+        self.edge(pass, name, false);
+    }
+
+    /** Declares that pass `pass` writes resource `name`. */
+    pub fn writes(mut self, pass : i32, name : string) : void {
+        self.edge(pass, name, true);
+    }
+
+    // Records an edge; an unknown resource name is kept (as a negative id) so validation can name it.
+    fn edge(mut self, pass : i32, name : string, write : bool) : void {
+        if (pass < 0 || pass >= self.passKind.len()) {
+            return;
+        }
+        let found : StringId = self.resNames.find(name);
+        let mut res : i32 = found.raw;
+        if (found.isNone()) {
+            res = -1 - self.strays.intern(name).raw;
+        }
+        self.edgePass.push(pass);
+        self.edgeRes.push(res);
+        self.edgeWrite.push(write);
+    }
+
+    /** How many passes were added. */
+    pub fn passTotal(self) : i32 {
+        return self.passKind.len();
+    }
+
+    /** How many resources were declared. */
+    pub fn resourceTotal(self) : i32 {
+        return self.resKind.len();
+    }
+
+    /** How many read/write declarations. */
+    pub fn edgeTotal(self) : i32 {
+        return self.edgePass.len();
+    }
+
+    /** The name of pass `p`. */
+    pub fn passName(self, p : i32) : string {
+        return self.passNames.name(StringId { raw: p });
+    }
+
+    /** The name of resource `r`. */
+    pub fn resourceName(self, r : i32) : string {
+        return self.resNames.name(StringId { raw: r });
+    }
+
+    /** The id of the pass called `name`, or -1. */
+    pub fn findPass(self, name : string) : i32 {
+        return self.passNames.find(name).raw;
+    }
+
+    /** The id of the resource called `name`, or -1. */
+    pub fn findResource(self, name : string) : i32 {
+        return self.resNames.find(name).raw;
+    }
+
+    /** The kind of pass `p`. */
+    pub fn passKindOf(self, p : i32) : PassKind {
+        return RenderGraph::passFrom(self.passKind.get(p));
+    }
+
+    /** The kind of resource `r`. */
+    pub fn resourceKind(self, r : i32) : GraphResKind {
+        return RenderGraph::kindFrom(self.resKind.get(r));
+    }
+
+    /** The format of resource `r`. */
+    pub fn resourceFormat(self, r : i32) : GraphFormat {
+        return RenderGraph::formatFrom(self.resFormat.get(r));
+    }
+
+    /** The width in pixels of image resource `r` (0 for others). */
+    pub fn resourceWidth(self, r : i32) : i32 {
+        return self.resWidth.get(r);
+    }
+
+    /** The height in pixels of image resource `r` (0 for others). */
+    pub fn resourceHeight(self, r : i32) : i32 {
+        return self.resHeight.get(r);
+    }
+
+    /** The size in bytes of resource `r`. */
+    pub fn resourceBytes(self, r : i32) : i64 {
+        return self.resBytes.get(r);
+    }
+
+    /** True when resource `r` lives outside the graph. */
+    pub fn isImported(self, r : i32) : bool {
+        return self.resImport.get(r);
+    }
+
+    /** True when resource `r` was marked as a result. */
+    pub fn isOutput(self, r : i32) : bool {
+        return self.resOutput.get(r);
+    }
+
+    /** The pass of declaration `e`. */
+    pub fn edgePassOf(self, e : i32) : i32 {
+        return self.edgePass.get(e);
+    }
+
+    /** The resource id of declaration `e`; negative for a name that was never declared. */
+    pub fn edgeResourceOf(self, e : i32) : i32 {
+        return self.edgeRes.get(e);
+    }
+
+    /** The name a declaration used for its resource, declared or not. */
+    pub fn edgeResourceName(self, e : i32) : string {
+        let r : i32 = self.edgeRes.get(e);
+        if (r >= 0) {
+            return self.resNames.name(StringId { raw: r });
+        }
+        return self.strays.name(StringId { raw: -1 - r });
+    }
+
+    /** True when declaration `e` is a write. */
+    pub fn edgeIsWrite(self, e : i32) : bool {
+        return self.edgeWrite.get(e);
+    }
+
+    /** The first resource of `kind` that pass `p` writes (or reads when `write` is false), or -1. */
+    pub fn firstResource(self, p : i32, kind : GraphResKind, write : bool) : i32 {
+        for (e of 0..self.edgePass.len()) {
+            if (self.edgePass.get(e) == p && self.edgeWrite.get(e) == write && self.edgeRes.get(e) >= 0) {
+                if (self.resKind.get(self.edgeRes.get(e)) == RenderGraph::kindCode(kind)) {
+                    return self.edgeRes.get(e);
+                }
+            }
+        }
+        return -1;
+    }
+
+    /** The problems found while declaring (duplicates, unknown output names). */
+    pub fn declarationIssues(self) : GraphIssues {
+        return self.problems;
+    }
+
+    /** The integer code of a resource kind. */
+    pub static fn kindCode(k : GraphResKind) : i32 {
+        return match k {
+            GraphResKind::Color => 0,
+            GraphResKind::Depth => 1,
+            GraphResKind::Texture => 2,
+            GraphResKind::Accel => 3,
+        };
+    }
+
+    /** The resource kind of a code. */
+    pub static fn kindFrom(code : i32) : GraphResKind {
+        return match code {
+            0 => GraphResKind::Color,
+            1 => GraphResKind::Depth,
+            2 => GraphResKind::Texture,
+            _ => GraphResKind::Accel,
+        };
+    }
+
+    /** The integer code of a format. */
+    pub static fn formatCode(f : GraphFormat) : i32 {
+        return match f {
+            GraphFormat::Hdr => 0,
+            GraphFormat::Depth32 => 1,
+            GraphFormat::Srgb8 => 2,
+            GraphFormat::Opaque => 3,
+        };
+    }
+
+    /** The format of a code. */
+    pub static fn formatFrom(code : i32) : GraphFormat {
+        return match code {
+            0 => GraphFormat::Hdr,
+            1 => GraphFormat::Depth32,
+            2 => GraphFormat::Srgb8,
+            _ => GraphFormat::Opaque,
+        };
+    }
+
+    /** The integer code of a pass kind. */
+    pub static fn passCode(k : PassKind) : i32 {
+        return match k {
+            PassKind::BuildAccel => 0,
+            PassKind::Forward => 1,
+            PassKind::Resolve => 2,
+            PassKind::Custom => 3,
+        };
+    }
+
+    /** The pass kind of a code. */
+    pub static fn passFrom(code : i32) : PassKind {
+        return match code {
+            0 => PassKind::BuildAccel,
+            1 => PassKind::Forward,
+            2 => PassKind::Resolve,
+            _ => PassKind::Custom,
+        };
+    }
+}

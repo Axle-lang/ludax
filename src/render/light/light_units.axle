@@ -1,0 +1,126 @@
+// light_units — the one place the scale of the scene is defined, and the exposure that leaves it.
+//
+// Scene values are linear radiance with 1.0 = a diffuse white surface (albedo 1) lit by the reference sun at
+// normal incidence. The reference sun is `LIGHT_SUN_LUX` = 100 000 lux; a Lambertian white under it returns
+// E / pi of that, so one scene unit stands for `100000 / pi` = 31 831 cd/m^2, and the reference sun's scene
+// irradiance is pi. Every conversion below follows from this single choice (the factor pi / LIGHT_SUN_LUX);
+// nothing else in the lighting code may mention lux or candela.
+//
+// Differences from voxel-axle: there a block's light was a level 0..15 and "full sun" a tuned constant; here
+// a
+// level is a physical quantity, so a lamp of 800 lumens and the sun can be placed in the same scene and an
+// exposure chosen by EV100 brings either into range.
+
+use crate::core::math::scalar::PI;
+use crate::render::light::light_math::{lightExp2, lightLog2};
+
+/** The illuminance of the reference sun in lux: the value that makes a white diffuse surface read 1.0. */
+pub const LIGHT_SUN_LUX : f32 = 100000.0;
+
+// The largest luminance the sensor represents without clipping, as a multiple of 2^EV100 (the
+// saturation-based
+// exposure of Lagarde and de Rousiers, "Moving Frostbite to PBR", 2014).
+const LUNITS_SATURATION : f32 = 1.2;
+
+// Reflected-light meter constant K and film speed 100, as in the EV100 definition.
+const LUNITS_METER_K : f32 = 12.5;
+const LUNITS_ISO_BASE : f32 = 100.0;
+
+// Below this a solid angle or a speed is not a number to divide by.
+const LUNITS_TINY : f32 = 0.0000001;
+
+/** Conversions between photometric units and scene units, and the exposure of a camera. All are pure maths.
+ * */
+pub struct LightUnits {
+    /** The scene irradiance of the reference sun, pi: a white surface facing it has radiance 1. */
+    pub static fn sunScene() : f32 {
+        return PI;
+    }
+
+    /** Scene irradiance (or radiance times pi) of an illuminance in lux. */
+    pub static fn luxToScene(lux : f32) : f32 {
+        return lux * PI / LIGHT_SUN_LUX;
+    }
+
+    /** The illuminance in lux of a scene irradiance; the inverse of `luxToScene`. */
+    pub static fn sceneToLux(scene : f32) : f32 {
+        return scene * LIGHT_SUN_LUX / PI;
+    }
+
+    /** Scene intensity of a luminous intensity in candela: at one metre it is the lux it makes there. */
+    pub static fn candelaToScene(candela : f32) : f32 {
+        return LightUnits::luxToScene(candela);
+    }
+
+    /** Scene radiance of a luminance in cd/m^2 (an emissive surface). */
+    pub static fn luminanceToScene(luminance : f32) : f32 {
+        return LightUnits::luxToScene(luminance);
+    }
+
+    /** The luminance in cd/m^2 of a scene radiance; the inverse of `luminanceToScene`. */
+    pub static fn sceneToLuminance(scene : f32) : f32 {
+        return LightUnits::sceneToLux(scene);
+    }
+
+    /** Candela of an isotropic point light of `lumens`: the flux spread over the full sphere, 4 pi sr. */
+    pub static fn lumensToCandelaPoint(lumens : f32) : f32 {
+        return lumens / (PI * (4.0 as f32));
+    }
+
+    /** Lumens of an isotropic point light of `candela`; the inverse of `lumensToCandelaPoint`. */
+    pub static fn candelaToLumensPoint(candela : f32) : f32 {
+        return candela * PI * (4.0 as f32);
+    }
+
+    /**
+     * Candela of a spot of `lumens` whose outer cone has the cosine `cosOuter`: the flux spread over the
+     * cone's
+     * solid angle, 2 pi (1 - cos). A cone that closes to nothing gives 0 rather than infinity.
+     */
+    pub static fn lumensToCandelaSpot(lumens : f32, cosOuter : f32) : f32 {
+        let solid : f32 = PI * (2.0 as f32) * ((1.0 as f32) - cosOuter);
+        if (solid < LUNITS_TINY) {
+            return 0.0;
+        }
+        return lumens / solid;
+    }
+
+    /** The EV100 of a camera: log2(N^2 / t) - log2(ISO / 100), for aperture N, shutter time t and film speed
+     * ISO. */
+    pub static fn ev100OfCamera(aperture : f32, shutterSeconds : f32, iso : f32) : f32 {
+        if (!(shutterSeconds > LUNITS_TINY) || !(iso > LUNITS_TINY)) {
+            return 0.0;
+        }
+        return lightLog2(aperture * aperture / shutterSeconds) - lightLog2(iso / LUNITS_ISO_BASE);
+    }
+
+    /**
+     * The multiplier that takes scene radiance to display-referred linear light before the tone map. With the
+     * saturation-based definition, a scene value whose luminance is 1.2 * 2^EV100 cd/m^2 maps to exactly 1.
+     * Adding one EV halves it: that is what "one stop" means.
+     */
+    pub static fn exposure(ev100 : f32) : f32 {
+        let sceneOneInCandela : f32 = LIGHT_SUN_LUX / PI;
+        return sceneOneInCandela / (LUNITS_SATURATION * lightExp2(ev100));
+    }
+
+    /** The EV100 at which the reference sun lighting a white surface maps to exactly 1 (about 14.7). */
+    pub static fn ev100ForSunlitWhite() : f32 {
+        return lightLog2(LIGHT_SUN_LUX / PI / LUNITS_SATURATION);
+    }
+
+    /**
+     * The EV100 that exposes a scene whose average radiance is `averageScene` as a reflected-light meter
+     * would:
+     * the average then lands at 12.5 / (100 * 1.2), about a tenth of the display range. Zero or negative
+     * averages
+     * (a black frame) answer the darkest sensible exposure, EV 0.
+     */
+    pub static fn ev100ForAverage(averageScene : f32) : f32 {
+        if (!(averageScene > LUNITS_TINY)) {
+            return 0.0;
+        }
+        let candela : f32 = LightUnits::sceneToLuminance(averageScene);
+        return lightLog2(candela * LUNITS_ISO_BASE / LUNITS_METER_K);
+    }
+}

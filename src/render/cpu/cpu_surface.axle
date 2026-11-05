@@ -1,0 +1,269 @@
+// cpu_surface — the surface at one pixel of a stored triangle: position, normals, material and texture reads.
+//
+// Both the renderer and the explainer need to know "what is at pixel (x, y)": the renderer to shade it, the explainer
+// to say why it has its colour. They call the same `CpuSurface::sample`, so they cannot disagree. From the integer
+// edge values at the pixel centre it gets barycentric weights (exact), makes them perspective-correct with the stored
+// 1/w, interpolates position, normal and uv, and reads the material: the constants of the `RenderMaterial` times the
+// textures it names. A texture is read through `Texture::trilinear`, with the footprint taken from how uv changes
+// one pixel right and one pixel down (the same triangle plane extended by one pixel), so a minified texture is
+// filtered instead of aliased. A normal map perturbs the shading normal in the tangent frame of the triangle (from
+// its positions and uvs); the geometric normal stays the triangle's, so a bumpy surface is still not lit from behind
+// its own face. Back faces of double-sided materials are shaded with flipped normals.
+
+use crate::core::math::scalar::{max, saturate};
+use crate::core::math::trig::sqrt;
+use crate::core::math::vec3::Vec3;
+use crate::core::math::vec4::Vec4;
+use crate::render::cpu::cpu_tris::{CpuTris, CPU_FLAG_BACK};
+use crate::render::light::light_color::lightSrgbEncode;
+use crate::render::light::light_dfg::LightDfgTable;
+use crate::render::light::light_material::{LightDfg, LightMaterial, LightSurface};
+use crate::render::scene::scene_assets::RenderAssets;
+use crate::render::scene::scene_material::RenderMaterial;
+use crate::render::texture::texture::Texture;
+
+/** Everything shading needs to know about one pixel's surface. */
+pub struct CpuSample {
+    /** Position, normals, view vector, layer and object id for the lighting library. */
+    pub surface : LightSurface = LightSurface {};
+
+    /** The material with its textures applied. */
+    pub material : LightMaterial = LightMaterial {};
+
+    /** The albedo/specular table entry for this view and roughness. */
+    pub dfg : LightDfg = LightDfg {};
+
+    /** Opacity after the texture, 0..1. */
+    pub alpha : f32 = 1.0;
+
+    /** Id of the material in `RenderAssets`. */
+    pub materialId : i32 = 0;
+
+    /** Id of the stored triangle. */
+    pub triangle : i32 = -1;
+}
+
+// Perspective-correct weights of the three vertices.
+struct CsBary {
+    a : f64 = 0.0;
+    b : f64 = 0.0;
+    c : f64 = 0.0;
+}
+
+/** Surface queries on stored triangles. */
+pub class CpuSurface {
+    // The weights of vertex 0, 1, 2 at edge values e0, e1, e2 (twice-areas over the whole area), made
+    // perspective-correct with the stored 1/w.
+    static fn weights(tris : CpuTris, t : i32, e0 : i64, e1 : i64, e2 : i64, area : f64) : CsBary {
+        let w0 : f64 = (e0 as f64) / area * (tris.zinv[t * 6 + 3] as f64);
+        let w1 : f64 = (e1 as f64) / area * (tris.zinv[t * 6 + 4] as f64);
+        let w2 : f64 = (e2 as f64) / area * (tris.zinv[t * 6 + 5] as f64);
+        let s : f64 = w0 + w1 + w2;
+        if (!(s > 0.0)) {
+            return CsBary { a: 0.3333333333333333, b: 0.3333333333333333, c: 0.3333333333333333 };
+        }
+        return CsBary { a: w0 / s, b: w1 / s, c: w2 / s };
+    }
+
+    static fn mix(tris : CpuTris, t : i32, k : i32, w : CsBary) : f32 {
+        return ((tris.attr[t * 24 + k] as f64) * w.a + (tris.attr[t * 24 + 8 + k] as f64) * w.b
+            + (tris.attr[t * 24 + 16 + k] as f64) * w.c) as f32;
+    }
+
+    // Reads the texture at (u, v) with the pixel's footprint: the uv change one pixel right (ux, vx) and one pixel
+    // down (uy, vy) span an ellipse. The longer side picks how many taps are spread along it (at most 8, an
+    // anisotropic filter), the tap's own footprint is that side divided by the taps, so a floor at a grazing angle
+    // is sharp across and filtered along instead of blurred both ways.
+    static fn fetch(tex : Texture, u : f32, v : f32, ux : f32, vx : f32, uy : f32, vy : f32) : Vec4 {
+        let w : f32 = tex.width(0) as f32;
+        let h : f32 = tex.height(0) as f32;
+        let dxu : f32 = ux - u;
+        let dxv : f32 = vx - v;
+        let dyu : f32 = uy - u;
+        let dyv : f32 = vy - v;
+        let lx : f32 = sqrt(dxu * dxu * w * w + dxv * dxv * h * h);
+        let ly : f32 = sqrt(dyu * dyu * w * w + dyv * dyv * h * h);
+        let mut majorU : f32 = dxu;
+        let mut majorV : f32 = dxv;
+        let mut major : f32 = lx;
+        let mut minor : f32 = ly;
+        if (ly > lx) {
+            majorU = dyu;
+            majorV = dyv;
+            major = ly;
+            minor = lx;
+        }
+        let mut taps : i32 = 1;
+        if (minor > (0.0001 as f32)) {
+            taps = (major / minor + (0.999 as f32)) as i32;
+        } else if (major > (1.0 as f32)) {
+            taps = 8;
+        }
+        if (taps > 8) {
+            taps = 8;
+        }
+        if (taps < 1) {
+            taps = 1;
+        }
+        let foot : f32 = major / (taps as f32);
+        if (taps == 1) {
+            return tex.trilinear(u, v, foot);
+        }
+        let mut sum : Vec4 = Vec4::zero();
+        for (i of 0..taps) {
+            let off : f32 = ((i as f32) + (0.5 as f32)) / (taps as f32) - (0.5 as f32);
+            sum = sum.plus(tex.trilinear(u + majorU * off, v + majorV * off, foot));
+        }
+        return sum.scale((1.0 as f32) / (taps as f32));
+    }
+
+    /**
+     * The surface of triangle `t` at the centre of pixel (x, y). `ortho` and `forward` describe the camera (the view
+     * vector of an orthographic camera is the same everywhere); `dfg` supplies the specular albedo table.
+     */
+    pub static fn sample(
+        tris : CpuTris,
+        assets : Shared<RenderAssets>,
+        dfg : LightDfgTable,
+        t : i32,
+        x : i32,
+        y : i32,
+        ortho : bool,
+        forward : Vec3
+    ) : CpuSample {
+        let ax : i64 = tris.snap[t * 6] as i64;
+        let ay : i64 = tris.snap[t * 6 + 1] as i64;
+        let bx : i64 = tris.snap[t * 6 + 2] as i64;
+        let by : i64 = tris.snap[t * 6 + 3] as i64;
+        let cx : i64 = tris.snap[t * 6 + 4] as i64;
+        let cy : i64 = tris.snap[t * 6 + 5] as i64;
+        let area : i64 = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
+        let px : i64 = (x as i64) * 256 + 128;
+        let py : i64 = (y as i64) * 256 + 128;
+        let e0 : i64 = (cx - bx) * (py - by) - (cy - by) * (px - bx);
+        let e1 : i64 = (ax - cx) * (py - cy) - (ay - cy) * (px - cx);
+        let e2 : i64 = (bx - ax) * (py - ay) - (by - ay) * (px - ax);
+        let fa : f64 = area as f64;
+        let w : CsBary = CpuSurface::weights(tris, t, e0, e1, e2, fa);
+        let wx : CsBary = CpuSurface::weights(
+            tris,
+            t,
+            e0 - (cy - by) * 256,
+            e1 - (ay - cy) * 256,
+            e2 - (by - ay) * 256,
+            fa
+        );
+        let wy : CsBary = CpuSurface::weights(
+            tris,
+            t,
+            e0 + (cx - bx) * 256,
+            e1 + (ax - cx) * 256,
+            e2 + (bx - ax) * 256,
+            fa
+        );
+        let position : Vec3 = Vec3::make(
+            CpuSurface::mix(tris, t, 0, w),
+            CpuSurface::mix(tris, t, 1, w),
+            CpuSurface::mix(tris, t, 2, w)
+        );
+        let mut normal : Vec3 = Vec3::make(
+            CpuSurface::mix(tris, t, 3, w),
+            CpuSurface::mix(tris, t, 4, w),
+            CpuSurface::mix(tris, t, 5, w)
+        );
+        let u : f32 = CpuSurface::mix(tris, t, 6, w);
+        let v : f32 = CpuSurface::mix(tris, t, 7, w);
+        let ux : f32 = CpuSurface::mix(tris, t, 6, wx);
+        let vx : f32 = CpuSurface::mix(tris, t, 7, wx);
+        let uy : f32 = CpuSurface::mix(tris, t, 6, wy);
+        let vy : f32 = CpuSurface::mix(tris, t, 7, wy);
+
+        let flags : i32 = tris.meta[t * 5 + 2];
+        let matId : i32 = tris.meta[t * 5 + 1];
+        let mat : RenderMaterial = assets.material(matId);
+        let mut geo : Vec3 = Vec3::make(tris.geo[t * 3], tris.geo[t * 3 + 1], tris.geo[t * 3 + 2]);
+        let back : bool = (flags & CPU_FLAG_BACK) != 0;
+        if (back) {
+            geo = geo.negated();
+            normal = normal.negated();
+        }
+        normal = normal.normalizedOr(geo);
+
+        let mut light : LightMaterial = mat.toLight();
+        if (mat.baseColorTexture >= 0) {
+            let tex : Texture = assets.texture(mat.baseColorTexture);
+            let texel : Vec4 = CpuSurface::fetch(tex, u, v, ux, vx, uy, vy);
+            light.baseColor = light.baseColor.times(texel.xyz());
+            light.alpha = light.alpha * texel.w;
+        }
+        if (mat.metalRoughTexture >= 0) {
+            let tex : Texture = assets.texture(mat.metalRoughTexture);
+            let texel : Vec4 = CpuSurface::fetch(tex, u, v, ux, vx, uy, vy);
+            light.roughness = saturate(light.roughness * texel.y);
+            light.metallic = saturate(light.metallic * texel.z);
+        }
+        if (mat.emissiveTexture >= 0) {
+            let tex : Texture = assets.texture(mat.emissiveTexture);
+            let texel : Vec4 = CpuSurface::fetch(tex, u, v, ux, vx, uy, vy);
+            light.emissive = light.emissive.times(texel.xyz());
+        }
+        if (mat.normalTexture >= 0) {
+            let tex : Texture = assets.texture(mat.normalTexture);
+            normal = CpuSurface::bump(
+                tris,
+                t,
+                mat.normalScale,
+                normal,
+                CpuSurface::fetch(tex, u, v, ux, vx, uy, vy)
+            );
+        }
+        let mut view : Vec3 = position.negated().normalizedOr(geo);
+        if (ortho) {
+            view = forward.negated();
+        }
+        let nv : f32 = saturate(normal.dot(view));
+        let mut s : CpuSample = CpuSample {};
+        s.surface = LightSurface {
+            position: position,
+            normal: normal,
+            geoNormal: geo,
+            view: view,
+            layer: tris.meta[t * 5 + 4] as u32,
+            objectId: tris.meta[t * 5 + 3],
+        };
+        s.material = light;
+        s.dfg = dfg.lookup(nv, light.roughness);
+        s.alpha = saturate(light.alpha);
+        s.materialId = matId;
+        s.triangle = t;
+        return s;
+    }
+
+    // The shading normal after a tangent-space normal map. The map is data stored 0..1; `Texture` decoded it as if
+    // it were sRGB colour, so the encoding is undone first.
+    static fn bump(tris : CpuTris, t : i32, scale : f32, n : Vec3, texel : Vec4) : Vec3 {
+        let p0 : Vec3 = Vec3::make(tris.attr[t * 24], tris.attr[t * 24 + 1], tris.attr[t * 24 + 2]);
+        let p1 : Vec3 = Vec3::make(tris.attr[t * 24 + 8], tris.attr[t * 24 + 9], tris.attr[t * 24 + 10]);
+        let p2 : Vec3 = Vec3::make(tris.attr[t * 24 + 16], tris.attr[t * 24 + 17], tris.attr[t * 24 + 18]);
+        let du1 : f32 = tris.attr[t * 24 + 14] - tris.attr[t * 24 + 6];
+        let dv1 : f32 = tris.attr[t * 24 + 15] - tris.attr[t * 24 + 7];
+        let du2 : f32 = tris.attr[t * 24 + 22] - tris.attr[t * 24 + 6];
+        let dv2 : f32 = tris.attr[t * 24 + 23] - tris.attr[t * 24 + 7];
+        let det : f32 = du1 * dv2 - du2 * dv1;
+        if (!(det > (0.0000001 as f32) || det < (-0.0000001 as f32))) {
+            return n;
+        }
+        let r : f32 = (1.0 as f32) / det;
+        let e1 : Vec3 = p1.minus(p0);
+        let e2 : Vec3 = p2.minus(p0);
+        let tangent : Vec3 = e1.scale(dv2).minus(e2.scale(dv1)).scale(r);
+        let ortho : Vec3 = tangent.minus(n.scale(tangent.dot(n))).normalizedOr(n.anyPerpendicular());
+        let bitangent : Vec3 = n.cross(ortho);
+        let tx : f32 = (lightSrgbEncode(texel.x) * (2.0 as f32) - (1.0 as f32)) * scale;
+        let ty : f32 = (lightSrgbEncode(texel.y) * (2.0 as f32) - (1.0 as f32)) * scale;
+        let tz : f32 = lightSrgbEncode(texel.z) * (2.0 as f32) - (1.0 as f32);
+        // Green is "up" in the image (the usual OpenGL convention), and n x tangent points up the picture.
+        let out : Vec3 = ortho.scale(tx).plus(bitangent.scale(ty)).plus(n.scale(max(tz, 0.05)));
+        return out.normalizedOr(n);
+    }
+}

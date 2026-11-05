@@ -1,0 +1,104 @@
+// light_color — exposure, the tone curve and the sRGB transfer function (doc/LIGHTING_MATH.md §8).
+//
+// The pipeline of a pixel is: scene radiance (linear, unbounded) x exposure -> tone map (linear, 0..1) ->
+// sRGB
+// encode. Gamma exists only in the last step, and only here; everything before it is linear light.
+//
+// TONE CURVE. With knee k in (0, 1) and x the largest channel of the exposed colour,
+//     T(x) = x                                          for x <= k,
+//     T(x) = k + (1 - k)(1 - exp(-(x - k)/(1 - k)))    for x > k.
+// T(0) = 0, T is increasing, T < 1 everywhere and T -> 1; at the knee both the value and the derivative are
+// continuous (T'(k-) = 1 = T'(k+)), the second derivative jumps from 0 to -1/(1-k) (a C1 curve, as
+// documented).
+// The colour is scaled by T(m)/m with m = max channel, so the ratios of the channels (hue and saturation) are
+// kept and no channel can exceed 1; below the knee the picture is untouched, which keeps mid-tones linear.
+// The default knee is `LIGHT_TONE_KNEE` = 0.6.
+//
+// sRGB. The exact piecewise IEC 61966-2-1 pair, with `lightPow` for the 2.4 power (deterministic, ~1e-7
+// relative).
+// An 8-bit pair rounds to the nearest code and is an exact bijection on 0..255: encode8(decode8(i)) == i.
+// Differences from voxel-axle: its `gamma` used a table and a global power; here the maths is closed form.
+// Subset rules: see light_math.axle.
+
+use crate::core::math::scalar::{max, saturate};
+use crate::core::math::vec3::Vec3;
+use crate::render::light::light_math::{lightExp, lightPow};
+
+/** The default knee of the tone curve: the exposed value up to which the picture stays linear. */
+pub const LIGHT_TONE_KNEE : f32 = 0.6;
+
+// The sRGB piecewise constants.
+const LCOL_LINEAR_CUT : f32 = 0.0031308;
+const LCOL_ENCODED_CUT : f32 = 0.04045;
+const LCOL_SLOPE : f32 = 12.92;
+const LCOL_OFFSET : f32 = 0.055;
+const LCOL_SCALE : f32 = 1.055;
+const LCOL_GAMMA : f32 = 2.4;
+
+/** The tone curve T(x) of one value `x >= 0` with the given knee (clamped to 0.01..0.99). */
+pub fn lightToneCurve(x : f32, knee : f32) : f32 {
+    let k : f32 = max(0.01, knee);
+    let kk : f32 = k - max(k - 0.99, 0.0);
+    if (x <= kk) {
+        return max(x, 0.0);
+    }
+    let room : f32 = (1.0 as f32) - kk;
+    return kk + room * ((1.0 as f32) - lightExp(-(x - kk) / room));
+}
+
+/** Tone-maps an exposed colour, keeping channel ratios: the largest channel goes through T and the rest
+ * follow. */
+pub fn lightToneMap(color : Vec3, knee : f32) : Vec3 {
+    let m : f32 = color.maxComponent();
+    if (!(m > 0.0)) {
+        return Vec3::zero();
+    }
+    return color.scale(lightToneCurve(m, knee) / m);
+}
+
+/** Scene radiance times exposure (see `LightUnits::exposure`). */
+pub fn lightExpose(radiance : Vec3, exposure : f32) : Vec3 {
+    return radiance.scale(exposure);
+}
+
+/** The sRGB opto-electronic transfer of one linear value, clamped to 0..1: linear light to the encoded
+ * signal. */
+pub fn lightSrgbEncode(linear : f32) : f32 {
+    let x : f32 = saturate(linear);
+    if (x <= LCOL_LINEAR_CUT) {
+        return x * LCOL_SLOPE;
+    }
+    return saturate(LCOL_SCALE * lightPow(x, (1.0 as f32) / LCOL_GAMMA) - LCOL_OFFSET);
+}
+
+/** The inverse transfer of one encoded value, clamped to 0..1: the encoded signal to linear light. */
+pub fn lightSrgbDecode(encoded : f32) : f32 {
+    let y : f32 = saturate(encoded);
+    if (y <= LCOL_ENCODED_CUT) {
+        return y / LCOL_SLOPE;
+    }
+    return lightPow((y + LCOL_OFFSET) / LCOL_SCALE, LCOL_GAMMA);
+}
+
+/** The 8-bit code (0..255) nearest to the sRGB encoding of a linear value. */
+pub fn lightSrgbEncode8(linear : f32) : i32 {
+    return (lightSrgbEncode(linear) * (255.0 as f32) + (0.5 as f32)) as i32;
+}
+
+/** The linear value of an 8-bit sRGB code (clamped to 0..255). */
+pub fn lightSrgbDecode8(code : i32) : f32 {
+    let mut c : i32 = code;
+    if (c < 0) {
+        c = 0;
+    }
+    if (c > 255) {
+        c = 255;
+    }
+    return lightSrgbDecode((c as f32) / (255.0 as f32));
+}
+
+/** The whole display path of a pixel: expose, tone-map with `knee`, sRGB-encode each channel (0..1). */
+pub fn lightDisplay(radiance : Vec3, exposure : f32, knee : f32) : Vec3 {
+    let mapped : Vec3 = lightToneMap(lightExpose(radiance, exposure), knee);
+    return Vec3::make(lightSrgbEncode(mapped.x), lightSrgbEncode(mapped.y), lightSrgbEncode(mapped.z));
+}

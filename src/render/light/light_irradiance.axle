@@ -1,0 +1,286 @@
+// light_irradiance — how much light a source puts on a surface point, exactly (doc/LIGHTING_MATH.md §2).
+//
+// A surface point with unit normal n sees a light source as a patch of directions. Irradiance is the
+// integral of
+// radiance times the cosine over that patch, clipped at the horizon of the surface. For the shapes below it
+// has a
+// closed form, so there is no hot spot at the light, no shadow-terminator error at the horizon and no tuning:
+//
+//   * a uniform SPHERE of radiance L seen from distance d, half-angle sigma (sin sigma = R/d), centre at
+//     angle
+//     theta from n:        E = L * S(cos theta, sin^2 sigma)
+//       S = pi sin^2 sigma cos theta                        when the sphere is wholly above the horizon,
+//       S = 0                                               when it is wholly below,
+//       S = (cos t acos y - x sin t sqrt(1-y^2)) sin^2 s + atan(sin t sqrt(1-y^2) / x)       between,
+//           with x = sqrt(1/sin^2 s - 1), y = -x cos t / sin t           (Snyder 1996, as in Lagarde-de
+//             Rousiers 2014);
+//   * a DIRECTIONAL light with angular radius r is the same sphere at infinity: its normal-incidence
+//     illuminance
+//     E_n = L pi sin^2 r, so E = E_n * S(cos theta, sin^2 r) / (pi sin^2 r);
+//   * a POINT light of intensity I and radius R is the sphere of radiance L = I / (pi R^2): for d >> R
+//     this is
+//     I cos(theta) / d^2 exactly; R = 0 is the classical point light;
+//   * an EMITTING DISC of radius r facing the point is the cone of half-angle atan(r/d): sin^2 sigma =
+//     r^2/(r^2+d^2);
+//     the cosine at the emitter scales it (exact on the axis, the usual disc approximation off it).
+//
+// On top of the physics: the glTF spot cone and a finite-range window (a deliberate artistic deviation, off
+// when
+// range is 0). Differences from voxel-axle: its sun had no size (a Lambert dot) and block light fell off as
+// 0.8^(15-level); here the sun's penumbra at the terminator and the 1/d^2 of a lamp both come out of one
+// formula.
+//
+// ERROR BUDGET. The f32 sphere function agrees with the f64 twin `lightSphereIlluminanceD` to a relative
+// 2e-5 away
+// from the horizon cusp (both measured by the suite over a Pcg32 sweep); the f64 twin agrees with a
+// quadrature of
+// the spherical cap to 1e-9 relative. Subset rules: see light_math.axle.
+
+use crate::core::math::scalar::{PI, PI_D, clamp, min, max, saturate, maxD, clampD};
+use crate::core::math::trig::{sqrt, sin, acos, atan, sqrtD, acosD, atanD};
+use crate::core::math::vec3::Vec3;
+use crate::render::light::light_source::{LightKind, LightSource};
+
+// A source smaller than this (world units) is a point: below it the sphere formula loses precision for
+// nothing.
+const LIRR_POINT_RADIUS : f32 = 0.0001;
+
+// Distances are kept above this squared, so a surface exactly at a light does not divide by zero.
+const LIRR_MIN_DIST_SQ : f32 = 0.00000001;
+
+// sin^2 of the half-angle is kept below this so the "between" branch always has a real x.
+const LIRR_MAX_SIN_SQ : f32 = 0.99999;
+
+// A sphere or disc whose sin^2 is under this is a point as far as an f32 can tell.
+const LIRR_TINY_SIN_SQ : f32 = 0.0000000001;
+
+/** Why a light does or does not reach a surface point; `None` means it reaches. Tested in this order. */
+pub enum LightReason : i8 {
+    /** The light reaches the point. */
+    None = 0,
+    /** The point is farther than the light's range. */
+    Range = 1,
+    /** The light's include mask has no bit of the surface layer. */
+    Mask = 2,
+    /** The surface layer is excluded, or the object is on the light's exclusion. */
+    Excluded = 3,
+    /** The light is wholly behind the surface (shading or geometric normal). */
+    Backface = 4,
+    /** The point is outside the spot cone. */
+    Cone = 5,
+    /** The shadow factor is zero: something blocks the light. */
+    Shadow = 6,
+}
+
+/** What one light puts on one surface point, before the BRDF and before any shadow. */
+pub struct LightIncident {
+    /** Whether the light reaches the point and, if not, why (never `Shadow`: that is decided by the caller).
+     * */
+    pub reason : LightReason = LightReason::None;
+
+    /** Unit vector from the point towards the light's centre. */
+    pub toLight : Vec3 = Vec3 { x: 0.0, y: 1.0, z: 0.0 };
+
+    /** Cosine between the shading normal and `toLight`, not clamped (negative: the centre is below the
+     * horizon). */
+    pub nDotL : f32 = 0.0;
+
+    /** The non-geometric falloff: range window times spot cone (1 for a directional light). */
+    pub attenuation : f32 = 0.0;
+
+    /** Scalar irradiance in scene units on the point, with horizon clipping and `attenuation` applied;
+     * colourless. */
+    pub irradiance : f32 = 0.0;
+}
+
+/**
+ * Snyder's illuminance of a sphere or disc of radiance 1: the integral of the cosine over the cap of
+ * directions,
+ * clipped at the horizon. `cosTheta` is the cosine between the normal and the cap's axis, `sinSigmaSqr` the
+ * squared
+ * sine of the cap's half-angle (clamped to 0..1). The answer is E / L, zero or more, at most pi sin^2(sigma).
+ */
+pub fn lightSphereIlluminance(cosTheta : f32, sinSigmaSqr : f32) : f32 {
+    let c : f32 = clamp(cosTheta, -1.0, 1.0);
+    let s2 : f32 = clamp(sinSigmaSqr, 0.0, LIRR_MAX_SIN_SQ);
+    if (c * c > s2) {
+        return PI * s2 * saturate(c);
+    }
+    let sinTheta : f32 = sqrt((1.0 as f32) - c * c);
+    let x : f32 = sqrt((1.0 as f32) / s2 - (1.0 as f32));
+    let y : f32 = clamp(-x * c / sinTheta, -1.0, 1.0);
+    let sinThetaSqrtY : f32 = sinTheta * sqrt((1.0 as f32) - y * y);
+    let e : f32 = (c * acos(y) - x * sinThetaSqrtY) * s2 + atan(sinThetaSqrtY / x);
+    return max(e, 0.0);
+}
+
+/** The f64 twin of `lightSphereIlluminance`: the reference the f32 version is held to. */
+pub fn lightSphereIlluminanceD(cosTheta : f64, sinSigmaSqr : f64) : f64 {
+    let c : f64 = clampD(cosTheta, -1.0, 1.0);
+    let s2 : f64 = clampD(sinSigmaSqr, 0.0, 0.99999999);
+    if (c * c > s2) {
+        return PI_D * s2 * clampD(c, 0.0, 1.0);
+    }
+    let sinTheta : f64 = sqrtD(1.0 - c * c);
+    let x : f64 = sqrtD(1.0 / s2 - 1.0);
+    let y : f64 = clampD(-x * c / sinTheta, -1.0, 1.0);
+    let sinThetaSqrtY : f64 = sinTheta * sqrtD(1.0 - y * y);
+    let e : f64 = (c * acosD(y) - x * sinThetaSqrtY) * s2 + atanD(sinThetaSqrtY / x);
+    return maxD(e, 0.0);
+}
+
+/**
+ * Irradiance of a point light of scene `intensity` and sphere `radius` at distance `dist`, the centre at
+ * angle
+ * `theta` (cosine `cosTheta`) from the normal. Inverse-square for a distant light; the sphere formula up
+ * close.
+ */
+pub fn lightPointIrradiance(intensity : f32, radius : f32, dist : f32, cosTheta : f32) : f32 {
+    let d2 : f32 = max(dist * dist, LIRR_MIN_DIST_SQ);
+    if (radius < LIRR_POINT_RADIUS) {
+        return intensity * saturate(cosTheta) / d2;
+    }
+    let r2 : f32 = radius * radius;
+    let radiance : f32 = intensity / (PI * r2);
+    return radiance * lightSphereIlluminance(cosTheta, r2 / d2);
+}
+
+/**
+ * Irradiance of a directional light whose normal-incidence illuminance is `normalE`, angular radius
+ * `angularRadius` (radians) and whose centre is at `cosTheta` from the normal.
+ */
+pub fn lightDirectionalIrradiance(normalE : f32, angularRadius : f32, cosTheta : f32) : f32 {
+    let s : f32 = sin(angularRadius);
+    let s2 : f32 = s * s;
+    if (s2 < LIRR_TINY_SIN_SQ) {
+        return normalE * saturate(cosTheta);
+    }
+    return normalE * lightSphereIlluminance(cosTheta, s2) / (PI * s2);
+}
+
+/**
+ * Irradiance of an emitting disc of scene `radiance` and `radius` at distance `dist`: the cone formula with
+ * sin^2 = r^2 / (r^2 + d^2), times the cosine of the angle at the emitter (`emitterCos`, clamped at 0).
+ */
+pub fn lightDiscIrradiance(radiance : f32, radius : f32, dist : f32, cosTheta : f32, emitterCos : f32) : f32 {
+    let d2 : f32 = max(dist * dist, LIRR_MIN_DIST_SQ);
+    let r2 : f32 = radius * radius;
+    return radiance * lightSphereIlluminance(cosTheta, r2 / (r2 + d2)) * saturate(emitterCos);
+}
+
+/** The smooth finite-range window sat(1 - (d/R)^4)^2: 1 at the light, exactly 0 at `range` and beyond; range
+ * 0 = 1. */
+pub fn lightRangeWindow(dist : f32, range : f32) : f32 {
+    if (!(range > 0.0)) {
+        return 1.0;
+    }
+    let q : f32 = dist / range;
+    let q2 : f32 = q * q;
+    let a : f32 = saturate((1.0 as f32) - q2 * q2);
+    return a * a;
+}
+
+/**
+ * The glTF spot cone: a = sat(cosAngle * scale + offset) with scale = 1 / max(1e-3, cosInner - cosOuter) and
+ * offset = -cosOuter * scale; the factor is a^2. 1 inside the inner cone, 0 at and beyond the outer,
+ * monotone.
+ * It is C1 at the outer edge (slope 0) but only C0 at the inner edge, where the slope jumps from 2*scale to
+ * 0:
+ * LIGHTING_MATH.md calls it C1 at the inner edge, which the maths contradicts (measured by the suite).
+ */
+pub fn lightSpotCone(cosAngle : f32, cosInner : f32, cosOuter : f32) : f32 {
+    let scale : f32 = (1.0 as f32) / max(0.001, cosInner - cosOuter);
+    let a : f32 = saturate(cosAngle * scale - cosOuter * scale);
+    return a * a;
+}
+
+// sin^2 of a sphere's or disc's angular radius at squared distance d2 for the given radius.
+fn lirrSphereSinSq(radius : f32, d2 : f32) : f32 {
+    return radius * radius / max(d2, LIRR_MIN_DIST_SQ);
+}
+
+// sin^2 of a disc's angular radius when seen face on.
+fn lirrDiscSinSq(radius : f32, d2 : f32) : f32 {
+    let r2 : f32 = radius * radius;
+    return r2 / (r2 + max(d2, LIRR_MIN_DIST_SQ));
+}
+
+// sin^2 of the angular radius the light subtends at the point; the backface test uses it.
+fn lirrSinSq(light : LightSource, distSq : f32) : f32 {
+    let half : f32 = light.angularDiameter * (0.5 as f32);
+    return match light.kind {
+        LightKind::Directional => sin(half) * sin(half),
+        LightKind::Point => lirrSphereSinSq(light.radius, distSq),
+        LightKind::Spot => lirrSphereSinSq(light.radius, distSq),
+        LightKind::Emissive => lirrDiscSinSq(light.radius, distSq),
+    };
+}
+
+// The geometric irradiance of one light, by kind.
+fn lirrGeometric(light : LightSource, dist : f32, cosTheta : f32, cosAxis : f32) : f32 {
+    let half : f32 = light.angularDiameter * (0.5 as f32);
+    return match light.kind {
+        LightKind::Directional => lightDirectionalIrradiance(light.intensity, half, cosTheta),
+        LightKind::Point => lightPointIrradiance(light.intensity, light.radius, dist, cosTheta),
+        LightKind::Spot => lightPointIrradiance(light.intensity, light.radius, dist, cosTheta),
+        LightKind::Emissive => lightDiscIrradiance(light.intensity, light.radius, dist, cosTheta, cosAxis),
+    };
+}
+
+/**
+ * Evaluates one light at a surface point: which way it is, whether it reaches, and the irradiance it puts
+ * there.
+ * `normal` is the shading normal, `geoNormal` the geometric one (a normal-mapped surface must still not be
+ * lit
+ * from behind its triangle). Reasons are tested in the order excluded, mask, range, cone, backface.
+ */
+pub fn lightIncidence(
+    light : LightSource,
+    position : Vec3,
+    normal : Vec3,
+    geoNormal : Vec3,
+    layer : u32,
+    objectId : i32
+) : LightIncident {
+    let mut toLight : Vec3 = light.direction.negated();
+    let mut dist : f32 = 0.0;
+    if (light.kind != LightKind::Directional) {
+        let delta : Vec3 = light.position.minus(position);
+        dist = delta.length();
+        toLight = delta.normalizedOr(Vec3::make(0.0, 1.0, 0.0));
+    }
+    let nDotL : f32 = normal.dot(toLight);
+    let sinSq : f32 = lirrSinSq(light, dist * dist);
+    let mut result : LightIncident = LightIncident { toLight: toLight, nDotL: nDotL };
+    if ((light.excludeLayers & layer) != 0 || objectId == light.excludeObject) {
+        result.reason = LightReason::Excluded;
+        return result;
+    }
+    if ((light.includeLayers & layer) == 0) {
+        result.reason = LightReason::Mask;
+        return result;
+    }
+    let window : f32 = lightRangeWindow(dist, light.range);
+    if (light.kind != LightKind::Directional && light.range > 0.0 && dist >= light.range) {
+        result.reason = LightReason::Range;
+        return result;
+    }
+    let cosAxis : f32 = light.direction.dot(toLight.negated());
+    let e : f32 = lirrGeometric(light, dist, nDotL, cosAxis);
+    result.attenuation = window;
+    if (light.kind == LightKind::Spot) {
+        let cone : f32 = lightSpotCone(cosAxis, light.cosInner, light.cosOuter);
+        result.attenuation = window * cone;
+        if (cone <= 0.0) {
+            result.reason = LightReason::Cone;
+            return result;
+        }
+    }
+    let geoCos : f32 = geoNormal.dot(toLight);
+    if (e <= 0.0 || geoCos <= -sqrt(min(sinSq, 1.0))) {
+        result.reason = LightReason::Backface;
+        return result;
+    }
+    result.irradiance = e * result.attenuation;
+    return result;
+}

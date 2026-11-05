@@ -1,0 +1,194 @@
+// light_dfg — the directional albedo of the specular lobe, tabulated by quadrature (not Monte Carlo).
+//
+// Multiple scattering needs E(mu, alpha) = integral over l of D V (n.l) dl, the fraction of light a rough
+// microfacet surface returns when F = 1, and the Fresnel split of it:
+//     albedo(F0) = F0 * A + B,   A = integral D V (1 - w) n.l dl,  B = integral D V w n.l dl,  w = (1 -
+//       v.h)^5.
+// Both are computed in f64 over the HALF-VECTOR domain, where the GGX lobe is wide for every alpha:
+//     dl = 4 (v.h) dh,   D (n.h) dh = du dphi / (2 pi)   with   n.h^2 = (1 - u) / (1 + (alpha^2 - 1) u),
+// so   A + B = (1 / pi) integral_0^1 du integral_0^phi0 dphi  4 V (n.l)(v.h) / (n.h)   (the lobe is
+// symmetric in phi).
+// l is above the horizon exactly when cos(phi) > n.v (1 - 2 n.h^2) / (2 n.h sin(theta_v) sin(theta_h)); that
+// gives
+// phi0 in closed form, so the integrand is smooth on the whole domain and Gauss-Legendre in u and in phi
+// converges
+// geometrically: no horizon kink, no noise. The table is a pure function of its two orders, so it is
+// identical on
+// every machine; shaders receive it as a texture of `size` x `size` (mu, roughness) texels.
+//
+// Measured by the suite: order 32 vs order 96 agree to 3e-7 (A, B) at every node; the half-vector integral
+// agrees
+// with a brute-force midpoint integral over l (a different domain and a different method) to 1e-3 at alpha
+// >= 0.09;
+// bilinear lookup between nodes is within 2e-3 of direct quadrature.
+
+use crate::core::math::dvec2::DVec2;
+use crate::core::math::scalar::{PI_D, HALF_PI_D, clampD, maxD, saturate};
+use crate::core::math::trig::{sqrt, sqrtD, acosD, cosD, sinD};
+use crate::render::light::light_brdf::{LIGHT_ALPHA_MIN, LIGHT_NV_MIN, lightSmithVD, lightFresnelWeightD};
+use crate::render::light::light_material::LightDfg;
+use crate::render::light::light_quadrature::LightGauss;
+
+/** A (cosine of view angle, perceptual roughness) table of the specular lobe's directional albedo. */
+pub class LightDfgTable {
+    count   : i32;
+    entries : f32[];
+
+    /** Builds the `size` x `size` table (size >= 2) by Gauss-Legendre quadrature of the given `order`. */
+    constructor(size : i32, order : i32) {
+        let mut n : i32 = size;
+        if (n < 2) {
+            n = 2;
+        }
+        self.count = n;
+        self.entries = malloc<f32>((n * n * 2) as i64);
+        for (j of 0..n) {
+            for (i of 0..n) {
+                let nv : f64 = LightDfgTable::cosineAt(i, n);
+                let r : f64 = (j as f64) / ((n - 1) as f64);
+                let pair : LightDfg = LightDfgTable::integrate(nv, LightDfgTable::alphaOf(r), order);
+                self.entries[((j * n + i) * 2) as i64] = pair.a;
+                self.entries[((j * n + i) * 2 + 1) as i64] = pair.b;
+            }
+        }
+    }
+
+    /**
+     * The view cosine of table column `i` of `n`: (i / (n - 1))^2, which packs the nodes where the albedo
+     * changes
+     * fastest (grazing views), but never below ten times the BRDF's own cosine floor.
+     */
+    pub static fn cosineAt(i : i32, n : i32) : f64 {
+        let s : f64 = (i as f64) / ((n - 1) as f64);
+        let mu : f64 = s * s;
+        if (mu < (LIGHT_NV_MIN as f64) * 10.0) {
+            return (LIGHT_NV_MIN as f64) * 10.0;
+        }
+        return mu;
+    }
+
+    /** The GGX width the table uses for perceptual roughness `r`: r^2 floored like the shading does. */
+    pub static fn alphaOf(r : f64) : f64 {
+        let a : f64 = r * r;
+        if (a < (LIGHT_ALPHA_MIN as f64)) {
+            return LIGHT_ALPHA_MIN as f64;
+        }
+        return a;
+    }
+
+    /**
+     * Where the horizon clips the half-vector domain, as the two values of u that bound the partly clipped
+     * band:
+     * below the first every half-vector has its whole circle of phi above the horizon, above the second none
+     * has.
+     * With theta_v the view angle, the band is theta_h between (pi/2 - theta_v)/2 and (pi/2 + theta_v)/2
+     * (where l
+     * grazes the horizon in the plane of v at phi = pi and phi = 0). Returned as (low, high).
+     */
+    pub static fn horizonBand(nv : f64, alpha : f64) : DVec2 {
+        let thetaV : f64 = acosD(nv);
+        let a2m : f64 = alpha * alpha - 1.0;
+        let lowCos : f64 = cosD(0.5 * (HALF_PI_D - thetaV));
+        let highCos : f64 = cosD(0.5 * (HALF_PI_D + thetaV));
+        let low : f64 = (1.0 - lowCos * lowCos) / (1.0 + lowCos * lowCos * a2m);
+        let high : f64 = (1.0 - highCos * highCos) / (1.0 + highCos * highCos * a2m);
+        return DVec2 { x: low, y: high };
+    }
+
+    /**
+     * The albedo split (A, B) of the lobe D V for view cosine `nv` and width `alpha`, by a Gauss-Legendre
+     * rule of
+     * `order` nodes in each of u and phi. A + B is the directional albedo for F = 1. The u range is cut
+     * where the
+     * horizon starts and stops clipping the lobe; inside the clipped band the phi range ends at a square-root
+     * singularity of the u-integrand, tamed by the substitution u = lo + (hi - lo)(1 - cos(pi t))/2.
+     */
+    pub static fn integrate(nv : f64, alpha : f64, order : i32) : LightDfg {
+        let rule : LightGauss = new LightGauss(order);
+        let sv : f64 = sqrtD(1.0 - nv * nv);
+        let a2 : f64 = alpha * alpha;
+        let band : DVec2 = LightDfgTable::horizonBand(nv, alpha);
+        let cutLow : f64 = band.x;
+        let cutHigh : f64 = band.y;
+        let mut sumA : f64 = 0.0;
+        let mut sumB : f64 = 0.0;
+        for (seg of 0..2) {
+            let mut lo : f64 = 0.0;
+            let mut hi : f64 = cutLow;
+            if (seg == 1) {
+                lo = cutLow;
+                hi = cutHigh;
+            }
+            let mut span : i32 = order;
+            if (hi - lo < 0.000000000001) {
+                span = 0;
+            }
+            for (i of 0..span) {
+                let t : f64 = rule.at(i, 0.0, 1.0);
+                let mut u : f64 = lo + (hi - lo) * t;
+                let mut du : f64 = (hi - lo) * rule.scaled(i, 0.0, 1.0);
+                if (seg == 1) {
+                    u = lo + (hi - lo) * 0.5 * (1.0 - cosD(PI_D * t));
+                    du = rule.scaled(i, 0.0, 1.0) * (hi - lo) * 0.5 * PI_D * sinD(PI_D * t);
+                }
+                let nh2 : f64 = (1.0 - u) / (1.0 + (a2 - 1.0) * u);
+                let nh : f64 = sqrtD(nh2);
+                let sh : f64 = sqrtD(1.0 - nh2);
+                let mut phi0 : f64 = PI_D;
+                if (seg == 1) {
+                    let reach : f64 = 2.0 * nh * sv * sh;
+                    phi0 = acosD(clampD(nv * (1.0 - 2.0 * nh2) / reach, -1.0, 1.0));
+                }
+                for (k of 0..order) {
+                    let phi : f64 = rule.at(k, 0.0, phi0);
+                    let vh : f64 = nv * nh + sv * sh * cosD(phi);
+                    let nl : f64 = maxD(2.0 * vh * nh - nv, 0.0);
+                    let g : f64 = 4.0 * lightSmithVD(nl, nv, alpha) * nl * vh / nh;
+                    let w : f64 = lightFresnelWeightD(vh);
+                    let weight : f64 = du * rule.scaled(k, 0.0, phi0);
+                    sumA = sumA + (1.0 - w) * g * weight;
+                    sumB = sumB + w * g * weight;
+                }
+            }
+        }
+        return LightDfg { a: (sumA / PI_D) as f32, b: (sumB / PI_D) as f32 };
+    }
+
+    /** How many columns and rows the table has. */
+    pub fn size(self) : i32 {
+        return self.count;
+    }
+
+    /** The stored entry at column `i` (view cosine) and row `j` (roughness). */
+    pub fn node(self, i : i32, j : i32) : LightDfg {
+        let at : i64 = ((j * self.count + i) * 2) as i64;
+        return LightDfg { a: self.entries[at], b: self.entries[at + 1] };
+    }
+
+    /** Bilinear lookup (in sqrt(nv) and roughness) for view cosine `nv` and perceptual `roughness`, both
+     * clamped to 0..1. */
+    pub fn lookup(self, nv : f32, roughness : f32) : LightDfg {
+        let last : f32 = (self.count - 1) as f32;
+        let x : f32 = sqrt(saturate(nv)) * last;
+        let y : f32 = saturate(roughness) * last;
+        let mut i0 : i32 = x as i32;
+        let mut j0 : i32 = y as i32;
+        if (i0 > self.count - 2) {
+            i0 = self.count - 2;
+        }
+        if (j0 > self.count - 2) {
+            j0 = self.count - 2;
+        }
+        let fx : f32 = x - (i0 as f32);
+        let fy : f32 = y - (j0 as f32);
+        let p00 : LightDfg = self.node(i0, j0);
+        let p10 : LightDfg = self.node(i0 + 1, j0);
+        let p01 : LightDfg = self.node(i0, j0 + 1);
+        let p11 : LightDfg = self.node(i0 + 1, j0 + 1);
+        let a0 : f32 = p00.a + (p10.a - p00.a) * fx;
+        let a1 : f32 = p01.a + (p11.a - p01.a) * fx;
+        let b0 : f32 = p00.b + (p10.b - p00.b) * fx;
+        let b1 : f32 = p01.b + (p11.b - p01.b) * fx;
+        return LightDfg { a: a0 + (a1 - a0) * fy, b: b0 + (b1 - b0) * fy };
+    }
+}

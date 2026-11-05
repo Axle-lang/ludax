@@ -1,0 +1,278 @@
+// cmd_stream — the render command stream: what to draw, as plain data in flat arrays.
+//
+// Design rule 6: rendering is data. A frame is recorded into a `CmdStream` and a backend consumes it, so a GPU
+// backend and the CPU oracle execute the same commands. A command is an opcode, three integer slots and four
+// float slots (unused ones are zero); nothing in it points at memory, only at ids that `RenderAssets`,
+// `RenderScene` and the render graph define: a resource id, a material id, a mesh id, an instance range.
+// Commands are stored as parallel arrays (`ops`, `args`, `vals`) that double when full, so recording never
+// allocates per command and the stream can be copied to a GPU upload buffer or serialised as it is (cmd_codec).
+//
+// Meaning of the slots, by opcode (the slot names a..c are integers, f0..f3 floats):
+//   BeginPass   a = pass id                       start of a pass; the backend times and counts until EndPass
+//   EndPass                                       end of the open pass
+//   SetTarget   a = colour resource, b = depth resource (-1 for none)
+//   Clear       a = flags (1 colour, 2 depth), f0..f2 = colour, f3 = depth
+//   BindMaterial a = material id                  the material of the draws that follow
+//   DrawMesh    a = mesh id, b = first instance, c = instance count  (instances of the frame's RenderScene)
+//   BuildAccel  a = acceleration-structure resource   build what shadow rays traverse (a BVH on the CPU)
+//   Resolve     a = source colour, b = destination, f0 = exposure, f1 = tone knee   tone map + sRGB to 8 bits
+
+/** The opcodes of the stream. */
+pub enum CmdOp : i8 {
+    /** Starts a pass. */
+    BeginPass = 1,
+    /** Ends the open pass. */
+    EndPass = 2,
+    /** Chooses colour and depth targets. */
+    SetTarget = 3,
+    /** Clears the targets. */
+    Clear = 4,
+    /** Binds the material of the following draws. */
+    BindMaterial = 5,
+    /** Draws a mesh for a range of the frame's instances. */
+    DrawMesh = 6,
+    /** Builds the acceleration structure shadow rays use. */
+    BuildAccel = 7,
+    /** Draws the fullscreen resolve: exposure, tone map, sRGB. */
+    Resolve = 8,
+}
+
+/** Clear flag: clear the colour target. */
+pub const CMD_CLEAR_COLOR : i32 = 1;
+
+/** Clear flag: clear the depth target. */
+pub const CMD_CLEAR_DEPTH : i32 = 2;
+
+/** A recorded frame: commands in submission order. */
+pub class CmdStream {
+    ops  : i32[];
+    args : i32[];
+    vals : f32[];
+    used : i32 = 0;
+    room : i32 = 64;
+
+    /** An empty stream. */
+    constructor() {
+        self.ops = malloc<i32>(64);
+        self.args = malloc<i32>(192);
+        self.vals = malloc<f32>(256);
+    }
+
+    /** How many commands. */
+    pub fn count(self) : i32 {
+        return self.used;
+    }
+
+    /** Forgets every command, keeping the memory. */
+    pub fn clear(mut self) : void {
+        self.used = 0;
+    }
+
+    // Appends one command.
+    fn push(mut self, op : CmdOp, a : i32, b : i32, c : i32, f0 : f32, f1 : f32, f2 : f32, f3 : f32) : void {
+        if (self.used == self.room) {
+            self.grow();
+        }
+        let k : i32 = self.used;
+        self.ops[k] = CmdStream::codeOf(op);
+        self.args[k * 3] = a;
+        self.args[k * 3 + 1] = b;
+        self.args[k * 3 + 2] = c;
+        self.vals[k * 4] = f0;
+        self.vals[k * 4 + 1] = f1;
+        self.vals[k * 4 + 2] = f2;
+        self.vals[k * 4 + 3] = f3;
+        self.used = k + 1;
+    }
+
+    fn grow(mut self) : void {
+        let bigger : i32 = self.room * 2;
+        let mut ops : i32[] = malloc<i32>(bigger as i64);
+        let mut args : i32[] = malloc<i32>((bigger * 3) as i64);
+        let mut vals : f32[] = malloc<f32>((bigger * 4) as i64);
+        for (i of 0..self.used) {
+            ops[i] = self.ops[i];
+        }
+        for (i of 0..self.used * 3) {
+            args[i] = self.args[i];
+        }
+        for (i of 0..self.used * 4) {
+            vals[i] = self.vals[i];
+        }
+        self.ops = ops;
+        self.args = args;
+        self.vals = vals;
+        self.room = bigger;
+    }
+
+    /** The integer code of an opcode (what is stored and serialised). */
+    pub static fn codeOf(op : CmdOp) : i32 {
+        return match op {
+            CmdOp::BeginPass => 1,
+            CmdOp::EndPass => 2,
+            CmdOp::SetTarget => 3,
+            CmdOp::Clear => 4,
+            CmdOp::BindMaterial => 5,
+            CmdOp::DrawMesh => 6,
+            CmdOp::BuildAccel => 7,
+            CmdOp::Resolve => 8,
+        };
+    }
+
+    /** The opcode of a code; false in `isValidCode` for a code that names none (then this answers EndPass). */
+    pub static fn opOf(code : i32) : CmdOp {
+        return match code {
+            1 => CmdOp::BeginPass,
+            2 => CmdOp::EndPass,
+            3 => CmdOp::SetTarget,
+            4 => CmdOp::Clear,
+            5 => CmdOp::BindMaterial,
+            6 => CmdOp::DrawMesh,
+            7 => CmdOp::BuildAccel,
+            8 => CmdOp::Resolve,
+            _ => CmdOp::EndPass,
+        };
+    }
+
+    /** True when `code` is one of the opcodes. */
+    pub static fn isValidCode(code : i32) : bool {
+        return code >= 1 && code <= 8;
+    }
+
+    /** Appends BeginPass. */
+    pub fn beginPass(mut self, pass : i32) : void {
+        self.push(CmdOp::BeginPass, pass, 0, 0, 0.0, 0.0, 0.0, 0.0);
+    }
+
+    /** Appends EndPass. */
+    pub fn endPass(mut self) : void {
+        self.push(CmdOp::EndPass, 0, 0, 0, 0.0, 0.0, 0.0, 0.0);
+    }
+
+    /** Appends SetTarget. */
+    pub fn setTarget(mut self, colorResource : i32, depthResource : i32) : void {
+        self.push(CmdOp::SetTarget, colorResource, depthResource, 0, 0.0, 0.0, 0.0, 0.0);
+    }
+
+    /** Appends Clear with `flags` (`CMD_CLEAR_COLOR` | `CMD_CLEAR_DEPTH`), a colour and a depth value. */
+    pub fn clear(mut self, flags : i32, r : f32, g : f32, b : f32, depth : f32) : void {
+        self.push(CmdOp::Clear, flags, 0, 0, r, g, b, depth);
+    }
+
+    /** Appends BindMaterial. */
+    pub fn bindMaterial(mut self, material : i32) : void {
+        self.push(CmdOp::BindMaterial, material, 0, 0, 0.0, 0.0, 0.0, 0.0);
+    }
+
+    /** Appends DrawMesh for `count` instances starting at `first`. */
+    pub fn drawMesh(mut self, mesh : i32, first : i32, count : i32) : void {
+        self.push(CmdOp::DrawMesh, mesh, first, count, 0.0, 0.0, 0.0, 0.0);
+    }
+
+    /** Appends BuildAccel. */
+    pub fn buildAccel(mut self, resource : i32) : void {
+        self.push(CmdOp::BuildAccel, resource, 0, 0, 0.0, 0.0, 0.0, 0.0);
+    }
+
+    /** Appends Resolve. */
+    pub fn resolve(mut self, source : i32, destination : i32, exposure : f32, knee : f32) : void {
+        self.push(CmdOp::Resolve, source, destination, 0, exposure, knee, 0.0, 0.0);
+    }
+
+    /** Appends a command from raw slots; for decoders and tools (the builders above are the normal way). */
+    pub fn pushRaw(
+        mut self,
+        code : i32,
+        a : i32,
+        b : i32,
+        c : i32,
+        f0 : f32,
+        f1 : f32,
+        f2 : f32,
+        f3 : f32
+    ) : void {
+        self.push(CmdStream::opOf(code), a, b, c, f0, f1, f2, f3);
+    }
+
+    /** The opcode of command `i`. */
+    pub fn op(self, i : i32) : CmdOp {
+        return CmdStream::opOf(self.ops[i]);
+    }
+
+    /** The opcode of command `i` as its integer code. */
+    pub fn code(self, i : i32) : i32 {
+        return self.ops[i];
+    }
+
+    /** Integer slot a of command `i`. */
+    pub fn a(self, i : i32) : i32 {
+        return self.args[i * 3];
+    }
+
+    /** Integer slot b of command `i`. */
+    pub fn b(self, i : i32) : i32 {
+        return self.args[i * 3 + 1];
+    }
+
+    /** Integer slot c of command `i`. */
+    pub fn c(self, i : i32) : i32 {
+        return self.args[i * 3 + 2];
+    }
+
+    /** Float slot `k` (0..3) of command `i`. */
+    pub fn f(self, i : i32, k : i32) : f32 {
+        return self.vals[i * 4 + k];
+    }
+
+    /** True when every slot of command `i` equals the same slot of command `j` of `other`. */
+    pub fn sameAs(self, i : i32, other : CmdStream, j : i32) : bool {
+        if (self.ops[i] != other.code(j) || self.a(i) != other.a(j) || self.b(i) != other.b(j)
+            || self.c(i) != other.c(j)) {
+            return false;
+        }
+        for (k of 0..4) {
+            if (self.f(i, k) != other.f(j, k)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /** True when `other` holds exactly the same commands. */
+    pub fn equals(self, other : CmdStream) : bool {
+        if (self.used != other.count()) {
+            return false;
+        }
+        for (i of 0..self.used) {
+            if (!self.sameAs(i, other, i)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /** One line of text for command `i`, for logs and diffs. */
+    pub fn describe(self, i : i32) : string {
+        return match self.op(i) {
+            CmdOp::BeginPass => "begin-pass " + self.a(i).toString(),
+            CmdOp::EndPass => "end-pass",
+            CmdOp::SetTarget => "set-target color=" + self.a(i).toString() + " depth=" + self.b(i).toString(),
+            CmdOp::Clear => "clear flags=" + self.a(i).toString() + " rgb=(" + self.f(i, 0).toString() + ", "
+                + self.f(i, 1).toString()
+                + ", "
+                + self.f(i, 2).toString()
+                + ") depth="
+                + self.f(i, 3).toString(),
+            CmdOp::BindMaterial => "bind-material " + self.a(i).toString(),
+            CmdOp::DrawMesh => "draw-mesh mesh=" + self.a(i).toString() + " first=" + self.b(i).toString()
+                + " count="
+                + self.c(i).toString(),
+            CmdOp::BuildAccel => "build-accel " + self.a(i).toString(),
+            CmdOp::Resolve => "resolve src=" + self.a(i).toString() + " dst=" + self.b(i).toString()
+                + " exposure="
+                + self.f(i, 0).toString()
+                + " knee="
+                + self.f(i, 1).toString(),
+        };
+    }
+}

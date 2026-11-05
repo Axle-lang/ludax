@@ -1,0 +1,103 @@
+// cpu_shadow — shadow rays against a triangle BVH, behind the lighting library's `LightShadowQuery`.
+//
+// The library never decides how a shadow is found: it asks a `LightShadowQuery` how much of light number `i`
+// reaches a surface point. This one answers with a ray. A light whose `shadowMode` is not `Ray` is never blocked
+// (that is how "none / ray" is chosen per light). For a `Ray` light it traces one ray from the surface point, lifted
+// off the surface along the geometric normal by a small bias that grows with the distance from the camera, towards
+// the light's centre (to its position for point and spot lights, to infinity against the travel direction for a
+// directional light) and answers 1 or 0. One ray means a hard shadow edge whatever the light's radius: the soft
+// penumbra of a sized light is future work, and `LightExplain` reports this honestly as "visibility 0 or 1".
+// Lights that obviously cannot reach the point (beyond their range, or wholly behind the surface) are skipped
+// without a ray; the library rejects them for the right reason anyway. The query owns a copy of the lights and of
+// the BVH, so it never points into the caller's data.
+
+use crate::core::collections::vec::Vec;
+use crate::core::math::vec3::Vec3;
+use crate::render::cpu::cpu_bvh::CpuBvh;
+use crate::render::light::light_material::LightSurface;
+use crate::render::light::light_shade::LightShadowQuery;
+use crate::render::light::light_source::{LightKind, LightShadowMode, LightSource};
+
+// Shadow rays start this far above the surface, plus a part per thousand of the distance from the camera.
+const CSH_BIAS : f32 = 0.002;
+const CSH_BIAS_FAR : f32 = 0.00002;
+
+// "Infinitely far" for a directional light.
+const CSH_FAR : f32 = 1000000000.0;
+
+// The origin, direction and length of a shadow ray, or `valid` false when none is needed.
+struct CsRay {
+    valid  : bool = false;
+    origin : Vec3 = Vec3 { x: 0.0, y: 0.0, z: 0.0 };
+    dir    : Vec3 = Vec3 { x: 0.0, y: 1.0, z: 0.0 };
+    length : f32 = 0.0;
+}
+
+/** Ray-traced shadows for the lights of one frame. */
+pub class CpuShadowQuery : LightShadowQuery {
+    tree  : CpuBvh;
+    lamps : Vec<LightSource>;
+
+    /** A query over `count` triangles (9 floats each, camera-relative) and a copy of `lights`. */
+    constructor(corners : f32[], count : i32, lights : Vec<LightSource>) {
+        self.tree = new CpuBvh(corners, count);
+        self.lamps = new Vec<LightSource>();
+        for (i of 0..lights.len()) {
+            self.lamps.push(lights.get(i));
+        }
+    }
+
+    /** How many triangles can block a ray. */
+    pub fn triangleCount(self) : i32 {
+        return self.tree.triangleCount();
+    }
+
+    // The ray from `surface` to light `lightIndex`.
+    fn rayFor(self, lightIndex : i32, surface : LightSurface) : CsRay {
+        if (lightIndex < 0 || lightIndex >= self.lamps.len()) {
+            return CsRay {};
+        }
+        let light : LightSource = self.lamps.get(lightIndex);
+        if (light.shadowMode != LightShadowMode::Ray) {
+            return CsRay {};
+        }
+        let bias : f32 = CSH_BIAS + CSH_BIAS_FAR * surface.position.length();
+        let origin : Vec3 = surface.position.plus(surface.geoNormal.scale(bias));
+        let mut dir : Vec3 = light.direction.negated();
+        let mut length : f32 = CSH_FAR;
+        if (light.kind != LightKind::Directional) {
+            let delta : Vec3 = light.position.minus(origin);
+            let dist : f32 = delta.length();
+            if (!(dist > bias) || (light.range > 0.0 && dist >= light.range)) {
+                return CsRay {};
+            }
+            dir = delta.scale((1.0 as f32) / dist);
+            length = dist - bias;
+        }
+        if (dir.dot(surface.geoNormal) < (-0.05 as f32)) {
+            return CsRay {};
+        }
+        return CsRay { valid: true, origin: origin, dir: dir, length: length };
+    }
+
+    /** 1 when light `lightIndex` is not blocked at `surface` (or casts no ray shadow), 0 when something is in the way. */
+    pub fn visibility(self, lightIndex : i32, surface : LightSurface) : f32 {
+        let r : CsRay = self.rayFor(lightIndex, surface);
+        if (!r.valid) {
+            return 1.0;
+        }
+        if (self.tree.occluded(r.origin.x, r.origin.y, r.origin.z, r.dir.x, r.dir.y, r.dir.z, r.length)) {
+            return 0.0;
+        }
+        return 1.0;
+    }
+
+    /** The distance to what a shadow ray from `surface` towards light `lightIndex` hits first, or -1 for nothing (or no ray). */
+    pub fn blockerDistance(self, lightIndex : i32, surface : LightSurface) : f32 {
+        let r : CsRay = self.rayFor(lightIndex, surface);
+        if (!r.valid) {
+            return -1.0;
+        }
+        return self.tree.nearest(r.origin.x, r.origin.y, r.origin.z, r.dir.x, r.dir.y, r.dir.z, r.length);
+    }
+}
