@@ -1,0 +1,302 @@
+// world — an infinite voxel world: the generator, a sparse layer of edits, and the chunks in memory.
+//
+// A world is *generator + edits*. Whatever nobody touched is never stored: it is regenerated from the seed when
+// its chunk is loaded. A chunk that was edited is kept whole in the edit layer when it leaves memory (in its
+// compact stored form) and comes back from there instead of from the generator. Saving writes exactly the edit
+// layer, so a save file holds only what the players changed.
+//
+// Chunk loading is explicit (`loadBatch`, `loadChunk`); deciding which chunks to hold is the streamer's job.
+// Edits go through `setBlock`, which loads the chunk if needed, marks it edited and dirty, and appends to the
+// journal that the mesher and the light bridge read. The world is one chunk column tall (see `VW_HEIGHT`);
+// chunks above or below it do not exist.
+
+use crate::core::collections::map::Map;
+use crate::core::collections::vec::Vec;
+use crate::data::bytes::ByteBuf;
+use crate::voxel::world::chunk::{VoxChunk, VW_SIDE};
+use crate::voxel::world::codec::VoxChunkCodec;
+use crate::voxel::world::journal::VoxJournal;
+use crate::voxel::world::loader::{VoxChunkLoader, VoxGenKernel};
+use crate::voxel::world::region::VoxRegion;
+use crate::voxel::world::store::VoxChunkStore;
+use crate::voxel::world::terrain::{VoxTerrain, VW_COLUMN_CHUNKS, VW_HEIGHT};
+
+// A chunk coordinate is listed as an (x, y, z) triple.
+const VW_COORD_STRIDE : i32 = 3;
+
+// Room a fresh edit buffer starts with; it grows on write.
+const VW_EDIT_ROOM : i32 = 512;
+
+// The local index inside a chunk is y * 256 + z * 16 + x.
+const VW_WORLD_Z_SHIFT : i32 = 4;
+const VW_WORLD_Y_SHIFT : i32 = 8;
+
+/** The world: generator, edits, loaded chunks and the journal of changes. */
+pub class VoxWorld {
+    pub terrain : Shared<VoxTerrain>;
+    pub store   : VoxChunkStore;
+    pub journal : VoxJournal;
+    loader      : VoxChunkLoader;
+    edits       : Map<i64, i32>;
+    editData    : ByteBuf[];
+    editUsed    : i32 = 0;
+    editRoom    : i32 = 8;
+
+    /** A world of `seed`, sea at `seaLevel`, generating on `workers` pool threads (0 or 1 for little parallelism). */
+    constructor(seed : i32, seaLevel : i32, workers : i32) {
+        let terrain : Shared<VoxTerrain> = new shared VoxTerrain(seed, seaLevel);
+        self.terrain = terrain;
+        self.store = new VoxChunkStore();
+        self.journal = new VoxJournal();
+        self.loader = new VoxChunkLoader(terrain, workers);
+        self.edits = new Map<i64, i32>();
+        self.editData = malloc<ByteBuf>(self.editRoom as i64);
+    }
+
+    /** Stops the generation threads. Call it before the program ends. */
+    pub fn close(mut self) : void {
+        self.loader.close();
+    }
+
+    /** True when chunk (cx, cy, cz) exists in this world (the world is one fixed height). */
+    pub static fn inWorld(cy : i32) : bool {
+        return cy >= 0 && cy < VW_COLUMN_CHUNKS;
+    }
+
+    /** True when chunk (cx, cy, cz) is in memory. */
+    pub fn isLoaded(self, cx : i32, cy : i32, cz : i32) : bool {
+        return self.store.has(cx, cy, cz);
+    }
+
+    /** How many chunks the generator has produced so far (a measure of work done). */
+    pub fn generated(self) : i64 {
+        return self.loader.made;
+    }
+
+    /** The block at world cell (x, y, z) if its chunk is loaded, else air. */
+    pub fn blockAt(self, x : i32, y : i32, z : i32) : i32 {
+        return self.store.blockAt(x, y, z);
+    }
+
+    // Reads chunk `key` from the edit layer into `chunk`; false when the layer does not hold it or its bytes are bad.
+    fn restoreEdit(self, key : i64, chunk : VoxChunk) : bool {
+        let at : i32 = self.edits.getOr(key, -1);
+        if (at < 0) {
+            return false;
+        }
+        let b : ByteBuf = self.editData[at as i64];
+        return VoxChunkCodec::decode(b, 0, b.len(), chunk);
+    }
+
+    /**
+     * Loads the `count` chunks whose coordinates are the triples `coords[3i..3i+2]` and are not loaded yet:
+     * from the edit layer where it has them, else from the generator (in parallel when `parallel`). Chunks
+     * above or below the world are skipped. Returns how many were loaded. The chunks enter the store in the
+     * order listed.
+     */
+    pub fn loadBatch(mut self, coords : i32[], count : i32, parallel : bool) : i32 {
+        let kernel : VoxGenKernel = self.loader.jobs();
+        kernel.reset(count);
+        let mut jobs : i32 = 0;
+        let mut jobOf : i32[] = malloc<i32>(count as i64 + 1);
+        for (i of 0..count) {
+            let cx : i32 = coords[(i * VW_COORD_STRIDE) as i64];
+            let cy : i32 = coords[(i * VW_COORD_STRIDE + 1) as i64];
+            let cz : i32 = coords[(i * VW_COORD_STRIDE + 2) as i64];
+            jobOf[i as i64] = -1;
+            if (VoxWorld::inWorld(cy) && !self.store.has(cx, cy, cz)) {
+                let key : i64 = VoxChunkStore::key(cx, cy, cz);
+                if (!self.edits.has(key)) {
+                    kernel.set(jobs, cx, cy, cz, new VoxChunk());
+                    jobOf[i as i64] = jobs;
+                    jobs = jobs + 1;
+                }
+            }
+        }
+        self.loader.run(jobs, parallel);
+        let mut loaded : i32 = 0;
+        for (i of 0..count) {
+            let cx : i32 = coords[(i * VW_COORD_STRIDE) as i64];
+            let cy : i32 = coords[(i * VW_COORD_STRIDE + 1) as i64];
+            let cz : i32 = coords[(i * VW_COORD_STRIDE + 2) as i64];
+            if (VoxWorld::inWorld(cy) && !self.store.has(cx, cy, cz)) {
+                let key : i64 = VoxChunkStore::key(cx, cy, cz);
+                if (jobOf[i as i64] >= 0) {
+                    self.store.insert(cx, cy, cz, kernel.take(jobOf[i as i64]));
+                    loaded = loaded + 1;
+                } else {
+                    let fresh : VoxChunk = new VoxChunk();
+                    if (self.restoreEdit(key, fresh)) {
+                        fresh.setEdited(true);
+                    } else {
+                        self.terrain.fillChunk(fresh, cx, cy, cz);
+                    }
+                    self.store.insert(cx, cy, cz, fresh);
+                    loaded = loaded + 1;
+                }
+            }
+        }
+        return loaded;
+    }
+
+    /** Loads one chunk (see `loadBatch`). True when it is loaded afterwards. */
+    pub fn loadChunk(mut self, cx : i32, cy : i32, cz : i32) : bool {
+        let mut one : i32[] = malloc<i32>(VW_COORD_STRIDE as i64);
+        one[0] = cx;
+        one[1] = cy;
+        one[2] = cz;
+        self.loadBatch(one, 1, false);
+        return self.store.has(cx, cy, cz);
+    }
+
+    // Puts the current content of a loaded edited chunk into the edit layer.
+    fn keepEdit(mut self, key : i64, chunk : VoxChunk) : void {
+        let bytes : ByteBuf = new ByteBuf(VW_EDIT_ROOM);
+        VoxChunkCodec::encode(chunk, bytes);
+        self.storeEdit(key, bytes);
+    }
+
+    // Writes one chunk's stored bytes into the edit layer, replacing what was there.
+    fn storeEdit(mut self, key : i64, own bytes : ByteBuf) : void {
+        let at : i32 = self.edits.getOr(key, -1);
+        if (at >= 0) {
+            self.editData[at as i64] = bytes;
+            return;
+        }
+        if (self.editUsed == self.editRoom) {
+            let mut bigger : ByteBuf[] = malloc<ByteBuf>((self.editRoom * 2) as i64);
+            for (i of 0..self.editUsed) {
+                bigger[i as i64] = self.editData[i as i64];
+            }
+            self.editData = bigger;
+            self.editRoom = self.editRoom * 2;
+        }
+        self.editData[self.editUsed as i64] = bytes;
+        self.edits.put(key, self.editUsed);
+        self.editUsed = self.editUsed + 1;
+    }
+
+    /** Drops chunk (cx, cy, cz) from memory, keeping it in the edit layer first when it was edited. */
+    pub fn unloadChunk(mut self, cx : i32, cy : i32, cz : i32) : bool {
+        if (!self.store.has(cx, cy, cz)) {
+            return false;
+        }
+        let chunk : VoxChunk = self.store.chunk(cx, cy, cz);
+        if (chunk.isEdited()) {
+            self.keepEdit(VoxChunkStore::key(cx, cy, cz), chunk);
+        }
+        return self.store.remove(cx, cy, cz);
+    }
+
+    /**
+     * Sets the block at world cell (x, y, z), loading its chunk first when needed. The change is recorded in the
+     * journal and the chunk is marked edited. Returns false when nothing changed (same block, or a cell outside
+     * the world's height).
+     */
+    pub fn setBlock(mut self, x : i32, y : i32, z : i32, id : i32) : bool {
+        if (y < 0 || y >= VW_HEIGHT) {
+            return false;
+        }
+        if (!self.loadChunk(x >> 4, y >> 4, z >> 4)) {
+            return false;
+        }
+        let chunk : VoxChunk = self.store.chunk(x >> 4, y >> 4, z >> 4);
+        let local : i32 = VoxWorld::localOf(x, y, z);
+        let was : i32 = chunk.get(local);
+        if (was == id) {
+            return false;
+        }
+        chunk.set(local, id);
+        chunk.setEdited(true);
+        self.journal.record(x, y, z, was, id);
+        return true;
+    }
+
+    /** How many chunks the edit layer holds (loaded edited chunks are counted once they have been unloaded or committed). */
+    pub fn editedStored(self) : i32 {
+        return self.edits.len();
+    }
+
+    /** Memory held by the edit layer, in bytes. */
+    pub fn editBytes(self) : i64 {
+        let mut total : i64 = 0;
+        for (i of 0..self.editUsed) {
+            total = total + self.editData[i as i64].len() as i64;
+        }
+        return total;
+    }
+
+    /** Copies every loaded edited chunk into the edit layer (they stay loaded). Call before saving. */
+    pub fn commitEdits(mut self) : void {
+        let mut pos : i32 = self.store.first();
+        while (pos >= 0) {
+            let chunk : VoxChunk = self.store.chunkAt(pos);
+            if (chunk.isEdited()) {
+                self.keepEdit(self.store.keyAt(pos), chunk);
+            }
+            pos = self.store.next(pos);
+        }
+    }
+
+    /** The edit layer as a region: exactly the chunks the world's players changed. */
+    pub fn editRegion(mut self) : VoxRegion {
+        self.commitEdits();
+        let region : VoxRegion = new VoxRegion();
+        let mut slot : i32 = self.edits.first();
+        while (slot >= 0) {
+            let bytes : ByteBuf = self.editData[self.edits.valueAt(slot) as i64];
+            region.add(self.edits.keyAt(slot), bytes);
+            slot = self.edits.next(slot);
+        }
+        return region;
+    }
+
+    /**
+     * Replaces the edit layer's chunks with those of `region` (chunks the region does not list keep their
+     * edits). Loaded chunks that the region lists are re-read from it. Returns false, changing nothing more,
+     * when a payload of the region is damaged or is not a chunk.
+     */
+    pub fn applyRegion(mut self, region : VoxRegion) : bool {
+        let probe : VoxChunk = new VoxChunk();
+        let mut staged : ByteBuf[] = malloc<ByteBuf>(region.count() as i64 + 1);
+        for (i of 0..region.count()) {
+            let raw : ByteBuf = new ByteBuf(VW_EDIT_ROOM);
+            if (!region.read(region.keyAt(i), raw)) {
+                return false;
+            }
+            if (!VoxChunkCodec::decode(raw, 0, raw.len(), probe)) {
+                return false;
+            }
+            staged[i as i64] = raw;
+        }
+        for (i of 0..region.count()) {
+            let key : i64 = region.keyAt(i);
+            let raw : ByteBuf = staged[i as i64];
+            let cx : i32 = VoxChunkStore::keyX(key);
+            let cy : i32 = VoxChunkStore::keyY(key);
+            let cz : i32 = VoxChunkStore::keyZ(key);
+            if (self.store.has(cx, cy, cz)) {
+                let live : VoxChunk = self.store.chunk(cx, cy, cz);
+                VoxChunkCodec::decode(raw, 0, raw.len(), live);
+                live.setEdited(true);
+            }
+            self.storeEdit(key, raw);
+        }
+        return true;
+    }
+
+    // The local index of a world cell inside its chunk.
+    static fn localOf(x : i32, y : i32, z : i32) : i32 {
+        let side : i32 = VW_SIDE - 1;
+        return ((y & side) << VW_WORLD_Y_SHIFT) | ((z & side) << VW_WORLD_Z_SHIFT) | (x & side);
+    }
+
+    /** The loaded chunks as a plain list of packed keys, in load order (for tools and tests). */
+    pub fn loadedKeys(self, out : Vec<i64>) : void {
+        let mut pos : i32 = self.store.first();
+        while (pos >= 0) {
+            out.push(self.store.keyAt(pos));
+            pos = self.store.next(pos);
+        }
+    }
+}

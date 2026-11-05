@@ -1,0 +1,378 @@
+// world — the light engine of one voxel grid, and the read seam over it.
+//
+// `VoxLightWorld` owns the pieces (the grid and block table it was given, the flood, the surface shell and
+// the baker) and is what a mesher or a renderer talks to:
+//
+//   writing   `setBlock` (flood updated incrementally), `rebuildLight`, `bakeAll` / `bakeStale` / `bakeSlice`
+//   reading   `cellSample`, `cornerSample` (one corner of one face, the four-cell mean smooth lighting uses),
+//             `pointSample` (any world point, trilinear over the eight cells around it), `aoCorner`
+//
+// A read never lies about a cell the shell does not store: a cell outside the shell (or one whose term is
+// flagged stale) is baked on the spot with the same code and settings as the bulk bake, so the stored and the
+// live answer are the same bytes. `liveFallback` can turn that off for a mesher that prefers speed (such
+// cells then read as open). Cells in a chunk that does not exist read as open air.
+
+use crate::core::math::vec3::Vec3;
+use crate::voxel::light::bake::{VoxBakeSettings, VoxJobList, VoxLightBaker, VoxSkyBake, voxByte};
+use crate::voxel::light::block::BlockLightTable;
+use crate::voxel::light::curve::VoxLightCurve;
+use crate::voxel::light::dda::voxFloor;
+use crate::voxel::light::flood::VoxLightFlood;
+use crate::voxel::light::grid::{VoxelGrid, voxFaceSign};
+use crate::voxel::light::sample::{VoxelLightSample, VoxSampleMean, voxAo, voxUnit};
+use crate::voxel::light::surface::{VoxLightSurface, VOX_STALE_SUN, VOX_STALE_SKY};
+use crate::voxel::light::trace::VoxRayTracer;
+
+// A step of `k` cells along one world axis (the other two components are zero).
+struct VoxStep {
+    x : i32 = 0;
+    y : i32 = 0;
+    z : i32 = 0;
+}
+
+// The four cells a face corner reads: the one in front of the face, the two beside it, and the diagonal.
+struct VoxCornerCells {
+    fx : i32 = 0;
+    fy : i32 = 0;
+    fz : i32 = 0;
+    ax : i32 = 0;
+    ay : i32 = 0;
+    az : i32 = 0;
+    bx : i32 = 0;
+    by : i32 = 0;
+    bz : i32 = 0;
+}
+
+/** The lighting of a voxel grid. */
+pub class VoxLightWorld {
+    pub grid    : Shared<VoxelGrid>;
+    pub table   : Shared<BlockLightTable>;
+    pub curve   : Shared<VoxLightCurve>;
+    pub flood   : VoxLightFlood;
+    pub surface : Shared<VoxLightSurface>;
+    pub baker   : VoxLightBaker;
+    inline      : VoxRayTracer;
+    config      : VoxBakeSettings;
+    live        : bool = true;
+
+    /**
+     * The engine over `grid` and `table`, with block light falling off along `curve`, sky light losing
+     * `skyStep` levels per cell sideways, and `workers` threads for the bakes.
+     */
+    constructor(
+        own grid : Shared<VoxelGrid>,
+        own table : Shared<BlockLightTable>,
+        own curve : Shared<VoxLightCurve>,
+        skyStep : i32,
+        workers : i32
+    ) {
+        self.grid = grid;
+        self.table = table;
+        self.curve = curve;
+        self.flood = new VoxLightFlood(grid, table, curve, skyStep);
+        let surface : Shared<VoxLightSurface> = new shared VoxLightSurface();
+        self.surface = surface;
+        self.baker = new VoxLightBaker(grid, table, surface, workers);
+        self.inline = new VoxRayTracer();
+        self.config = VoxBakeSettings {};
+        self.baker.kernel.configure(self.config);
+    }
+
+    /** Stops the bake threads. */
+    pub fn close(mut self) : void {
+        self.baker.close();
+    }
+
+    /** The settings the bakes and the on-demand reads use. */
+    pub fn settings(self) : VoxBakeSettings {
+        return self.config;
+    }
+
+    /** Changes the settings; stored terms are stale until baked again (`bakeAll`). */
+    pub fn configure(mut self, s : VoxBakeSettings) : void {
+        self.config = s;
+        self.baker.kernel.configure(s);
+    }
+
+    /** True: cells the shell does not store are baked when read. False: they read as open. */
+    pub fn setLiveFallback(mut self, on : bool) : void {
+        self.live = on;
+    }
+
+    /** Sets a block; the flood is updated. Baked terms are not touched (see `bakeSlice`). */
+    pub fn setBlock(mut self, x : i32, y : i32, z : i32, id : i32) : void {
+        self.flood.setBlock(x, y, z, id);
+    }
+
+    /** Makes a cell a lamp of its own colour, strength (0..1023 per channel) and pass mask; see the flood. */
+    pub fn setEmitter(mut self, x : i32, y : i32, z : i32, r : i32, g : i32, b : i32, pass : i32) : void {
+        self.flood.setEmitter(x, y, z, r, g, b, pass);
+    }
+
+    /** Gives a cell back to its block's own emission. */
+    pub fn clearEmitter(mut self, x : i32, y : i32, z : i32) : void {
+        self.flood.clearEmitter(x, y, z);
+    }
+
+    /** Floods all light from scratch. */
+    pub fn rebuildLight(mut self) : void {
+        self.flood.rebuild();
+    }
+
+    /** Recomputes the shell, keeping baked terms of cells that stay in it. */
+    pub fn rebuildSurface(mut self) : void {
+        self.surface.rebuild(self.grid, self.table);
+    }
+
+    /** Rebuilds the shell and bakes sun, sky access and bounce for every cell of it. */
+    pub fn bakeAll(mut self, parallel : bool) : void {
+        self.rebuildSurface();
+        let n : i32 = self.surface.count();
+        let jobs : VoxJobList = self.baker.jobs();
+        jobs.ensure(n);
+        for (i of 0..n) {
+            jobs.set(i, i);
+        }
+        self.baker.bakeSun(self.config, n, parallel);
+        self.baker.bakeSky(self.config, n, parallel);
+    }
+
+    /** Bakes only the entries flagged stale (those that joined the shell since they were last baked). */
+    pub fn bakeStale(mut self, parallel : bool) : void {
+        let n : i32 = self.surface.count();
+        let jobs : VoxJobList = self.baker.jobs();
+        jobs.ensure(n);
+        let mut count : i32 = 0;
+        for (i of 0..n) {
+            if ((self.surface.stale(i) & VOX_STALE_SUN) != 0) {
+                jobs.set(count, i);
+                count = count + 1;
+            }
+        }
+        self.baker.bakeSun(self.config, count, parallel);
+        count = 0;
+        for (i of 0..n) {
+            if ((self.surface.stale(i) & VOX_STALE_SKY) != 0) {
+                jobs.set(count, i);
+                count = count + 1;
+            }
+        }
+        self.baker.bakeSky(self.config, count, parallel);
+    }
+
+    /**
+     * Re-bakes the sun term of `count` entries starting at `from` (wrapping past the end): the round-robin
+     * refresh that lets shadows glide as the sun turns. Returns the entry to continue from.
+     */
+    pub fn bakeSunSlice(mut self, from : i32, count : i32, parallel : bool) : i32 {
+        let n : i32 = self.surface.count();
+        if (n == 0) {
+            return 0;
+        }
+        let mut take : i32 = count;
+        if (take > n) {
+            take = n;
+        }
+        let jobs : VoxJobList = self.baker.jobs();
+        jobs.ensure(take);
+        for (i of 0..take) {
+            jobs.set(i, (from + i) % n);
+        }
+        self.baker.bakeSun(self.config, take, parallel);
+        return (from + take) % n;
+    }
+
+    /** The light of the cell (x, y, z). */
+    pub fn cellSample(self, x : i32, y : i32, z : i32) : VoxelLightSample {
+        let id : i32 = self.grid.cellId(x, y, z);
+        if (id < 0) {
+            return VoxelLightSample::open();
+        }
+        let block : i32 = self.grid.blockOfId(id);
+        if (self.table.isSolid(block)) {
+            return VoxelLightSample {
+                blockLight: Vec3::zero(),
+                skyLight: 0.0,
+                sunVisibility: 0.0,
+                skyAccess: 0.0,
+                bounceTint: Vec3 {
+                    x: voxUnit(self.table.albedoOf(block, 0)),
+                    y: voxUnit(self.table.albedoOf(block, 1)),
+                    z: voxUnit(self.table.albedoOf(block, 2)),
+                },
+            };
+        }
+        let mut s : VoxelLightSample = VoxelLightSample {
+            blockLight: Vec3 {
+                x: voxUnit(self.flood.blockLevel(id, 0)),
+                y: voxUnit(self.flood.blockLevel(id, 1)),
+                z: voxUnit(self.flood.blockLevel(id, 2)),
+            },
+            skyLight: voxUnit(self.flood.skyLevel(id)),
+        };
+        let ordinal : i32 = self.surface.ordinalOf(id);
+        let mut flags : i32 = VOX_STALE_SUN | VOX_STALE_SKY;
+        if (ordinal >= 0) {
+            flags = self.surface.stale(ordinal);
+        }
+        if ((flags & VOX_STALE_SUN) == 0) {
+            s.sunVisibility = voxUnit(self.surface.sun(ordinal));
+        } else if (self.live) {
+            s.sunVisibility = voxUnit(voxByte(self.baker.kernel.sunAt(self.inline, x, y, z)));
+        }
+        if ((flags & VOX_STALE_SKY) == 0) {
+            s.skyAccess = voxUnit(self.surface.access(ordinal));
+            s.bounceTint = Vec3 {
+                x: voxUnit(self.surface.tint(ordinal, 0)),
+                y: voxUnit(self.surface.tint(ordinal, 1)),
+                z: voxUnit(self.surface.tint(ordinal, 2)),
+            };
+        } else if (self.live) {
+            let b : VoxSkyBake = self.baker.kernel.skyAt(self.inline, x, y, z);
+            s.skyAccess = voxUnit(voxByte(b.access));
+            s.bounceTint = Vec3 {
+                x: voxUnit(voxByte(b.red)),
+                y: voxUnit(voxByte(b.green)),
+                z: voxUnit(voxByte(b.blue)),
+            };
+        }
+        return s;
+    }
+
+    fn solidAt(self, x : i32, y : i32, z : i32) : bool {
+        return self.table.isSolid(self.grid.blockAt(x, y, z));
+    }
+
+    // A step of `k` cells along axis `axis` (0 x, 1 y, 2 z).
+    static fn step(axis : i32, k : i32) : VoxStep {
+        let mut step : VoxStep = VoxStep {};
+        if (axis == 0) {
+            step.x = k;
+        }
+        if (axis == 1) {
+            step.y = k;
+        }
+        if (axis == 2) {
+            step.z = k;
+        }
+        return step;
+    }
+
+    // The cells a corner of a face reads. Bit 0 of `corner` picks the positive side along the face's first
+    // tangent, bit 1 along the second.
+    static fn cornerCells(x : i32, y : i32, z : i32, face : i32, corner : i32) : VoxCornerCells {
+        let axis : i32 = face >> 1;
+        let t1 : i32 = (axis + 1) % 3;
+        let t2 : i32 = (axis + 2) % 3;
+        let si : i32 = voxFaceSign(face);
+        let s1 : i32 = (corner & 1) * 2 - 1;
+        let s2 : i32 = ((corner >> 1) & 1) * 2 - 1;
+        let out : VoxStep = VoxLightWorld::step(axis, si);
+        let sideA : VoxStep = VoxLightWorld::step(t1, s1);
+        let sideB : VoxStep = VoxLightWorld::step(t2, s2);
+        return VoxCornerCells {
+            fx: x + out.x,
+            fy: y + out.y,
+            fz: z + out.z,
+            ax: sideA.x,
+            ay: sideA.y,
+            az: sideA.z,
+            bx: sideB.x,
+            by: sideB.y,
+            bz: sideB.z,
+        };
+    }
+
+    /**
+     * The light at corner `corner` (0..3: bit 0 picks the positive side along the face's first tangent axis,
+     * bit 1 along the second) of face `face` of the block at (x, y, z). It is the mean of the four cells that
+     * meet at that corner in front of the face; solid cells are left out, and the diagonal one too when both
+     * cells beside it are solid (that is how light is kept from leaking round a crease).
+     */
+    pub fn cornerSample(self, x : i32, y : i32, z : i32, face : i32, corner : i32) : VoxelLightSample {
+        let c : VoxCornerCells = VoxLightWorld::cornerCells(x, y, z, face, corner);
+        let ax : i32 = c.fx + c.ax;
+        let ay : i32 = c.fy + c.ay;
+        let az : i32 = c.fz + c.az;
+        let bx : i32 = c.fx + c.bx;
+        let by : i32 = c.fy + c.by;
+        let bz : i32 = c.fz + c.bz;
+        let dx : i32 = ax + c.bx;
+        let dy : i32 = ay + c.by;
+        let dz : i32 = az + c.bz;
+        let frontSolid : bool = self.solidAt(c.fx, c.fy, c.fz);
+        let sideASolid : bool = self.solidAt(ax, ay, az);
+        let sideBSolid : bool = self.solidAt(bx, by, bz);
+        let diagSolid : bool = self.solidAt(dx, dy, dz);
+        let mean : VoxSampleMean = new VoxSampleMean();
+        if (!frontSolid) {
+            mean.add(self.cellSample(c.fx, c.fy, c.fz), 1.0);
+        }
+        if (!sideASolid) {
+            mean.add(self.cellSample(ax, ay, az), 1.0);
+        }
+        if (!sideBSolid) {
+            mean.add(self.cellSample(bx, by, bz), 1.0);
+        }
+        if (!diagSolid && !(sideASolid && sideBSolid)) {
+            mean.add(self.cellSample(dx, dy, dz), 1.0);
+        }
+        return mean.result(self.cellSample(c.fx, c.fy, c.fz));
+    }
+
+    /** The darkening count 0..3 (see `voxAo`) of corner `corner` of face `face` of the block at (x, y, z). */
+    pub fn aoCorner(self, x : i32, y : i32, z : i32, face : i32, corner : i32) : i32 {
+        let c : VoxCornerCells = VoxLightWorld::cornerCells(x, y, z, face, corner);
+        let sideASolid : bool = self.solidAt(c.fx + c.ax, c.fy + c.ay, c.fz + c.az);
+        let sideBSolid : bool = self.solidAt(c.fx + c.bx, c.fy + c.by, c.fz + c.bz);
+        let diagSolid : bool = self.solidAt(
+            c.fx + c.ax + c.bx,
+            c.fy + c.ay + c.by,
+            c.fz + c.az + c.bz
+        );
+        return voxAo(sideASolid, sideBSolid, diagSolid);
+    }
+
+    /**
+     * The light at the world point (px, py, pz): the trilinear blend of the eight cells whose centres
+     * surround it, solid cells left out (the weights of the others are renormalised), so a point beside a wall
+     * is not darkened by the wall's own zero. Inside solid it reads as the cell itself.
+     */
+    pub fn pointSample(self, px : f64, py : f64, pz : f64) : VoxelLightSample {
+        let gx : f64 = px - 0.5;
+        let gy : f64 = py - 0.5;
+        let gz : f64 = pz - 0.5;
+        let ix : i32 = voxFloor(gx);
+        let iy : i32 = voxFloor(gy);
+        let iz : i32 = voxFloor(gz);
+        let tx : f64 = gx - ix as f64;
+        let ty : f64 = gy - iy as f64;
+        let tz : f64 = gz - iz as f64;
+        let mean : VoxSampleMean = new VoxSampleMean();
+        for (k of 0..8) {
+            let ox : i32 = k & 1;
+            let oy : i32 = (k >> 1) & 1;
+            let oz : i32 = (k >> 2) & 1;
+            let mut w : f64 = 1.0;
+            if (ox == 1) {
+                w = w * tx;
+            } else {
+                w = w * (1.0 - tx);
+            }
+            if (oy == 1) {
+                w = w * ty;
+            } else {
+                w = w * (1.0 - ty);
+            }
+            if (oz == 1) {
+                w = w * tz;
+            } else {
+                w = w * (1.0 - tz);
+            }
+            if (w > 0.0 && !self.solidAt(ix + ox, iy + oy, iz + oz)) {
+                mean.add(self.cellSample(ix + ox, iy + oy, iz + oz), w);
+            }
+        }
+        return mean.result(self.cellSample(voxFloor(px), voxFloor(py), voxFloor(pz)));
+    }
+}

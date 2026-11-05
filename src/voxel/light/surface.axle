@@ -1,0 +1,214 @@
+// surface — where the ray bakes keep their answers: only in the shell of cells next to blocks that stop light.
+//
+// A face corner reads the four cells in front of the face, and every one of those touches the face's block
+// (by a face or by a corner). So the baked terms (sun visibility, sky access, bounce tint) only need to
+// exist for *cells with a light-blocking block among their 26 neighbours*, about one cell in eighty of a
+// landscape. "Light-blocking" is any block that stops any of any channel, not only the fully opaque ones: a
+// tree's leaves, a pane of glass and the surface of a lake shade the cells beside them too, and a shell that
+// left those out would read the unbaked default (full sun, full sky) exactly where the shade is.
+// This table keeps exactly those, in cell-id order, five bytes each, plus one `i32` per grid cell that says
+// which entry a cell has (-1: none). Cells outside the shell are not stored; the reader bakes them on demand
+// (see world), so storing less never means answering wrong.
+//
+// Unlike voxel-axle's surface tables this one is never touched by two threads at once: the bake jobs write
+// disjoint entries of one flat array (job i writes entry i), the shell is rebuilt on the calling thread
+// between bakes, and nothing is published through atomics. That is what makes it testable: the parallel
+// result is byte-for-byte the serial one.
+//
+// An entry also carries two flags that say its sun term or sky term has not been baked since the cell
+// entered the shell, so an edit that grows the shell can bake exactly the new cells.
+
+use crate::core::collections::vec::Vec;
+use crate::voxel::light::block::BlockLightTable;
+use crate::voxel::light::grid::{VoxelGrid, VOX_CHUNK, VOX_CHUNK_CELLS};
+
+/** Flag: the entry's sun visibility was never baked. */
+pub const VOX_STALE_SUN : i32 = 1;
+
+/** Flag: the entry's sky access and bounce tint were never baked. */
+pub const VOX_STALE_SKY : i32 = 2;
+
+// An entry is five bytes: sun, access and the three tint channels.
+const VOX_SURFACE_STRIDE : i32 = 5;
+
+// A cell outside the shell that needs baking starts fully open and stale.
+const VOX_SURFACE_OPEN : i32 = 255;
+const VOX_STALE_BOTH : i32 = 3;
+
+// Clearing one stale flag leaves the other alone.
+const VOX_CLEAR_SUN : i32 = 254;
+const VOX_CLEAR_SKY : i32 = 253;
+
+// Bookkeeping bytes one shell entry is charged for: cell id, the five bytes, and the flag.
+const VOX_SURFACE_ENTRY_BYTES : i64 = 10;
+
+// Strides of the local index inside a chunk (x + z * 16 + y * 256).
+const VOX_LOCAL_Z : i32 = 16;
+const VOX_LOCAL_Y : i32 = 256;
+
+/** The shell of air cells at the surface, with the baked terms. */
+pub class VoxLightSurface {
+    index : i32[];
+    room  : i32 = 0;
+    cells : Vec<i32>;
+    data  : i8[];
+    flags : i8[];
+
+    /** An empty surface. */
+    constructor() {
+        self.index = malloc<i32>(1);
+        self.cells = new Vec<i32>();
+        self.data = malloc<i8>(1);
+        self.flags = malloc<i8>(1);
+    }
+
+    /** How many cells are in the shell. */
+    pub fn count(self) : i32 {
+        return self.cells.len();
+    }
+
+    /** The cell id of entry `ordinal`. */
+    pub fn cellAt(self, ordinal : i32) : i32 {
+        return self.cells.get(ordinal);
+    }
+
+    /** The entry of cell id `id`, or -1 when the cell is not in the shell. */
+    pub fn ordinalOf(self, id : i32) : i32 {
+        if (id < 0 || id >= self.room * VOX_CHUNK_CELLS) {
+            return -1;
+        }
+        return self.index[id];
+    }
+
+    /** Bytes of memory the table holds: the entries, the flags and the index. */
+    pub fn bytes(self) : i64 {
+        return self.cells.len() as i64 * VOX_SURFACE_ENTRY_BYTES
+            + self.room as i64 * VOX_CHUNK_CELLS as i64 * 4;
+    }
+
+    /** Sun visibility 0..255 of entry `ordinal`. */
+    pub fn sun(self, ordinal : i32) : i32 {
+        return self.data[ordinal as i64 * VOX_SURFACE_STRIDE] as i32 & 255;
+    }
+
+    /** Sky access 0..255 of entry `ordinal`. */
+    pub fn access(self, ordinal : i32) : i32 {
+        return self.data[ordinal as i64 * VOX_SURFACE_STRIDE + 1] as i32 & 255;
+    }
+
+    /** One channel (0 red, 1 green, 2 blue) of the bounce tint of entry `ordinal`, 0..255. */
+    pub fn tint(self, ordinal : i32, channel : i32) : i32 {
+        return self.data[ordinal as i64 * VOX_SURFACE_STRIDE + 2 + channel as i64] as i32 & 255;
+    }
+
+    /** The stale flags of entry `ordinal` (`VOX_STALE_SUN` | `VOX_STALE_SKY`). */
+    pub fn stale(self, ordinal : i32) : i32 {
+        return self.flags[ordinal as i64] as i32;
+    }
+
+    /** Stores a sun visibility and clears the entry's sun flag. */
+    pub fn setSun(mut self, ordinal : i32, sun : i32) : void {
+        self.data[ordinal as i64 * VOX_SURFACE_STRIDE] = sun as i8;
+        self.flags[ordinal as i64] = (self.flags[ordinal as i64] as i32 & VOX_CLEAR_SUN) as i8;
+    }
+
+    /** Stores a sky access and bounce tint and clears the entry's sky flag. */
+    pub fn setSky(mut self, ordinal : i32, access : i32, r : i32, g : i32, b : i32) : void {
+        let at : i64 = ordinal as i64 * VOX_SURFACE_STRIDE;
+        self.data[at + 1] = access as i8;
+        self.data[at + 2] = r as i8;
+        self.data[at + 3] = g as i8;
+        self.data[at + 4] = b as i8;
+        self.flags[ordinal as i64] = (self.flags[ordinal as i64] as i32 & VOX_CLEAR_SKY) as i8;
+    }
+
+    /** Copies the bytes of the baked terms, for comparing two bakes. */
+    pub fn bytesOf(self, ordinal : i32, k : i32) : i32 {
+        return self.data[ordinal as i64 * VOX_SURFACE_STRIDE + k as i64] as i32 & 255;
+    }
+
+    /**
+     * Recomputes which cells are in the shell after the blocks changed. Cells that stay keep their baked
+     * terms; cells that join start fully open and flagged stale.
+     */
+    pub fn rebuild(mut self, grid : Shared<VoxelGrid>, table : Shared<BlockLightTable>) : void {
+        let slots : i32 = grid.slotCount();
+        let total : i32 = slots * VOX_CHUNK_CELLS;
+        let mut mark : i8[] = malloc<i8>(total as i64 + 1);
+        for (i of 0..total as i64) {
+            mark[i] = 0;
+        }
+        for (slot of 0..slots) {
+            for (local of 0..VOX_CHUNK_CELLS) {
+                let id : i32 = slot * VOX_CHUNK_CELLS + local;
+                if (table.blocksLight(grid.blockOfId(id))) {
+                    VoxLightSurface::markAround(grid, mark, id);
+                }
+            }
+        }
+        let fresh : Vec<i32> = new Vec<i32>();
+        let mut index : i32[] = malloc<i32>(total as i64 + 1);
+        for (id of 0..total as i64) {
+            index[id] = -1;
+            if (mark[id] == 1 && !table.isSolid(grid.blockOfId(id as i32))) {
+                index[id] = fresh.len();
+                fresh.push(id as i32);
+            }
+        }
+        let n : i64 = fresh.len() as i64;
+        let mut data : i8[] = malloc<i8>(n * VOX_SURFACE_STRIDE as i64 + 1);
+        let mut flags : i8[] = malloc<i8>(n + 1);
+        for (k of 0..fresh.len()) {
+            let id : i32 = fresh.get(k);
+            let old : i32 = self.ordinalOf(id);
+            for (j of 0..VOX_SURFACE_STRIDE) {
+                data[k as i64 * VOX_SURFACE_STRIDE as i64 + j as i64] = VOX_SURFACE_OPEN as i8;
+            }
+            flags[k] = VOX_STALE_BOTH as i8;
+            if (old >= 0) {
+                for (j of 0..VOX_SURFACE_STRIDE) {
+                    data[k as i64 * VOX_SURFACE_STRIDE as i64 + j as i64] = self.data[old as i64
+                        * VOX_SURFACE_STRIDE as i64
+                        + j as i64];
+                }
+                flags[k] = self.flags[old as i64];
+            }
+        }
+        self.index = index;
+        self.room = slots;
+        self.cells = fresh;
+        self.data = data;
+        self.flags = flags;
+    }
+
+    // Marks the 26 cells around solid cell `id` (those that exist).
+    fn markAround(grid : Shared<VoxelGrid>, mark : i8[], id : i32) : void {
+        let local : i32 = id & (VOX_CHUNK_CELLS - 1);
+        let lx : i32 = local % VOX_CHUNK;
+        let lz : i32 = (local / VOX_CHUNK) % VOX_CHUNK;
+        let ly : i32 = local / VOX_LOCAL_Y;
+        let inside : bool = lx > 0 && lx < VOX_CHUNK - 1 && ly > 0 && ly < VOX_CHUNK - 1 && lz > 0
+            && lz < VOX_CHUNK - 1;
+        for (dz of -1..2) {
+            for (dy of -1..2) {
+                for (dx of -1..2) {
+                    if (dx == 0 && dy == 0 && dz == 0) {
+                        continue;
+                    }
+                    if (inside) {
+                        mark[(id + dx + dz * VOX_LOCAL_Z + dy * VOX_LOCAL_Y) as i64] = 1;
+                    } else {
+                        let other : i32 = grid.cellId(
+                            grid.cellX(id) + dx,
+                            grid.cellY(id) + dy,
+                            grid.cellZ(id) + dz
+                        );
+                        if (other >= 0) {
+                            mark[other as i64] = 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

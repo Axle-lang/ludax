@@ -1,0 +1,205 @@
+// bridge — the loaded window of the world, lit by the voxel light library.
+//
+// The light module works on a `VoxelGrid` it owns and never frees a chunk, so the bridge keeps one grid for a
+// *window*: the columns within `radius` chunks of a centre column, the whole height of the world. `rebuild`
+// copies the window's loaded chunks from the store into a fresh grid and floods all of it; from then on
+// `sync` feeds the world's journal of edits into the flood one by one (the library's incremental update, which
+// is exact: it equals a rebuild, see the light module's tests), so a torch placed or a roof broken re-floods only
+// what that edit can reach. When the centre moves far enough that it nears the window's edge, `recentre` builds
+// a new window around it. That rebuild is the cost of sliding: the library has no way to drop chunks from a
+// grid, so a slide starts a new one rather than shifting the old.
+//
+// A window that is only partly loaded lights what is loaded and treats the rest as void (open air, dark), so
+// `sync` also rebuilds when more of the window has arrived since the last build.
+
+use crate::voxel::light::block::BlockLightTable;
+use crate::voxel::light::curve::VoxLightCurve;
+use crate::voxel::light::grid::{VoxelGrid, VOX_CHUNK_CELLS};
+use crate::voxel::light::sample::VoxelLightSample;
+use crate::voxel::light::world::VoxLightWorld;
+use crate::voxel::world::blocks::{VoxBlocks, VW_AIR, VW_BLOCK_LIGHT_IDS};
+use crate::voxel::world::chunk::{VoxChunk, VW_CELLS};
+use crate::voxel::world::terrain::{VW_COLUMN_CHUNKS, VW_HEIGHT};
+use crate::voxel::world::world::VoxWorld;
+
+/** The light of a window of a world. */
+pub class VoxLightBridge {
+    radius  : i32;
+    workers : i32;
+    skyStep : i32;
+    centreX : i32 = 0;
+    centreZ : i32 = 0;
+    cursor  : i32 = 0;
+    loaded  : i32 = 0;
+    built   : bool = false;
+    lit     : VoxLightWorld;
+    builds  : i32 = 0;
+    edits   : i64 = 0;
+
+    /** A bridge whose window reaches `radius` chunks from its centre, baking on `workers` threads. */
+    constructor(radius : i32, skyStep : i32, workers : i32) {
+        self.radius = radius;
+        self.skyStep = skyStep;
+        self.workers = workers;
+        self.lit = VoxLightBridge::fresh(workers, skyStep);
+    }
+
+    fn fresh(workers : i32, skyStep : i32) : VoxLightWorld {
+        let grid : Shared<VoxelGrid> = new shared VoxelGrid();
+        let table : Shared<BlockLightTable> = new shared BlockLightTable(VW_BLOCK_LIGHT_IDS);
+        let stock : BlockLightTable = VoxBlocks::lightTable();
+        for (i of 0..VW_BLOCK_LIGHT_IDS) {
+            table.define(i, stock.get(i));
+        }
+        // The standard torch curve: half brightness at 2 cells, nothing from 32.
+        let curve : Shared<VoxLightCurve> = new shared VoxLightCurve(2.0, 32.0);
+        return new VoxLightWorld(grid, table, curve, skyStep, workers);
+    }
+
+    /** Stops the bake threads. */
+    pub fn close(mut self) : void {
+        self.lit.close();
+    }
+
+    /** The light engine over the current window; its grid is replaced by a rebuild, so do not hold it across one. */
+    pub fn light(self) : VoxLightWorld {
+        return self.lit;
+    }
+
+    /** How many times the whole window has been copied and flooded. */
+    pub fn rebuilds(self) : i32 {
+        return self.builds;
+    }
+
+    /** How many journal edits were fed to the incremental flood. */
+    pub fn editsApplied(self) : i64 {
+        return self.edits;
+    }
+
+    /** The chunk x of the window's centre column. */
+    pub fn centreChunkX(self) : i32 {
+        return self.centreX;
+    }
+
+    /** The chunk z of the window's centre column. */
+    pub fn centreChunkZ(self) : i32 {
+        return self.centreZ;
+    }
+
+    /** True when world cell (x, y, z) lies inside the window. */
+    pub fn covers(self, x : i32, y : i32, z : i32) : bool {
+        if (y < 0 || y >= VW_HEIGHT) {
+            return false;
+        }
+        let dx : i32 = (x >> 4) - self.centreX;
+        let dz : i32 = (z >> 4) - self.centreZ;
+        return dx >= 0 - self.radius && dx <= self.radius && dz >= 0 - self.radius && dz <= self.radius;
+    }
+
+    // How many chunks of the window the store has.
+    fn loadedInWindow(self, world : VoxWorld) : i32 {
+        let mut n : i32 = 0;
+        for (cz of (self.centreZ - self.radius)..(self.centreZ + self.radius + 1)) {
+            for (cx of (self.centreX - self.radius)..(self.centreX + self.radius + 1)) {
+                for (cy of 0..VW_COLUMN_CHUNKS) {
+                    if (world.isLoaded(cx, cy, cz)) {
+                        n = n + 1;
+                    }
+                }
+            }
+        }
+        return n;
+    }
+
+    /**
+     * Builds the window around chunk column (cx, cz) from the loaded chunks of `world` and floods it from
+     * scratch. Edits already in the journal are part of the blocks, so the cursor moves to the end.
+     */
+    pub fn rebuild(mut self, world : VoxWorld, cx : i32, cz : i32) : void {
+        self.lit.close();
+        self.lit = VoxLightBridge::fresh(self.workers, self.skyStep);
+        self.centreX = cx;
+        self.centreZ = cz;
+        let grid : Shared<VoxelGrid> = self.lit.grid;
+        let mut cells : i32[] = malloc<i32>(VW_CELLS as i64);
+        let mut count : i32 = 0;
+        for (wz of (cz - self.radius)..(cz + self.radius + 1)) {
+            for (wy of 0..VW_COLUMN_CHUNKS) {
+                for (wx of (cx - self.radius)..(cx + self.radius + 1)) {
+                    let slot : i32 = grid.ensureChunk(wx, wy, wz);
+                    if (world.isLoaded(wx, wy, wz)) {
+                        let chunk : VoxChunk = world.store.chunk(wx, wy, wz);
+                        count = count + 1;
+                        if (!(chunk.isUniform() && chunk.firstBlock() == VW_AIR)) {
+                            chunk.copyCells(cells);
+                            for (i of 0..VW_CELLS) {
+                                grid.setBlockOfId(slot * VOX_CHUNK_CELLS + i, cells[i as i64]);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        self.lit.rebuildLight();
+        self.cursor = world.journal.end();
+        self.loaded = count;
+        self.built = true;
+        self.builds = self.builds + 1;
+    }
+
+    /**
+     * Brings the light up to date with `world`: feeds every journal edit since the last call that falls inside
+     * the window to the incremental flood, and rebuilds when more of the window has been loaded in the meantime.
+     * Returns the number of edits applied incrementally (0 after a rebuild).
+     */
+    pub fn sync(mut self, world : VoxWorld) : i32 {
+        if (!self.built) {
+            self.rebuild(world, self.centreX, self.centreZ);
+            return 0;
+        }
+        if (self.loadedInWindow(world) != self.loaded) {
+            self.rebuild(world, self.centreX, self.centreZ);
+            return 0;
+        }
+        let end : i32 = world.journal.end();
+        let mut applied : i32 = 0;
+        for (n of self.cursor..end) {
+            let x : i32 = world.journal.xAt(n);
+            let y : i32 = world.journal.yAt(n);
+            let z : i32 = world.journal.zAt(n);
+            if (self.covers(x, y, z)) {
+                self.lit.setBlock(x, y, z, world.journal.nowAt(n));
+                applied = applied + 1;
+            }
+        }
+        self.cursor = end;
+        self.edits = self.edits + applied as i64;
+        return applied;
+    }
+
+    /**
+     * Moves the window to chunk column (cx, cz) when the focus has come within `slack` chunks of its edge (or
+     * left it); returns true when it did, which costs a rebuild. With `slack` equal to the radius the window
+     * recentres on every chunk step.
+     */
+    pub fn recentre(mut self, world : VoxWorld, cx : i32, cz : i32, slack : i32) : bool {
+        let dx : i32 = cx - self.centreX;
+        let dz : i32 = cz - self.centreZ;
+        let near : i32 = self.radius - slack;
+        if (self.built && dx <= near && dx >= 0 - near && dz <= near && dz >= 0 - near) {
+            return false;
+        }
+        self.rebuild(world, cx, cz);
+        return true;
+    }
+
+    /** Bakes sun, sky access and bounce for the whole window (see `VoxLightWorld::bakeAll`). */
+    pub fn bake(mut self, parallel : bool) : void {
+        self.lit.bakeAll(parallel);
+    }
+
+    /** The light of cell (x, y, z) of the window. */
+    pub fn sample(self, x : i32, y : i32, z : i32) : VoxelLightSample {
+        return self.lit.cellSample(x, y, z);
+    }
+}

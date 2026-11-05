@@ -1,0 +1,539 @@
+// terrain — the world generator: a seeded terrain that is a pure function of the cell.
+//
+// Height comes from three layers of fractal value noise (continents, hills, mountains), with rivers cut where a
+// fourth noise passes through its middle value and everything below sea level filled with water, so lakes and
+// seas fall out of the same field. Climate (temperature, humidity) picks a biome, the biome picks the surface
+// and the tree density, and 3D noise carves tunnels and caverns underneath.
+//
+// Chunks are generated independently and in any order, so nothing may depend on a neighbour having been
+// generated first. Terrain is a function of (x, y, z) alone. Trees are the one thing that crosses a chunk
+// border, and they are handled by *re-evaluating them in every chunk they touch*: the world is cut into 6 x 6
+// tree cells, each cell decides from a hash whether it holds a tree and where, and a chunk asks the cells
+// around it (a tree is at most 2 cells wide on each side of its trunk). The trees are applied in a fixed
+// order with fixed overwrite rules, so a cell that two chunks both see gets the same block in both.
+//
+// A `VoxTerrain` holds only its seed and sea level and is never written after construction, so any number of
+// threads may call `fillChunk` on it at once.
+
+use crate::voxel::world::blocks::{
+    VW_AIR, VW_STONE, VW_DIRT, VW_GRASS, VW_SAND, VW_WATER, VW_SNOW, VW_LOG, VW_LEAVES, VW_BEDROCK, VW_GRAVEL
+};
+use crate::voxel::world::chunk::{VoxChunk, VW_CELLS, VW_SIDE};
+use crate::voxel::world::noise::VoxNoise;
+
+/** Chunks stacked in a world column (the world is 128 blocks high). */
+pub const VW_COLUMN_CHUNKS : i32 = 8;
+
+/** The world's height in blocks. */
+pub const VW_HEIGHT : i32 = 128;
+
+// Ground heights.
+const TERRAIN_MIN_GROUND : i32 = 4;
+const TERRAIN_MAX_GROUND : i32 = 119;
+const TERRAIN_SOIL_DEPTH : i32 = 3;
+const TERRAIN_SNOW_LINE : i32 = 108;
+const TERRAIN_SHELL_TOP : i32 = 3;
+const TERRAIN_SHELL_BOTTOM : i32 = 5;
+
+// How fast each noise field varies, per block.
+const TERRAIN_CONTINENT_SCALE : f32 = 0.0032;
+const TERRAIN_HILL_SCALE : f32 = 0.017;
+const TERRAIN_MOUNTAIN_SCALE : f32 = 0.0045;
+const TERRAIN_RIVER_SCALE : f32 = 0.0042;
+const TERRAIN_CLIMATE_SCALE : f32 = 0.0021;
+const TERRAIN_CAVE_SCALE : f32 = 0.034;
+const TERRAIN_CAVE_Y_SCALE : f32 = 0.052;
+const TERRAIN_CAVERN_SCALE : f32 = 0.021;
+const TERRAIN_CAVERN_Y_SCALE : f32 = 0.033;
+
+// A shift that keeps the temperature and humidity fields from lining up.
+const TERRAIN_NOISE_OFFSET : f32 = 137.0;
+
+// The height model: a base, a continent scale, hills around the mean and mountains above a threshold.
+const TERRAIN_BASE_HEIGHT : f32 = 22.0;
+const TERRAIN_CONTINENT_HEIGHT : f32 = 46.0;
+const TERRAIN_HILL_HEIGHT : f32 = 36.0;
+const TERRAIN_MOUNTAIN_HEIGHT : f32 = 52.0;
+const TERRAIN_MOUNT_FROM : f32 = 0.54;
+const TERRAIN_MOUNT_TO : f32 = 0.74;
+
+// Rivers are cut where the river noise passes through its middle, and stop short of the mountains.
+const TERRAIN_RIVER_WIDTH : f32 = 0.02;
+const TERRAIN_RIVER_DEPTH : i32 = 3;
+const TERRAIN_TUNNEL_WIDTH : f32 = 0.016;
+const TERRAIN_CAVERN_LEVEL : f32 = 0.74;
+const TERRAIN_CAVERN_TOP : i32 = 44;
+
+// The biome limits, in blocks of height or in the climate fields' 0..1 range.
+const TERRAIN_MOUNTAIN_ABOVE : i32 = 96;
+const TERRAIN_BEACH_BAND : i32 = 2;
+const TERRAIN_COLD_BELOW : f32 = 0.42;
+const TERRAIN_HOT_ABOVE : f32 = 0.58;
+const TERRAIN_DRY_BELOW : f32 = 0.5;
+const TERRAIN_WET_ABOVE : f32 = 0.52;
+
+// Two constants the expressions below share.
+const TERRAIN_ZERO : f32 = 0.0;
+const TERRAIN_ONE : f32 = 1.0;
+const TERRAIN_HALF : f32 = 0.5;
+
+// Trees: one per TREE_CELL x TREE_CELL cell, no taller and no wider than these.
+const TREE_CELL : i32 = 6;
+const TREE_MAX_PERCENT : i32 = 46;
+const TREE_MAX_GROUND : i32 = 100;
+const TREE_MIN_TRUNK : i32 = 4;
+const TREE_TRUNK_VARY : i32 = 3;
+const TREE_CANOPY_DOWN : i32 = 2;
+const TREE_CANOPY_UP : i32 = 2;
+const TREE_CROWN_RADIUS : i32 = 2;
+const TREE_TOP_RADIUS : i32 = 1;
+const TREE_REACH : i32 = 2;
+const TREE_HASH_MASK : i32 = 255;
+
+// A byte of hash becomes a percentage: the 256 values spread over 0..99.
+const TREE_HASH_RANGE : i32 = 256;
+const TREE_PERCENT_SCALE : i32 = 100;
+const TREE_HASH_SHIFT : i32 = 8;
+const TREE_CHANCE_SHIFT : i32 = 16;
+const TREE_TRUNK_SHIFT : i32 = 6;
+
+// Gravel patches on the seabed: one cell in this many, hashed in cells this many blocks wide.
+const TERRAIN_GRAVEL_ONE_IN : i32 = 5;
+const TERRAIN_GRAVEL_SHIFT : i32 = 2;
+
+// Local index parts inside a chunk.
+const TERRAIN_COLUMN_SHIFT : i32 = 4;
+const TERRAIN_LAYER_SHIFT : i32 = 8;
+
+/** What a column of the world is: decides its surface blocks and what grows on it. */
+pub enum VoxBiome : i8 {
+    Ocean = 0,
+    Beach = 1,
+    Plains = 2,
+    Forest = 3,
+    Desert = 4,
+    Tundra = 5,
+    Mountain = 6,
+
+    /** Percent of 6 x 6 tree cells that hold a tree in this biome. */
+    pub fn treePercent(self) : i32 {
+        return match self {
+            VoxBiome::Forest => 46,
+            VoxBiome::Plains => 5,
+            VoxBiome::Tundra => 8,
+            VoxBiome::Mountain => 3,
+            _ => 0,
+        };
+    }
+
+    /** The biome with code `n` (Plains for a code out of range). */
+    pub static fn fromCode(n : i32) : VoxBiome {
+        return match n {
+            0 => VoxBiome::Ocean,
+            1 => VoxBiome::Beach,
+            3 => VoxBiome::Forest,
+            4 => VoxBiome::Desert,
+            5 => VoxBiome::Tundra,
+            6 => VoxBiome::Mountain,
+            _ => VoxBiome::Plains,
+        };
+    }
+
+    /** A short name for reports. */
+    pub fn label(self) : string {
+        return match self {
+            VoxBiome::Ocean => "ocean",
+            VoxBiome::Beach => "beach",
+            VoxBiome::Plains => "plains",
+            VoxBiome::Forest => "forest",
+            VoxBiome::Desert => "desert",
+            VoxBiome::Tundra => "tundra",
+            VoxBiome::Mountain => "mountain",
+        };
+    }
+}
+
+/** The ground at one (x, z): its height (the y of the topmost ground block) and biome. */
+pub struct VoxColumn {
+    /** The y of the highest ground block; water may stand above it. */
+    pub height : i32 = 0;
+
+    /** The biome of the column. */
+    pub biome : VoxBiome = VoxBiome::Plains;
+}
+
+// One tree as a chunk sees it.
+struct TreeSpec {
+    ox     : i32 = 0;
+    oz     : i32 = 0;
+    ground : i32 = 0;
+    trunk  : i32 = 0;
+    ok     : bool = false;
+}
+
+/** The seeded generator of the world. */
+pub class VoxTerrain {
+    seed : i32;
+    sea  : i32;
+
+    /** A generator for `seed` with the sea at height `seaLevel`. */
+    constructor(seed : i32, seaLevel : i32) {
+        self.seed = seed;
+        self.sea = seaLevel;
+    }
+
+    /** The seed. */
+    pub fn seedOf(self) : i32 {
+        return self.seed;
+    }
+
+    /** The y of the water surface. */
+    pub fn seaLevel(self) : i32 {
+        return self.sea;
+    }
+
+    /** The ground height and biome at world column (x, z). */
+    pub fn column(self, x : i32, z : i32) : VoxColumn {
+        let fx : f32 = x as f32;
+        let fz : f32 = z as f32;
+        let c : f32 = VoxNoise::fbm2(
+            fx * TERRAIN_CONTINENT_SCALE,
+            fz * TERRAIN_CONTINENT_SCALE,
+            4,
+            self.seed
+        );
+        let hill : f32 = VoxNoise::fbm2(fx * TERRAIN_HILL_SCALE, fz * TERRAIN_HILL_SCALE, 4, self.seed + 1);
+        let m : f32 = VoxNoise::fbm2(
+            fx * TERRAIN_MOUNTAIN_SCALE,
+            fz * TERRAIN_MOUNTAIN_SCALE,
+            3,
+            self.seed + 2
+        );
+        let mount : f32 = VoxNoise::ramp(TERRAIN_MOUNT_FROM, TERRAIN_MOUNT_TO, m);
+        let mut hgt : f32 = TERRAIN_BASE_HEIGHT + c * TERRAIN_CONTINENT_HEIGHT
+            + (hill - TERRAIN_HALF) * TERRAIN_HILL_HEIGHT
+            + mount * TERRAIN_MOUNTAIN_HEIGHT;
+        let mut river : f32 = VoxNoise::fbm2(
+            fx * TERRAIN_RIVER_SCALE,
+            fz * TERRAIN_RIVER_SCALE,
+            3,
+            self.seed + 5
+        )
+            - TERRAIN_HALF;
+        if (river < TERRAIN_ZERO) {
+            river = TERRAIN_ZERO - river;
+        }
+        if (river < TERRAIN_RIVER_WIDTH && mount < TERRAIN_HALF) {
+            let t : f32 = VoxNoise::ramp(
+                TERRAIN_ZERO,
+                TERRAIN_ONE,
+                TERRAIN_ONE - river / TERRAIN_RIVER_WIDTH
+            );
+            let target : f32 = (self.sea - TERRAIN_RIVER_DEPTH) as f32;
+            if (hgt > target) {
+                hgt = hgt - (hgt - target) * t;
+            }
+        }
+        let mut h : i32 = hgt as i32;
+        if (h < TERRAIN_MIN_GROUND) {
+            h = TERRAIN_MIN_GROUND;
+        }
+        if (h > TERRAIN_MAX_GROUND) {
+            h = TERRAIN_MAX_GROUND;
+        }
+        let temp : f32 = VoxNoise::fbm2(
+            fx * TERRAIN_CLIMATE_SCALE + TERRAIN_NOISE_OFFSET,
+            fz * TERRAIN_CLIMATE_SCALE,
+            3,
+            self.seed + 11
+        );
+        let humid : f32 = VoxNoise::fbm2(
+            fx * TERRAIN_CLIMATE_SCALE,
+            fz * TERRAIN_CLIMATE_SCALE + TERRAIN_NOISE_OFFSET,
+            3,
+            self.seed + 12
+        );
+        let mut biome : VoxBiome = VoxBiome::Plains;
+        if (h <= self.sea) {
+            biome = VoxBiome::Ocean;
+        } else if (h >= TERRAIN_MOUNTAIN_ABOVE) {
+            biome = VoxBiome::Mountain;
+        } else if (h <= self.sea + TERRAIN_BEACH_BAND) {
+            biome = VoxBiome::Beach;
+        } else if (temp < TERRAIN_COLD_BELOW) {
+            biome = VoxBiome::Tundra;
+        } else if (temp > TERRAIN_HOT_ABOVE && humid < TERRAIN_DRY_BELOW) {
+            biome = VoxBiome::Desert;
+        } else if (humid > TERRAIN_WET_ABOVE) {
+            biome = VoxBiome::Forest;
+        }
+        return VoxColumn {
+            height: h,
+            biome: biome,
+        };
+    }
+
+    /** The ground height at world column (x, z). */
+    pub fn heightAt(self, x : i32, z : i32) : i32 {
+        return self.column(x, z).height;
+    }
+
+    /** The biome at world column (x, z). */
+    pub fn biomeAt(self, x : i32, z : i32) : VoxBiome {
+        return self.column(x, z).biome;
+    }
+
+    // True when (x, y, z) is hollowed out by a tunnel or a cavern.
+    fn hollow(self, x : i32, y : i32, z : i32) : bool {
+        let fx : f32 = x as f32;
+        let fy : f32 = y as f32;
+        let fz : f32 = z as f32;
+        if (y < TERRAIN_CAVERN_TOP) {
+            let big : f32 = VoxNoise::value3(
+                fx * TERRAIN_CAVERN_SCALE,
+                fy * TERRAIN_CAVERN_Y_SCALE,
+                fz * TERRAIN_CAVERN_SCALE,
+                self.seed + 42
+            );
+            if (big > TERRAIN_CAVERN_LEVEL) {
+                return true;
+            }
+        }
+        let a : f32 = VoxNoise::value3(
+            fx * TERRAIN_CAVE_SCALE,
+            fy * TERRAIN_CAVE_Y_SCALE,
+            fz * TERRAIN_CAVE_SCALE,
+            self.seed + 40
+        )
+            - TERRAIN_HALF;
+        if (a > TERRAIN_TUNNEL_WIDTH || a < TERRAIN_ZERO - TERRAIN_TUNNEL_WIDTH) {
+            return false;
+        }
+        let b : f32 = VoxNoise::value3(
+            fx * TERRAIN_CAVE_SCALE + TERRAIN_NOISE_OFFSET,
+            fy * TERRAIN_CAVE_Y_SCALE,
+            fz * TERRAIN_CAVE_SCALE,
+            self.seed + 41
+        )
+            - TERRAIN_HALF;
+        return b <= TERRAIN_TUNNEL_WIDTH && b >= TERRAIN_ZERO - TERRAIN_TUNNEL_WIDTH;
+    }
+
+    // The ground block at height `y` of a column of this biome and height.
+    fn groundBlock(self, biome : VoxBiome, h : i32, y : i32, x : i32, z : i32) : i32 {
+        if (y == 0) {
+            return VW_BEDROCK;
+        }
+        let depth : i32 = h - y;
+        if (depth > TERRAIN_SOIL_DEPTH) {
+            return VW_STONE;
+        }
+        return match biome {
+            VoxBiome::Ocean => self.seabed(x, y, z, depth),
+            VoxBiome::Beach => VW_SAND,
+            VoxBiome::Desert => VW_SAND,
+            VoxBiome::Mountain => self.rockTop(h, depth),
+            VoxBiome::Tundra => self.coldTop(depth),
+            _ => self.grassTop(depth),
+        };
+    }
+
+    fn seabed(self, x : i32, y : i32, z : i32, depth : i32) : i32 {
+        if (VoxNoise::hash(x >> TERRAIN_GRAVEL_SHIFT, y, z >> TERRAIN_GRAVEL_SHIFT, self.seed + 60)
+            % TERRAIN_GRAVEL_ONE_IN
+            == 0) {
+            return VW_GRAVEL;
+        }
+        return VW_SAND;
+    }
+
+    fn rockTop(self, h : i32, depth : i32) : i32 {
+        if (depth == 0 && h >= TERRAIN_SNOW_LINE) {
+            return VW_SNOW;
+        }
+        return VW_STONE;
+    }
+
+    fn coldTop(self, depth : i32) : i32 {
+        if (depth == 0) {
+            return VW_SNOW;
+        }
+        return VW_DIRT;
+    }
+
+    fn grassTop(self, depth : i32) : i32 {
+        if (depth == 0) {
+            return VW_GRASS;
+        }
+        return VW_DIRT;
+    }
+
+    // Rounds a division toward minus infinity.
+    fn floorDiv(a : i32, b : i32) : i32 {
+        if (a >= 0) {
+            return a / b;
+        }
+        return 0 - ((0 - a + b - 1) / b);
+    }
+
+    // The tree of tree cell (gx, gz), if the cell has one.
+    fn treeOf(self, gx : i32, gz : i32) : TreeSpec {
+        let h : i32 = VoxNoise::hash(gx, gz, 0, self.seed + 100);
+        let chance : i32 = ((h >> TREE_CHANCE_SHIFT) & TREE_HASH_MASK) * TREE_PERCENT_SCALE / TREE_HASH_RANGE;
+        if (chance >= TREE_MAX_PERCENT) {
+            return TreeSpec {};
+        }
+        let ox : i32 = gx * TREE_CELL + (h & TREE_HASH_MASK) % TREE_CELL;
+        let oz : i32 = gz * TREE_CELL + ((h >> TREE_HASH_SHIFT) & TREE_HASH_MASK) % TREE_CELL;
+        let col : VoxColumn = self.column(ox, oz);
+        let biome : VoxBiome = col.biome;
+        if (chance >= biome.treePercent() || col.height <= self.sea || col.height > TREE_MAX_GROUND) {
+            return TreeSpec {};
+        }
+        let h2 : i32 = VoxNoise::hash(gx, gz, 1, self.seed + 101);
+        return TreeSpec {
+            ox: ox,
+            oz: oz,
+            ground: col.height,
+            trunk: TREE_MIN_TRUNK + (h2 >> TREE_TRUNK_SHIFT) % TREE_TRUNK_VARY,
+            ok: true,
+        };
+    }
+
+    // Writes one tree into `cells` where it overlaps the chunk whose origin is (x0, y0, z0).
+    fn plant(self, t : TreeSpec, cells : i32[], x0 : i32, y0 : i32, z0 : i32) : void {
+        for (k of 1..(t.trunk + 1)) {
+            VoxTerrain::putCell(cells, x0, y0, z0, t.ox, t.ground + k, t.oz, VW_LOG, true);
+        }
+        for (dy of (t.trunk - TREE_CANOPY_DOWN)..(t.trunk + TREE_CANOPY_UP)) {
+            let mut r : i32 = TREE_CROWN_RADIUS;
+            if (dy > t.trunk) {
+                r = TREE_TOP_RADIUS;
+            }
+            for (dz of (0 - r)..(r + 1)) {
+                for (dx of (0 - r)..(r + 1)) {
+                    let trunkCell : bool = dx == 0 && dz == 0 && dy <= t.trunk;
+                    let mut corner : bool = false;
+                    if (r == TREE_CROWN_RADIUS && (dx == r || dx == 0 - r) && (dz == r || dz == 0 - r)) {
+                        corner = (VoxNoise::hash(t.ox + dx, t.ground + dy, t.oz + dz, self.seed + 102) & 1)
+                            == 0;
+                    }
+                    if (!trunkCell && !corner) {
+                        VoxTerrain::putCell(
+                            cells,
+                            x0,
+                            y0,
+                            z0,
+                            t.ox + dx,
+                            t.ground + dy,
+                            t.oz + dz,
+                            VW_LEAVES,
+                            false
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // Sets world cell (wx, wy, wz) when it lies in the chunk at (x0, y0, z0): a trunk may replace leaves, leaves only air.
+    fn putCell(
+        mut cells : i32[],
+        x0 : i32,
+        y0 : i32,
+        z0 : i32,
+        wx : i32,
+        wy : i32,
+        wz : i32,
+        id : i32,
+        strong : bool
+    ) : void {
+        let lx : i32 = wx - x0;
+        let ly : i32 = wy - y0;
+        let lz : i32 = wz - z0;
+        if (lx < 0 || lx > 15 || ly < 0 || ly > 15 || lz < 0 || lz > 15) {
+            return;
+        }
+        let at : i64 = ((ly << 8) | (lz << 4) | lx) as i64;
+        let old : i32 = cells[at];
+        if (old == VW_AIR || (strong && old == VW_LEAVES)) {
+            cells[at] = id;
+        }
+    }
+
+    /**
+     * Generates the blocks of chunk (cx, cy, cz) into `chunk`, replacing what it held. The same seed and
+     * coordinates always give the same blocks, whatever else has been generated before. The chunk comes out
+     * clean (not edited).
+     */
+    pub fn fillChunk(self, chunk : VoxChunk, cx : i32, cy : i32, cz : i32) : void {
+        let x0 : i32 = cx * VW_SIDE;
+        let y0 : i32 = cy * VW_SIDE;
+        let z0 : i32 = cz * VW_SIDE;
+        let mut heights : i32[] = malloc<i32>((VW_SIDE * VW_SIDE) as i64);
+        let mut biomes : i32[] = malloc<i32>((VW_SIDE * VW_SIDE) as i64);
+        let mut maxH : i32 = 0;
+        for (i of 0..VW_SIDE * VW_SIDE) {
+            let col : VoxColumn = self.column(x0 + (i & (VW_SIDE - 1)), z0 + (i >> TERRAIN_COLUMN_SHIFT));
+            heights[i as i64] = col.height;
+            biomes[i as i64] = col.biome as i32;
+            if (col.height > maxH) {
+                maxH = col.height;
+            }
+        }
+        // Trees of the tree cells around the chunk, in a fixed order.
+        let gxLo : i32 = VoxTerrain::floorDiv(x0 - TREE_REACH, TREE_CELL);
+        let gxHi : i32 = VoxTerrain::floorDiv(x0 + VW_SIDE + 1, TREE_CELL);
+        let gzLo : i32 = VoxTerrain::floorDiv(z0 - TREE_REACH, TREE_CELL);
+        let gzHi : i32 = VoxTerrain::floorDiv(z0 + VW_SIDE + 1, TREE_CELL);
+        let mut trees : TreeSpec[] = malloc<TreeSpec>(((gxHi - gxLo + 1) * (gzHi - gzLo + 1)) as i64);
+        let mut treeCount : i32 = 0;
+        let mut treeTop : i32 = 0;
+        for (gz of gzLo..(gzHi + 1)) {
+            for (gx of gxLo..(gxHi + 1)) {
+                let t : TreeSpec = self.treeOf(gx, gz);
+                if (t.ok && t.ground + t.trunk + TREE_CANOPY_UP >= y0 && t.ground < y0 + VW_SIDE) {
+                    trees[treeCount as i64] = t;
+                    treeCount = treeCount + 1;
+                    if (t.ground + t.trunk + TREE_CANOPY_UP > treeTop) {
+                        treeTop = t.ground + t.trunk + TREE_CANOPY_UP;
+                    }
+                }
+            }
+        }
+        let mut surface : i32 = maxH;
+        if (self.sea > surface) {
+            surface = self.sea;
+        }
+        if (y0 > surface && y0 > treeTop) {
+            chunk.fillUniform(VW_AIR);
+            chunk.setEdited(false);
+            return;
+        }
+        let mut cells : i32[] = malloc<i32>(VW_CELLS as i64);
+        for (i of 0..VW_SIDE * VW_SIDE) {
+            let h : i32 = heights[i as i64];
+            let biome : VoxBiome = VoxBiome::fromCode(biomes[i as i64]);
+            let x : i32 = x0 + (i & (VW_SIDE - 1));
+            let z : i32 = z0 + (i >> TERRAIN_COLUMN_SHIFT);
+            for (ly of 0..VW_SIDE) {
+                let y : i32 = y0 + ly;
+                let mut id : i32 = VW_AIR;
+                if (y <= h) {
+                    id = self.groundBlock(biome, h, y, x, z);
+                    if (y >= TERRAIN_SHELL_TOP && y <= h - TERRAIN_SHELL_BOTTOM && self.hollow(x, y, z)) {
+                        id = VW_AIR;
+                    }
+                } else if (y <= self.sea) {
+                    id = VW_WATER;
+                }
+                cells[((ly << TERRAIN_LAYER_SHIFT) | i) as i64] = id;
+            }
+        }
+        for (k of 0..treeCount) {
+            self.plant(trees[k as i64], cells, x0, y0, z0);
+        }
+        chunk.fromCells(cells);
+        chunk.setEdited(false);
+    }
+}

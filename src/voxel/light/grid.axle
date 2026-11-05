@@ -1,0 +1,311 @@
+// grid — a minimal chunked voxel grid: 16x16x16 chunks of block ids, found by chunk coordinate.
+//
+// The light engine needs a world to look at, not a world engine, so this is the least that is honest: chunks
+// live in a `Map` from chunk coordinate to a slot, a slot owns 4096 consecutive cells of one big array, and a
+// cell is named either by its world coordinate (x, y, z) or by its *cell id* `slot * 4096 + local`, where
+// `local = y * 256 + z * 16 + x`. The flood works on cell ids and never on coordinates; each slot also keeps
+// the six neighbouring slots, so a step to a neighbour is arithmetic, not a hash lookup.
+//
+// A chunk that was never created is void: it reads as air, holds no light, and a ray crosses it freely.
+// Face numbering is used everywhere in the module: 0 +x, 1 -x, 2 +y, 3 -y, 4 +z, 5 -z (so `face ^ 1` is the
+// opposite face and `face >> 1` the axis).
+
+use std::ffi::runtime::panicMsg;
+
+use crate::core::collections::map::Map;
+
+/** Cells along one side of a chunk. */
+pub const VOX_CHUNK : i32 = 16;
+
+/** Cells in a chunk. */
+pub const VOX_CHUNK_CELLS : i32 = 4096;
+
+// A chunk side is 16, so a world coordinate splits into a chunk index and an offset with four bits.
+const VOX_CHUNK_SHIFT : i32 = 4;
+
+// A cell id is a slot in its high bits and a local index in its low ones.
+const VOX_SLOT_SHIFT : i32 = 12;
+const VOX_LOCAL_MASK : i32 = 4095;
+
+// Chunk keys pack three 21-bit coordinates.
+const VOX_KEY_BITS : i32 = 21;
+const VOX_KEY_MASK : i64 = 2097151;
+
+/** The chunk coordinate containing the world coordinate `v` (rounds toward minus infinity). */
+pub fn voxChunkOf(v : i32) : i32 {
+    return v >> VOX_CHUNK_SHIFT;
+}
+
+/** The position of world coordinate `v` inside its chunk, 0..15. */
+pub fn voxLocalOf(v : i32) : i32 {
+    return v & (VOX_CHUNK - 1);
+}
+
+/** The step along axis `face >> 1` that face `face` points in: +1 or -1. */
+pub fn voxFaceSign(face : i32) : i32 {
+    if ((face & 1) == 0) {
+        return 1;
+    }
+    return -1;
+}
+
+// How far left the local index is shifted to read the coordinate along an axis: x is the low bits,
+// then z, then y.
+fn voxAxisShift(axis : i32) : i32 {
+    if (axis == 0) {
+        return 0;
+    }
+    if (axis == 1) {
+        return 2 * VOX_CHUNK_SHIFT;
+    }
+    return VOX_CHUNK_SHIFT;
+}
+
+// One 64-bit key for a chunk coordinate; 21 bits each cover +-1M chunks.
+fn voxChunkKey(cx : i32, cy : i32, cz : i32) : i64 {
+    return (cx as i64 & VOX_KEY_MASK) | ((cy as i64 & VOX_KEY_MASK) << VOX_KEY_BITS)
+        | ((cz as i64 & VOX_KEY_MASK) << (2 * VOX_KEY_BITS));
+}
+
+/** Chunks of block ids, addressed by world cell or by cell id. */
+pub class VoxelGrid {
+    index  : Map<i64, i32>;
+    blocks : i32[];
+    nbr    : i32[];
+    coords : i32[];
+    used   : i32 = 0;
+    room   : i32 = 8;
+    lowC   : i32[];
+    highC  : i32[];
+
+    /** An empty grid. */
+    constructor() {
+        self.index = new Map<i64, i32>();
+        self.blocks = malloc<i32>(self.room as i64 * VOX_CHUNK_CELLS as i64);
+        self.nbr = malloc<i32>(self.room as i64 * 6);
+        self.coords = malloc<i32>(self.room as i64 * 3);
+        self.lowC = malloc<i32>(3);
+        self.highC = malloc<i32>(3);
+        for (a of 0..3) {
+            self.lowC[a] = 0;
+            self.highC[a] = -1;
+        }
+    }
+
+    /** How many chunks exist; slots are numbered 0 up to this. */
+    pub fn slotCount(self) : i32 {
+        return self.used;
+    }
+
+    /** The slot of chunk (cx, cy, cz), or -1 when it does not exist. */
+    pub fn slotOf(self, cx : i32, cy : i32, cz : i32) : i32 {
+        return self.index.getOr(voxChunkKey(cx, cy, cz), -1);
+    }
+
+    /** The chunk coordinate of slot `slot` along `axis` (0 x, 1 y, 2 z). */
+    pub fn chunkCoord(self, slot : i32, axis : i32) : i32 {
+        return self.coords[slot as i64 * 3 + axis as i64];
+    }
+
+    /** The slot of chunk (cx, cy, cz), creating an empty (all air) chunk when it is missing. */
+    pub fn ensureChunk(mut self, cx : i32, cy : i32, cz : i32) : i32 {
+        let found : i32 = self.slotOf(cx, cy, cz);
+        if (found >= 0) {
+            return found;
+        }
+        if (self.used == self.room) {
+            self.grow();
+        }
+        let slot : i32 = self.used;
+        self.used = self.used + 1;
+        self.index.put(voxChunkKey(cx, cy, cz), slot);
+        self.coords[slot as i64 * 3] = cx;
+        self.coords[slot as i64 * 3 + 1] = cy;
+        self.coords[slot as i64 * 3 + 2] = cz;
+        let base : i64 = slot as i64 * VOX_CHUNK_CELLS as i64;
+        for (i of 0..VOX_CHUNK_CELLS) {
+            self.blocks[base + i as i64] = 0;
+        }
+        for (f of 0..6) {
+            self.nbr[slot as i64 * 6 + f as i64] = -1;
+        }
+        self.linkNeighbours(slot, cx, cy, cz);
+        self.widen(cx, cy, cz);
+        return slot;
+    }
+
+    /** Sets the block at world cell (x, y, z), creating its chunk if needed. */
+    pub fn setBlock(mut self, x : i32, y : i32, z : i32, id : i32) : void {
+        let slot : i32 = self.ensureChunk(voxChunkOf(x), voxChunkOf(y), voxChunkOf(z));
+        self.blocks[slot as i64 * VOX_CHUNK_CELLS as i64 + voxLocal(x, y, z) as i64] = id;
+    }
+
+    /** The block at world cell (x, y, z); 0 (air) where no chunk exists. */
+    pub fn blockAt(self, x : i32, y : i32, z : i32) : i32 {
+        let id : i32 = self.cellId(x, y, z);
+        if (id < 0) {
+            return 0;
+        }
+        return self.blocks[id as i64];
+    }
+
+    /** The block of cell id `id`. */
+    pub fn blockOfId(self, id : i32) : i32 {
+        return self.blocks[id as i64];
+    }
+
+    /** Sets the block of cell id `id` directly. */
+    pub fn setBlockOfId(mut self, id : i32, block : i32) : void {
+        self.blocks[id as i64] = block;
+    }
+
+    /** The cell id of world cell (x, y, z), or -1 when its chunk does not exist. */
+    pub fn cellId(self, x : i32, y : i32, z : i32) : i32 {
+        let slot : i32 = self.slotOf(voxChunkOf(x), voxChunkOf(y), voxChunkOf(z));
+        if (slot < 0) {
+            return -1;
+        }
+        return slot * VOX_CHUNK_CELLS + voxLocal(x, y, z);
+    }
+
+    /** The world x of cell id `id`. */
+    pub fn cellX(self, id : i32) : i32 {
+        return self.chunkCoord(id >> VOX_SLOT_SHIFT, 0) * VOX_CHUNK + (id & (VOX_CHUNK - 1));
+    }
+
+    /** The world y of cell id `id`. */
+    pub fn cellY(self, id : i32) : i32 {
+        return self.chunkCoord(id >> VOX_SLOT_SHIFT, 1) * VOX_CHUNK
+            + ((id >> (2 * VOX_CHUNK_SHIFT)) & (VOX_CHUNK - 1));
+    }
+
+    /** The world z of cell id `id`. */
+    pub fn cellZ(self, id : i32) : i32 {
+        return self.chunkCoord(id >> VOX_SLOT_SHIFT, 2) * VOX_CHUNK
+            + ((id >> VOX_CHUNK_SHIFT) & (VOX_CHUNK - 1));
+    }
+
+    /** The cell id across face `face` of cell id `id`, or -1 when that cell lies in a chunk that does not exist. */
+    pub fn neighbour(self, id : i32, face : i32) : i32 {
+        let slot : i32 = id >> VOX_SLOT_SHIFT;
+        let local : i32 = id & VOX_LOCAL_MASK;
+        let axis : i32 = face >> 1;
+        let shift : i32 = voxAxisShift(axis);
+        let sign : i32 = voxFaceSign(face);
+        let here : i32 = (local >> shift) & (VOX_CHUNK - 1);
+        let there : i32 = here + sign;
+        if (there >= 0 && there < VOX_CHUNK) {
+            return id + sign * (1 << shift);
+        }
+        let other : i32 = self.nbr[slot as i64 * 6 + face as i64];
+        if (other < 0) {
+            return -1;
+        }
+        return other * VOX_CHUNK_CELLS + local - sign * (VOX_CHUNK - 1) * (1 << shift);
+    }
+
+    /** The lowest world coordinate along `axis` that a chunk covers; 0 when the grid is empty. */
+    pub fn lowCell(self, axis : i32) : i32 {
+        return self.lowC[axis] * VOX_CHUNK;
+    }
+
+    /** One past the highest world coordinate along `axis` that a chunk covers (equals `lowCell` when empty). */
+    pub fn highCell(self, axis : i32) : i32 {
+        return (self.highC[axis] + 1) * VOX_CHUNK;
+    }
+
+    /** The highest chunk coordinate along `axis`. */
+    pub fn highChunk(self, axis : i32) : i32 {
+        return self.highC[axis];
+    }
+
+    /** The lowest chunk coordinate along `axis`. */
+    pub fn lowChunk(self, axis : i32) : i32 {
+        return self.lowC[axis];
+    }
+
+    /** True when world cell (x, y, z) lies inside the box spanned by all chunks (whether or not its own exists). */
+    pub fn inBounds(self, x : i32, y : i32, z : i32) : bool {
+        let insideX : bool = x >= self.lowCell(0) && x < self.highCell(0);
+        let insideY : bool = y >= self.lowCell(1) && y < self.highCell(1);
+        let insideZ : bool = z >= self.lowCell(2) && z < self.highCell(2);
+        return insideX && insideY && insideZ;
+    }
+
+    // Records the new chunk in its neighbours and theirs in it.
+    fn linkNeighbours(mut self, slot : i32, cx : i32, cy : i32, cz : i32) : void {
+        for (f of 0..6) {
+            let axis : i32 = f >> 1;
+            let sign : i32 = voxFaceSign(f);
+            let mut nx : i32 = cx;
+            let mut ny : i32 = cy;
+            let mut nz : i32 = cz;
+            if (axis == 0) {
+                nx = nx + sign;
+            }
+            if (axis == 1) {
+                ny = ny + sign;
+            }
+            if (axis == 2) {
+                nz = nz + sign;
+            }
+            let other : i32 = self.slotOf(nx, ny, nz);
+            if (other >= 0) {
+                self.nbr[slot as i64 * 6 + f as i64] = other;
+                self.nbr[other as i64 * 6 + (f ^ 1) as i64] = slot;
+            }
+        }
+    }
+
+    // Widens the chunk bounding box to include (cx, cy, cz).
+    fn widen(mut self, cx : i32, cy : i32, cz : i32) : void {
+        if (self.used == 1) {
+            self.lowC[0] = cx;
+            self.lowC[1] = cy;
+            self.lowC[2] = cz;
+            self.highC[0] = cx;
+            self.highC[1] = cy;
+            self.highC[2] = cz;
+            return;
+        }
+        self.widenAxis(0, cx);
+        self.widenAxis(1, cy);
+        self.widenAxis(2, cz);
+    }
+
+    fn widenAxis(mut self, axis : i32, c : i32) : void {
+        if (c < self.lowC[axis]) {
+            self.lowC[axis] = c;
+        }
+        if (c > self.highC[axis]) {
+            self.highC[axis] = c;
+        }
+    }
+
+    // Doubles the slot arrays.
+    fn grow(mut self) : void {
+        let bigger : i32 = self.room * 2;
+        let mut blocks : i32[] = malloc<i32>(bigger as i64 * VOX_CHUNK_CELLS as i64);
+        let mut nbr : i32[] = malloc<i32>(bigger as i64 * 6);
+        let mut coords : i32[] = malloc<i32>(bigger as i64 * 3);
+        for (i of 0..self.used as i64 * VOX_CHUNK_CELLS as i64) {
+            blocks[i] = self.blocks[i];
+        }
+        for (i of 0..self.used as i64 * 6) {
+            nbr[i] = self.nbr[i];
+        }
+        for (i of 0..self.used as i64 * 3) {
+            coords[i] = self.coords[i];
+        }
+        self.blocks = blocks;
+        self.nbr = nbr;
+        self.coords = coords;
+        self.room = bigger;
+    }
+}
+
+// The local index of world cell (x, y, z) inside its chunk.
+fn voxLocal(x : i32, y : i32, z : i32) : i32 {
+    let side : i32 = VOX_CHUNK - 1;
+    return ((y & side) << (2 * VOX_CHUNK_SHIFT)) | ((z & side) << VOX_CHUNK_SHIFT) | (x & side);
+}

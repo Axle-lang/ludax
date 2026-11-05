@@ -1,0 +1,193 @@
+// store — the chunks that are in memory, found by integer chunk coordinate.
+//
+// A `Map` from the packed chunk coordinate to a slot, and an array of chunks indexed by slot. The map iterates
+// in insertion order, so walking the store (to unload, to save, to count bytes) is the same on every run.
+// Unloading a chunk frees its slot for the next one. Reads outside the loaded set answer air: the store is a
+// window onto an infinite world, not the world itself (see `VoxWorld` for that).
+
+use crate::core::collections::map::Map;
+use crate::core::collections::vec::Vec;
+use crate::voxel::world::chunk::{VoxChunk, VW_CELLS, VW_SIDE};
+
+// A chunk key packs three 21-bit coordinates.
+const VW_KEY_BITS : i32 = 21;
+const VW_KEY_MASK : i64 = 2097151;
+const VW_KEY_SIGN : i64 = 1048576;
+const VW_KEY_RANGE : i64 = 2097152;
+
+// What a slot and a map entry account for in `bytesUsed`, and one dense block.
+const VW_SLOT_BYTES : i64 = 8;
+const VW_MAP_ENTRY_BYTES : i64 = 24;
+const VW_BLOCK_BYTES : i64 = 4;
+
+// The local index is y * 256 + z * 16 + x.
+const VW_STORE_Z_SHIFT : i32 = 4;
+const VW_STORE_Y_SHIFT : i32 = 8;
+
+/** The loaded chunks of a world. */
+pub class VoxChunkStore {
+    index  : Map<i64, i32>;
+    chunks : VoxChunk[];
+    spare  : Vec<i32>;
+    used   : i32 = 0;
+    room   : i32 = 16;
+    none   : VoxChunk;
+
+    /** An empty store. */
+    constructor() {
+        self.index = new Map<i64, i32>();
+        self.chunks = malloc<VoxChunk>(self.room as i64);
+        self.spare = new Vec<i32>();
+        self.none = new VoxChunk();
+    }
+
+    /** One 64-bit key for a chunk coordinate; 21 bits each cover +-1M chunks. */
+    pub static fn key(cx : i32, cy : i32, cz : i32) : i64 {
+        return (cx as i64 & VW_KEY_MASK) | ((cy as i64 & VW_KEY_MASK) << VW_KEY_BITS)
+            | ((cz as i64 & VW_KEY_MASK) << (2 * VW_KEY_BITS));
+    }
+
+    /** The x chunk coordinate packed in `key`. */
+    pub static fn keyX(key : i64) : i32 {
+        return VoxChunkStore::signed(key & VW_KEY_MASK);
+    }
+
+    /** The y chunk coordinate packed in `key`. */
+    pub static fn keyY(key : i64) : i32 {
+        return VoxChunkStore::signed((key >> VW_KEY_BITS) & VW_KEY_MASK);
+    }
+
+    /** The z chunk coordinate packed in `key`. */
+    pub static fn keyZ(key : i64) : i32 {
+        return VoxChunkStore::signed((key >> (2 * VW_KEY_BITS)) & VW_KEY_MASK);
+    }
+
+    // Sign-extends a 21-bit field.
+    fn signed(v : i64) : i32 {
+        if (v >= VW_KEY_SIGN) {
+            return (v - VW_KEY_RANGE) as i32;
+        }
+        return v as i32;
+    }
+
+    /** How many chunks are loaded. */
+    pub fn count(self) : i32 {
+        return self.index.len();
+    }
+
+    /** True when chunk (cx, cy, cz) is loaded. */
+    pub fn has(self, cx : i32, cy : i32, cz : i32) : bool {
+        return self.index.has(VoxChunkStore::key(cx, cy, cz));
+    }
+
+    /** The chunk (cx, cy, cz); an all-air placeholder when it is not loaded (ask `has` first to tell them apart). */
+    pub fn chunk(self, cx : i32, cy : i32, cz : i32) : VoxChunk {
+        let slot : i32 = self.index.getOr(VoxChunkStore::key(cx, cy, cz), -1);
+        if (slot < 0) {
+            return self.none;
+        }
+        return self.chunks[slot as i64];
+    }
+
+    /** Adds chunk (cx, cy, cz), replacing a loaded one there. The store takes the chunk; do not use it afterwards. */
+    pub fn insert(mut self, cx : i32, cy : i32, cz : i32, own chunk : VoxChunk) : void {
+        let k : i64 = VoxChunkStore::key(cx, cy, cz);
+        let found : i32 = self.index.getOr(k, -1);
+        if (found >= 0) {
+            self.chunks[found as i64] = chunk;
+            return;
+        }
+        let mut slot : i32 = 0;
+        if (self.spare.isEmpty()) {
+            if (self.used == self.room) {
+                let mut bigger : VoxChunk[] = malloc<VoxChunk>((self.room * 2) as i64);
+                for (i of 0..self.used) {
+                    bigger[i as i64] = self.chunks[i as i64];
+                }
+                self.chunks = bigger;
+                self.room = self.room * 2;
+            }
+            slot = self.used;
+            self.used = self.used + 1;
+        } else {
+            slot = self.spare.pop();
+        }
+        self.chunks[slot as i64] = chunk;
+        self.index.put(k, slot);
+    }
+
+    /** Drops chunk (cx, cy, cz) from memory. True when it was loaded. */
+    pub fn remove(mut self, cx : i32, cy : i32, cz : i32) : bool {
+        let k : i64 = VoxChunkStore::key(cx, cy, cz);
+        let slot : i32 = self.index.getOr(k, -1);
+        if (slot < 0) {
+            return false;
+        }
+        self.index.remove(k);
+        self.chunks[slot as i64] = new VoxChunk();
+        self.spare.push(slot);
+        return true;
+    }
+
+    /** The first position of the walk over the loaded chunks, in the order they were loaded; -1 when empty. */
+    pub fn first(self) : i32 {
+        return self.index.first();
+    }
+
+    /** The position after `pos` in the walk; -1 at the end. Removing chunks while walking is fine. */
+    pub fn next(self, pos : i32) : i32 {
+        return self.index.next(pos);
+    }
+
+    /** The packed coordinate (see `keyX`) of the chunk at walk position `pos`. */
+    pub fn keyAt(self, pos : i32) : i64 {
+        return self.index.keyAt(pos);
+    }
+
+    /** The chunk at walk position `pos`. */
+    pub fn chunkAt(self, pos : i32) : VoxChunk {
+        return self.chunks[self.index.valueAt(pos) as i64];
+    }
+
+    // The local index of a world cell inside its chunk.
+    static fn localOf(x : i32, y : i32, z : i32) : i32 {
+        let side : i32 = VW_SIDE - 1;
+        return ((y & side) << VW_STORE_Y_SHIFT) | ((z & side) << VW_STORE_Z_SHIFT) | (x & side);
+    }
+
+    /** The block at world cell (x, y, z); air in a chunk that is not loaded. */
+    pub fn blockAt(self, x : i32, y : i32, z : i32) : i32 {
+        let slot : i32 = self.index.getOr(VoxChunkStore::key(x >> 4, y >> 4, z >> 4), -1);
+        if (slot < 0) {
+            return 0;
+        }
+        return self.chunks[slot as i64].get(VoxChunkStore::localOf(x, y, z));
+    }
+
+    /** Sets the block at world cell (x, y, z) in a loaded chunk. False (nothing done) when the chunk is not loaded. */
+    pub fn setBlock(mut self, x : i32, y : i32, z : i32, id : i32) : bool {
+        let slot : i32 = self.index.getOr(VoxChunkStore::key(x >> 4, y >> 4, z >> 4), -1);
+        if (slot < 0) {
+            return false;
+        }
+        self.chunks[slot as i64].set(VoxChunkStore::localOf(x, y, z), id);
+        return true;
+    }
+
+    /** Memory held by the loaded chunks, in bytes (palettes, packed cells and bookkeeping), plus the index. */
+    pub fn bytesUsed(self) : i64 {
+        let mut total : i64 = (self.room as i64) * VW_SLOT_BYTES
+            + (self.index.len() as i64) * VW_MAP_ENTRY_BYTES;
+        let mut pos : i32 = self.index.first();
+        while (pos >= 0) {
+            total = total + self.chunkAt(pos).bytesUsed() as i64;
+            pos = self.index.next(pos);
+        }
+        return total;
+    }
+
+    /** What the same chunks would cost stored as one `i32` per cell, the way the dense light grid does (for comparison). */
+    pub fn denseBytes(self) : i64 {
+        return (self.index.len() as i64) * VW_CELLS as i64 * VW_BLOCK_BYTES;
+    }
+}

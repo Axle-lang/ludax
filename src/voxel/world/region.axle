@@ -1,0 +1,238 @@
+// region — many chunks in one file: a table of contents and one deflated payload per chunk.
+//
+// Layout, all numbers 32-bit little endian:
+//
+//   "VXRG" | version (1) | chunk count N
+//   N table entries of 7 numbers: cx, cy, cz, payload offset (from the file start), payload length,
+//                                 raw length (before deflating), CRC-32 of the payload
+//   CRC-32 of everything above
+//   the payloads, each a zlib stream of one chunk in the form of `VoxChunkCodec`
+//
+// Loading is paranoid: the magic, the version, the count against the file size, the header checksum, every
+// payload's bounds and checksum are checked before anything is accepted, and a payload is inflated only when it
+// is asked for, with its length checked against the table. A damaged region is rejected whole (`load` answers
+// false and `error` says why); there is no half-loaded region.
+
+use crate::core::collections::map::Map;
+use crate::core::collections::vec::Vec;
+use crate::data::bytes::{ByteBuf, Crc32};
+use crate::data::image::deflate::Deflater;
+use crate::data::image::inflate::Inflater;
+use crate::voxel::world::store::VoxChunkStore;
+
+const VW_REGION_VERSION : i32 = 1;
+
+// 4 bytes of tag, 4 of version and 4 of count, then the table of contents and its checksum.
+const VW_REGION_HEAD : i32 = 12;
+const VW_REGION_CRC : i32 = 4;
+
+// One table entry: cx, cy, cz, offset, length, raw length and checksum.
+const VW_REGION_ENTRY : i32 = 28;
+const VW_REGION_AT_Y : i32 = 4;
+const VW_REGION_AT_Z : i32 = 8;
+const VW_REGION_AT_OFFSET : i32 = 12;
+const VW_REGION_AT_LENGTH : i32 = 16;
+const VW_REGION_AT_RAW : i32 = 20;
+const VW_REGION_AT_CRC : i32 = 24;
+
+// A region this long is not a save; refuse before allocating for it.
+const VW_REGION_MAX : i32 = 1000000;
+
+// The inflater's window, and the slack a payload buffer starts with.
+const VW_REGION_INFLATE_ROOM : i32 = 1048576;
+const VW_REGION_FILE_ROOM : i32 = 1024;
+const VW_REGION_PAYLOAD_SLACK : i32 = 16;
+
+/** A set of stored chunks, in the order they were added. */
+pub class VoxRegion {
+    index    : Map<i64, i32>;
+    keys     : Vec<i64>;
+    rawLens  : Vec<i32>;
+    payloads : ByteBuf[];
+    room     : i32 = 8;
+    crc      : Crc32;
+    deflate  : Deflater;
+    inflate  : Inflater;
+    why      : string;
+
+    /** An empty region. */
+    constructor() {
+        self.index = new Map<i64, i32>();
+        self.keys = new Vec<i64>();
+        self.rawLens = new Vec<i32>();
+        self.payloads = malloc<ByteBuf>(self.room as i64);
+        self.crc = new Crc32();
+        self.deflate = new Deflater();
+        self.inflate = new Inflater(VW_REGION_INFLATE_ROOM);
+        self.why = "";
+    }
+
+    /** How many chunks it holds. */
+    pub fn count(self) : i32 {
+        return self.keys.len();
+    }
+
+    /** The packed key (see `VoxChunkStore::key`) of chunk number `i`. */
+    pub fn keyAt(self, i : i32) : i64 {
+        return self.keys.get(i);
+    }
+
+    /** True when the region holds the chunk with packed key `key`. */
+    pub fn has(self, key : i64) : bool {
+        return self.index.has(key);
+    }
+
+    /** Why the last `load` was refused, or an empty string. */
+    pub fn error(self) : string {
+        return self.why;
+    }
+
+    /** Bytes of memory held by the deflated payloads. */
+    pub fn payloadBytes(self) : i64 {
+        let mut total : i64 = 0;
+        for (i of 0..self.keys.len()) {
+            total = total + self.payloads[i as i64].len() as i64;
+        }
+        return total;
+    }
+
+    /** Adds (or replaces) the chunk with packed key `key`, whose stored form is `raw`; it is deflated here. */
+    pub fn add(mut self, key : i64, raw : ByteBuf) : void {
+        let packed : ByteBuf = self.deflate.zlib(raw, 0, raw.len());
+        self.store(key, raw.len(), packed);
+    }
+
+    fn store(mut self, key : i64, rawLen : i32, own packed : ByteBuf) : void {
+        let at : i32 = self.index.getOr(key, -1);
+        if (at >= 0) {
+            self.payloads[at as i64] = packed;
+            self.rawLens.set(at, rawLen);
+            return;
+        }
+        if (self.keys.len() == self.room) {
+            let mut bigger : ByteBuf[] = malloc<ByteBuf>((self.room * 2) as i64);
+            for (i of 0..self.keys.len()) {
+                bigger[i as i64] = self.payloads[i as i64];
+            }
+            self.payloads = bigger;
+            self.room = self.room * 2;
+        }
+        self.payloads[self.keys.len() as i64] = packed;
+        self.index.put(key, self.keys.len());
+        self.keys.push(key);
+        self.rawLens.push(rawLen);
+    }
+
+    /** Inflates the chunk with packed key `key` into `out`. False when it is absent or its payload is bad. */
+    pub fn read(mut self, key : i64, out : ByteBuf) : bool {
+        let at : i32 = self.index.getOr(key, -1);
+        if (at < 0) {
+            return false;
+        }
+        let p : ByteBuf = self.payloads[at as i64];
+        if (!self.inflate.zlib(p, 0, p.len())) {
+            return false;
+        }
+        let raw : ByteBuf = self.inflate.output();
+        if (raw.len() != self.rawLens.get(at)) {
+            return false;
+        }
+        out.pushRange(raw, 0, raw.len());
+        return true;
+    }
+
+    /** The whole region as a file's bytes. */
+    pub fn toBytes(self) : ByteBuf {
+        let n : i32 = self.keys.len();
+        let out : ByteBuf = new ByteBuf(VW_REGION_FILE_ROOM);
+        out.pushText("VXRG");
+        out.pushLe32(VW_REGION_VERSION);
+        out.pushLe32(n);
+        let mut offset : i32 = VW_REGION_HEAD + n * VW_REGION_ENTRY + VW_REGION_CRC;
+        for (i of 0..n) {
+            let key : i64 = self.keys.get(i);
+            let p : ByteBuf = self.payloads[i as i64];
+            out.pushLe32(VoxChunkStore::keyX(key));
+            out.pushLe32(VoxChunkStore::keyY(key));
+            out.pushLe32(VoxChunkStore::keyZ(key));
+            out.pushLe32(offset);
+            out.pushLe32(p.len());
+            out.pushLe32(self.rawLens.get(i));
+            out.pushLe32(self.crc.sum(p, 0, p.len()));
+            offset = offset + p.len();
+        }
+        out.pushLe32(self.crc.sum(out, 0, out.len()));
+        for (i of 0..n) {
+            let p : ByteBuf = self.payloads[i as i64];
+            out.pushRange(p, 0, p.len());
+        }
+        return out;
+    }
+
+    // Empties the table without touching `error`.
+    fn forgetContents(mut self) : void {
+        self.index.clear();
+        self.keys.clear();
+        self.rawLens.clear();
+    }
+
+    fn refuse(mut self, reason : string) : bool {
+        self.why = reason;
+        return false;
+    }
+
+    /**
+     * Replaces the contents with the region in `file`. Returns false (see `error`) and leaves the region empty
+     * when the bytes are not a whole, undamaged region.
+     */
+    pub fn load(mut self, file : ByteBuf) : bool {
+        self.forgetContents();
+        self.why = "";
+        if (file.len() < VW_REGION_HEAD + VW_REGION_CRC || !file.tagAt(0, "VXRG")) {
+            return self.refuse("not a region file");
+        }
+        if (file.le32(4) != VW_REGION_VERSION) {
+            return self.refuse("unknown region version");
+        }
+        let n : i32 = file.le32(8);
+        if (n < 0 || n > VW_REGION_MAX) {
+            return self.refuse("bad chunk count");
+        }
+        let head : i32 = VW_REGION_HEAD + n * VW_REGION_ENTRY;
+        if (head + VW_REGION_CRC > file.len()) {
+            return self.refuse("table of contents runs past the end");
+        }
+        if (self.crc.sum(file, 0, head) != file.le32(head)) {
+            return self.refuse("table of contents checksum mismatch");
+        }
+        let start : i32 = head + VW_REGION_CRC;
+        for (i of 0..n) {
+            let at : i32 = VW_REGION_HEAD + i * VW_REGION_ENTRY;
+            let offset : i32 = file.le32(at + VW_REGION_AT_OFFSET);
+            let length : i32 = file.le32(at + VW_REGION_AT_LENGTH);
+            let rawLen : i32 = file.le32(at + VW_REGION_AT_RAW);
+            if (offset < start || length < 0 || rawLen < 0 || offset > file.len()
+                || length > file.len() - offset) {
+                self.forgetContents();
+                return self.refuse("payload outside the file");
+            }
+            if (self.crc.sum(file, offset, offset + length) != file.le32(at + VW_REGION_AT_CRC)) {
+                self.forgetContents();
+                return self.refuse("payload checksum mismatch");
+            }
+            let packed : ByteBuf = new ByteBuf(length + VW_REGION_PAYLOAD_SLACK);
+            packed.pushRange(file, offset, offset + length);
+            let key : i64 = VoxChunkStore::key(
+                file.le32(at),
+                file.le32(at + VW_REGION_AT_Y),
+                file.le32(at + VW_REGION_AT_Z)
+            );
+            if (self.index.has(key)) {
+                self.forgetContents();
+                return self.refuse("chunk listed twice");
+            }
+            self.store(key, rawLen, packed);
+        }
+        return true;
+    }
+}

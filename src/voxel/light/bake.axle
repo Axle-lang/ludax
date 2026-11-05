@@ -1,0 +1,347 @@
+// bake — the ray bakes: sun visibility, sky access and bounce tint, as jobs.
+//
+// Every shell cell is baked independently of every other, so a bake is a parallel loop over the shell:
+// job `i` bakes entry `order[i]` and writes only that entry, which is the engine's determinism contract
+// for jobs (see core/jobs/kernel): the bytes come out the same with 0, 1 or 8 workers. The serial path is
+// `runSerial`, kept as the reference the tests compare the pool against.
+//
+//   sun       a fan of rays over the sun's disc: the share that gets through is the cell's sun visibility,
+//             so a shadow edge is as wide as the disc says (penumbra ~ distance to the occluder times the
+//             disc's angular diameter). The fan is the same low-discrepancy sunflower every time; see pattern.
+//   sky       a fan over the upper hemisphere: the share that gets through is the sky access, and the mean
+//             colour the rays saw is the bounce tint (white sky and the albedo of what blocked them).
+//
+// A ray is `VoxRayTracer.trace` from the cell's centre. `reach` bounds the cells a ray walks (an occluder
+// further away than that is ignored: the cost knob, documented in the settings).
+
+use crate::core::jobs::kernel::{RangeKernel, runSerial};
+use crate::core::jobs::pool::JobPool;
+use crate::core::math::dgeom::{DVec3, DRay};
+use crate::core::math::trig::{sqrtD, tanD};
+use crate::core::math::vec3::Vec3;
+use crate::voxel::light::block::BlockLightTable;
+use crate::voxel::light::grid::VoxelGrid;
+use crate::voxel::light::pattern::VoxRayPattern;
+use crate::voxel::light::surface::VoxLightSurface;
+use crate::voxel::light::trace::VoxRayTracer;
+
+// The two bakes the kernel knows.
+const VOX_BAKE_SUN : i8 = 0;
+const VOX_BAKE_SKY : i8 = 1;
+
+// The grain the pool cuts a bake into: small enough to balance, large enough to be cheap.
+const VOX_BAKE_GRAIN : i32 = 32;
+
+// When the sun is this close to the x axis, the frame builder picks a different helper direction.
+const VOX_SUN_POLE : f64 = 0.9;
+
+// A byte of share, and the full share.
+const VOX_BYTE_MAX : f64 = 255.0;
+
+/** What a bake needs to know about the light and how much to spend. */
+pub struct VoxBakeSettings {
+    /** The direction *towards* the sun (need not be unit length). */
+    pub sunDirection : Vec3 = Vec3 { x: 0.3, y: 1.0, z: 0.2 };
+
+    /** Angular radius of the sun's disc in radians (the real sun: 0.0047; games exaggerate it). */
+    pub sunHalfAngle : f32 = 0.02;
+
+    /** Rays over the sun's disc per cell. */
+    pub sunRays : i32 = 64;
+
+    /** Rays over the sky hemisphere per cell. */
+    pub skyRays : i32 = 64;
+
+    /** The farthest cell a ray walks. */
+    pub reach : f32 = 96.0;
+
+    /** False: every cell uses the same fan (what analytic tests want); true: a hash of the cell turns it. */
+    pub turned : bool = true;
+}
+
+/** What the hemisphere fan of one cell found, each 0..1. */
+pub struct VoxSkyBake {
+    /** Share of the sky the cell sees. */
+    pub access : f64 = 1.0;
+
+    /** Red of the mean colour the rays saw. */
+    pub red : f64 = 1.0;
+
+    /** Green of the mean colour the rays saw. */
+    pub green : f64 = 1.0;
+
+    /** Blue of the mean colour the rays saw. */
+    pub blue : f64 = 1.0;
+}
+
+/** The list of surface entries a bake works through: job `i` bakes entry `get(i)`. */
+pub class VoxJobList {
+    items : i32[];
+    room  : i32 = 1;
+
+    /** An empty list. */
+    constructor() {
+        self.items = malloc<i32>(1);
+    }
+
+    /** Makes room for `n` jobs, keeping what is there. */
+    pub fn ensure(mut self, n : i32) : void {
+        if (n <= self.room) {
+            return;
+        }
+        let mut bigger : i32[] = malloc<i32>(n as i64);
+        for (i of 0..self.room) {
+            bigger[i] = self.items[i];
+        }
+        self.items = bigger;
+        self.room = n;
+    }
+
+    /** Job `i`'s entry. */
+    pub fn get(self, i : i32) : i32 {
+        return self.items[i];
+    }
+
+    /** Sets job `i`'s entry (after `ensure`). */
+    pub fn set(mut self, i : i32, ordinal : i32) : void {
+        self.items[i] = ordinal;
+    }
+}
+
+/** The job kernel of the bakes: which entries, which bake, and the fans. */
+pub class VoxBakeKernel : RangeKernel {
+    grid     : Shared<VoxelGrid>;
+    table    : Shared<BlockLightTable>;
+    surface  : Shared<VoxLightSurface>;
+    pub jobs : VoxJobList;
+    pub mode : i8 = 0;
+    disc     : VoxRayPattern;
+    hemi     : VoxRayPattern;
+    sunX     : f64 = 0.0;
+    sunY     : f64 = 1.0;
+    sunZ     : f64 = 0.0;
+    upX      : f64 = 0.0;
+    upY      : f64 = 0.0;
+    upZ      : f64 = 1.0;
+    sideX    : f64 = 1.0;
+    sideY    : f64 = 0.0;
+    sideZ    : f64 = 0.0;
+    spread   : f64 = 0.0;
+    reach    : f64 = 96.0;
+    turned   : bool = true;
+    pub rays : i64 = 0;
+
+    constructor(
+        own grid : Shared<VoxelGrid>,
+        own table : Shared<BlockLightTable>,
+        own surface : Shared<VoxLightSurface>
+    ) {
+        self.grid = grid;
+        self.table = table;
+        self.surface = surface;
+        self.jobs = new VoxJobList();
+        self.disc = VoxRayPattern::disc(1);
+        self.hemi = VoxRayPattern::hemisphere(1);
+    }
+
+    /** Takes the settings: builds the sun's frame and the two fans. */
+    pub fn configure(mut self, s : VoxBakeSettings) : void {
+        let len : f64 = sqrtD(s.sunDirection.x as f64 * s.sunDirection.x as f64
+            + s.sunDirection.y as f64 * s.sunDirection.y as f64
+            + s.sunDirection.z as f64 * s.sunDirection.z as f64);
+        if (len > 0.0) {
+            self.sunX = s.sunDirection.x as f64 / len;
+            self.sunY = s.sunDirection.y as f64 / len;
+            self.sunZ = s.sunDirection.z as f64 / len;
+        }
+        // Two unit vectors perpendicular to the sun direction and to each other.
+        let mut hx : f64 = 1.0;
+        let mut hy : f64 = 0.0;
+        if (self.sunX > VOX_SUN_POLE || self.sunX < 0.0 - VOX_SUN_POLE) {
+            hx = 0.0;
+            hy = 1.0;
+        }
+        let mut ux : f64 = hy * self.sunZ;
+        let mut uy : f64 = 0.0 - hx * self.sunZ;
+        let mut uz : f64 = hx * self.sunY - hy * self.sunX;
+        let ul : f64 = sqrtD(ux * ux + uy * uy + uz * uz);
+        ux = ux / ul;
+        uy = uy / ul;
+        uz = uz / ul;
+        self.upX = ux;
+        self.upY = uy;
+        self.upZ = uz;
+        self.sideX = self.sunY * uz - self.sunZ * uy;
+        self.sideY = self.sunZ * ux - self.sunX * uz;
+        self.sideZ = self.sunX * uy - self.sunY * ux;
+        self.spread = tanD(s.sunHalfAngle as f64);
+        self.reach = s.reach as f64;
+        self.turned = s.turned;
+        if (self.disc.count() != s.sunRays) {
+            self.disc = VoxRayPattern::disc(s.sunRays);
+        }
+        if (self.hemi.count() != s.skyRays) {
+            self.hemi = VoxRayPattern::hemisphere(s.skyRays);
+        }
+    }
+
+    /** The sun's direction after normalising (x). */
+    pub fn sunDirX(self) : f64 {
+        return self.sunX;
+    }
+
+    /** Bakes the jobs `begin..end` of the work list; the pool calls it from each worker. */
+    pub fn runRange(mut self, begin : i32, end : i32) : void {
+        let tracer : VoxRayTracer = new VoxRayTracer();
+        for (job of begin..end) {
+            let ordinal : i32 = self.jobs.get(job);
+            let id : i32 = self.surface.cellAt(ordinal);
+            if (self.mode == VOX_BAKE_SUN) {
+                self.bakeSun(tracer, ordinal, id);
+            } else {
+                self.bakeSky(tracer, ordinal, id);
+            }
+        }
+    }
+
+    // Bakes one entry's sun visibility.
+    fn bakeSun(self, tracer : VoxRayTracer, ordinal : i32, id : i32) : void {
+        let v : f64 = self.sunAt(tracer, self.grid.cellX(id), self.grid.cellY(id), self.grid.cellZ(id));
+        self.surface.setSun(ordinal, voxByte(v));
+    }
+
+    // Bakes one entry's sky access and bounce tint.
+    fn bakeSky(self, tracer : VoxRayTracer, ordinal : i32, id : i32) : void {
+        let r : VoxSkyBake = self.skyAt(
+            tracer,
+            self.grid.cellX(id),
+            self.grid.cellY(id),
+            self.grid.cellZ(id)
+        );
+        self.surface.setSky(ordinal, voxByte(r.access), voxByte(r.red), voxByte(r.green), voxByte(r.blue));
+    }
+
+    /**
+     * The sun visibility, 0..1, of the cell (x, y, z): the mean survival of a fan of rays from its centre over
+     * the sun's disc.
+     */
+    pub fn sunAt(self, tracer : VoxRayTracer, x : i32, y : i32, z : i32) : f64 {
+        let copy : i32 = VoxRayPattern::copyFor(x, y, z, self.turned);
+        let n : i32 = self.disc.count();
+        let mut sum : f64 = 0.0;
+        for (i of 0..n) {
+            let a : f64 = self.disc.a(copy, i) * self.spread;
+            let b : f64 = self.disc.b(copy, i) * self.spread;
+            let dx : f64 = self.sunX + a * self.upX + b * self.sideX;
+            let dy : f64 = self.sunY + a * self.upY + b * self.sideY;
+            let dz : f64 = self.sunZ + a * self.upZ + b * self.sideZ;
+            let l : f64 = sqrtD(dx * dx + dy * dy + dz * dz);
+            let ray : DRay = DRay::make(
+                DVec3::make(x as f64 + 0.5, y as f64 + 0.5, z as f64 + 0.5),
+                DVec3::make(dx / l, dy / l, dz / l)
+            );
+            tracer.trace(self.grid, self.table, ray, self.reach);
+            sum = sum + tracer.fraction();
+        }
+        return sum / n as f64;
+    }
+
+    /**
+     * The sky access and bounce tint of the cell (x, y, z): the mean survival and the mean colour seen by a
+     * fan of rays over the upper hemisphere.
+     */
+    pub fn skyAt(self, tracer : VoxRayTracer, x : i32, y : i32, z : i32) : VoxSkyBake {
+        let copy : i32 = VoxRayPattern::copyFor(x, y, z, self.turned);
+        let n : i32 = self.hemi.count();
+        let mut open : f64 = 0.0;
+        let mut red : f64 = 0.0;
+        let mut green : f64 = 0.0;
+        let mut blue : f64 = 0.0;
+        for (i of 0..n) {
+            let ray : DRay = DRay::make(
+                DVec3::make(x as f64 + 0.5, y as f64 + 0.5, z as f64 + 0.5),
+                DVec3::make(self.hemi.a(copy, i), self.hemi.b(copy, i), self.hemi.c(copy, i))
+            );
+            tracer.trace(self.grid, self.table, ray, self.reach);
+            open = open + tracer.fraction();
+            red = red + tracer.red();
+            green = green + tracer.green();
+            blue = blue + tracer.blue();
+        }
+        let k : f64 = n as f64;
+        return VoxSkyBake { access: open / k, red: red / k, green: green / k, blue: blue / k };
+    }
+}
+
+/** 0..1 to a byte, rounded to nearest. */
+pub fn voxByte(v : f64) : i32 {
+    let r : i32 = (v * VOX_BYTE_MAX + 0.5) as i32;
+    if (r < 0) {
+        return 0;
+    }
+    if (r > VOX_BYTE_MAX as i32) {
+        return VOX_BYTE_MAX as i32;
+    }
+    return r;
+}
+
+/** Runs the bakes, on a pool or serially. */
+pub class VoxLightBaker {
+    pub kernel : VoxBakeKernel;
+    pool       : JobPool;
+    cast       : i64 = 0;
+
+    /** A baker with `workers` pool threads (at least 1; the serial path is always available). */
+    constructor(
+        own grid : Shared<VoxelGrid>,
+        own table : Shared<BlockLightTable>,
+        own surface : Shared<VoxLightSurface>,
+        workers : i32
+    ) {
+        self.kernel = new VoxBakeKernel(grid, table, surface);
+        self.pool = new JobPool(workers, self.kernel);
+    }
+
+    /** How many rays the baker has cast (`count * rays per cell`), for speed figures. */
+    pub fn raysCast(self) : i64 {
+        return self.cast;
+    }
+
+    /** Stops the pool's threads. */
+    pub fn close(mut self) : void {
+        self.pool.shutdown();
+    }
+
+    /** The list of entries the next bake works through; fill it with `ensure` and `set`, then call a bake. */
+    pub fn jobs(self) : VoxJobList {
+        return self.kernel.jobs;
+    }
+
+    /**
+     * Bakes sun visibility for the first `count` entries of `jobs()`. `parallel` false is the serial
+     * reference path. The result is identical either way.
+     */
+    pub fn bakeSun(mut self, s : VoxBakeSettings, count : i32, parallel : bool) : void {
+        self.kernel.configure(s);
+        self.kernel.mode = VOX_BAKE_SUN;
+        self.run(count, s.sunRays, parallel);
+    }
+
+    /** Bakes sky access and bounce tint for the first `count` entries of `jobs()`. */
+    pub fn bakeSky(mut self, s : VoxBakeSettings, count : i32, parallel : bool) : void {
+        self.kernel.configure(s);
+        self.kernel.mode = VOX_BAKE_SKY;
+        self.run(count, s.skyRays, parallel);
+    }
+
+    fn run(mut self, count : i32, rays : i32, parallel : bool) : void {
+        self.cast = self.cast + count as i64 * rays as i64;
+        if (parallel) {
+            if (!self.pool.run(count, VOX_BAKE_GRAIN)) {
+                runSerial(self.kernel, count, VOX_BAKE_GRAIN);
+            }
+        } else {
+            runSerial(self.kernel, count, VOX_BAKE_GRAIN);
+        }
+    }
+}

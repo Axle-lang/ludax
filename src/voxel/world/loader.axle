@@ -1,0 +1,102 @@
+// loader — generating a batch of chunks, on the job pool or on the calling thread.
+//
+// A generation job is "fill this chunk object from the terrain at these coordinates". Jobs share nothing: each
+// writes its own chunk and reads only the immutable terrain, so the result is the same bytes with 0, 1 or 8
+// workers (the contract of core/jobs). The loader owns the pool; call `close` when the world is done with it.
+
+use crate::core::jobs::kernel::{RangeKernel, runSerial};
+use crate::core::jobs::pool::JobPool;
+use crate::voxel::world::chunk::VoxChunk;
+use crate::voxel::world::terrain::VoxTerrain;
+
+// The grain the pool cuts a batch into: chunks are cheap enough that a few each balance well.
+const VW_GEN_GRAIN : i32 = 2;
+
+/** The job kernel of generation. */
+pub class VoxGenKernel : RangeKernel {
+    terrain : Shared<VoxTerrain>;
+    xs      : i32[];
+    ys      : i32[];
+    zs      : i32[];
+    out     : VoxChunk[];
+    room    : i32 = 0;
+
+    /** A kernel generating from `terrain`. */
+    constructor(own terrain : Shared<VoxTerrain>) {
+        self.terrain = terrain;
+        self.xs = malloc<i32>(1);
+        self.ys = malloc<i32>(1);
+        self.zs = malloc<i32>(1);
+        self.out = malloc<VoxChunk>(1);
+    }
+
+    /** Makes room for `n` jobs, forgetting the previous ones. */
+    pub fn reset(mut self, n : i32) : void {
+        if (n > self.room) {
+            self.xs = malloc<i32>(n as i64);
+            self.ys = malloc<i32>(n as i64);
+            self.zs = malloc<i32>(n as i64);
+            self.out = malloc<VoxChunk>(n as i64);
+            self.room = n;
+        }
+    }
+
+    /** Job `i` generates chunk (cx, cy, cz) into `chunk` (the kernel keeps it until `take`). */
+    pub fn set(mut self, i : i32, cx : i32, cy : i32, cz : i32, own chunk : VoxChunk) : void {
+        self.xs[i as i64] = cx;
+        self.ys[i as i64] = cy;
+        self.zs[i as i64] = cz;
+        self.out[i as i64] = chunk;
+    }
+
+    /** The generated chunk of job `i`. */
+    pub fn take(self, i : i32) : VoxChunk {
+        return self.out[i as i64];
+    }
+
+    /** Generates jobs `begin` up to `end`. */
+    pub fn runRange(mut self, begin : i32, end : i32) : void {
+        for (i of begin..end) {
+            self.terrain.fillChunk(
+                self.out[i as i64],
+                self.xs[i as i64],
+                self.ys[i as i64],
+                self.zs[i as i64]
+            );
+        }
+    }
+}
+
+/** A generator of batches of chunks. */
+pub class VoxChunkLoader {
+    kernel   : VoxGenKernel;
+    pool     : JobPool;
+    pub made : i64 = 0;
+
+    /** A loader generating from `terrain` with `workers` pool threads (the serial path always exists). */
+    constructor(own terrain : Shared<VoxTerrain>, workers : i32) {
+        self.kernel = new VoxGenKernel(terrain);
+        self.pool = new JobPool(workers, self.kernel);
+    }
+
+    /** Stops the pool's threads. */
+    pub fn close(mut self) : void {
+        self.pool.shutdown();
+    }
+
+    /** The kernel, to fill with jobs (`reset`, `set`) before `run`. */
+    pub fn jobs(self) : VoxGenKernel {
+        return self.kernel;
+    }
+
+    /** Runs the first `count` jobs; `parallel` false is the serial reference path with the same result. */
+    pub fn run(mut self, count : i32, parallel : bool) : void {
+        self.made = self.made + count as i64;
+        if (parallel && self.pool.workerCount() > 0) {
+            if (self.pool.run(count, VW_GEN_GRAIN)) {
+                return;
+            }
+        }
+        runSerial(self.kernel, count, VW_GEN_GRAIN);
+    }
+}
