@@ -1,0 +1,272 @@
+// runtime_sched — checks for the system scheduler and the parallel fan-out.
+//
+// The order must be a function of the declarations alone, contradictions must be found and named, disabled
+// systems must keep their place, and a parallel run over a store must give the bytes a serial run gives.
+
+use ludax::Checks;
+use ludax::ComponentStore;
+use ludax::EntityId;
+use ludax::FanOut;
+use ludax::NullRunner;
+use ludax::RangeKernel;
+use ludax::Scheduler;
+use ludax::SystemRunner;
+use ludax::World;
+use ludax::runSerial;
+
+// Remembers the order it was called in and charges a cost per system.
+class SchedRecorder : SystemRunner {
+    /** The system ids, concatenated in the order they ran. */
+    pub seen : string = "";
+
+    /** What one system costs per run. */
+    pub cost : i64 = 10;
+
+    /** The last tick passed to `runSystem`. */
+    pub ticks : i64 = 0;
+
+    constructor() {}
+
+    /** Records the system run and returns what it costs on tick `tick`. */
+    pub fn runSystem(mut self, id : i32, tick : i64) : i64 {
+        self.seen = "${self.seen}${id}";
+        self.ticks = tick;
+        return self.cost * (id as i64 + 1);
+    }
+}
+
+// Squares each input value into the output slot of the same index.
+class SchedSquare : RangeKernel {
+    /** The values the kernel reads. */
+    pub input : f32[];
+
+    /** The squared values the kernel writes. */
+    pub output : f32[];
+
+    constructor(n : i32) {
+        self.input = malloc<f32>(n as i64);
+        self.output = malloc<f32>(n as i64);
+    }
+
+    /** Squares every input in `begin..end`, offset so a missing add is visible. */
+    pub fn runRange(mut self, begin : i32, end : i32) : void {
+        for (i of begin..end) {
+            self.output[i] = self.input[i] * self.input[i] + 1.0 as f32;
+        }
+    }
+}
+
+/** The scheduler checks. */
+pub class RuntimeSchedSuite {
+    /** Runs every check of the suite. */
+    pub static fn run(c : Checks) : void {
+        schOrder(c);
+        schErrors(c);
+        schRun(c);
+        schFanOut(c);
+    }
+}
+
+fn schOrder(c : Checks) : void {
+    let s : Scheduler = new Scheduler();
+    let input : i32 = s.add("input");
+    let ai : i32 = s.add("ai");
+    let physics : i32 = s.add("physics");
+    let mission : i32 = s.add("mission");
+    let audio : i32 = s.add("audio");
+    c.sameInt("sched: add answers numbers in order", physics, 2);
+    c.sameInt("sched: a name added twice is one system", s.add("ai"), ai);
+    c.sameInt("sched: count", s.count(), 5);
+    c.sameInt("sched: find", s.find("audio"), audio);
+    c.sameInt("sched: find unknown", s.find("zzz"), -1);
+    c.that("sched: nameOf", s.nameOf(mission) == "mission");
+    c.that(
+        "sched: resolving with no constraints gives registration order",
+        s.resolve() && s.orderText() == "input > ai > physics > mission > audio"
+    );
+
+    s.before("physics", "ai");
+    c.that("sched: a new constraint un-resolves", !s.isResolved());
+    c.that(
+        "sched: physics before ai",
+        s.resolve() && s.orderText() == "input > physics > ai > mission > audio"
+    );
+    s.after("input", "mission");
+    c.that(
+        "sched: after is before the other way round",
+        s.resolve() && s.orderText() == "physics > ai > mission > input > audio"
+    );
+    s.before("audio", "physics");
+    c.that(
+        "sched: a chain through several systems",
+        s.resolve() && s.orderText() == "mission > input > audio > physics > ai"
+    );
+    c.sameInt("sched: orderAt", s.orderAt(0), mission);
+    c.that("sched: the original input is untouched by the order", s.nameOf(input) == "input");
+
+    let late : Scheduler = new Scheduler();
+    late.before("b", "a");
+    late.add("a");
+    late.add("b");
+    c.that(
+        "sched: constraints may come before the systems",
+        late.resolve() && late.orderText() == "b > a"
+    );
+
+    let t : Scheduler = new Scheduler();
+    t.add("x");
+    t.add("y");
+    t.add("z");
+    t.before("z", "x");
+    t.resolve();
+    let one : string = t.orderText();
+    let u : Scheduler = new Scheduler();
+    u.add("x");
+    u.add("y");
+    u.add("z");
+    u.before("z", "x");
+    u.resolve();
+    c.that(
+        "sched: the same declarations give the same order",
+        one == u.orderText() && one == "y > z > x"
+    );
+}
+
+fn schErrors(c : Checks) : void {
+    let s : Scheduler = new Scheduler();
+    s.add("a");
+    s.add("b");
+    s.add("c");
+    s.before("a", "b");
+    s.before("b", "c");
+    s.before("c", "a");
+    c.that("sched: a cycle is refused", !s.resolve());
+    c.that(
+        "sched: and the problem names the systems",
+        s.problem() == "the order constraints form a cycle among: a, b, c"
+    );
+    c.that("sched: running an unresolved scheduler does nothing", !s.run(new NullRunner(), 0));
+
+    let u : Scheduler = new Scheduler();
+    u.add("a");
+    u.before("a", "ghost");
+    c.that(
+        "sched: an unknown system is refused",
+        !u.resolve() && u.problem() == "no system called 'ghost'"
+    );
+    let w : Scheduler = new Scheduler();
+    w.add("a");
+    w.before("a", "a");
+    c.that(
+        "sched: a system before itself is refused",
+        !w.resolve() && w.problem() == "'a' cannot run before itself"
+    );
+
+    let partial : Scheduler = new Scheduler();
+    partial.add("p");
+    partial.add("q");
+    partial.add("r");
+    partial.before("p", "q");
+    partial.before("q", "p");
+    c.that(
+        "sched: a cycle among some systems names only those",
+        !partial.resolve() && partial.problem() == "the order constraints form a cycle among: p, q"
+    );
+}
+
+fn schRun(c : Checks) : void {
+    let s : Scheduler = new Scheduler();
+    let a : i32 = s.add("a");
+    let b : i32 = s.add("b");
+    let d : i32 = s.add("d");
+    s.before("d", "a");
+    s.resolve();
+    let rec : SchedRecorder = new SchedRecorder();
+    c.that("sched: run answers true once resolved", s.run(rec, 12));
+    c.that("sched: systems ran in the resolved order", rec.seen == "120");
+    c.sameInt("sched: the tick is passed through", rec.ticks, 12);
+    c.sameInt("sched: costs are recorded per system", s.lastCostOf(b), 20);
+    c.sameInt("sched: the total of a run", s.lastTotalCost(), 10 + 20 + 30);
+    s.setEnabled(b, false);
+    c.that("sched: isEnabled", !s.isEnabled(b) && s.isEnabled(a));
+    let mut rec2 : SchedRecorder = new SchedRecorder();
+    s.run(rec2, 13);
+    c.that("sched: a disabled system is skipped but the rest keep their order", rec2.seen == "20");
+    c.sameInt("sched: a skipped system costs 0 in that run", s.lastCostOf(b), 0);
+    c.sameInt("sched: costs accumulate", s.totalCostOf(a), 20);
+    c.sameInt("sched: run counts", s.runCount(a), 2);
+    c.sameInt("sched: and the skipped one ran once", s.runCount(b), 1);
+    s.setEnabled(b, true);
+    s.setBudget(d, 25);
+    s.setBudget(a, 25);
+    s.run(rec2, 14);
+    c.sameInt("sched: a system over its budget is counted (30 > 25)", s.overBudgetCount(d), 1);
+    c.sameInt("sched: a system within its budget is not (10 <= 25)", s.overBudgetCount(a), 0);
+    rec2.cost = 20;
+    s.run(rec2, 15);
+    c.sameInt("sched: and again (60 > 25)", s.overBudgetCount(d), 2);
+    c.sameInt("sched: 20 <= 25 is still within", s.overBudgetCount(a), 0);
+    c.sameInt("sched: budget 0 means unlimited", s.overBudgetCount(b), 0);
+    s.resetAccounts();
+    c.that(
+        "sched: resetAccounts",
+        s.totalCostOf(a) == 0 && s.runCount(a) == 0 && s.overBudgetCount(d) == 0
+    );
+    c.that("sched: and keeps the order and flags", s.isResolved() && s.isEnabled(b));
+}
+
+fn schFanOut(c : Checks) : void {
+    let w : World = new World();
+    let store : ComponentStore<f32> = new ComponentStore<f32>();
+    let n : i32 = 5000;
+    let mut input : f32[] = malloc<f32>(n as i64);
+    for (i of 0..n) {
+        let e : EntityId = w.create();
+        store.add(w, e, (i % 97) as f32 * 0.5 as f32);
+    }
+    for (d of 0..store.len()) {
+        input[d] = store.valueAt(d);
+    }
+
+    let mut serial : SchedSquare = new SchedSquare(n);
+    for (i of 0..n) {
+        serial.input[i] = input[i];
+    }
+    runSerial(serial, n, 64);
+
+    let mut k1 : SchedSquare = new SchedSquare(n);
+    let mut k4 : SchedSquare = new SchedSquare(n);
+    for (i of 0..n) {
+        k1.input[i] = input[i];
+        k4.input[i] = input[i];
+    }
+    let one : FanOut = new FanOut(1, k1);
+    let four : FanOut = new FanOut(4, k4);
+    c.sameInt("fanout: workers", four.workerCount() + one.workerCount(), 5);
+    c.that(
+        "fanout: a run over the store's length answers true",
+        one.forCount(store.len(), 16) && four.forCount(store.len(), 16)
+    );
+    let mut same : bool = true;
+    for (i of 0..n) {
+        if (k1.output[i] != serial.output[i] || k4.output[i] != serial.output[i]) {
+            same = false;
+        }
+    }
+    c.that("fanout: one worker, four workers and serial give the same bytes", same);
+    c.that(
+        "fanout: the result is what the kernel computes",
+        k4.output[3] == input[3] * input[3] + 1.0 as f32
+    );
+    c.that(
+        "fanout: more than one chunk at this size",
+        four.chunksFor(n, 16) > 1 && four.chunksFor(0, 16) == 0
+    );
+    c.that(
+        "fanout: the grain never falls below the minimum",
+        FanOut::grainFor(100, 4, 64) == 64 && FanOut::grainFor(1000000, 4, 1) == 62500
+    );
+    one.shutdown();
+    four.shutdown();
+    c.that("fanout: a run after shutdown is refused", !four.forCount(10, 1));
+}

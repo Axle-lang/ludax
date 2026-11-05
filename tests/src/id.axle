@@ -1,0 +1,220 @@
+// id — checks for the hash functions, EntityId, IdAllocator and StringInterner.
+//
+// The hashes are checked against published FNV-1a test vectors and against `std`'s own implementations,
+// because a content hash that drifts from its definition silently invalidates every file written with it. The
+// allocator is checked for the property the simulation depends on: the same calls give the same ids.
+
+use std::text::hashing::fnv1aBytes;
+
+use ludax::Checks;
+use ludax::EntityId;
+use ludax::IdAllocator;
+use ludax::StringId;
+use ludax::StringInterner;
+use ludax::combineHash;
+use ludax::fnv1a64;
+use ludax::fnv1a64Bytes;
+use ludax::mixI64;
+
+/** The id checks. Helpers are prefixed because top-level names are global to the package. */
+pub class IdSuite {
+    /** Runs every check of the suite. */
+    pub static fn run(c : Checks) : void {
+        idHashChecks(c);
+        idEntityIdChecks(c);
+        idAllocatorChecks(c);
+        idAllocatorDeterminism(c);
+        idInternerChecks(c);
+    }
+}
+
+fn idHashChecks(c : Checks) : void {
+    // Test vectors from the FNV reference: 0xcbf29ce484222325, 0xaf63dc4c8601ec8c, 0x85944171f73967e8.
+    c.sameInt(
+        "hash: fnv1a64 of the empty string is the offset basis",
+        fnv1a64(""),
+        -3750763034362895579
+    );
+    c.sameInt("hash: fnv1a64 of a", fnv1a64("a"), -5808556873153909620);
+    c.sameInt("hash: fnv1a64 of foobar", fnv1a64("foobar"), -8821353812377114648);
+    c.sameInt("hash: fnv1a64 agrees with std (short)", fnv1a64("hello"), fnv1aBytes("hello"));
+    c.sameInt("hash: fnv1a64 agrees with std (non-ascii)", fnv1a64("café ☃"), fnv1aBytes("café ☃"));
+
+    let mut data : i8[] = malloc<i8>(16);
+    data[0] = 102;
+    data[1] = 111;
+    data[2] = 111;
+    data[3] = -1;
+    c.sameInt("hash: fnv1a64Bytes of a prefix", fnv1a64Bytes(data, 3), fnv1a64("foo"));
+    c.that(
+        "hash: fnv1a64Bytes sees a byte above 127",
+        fnv1a64Bytes(data, 4) != fnv1a64Bytes(data, 3)
+    );
+    c.sameInt("hash: fnv1a64Bytes of nothing", fnv1a64Bytes(data, 0), fnv1a64(""));
+
+    // SplitMix64's first output for seed 0 is 0xe220a8397b1dcdaf.
+    c.sameInt("hash: mixI64 of 0 is the SplitMix64 reference", mixI64(0), -2152535657050944081);
+    c.sameInt(
+        "hash: mixI64 matches an independent computation",
+        mixI64(123456789),
+        2466975172287755897
+    );
+    c.that(
+        "hash: neighbours mix far apart",
+        mixI64(1) != mixI64(2) && (mixI64(1) ^ mixI64(2)) != 3
+    );
+
+    let mut spread : i64 = 0;
+    for (i of 0..64) {
+        spread = spread | (mixI64(1) ^ mixI64(1 ^ (1 << i)));
+    }
+    c.that("hash: flipping any input bit reaches the whole output", spread == -1);
+
+    c.that("hash: combineHash depends on the order", combineHash(1, 2) != combineHash(2, 1));
+    c.that("hash: combineHash depends on both", combineHash(1, 2) != combineHash(1, 3));
+}
+
+fn idEntityIdChecks(c : Checks) : void {
+    let id : EntityId = EntityId::make(7, 3);
+    c.that("entity id: parts", id.index == 7 && id.generation == 3);
+    let sameParts : bool = id.same(EntityId::make(7, 3));
+    let otherGeneration : bool = id.same(EntityId::make(7, 4));
+    let otherIndex : bool = id.same(EntityId::make(8, 3));
+    c.that("entity id: same", sameParts && !otherGeneration && !otherIndex);
+    let back : EntityId = EntityId::fromBits(id.bits());
+    c.that("entity id: bits round trip", back.same(id));
+    c.that(
+        "entity id: bits differ for a different generation",
+        id.bits() != EntityId::make(7, 4).bits()
+    );
+    c.sameInt("entity id: generation is in the high word", id.bits() >>> 32, 3);
+
+    let top : EntityId = EntityId::make(2147483647, 2147483647);
+    c.that("entity id: bits round trip at the maximum", EntityId::fromBits(top.bits()).same(top));
+    let none : EntityId = EntityId::none();
+    c.that("entity id: none is none", none.isNone() && !id.isNone());
+    c.that("entity id: none survives bits", EntityId::fromBits(none.bits()).isNone());
+    c.that("entity id: a zeroed index is not none", !EntityId::make(0, 1).isNone());
+}
+
+fn idAllocatorChecks(c : Checks) : void {
+    let ids : IdAllocator = new IdAllocator();
+    let a : EntityId = ids.create();
+    let b : EntityId = ids.create();
+    let d : EntityId = ids.create();
+    c.that("allocator: slots count up from 0", a.index == 0 && b.index == 1 && d.index == 2);
+    c.that("allocator: generations start at 1", a.generation == 1 && b.generation == 1);
+    c.sameInt("allocator: liveCount", ids.liveCount() as i64, 3);
+    c.sameInt("allocator: slotCount", ids.slotCount() as i64, 3);
+    c.that("allocator: issued ids are alive", ids.isAlive(a) && ids.isAlive(b) && ids.isAlive(d));
+    c.that("allocator: none is not alive", !ids.isAlive(EntityId::none()));
+    c.that("allocator: an unissued id is not alive", !ids.isAlive(EntityId::make(50, 1)));
+
+    c.that("allocator: destroy", ids.destroy(b));
+    c.that("allocator: a destroyed id is dead", !ids.isAlive(b));
+    c.that("allocator: destroying twice is refused", !ids.destroy(b));
+    c.that("allocator: destroying an unissued id is refused", !ids.destroy(EntityId::make(50, 1)));
+    c.that("allocator: destroying none is refused", !ids.destroy(EntityId::none()));
+    c.sameInt("allocator: liveCount after destroy", ids.liveCount() as i64, 2);
+    c.that("allocator: idAt a free slot is none", ids.idAt(1).isNone());
+    c.that("allocator: idAt a live slot", ids.idAt(2).same(d));
+    c.that("allocator: idAt out of range is none", ids.idAt(9).isNone() && ids.idAt(-1).isNone());
+
+    let again : EntityId = ids.create();
+    c.sameInt("allocator: the freed slot is reused", again.index as i64, 1);
+    c.sameInt("allocator: with the next generation", again.generation as i64, 2);
+    c.that("allocator: the old id is still dead", !ids.isAlive(b) && ids.isAlive(again));
+    c.that(
+        "allocator: the old id cannot destroy the new tenant",
+        !ids.destroy(b) && ids.isAlive(again)
+    );
+    c.sameInt("allocator: slotCount does not grow on reuse", ids.slotCount() as i64, 3);
+
+    ids.destroy(a);
+    ids.destroy(d);
+    c.sameInt("allocator: most recently freed slot first", ids.create().index as i64, 2);
+    c.sameInt("allocator: then the earlier", ids.create().index as i64, 0);
+
+    // One slot reused many times: every generation is distinct and only the latest is alive.
+    let lone : IdAllocator = new IdAllocator();
+    let mut previous : EntityId = lone.create();
+    let mut distinct : bool = true;
+    let mut onlyLatest : bool = true;
+    for (i of 0..1000) {
+        lone.destroy(previous);
+        let next : EntityId = lone.create();
+        if (next.index != 0 || next.generation != previous.generation + 1) {
+            distinct = false;
+        }
+        if (lone.isAlive(previous) || !lone.isAlive(next)) {
+            onlyLatest = false;
+        }
+        previous = next;
+    }
+    c.that("allocator: 1000 reuses give 1000 distinct generations", distinct);
+    c.that("allocator: only the latest generation is alive", onlyLatest);
+}
+
+// The same sequence of calls must give the same ids, whatever else the process does in between.
+fn idAllocatorDeterminism(c : Checks) : void {
+    let one : IdAllocator = new IdAllocator();
+    let two : IdAllocator = new IdAllocator();
+    let mut fingerprintOne : i64 = 0;
+    let mut fingerprintTwo : i64 = 0;
+    let mut pending : i64 = 0;
+    for (step of 0..500) {
+        let idOne : EntityId = one.create();
+        let idTwo : EntityId = two.create();
+        fingerprintOne = combineHash(fingerprintOne, idOne.bits());
+        fingerprintTwo = combineHash(fingerprintTwo, idTwo.bits());
+        if (step % 3 == 0) {
+            one.destroy(idOne);
+            two.destroy(idTwo);
+        }
+        pending = pending + 1;
+    }
+    c.sameInt("allocator: two replays issue identical ids", fingerprintOne, fingerprintTwo);
+    c.sameInt(
+        "allocator: replays agree on what is alive",
+        one.liveCount() as i64,
+        two.liveCount() as i64
+    );
+}
+
+fn idInternerChecks(c : Checks) : void {
+    let names : StringInterner = new StringInterner();
+    let player : StringId = names.intern("player");
+    let enemy : StringId = names.intern("enemy");
+    c.sameInt("interner: numbers start at 0", player.raw as i64, 0);
+    c.sameInt("interner: and count up in first-seen order", enemy.raw as i64, 1);
+    c.that("interner: the same text gives the same id", names.intern("player").same(player));
+    c.that(
+        "interner: a fresh equal string gives the same id",
+        names.intern("pla" + "yer").same(player)
+    );
+    c.sameInt("interner: len counts distinct texts", names.len() as i64, 2);
+    c.that("interner: name reads back", names.name(enemy) == "enemy");
+    c.that("interner: find a known text", names.find("enemy").same(enemy));
+    c.that("interner: find an unknown text is none", names.find("boss").isNone());
+    c.sameInt("interner: find does not add", names.len() as i64, 2);
+    let empty : StringId = names.intern("");
+    c.that("interner: the empty string is a name", empty.raw == 2 && names.name(empty) == "");
+    c.that("interner: case matters", !names.intern("Player").same(player));
+    c.that("interner: none is none", StringId::none().isNone() && !player.isNone());
+
+    let many : StringInterner = new StringInterner();
+    let mut stable : bool = true;
+    for (i of 0..500) {
+        let text : string = "asset/models/${i}.mesh";
+        if (many.intern(text).raw != i) {
+            stable = false;
+        }
+    }
+    for (i of 0..500) {
+        let text : string = "asset/models/${i}.mesh";
+        if (many.find(text).raw != i || many.name(StringId { raw: i }) != text) {
+            stable = false;
+        }
+    }
+    c.that("interner: 500 texts keep their numbers and names through growth", stable);
+}

@@ -1,0 +1,401 @@
+// light_explain — shading a point against many lights: every reason, the sums, the ambient furnace.
+//
+// One scene of nine lights is built so each rejection has exactly one cause — range, mask, exclusion,
+// backface, cone, shadow — and the explanation must name that cause and nothing else. The same scene then
+// checks that the recorded numbers are the incidence's, that the parts add to the shaded result exactly, and
+// that a visibility of zero removes only the direct half. The ambient furnace runs the real `lightShade`
+// path, so an occlusion or SH bug shows as energy that is not one.
+
+use ludax::{Checks, Vec, Vec3, LightSource, LightReason, LightSurface, LightMaterial, LightDfg};
+use ludax::{LightDfgTable, LightPrepared};
+use ludax::{LightAlphaMode, LightDiffuseModel, LightSh9, LightEnvironment, LightUniformEnvironment};
+use ludax::{LightAmbientInput, LightShadowQuery, LightNoShadows};
+use ludax::{
+    LightExplain, LightContribution, LightShadeTerms, LightDirectAmbient, lightExplain, lightShade
+};
+use ludax::{lightContribution, lightPrepare};
+use ludax::{lightIncidence, lightBrdf, LightIncident, LIGHT_LAYERS_ALL};
+
+use crate::light_support::{LightWorst, lightText};
+
+// Blocks light number `blocked` completely and light number `dimmed` by half; every other light is fully
+// visible.
+class TestShadows : LightShadowQuery {
+    blocked : i32;
+    dimmed  : i32;
+
+    constructor(blocked : i32, dimmed : i32) {
+        self.blocked = blocked;
+        self.dimmed = dimmed;
+    }
+
+    /** Fully blocks the blocked light, halves the dimmed one, leaves the rest visible. */
+    pub fn visibility(self, lightIndex : i32, surface : LightSurface) : f32 {
+        if (lightIndex == self.blocked) {
+            return 0.0;
+        }
+        if (lightIndex == self.dimmed) {
+            return 0.5;
+        }
+        return 1.0;
+    }
+}
+
+fn testSurface() : LightSurface {
+    return LightSurface {
+        position: Vec3::zero(),
+        normal: Vec3::unitY(),
+        geoNormal: Vec3::unitY(),
+        view: Vec3::make(0.5, 0.8660254, 0.0),
+        layer: 1,
+        objectId: 3,
+    };
+}
+
+fn testLights() : Vec<LightSource> {
+    let white : Vec3 = Vec3::splat(1.0);
+    let lights : Vec<LightSource> = new Vec<LightSource>();
+    // 0: the sun, reaches.
+    lights.push(LightSource::directional(white, 80000.0, Vec3::make(-0.3, -1.0, 0.1), 0.0093));
+    // 1: a lamp above, reaches.
+    lights.push(LightSource::point(
+        Vec3::make(1.0, 0.8, 0.6),
+        300.0,
+        Vec3::make(0.0, 2.0, 1.0),
+        0.1,
+        10.0
+    ));
+    // 2: a lamp with a short range, far away.
+    lights.push(LightSource::point(white, 300.0, Vec3::make(0.0, 5.0, 0.0), 0.0, 3.0));
+    // 3: a lamp whose include mask has no bit of the surface's layer.
+    let mut masked : LightSource = LightSource::point(
+        white,
+        300.0,
+        Vec3::make(1.0, 2.0, 0.0),
+        0.0,
+        10.0
+    );
+    masked.includeLayers = 2;
+    lights.push(masked);
+    // 4: a lamp that excludes the surface's object.
+    let mut skip : LightSource = LightSource::point(
+        white,
+        300.0,
+        Vec3::make(-1.0, 2.0, 0.0),
+        0.0,
+        10.0
+    );
+    skip.excludeObject = 3;
+    lights.push(skip);
+    // 5: a lamp under the floor.
+    lights.push(LightSource::point(white, 300.0, Vec3::make(0.0, -2.0, 0.0), 0.0, 10.0));
+    // 6: a spot pointing away.
+    lights.push(LightSource::spot(
+        white,
+        300.0,
+        Vec3::make(0.0, 2.0, 0.0),
+        Vec3::make(0.0, 1.0, 0.0),
+        0.2,
+        0.4,
+        0.0,
+        0.0
+    ));
+    // 7: a lamp that is fully shadowed.
+    lights.push(LightSource::point(white, 300.0, Vec3::make(2.0, 2.0, 0.0), 0.0, 10.0));
+    // 8: a lamp that is half shadowed.
+    lights.push(LightSource::point(white, 300.0, Vec3::make(-2.0, 2.0, 0.0), 0.0, 10.0));
+    return lights;
+}
+
+/** Checks of shading and explanation. */
+pub class LightExplainSuite {
+    /** Runs every check of this suite. */
+    pub static fn run(c : Checks) : void {
+        let table : LightDfgTable = new LightDfgTable(16, 32);
+        LightExplainSuite::reasons(c, table);
+        LightExplainSuite::recorded(c, table);
+        LightExplainSuite::sums(c, table);
+        LightExplainSuite::furnace(c, table);
+        LightExplainSuite::layers(c, table);
+    }
+    static fn reasons(c : Checks, table : LightDfgTable) : void {
+        let lights : Vec<LightSource> = testLights();
+        let surface : LightSurface = testSurface();
+        let material : LightMaterial = LightMaterial {
+            baseColor: Vec3::make(0.8, 0.7, 0.6),
+            metallic: 0.0,
+            roughness: 0.5,
+            emissive: Vec3::make(0.01, 0.0, 0.0),
+        };
+        let dfg : LightDfg = table.lookup(0.8660254, 0.5);
+        let ambient : LightAmbientInput = LightAmbientInput {
+            sh: LightSh9::project(new LightUniformEnvironment(Vec3::make(0.3, 0.4, 0.5)), 16),
+            specular: Vec3::make(0.3, 0.4, 0.5),
+        };
+        let shadows : TestShadows = new TestShadows(7, 8);
+        let e : LightExplain = lightExplain(lights, surface, material, dfg, ambient, shadows);
+        c.sameInt("the explanation has one entry per light", e.count() as i64, 9);
+        c.that("light 0 (sun) reaches", e.light(0).reason == LightReason::None);
+        c.that("light 1 (lamp) reaches", e.light(1).reason == LightReason::None);
+        c.that("light 2 is out of range", e.light(2).reason == LightReason::Range);
+        c.that("light 3 is masked", e.light(3).reason == LightReason::Mask);
+        c.that("light 4 is excluded", e.light(4).reason == LightReason::Excluded);
+        c.that("light 5 is a backface", e.light(5).reason == LightReason::Backface);
+        c.that("light 6 is outside its cone", e.light(6).reason == LightReason::Cone);
+        c.that("light 7 is in shadow", e.light(7).reason == LightReason::Shadow);
+        c.that("light 8 reaches, dimmed", e.light(8).reason == LightReason::None);
+        c.sameInt(
+            "three lights reach the point... four with the dimmed one (reaching count)",
+            e.reaching() as i64,
+            3
+        );
+        c.near("light 8's shadow factor is recorded", e.light(8).shadow as f64, 0.5, 0.0);
+        c.near("light 7's rgb is exactly 0", e.light(7).rgb().length() as f64, 0.0, 0.0);
+        c.near("light 5's rgb is exactly 0", e.light(5).rgb().length() as f64, 0.0, 0.0);
+        c.that("a reaching light adds light", e.light(1).rgb().x > 0.0);
+    }
+
+    // The recorded numbers are the incidence's, and a shadow scales the reaching light.
+    static fn recorded(c : Checks, table : LightDfgTable) : void {
+        let lights : Vec<LightSource> = testLights();
+        let surface : LightSurface = testSurface();
+        let material : LightMaterial = LightMaterial {
+            baseColor: Vec3::make(0.8, 0.7, 0.6),
+            metallic: 0.0,
+            roughness: 0.5,
+            emissive: Vec3::make(0.01, 0.0, 0.0),
+        };
+        let dfg : LightDfg = table.lookup(0.8660254, 0.5);
+        let ambient : LightAmbientInput = LightAmbientInput {
+            sh: LightSh9::project(new LightUniformEnvironment(Vec3::make(0.3, 0.4, 0.5)), 16),
+            specular: Vec3::make(0.3, 0.4, 0.5),
+        };
+        let shadows : TestShadows = new TestShadows(7, 8);
+        let e : LightExplain = lightExplain(lights, surface, material, dfg, ambient, shadows);
+
+        // Half shadow is exactly half the light of an identical unshadowed lamp placed symmetrically.
+        let lampA : LightContribution = e.light(8);
+        let open : LightExplain = lightExplain(
+            lights,
+            surface,
+            material,
+            dfg,
+            ambient,
+            new TestShadows(-1, -1)
+        );
+        c.near(
+            "a half-shadowed light adds half of what it adds unshadowed",
+            lampA.rgb().y as f64,
+            (open.light(8).rgb().y * 0.5) as f64,
+            0.000001
+        );
+        // Sunlit: the recorded numbers are the ones of the maths.
+        let prepared : LightPrepared = lightPrepare(material, dfg);
+        let inc : LightIncident = lightIncidence(
+            lights.get(1),
+            surface.position,
+            surface.normal,
+            surface.geoNormal,
+            1,
+            3
+        );
+        c.near(
+            "recorded nDotL is the geometric cosine",
+            e.light(1).nDotL as f64,
+            inc.nDotL as f64,
+            0.0
+        );
+        c.near(
+            "recorded irradiance is the incidence's",
+            e.light(1).irradiance as f64,
+            inc.irradiance as f64,
+            0.0
+        );
+        c.near(
+            "recorded attenuation is the incidence's",
+            e.light(1).attenuation as f64,
+            inc.attenuation as f64,
+            0.0
+        );
+        let byHand : Vec3 = lightBrdf(
+            prepared,
+            surface.normal,
+            surface.view,
+            inc.toLight
+        ).diffuse
+            .times(lights.get(1).color)
+            .scale(inc.irradiance);
+        c.that(
+            "diffuse part is BRDF x colour x irradiance ${lightText(e.light(1).diffuse)}",
+            e.light(1).diffuse.approxEq(byHand, 0.0000001)
+        );
+    }
+
+    // The sum of the parts is the shaded result, exactly.
+    static fn sums(c : Checks, table : LightDfgTable) : void {
+        let lights : Vec<LightSource> = testLights();
+        let surface : LightSurface = testSurface();
+        let material : LightMaterial = LightMaterial {
+            baseColor: Vec3::make(0.8, 0.7, 0.6),
+            metallic: 0.0,
+            roughness: 0.5,
+            emissive: Vec3::make(0.01, 0.0, 0.0),
+        };
+        let dfg : LightDfg = table.lookup(0.8660254, 0.5);
+        let ambient : LightAmbientInput = LightAmbientInput {
+            sh: LightSh9::project(new LightUniformEnvironment(Vec3::make(0.3, 0.4, 0.5)), 16),
+            specular: Vec3::make(0.3, 0.4, 0.5),
+        };
+        let shadows : TestShadows = new TestShadows(7, 8);
+        let e : LightExplain = lightExplain(lights, surface, material, dfg, ambient, shadows);
+
+        println("  measured explain: |sum of parts - shaded result| = ${e.difference()}, shaded ${lightText(e.shadedResult())}");
+        c.near(
+            "the explanation's sum equals the shaded result exactly",
+            e.difference() as f64,
+            0.0,
+            0.0
+        );
+        let terms : LightShadeTerms = lightShade(lights, surface, material, dfg, ambient, shadows);
+        c.that(
+            "shade total equals the explanation's shaded result",
+            terms.total().approxEq(e.shadedResult(), 0.0)
+        );
+        c.that(
+            "the emissive term is the material's",
+            terms.emissive.approxEq(Vec3::make(0.01, 0.0, 0.0), 0.0)
+        );
+        c.that("ambient is positive for a lit environment", terms.ambient().x > 0.0);
+        // Direct/ambient split recombines to the total; visibility removes direct only.
+        let split : LightDirectAmbient = terms.split();
+        c.that(
+            "direct + ambient (+ emissive) is the total",
+            split.total().approxEq(terms.total(), 0.000001)
+        );
+        let shaded : LightDirectAmbient = split.withVisibility(0.0);
+        c.that(
+            "a shadow removes the direct half and keeps the ambient",
+            shaded.direct.length() == 0.0 && shaded.ambient.approxEq(split.ambient, 0.0)
+        );
+        c.that("direct share is in 0..1", split.directShare() > 0.0 && split.directShare() < 1.0);
+    }
+
+    // The white furnace through the real ambient path: albedo 1, uniform environment L, no lights => Lo = L.
+    static fn furnace(c : Checks, table : LightDfgTable) : void {
+        let env : Vec3 = Vec3::make(0.5, 0.8, 1.2);
+        let ambient : LightAmbientInput = LightAmbientInput {
+            sh: LightSh9::project(new LightUniformEnvironment(env), 24),
+            specular: env,
+        };
+        let none : Vec<LightSource> = new Vec<LightSource>();
+        let worst : LightWorst = new LightWorst();
+        let n : i32 = table.size();
+        for (j of 0..n) {
+            for (i of 1..n) {
+                let r : f32 = (j as f32) / ((n - 1) as f32);
+                let nv : f32 = LightDfgTable::cosineAt(i, n) as f32;
+                let surface : LightSurface = LightSurface {
+                    view: Vec3::make(ludax::sqrt(1.0 - nv * nv), nv, 0.0),
+                };
+                let mut m : f32 = 0.0;
+                for (mm of 0..2) {
+                    let material : LightMaterial = LightMaterial {
+                        baseColor: Vec3::splat(1.0),
+                        metallic: m,
+                        roughness: r,
+                    };
+                    let t : LightShadeTerms = lightShade(
+                        none,
+                        surface,
+                        material,
+                        table.node(i, j),
+                        ambient,
+                        new LightNoShadows()
+                    );
+                    let lo : Vec3 = t.total();
+                    worst.note(((lo.x / env.x) - 1.0) as f64, "metallic ${m} r ${r} nv ${nv}");
+                    worst.note(((lo.z / env.z) - 1.0) as f64, "metallic ${m} r ${r} nv ${nv}");
+                    m = m + (1.0 as f32);
+                }
+            }
+        }
+        worst.within(
+            c,
+            "ambient white furnace through lightShade: Lo / L = 1, dielectric and metal, all table nodes",
+            0.0001
+        );
+        // Occlusion darkens ambient only and scales it linearly.
+        let material : LightMaterial = LightMaterial {
+            baseColor: Vec3::splat(1.0),
+            roughness: 0.5,
+            occlusion: 0.5,
+        };
+        let lit : LightShadeTerms = lightShade(
+            none,
+            LightSurface {},
+            material,
+            table.lookup(1.0, 0.5),
+            ambient,
+            new LightNoShadows()
+        );
+        let openSky : LightShadeTerms = lightShade(
+            none,
+            LightSurface {},
+            LightMaterial { baseColor: Vec3::splat(1.0), roughness: 0.5 },
+            table.lookup(1.0, 0.5),
+            ambient,
+            new LightNoShadows()
+        );
+        c.near(
+            "occlusion 0.5 halves the ambient",
+            (lit.ambient().y / openSky.ambient().y) as f64,
+            0.5,
+            0.000001
+        );
+    }
+
+    // Layer and object lists change who is lit, nothing else.
+    static fn layers(c : Checks, table : LightDfgTable) : void {
+        let lamp : LightSource = LightSource::point(
+            Vec3::splat(1.0),
+            500.0,
+            Vec3::make(0.0, 2.0, 0.0),
+            0.0,
+            0.0
+        );
+        let mut a : LightSource = lamp;
+        a.includeLayers = 4 | 1;
+        let mut b : LightSource = lamp;
+        b.excludeLayers = 4;
+        c.that(
+            "mayLight: include mask shares a bit",
+            a.mayLight(4, 0) && a.mayLight(1, 0) && !a.mayLight(2, 0)
+        );
+        c.that("mayLight: exclusion wins over inclusion", !b.mayLight(4, 0) && b.mayLight(1, 0));
+        c.that("mayLight: all layers by default", lamp.mayLight(LIGHT_LAYERS_ALL, 5));
+        let spot : LightSource = LightSource::spot(
+            Vec3::splat(1.0),
+            500.0,
+            Vec3::make(0.0, 2.0, 0.0),
+            Vec3::make(0.0, -1.0, 0.0),
+            0.2,
+            0.4,
+            0.0,
+            0.0
+        );
+        c.that("a spot's inner cone is inside its outer", spot.cosInner >= spot.cosOuter);
+        c.near(
+            "emitterArea is pi r^2",
+            LightSource::emissive(
+                Vec3::splat(1.0),
+                100.0,
+                Vec3::zero(),
+                Vec3::unitY(),
+                2.0,
+                0.0
+            ).emitterArea() as f64,
+            12.5663706,
+            0.0001
+        );
+    }
+}

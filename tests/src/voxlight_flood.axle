@@ -1,0 +1,278 @@
+// voxlight_flood — the laws of the block-light and sky-light flood.
+//
+// The flood claims to be a pure function of the blocks, so the checks pin its closed form on open ground, the
+// seed rule when a brighter lamp is removed, and the equality of an incrementally edited field with a rebuilt
+// one. A sealed room and a tinted pane exercise what a curve alone cannot: opacity, colour and the paths light
+// takes around a corner.
+
+use ludax::{Checks, Pcg32, VoxLightCurve};
+
+use crate::voxlight_support::{VoxIds, VoxLightRig, voxDiffer};
+
+/** Checks the block-light and sky-light flood: curve, seeds, opacity, tint and removal. */
+pub class VoxLightFloodSuite {
+    // A white lamp in the middle of an open 3x3x3-chunk box: the level along every axis is the calibrated
+    // curve, to the rounding of one level.
+    static fn calibration(c : Checks) : void {
+        let rig : VoxLightRig = new VoxLightRig(3, 3, 3, 16);
+        rig.set(24, 24, 24, VoxIds::lamp());
+        rig.flood.rebuild();
+        let curve : Shared<VoxLightCurve> = rig.curve;
+        let mut worst : f64 = 0.0;
+        for (d of 1..24) {
+            let want : f64 = 255.0 * curve.ideal(d as f64);
+            let got : f64 = rig.level(24 + d, 24, 24, 0) as f64;
+            let mut err : f64 = got - want;
+            if (err < 0.0) {
+                err = 0.0 - err;
+            }
+            if (err > worst) {
+                worst = err;
+            }
+        }
+        c.that(
+            "flood tracks 255 * S(d) along an axis within one level (worst ${worst})",
+            worst <= 0.51
+        );
+        c.sameInt("the lamp cell holds the full emission", rig.level(24, 24, 24, 0), 255);
+
+        // Inverse-square regime: with an unwindowed curve (huge range) the ratio of two distances is the ratio
+        // of (d^2 + r^2).
+        let wide : VoxLightCurve = new VoxLightCurve(2.0, 250.0);
+        let at8 : f64 = wide.ideal(8.0);
+        let at16 : f64 = wide.ideal(16.0);
+        c.near(
+            "S(8) / S(16) is (256 + 4) / (64 + 4) within the window",
+            at8 / at16,
+            260.0 / 68.0,
+            0.05
+        );
+        c.near("S(r) is one half, the core radius", wide.ideal(2.0), 0.5, 0.01);
+        c.near(
+            "far field: doubling the distance quarters the light",
+            wide.ideal(20.0) / wide.ideal(40.0),
+            4.0,
+            0.2
+        );
+        c.near("S reaches exactly zero at the range", curve.ideal(32.0), 0.0, 0.0);
+        c.sameInt("and the table agrees", curve.factor(32), 0);
+        c.that(
+            "table is strictly decreasing up to the range",
+            VoxLightFloodSuite::decreasing(curve)
+        );
+    }
+
+    static fn decreasing(curve : Shared<VoxLightCurve>) : bool {
+        for (d of 0..31) {
+            if (curve.factor(d + 1) >= curve.factor(d)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // In open air the level at a cell depends only on its taxicab distance from the lamp, and decays with it.
+    static fn monotone(c : Checks) : void {
+        let rig : VoxLightRig = new VoxLightRig(3, 3, 3, 16);
+        rig.set(24, 24, 24, VoxIds::lamp());
+        rig.flood.rebuild();
+        let curve : Shared<VoxLightCurve> = rig.curve;
+        let mut wrong : i32 = 0;
+        let mut lit : i32 = 0;
+        for (z of 8..40) {
+            for (y of 8..40) {
+                for (x of 8..40) {
+                    let mut dx : i32 = x - 24;
+                    let mut dy : i32 = y - 24;
+                    let mut dz : i32 = z - 24;
+                    if (dx < 0) { dx = 0 - dx; }
+                    if (dy < 0) { dy = 0 - dy; }
+                    if (dz < 0) { dz = 0 - dz; }
+                    let want : i32 = curve.levelAtCells(255, dx + dy + dz);
+                    if (rig.level(x, y, z, 0) != want) {
+                        wrong = wrong + 1;
+                    }
+                    if (want > 0) {
+                        lit = lit + 1;
+                    }
+                }
+            }
+        }
+        c.sameInt("every cell holds the level of its taxicab distance (mismatches)", wrong, 0);
+        c.that("a good number of cells are lit", lit > 3000);
+        // The taxicab path is never shorter than the straight one, so the flood never exceeds the ideal.
+        let mut over : i32 = 0;
+        for (z of 8..40) {
+            for (x of 8..40) {
+                let dx : f64 = (x - 24) as f64;
+                let dz : f64 = (z - 24) as f64;
+                let ideal : f64 = 255.0 * curve.ideal((dx * dx + dz * dz).sqrt());
+                if (rig.level(x, 24, z, 0) as f64 > ideal + 0.51) {
+                    over = over + 1;
+                }
+            }
+        }
+        c.sameInt("the flood is never brighter than the straight-line law (cells over)", over, 0);
+    }
+
+    // Removing a lamp darkens everything; putting it back restores the exact field, key for key.
+    static fn removeThenAdd(c : Checks) : void {
+        let rig : VoxLightRig = new VoxLightRig(2, 2, 2, 16);
+        rig.fill(10, 0, 0, 12, 20, 32, VoxIds::stone());
+        rig.set(5, 5, 5, VoxIds::lamp());
+        rig.set(20, 8, 20, VoxIds::warmLamp());
+        rig.flood.rebuild();
+        let before : i32[] = rig.snapshot();
+        let n : i64 = rig.grid.slotCount() as i64 * 4096 * 4;
+        rig.put(5, 5, 5, VoxIds::air());
+        c.sameInt("the removed lamp's cell is dark", rig.level(5, 5, 5, 0), 0);
+        c.sameInt("and its neighbour", rig.level(6, 5, 5, 0), 0);
+        let mid : i32[] = rig.snapshot();
+        c.that("the field changed", voxDiffer(before, mid, n) > 0);
+        rig.put(5, 5, 5, VoxIds::lamp());
+        let after : i32[] = rig.snapshot();
+        c.sameInt(
+            "put back: the field is identical (differing keys)",
+            voxDiffer(before, after, n),
+            0
+        );
+        // Remove both lamps: nothing but sky light remains.
+        rig.put(5, 5, 5, VoxIds::air());
+        rig.put(20, 8, 20, VoxIds::air());
+        let mut lit : i32 = 0;
+        for (id of 0..rig.grid.slotCount() * 4096) {
+            for (ch of 0..3) {
+                if (rig.flood.blockLevel(id, ch) > 0) {
+                    lit = lit + 1;
+                }
+            }
+        }
+        c.sameInt("no lamp, no block light anywhere", lit, 0);
+    }
+
+    // A brighter lamp removed leaves a dimmer neighbour's own light intact (the seed rule in the removal pass).
+    static fn twoLamps(c : Checks) : void {
+        let rig : VoxLightRig = new VoxLightRig(2, 1, 1, 16);
+        rig.set(4, 8, 8, VoxIds::lamp());
+        rig.set(9, 8, 8, VoxIds::dimLamp());
+        rig.flood.rebuild();
+        let both : i32[] = rig.snapshot();
+        let n : i64 = rig.grid.slotCount() as i64 * 4096 * 4;
+        rig.put(4, 8, 8, VoxIds::air());
+        c.sameInt("the dim lamp still shines at its own strength", rig.level(9, 8, 8, 0), 60);
+        let solo : VoxLightRig = new VoxLightRig(2, 1, 1, 16);
+        solo.set(9, 8, 8, VoxIds::dimLamp());
+        solo.flood.rebuild();
+        c.sameInt(
+            "equals a world that never had the bright lamp",
+            voxDiffer(rig.snapshot(), solo.snapshot(), n),
+            0
+        );
+        rig.put(4, 8, 8, VoxIds::lamp());
+        c.sameInt("and restoring it restores both", voxDiffer(rig.snapshot(), both, n), 0);
+    }
+
+    // A sealed stone room: nothing leaks out, nothing inside a solid cell.
+    static fn opaque(c : Checks) : void {
+        let rig : VoxLightRig = new VoxLightRig(2, 2, 2, 16);
+        let curve : Shared<VoxLightCurve> = rig.curve;
+        rig.fill(8, 8, 8, 20, 20, 20, VoxIds::stone());
+        rig.fill(9, 9, 9, 19, 19, 19, VoxIds::air());
+        rig.set(14, 14, 14, VoxIds::lamp());
+        rig.flood.rebuild();
+        let mut leaked : i32 = 0;
+        let mut inside : i32 = 0;
+        for (z of 0..32) {
+            for (y of 0..32) {
+                for (x of 0..32) {
+                    let isInside : bool = x >= 9 && x < 19 && y >= 9 && y < 19 && z >= 9 && z < 19;
+                    for (ch of 0..3) {
+                        let lv : i32 = rig.level(x, y, z, ch);
+                        if (!isInside && lv > 0) {
+                            leaked = leaked + 1;
+                        }
+                        if (isInside && lv > 0) {
+                            inside = inside + 1;
+                        }
+                    }
+                }
+            }
+        }
+        c.sameInt("no light outside the sealed room", leaked, 0);
+        c.that("light inside the room", inside > 100);
+        c.sameInt("a wall cell holds none", rig.level(8, 14, 14, 0), 0);
+        // Open a door: light leaks exactly there.
+        rig.put(19, 14, 14, VoxIds::air());
+        c.that("a doorway lets light out", rig.level(20, 14, 14, 0) > 0);
+        c.sameInt(
+            "beside it, light has come round the corner along a path of 8 cells",
+            rig.level(20, 16, 14, 0),
+            curve.levelAtCells(255, 8)
+        );
+        rig.put(19, 14, 14, VoxIds::stone());
+        c.sameInt("closing the door shuts the light out again", rig.level(20, 14, 14, 0), 0);
+    }
+
+    // Red glass lets red through and keeps almost all green and blue back.
+    static fn tint(c : Checks) : void {
+        let rig : VoxLightRig = new VoxLightRig(2, 1, 1, 16);
+        rig.set(4, 8, 8, VoxIds::lamp());
+        rig.flood.rebuild();
+        let clear : VoxLightRig = new VoxLightRig(2, 1, 1, 16);
+        clear.set(4, 8, 8, VoxIds::lamp());
+        clear.flood.rebuild();
+        // A whole pane, so nothing goes round it.
+        for (z of 0..16) {
+            for (y of 0..16) {
+                rig.put(8, y, z, VoxIds::redGlass());
+            }
+        }
+        let curve : Shared<VoxLightCurve> = rig.curve;
+        let mut ok : bool = true;
+        for (d of 1..12) {
+            let x : i32 = 8 + d;
+            let r : i32 = rig.level(x, 8, 8, 0);
+            let g : i32 = rig.level(x, 8, 8, 1);
+            let b : i32 = rig.level(x, 8, 8, 2);
+            let open : i32 = clear.level(x, 8, 8, 0);
+            // red: glass opacity 0 for red keeps the open level
+            if (r != open) { ok = false; }
+            // green: transmit 55/255 of the strength, exact to the curve's rounding
+            let want : f64 = rig.level(8 + d, 8, 8, 0) as f64 * 55.0 / 255.0;
+            let gap : f64 = g as f64 - want;
+            if (gap > 1.0 || gap < -1.0 || g != b) {
+                ok = false;
+            }
+        }
+        c.that(
+            "red passes untouched, green and blue are scaled to about 55/255 (within a level) behind the glass",
+            ok
+        );
+        c.that("the glass cell itself is lit", rig.level(8, 8, 8, 0) > 0);
+        c.that(
+            "green behind the glass is much dimmer than red",
+            rig.level(10, 8, 8, 1) * 3 < rig.level(10, 8, 8, 0)
+        );
+        for (z of 0..16) {
+            for (y of 0..16) {
+                rig.put(8, y, z, VoxIds::air());
+            }
+        }
+        let n : i64 = rig.grid.slotCount() as i64 * 4096 * 4;
+        c.sameInt(
+            "taking the glass away restores the open field",
+            voxDiffer(rig.snapshot(), clear.snapshot(), n),
+            0
+        );
+    }
+
+    /** Runs every check. */
+    pub static fn run(c : Checks) : void {
+        VoxLightFloodSuite::calibration(c);
+        VoxLightFloodSuite::monotone(c);
+        VoxLightFloodSuite::removeThenAdd(c);
+        VoxLightFloodSuite::twoLamps(c);
+        VoxLightFloodSuite::opaque(c);
+        VoxLightFloodSuite::tint(c);
+    }
+}

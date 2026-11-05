@@ -1,0 +1,165 @@
+// log — levels, the logger's filter and numbering, the ring buffer and the sink combinator.
+//
+// The checks follow one log line from the threshold that lets it through to the sink that keeps it: a record
+// below the threshold is dropped before it is numbered, so a gap in the sequence would mean the filter ran in
+// the wrong order. The ring is checked at its edges (a zero capacity is one slot) because it is where a logger
+// under pressure loses history, and the copying checks pin the ownership the ring promises.
+
+use ludax::{Checks, LogLevel, LogRecord, Logger, MemorySink, StdoutSink, TeeSink};
+
+/** The log checks, one static function per topic. */
+pub class LogSuite {
+    static fn levels(c : Checks) : void {
+        c.that("levels are ordered by severity", LogLevel::Trace.rank() < LogLevel::Debug.rank());
+        c.that("debug below info", LogLevel::Debug.rank() < LogLevel::Info.rank());
+        c.that("info below warn", LogLevel::Info.rank() < LogLevel::Warn.rank());
+        c.that("warn below error", LogLevel::Warn.rank() < LogLevel::Error.rank());
+        c.that("labels are five wide", LogLevel::Info.label() == "INFO ");
+        c.sameInt("every label has the same width", LogLevel::Error.label().length, 5);
+    }
+
+    static fn formatting(c : Checks) : void {
+        let record : LogRecord = LogRecord {
+            sequence: 12,
+            frame: 340,
+            level: LogLevel::Warn,
+            channel: "physics",
+            message: "body fell out of the world",
+        };
+        let line : string = "[WARN ] #12 f340 physics: body fell out of the world";
+        c.that("a record formats as one line", record.format() == line);
+        let bare : LogRecord = LogRecord {
+            sequence: 0,
+            frame: 0,
+            level: LogLevel::Info,
+            channel: "",
+            message: "hi",
+        };
+        c.that("an empty channel is left out", bare.format() == "[INFO ] #0 f0 hi");
+    }
+
+    static fn filtering(c : Checks) : void {
+        let mut log : Logger<MemorySink> = new Logger<MemorySink>(
+            new MemorySink(16),
+            LogLevel::Info
+        );
+        log.trace("t", "dropped");
+        log.debug("t", "dropped");
+        log.info("a", "kept one");
+        log.warn("b", "kept two");
+        log.error("c", "kept three");
+        c.sameInt("records below the threshold are dropped", log.sink().count(), 3);
+        c.sameInt("written counts what passed", log.written(), 3);
+        c.that(
+            "enabled follows the threshold",
+            log.enabled(LogLevel::Warn) && !log.enabled(LogLevel::Debug)
+        );
+
+        log.setThreshold(LogLevel::Trace);
+        log.trace("t", "now kept");
+        c.sameInt("lowering the threshold lets trace through", log.sink().count(), 4);
+        log.setThreshold(LogLevel::Error);
+        log.warn("t", "dropped again");
+        c.sameInt("raising it drops warnings", log.sink().count(), 4);
+    }
+
+    static fn numbering(c : Checks) : void {
+        let mut log : Logger<MemorySink> = new Logger<MemorySink>(
+            new MemorySink(16),
+            LogLevel::Trace
+        );
+        log.setFrame(7);
+        log.info("a", "first");
+        log.setFrame(8);
+        log.error("b", "second");
+        let first : LogRecord = log.sink().at(0);
+        let second : LogRecord = log.sink().at(1);
+        c.sameInt("sequence starts at zero", first.sequence, 0);
+        c.sameInt("sequence counts up", second.sequence, 1);
+        c.sameInt("frame is stamped", first.frame, 7);
+        c.sameInt("frame follows setFrame", second.frame, 8);
+        c.that("fields come back intact", first.channel == "a" && first.message == "first");
+        c.that("level comes back intact", second.level == LogLevel::Error);
+
+        log.setThreshold(LogLevel::Error);
+        log.info("a", "filtered records take no number");
+        log.error("a", "third");
+        c.sameInt("a filtered record leaves no gap", log.sink().at(2).sequence, 2);
+    }
+
+    static fn ring(c : Checks) : void {
+        let mut log : Logger<MemorySink> = new Logger<MemorySink>(
+            new MemorySink(3),
+            LogLevel::Trace
+        );
+        for (i of 0..5) {
+            log.info("n", "message ${i}");
+        }
+        let ring : MemorySink = log.sink();
+        c.sameInt("the ring keeps only its capacity", ring.count(), 3);
+        c.sameInt("it counts everything that arrived", ring.received(), 5);
+        c.that("the oldest retained record is the third", ring.at(0).message == "message 2");
+        c.that("the newest is last", ring.at(2).message == "message 4");
+        c.sameInt("sequence numbers stay attached to their records", ring.at(0).sequence, 2);
+
+        ring.clear();
+        c.sameInt("clear empties the ring", ring.count(), 0);
+        log.info("n", "after clear");
+        c.that("a cleared ring starts again at the oldest", ring.at(0).message == "after clear");
+        c.sameInt("numbering continues after clear", ring.at(0).sequence, 5);
+
+        let tiny : MemorySink = new MemorySink(0);
+        let mut small : Logger<MemorySink> = new Logger<MemorySink>(tiny, LogLevel::Trace);
+        small.info("x", "one");
+        small.info("x", "two");
+        c.sameInt("a zero capacity is one slot", small.sink().count(), 1);
+        c.that("and holds the newest record", small.sink().at(0).message == "two");
+    }
+
+    static fn copying(c : Checks) : void {
+        let mut log : Logger<MemorySink> = new Logger<MemorySink>(
+            new MemorySink(4),
+            LogLevel::Trace
+        );
+        let mut text : string = "built 1";
+        log.info("ch2", text);
+        text = "changed afterwards";
+        c.that("the ring holds its own copy of the message", log.sink().at(0).message == "built 1");
+        c.that("and of the channel", log.sink().at(0).channel == "ch2");
+    }
+
+    static fn fanOut(c : Checks) : void {
+        let both : TeeSink<MemorySink, MemorySink> = new TeeSink<MemorySink, MemorySink>(
+            new MemorySink(4),
+            new MemorySink(2)
+        );
+        let mut log : Logger<TeeSink<MemorySink, MemorySink>> = new Logger<TeeSink<MemorySink, MemorySink>>(
+            both,
+            LogLevel::Trace
+        );
+        log.info("a", "one");
+        log.info("a", "two");
+        log.info("a", "three");
+        c.sameInt("the first sink receives every record", log.sink().first().count(), 3);
+        c.sameInt("the second receives them too", log.sink().second().received(), 3);
+        c.sameInt("each keeps to its own capacity", log.sink().second().count(), 2);
+    }
+
+    static fn console(c : Checks) : void {
+        let mut log : Logger<StdoutSink> = new Logger<StdoutSink>(new StdoutSink(), LogLevel::Info);
+        log.info("log", "the stdout sink prints this line");
+        c.sameInt("a console logger counts like any other", log.written(), 1);
+    }
+
+    /** Runs the log checks. */
+    pub static fn run(c : Checks) : void {
+        LogSuite::levels(c);
+        LogSuite::formatting(c);
+        LogSuite::filtering(c);
+        LogSuite::numbering(c);
+        LogSuite::ring(c);
+        LogSuite::copying(c);
+        LogSuite::fanOut(c);
+        LogSuite::console(c);
+    }
+}

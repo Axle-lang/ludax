@@ -1,0 +1,458 @@
+// render_scene — checks for the render scene data: cameras, procedural meshes, materials, light components and the
+// extraction of a world into a `RenderScene` (culling counts, ordering, camera-relative precision).
+//
+// Meshes are checked by invariants that hold for any subdivision — outward winding, unit normals, area within a
+// tolerance — rather than by a vertex table, so a changed tessellation does not break the suite. Extraction is
+// checked at 5000 km, where a model matrix narrowed to f32 first would lose the offset the check demands.
+
+use ludax::{
+    Camera, Frustum, abs, Checks, ComponentStore, DQuat, DTransform, DVec3, EntityId, LightComp,
+    LightKind
+};
+use ludax::{
+    LightSource, LightUnits, LightAlphaMode, Mat4, MaterialRef, MeshData, MeshRef, MeshDataShapes
+};
+use ludax::{
+    RenderAssets, RenderExtract, RenderInstance, RenderMaterial, RenderScene, Scene, Vec3, PI
+};
+
+/** The scene data checks. */
+pub class RenderSceneSuite {
+    /** Runs every check of the suite. */
+    pub static fn run(c : Checks) : void {
+        rscShapeChecks(c);
+        rscCameraChecks(c);
+        rscExtractChecks(c);
+        rscOrderChecks(c);
+    }
+}
+
+// Every triangle's winding agrees with the normals of its vertices, indices are in range, normals are unit.
+fn rscWindingOk(m : MeshData) : bool {
+    let mut ok : bool = true;
+    for (t of 0..m.triangleCount()) {
+        let a : i32 = m.index(t * 3);
+        let b : i32 = m.index(t * 3 + 1);
+        let c : i32 = m.index(t * 3 + 2);
+        if (a < 0 || b < 0 || c < 0 || a >= m.vertexCount() || b >= m.vertexCount()
+            || c >= m.vertexCount()) {
+            ok = false;
+            continue;
+        }
+        let avg : Vec3 = m.normal(a).plus(m.normal(b)).plus(m.normal(c));
+        if (m.faceNormal(t).dot(avg.normalized()) < 0.8) {
+            ok = false;
+        }
+    }
+    return ok;
+}
+
+fn rscNormalsUnit(m : MeshData) : bool {
+    let mut ok : bool = true;
+    for (i of 0..m.vertexCount()) {
+        let l : f32 = m.normal(i).length();
+        if (l < 0.9999 || l > 1.0001) {
+            ok = false;
+        }
+    }
+    return ok;
+}
+
+fn rscShapeChecks(c : Checks) : void {
+    let box : MeshData = MeshDataShapes::box(2.0, 4.0, 6.0);
+    c.sameInt(
+        "scene: a box has 24 vertices and 12 triangles",
+        box.vertexCount() * 100 + box.triangleCount(),
+        2412
+    );
+    c.near(
+        "scene: a box's area is 2(ab+bc+ca)",
+        box.surfaceArea() as f64,
+        2.0 * (8.0 + 24.0 + 12.0),
+        0.0001
+    );
+    c.that(
+        "scene: a box's bounds are its half sizes",
+        box.bounds().min.approxEq(Vec3::make(-1.0, -2.0, -3.0), 0.00001)
+            && box.bounds().max.approxEq(Vec3::make(1.0, 2.0, 3.0), 0.00001)
+    );
+    c.that(
+        "scene: a box winds outward and has unit normals",
+        rscWindingOk(box) && rscNormalsUnit(box)
+    );
+
+    let ball : MeshData = MeshDataShapes::uvSphere(2.0, 48, 24);
+    let want : f64 = 4.0 * 3.14159265358979 * 4.0;
+    c.near(
+        "scene: a sphere's area is 4 pi r^2 within 0.6 percent",
+        ball.surfaceArea() as f64,
+        want,
+        want * 0.006
+    );
+    c.that(
+        "scene: a sphere winds outward and has unit normals",
+        rscWindingOk(ball) && rscNormalsUnit(ball)
+    );
+    c.that(
+        "scene: a sphere's bounds are +-r",
+        ball.bounds().max.approxEq(Vec3::make(2.0, 2.0, 2.0), 0.002)
+            && ball.bounds().min.approxEq(Vec3::make(-2.0, -2.0, -2.0), 0.002)
+    );
+    let mut onSphere : bool = true;
+    for (i of 0..ball.vertexCount()) {
+        if (ball.position(i).length() < 1.9999 || ball.position(i).length() > 2.0001) {
+            onSphere = false;
+        }
+    }
+    c.that("scene: every sphere vertex is at radius r", onSphere);
+    c.sameInt(
+        "scene: the sphere drops its collapsed pole triangles",
+        ball.triangleCount(),
+        48 * 23 * 2
+    );
+
+    let sheet : MeshData = MeshDataShapes::plane(10.0, 4.0, 5, 2, 3.0, 1.0);
+    c.near("scene: a plane's area is width x depth", sheet.surfaceArea() as f64, 40.0, 0.001);
+    c.sameInt("scene: a 5x2 plane has 20 triangles", sheet.triangleCount(), 20);
+    c.that("scene: a plane faces up", rscWindingOk(sheet) && sheet.faceNormal(0).y > 0.999);
+    c.near(
+        "scene: plane uv spans the repeat",
+        sheet.uv(sheet.vertexCount() - 1).x as f64,
+        3.0,
+        0.0001
+    );
+
+    let can : MeshData = MeshDataShapes::cylinder(1.5, 4.0, 40);
+    let canArea : f64 = 2.0 * 3.14159265358979 * 1.5 * 4.0 + 2.0 * 3.14159265358979 * 2.25;
+    c.near(
+        "scene: a cylinder's area is the side plus both caps within 1 percent",
+        can.surfaceArea() as f64,
+        canArea,
+        canArea * 0.01
+    );
+    c.that(
+        "scene: a cylinder winds outward and has unit normals",
+        rscWindingOk(can) && rscNormalsUnit(can)
+    );
+    c.that(
+        "scene: a cylinder's bounds",
+        can.bounds().max.y > 1.9999 && can.bounds().min.y < -1.9999 && can.bounds().max.x > 1.49
+    );
+
+    let metal : RenderMaterial = RenderMaterial::metal(Vec3::make(1.0, 0.8, 0.2), 0.3);
+    c.that(
+        "scene: a metal material is metallic and hands its constants to the lighting library",
+        metal.toLight().metallic == 1.0 && abs(metal.toLight().roughness - 0.3) < 0.00001
+            && abs(metal.toLight().baseColor.y - 0.8) < 0.00001
+    );
+    let mut glass : RenderMaterial = RenderMaterial {};
+    glass.alphaMode = LightAlphaMode::Blend;
+    c.that("scene: a blend material says so", glass.isBlended() && !metal.isBlended());
+}
+
+fn rscCameraChecks(c : Checks) : void {
+    let cam : Camera = Camera::perspective(
+        DVec3::make(0.0, 0.0, 0.0),
+        DQuat::identity(),
+        1.0,
+        2.0,
+        1.0,
+        100.0
+    );
+    let vp : Mat4 = cam.viewProjection();
+    let ahead : Vec3 = vp.projectPoint(Vec3::make(0.0, 0.0, -10.0));
+    c.that(
+        "camera: straight ahead is the centre of the screen",
+        abs(ahead.x) < 0.0001 && abs(ahead.y) < 0.0001
+    );
+    c.that(
+        "camera: depth runs 0 at near to 1 at far",
+        abs(vp.projectPoint(Vec3::make(0.0, 0.0, -1.0)).z) < 0.0001
+            && abs(vp.projectPoint(Vec3::make(0.0, 0.0, -100.0)).z - 1.0) < 0.0001
+    );
+    // Half the view at distance 10: tan(fov/2) * 10 high, aspect times that wide.
+    let halfH : f32 = (0.5463025 as f32) * (10.0 as f32);
+    let edge : Vec3 = vp.projectPoint(Vec3::make(halfH * 2.0, halfH, -10.0));
+    c.that(
+        "camera: the corner of the view is (1, -1) in Vulkan NDC (y down)",
+        abs(edge.x - 1.0) < 0.001 && abs(edge.y + 1.0) < 0.001
+    );
+
+    let fr : Frustum = cam.frustum();
+    c.that("camera: the frustum holds what is ahead", fr.containsPoint(Vec3::make(0.0, 0.0, -5.0)));
+    c.that(
+        "camera: the frustum rejects what is behind",
+        !fr.containsPoint(Vec3::make(0.0, 0.0, 5.0))
+    );
+    c.that(
+        "camera: the frustum rejects what is past far",
+        !fr.containsPoint(Vec3::make(0.0, 0.0, -101.0))
+    );
+    c.that(
+        "camera: the frustum rejects what is far to the side",
+        !fr.containsPoint(Vec3::make(500.0, 0.0, -5.0))
+    );
+
+    let ortho : Camera = Camera::orthographic(
+        DVec3::make(0.0, 0.0, 0.0),
+        DQuat::identity(),
+        8.0,
+        2.0,
+        0.5,
+        50.0
+    );
+    let corner : Vec3 = ortho.viewProjection().projectPoint(Vec3::make(8.0, 4.0, -20.0));
+    c.that(
+        "camera: an orthographic box is height x aspect*height",
+        abs(corner.x - 1.0) < 0.0001 && abs(corner.y + 1.0) < 0.0001
+    );
+    c.that(
+        "camera: an orthographic frustum is a box",
+        ortho.frustum().containsPoint(Vec3::make(7.9, 3.9, -49.0))
+            && !ortho.frustum().containsPoint(Vec3::make(8.1, 0.0, -10.0))
+    );
+    c.that("camera: ortho kind is reported", ortho.isOrthographic() && !cam.isOrthographic());
+
+    let aimed : Camera = cam
+        .movedTo(DVec3::make(10.0, 5.0, 0.0))
+        .lookAt(DVec3::make(10.0, 5.0, -20.0), DVec3::make(0.0, 1.0, 0.0));
+    c.that(
+        "camera: lookAt faces the target",
+        aimed.forward().minus(DVec3::make(0.0, 0.0, -1.0)).length() < 0.000001
+    );
+    let turned : Camera = cam.lookAt(DVec3::make(1.0, 0.0, 0.0), DVec3::make(0.0, 1.0, 0.0));
+    c.that(
+        "camera: lookAt turns to +X, and up stays up",
+        turned.forward().minus(DVec3::make(1.0, 0.0, 0.0)).length() < 0.000001
+            && turned.up().y > 0.999999
+    );
+    let seen : Vec3 = turned.viewProjection().projectPoint(Vec3::make(10.0, 0.0, 0.0));
+    c.that(
+        "camera: a point on the target axis lands on the centre after turning",
+        abs(seen.x) < 0.0001 && abs(seen.y) < 0.0001
+    );
+
+    // 10 000 km from the origin an f32 position has a 1 m grain; relative to the camera the offset is exact.
+    let far : Camera = cam.movedTo(DVec3::make(10000000.0, 0.0, 0.0));
+    let rel : Vec3 = far.relativePoint(DVec3::make(10000000.25, 3.0, -2.0));
+    c.that(
+        "camera: positions are made relative in f64, so 0.25 survives 10000 km",
+        rel.x == 0.25 && rel.y == 3.0 && rel.z == -2.0
+    );
+    c.that(
+        "camera: narrowing the absolute position first would lose it",
+        (10000000.25 as f32) as f64 == 10000000.0
+    );
+}
+
+// A world with entities at the given places, each a unit cube of material `mat`; returns the ids by slot.
+fn rscAddCube(
+    s : Scene,
+    meshes : ComponentStore<MeshRef>,
+    mats : ComponentStore<MaterialRef>,
+    mesh : i32,
+    mat : i32,
+    x : f64,
+    y : f64,
+    z : f64
+) : EntityId {
+    let id : EntityId = s.add("cube");
+    s.setLocal(id, DTransform::fromTranslation(DVec3::make(x, y, z)));
+    meshes.add(s.entities(), id, MeshRef { mesh: mesh });
+    mats.add(s.entities(), id, MaterialRef { material: mat });
+    return id;
+}
+
+fn rscAssets() : Shared<RenderAssets> {
+    let a : Shared<RenderAssets> = new shared RenderAssets();
+    a.addMesh(MeshDataShapes::box(1.0, 1.0, 1.0));
+    a.addMesh(MeshDataShapes::uvSphere(0.5, 8, 6));
+    a.addMaterial(RenderMaterial::matte(Vec3::make(0.5, 0.5, 0.5)));
+    a.addMaterial(RenderMaterial::metal(Vec3::make(0.9, 0.9, 0.9), 0.2));
+    return a;
+}
+
+fn rscExtractChecks(c : Checks) : void {
+    let s : Scene = new Scene();
+    let meshes : ComponentStore<MeshRef> = new ComponentStore<MeshRef>();
+    let mats : ComponentStore<MaterialRef> = new ComponentStore<MaterialRef>();
+    let lights : ComponentStore<LightComp> = new ComponentStore<LightComp>();
+    let assets : Shared<RenderAssets> = rscAssets();
+    for (i of 0..5) {
+        rscAddCube(s, meshes, mats, 0, 0, (i as f64) - 2.0, 0.0, -10.0 - (i as f64));
+    }
+    for (i of 0..3) {
+        rscAddCube(s, meshes, mats, 0, 0, 0.0, 0.0, 10.0 + (i as f64));
+    }
+    rscAddCube(s, meshes, mats, 0, 0, -1000.0, 0.0, -10.0);
+    rscAddCube(s, meshes, mats, 1, 1, 0.0, 0.0, -2000.0);
+    let cam : Camera = Camera::perspective(
+        DVec3::make(0.0, 0.0, 0.0),
+        DQuat::identity(),
+        1.0,
+        1.7777,
+        0.1,
+        500.0
+    );
+    let frame : RenderScene = RenderExtract::run(s, meshes, mats, lights, assets, cam);
+    c.sameInt("extract: ten meshes were considered", frame.consideredCount(), 10);
+    c.sameInt(
+        "extract: three behind, one aside and one past far are culled",
+        frame.culledCount(),
+        5
+    );
+    c.sameInt("extract: five instances remain", frame.instanceCount(), 5);
+
+    // Camera-relative model translation, and a moved camera sees the same things at the same relative places.
+    let moved : Camera = cam.movedTo(DVec3::make(5000000.0, 0.0, 0.0));
+    let s2 : Scene = new Scene();
+    let m2 : ComponentStore<MeshRef> = new ComponentStore<MeshRef>();
+    let t2 : ComponentStore<MaterialRef> = new ComponentStore<MaterialRef>();
+    rscAddCube(s2, m2, t2, 0, 0, 5000000.5, 1.0, -10.0);
+    let far : RenderScene = RenderExtract::run(s2, m2, t2, lights, assets, moved);
+    c.sameInt("extract: a cube 5000 km away is in view of a camera there", far.instanceCount(), 1);
+    c.that(
+        "extract: its model matrix is camera-relative and exact",
+        far.instance(0).model.m03 == 0.5 && far.instance(0).model.m13 == 1.0
+            && far.instance(0).model.m23 == -10.0
+    );
+    c.that(
+        "extract: its bounds are camera-relative too",
+        far.instance(0).bounds.min.x == 0.0 && far.instance(0).bounds.max.x == 1.0
+    );
+
+    // A destroyed entity is not extracted.
+    let victim : EntityId = rscAddCube(s2, m2, t2, 0, 0, 5000000.0, 0.0, -20.0);
+    s2.destroy(victim);
+    c.sameInt(
+        "extract: a destroyed entity is not drawn",
+        RenderExtract::run(s2, m2, t2, lights, assets, moved).instanceCount(),
+        1
+    );
+
+    // Lights: the sun's lux becomes scene irradiance, position is camera-relative, direction follows rotation.
+    let lamp : EntityId = s.add("sun");
+    s.setLocal(
+        lamp,
+        DTransform::make(
+            DVec3::make(0.0, 0.0, 0.0),
+            DQuat::fromAxisAngle(DVec3::make(1.0, 0.0, 0.0), -1.5707963267949),
+            DVec3::make(1.0, 1.0, 1.0)
+        )
+    );
+    lights.add(s.entities(), lamp, LightComp::sun(Vec3::make(1.0, 1.0, 1.0), 100000.0, 0.0093));
+    let bulb : EntityId = s.add("bulb");
+    s.setLocal(bulb, DTransform::fromTranslation(DVec3::make(3.0, 4.0, -5.0)));
+    lights.add(s.entities(), bulb, LightComp::point(Vec3::make(1.0, 0.5, 0.2), 400.0, 0.05, 20.0));
+    let lit : RenderScene = RenderExtract::run(
+        s,
+        meshes,
+        mats,
+        lights,
+        assets,
+        cam.movedTo(DVec3::make(1.0, 1.0, 1.0))
+    );
+    c.sameInt("extract: two lights", lit.lightCount(), 2);
+    let sun : LightSource = lit.light(0);
+    c.that(
+        "extract: the sun is directional at the reference irradiance (pi)",
+        sun.kind == LightKind::Directional && abs(sun.intensity - PI) < 0.0001
+    );
+    c.that(
+        "extract: a sun turned -90 degrees about X points along -Y",
+        sun.direction.y < -0.999 && abs(sun.direction.z) < 0.001
+    );
+    let point : LightSource = lit.light(1);
+    c.that(
+        "extract: the lamp is a point light at its camera-relative place",
+        point.kind == LightKind::Point
+            && point.position.approxEq(Vec3::make(2.0, 3.0, -6.0), 0.00001)
+    );
+    c.near(
+        "extract: the lamp's candela become scene units",
+        point.intensity as f64,
+        LightUnits::candelaToScene(400.0) as f64,
+        0.000001
+    );
+    c.near("extract: the lamp keeps its range", point.range as f64, 20.0, 0.00001);
+}
+
+fn rscOrderChecks(c : Checks) : void {
+    let s : Scene = new Scene();
+    let meshes : ComponentStore<MeshRef> = new ComponentStore<MeshRef>();
+    let mats : ComponentStore<MaterialRef> = new ComponentStore<MaterialRef>();
+    let lights : ComponentStore<LightComp> = new ComponentStore<LightComp>();
+    let assets : Shared<RenderAssets> = rscAssets();
+    let mut glass : RenderMaterial = RenderMaterial::plastic(Vec3::make(0.2, 0.4, 0.8), 0.1);
+    glass.alphaMode = LightAlphaMode::Blend;
+    glass.alpha = 0.5;
+    assets.addMaterial(glass);
+    // Inserted in a scrambled order on purpose.
+    rscAddCube(s, meshes, mats, 1, 1, 0.0, 0.0, -9.0);
+    rscAddCube(s, meshes, mats, 0, 2, 0.0, 0.0, -5.0);
+    rscAddCube(s, meshes, mats, 0, 1, 1.0, 0.0, -8.0);
+    rscAddCube(s, meshes, mats, 0, 0, 2.0, 0.0, -7.0);
+    rscAddCube(s, meshes, mats, 0, 2, 0.0, 0.0, -15.0);
+    rscAddCube(s, meshes, mats, 1, 0, -2.0, 0.0, -6.0);
+    rscAddCube(s, meshes, mats, 0, 0, -1.0, 0.0, -12.0);
+    let cam : Camera = Camera::perspective(
+        DVec3::make(0.0, 0.0, 0.0),
+        DQuat::identity(),
+        1.2,
+        1.7777,
+        0.1,
+        100.0
+    );
+    let a : RenderScene = RenderExtract::run(s, meshes, mats, lights, assets, cam);
+    let b : RenderScene = RenderExtract::run(s, meshes, mats, lights, assets, cam);
+    c.sameInt("order: all seven instances are drawn", a.instanceCount(), 7);
+    let mut same : bool = a.instanceCount() == b.instanceCount();
+    for (i of 0..a.instanceCount()) {
+        if (a.instance(i).objectId != b.instance(i).objectId) {
+            same = false;
+        }
+    }
+    c.that("order: two extractions give the same list", same);
+    // Opaque by (material, mesh): materials 0 (mesh 0 then 1), 1 (mesh 0 then 1); then blended, farthest first.
+    let want : i32[] = rscWant();
+    let mut ok : bool = true;
+    for (i of 0..7) {
+        if (a.instance(i).objectId != want[i]) {
+            ok = false;
+        }
+    }
+    c.that("order: opaque by material then mesh, then blended far to near", ok);
+    c.that(
+        "order: blended instances are last",
+        assets.material(a.instance(5).material).isBlended()
+            && assets.material(a.instance(6).material).isBlended()
+            && !assets.material(a.instance(4).material).isBlended()
+    );
+
+    let mut keys : i64[] = malloc<i64>(6);
+    keys[0] = 5;
+    keys[1] = 1;
+    keys[2] = 5;
+    keys[3] = 0;
+    keys[4] = 1;
+    keys[5] = 9;
+    let order : i32[] = RenderExtract::sortedOrder(keys, 6);
+    c.that(
+        "order: the merge sort is ascending and stable",
+        order[0] == 3 && order[1] == 1 && order[2] == 4 && order[3] == 0 && order[4] == 2
+            && order[5] == 5
+    );
+}
+
+// Slots of the entities created in rscOrderChecks, in the order they should be drawn.
+fn rscWant() : i32[] {
+    let mut w : i32[] = malloc<i32>(7);
+    w[0] = 3;
+    w[1] = 6;
+    w[2] = 5;
+    w[3] = 2;
+    w[4] = 0;
+    w[5] = 4;
+    w[6] = 1;
+    return w;
+}

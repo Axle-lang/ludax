@@ -1,0 +1,152 @@
+// world_json — checks for saving a scene to JSON and loading it back.
+//
+// The round trip must keep the tree (parents, child order, names) and the local transforms exactly, including
+// numbers that are not tidy; game fields added to the entity objects must come back attached to the right
+// entity; and a file that is wrong in any way must be refused with a reason, not half-loaded.
+
+use ludax::Checks;
+use ludax::DQuat;
+use ludax::DTransform;
+use ludax::DVec3;
+use ludax::EntityId;
+use ludax::JsonDoc;
+use ludax::JsonValue;
+use ludax::Scene;
+use ludax::SceneInspector;
+use ludax::SceneJson;
+use ludax::SceneLoad;
+use ludax::SceneSave;
+
+/** The scene serialisation checks. Helpers are prefixed because top-level names are global to the package. */
+pub class WorldJsonSuite {
+    /** Runs every check of the suite. */
+    pub static fn run(c : Checks) : void {
+        wjsonRoundTrip(c);
+        wjsonExtraFields(c);
+        wjsonRefusals(c);
+    }
+}
+
+fn wjsonScene() : Scene {
+    let s : Scene = new Scene();
+    let root : EntityId = s.add("root");
+    s.setLocal(
+        root,
+        DTransform::make(
+            DVec3::make(0.1 + 0.2, -1234567.891, 1.0 / 3.0),
+            DQuat::fromAxisAngle(DVec3::unitY(), 0.7),
+            DVec3::make(1.5, 2.0, 0.25)
+        )
+    );
+    let a : EntityId = s.addChild(
+        root,
+        "a",
+        DTransform::fromTranslation(DVec3::make(1.0, 2.0, 3.0))
+    );
+    s.addChild(a, "a-child \"quoted\"", DTransform::identity());
+    s.addChild(root, "b", DTransform::fromTranslation(DVec3::make(-4.0, 0.0, 0.0)));
+    s.add("");
+    // A destroyed entity leaves a hole in the slots; the file must not care.
+    let gone : EntityId = s.add("gone");
+    s.destroy(gone);
+    s.add("late");
+    return s;
+}
+
+fn wjsonRoundTrip(c : Checks) : void {
+    let s : Scene = wjsonScene();
+    let save : SceneSave = SceneJson::save(s);
+    c.sameInt("scene json: every living entity is saved", save.count(), s.count());
+    let text : string = save.text();
+    let load : SceneLoad = SceneJson::load(text);
+    c.that("scene json: the file loads (${load.error()})", load.ok());
+    c.sameInt(
+        "scene json: the same number of entities comes back",
+        load.scene().count(),
+        s.count()
+    );
+    c.that(
+        "scene json: the tree, names, child order and positions are the same",
+        SceneInspector::dumpStructure(load.scene()) == SceneInspector::dumpStructure(s)
+    );
+    let back : SceneSave = SceneJson::save(load.scene());
+    c.that(
+        "scene json: saving the loaded scene gives the same text, byte for byte",
+        back.text() == text
+    );
+    // Exactness of an untidy number.
+    let first : EntityId = load.entityAt(0);
+    let t : DTransform = load.scene().localTransform(first);
+    c.that("scene json: 0.1 + 0.2 survives", t.translation.x == 0.1 + 0.2);
+    c.that("scene json: 1/3 survives", t.translation.z == 1.0 / 3.0);
+    c.that("scene json: a large fraction survives", t.translation.y == -1234567.891);
+    c.that(
+        "scene json: the rotation survives",
+        t.rotation.approxEq(DQuat::fromAxisAngle(DVec3::unitY(), 0.7), 0.0000000001)
+    );
+    c.that(
+        "scene json: a name with quotes survives",
+        !load.scene().find("a-child \"quoted\"").isNone()
+    );
+    c.that("scene json: the indented form loads too", SceneJson::load(save.pretty(2)).ok());
+    c.that(
+        "scene json: the file maps indices to entities both ways",
+        save.indexOf(save.entityAt(3)) == 3 && save.indexOf(EntityId::none()) == -1
+    );
+}
+
+fn wjsonExtraFields(c : Checks) : void {
+    let s : Scene = new Scene();
+    let a : EntityId = s.add("a");
+    let b : EntityId = s.addChild(a, "b", DTransform::identity());
+    let save : SceneSave = SceneJson::save(s);
+    let doc : JsonDoc = save.doc();
+    let jb : JsonValue = save.entityJson(save.indexOf(b));
+    doc.set(jb, "health", doc.newNumber(42.0));
+    let load : SceneLoad = SceneJson::load(save.text());
+    c.that("scene json: a game field comes back", load.ok());
+    let i : i32 = 1;
+    let e : EntityId = load.entityAt(i);
+    c.that("scene json: ... on the entity it was stored with", load.scene().nameOfEntity(e) == "b");
+    c.sameInt(
+        "scene json: ... with its value",
+        load.doc().intOr(load.doc().field(load.entityJson(i), "health"), -1),
+        42
+    );
+    c.sameInt(
+        "scene json: an entity without the field has none",
+        load.doc().intOr(load.doc().field(load.entityJson(0), "health"), -1),
+        -1
+    );
+}
+
+fn wjsonRefusals(c : Checks) : void {
+    c.that("scene json: broken JSON is refused", !SceneJson::load("{\"format\": ").ok());
+    c.that(
+        "scene json: another kind of file is refused",
+        !SceneJson::load("{\"format\":\"other\",\"version\":1,\"entities\":[]}").ok()
+    );
+    c.that(
+        "scene json: another version is refused",
+        !SceneJson::load("{\"format\":\"ludax.scene\",\"version\":2,\"entities\":[]}").ok()
+    );
+    c.that(
+        "scene json: a missing entity list is refused",
+        !SceneJson::load("{\"format\":\"ludax.scene\",\"version\":1}").ok()
+    );
+    c.that(
+        "scene json: a parent that comes later is refused",
+        !SceneJson::load("{\"format\":\"ludax.scene\",\"version\":1,\"entities\":[{\"parent\":1},{\"parent\":-1}]}").ok()
+    );
+    c.that(
+        "scene json: an entity that is not an object is refused",
+        !SceneJson::load("{\"format\":\"ludax.scene\",\"version\":1,\"entities\":[3]}").ok()
+    );
+    let empty : SceneLoad = SceneJson::load("{\"format\":\"ludax.scene\",\"version\":1,\"entities\":[]}");
+    c.that("scene json: an empty scene is fine", empty.ok() && empty.scene().count() == 0);
+    let bad : SceneLoad = SceneJson::load("{\"format\":\"ludax.scene\",\"version\":1,\"entities\":[{\"parent\":-1},{\"parent\":7}]}");
+    c.that(
+        "scene json: a refused file leaves an empty scene, not half of one",
+        !bad.ok() && bad.scene().count() == 0
+    );
+}

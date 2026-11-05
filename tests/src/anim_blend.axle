@@ -1,0 +1,356 @@
+// anim_blend — pose blending, masks, additive layers and the animator state machine.
+//
+// The blend functions are checked against hand-computed poses: a lerp at 0, 1/2 and beyond 1, a mask that
+// covers a subtree, and an additive layer measured against its own reference. The animator is checked through
+// what it produces — the pose, the weights during a crossfade, the clock under a speed change, the events and
+// root motion of a walk — so a state-machine bug shows up as a wrong pose rather than a wrong field.
+
+use ludax::{
+    Checks, Vec3, Quat, Transform, Skeleton, Pose, Interp, Vec3Track, QuatTrack, AnimationClip,
+    BoneMask, PoseBlend, AnimCond, AnimTransition, Animator, HALF_PI
+};
+
+use crate::anim_clip::{animPairSkeleton, animSlideClip};
+use crate::math_support::{nearVec3, nearF};
+
+// A quarter and a half turn in radians, the angles this suite compares against.
+const ANIM_BLEND_QUARTER_TURN : f32 = 0.785398163;
+const ANIM_BLEND_HALF_TURN : f32 = 3.14159265;
+
+/** A looping clip of `seconds` that holds bone 0 at x = `x` the whole time. */
+fn animHoldClip(label : string, x : f32, seconds : f32, looping : bool) : AnimationClip {
+    let mut clip : AnimationClip = new AnimationClip(label, 1, looping);
+    let mut place : Vec3Track = new Vec3Track(Interp::Linear, 2);
+    place.setKey(0, 0.0, Vec3::make(x, 0.0, 0.0));
+    place.setKey(1, seconds, Vec3::make(x, 0.0, 0.0));
+    clip.addChannel(0, place, QuatTrack::none(), Vec3Track::none());
+    return clip;
+}
+
+fn animBlendTestLerp(c : Checks) : void {
+    let mut a : Pose = new Pose(2);
+    let mut b : Pose = new Pose(2);
+    let mut out : Pose = new Pose(2);
+    a.set(
+        0,
+        Transform::make(Vec3::make(0.0, 0.0, 0.0), Quat::identity(), Vec3::make(1.0, 1.0, 1.0))
+    );
+    b.set(
+        0,
+        Transform::make(
+            Vec3::make(10.0, 0.0, 0.0),
+            Quat::fromAxisAngle(Vec3::unitY(), HALF_PI),
+            Vec3::make(3.0, 3.0, 3.0)
+        )
+    );
+    PoseBlend::lerp(a, b, 0.5, out);
+    let mid : Transform = out.get(0);
+    nearVec3(
+        c,
+        "lerp halves the translation",
+        mid.translation,
+        Vec3::make(5.0, 0.0, 0.0),
+        0.00001
+    );
+    nearF(c, "lerp halves the angle", mid.rotation.angle(), ANIM_BLEND_QUARTER_TURN, 0.0001);
+    nearVec3(c, "lerp halves the scale", mid.scale, Vec3::make(2.0, 2.0, 2.0), 0.00001);
+
+    PoseBlend::lerp(a, b, 0.0, out);
+    c.that(
+        "weight 0 is exactly the first pose",
+        out.get(0).translation.x == 0.0 && out.get(0).scale.x == 1.0 && out.get(0).rotation.w == 1.0
+    );
+    PoseBlend::lerp(a, b, 1.0, out);
+    c.that(
+        "weight 1 is exactly the second pose",
+        out.get(0).translation.x == 10.0 && out.get(0).scale.x == 3.0
+            && out.get(0).rotation.w == b.get(0).rotation.w
+    );
+    PoseBlend::lerp(a, b, 7.0, out);
+    c.that("weights beyond 1 are limited", out.get(0).translation.x == 10.0);
+
+    // The output may alias an input: the blend reads both before writing either.
+    PoseBlend::lerp(a, b, 0.25, a);
+    nearVec3(
+        c,
+        "the output may be an input",
+        a.get(0).translation,
+        Vec3::make(2.5, 0.0, 0.0),
+        0.00001
+    );
+}
+
+fn animBlendTestMaskAndAdditive(c : Checks) : void {
+    let s : Skeleton = animPairSkeleton();
+    let mut base : Pose = Pose::bindOf(s);
+    let mut aim : Pose = Pose::bindOf(s);
+    let mut out : Pose = Pose::bindOf(s);
+    aim.set(0, Transform::fromTranslation(Vec3::make(0.0, 5.0, 0.0)));
+    aim.set(1, Transform::fromTranslation(Vec3::make(1.0, 5.0, 0.0)));
+    let mask : BoneMask = BoneMask::subtree(s, 1, 1.0, 0.0);
+    c.that("the mask covers the arm and not the root", mask.get(1) == 1.0 && mask.get(0) == 0.0);
+    PoseBlend::lerpMasked(base, aim, 1.0, mask, out);
+    nearVec3(c, "a masked-out bone keeps the base", out.get(0).translation, Vec3::zero(), 0.0);
+    nearVec3(
+        c,
+        "a masked-in bone takes the layer",
+        out.get(1).translation,
+        Vec3::make(1.0, 5.0, 0.0),
+        0.0
+    );
+    PoseBlend::lerpMasked(base, aim, 0.5, mask, out);
+    nearVec3(
+        c,
+        "a half weight halves the masked-in bone",
+        out.get(1).translation,
+        Vec3::make(1.0, 2.5, 0.0),
+        0.00001
+    );
+
+    // Additive: the reference is the layer's neutral frame, so layer == reference adds nothing.
+    let reference : Pose = Pose::bindOf(s);
+    let mut layer : Pose = Pose::bindOf(s);
+    layer.set(
+        1,
+        Transform::make(
+            Vec3::make(1.0, 2.0, 0.0),
+            Quat::fromAxisAngle(Vec3::unitZ(), HALF_PI),
+            Vec3::make(1.0, 1.0, 1.0)
+        )
+    );
+    PoseBlend::addLayer(base, reference, reference, 1.0, out);
+    nearVec3(
+        c,
+        "an additive layer equal to its reference adds nothing",
+        out.get(1).translation,
+        Vec3::make(1.0, 0.0, 0.0),
+        0.0
+    );
+    PoseBlend::addLayer(base, layer, reference, 1.0, out);
+    nearVec3(
+        c,
+        "the layer's difference is added to the base",
+        out.get(1).translation,
+        Vec3::make(1.0, 2.0, 0.0),
+        0.00001
+    );
+    nearF(c, "and its turn", out.get(1).rotation.angle(), HALF_PI, 0.0001);
+    PoseBlend::addLayer(base, layer, reference, 0.5, out);
+    nearVec3(
+        c,
+        "half weight adds half the shift",
+        out.get(1).translation,
+        Vec3::make(1.0, 1.0, 0.0),
+        0.00001
+    );
+    nearF(c, "and half the turn", out.get(1).rotation.angle(), ANIM_BLEND_QUARTER_TURN, 0.0001);
+    base.set(
+        1,
+        Transform::make(
+            Vec3::make(1.0, 0.0, 0.0),
+            Quat::fromAxisAngle(Vec3::unitZ(), HALF_PI),
+            Vec3::make(1.0, 1.0, 1.0)
+        )
+    );
+    PoseBlend::addLayer(base, layer, reference, 1.0, out);
+    nearF(
+        c,
+        "turns accumulate on a base that already turned",
+        out.get(1).rotation.angle(),
+        ANIM_BLEND_HALF_TURN,
+        0.0001
+    );
+    PoseBlend::addLayerMasked(base, layer, reference, 1.0, mask, out);
+    nearVec3(
+        c,
+        "a masked additive layer reaches the arm",
+        out.get(1).translation,
+        Vec3::make(1.0, 2.0, 0.0),
+        0.00001
+    );
+    PoseBlend::addLayerMasked(base, layer, reference, 1.0, BoneMask::subtree(s, 0, 0.0, 0.0), out);
+    nearVec3(c, "a zero mask adds nothing", out.get(1).translation, Vec3::make(1.0, 0.0, 0.0), 0.0);
+}
+
+fn animBlendMachine(s : Skeleton) : Animator {
+    let mut anim : Animator = new Animator(s);
+    anim.addState("idle", animHoldClip("idle", 0.0, 1.0, true), 1.0);
+    anim.addState("run", animHoldClip("run", 10.0, 1.0, true), 1.0);
+    anim.declare("go", 0.0);
+    anim.addTransition(AnimTransition {
+        from: 0,
+        to: 1,
+        duration: 1.0,
+        cond: AnimCond::IsTrue,
+        param: 0,
+    });
+    anim.addTransition(AnimTransition {
+        from: 1,
+        to: 0,
+        duration: 0.5,
+        cond: AnimCond::IsFalse,
+        param: 0,
+    });
+    return anim;
+}
+
+fn animBlendTestCrossfade(c : Checks) : void {
+    let s : Skeleton = animPairSkeleton();
+    let mut anim : Animator = animBlendMachine(s);
+    anim.update(0.25);
+    nearF(c, "idle holds x = 0", anim.pose().get(0).translation.x, 0.0, 0.0);
+    c.that("no fade yet", !anim.isFading() && anim.currentWeight() == 1.0);
+    anim.setBool("go", true);
+    anim.update(0.25);
+    c.that("the transition starts a fade", anim.isFading());
+    c.sameInt("into run", anim.currentState() as i64, 1);
+    c.sameInt("out of idle", anim.previousState() as i64, 0);
+    c.that(
+        "at the start of the fade the pose is exactly the outgoing clip's",
+        anim.pose().get(0).translation.x == 0.0
+    );
+    nearF(c, "weights at the start", anim.currentWeight(), 0.0, 0.0);
+    let mut sumOk : bool = true;
+    let mut last : f32 = 0.0;
+    for (i of 0..3) {
+        anim.update(0.25);
+        let w : f32 = anim.currentWeight();
+        let p : f32 = anim.previousWeight();
+        let one : f32 = 1.0;
+        let mut gap : f32 = w + p - one;
+        if (gap < 0.0) {
+            gap = -gap;
+        }
+        if (gap > 0.000001 || w <= last) {
+            sumOk = false;
+        }
+        last = w;
+        nearF(c, "the pose follows the weight", anim.pose().get(0).translation.x, w * 10.0, 0.0001);
+    }
+    c.that("weights sum to 1 and rise through the fade", sumOk);
+    anim.update(0.25);
+    c.that("the fade is over after its duration", !anim.isFading());
+    c.that(
+        "at the end of the fade the pose is exactly the incoming clip's",
+        anim.pose().get(0).translation.x == 10.0
+    );
+    nearF(c, "weight is 1 again", anim.currentWeight(), 1.0, 0.0);
+    anim.setBool("go", false);
+    anim.update(0.25);
+    c.sameInt("a second transition leads back to idle", anim.currentState() as i64, 0);
+    nearF(c, "stateNamed", anim.stateNamed("run") as f32, 1.0, 0.0);
+    c.sameInt("an unknown state is -1", anim.stateNamed("fly") as i64, -1);
+}
+
+fn animBlendTestSpeedAndFinish(c : Checks) : void {
+    let s : Skeleton = animPairSkeleton();
+    let mut anim : Animator = new Animator(s);
+    anim.addState("slide", animSlideClip(true), 1.0);
+    anim.update(0.25);
+    nearF(c, "a quarter second in", anim.stateClock() as f32, 0.25, 0.000001);
+    anim.setSpeed(2.0);
+    anim.update(0.25);
+    nearF(c, "twice the speed advances twice as far", anim.stateClock() as f32, 0.75, 0.000001);
+    anim.setSpeed(0.0);
+    anim.update(1.0);
+    nearF(c, "speed 0 pauses", anim.stateClock() as f32, 0.75, 0.000001);
+
+    // A one-shot state hands over to the next when it has finished.
+    let mut shot : Animator = new Animator(s);
+    shot.addState("once", animHoldClip("once", 1.0, 0.5, false), 1.0);
+    shot.addState("rest", animHoldClip("rest", 2.0, 1.0, true), 1.0);
+    shot.addTransition(AnimTransition { from: 0, to: 1, duration: 0.0, cond: AnimCond::Finished });
+    shot.update(0.25);
+    c.sameInt("not finished yet", shot.currentState() as i64, 0);
+    shot.update(0.25);
+    c.sameInt("finished: on to the next state", shot.currentState() as i64, 1);
+    nearF(c, "a zero-length fade switches at once", shot.pose().get(0).translation.x, 2.0, 0.0);
+    c.that("and leaves no fade", !shot.isFading());
+
+    let mut thr : Animator = new Animator(s);
+    thr.addState("a", animHoldClip("a", 1.0, 1.0, true), 1.0);
+    thr.addState("b", animHoldClip("b", 2.0, 1.0, true), 1.0);
+    thr.declare("speed", 0.0);
+    thr.addTransition(AnimTransition {
+        from: -1,
+        to: 1,
+        duration: 0.0,
+        cond: AnimCond::Greater,
+        param: 0,
+        threshold: 0.5,
+    });
+    thr.setFloat("speed", 0.4);
+    thr.update(0.1);
+    c.sameInt("below the threshold nothing happens", thr.currentState() as i64, 0);
+    thr.setFloat("speed", 0.6);
+    thr.update(0.1);
+    c.sameInt("above it the transition fires", thr.currentState() as i64, 1);
+    nearF(c, "parameters read back", thr.getFloat("speed"), 0.6, 0.0);
+    nearF(c, "an unknown parameter reads 0", thr.getFloat("nope"), 0.0, 0.0);
+}
+
+fn animBlendTestEventsAndMotion(c : Checks) : void {
+    let s : Skeleton = animPairSkeleton();
+    let mut anim : Animator = new Animator(s);
+    let mut clip : AnimationClip = animSlideClip(true);
+    clip.addEvent(0.5, 42);
+    anim.addState("walk", clip, 1.0);
+    anim.setRootBone(0);
+    let mut fires : i32 = 0;
+    let mut travelled : f32 = 0.0;
+    for (i of 0..40) {
+        anim.update(0.1);
+        fires = fires + anim.events().countOf(42);
+        travelled = travelled + anim.rootMotion().translation.x;
+    }
+    c.sameInt("four seconds of walking fire the marker twice", fires as i64, 2);
+    nearF(c, "and move the root 8 units (2 per second)", travelled, 8.0, 0.001);
+
+    // Cross-fading two walks blends their root motion with the same weights as the pose.
+    let mut mix : Animator = new Animator(s);
+    mix.addState("slow", animSlideClip(true), 1.0);
+    mix.addState("fast", animSlideClip(true), 2.0);
+    mix.setRootBone(0);
+    mix.crossFade(1, 1.0);
+    mix.update(0.5);
+    nearF(
+        c,
+        "halfway through the fade the two speeds average",
+        mix.rootMotion().translation.x,
+        1.5,
+        0.001
+    );
+}
+
+fn animBlendTestDeterminism(c : Checks) : void {
+    let s : Skeleton = animPairSkeleton();
+    let mut a : Animator = animBlendMachine(s);
+    let mut b : Animator = animBlendMachine(s);
+    let mut same : bool = true;
+    for (i of 0..50) {
+        if (i == 10) {
+            a.setBool("go", true);
+            b.setBool("go", true);
+        }
+        a.update(0.033);
+        b.update(0.033);
+        if (a.pose().get(0).translation.x != b.pose().get(0).translation.x) {
+            same = false;
+        }
+    }
+    c.that("two animators fed the same steps agree exactly", same);
+    c.that("and the fade did run", a.currentState() == 1);
+}
+
+/** The blend and animator suite. */
+pub class AnimBlendSuite {
+    /** Runs the blend and animator checks. */
+    pub static fn run(c : Checks) : void {
+        animBlendTestLerp(c);
+        animBlendTestMaskAndAdditive(c);
+        animBlendTestCrossfade(c);
+        animBlendTestSpeedAndFinish(c);
+        animBlendTestEventsAndMotion(c);
+        animBlendTestDeterminism(c);
+    }
+}

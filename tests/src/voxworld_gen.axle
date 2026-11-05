@@ -1,0 +1,270 @@
+// voxworld_gen — the terrain generator: same seed same blocks, in any order, on any number of threads.
+//
+// Trees cross chunk borders, which is where an order-dependent generator goes wrong, so the main check
+// generates a patch of forest chunk by chunk in two different orders and compares every cell. The others look
+// at what the generator is supposed to make: bedrock, water at sea level, caves below ground, several biomes.
+
+use ludax::{
+    Checks, Pcg32, VoxChunk, VoxChunkStore, VoxTerrain, VoxBiome, VoxWorld, VW_AIR, VW_WATER,
+    VW_BEDROCK, VW_LOG, VW_LEAVES
+};
+
+/** The chunk column of a found forest, and whether the search found one at all. */
+struct VoxForestSpot {
+    cx    : i32;
+    cz    : i32;
+    found : bool;
+}
+
+/** Checks terrain generation: order, seeds, biomes, water and caves. */
+pub class VoxWorldGenSuite {
+    // The chunk column of a forest above water, searched outward on a coarse grid.
+    static fn findForest(t : VoxTerrain) : VoxForestSpot {
+        let mut spot : VoxForestSpot = VoxForestSpot { cx: 0, cz: 0, found: false };
+        for (r of 0..60) {
+            for (dz of -r..(r + 1)) {
+                for (dx of -r..(r + 1)) {
+                    let edge : bool = dx == -r || dx == r || dz == -r || dz == r;
+                    if (edge && !spot.found) {
+                        let x : i32 = dx * 64 + 8;
+                        let z : i32 = dz * 64 + 8;
+                        if (t.biomeAt(x, z) == VoxBiome::Forest
+                            && t.heightAt(x, z) > t.seaLevel() + 4) {
+                            spot.cx = dx * 4;
+                            spot.cz = dz * 4;
+                            spot.found = true;
+                        }
+                    }
+                }
+            }
+        }
+        return spot;
+    }
+
+    static fn sameChunk(a : VoxChunk, b : VoxChunk) : bool {
+        for (i of 0..4096) {
+            if (a.get(i) != b.get(i)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /** Runs every check. */
+    pub static fn run(c : Checks) : void {
+        let t : VoxTerrain = new VoxTerrain(1234, 44);
+        let spot : VoxForestSpot = VoxWorldGenSuite::findForest(t);
+        c.that("a forest exists near the origin", spot.found);
+        let fcx : i32 = spot.cx;
+        let fcz : i32 = spot.cz;
+        println("  measured forest patch near chunk column (${fcx}, ${fcz})");
+
+        // Chunks of a 4 x 8 x 4 block of the forest, generated in two orders.
+        let n : i32 = 4 * 8 * 4;
+        let a : VoxChunkStore = new VoxChunkStore();
+        let b : VoxChunkStore = new VoxChunkStore();
+        for (i of 0..n) {
+            let cx : i32 = fcx - 2 + (i & 3);
+            let cz : i32 = fcz - 2 + ((i >> 2) & 3);
+            let cy : i32 = i >> 4;
+            let ch : VoxChunk = new VoxChunk();
+            t.fillChunk(ch, cx, cy, cz);
+            a.insert(cx, cy, cz, ch);
+        }
+        let r : Pcg32 = new Pcg32(5, 9);
+        let order : i32[] = r.permutation(n);
+        for (k of 0..n) {
+            let i : i32 = order[k as i64];
+            let cx : i32 = fcx - 2 + (i & 3);
+            let cz : i32 = fcz - 2 + ((i >> 2) & 3);
+            let cy : i32 = i >> 4;
+            let ch : VoxChunk = new VoxChunk();
+            t.fillChunk(ch, cx, cy, cz);
+            b.insert(cx, cy, cz, ch);
+        }
+        let mut same : bool = true;
+        let mut logs : i32 = 0;
+        let mut acrossBorder : i32 = 0;
+        for (i of 0..n) {
+            let cx : i32 = fcx - 2 + (i & 3);
+            let cz : i32 = fcz - 2 + ((i >> 2) & 3);
+            let cy : i32 = i >> 4;
+            if (!VoxWorldGenSuite::sameChunk(a.chunk(cx, cy, cz), b.chunk(cx, cy, cz))) {
+                same = false;
+            }
+            let ch : VoxChunk = a.chunk(cx, cy, cz);
+            for (k of 0..4096) {
+                let id : i32 = ch.get(k);
+                if (id == VW_LOG) {
+                    logs = logs + 1;
+                }
+                if (id == VW_LEAVES) {
+                    let x : i32 = cx * 16 + (k & 15);
+                    let y : i32 = cy * 16 + (k >> 8);
+                    let z : i32 = cz * 16 + ((k >> 4) & 15);
+                    if ((k & 15) == 15 && a.blockAt(x + 1, y, z) == VW_LEAVES) {
+                        acrossBorder = acrossBorder + 1;
+                    }
+                    if (((k >> 4) & 15) == 15 && a.blockAt(x, y, z + 1) == VW_LEAVES) {
+                        acrossBorder = acrossBorder + 1;
+                    }
+                }
+            }
+        }
+        c.that("generating chunks in two different orders gives identical blocks", same);
+        c.that("the forest patch has trees", logs > 20);
+        c.that("a tree's leaves continue over a chunk border", acrossBorder > 0);
+        println("  measured trunk blocks in the patch: ${logs}, leaf pairs across borders: ${acrossBorder}");
+
+        // Again through the world, serial against the job pool.
+        let serial : VoxWorld = new VoxWorld(1234, 44, 1);
+        let pooled : VoxWorld = new VoxWorld(1234, 44, 3);
+        let mut coords : i32[] = malloc<i32>((n * 3) as i64);
+        for (i of 0..n) {
+            coords[(i * 3) as i64] = fcx - 2 + (i & 3);
+            coords[(i * 3 + 1) as i64] = i >> 4;
+            coords[(i * 3 + 2) as i64] = fcz - 2 + ((i >> 2) & 3);
+        }
+        c.sameInt("serial batch loads every chunk", serial.loadBatch(coords, n, false), n);
+        c.sameInt("pooled batch loads every chunk", pooled.loadBatch(coords, n, true), n);
+        let mut poolSame : bool = true;
+        for (i of 0..n) {
+            if (!VoxWorldGenSuite::sameChunk(
+                serial.store.chunk(
+                    coords[(i * 3) as i64],
+                    coords[(i * 3 + 1) as i64],
+                    coords[(i * 3 + 2) as i64]
+                ),
+                a.chunk(
+                    coords[(i * 3) as i64],
+                    coords[(i * 3 + 1) as i64],
+                    coords[(i * 3 + 2) as i64]
+                )
+            )) {
+                poolSame = false;
+            }
+            if (!VoxWorldGenSuite::sameChunk(
+                pooled.store.chunk(
+                    coords[(i * 3) as i64],
+                    coords[(i * 3 + 1) as i64],
+                    coords[(i * 3 + 2) as i64]
+                ),
+                a.chunk(
+                    coords[(i * 3) as i64],
+                    coords[(i * 3 + 1) as i64],
+                    coords[(i * 3 + 2) as i64]
+                )
+            )) {
+                poolSame = false;
+            }
+        }
+        c.that("serial and pooled generation equal the direct generator", poolSame);
+        serial.close();
+        pooled.close();
+
+        // What the generator makes.
+        let other : VoxTerrain = new VoxTerrain(99, 44);
+        let x0 : i32 = fcx * 16;
+        let z0 : i32 = fcz * 16;
+        let c1 : VoxChunk = new VoxChunk();
+        let c2 : VoxChunk = new VoxChunk();
+        t.fillChunk(c1, fcx, 2, fcz);
+        other.fillChunk(c2, fcx, 2, fcz);
+        c.that("another seed makes another world", !VoxWorldGenSuite::sameChunk(c1, c2));
+        let c3 : VoxChunk = new VoxChunk();
+        t.fillChunk(c3, fcx, 2, fcz);
+        c.that("the same seed makes the same chunk", VoxWorldGenSuite::sameChunk(c1, c3));
+        let sky : VoxChunk = new VoxChunk();
+        t.fillChunk(sky, fcx, 7, fcz);
+        c.that("the sky chunk is uniform air", sky.isUniform() && sky.firstBlock() == VW_AIR);
+        let floor : VoxChunk = new VoxChunk();
+        t.fillChunk(floor, fcx, 0, fcz);
+        let mut bedrock : bool = true;
+        for (z of 0..16) {
+            for (x of 0..16) {
+                if (floor.at(x, 0, z) != VW_BEDROCK) {
+                    bedrock = false;
+                }
+            }
+        }
+        c.that("the world's floor is bedrock", bedrock);
+
+        let mut oceanCols : i32 = 0;
+        let mut waterOk : bool = true;
+        let mut heightsOk : bool = true;
+        let mut biomeSeen : i32 = 0;
+        let mut counts : i32[] = malloc<i32>(7);
+        for (i of 0..7) {
+            counts[i as i64] = 0;
+        }
+        for (iz of 0..40) {
+            for (ix of 0..40) {
+                let x : i32 = (ix - 20) * 61;
+                let z : i32 = (iz - 20) * 61;
+                let h : i32 = t.heightAt(x, z);
+                if (h < 4 || h > 119) {
+                    heightsOk = false;
+                }
+                let bi : i32 = t.biomeAt(x, z) as i32;
+                counts[bi as i64] = counts[bi as i64] + 1;
+                if (h < t.seaLevel()) {
+                    oceanCols = oceanCols + 1;
+                }
+            }
+        }
+        for (i of 0..7) {
+            if (counts[i as i64] > 0) {
+                biomeSeen = biomeSeen + 1;
+            }
+        }
+        println("  measured biomes over 1600 columns: ocean ${counts[0]}, beach ${counts[1]}, plains ${counts[2]}, forest ${counts[3]}, desert ${counts[4]}, tundra ${counts[5]}, mountain ${counts[6]}");
+        c.that("heights stay inside the world", heightsOk);
+        c.that("several biomes occur", biomeSeen >= 4);
+        c.that("there are seas", oceanCols > 100);
+
+        // Water fills up to sea level above low ground; a lake column is water at sea level.
+        let mut lakes : VoxWorld = new VoxWorld(1234, 44, 1);
+        let mut checkedWater : i32 = 0;
+        for (iz of 0..40) {
+            for (ix of 0..40) {
+                let x : i32 = (ix - 20) * 61;
+                let z : i32 = (iz - 20) * 61;
+                if (t.heightAt(x, z) < t.seaLevel() - 2 && checkedWater < 20) {
+                    lakes.loadChunk(x >> 4, t.seaLevel() >> 4, z >> 4);
+                    if (lakes.blockAt(x, t.seaLevel(), z) != VW_WATER) {
+                        waterOk = false;
+                    }
+                    checkedWater = checkedWater + 1;
+                }
+            }
+        }
+        lakes.close();
+        c.that("low ground is flooded to sea level", waterOk && checkedWater > 0);
+
+        // Caves: air under thick ground.
+        let cave : VoxWorld = new VoxWorld(1234, 44, 1);
+        let mut hollow : i32 = 0;
+        let mut solid : i32 = 0;
+        for (i of 0..80) {
+            let x : i32 = (i - 40) * 37;
+            let z : i32 = (i * 7 % 80 - 40) * 41;
+            cave.loadChunk(x >> 4, 0, z >> 4);
+            cave.loadChunk(x >> 4, 1, z >> 4);
+            cave.loadChunk(x >> 4, 2, z >> 4);
+            let h : i32 = t.heightAt(x, z);
+            for (y of 8..(h - 5)) {
+                if (y < 48) {
+                    if (cave.blockAt(x, y, z) == VW_AIR) {
+                        hollow = hollow + 1;
+                    } else {
+                        solid = solid + 1;
+                    }
+                }
+            }
+        }
+        cave.close();
+        println("  measured underground cells sampled: ${solid} solid, ${hollow} hollow");
+        c.that("underground is mostly rock", solid > hollow * 5);
+        c.that("there are caves", hollow > 0);
+    }
+}

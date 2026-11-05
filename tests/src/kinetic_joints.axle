@@ -1,0 +1,379 @@
+// kinetic_joints — checks for the distance, ball-and-socket and hinge joints.
+//
+// A pendulum is the reference: its rod must keep its length, and its swing must take the time mechanics gives
+// (a quarter of 2 pi sqrt(L / g) for small angles). A hinge door must turn about its axis and about nothing
+// else, and a limited hinge must stop where it was told to.
+
+use ludax::BodyDesc;
+use ludax::Checks;
+use ludax::DQuat;
+use ludax::DVec3;
+use ludax::EntityId;
+use ludax::PhysicsSettings;
+use ludax::PhysicsWorld;
+use ludax::Shape;
+use ludax::absD;
+use ludax::atan2D;
+use ludax::maxD;
+use ludax::cosD;
+use ludax::dynamicBody;
+use ludax::sinD;
+use ludax::staticBody;
+use ludax::TAU;
+
+// The gravity the joint simulations use, named so the expected times and drops read against it.
+const KIN_JOINT_GRAVITY : f64 = 9.81;
+
+/** The joint checks. */
+pub class KineticJointsSuite {
+    /** Runs every check of the suite. */
+    pub static fn run(c : Checks) : void {
+        kinDistancePendulum(c);
+        kinBallSocket(c);
+        kinChain(c);
+        kinHingeDoor(c);
+        kinHingeLimits(c);
+        kinJointRules(c);
+    }
+}
+
+fn kinDistancePendulum(c : Checks) : void {
+    // Small swing: a quarter period is T/4 with T = 2 pi sqrt(L/g) (1 + theta0^2 / 16).
+    let w : PhysicsWorld = new PhysicsWorld(PhysicsSettings { sleeping: false });
+    let pivot : DVec3 = DVec3::make(0.0, 5.0, 0.0);
+    let theta0 : f64 = 0.17453292519943295;
+    let start : DVec3 = pivot.plus(DVec3::make(2.0 * sinD(theta0), 0.0 - 2.0 * cosD(theta0), 0.0));
+    let bob : EntityId = w.addBody(dynamicBody(Shape::sphere(0.1), start, 1.0));
+    w.addDistance(EntityId::none(), bob, pivot, start);
+    let mut worst : f64 = 0.0;
+    let mut crossing : f64 = 0.0;
+    let mut lastX : f64 = start.x;
+    for (i of 0..720) {
+        w.advance();
+        let p : DVec3 = w.position(bob);
+        let err : f64 = absD(p.minus(pivot).length() - 2.0);
+        if (err > worst) {
+            worst = err;
+        }
+        if (crossing == 0.0 && lastX > 0.0 && p.x <= 0.0) {
+            let frac : f64 = lastX / (lastX - p.x);
+            crossing = ((i as f64) + frac) * w.settings().substep;
+        }
+        lastX = p.x;
+    }
+    let period : f64 = TAU * (2.0 / KIN_JOINT_GRAVITY).sqrt() * (1.0 + theta0 * theta0 / 16.0);
+    c.that("pendulum: the rod keeps its length within 1 % over 6 s", worst < 0.02);
+    c.near(
+        "pendulum: a quarter swing takes T/4 = pi/2 sqrt(L/g)",
+        crossing,
+        period / 4.0,
+        0.03 * period / 4.0
+    );
+
+    // Big swing: the rod still holds and energy is not created.
+    let wb : PhysicsWorld = new PhysicsWorld(PhysicsSettings { sleeping: false });
+    let big : DVec3 = pivot.plus(DVec3::make(
+        2.0 * sinD(1.0471975511965976),
+        0.0 - 2.0 * cosD(1.0471975511965976),
+        0.0
+    ));
+    let b2 : EntityId = wb.addBody(dynamicBody(Shape::sphere(0.1), big, 1.0));
+    wb.addDistance(EntityId::none(), b2, pivot, big);
+    let e0 : f64 = wb.kineticEnergy() + wb.potentialEnergy();
+    let mut worstLen : f64 = 0.0;
+    let mut maxE : f64 = e0;
+    let mut minE : f64 = e0;
+    for (i of 0..960) {
+        wb.advance();
+        let err : f64 = absD(wb.position(b2).minus(pivot).length() - 2.0);
+        if (err > worstLen) {
+            worstLen = err;
+        }
+        let e : f64 = wb.kineticEnergy() + wb.potentialEnergy();
+        if (e > maxE) {
+            maxE = e;
+        }
+        if (e < minE) {
+            minE = e;
+        }
+    }
+    c.that("pendulum: a 60 degree swing keeps the length within 1 %", worstLen < 0.02);
+    c.that(
+        "pendulum: the energy of a 60 degree swing stays within 2 % of the swing's energy range",
+        maxE - e0 < 0.02 * KIN_JOINT_GRAVITY && e0 - minE < 0.02 * KIN_JOINT_GRAVITY
+    );
+}
+
+fn kinBallSocket(c : Checks) : void {
+    let w : PhysicsWorld = new PhysicsWorld(PhysicsSettings { sleeping: false });
+    let pivot : DVec3 = DVec3::make(0.0, 5.0, 0.0);
+    let bob : EntityId = w.addBody(dynamicBody(
+        Shape::sphere(0.25),
+        DVec3::make(2.0, 5.0, 0.0),
+        1.0
+    ));
+    let j : i32 = w.addBallSocket(EntityId::none(), bob, pivot);
+    let mut worst : f64 = 0.0;
+    let mut lowest : f64 = 5.0;
+    for (i of 0..480) {
+        w.advance();
+        let gap : f64 = w.jointAnchorA(j).distance(w.jointAnchorB(j));
+        if (gap > worst) {
+            worst = gap;
+        }
+        if (w.position(bob).y < lowest) {
+            lowest = w.position(bob).y;
+        }
+    }
+    c.that(
+        "ball-socket: the two anchors stay together (below 5 mm) while the bob swings",
+        worst < 0.005
+    );
+    c.near(
+        "ball-socket: the bob swings through the bottom, 2 m below the pivot",
+        lowest,
+        3.0,
+        0.03
+    );
+    c.near(
+        "ball-socket: the bob's distance from the pivot is the arm length",
+        w.position(bob).minus(pivot).length(),
+        2.0,
+        0.02
+    );
+}
+
+fn kinChain(c : Checks) : void {
+    let w : PhysicsWorld = new PhysicsWorld(PhysicsSettings { sleeping: false });
+    let links : i32 = 6;
+    let mut ids : EntityId[] = malloc<EntityId>(8);
+    let mut joints : i32[] = malloc<i32>(8);
+    let mut prev : EntityId = EntityId::none();
+    for (i of 0..links) {
+        let x : f64 = 0.5 + (i as f64);
+        let mut d : BodyDesc = dynamicBody(
+            Shape::cuboid(0.45, 0.08, 0.08),
+            DVec3::make(x, 6.0, 0.0),
+            1.0
+        );
+        d.friction = 0.2;
+        let id : EntityId = w.addBody(d);
+        joints[i as i64] = w.addBallSocket(prev, id, DVec3::make(x - 0.5, 6.0, 0.0));
+        ids[i as i64] = id;
+        prev = id;
+    }
+    let mut worst : f64 = 0.0;
+    for (i of 0..720) {
+        w.advance();
+        for (k of 0..links) {
+            let gap : f64 = w
+                .jointAnchorA(joints[k as i64])
+                .distance(w.jointAnchorB(joints[k as i64]));
+            if (gap > worst) {
+                worst = gap;
+            }
+        }
+    }
+    // The worst moment is the whip of the free end after the chain has swung down: about 5 cm at its worst.
+    c.that(
+        "chain: every link of a 6-link chain stays within 8 cm (8 % of a link) of its neighbour while it whips",
+        worst < 0.08
+    );
+    let tip : DVec3 = w.position(ids[(links - 1) as i64]);
+    c.that(
+        "chain: the chain stays within its length of the pivot",
+        tip.minus(DVec3::make(0.0, 6.0, 0.0)).length() < 6.0 + 0.1
+    );
+    c.that("chain: and has swung down from the horizontal", tip.y < 5.5);
+}
+
+fn kinHingeDoor(c : Checks) : void {
+    let w : PhysicsWorld = new PhysicsWorld(PhysicsSettings { sleeping: false });
+    let hinge : DVec3 = DVec3::make(0.0, 1.0, 0.0);
+    let door : EntityId = w.addBody(dynamicBody(
+        Shape::cuboid(0.5, 1.0, 0.05),
+        DVec3::make(0.5, 1.0, 0.0),
+        4.0
+    ));
+    let j : i32 = w.addHinge(EntityId::none(), door, hinge, DVec3::unitY());
+    let mut dyMax : f64 = 0.0;
+    let mut radiusErr : f64 = 0.0;
+    let mut offAxis : f64 = 0.0;
+    for (i of 0..240) {
+        if (i < 120) {
+            w.applyForce(door, DVec3::make(0.0, 0.0, 30.0));
+        }
+        w.advance();
+        let p : DVec3 = w.position(door);
+        dyMax = maxD(dyMax, absD(p.y - 1.0));
+        let r : f64 = (p.x * p.x + p.z * p.z).sqrt();
+        radiusErr = maxD(radiusErr, absD(r - 0.5));
+        let om : DVec3 = w.angularVelocity(door);
+        let side : f64 = (om.x * om.x + om.z * om.z).sqrt();
+        offAxis = maxD(offAxis, side);
+    }
+    c.that("hinge: gravity does not drop the door (height within 2 mm)", dyMax < 0.002);
+    c.that(
+        "hinge: the door's centre stays on its circle about the hinge (within 5 mm)",
+        radiusErr < 0.005
+    );
+    c.that(
+        "hinge: the door turns only about the hinge axis (off-axis spin below 0.01 rad/s)",
+        offAxis < 0.01
+    );
+    let p : DVec3 = w.position(door);
+    let swung : f64 = absD(atan2D(p.z, p.x));
+    c.that("hinge: the push swings the door by more than 0.5 rad", swung > 0.5);
+    c.near(
+        "hinge: the hinge angle agrees with where the door is",
+        absD(w.hingeAngle(j)),
+        swung,
+        0.01
+    );
+    c.that(
+        "hinge: the door's own axis still points up",
+        w.rotation(door).rotate(DVec3::unitY()).y > 0.9999
+    );
+}
+
+fn kinHingeLimits(c : Checks) : void {
+    // A bar on a horizontal hinge falls under gravity; with limits [-0.5, 0.5] it stops at -0.5 rad.
+    let w : PhysicsWorld = new PhysicsWorld(PhysicsSettings { sleeping: false });
+    let bar : EntityId = w.addBody(dynamicBody(
+        Shape::cuboid(0.5, 0.05, 0.05),
+        DVec3::make(0.5, 3.0, 0.0),
+        1.0
+    ));
+    let j : i32 = w.addHinge(EntityId::none(), bar, DVec3::make(0.0, 3.0, 0.0), DVec3::unitZ());
+    w.setHingeLimits(j, 0.0 - 0.5, 0.5);
+    let mut lowest : f64 = 0.0;
+    for (i of 0..360) {
+        w.advance();
+        let a : f64 = w.hingeAngle(j);
+        if (a < lowest) {
+            lowest = a;
+        }
+    }
+    c.that(
+        "hinge limit: the bar never passes the lower limit by more than 0.05 rad",
+        lowest > 0.0 - 0.55
+    );
+    c.that("hinge limit: and it does reach it", lowest < 0.0 - 0.45);
+    c.near("hinge limit: it rests against the limit", w.hingeAngle(j), 0.0 - 0.5, 0.03);
+    c.that("hinge limit: at rest", w.angularVelocity(bar).length() < 0.05);
+
+    let wf : PhysicsWorld = new PhysicsWorld(PhysicsSettings { sleeping: false });
+    let loose : EntityId = wf.addBody(dynamicBody(
+        Shape::cuboid(0.5, 0.05, 0.05),
+        DVec3::make(0.5, 3.0, 0.0),
+        1.0
+    ));
+    let jf : i32 = wf.addHinge(EntityId::none(), loose, DVec3::make(0.0, 3.0, 0.0), DVec3::unitZ());
+    let mut low : f64 = 0.0;
+    for (i of 0..120) {
+        wf.advance();
+        if (wf.hingeAngle(jf) < low) {
+            low = wf.hingeAngle(jf);
+        }
+    }
+    c.that("hinge limit: without limits the same bar swings down to the vertical", low < 0.0 - 1.3);
+
+    // The upper limit: spin the bar up against it.
+    let wu : PhysicsWorld = new PhysicsWorld(PhysicsSettings {
+        sleeping: false,
+        gravity: DVec3::zero(),
+    });
+    let up : EntityId = wu.addBody(dynamicBody(
+        Shape::cuboid(0.5, 0.05, 0.05),
+        DVec3::make(0.5, 3.0, 0.0),
+        1.0
+    ));
+    let ju : i32 = wu.addHinge(EntityId::none(), up, DVec3::make(0.0, 3.0, 0.0), DVec3::unitZ());
+    wu.setHingeLimits(ju, 0.0 - 0.5, 0.5);
+    wu.setAngularVelocity(up, DVec3::make(0.0, 0.0, 3.0));
+    let mut highest : f64 = 0.0;
+    for (i of 0..120) {
+        wu.advance();
+        if (wu.hingeAngle(ju) > highest) {
+            highest = wu.hingeAngle(ju);
+        }
+    }
+    c.that("hinge limit: the upper limit holds", highest < 0.55 && highest > 0.45);
+}
+
+fn kinJointRules(c : Checks) : void {
+    // Two boxes tied by a distance joint fly as a dumbbell: the centre of mass moves ballistically, the rod holds.
+    let w : PhysicsWorld = new PhysicsWorld(PhysicsSettings { sleeping: false });
+    let mut da : BodyDesc = dynamicBody(Shape::sphere(0.2), DVec3::make(0.0, 10.0, 0.0), 1.0);
+    da.linearVelocity = DVec3::make(0.0, 0.0, 2.0);
+    let mut db : BodyDesc = dynamicBody(Shape::sphere(0.2), DVec3::make(1.5, 10.0, 0.0), 3.0);
+    db.linearVelocity = DVec3::make(0.0, 0.0, -1.0);
+    let a : EntityId = w.addBody(da);
+    let b : EntityId = w.addBody(db);
+    w.addDistance(a, b, DVec3::make(0.0, 10.0, 0.0), DVec3::make(1.5, 10.0, 0.0));
+    kinRunJ(w, 120);
+    let com : DVec3 = w.position(a).scale(0.25).plus(w.position(b).scale(0.75));
+    let comZ : f64 = 0.25 * 2.0 + 0.75 * -1.0;
+    c.near(
+        "distance joint: the dumbbell's rod keeps its length",
+        w.position(a).distance(w.position(b)),
+        1.5,
+        0.03
+    );
+    c.near(
+        "distance joint: the centre of mass drifts at its mean velocity",
+        com.z,
+        comZ * 1.0,
+        0.01
+    );
+    c.near(
+        "distance joint: the centre of mass falls freely",
+        com.y,
+        10.0 - 0.5 * KIN_JOINT_GRAVITY,
+        0.02
+    );
+    c.that(
+        "distance joint: the pair rotates (it carries angular momentum)",
+        w.position(a).z != w.position(b).z
+    );
+
+    // Removing a joint frees the bodies; removing a body removes its joints.
+    let w2 : PhysicsWorld = new PhysicsWorld(PhysicsSettings { sleeping: false });
+    let x : EntityId = w2.addBody(dynamicBody(
+        Shape::sphere(0.2),
+        DVec3::make(0.0, 10.0, 0.0),
+        1.0
+    ));
+    let j : i32 = w2.addBallSocket(EntityId::none(), x, DVec3::make(0.0, 10.0, 0.0));
+    kinRunJ(w2, 60);
+    c.that("joints: a ball joint at the body's own centre holds it up", w2.position(x).y > 9.99);
+    w2.removeJoint(j);
+    kinRunJ(w2, 60);
+    c.that("joints: without the joint it falls", w2.position(x).y < 9.9);
+    let w3 : PhysicsWorld = new PhysicsWorld(PhysicsSettings { sleeping: false });
+    let y : EntityId = w3.addBody(dynamicBody(
+        Shape::sphere(0.2),
+        DVec3::make(0.0, 10.0, 0.0),
+        1.0
+    ));
+    let z : EntityId = w3.addBody(dynamicBody(
+        Shape::sphere(0.2),
+        DVec3::make(1.0, 10.0, 0.0),
+        1.0
+    ));
+    w3.addDistance(y, z, DVec3::make(0.0, 10.0, 0.0), DVec3::make(1.0, 10.0, 0.0));
+    w3.removeBody(y);
+    kinRunJ(w3, 60);
+    c.near(
+        "joints: removing a body removes its joints, the other falls freely (g t^2 / 2 in 0.5 s)",
+        w3.position(z).y,
+        10.0 - 0.5 * KIN_JOINT_GRAVITY * 0.25,
+        0.001
+    );
+}
+
+fn kinRunJ(w : PhysicsWorld, n : i32) : void {
+    for (i of 0..n) {
+        w.advance();
+    }
+}

@@ -1,0 +1,452 @@
+// assetdb — checks for the asset database: ids, kinds, loading through the virtual file system, dependencies
+// and reload.
+//
+// The ids are checked for stability and normalisation, and for the collision rule by actually finding two
+// paths that share an id. Dependencies are checked by what they make fail: an asset whose dependency is
+// missing must not be loaded, a cycle must be refused before anything is read. Reload is checked by
+// version numbers across unchanged, changed, broken and vanished files.
+
+use ludax::AssetDb;
+use ludax::AssetId;
+use ludax::AssetKind;
+use ludax::ByteBuf;
+use ludax::Checks;
+use ludax::Image;
+use ludax::JsonDoc;
+use ludax::Map;
+use ludax::ModelAsset;
+use ludax::PngCodec;
+use ludax::Vfs;
+
+/** The asset database checks. */
+pub class AssetDbSuite {
+    /** Runs every check of the suite. */
+    pub static fn run(c : Checks) : void {
+        adbIdChecks(c);
+        adbLoadChecks(c);
+        adbDependencyChecks(c);
+        adbReloadChecks(c);
+        adbModelChecks(c);
+        adbCollisionChecks(c);
+    }
+}
+
+fn adbPng(w : i32, h : i32, pixel : i32) : ByteBuf {
+    let img : Image = new Image(w, h);
+    img.fill(pixel);
+    let codec : PngCodec = new PngCodec();
+    return codec.encode(img);
+}
+
+fn adbPut(db : AssetDb, path : string, text : string) : void {
+    try {
+        db.files().writeText(path, text);
+    } catch e : IOException {
+        println("adb: setup failed ${e.message}");
+    }
+}
+
+fn adbPutBytes(db : AssetDb, path : string, bytes : ByteBuf) : void {
+    try {
+        db.files().write(path, bytes);
+    } catch e : IOException {
+        println("adb: setup failed ${e.message}");
+    }
+}
+
+fn adbNewDb() : AssetDb {
+    let files : Vfs = new Vfs();
+    files.addMemory("");
+    return new AssetDb(files);
+}
+
+fn adbIdChecks(c : Checks) : void {
+    let a : AssetId = AssetDb::idFor("textures/grass.png");
+    c.that("assets: an id is not negative", a.raw >= 0 && !a.isNone());
+    c.that("assets: ids are stable", a.same(AssetDb::idFor("textures/grass.png")));
+    c.that(
+        "assets: ids are taken from the normalised path",
+        a.same(AssetDb::idFor("./textures//grass.png"))
+            && a.same(AssetDb::idFor("textures\\x\\..\\grass.png"))
+    );
+    c.that(
+        "assets: different paths have different ids",
+        !a.same(AssetDb::idFor("textures/grass.PNG"))
+            && !a.same(AssetDb::idFor("textures/dirt.png"))
+    );
+    // Pinned: the id of this path must never change between releases, or saved references break.
+    c.sameInt("assets: the id of textures/grass.png is pinned", a.raw, adbPinned());
+    let db : AssetDb = adbNewDb();
+    let id : AssetId = db.register("textures/grass.png");
+    c.that("assets: register gives the derived id", id.same(a) && db.count() == 1);
+    c.that(
+        "assets: registering again changes nothing",
+        db.register("./textures/grass.png").same(id) && db.count() == 1
+    );
+    c.that(
+        "assets: find",
+        db.find("textures/grass.png").same(id) && db.find("textures/none.png").isNone()
+    );
+    c.that(
+        "assets: pathOf",
+        db.pathOf(id) == "textures/grass.png" && db.pathOf(AssetId::none()) == ""
+    );
+    c.that(
+        "assets: the kind comes from the extension",
+        db.kindOf(id) == AssetKind::Image && db.kindOf(db.register("a.JSON")) == AssetKind::Json
+            && db.kindOf(db.register("m/x.gltf")) == AssetKind::Model
+            && db.kindOf(db.register("m/x.glb")) == AssetKind::Model
+            && db.kindOf(db.register("m/x.bbmodel")) == AssetKind::Model
+            && db.kindOf(db.register("m/x.bin")) == AssetKind::Bytes
+            && db.kindOf(db.register("noext")) == AssetKind::Bytes
+    );
+    c.that(
+        "assets: a kind can be forced",
+        db.kindOf(db.registerAs("data.dat", AssetKind::Json)) == AssetKind::Json
+    );
+    c.that(
+        "assets: a path above the root is refused",
+        db.register("../x.png").isNone() && db.error().byteLength > 0
+    );
+    c.that(
+        "assets: the empty path is refused",
+        db.register("").isNone() && db.register("a/..").isNone()
+    );
+    c.that("assets: nothing is loaded by registering", !db.isLoaded(id) && db.version(id) == 0);
+}
+
+// The id of "textures/grass.png", fixed once and for all.
+fn adbPinned() : i32 {
+    return 702303516;
+}
+
+fn adbLoadChecks(c : Checks) : void {
+    let db : AssetDb = adbNewDb();
+    adbPutBytes(db, "img/red.png", adbPng(3, 2, Image::pack(200, 10, 20, 255)));
+    adbPut(db, "cfg/game.json", "{\"title\": \"ludax\", \"lives\": 3}");
+    adbPut(db, "raw/blob.bin", "abc");
+    let png : AssetId = db.load("img/red.png");
+    c.that("assets: an image loads", !png.isNone() && db.isLoaded(png) && db.version(png) == 1);
+    let img : Image = db.image(png);
+    c.that(
+        "assets: the image has its size and pixels",
+        img.width() == 3 && img.height() == 2 && img.get(2, 1) == Image::pack(200, 10, 20, 255)
+    );
+    let js : AssetId = db.load("cfg/game.json");
+    let doc : JsonDoc = db.json(js);
+    c.that(
+        "assets: a JSON file loads",
+        doc.ok() && doc.asString(doc.field(doc.root(), "title")) == "ludax"
+            && doc.intOr(doc.field(doc.root(), "lives"), 0) == 3
+    );
+    let raw : AssetId = db.load("raw/blob.bin");
+    c.that("assets: bytes load", db.bytes(raw).len() == 3 && db.bytes(raw).get(1) == 98);
+    c.that(
+        "assets: a value of the wrong kind is empty",
+        db.image(js).isEmpty() && db.json(png).root().isNone() && db.bytes(png).len() == 0
+            && db.image(AssetId::none()).isEmpty()
+    );
+    c.sameInt("assets: three installs so far", db.installCount(), 3);
+    c.that(
+        "assets: loading again does not install again",
+        db.load("img/red.png").same(png) && db.installCount() == 3 && db.version(png) == 1
+    );
+    // Failures.
+    c.that(
+        "assets: a missing file fails",
+        db.load("img/none.png").isNone() && db.error().byteLength > 0
+    );
+    c.that(
+        "assets: the failed asset is registered but not loaded",
+        !db.find("img/none.png").isNone() && !db.isLoaded(db.find("img/none.png"))
+    );
+    adbPut(db, "img/bad.png", "this is not a png");
+    c.that(
+        "assets: a damaged image fails with the codec's reason",
+        db.load("img/bad.png").isNone() && db.error().startsWith("img/bad.png: ")
+    );
+    adbPut(db, "cfg/bad.json", "{\"a\": }");
+    c.that(
+        "assets: a damaged JSON file fails with its position",
+        db.load("cfg/bad.json").isNone() && db.error().startsWith("cfg/bad.json: line 1, column 7")
+    );
+    c.that("assets: a path above the root fails", db.load("../secret.json").isNone());
+    c.that("assets: models are not read yet", db.load("m/x.gltf").isNone());
+    c.sameInt("assets: failures installed nothing", db.installCount(), 3);
+}
+
+fn adbDependencyChecks(c : Checks) : void {
+    // A chain: scene.json needs mesh.json needs tex.png.
+    let db : AssetDb = adbNewDb();
+    adbPut(db, "scene.json", "{\"scene\":1}");
+    adbPut(db, "mesh.json", "{\"mesh\":1}");
+    adbPutBytes(db, "tex.png", adbPng(1, 1, 0xFF0000FF));
+    c.that(
+        "assets: dependsOn registers both",
+        db.dependsOn("scene.json", "mesh.json") && db.dependsOn("mesh.json", "tex.png")
+            && db.count() == 3
+    );
+    c.that(
+        "assets: declaring a dependency twice adds one",
+        db.dependsOn("scene.json", "mesh.json") && db.dependencyCount(db.find("scene.json")) == 1
+    );
+    c.that(
+        "assets: dependencyAt",
+        db.dependencyAt(db.find("scene.json"), 0).same(db.find("mesh.json"))
+            && db.dependencyAt(db.find("scene.json"), 1).isNone()
+    );
+    let top : AssetId = db.loadWithDependencies("scene.json");
+    c.that(
+        "assets: loading with dependencies loads all of them",
+        !top.isNone() && db.isLoaded(top) && db.isLoaded(db.find("mesh.json"))
+            && db.isLoaded(db.find("tex.png"))
+    );
+    c.sameInt("assets: each loaded once", db.installCount(), 3);
+    // Dependencies first: when the deepest one is missing, nothing above it is loaded.
+    let broken : AssetDb = adbNewDb();
+    adbPut(broken, "a.json", "{}");
+    adbPut(broken, "b.json", "{}");
+    broken.dependsOn("a.json", "b.json");
+    broken.dependsOn("b.json", "missing.json");
+    c.that(
+        "assets: a missing dependency fails the whole load",
+        broken.loadWithDependencies("a.json").isNone() && broken.error().byteLength > 0
+    );
+    c.that(
+        "assets: nothing above a failed dependency is loaded",
+        !broken.isLoaded(broken.find("a.json")) && !broken.isLoaded(broken.find("b.json"))
+    );
+    c.sameInt("assets: and nothing was installed", broken.installCount(), 0);
+    // A diamond loads the shared dependency once.
+    let dia : AssetDb = adbNewDb();
+    adbPut(dia, "top.json", "{}");
+    adbPut(dia, "left.json", "{}");
+    adbPut(dia, "right.json", "{}");
+    adbPut(dia, "base.json", "{}");
+    dia.dependsOn("top.json", "left.json");
+    dia.dependsOn("top.json", "right.json");
+    dia.dependsOn("left.json", "base.json");
+    dia.dependsOn("right.json", "base.json");
+    c.that("assets: a diamond loads", !dia.loadWithDependencies("top.json").isNone());
+    c.sameInt("assets: the shared dependency is loaded once", dia.installCount(), 4);
+    c.sameInt("assets: and has version 1", dia.version(dia.find("base.json")), 1);
+    // Already loaded dependencies are not loaded again.
+    adbPut(dia, "extra.json", "{}");
+    dia.dependsOn("extra.json", "base.json");
+    dia.loadWithDependencies("extra.json");
+    c.sameInt("assets: only the new asset is installed", dia.installCount(), 5);
+    // Cycles.
+    let cyc : AssetDb = adbNewDb();
+    adbPut(cyc, "x.json", "{}");
+    adbPut(cyc, "y.json", "{}");
+    adbPut(cyc, "z.json", "{}");
+    cyc.dependsOn("x.json", "y.json");
+    cyc.dependsOn("y.json", "z.json");
+    cyc.dependsOn("z.json", "x.json");
+    c.that("assets: a cycle is refused", cyc.loadWithDependencies("x.json").isNone());
+    c.that(
+        "assets: the cycle is named",
+        cyc.error().startsWith("dependency cycle: x.json -> y.json -> z.json -> x.json")
+    );
+    c.sameInt("assets: nothing of a cycle is loaded", cyc.installCount(), 0);
+    c.that("assets: a cycle can still be loaded one by one", !cyc.load("x.json").isNone());
+    let selfLoop : AssetDb = adbNewDb();
+    adbPut(selfLoop, "s.json", "{}");
+    selfLoop.dependsOn("s.json", "s.json");
+    c.that(
+        "assets: an asset that needs itself is a cycle",
+        selfLoop.loadWithDependencies("s.json").isNone()
+            && selfLoop.error().startsWith("dependency cycle")
+    );
+    // A cycle that does not include the asked asset is still found on the way.
+    let tail : AssetDb = adbNewDb();
+    adbPut(tail, "r.json", "{}");
+    tail.dependsOn("r.json", "p.json");
+    tail.dependsOn("p.json", "q.json");
+    tail.dependsOn("q.json", "p.json");
+    c.that(
+        "assets: a cycle below the root is found",
+        tail.loadWithDependencies("r.json").isNone()
+            && tail.error().startsWith("dependency cycle: p.json -> q.json -> p.json")
+    );
+}
+
+fn adbReloadChecks(c : Checks) : void {
+    let db : AssetDb = adbNewDb();
+    adbPut(db, "cfg.json", "{\"v\": 1}");
+    adbPutBytes(db, "pic.png", adbPng(2, 2, 0xFF00FF00));
+    adbPut(db, "raw.bin", "one");
+    let cfg : AssetId = db.load("cfg.json");
+    let pic : AssetId = db.load("pic.png");
+    let raw : AssetId = db.load("raw.bin");
+    c.that(
+        "assets: version 1 after the first load",
+        db.version(cfg) == 1 && db.version(pic) == 1 && db.version(raw) == 1
+    );
+    c.that(
+        "assets: an unchanged file does not reload",
+        !db.reload("cfg.json") && db.version(cfg) == 1 && db.error() == ""
+    );
+    adbPut(db, "cfg.json", "{\"v\": 2}");
+    c.that("assets: a changed file reloads", db.reload("cfg.json") && db.version(cfg) == 2);
+    c.that(
+        "assets: with its new value",
+        db.json(cfg).intOr(db.json(cfg).field(db.json(cfg).root(), "v"), 0) == 2
+    );
+    c.that(
+        "assets: the other assets keep their version",
+        db.version(pic) == 1 && db.version(raw) == 1
+    );
+    adbPut(db, "cfg.json", "{\"v\": 2}");
+    c.that(
+        "assets: writing the same bytes again is not a change",
+        !db.reload("cfg.json") && db.version(cfg) == 2
+    );
+    adbPut(db, "cfg.json", "{\"v\": ");
+    c.that(
+        "assets: a broken file is not installed",
+        !db.reload("cfg.json") && db.version(cfg) == 2 && db.error().startsWith("cfg.json: line 1")
+    );
+    c.that(
+        "assets: the last good value stays",
+        db.json(cfg).intOr(db.json(cfg).field(db.json(cfg).root(), "v"), 0) == 2
+    );
+    adbPut(db, "cfg.json", "{\"v\": 3}");
+    c.that("assets: a repaired file reloads", db.reload("cfg.json") && db.version(cfg) == 3);
+    adbPutBytes(db, "pic.png", adbPng(4, 1, 0xFF112233));
+    c.that(
+        "assets: an image reloads",
+        db.reload("pic.png") && db.version(pic) == 2 && db.image(pic).width() == 4
+            && db.image(pic).height() == 1
+    );
+    try {
+        db.files().remove("raw.bin");
+    } catch e : IOException {
+        c.that("assets: the removal worked", false);
+    }
+    c.that(
+        "assets: a vanished file keeps its value",
+        !db.reload("raw.bin") && db.version(raw) == 1 && db.bytes(raw).len() == 3
+            && db.error().byteLength > 0
+    );
+    adbPut(db, "raw.bin", "two!");
+    adbPut(db, "cfg.json", "{\"v\": 4}");
+    c.sameInt("assets: reloadAll counts the changed assets", db.reloadAll(), 2);
+    c.that(
+        "assets: reloadAll updated them",
+        db.version(raw) == 2 && db.bytes(raw).len() == 4 && db.version(cfg) == 4
+            && db.version(pic) == 2
+    );
+    c.sameInt("assets: and a second reloadAll finds nothing", db.reloadAll(), 0);
+    c.that(
+        "assets: reloading an asset never loaded loads it",
+        db.reload("cfg2.json") == false && db.error().byteLength > 0
+    );
+    adbPut(db, "cfg2.json", "{}");
+    c.that(
+        "assets: reload of a new file loads it",
+        db.reload("cfg2.json") && db.version(db.find("cfg2.json")) == 1
+    );
+}
+
+fn adbCollisionChecks(c : Checks) : void {
+    // Find two paths with the same id by brute force (31-bit ids: a few tens of thousands of paths suffice).
+    let seen : Map<i32, i32> = new Map<i32, i32>();
+    let mut first : i32 = -1;
+    let mut second : i32 = -1;
+    let mut i : i32 = 0;
+    while (second < 0 && i < 600000) {
+        let id : i32 = AssetDb::idFor("collide/${i}.bin").raw;
+        let before : i32 = seen.getOr(id, -1);
+        if (before >= 0) {
+            first = before;
+            second = i;
+        } else {
+            seen.put(id, i);
+        }
+        i = i + 1;
+    }
+    c.that("assets: found two paths with one id to test with", second >= 0);
+    if (second < 0) {
+        return;
+    }
+    let a : string = "collide/${first}.bin";
+    let b : string = "collide/${second}.bin";
+    let db : AssetDb = adbNewDb();
+    let ida : AssetId = db.register(a);
+    c.that("assets: the first path registers", !ida.isNone());
+    let idb : AssetId = db.register(b);
+    c.that("assets: the second path with the same id is refused", idb.isNone());
+    c.that(
+        "assets: the error names both paths",
+        db.error().startsWith("asset id collision: ${b} and ${a}")
+    );
+    c.sameInt("assets: only one is registered", db.count(), 1);
+    c.that("assets: the first still works", db.register(a).same(ida));
+    adbPut(db, b, "x");
+    c.that("assets: loading the refused path fails", db.load(b).isNone());
+}
+
+fn adbJson(s : string) : string {
+    let b : ByteBuf = DataText::toBytes(s);
+    for (i of 0..b.len()) {
+        if (b.get(i) == 39) {
+            b.set(i, 34);
+        }
+    }
+    return DataText::fromBytes(b, 0, b.len());
+}
+
+fn adbGltf(nodes : string) : string {
+    return adbJson("{'asset':{'version':'2.0'},'scene':0,'scenes':[{'nodes':[0]}],'nodes':${nodes},'meshes':[{'primitives':[{'attributes':{'POSITION':1},'indices':0}]}],'buffers':[{'byteLength':44,'uri':'data:application/octet-stream;base64,AAABAAIAAAAAAAAAAAAAAAAAAAAAAIA/AAAAAAAAAAAAAAAAAACAPwAAAAA='}],'bufferViews':[{'buffer':0,'byteLength':6},{'buffer':0,'byteOffset':8,'byteLength':36}],'accessors':[{'bufferView':0,'componentType':5123,'count':3,'type':'SCALAR'},{'bufferView':1,'componentType':5126,'count':3,'type':'VEC3'}]}");
+}
+
+fn adbModelChecks(c : Checks) : void {
+    let db : AssetDb = adbNewDb();
+    adbPut(db, "m/tri.gltf", adbGltf("[{'mesh':0}]"));
+    adbPut(
+        db,
+        "m/cube.bbmodel",
+        adbJson("{'elements':[{'type':'cube','uuid':'u','from':[0,0,0],'to':[16,16,16],'faces':{'north':{'uv':[0,0,16,16]}}}]}")
+    );
+    adbPut(
+        db,
+        "m/bad.gltf",
+        "{\"asset\":{\"version\":\"2.0\"},\"buffers\":[{\"byteLength\":4,\"uri\":\"missing.bin\"}]}"
+    );
+    let tri : AssetId = db.load("m/tri.gltf");
+    c.that(
+        "assets: a glTF model loads (${db.error()})",
+        !tri.isNone() && db.kindOf(tri) == AssetKind::Model && db.version(tri) == 1
+    );
+    let model : ModelAsset = db.model(tri);
+    c.that(
+        "assets: the model is there",
+        model.ok() && model.meshCount() == 1 && model.nodeCount() == 1
+            && model.mesh(0).primitive(0).triangleCount() == 1
+    );
+    let cube : AssetId = db.load("m/cube.bbmodel");
+    c.that(
+        "assets: a Blockbench model loads (${db.error()})",
+        !cube.isNone() && db.model(cube).mesh(0).primitive(0).vertexCount() == 4
+    );
+    c.that(
+        "assets: a model of the wrong kind is an empty failed one",
+        !db.model(db.register("x.json")).ok() && !db.model(AssetId::none()).ok()
+    );
+    c.that(
+        "assets: a broken model fails with the importer's reason",
+        db.load("m/bad.gltf").isNone() && db.error().startsWith("m/bad.gltf: ")
+    );
+    adbPut(db, "m/tri.gltf", adbGltf("[{'mesh':0},{}]"));
+    c.that(
+        "assets: a changed model reloads",
+        db.reload("m/tri.gltf") && db.version(tri) == 2 && db.model(tri).nodeCount() == 2
+    );
+    adbPut(db, "m/tri.gltf", adbGltf("[{'children':[0]}]"));
+    c.that(
+        "assets: a model that became invalid keeps its last good value",
+        !db.reload("m/tri.gltf") && db.version(tri) == 2 && db.model(tri).nodeCount() == 2
+            && db.error().startsWith("m/tri.gltf: ")
+    );
+}

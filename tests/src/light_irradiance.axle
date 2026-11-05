@@ -1,0 +1,552 @@
+// light_irradiance — the laws of a light's irradiance: sphere, cap quadrature, inverse square, window, cone.
+//
+// Every closed form is checked against a numerical integral written independently: the sphere's illuminance
+// against a cap quadrature, the point light against the inverse-square law at two distances, the directional
+// penumbra against its own monotonicity. The quadrature rule is checked first, so a later failure points at
+// the law rather than at the instrument. The range and spot windows are checked at both edges, where a
+// discontinuity is easiest to hide.
+
+use ludax::{
+    Checks, Pcg32, Vec3, Vec, LightGauss, LightSource, LightReason, LightIncident, LIGHT_LAYERS_ALL
+};
+use ludax::{lightSphereIlluminance, lightSphereIlluminanceD, lightPointIrradiance};
+use ludax::{lightDirectionalIrradiance};
+use ludax::{lightDiscIrradiance, lightRangeWindow, lightSpotCone, lightIncidence};
+use ludax::{cosD, sinD, acosD, PI_D};
+
+use crate::light_support::{LightWorst, LightSum, lightRel};
+
+// E / L of a spherical cap of half-angle `sigma` whose axis is at angle `theta` from the normal, by direct
+// quadrature of the integral of max(0, n.w) dw over the cap, with no closed form in it. Polar coordinates
+// around the axis: w = cos(r) a + sin(r)(cos(p) e1 + sin(p) e2), dw = sin(r) dr dp,
+// n.w = cos(t)cos(r) + sin(t) sin(r) cos(p).
+// The horizon clip makes the p-range [-p0, p0] with cos(p0) = -k; the r-integral is cut where the clip
+// begins and ends (k = +-1), and a cosine substitution tames the square-root behaviour at those cuts.
+fn capQuad(rule : LightGauss, phiRule : LightGauss, theta : f64, sigma : f64) : f64 {
+    let cuts : Vec<f64> = new Vec<f64>();
+    cuts.push(0.0);
+    let mut candidates : f64[] = malloc<f64>(3);
+    candidates[0] = PI_D * 0.5 - theta;
+    candidates[1] = theta - PI_D * 0.5;
+    candidates[2] = theta + PI_D * 0.5;
+    for (k of 0..3) {
+        let b : f64 = candidates[k as i64];
+        if (b > 0.0 && b < sigma) {
+            let mut at : i32 = cuts.len();
+            cuts.push(b);
+            while (at > 0 && cuts.get(at - 1) > b) {
+                cuts.swap(at, at - 1);
+                at = at - 1;
+            }
+        }
+    }
+    cuts.push(sigma);
+    let total : LightSum = new LightSum();
+    for (seg of 0..(cuts.len() - 1)) {
+        let lo : f64 = cuts.get(seg);
+        let hi : f64 = cuts.get(seg + 1);
+        for (i of 0..rule.order()) {
+            let t : f64 = rule.at(i, 0.0, 1.0);
+            let r : f64 = lo + (hi - lo) * 0.5 * (1.0 - cosD(PI_D * t));
+            let w : f64 = rule.scaled(i, 0.0, 1.0) * (hi - lo) * 0.5 * PI_D * sinD(PI_D * t);
+            total.add(w * sinD(r) * capAzimuth(phiRule, theta, r));
+        }
+    }
+    return total.total();
+}
+
+// The azimuth integral of max(0, A + B cos p) at polar angle r.
+fn capAzimuth(rule : LightGauss, theta : f64, r : f64) : f64 {
+    let a : f64 = cosD(theta) * cosD(r);
+    let b : f64 = sinD(theta) * sinD(r);
+    let mut p0 : f64 = PI_D;
+    if (b > 0.0000000001) {
+        let k : f64 = a / b;
+        if (k <= -1.0) {
+            return 0.0;
+        }
+        if (k < 1.0) {
+            p0 = acosD(0.0 - k);
+        }
+    } else if (a <= 0.0) {
+        return 0.0;
+    }
+    let sum : LightSum = new LightSum();
+    for (i of 0..rule.order()) {
+        let p : f64 = rule.at(i, 0.0 - p0, p0);
+        sum.add(rule.scaled(i, 0.0 - p0, p0) * (a + b * cosD(p)));
+    }
+    return sum.total();
+}
+
+/** Checks of sources' irradiance. */
+pub class LightIrradianceSuite {
+    /** Runs every check of this suite. */
+    pub static fn run(c : Checks) : void {
+        LightIrradianceSuite::rules(c);
+        LightIrradianceSuite::sphere(c);
+        LightIrradianceSuite::sphereF32(c);
+        LightIrradianceSuite::lawsInverseSquare(c);
+        LightIrradianceSuite::lawsDirectional(c);
+        LightIrradianceSuite::lawsDisc(c);
+        LightIrradianceSuite::windowRange(c);
+        LightIrradianceSuite::windowSpot(c);
+        LightIrradianceSuite::incidence(c);
+    }
+
+    // The quadrature rule itself, before it is trusted to check anything.
+    static fn rules(c : Checks) : void {
+        let worstSum : LightWorst = new LightWorst();
+        let worstPoly : LightWorst = new LightWorst();
+        for (n of 1..65) {
+            let g : LightGauss = new LightGauss(n);
+            let sum : LightSum = new LightSum();
+            for (i of 0..n) {
+                sum.add(g.weight(i));
+            }
+            worstSum.note(sum.total() - 2.0, "order ${n}");
+            // x^k over [0, 1] is 1/(k+1); exact for k up to 2n-1.
+            let top : i32 = 2 * n - 1;
+            let poly : LightSum = new LightSum();
+            for (i of 0..n) {
+                let x : f64 = g.at(i, 0.0, 1.0);
+                let mut p : f64 = 1.0;
+                for (k of 0..top) {
+                    p = p * x;
+                }
+                poly.add(g.scaled(i, 0.0, 1.0) * p);
+            }
+            worstPoly.note(poly.total() - 1.0 / (top as f64 + 1.0), "order ${n}");
+        }
+        worstSum.within(c, "Gauss-Legendre weights sum to 2, orders 1..64", 0.00000000000002);
+        worstPoly.within(
+            c,
+            "Gauss-Legendre integrates x^(2n-1) exactly, orders 1..64",
+            0.00000000000001
+        );
+    }
+
+    // The closed-form sphere illuminance against the cap quadrature, in all three regimes.
+    static fn sphere(c : Checks) : void {
+        let rule : LightGauss = new LightGauss(40);
+        let phi : LightGauss = new LightGauss(24);
+        let worstD : LightWorst = new LightWorst();
+        let worstRegime : LightWorst = new LightWorst();
+        let mut sigmas : f64[] = malloc<f64>(5);
+        sigmas[0] = 0.0046;
+        sigmas[1] = 0.1;
+        sigmas[2] = 0.4;
+        sigmas[3] = 0.9;
+        sigmas[4] = 1.3;
+        for (si of 0..5) {
+            let sigma : f64 = sigmas[si as i64];
+            let s2 : f64 = sinD(sigma) * sinD(sigma);
+            for (ti of 0..181) {
+                let theta : f64 = (ti as f64) * PI_D / 180.0;
+                let want : f64 = capQuad(rule, phi, theta, sigma);
+                let got : f64 = lightSphereIlluminanceD(cosD(theta), s2);
+                worstD.note((got - want) / s2, "sigma ${sigma} theta ${theta}");
+            }
+        }
+        worstD.within(
+            c,
+            "sphere illuminance f64 vs cap quadrature, error / sin^2(sigma), 5 sizes x 181 angles",
+            0.00000001
+        );
+        // The three regimes named separately, so a failure says which branch broke.
+        let sigma : f64 = 0.4;
+        let s2 : f64 = sinD(sigma) * sinD(sigma);
+        let above : f64 = 0.5;
+        let between : f64 = 1.5707963 - 0.1;
+        let below : f64 = 2.8;
+        worstRegime.note(
+            lightSphereIlluminanceD(cosD(above), s2) - capQuad(rule, phi, above, sigma),
+            "above"
+        );
+        worstRegime.note(
+            lightSphereIlluminanceD(cosD(between), s2) - capQuad(rule, phi, between, sigma),
+            "clipped"
+        );
+        worstRegime.note(
+            lightSphereIlluminanceD(cosD(below), s2) - capQuad(rule, phi, below, sigma),
+            "below"
+        );
+        worstRegime.within(
+            c,
+            "sphere: above, clipped and below regimes match quadrature",
+            0.0000000001
+        );
+        c.near(
+            "wholly below the horizon gives exactly 0",
+            lightSphereIlluminanceD(cosD(below), s2),
+            0.0,
+            0.0
+        );
+        c.near(
+            "wholly above equals pi sin^2 cos",
+            lightSphereIlluminanceD(cosD(above), s2),
+            PI_D * s2 * cosD(above),
+            0.0000000000001
+        );
+    }
+
+    // f32 against f64 over a seeded sweep, relative to the maximum pi sin^2 so the clipped tail is judged
+    // fairly.
+    static fn sphereF32(c : Checks) : void {
+        let mut rng : Pcg32 = new Pcg32(11, 5);
+        let worst32 : LightWorst = new LightWorst();
+        for (k of 0..4000) {
+            let ct : f32 = rng.rangeF32(-1.0, 1.0);
+            let ss : f32 = rng.rangeF32(0.0001, 0.9);
+            let f32v : f64 = lightSphereIlluminance(ct, ss) as f64;
+            let f64v : f64 = lightSphereIlluminanceD(ct as f64, ss as f64);
+            worst32.note((f32v - f64v) / (PI_D * (ss as f64)), "cos ${ct} s2 ${ss}");
+        }
+        worst32.within(
+            c,
+            "sphere illuminance f32 vs f64, error / (pi sin^2), 4000 seeded draws",
+            0.00005
+        );
+    }
+
+    // Inverse square and cosine, and the point-light limit of a small sphere.
+    static fn lawsInverseSquare(c : Checks) : void {
+        let worstSq : LightWorst = new LightWorst();
+        let worstPoint : LightWorst = new LightWorst();
+        let mut rng : Pcg32 = new Pcg32(21, 9);
+        for (k of 0..500) {
+            let intensity : f32 = rng.rangeF32(0.5, 20.0);
+            let d : f32 = rng.rangeF32(1.0, 30.0);
+            let ct : f32 = rng.rangeF32(0.2, 1.0);
+            let near : f32 = lightPointIrradiance(intensity, 0.0, d, ct);
+            let far : f32 = lightPointIrradiance(intensity, 0.0, d * 2.0, ct);
+            worstSq.note((near / far) as f64 / 4.0 - 1.0, "point d ${d}");
+            // A radius-0.05 sphere is far enough to be a point at d >= 1: the same quarter law within 1e-4.
+            let sNear : f32 = lightPointIrradiance(intensity, 0.05, d, ct);
+            let sFar : f32 = lightPointIrradiance(intensity, 0.05, d * 2.0, ct);
+            worstSq.note((sNear / sFar) as f64 / 4.0 - 1.0, "sphere d ${d}");
+            // sigma -> 0: sphere = I cos / d^2 with I = L pi R^2 (law 6).
+            worstPoint.note(
+                (sNear as f64) / ((intensity * ct / (d * d)) as f64) - 1.0,
+                "sphere vs point d ${d}"
+            );
+        }
+        worstSq.within(
+            c,
+            "doubling the distance quarters the irradiance (point and sphere)",
+            0.0002
+        );
+        worstPoint.within(
+            c,
+            "sphere of radius 0.05 at d>=1 equals the point formula I cos/d^2",
+            0.0001
+        );
+        c.near(
+            "point: I cos / d^2 exactly",
+            lightPointIrradiance(8.0, 0.0, 2.0, 0.5) as f64,
+            1.0,
+            0.0000001
+        );
+        c.near(
+            "point: cosine law, 60 degrees is half of normal",
+            (lightPointIrradiance(
+                4.0,
+                0.0,
+                1.0,
+                0.5
+            )
+                / lightPointIrradiance(4.0, 0.0, 1.0, 1.0)) as f64,
+            0.5,
+            0.0000001
+        );
+        c.near(
+            "point behind the surface gives 0",
+            lightPointIrradiance(4.0, 0.0, 1.0, -0.3) as f64,
+            0.0,
+            0.0
+        );
+        // A large sphere touching the light: no singularity, finite and below the surface-of-sphere limit.
+        let inside : f32 = lightPointIrradiance(10.0, 0.5, 0.0, 1.0);
+        c.that("a surface at the light's centre is finite", inside.isFinite() && inside > 0.0);
+        c.that(
+            "a sphere light is never brighter than the point it replaces",
+            lightPointIrradiance(
+                10.0,
+                0.5,
+                0.6,
+                1.0
+            )
+                <= lightPointIrradiance(10.0, 0.0, 0.6, 1.0) * 1.00001
+        );
+    }
+
+    // Directional: normal incidence returns exactly the illuminance, and the disc's penumbra is real.
+    static fn lawsDirectional(c : Checks) : void {
+        let r : f32 = 0.00465;
+        c.near(
+            "sun at normal incidence returns its illuminance",
+            lightDirectionalIrradiance(3.0, r, 1.0) as f64,
+            3.0,
+            0.00001
+        );
+        c.near(
+            "sun cosine law at 60 degrees",
+            lightDirectionalIrradiance(3.0, r, 0.5) as f64,
+            1.5,
+            0.00001
+        );
+        c.near(
+            "sun far below the horizon is 0",
+            lightDirectionalIrradiance(3.0, r, -0.2) as f64,
+            0.0,
+            0.0
+        );
+        c.near(
+            "zero-size sun is a Lambert dot",
+            lightDirectionalIrradiance(3.0, 0.0, 0.5) as f64,
+            1.5,
+            0.0000001
+        );
+        let half : f32 = lightDirectionalIrradiance(3.0, r, 0.0);
+        c.that(
+            "sun on the horizon is about half a disc, between 0 and its width",
+            half > 0.0 && half < 3.0 * 0.01
+        );
+        // Penumbra monotone through the horizon, and its width is the disc's: nonzero for cos in (-sin r,
+        // sin r).
+        let mut prev : f32 = -1.0;
+        let mut ok : bool = true;
+        let mut lit : i32 = 0;
+        let mut ct : f32 = -0.02;
+        while (ct < 0.02) {
+            let e : f32 = lightDirectionalIrradiance(3.0, r, ct);
+            if (e < prev) {
+                ok = false;
+            }
+            if (e > 0.0 && e < 3.0 * ct) {
+                lit = lit + 1;
+            }
+            prev = e;
+            ct = ct + (0.0001 as f32);
+        }
+        c.that("directional irradiance is monotone in cosine through the penumbra", ok);
+        c.that("a penumbra exists: lit below the cosine-law line near the horizon", lit > 20);
+    }
+
+    // A disc seen on its axis at a distance.
+    static fn lawsDisc(c : Checks) : void {
+        c.near(
+            "disc on its axis at distance d: L pi r^2/(r^2+d^2) when facing the point",
+            lightDiscIrradiance(2.0, 1.0, 3.0, 1.0, 1.0) as f64,
+            2.0 * 3.14159265 * 0.1,
+            0.00001
+        );
+        c.near(
+            "disc seen from behind gives 0",
+            lightDiscIrradiance(2.0, 1.0, 3.0, 1.0, -0.5) as f64,
+            0.0,
+            0.0
+        );
+    }
+
+    // The range window: one at the light, zero at and beyond its range, monotone between.
+    static fn windowRange(c : Checks) : void {
+        c.near("window is 1 at the light", lightRangeWindow(0.0, 10.0) as f64, 1.0, 0.0);
+        c.near("window is exactly 0 at range", lightRangeWindow(10.0, 10.0) as f64, 0.0, 0.0);
+        c.near("window is 0 beyond range", lightRangeWindow(25.0, 10.0) as f64, 0.0, 0.0);
+        c.near("window with range 0 is off", lightRangeWindow(1000.0, 0.0) as f64, 1.0, 0.0);
+        let mut mono : bool = true;
+        let mut prev : f32 = 2.0;
+        let mut d : f32 = 0.0;
+        while (d < 12.0) {
+            let w : f32 = lightRangeWindow(d, 10.0);
+            if (w > prev || w < 0.0 || w > 1.0) {
+                mono = false;
+            }
+            prev = w;
+            d = d + (0.05 as f32);
+        }
+        c.that("window decreases monotonically from 1 to 0 and stays within 0..1", mono);
+        // C1 at range: the slope just inside is tiny (w'(R) = 0).
+        let slope : f64 = ((lightRangeWindow(
+            9.999,
+            10.0
+        )
+            - lightRangeWindow(10.0, 10.0))
+            / 0.001) as f64;
+        c.near("window slope at range is 0 (w'(R) = 0)", slope, 0.0, 0.001);
+    }
+
+    // The spot cone: one inside, zero outside, a smooth ramp between.
+    static fn windowSpot(c : Checks) : void {
+        let inner : f32 = 0.9;
+        let outer : f32 = 0.7;
+        c.near(
+            "spot is 1 inside the inner cone",
+            lightSpotCone(0.95, inner, outer) as f64,
+            1.0,
+            0.0
+        );
+        c.near("spot is 0 at the outer cone", lightSpotCone(outer, inner, outer) as f64, 0.0, 0.0);
+        c.near("spot is 0 outside", lightSpotCone(0.1, inner, outer) as f64, 0.0, 0.0);
+        let mut cosv : f32 = 0.6;
+        let mut last : f32 = -1.0;
+        let mut smooth : bool = true;
+        while (cosv <= 1.0) {
+            let s : f32 = lightSpotCone(cosv, inner, outer);
+            if (s < last) {
+                smooth = false;
+            }
+            last = s;
+            cosv = cosv + (0.002 as f32);
+        }
+        c.that("spot factor is monotone in the angle (rises as the cosine rises)", smooth);
+        // Slope at the outer edge is 0 (C1 there); at the inner edge it jumps from 2*scale = 10 per unit
+        // cosine to 0.
+        let outerSlope : f64 = ((lightSpotCone(
+            0.7 + 0.0001,
+            inner,
+            outer
+        )
+            - lightSpotCone(0.7, inner, outer))
+            / 0.0001) as f64;
+        c.near("spot slope at the outer edge is 0", outerSlope, 0.0, 0.01);
+        let innerSlope : f64 = ((lightSpotCone(
+            0.9,
+            inner,
+            outer
+        )
+            - lightSpotCone(0.9 - 0.0001, inner, outer))
+            / 0.0001) as f64;
+        c.near(
+            "spot slope just inside the inner edge is 2*scale (C0, not C1, there)",
+            innerSlope,
+            10.0,
+            0.05
+        );
+        c.near(
+            "spot is continuous at the inner edge",
+            lightSpotCone(0.9, inner, outer) as f64,
+            1.0,
+            0.0
+        );
+        c.near(
+            "spot halfway is a squared linear ramp",
+            lightSpotCone(0.8, inner, outer) as f64,
+            0.25,
+            0.00001
+        );
+        c.near(
+            "degenerate cone (inner = outer) does not divide by zero",
+            lightSpotCone(0.5, 0.8, 0.8) as f64,
+            0.0,
+            0.0
+        );
+    }
+
+    // lightIncidence and every reason in the documented order.
+    static fn incidence(c : Checks) : void {
+        let white : Vec3 = Vec3::splat(1.0);
+        let up : Vec3 = Vec3::unitY();
+        let origin : Vec3 = Vec3::zero();
+        let lamp : LightSource = LightSource::point(
+            white,
+            100.0,
+            Vec3::make(0.0, 2.0, 0.0),
+            0.0,
+            10.0
+        );
+        let hit : LightIncident = lightIncidence(lamp, origin, up, up, 1, 0);
+        c.that("a lamp above the point reaches it", hit.reason == LightReason::None);
+        c.near(
+            "lamp irradiance is I/d^2 times the window",
+            hit.irradiance as f64,
+            ((lamp.intensity / 4.0) * lightRangeWindow(2.0, 10.0)) as f64,
+            0.000001
+        );
+        c.near("lamp nDotL straight above is 1", hit.nDotL as f64, 1.0, 0.0000001);
+        let far : LightIncident = lightIncidence(lamp, Vec3::make(0.0, -9.0, 0.0), up, up, 1, 0);
+        c.that("beyond the range the lamp is excluded for range", far.reason == LightReason::Range);
+        let under : LightIncident = lightIncidence(lamp, Vec3::make(0.0, 4.0, 0.0), up, up, 1, 0);
+        c.that("a lamp below the surface is a backface", under.reason == LightReason::Backface);
+        let mut masked : LightSource = lamp;
+        masked.includeLayers = 2;
+        c.that(
+            "layer outside the include mask",
+            lightIncidence(masked, origin, up, up, 1, 0).reason == LightReason::Mask
+        );
+        c.that(
+            "layer inside the include mask is lit",
+            lightIncidence(masked, origin, up, up, 2, 0).reason == LightReason::None
+        );
+        let mut barred : LightSource = lamp;
+        barred.excludeLayers = 1;
+        c.that(
+            "excluded layer",
+            lightIncidence(barred, origin, up, up, 1, 0).reason == LightReason::Excluded
+        );
+        let mut skip : LightSource = lamp;
+        skip.excludeObject = 7;
+        c.that(
+            "excluded object",
+            lightIncidence(skip, origin, up, up, 1, 7).reason == LightReason::Excluded
+        );
+        c.that(
+            "other objects are lit",
+            lightIncidence(skip, origin, up, up, 1, 8).reason == LightReason::None
+        );
+        let spot : LightSource = LightSource::spot(
+            white,
+            100.0,
+            Vec3::make(0.0, 2.0, 0.0),
+            Vec3::make(0.0, -1.0, 0.0),
+            0.2,
+            0.4,
+            0.0,
+            0.0
+        );
+        c.that(
+            "spot straight down lights the point below",
+            lightIncidence(spot, origin, up, up, 1, 0).reason == LightReason::None
+        );
+        c.that(
+            "spot misses a point far off axis",
+            lightIncidence(
+                spot,
+                Vec3::make(5.0, 0.0, 0.0),
+                up,
+                up,
+                1,
+                0
+            ).reason
+                == LightReason::Cone
+        );
+        let sun : LightSource = LightSource::directional(
+            white,
+            100000.0,
+            Vec3::make(0.0, -1.0, 0.0),
+            0.0093
+        );
+        let lit : LightIncident = lightIncidence(sun, origin, up, up, 1, 0);
+        c.near(
+            "the reference sun overhead puts pi on a flat surface",
+            lit.irradiance as f64,
+            3.14159265,
+            0.0001
+        );
+        let night : LightIncident = lightIncidence(
+            sun,
+            origin,
+            Vec3::make(0.0, -1.0, 0.0),
+            Vec3::make(0.0, -1.0, 0.0),
+            1,
+            0
+        );
+        c.that("the sun on the underside is a backface", night.reason == LightReason::Backface);
+        let geo : LightIncident = lightIncidence(sun, origin, up, Vec3::make(0.0, -1.0, 0.0), 1, 0);
+        c.that(
+            "geometric normal facing away blocks a normal-mapped surface",
+            geo.reason == LightReason::Backface
+        );
+    }
+}

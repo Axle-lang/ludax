@@ -1,0 +1,149 @@
+// light_vndf — the visible-normal sampler: its density integrates to 1 and the samples follow it.
+//
+// The density's integral is evaluated in the CDF coordinates of D, where the visible set's square-root edge
+// is handled by cutting u and substituting a cosine. The sampler is then checked statistically: 200000 seeded
+// draws must stay on the unit hemisphere, their mean n.h must match the quadrature within four standard
+// errors, and so must the mean G2/G1 against the albedo table. A statistical check with a stated error bound
+// is the only honest way to test a sampler.
+
+use ludax::{
+    Checks, Pcg32, Vec3, LightGauss, LightDfg, LightDfgTable, lightVndfSample, lightVndfPdf
+};
+use ludax::{lightSmithG1, lightSmithG2};
+use ludax::{lightGgxDD, clampD, acosD, cosD, sinD, sqrtD, PI_D, sqrt, absD};
+
+use crate::light_support::{LightWorst, LightSum};
+
+// The view in tangent space (+Z normal) at cosine nv.
+fn tangentView(nv : f32) : Vec3 {
+    return Vec3::make(sqrt(1.0 - nv * nv), 0.0, nv);
+}
+
+// Integral over the hemisphere of g(h) * pdf(h) dwh, with g = 1 (kind 0) or g = n.h (kind 1), by quadrature
+// in the CDF coordinates of D: dwh = du dphi / (2 pi D n.h). The visible set v.h > 0 has a square-root edge in
+// u where theta_h = pi/2 - theta_v (n.h = sin theta_v): u is cut there and the upper part uses the cosine
+// substitution; phi runs over [0, phi0] (twice, by symmetry) with Gauss-Legendre.
+fn pdfIntegral(v : Vec3, alpha : f32, kind : i32) : f64 {
+    let rule : LightGauss = new LightGauss(64);
+    let a2 : f64 = (alpha as f64) * (alpha as f64);
+    let nv : f64 = v.z as f64;
+    let sv : f64 = sqrtD(1.0 - nv * nv);
+    let cut : f64 = (1.0 - sv * sv) / (1.0 + sv * sv * (a2 - 1.0));
+    let sum : LightSum = new LightSum();
+    for (i of 0..128) {
+        let seg : i32 = i / 64;
+        let node : i32 = i % 64;
+        let t : f64 = rule.at(node, 0.0, 1.0);
+        let mut u : f64 = cut * t;
+        let mut du : f64 = cut * rule.scaled(node, 0.0, 1.0);
+        if (seg == 1) {
+            u = cut + (1.0 - cut) * 0.5 * (1.0 - cosD(PI_D * t));
+            du = rule.scaled(node, 0.0, 1.0) * (1.0 - cut) * 0.5 * PI_D * sinD(PI_D * t);
+        }
+        let nh2 : f64 = (1.0 - u) / (1.0 + (a2 - 1.0) * u);
+        let nh : f64 = sqrtD(nh2);
+        let sh : f64 = sqrtD(1.0 - nh2);
+        if (nh < 0.000000001) {
+            continue;
+        }
+        let mut phi0 : f64 = PI_D;
+        if (seg == 1 && sv * sh > 0.000000000001) {
+            phi0 = acosD(clampD(0.0 - nv * nh / (sv * sh), -1.0, 1.0));
+        }
+        for (k of 0..64) {
+            let phi : f64 = rule.at(k, 0.0, phi0);
+            let h : Vec3 = Vec3::make((sh * cosD(phi)) as f32, (sh * sinD(phi)) as f32, nh as f32);
+            let d : f64 = lightGgxDD(nh, alpha as f64);
+            let mut g : f64 = 1.0;
+            if (kind == 1) {
+                g = nh;
+            }
+            let w : f64 = 2.0 * du * rule.scaled(k, 0.0, phi0) / (2.0 * PI_D * d * nh);
+            sum.add(g * (lightVndfPdf(v, h, alpha) as f64) * w);
+        }
+    }
+    return sum.total();
+}
+
+/** Checks of the visible-normal sampler. */
+pub class LightVndfSuite {
+    /** Runs every check of this suite. */
+    pub static fn run(c : Checks) : void {
+        let norm : LightWorst = new LightWorst();
+        let mut views : f32[] = malloc<f32>(4);
+        views[0] = 0.15;
+        views[1] = 0.5;
+        views[2] = 0.8;
+        views[3] = 1.0;
+        let mut alphas : f32[] = malloc<f32>(3);
+        alphas[0] = 0.1;
+        alphas[1] = 0.4;
+        alphas[2] = 1.0;
+        for (a of 0..3) {
+            for (m of 0..4) {
+                let nv : f32 = views[m as i64];
+                let alpha : f32 = alphas[a as i64];
+                let v : Vec3 = tangentView(nv);
+                norm.note(pdfIntegral(v, alpha, 0) - 1.0, "nv ${nv} alpha ${alpha}");
+            }
+        }
+        norm.within(
+            c,
+            "VNDF density integrates to 1 over the hemisphere (3 widths x 4 views)",
+            0.0002
+        );
+        LightVndfSuite::samples(c, 0.5, 0.4);
+        LightVndfSuite::samples(c, 0.2, 0.09);
+        LightVndfSuite::samples(c, 0.9, 1.0);
+    }
+
+    // 200 000 seeded samples: validity, mean n.h against its quadrature, mean G2/G1 against the table's E.
+    static fn samples(c : Checks, nv : f32, alpha : f32) : void {
+        let v : Vec3 = tangentView(nv);
+        let mut rng : Pcg32 = new Pcg32(2018, 7);
+        let count : i32 = 200000;
+        let mut invalid : i32 = 0;
+        let sumNh : LightSum = new LightSum();
+        let sumNh2 : LightSum = new LightSum();
+        let sumW : LightSum = new LightSum();
+        let sumW2 : LightSum = new LightSum();
+        for (k of 0..count) {
+            let h : Vec3 = lightVndfSample(v, alpha, rng.nextF32(), rng.nextF32());
+            if (!(h.z >= 0.0) || absD((h.length() - 1.0) as f64) > 0.0001) {
+                invalid = invalid + 1;
+            }
+            sumNh.add(h.z as f64);
+            sumNh2.add((h.z * h.z) as f64);
+            let l : Vec3 = h.scale(2.0 * v.dot(h)).minus(v);
+            let mut w : f64 = 0.0;
+            if (l.z > 0.0) {
+                w = (lightSmithG2(l.z, nv, alpha) / lightSmithG1(nv, alpha)) as f64;
+            }
+            sumW.add(w);
+            sumW2.add(w * w);
+        }
+        c.sameInt(
+            "every sampled normal is a unit vector in the upper hemisphere (invalid count)",
+            invalid as i64,
+            0
+        );
+        let n : f64 = count as f64;
+        let meanNh : f64 = sumNh.total() / n;
+        let seNh : f64 = sqrtD((sumNh2.total() / n - meanNh * meanNh) / n);
+        let wantNh : f64 = pdfIntegral(v, alpha, 1);
+        println("  measured VNDF mean n.h nv ${nv} alpha ${alpha}: sampled ${meanNh} quadrature ${wantNh} std.err ${seNh}");
+        c.that(
+            "VNDF sample mean of n.h within 4 standard errors of the density's quadrature",
+            absD(meanNh - wantNh) <= 4.0 * seNh + 0.00001
+        );
+        let meanW : f64 = sumW.total() / n;
+        let seW : f64 = sqrtD((sumW2.total() / n - meanW * meanW) / n);
+        let e : LightDfg = LightDfgTable::integrate(nv as f64, alpha as f64, 64);
+        let want : f64 = (e.a + e.b) as f64;
+        println("  measured VNDF albedo estimator nv ${nv} alpha ${alpha}: mean(G2/G1) ${meanW} table E ${want} std.err ${seW}");
+        c.that(
+            "VNDF estimator mean(G2/G1) equals the albedo table within 4 standard errors",
+            absD(meanW - want) <= 4.0 * seW + 0.00001
+        );
+    }
+}

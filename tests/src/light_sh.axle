@@ -1,0 +1,205 @@
+// light_sh — SH9: a constant, a gradient and a clamped cosine lobe, against exact and brute-force irradiance.
+//
+// A uniform environment and a linear gradient have closed-form irradiance, so they pin the basis and the
+// reconstruction before the hard case. The clamped cosine lobe is checked against a brute-force spherical
+// integral, because nine terms cannot represent it exactly; the measured error is reported and bounded by a
+// fraction of its peak, the only statement that is meaningful for a truncated basis.
+
+use ludax::{
+    Checks, Pcg32, Vec3, LightEnvironment, LightUniformEnvironment, LightSh9, LightShValues
+};
+use ludax::{lightShBasisAt};
+use ludax::{LightGauss, cosD, sinD, sqrtD, PI_D, max};
+
+use crate::light_support::{LightWorst, LightSum, lightText};
+
+// L(w) = a + b * w.y, a gradient that lies in the l <= 1 band, so SH9 must reproduce it.
+class GradientEnvironment : LightEnvironment {
+    a : f32;
+    b : f32;
+
+    constructor(a : f32, b : f32) {
+        self.a = a;
+        self.b = b;
+    }
+
+    /** `a + b * w.y`: a gradient inside the band nine terms can carry. */
+    pub fn radiance(self, dir : Vec3) : Vec3 {
+        return Vec3::splat(self.a + self.b * dir.y);
+    }
+}
+
+// L(w) = max(0, d.w): the clamped cosine lobe, the worst case for nine terms.
+class LobeEnvironment : LightEnvironment {
+    axis : Vec3;
+
+    constructor(axis : Vec3) {
+        self.axis = axis;
+    }
+
+    /** `max(0, axis · w)`: the clamped cosine lobe. */
+    pub fn radiance(self, dir : Vec3) : Vec3 {
+        return Vec3::splat(max(self.axis.dot(dir), 0.0));
+    }
+}
+
+// Exact E(n)/pi of the lobe L = max(0, d.w), by brute force: Gauss-Legendre in cos(theta) over the whole
+// sphere and a midpoint rule in phi (the integrand has kinks at the two horizons, so many nodes per band).
+fn lobeIrradiance(axis : Vec3, n : Vec3) : f64 {
+    let rule : LightGauss = new LightGauss(200);
+    let sum : LightSum = new LightSum();
+    let azimuths : i32 = 800;
+    for (i of 0..200) {
+        let y : f64 = rule.at(i, -1.0, 1.0);
+        let ring : f64 = sqrtD(1.0 - y * y);
+        for (k of 0..azimuths) {
+            let phi : f64 = 2.0 * PI_D * (((k as f64) + 0.5) / (azimuths as f64));
+            let dir : Vec3 = Vec3::make(
+                (ring * cosD(phi)) as f32,
+                y as f32,
+                (ring * sinD(phi)) as f32
+            );
+            let a : f64 = max(axis.dot(dir), 0.0) as f64;
+            let b : f64 = max(n.dot(dir), 0.0) as f64;
+            sum.add(a * b * rule.scaled(i, -1.0, 1.0) * 2.0 * PI_D / (azimuths as f64));
+        }
+    }
+    return sum.total() / PI_D;
+}
+
+/** Checks of SH9. */
+pub class LightShSuite {
+    /** Runs every check of this suite. */
+    pub static fn run(c : Checks) : void {
+        // One generator across the two sampling topics, so the swept directions are the same as they were
+        // when the suite was one function.
+        let mut rng : Pcg32 = new Pcg32(41, 2);
+        LightShSuite::constantAndGradient(c, rng);
+        LightShSuite::basis(c);
+        LightShSuite::lobe(c, rng);
+    }
+
+    // A constant environment and a linear gradient, whose irradiance has a closed form.
+    static fn constantAndGradient(c : Checks, rng : Pcg32) : void {
+        let constant : LightSh9 = LightSh9::project(
+            new LightUniformEnvironment(Vec3::make(2.0, 0.5, 1.0)),
+            32
+        );
+        let worstConst : LightWorst = new LightWorst();
+        let grad : LightSh9 = LightSh9::project(new GradientEnvironment(0.8, 0.5), 32);
+        let worstGrad : LightWorst = new LightWorst();
+        for (k of 0..400) {
+            let n : Vec3 = Vec3::make(
+                rng.rangeF32(-1.0, 1.0),
+                rng.rangeF32(-1.0, 1.0),
+                rng.rangeF32(-1.0, 1.0)
+            ).normalized();
+            let e : Vec3 = constant.irradiance(n);
+            worstConst.note((e.x - 2.0) as f64, "n ${lightText(n)}");
+            worstConst.note((e.y - 0.5) as f64, "n ${lightText(n)}");
+            worstConst.note((e.z - 1.0) as f64, "n ${lightText(n)}");
+            // E/pi of L = a + b w.y is a + (2/3) b n.y.
+            worstGrad.note(
+                (grad.irradiance(n).x - (0.8 + 0.5 * 2.0 / 3.0 * n.y)) as f64,
+                "n ${lightText(n)}"
+            );
+        }
+        worstConst.within(
+            c,
+            "SH9 of a constant reproduces it as irradiance/pi in every direction",
+            0.00002
+        );
+        worstGrad.within(c, "SH9 of a + b y gives a + (2/3) b n.y (known closed form)", 0.00002);
+        c.near(
+            "SH9 coefficient 0 of a constant L is L * sqrt(4 pi)",
+            constant.c0.x as f64,
+            2.0 * 3.5449077018,
+            0.00005
+        );
+        c.that(
+            "SH9 of a constant has no higher-order energy",
+            constant.c4.lengthSquared() < 0.0000001 && constant.c8.lengthSquared() < 0.0000001
+        );
+    }
+
+    // Orthonormality of the basis on the same grid: integral Y_i Y_j = delta_ij.
+    static fn basis(c : Checks) : void {
+        let worstBasis : LightWorst = new LightWorst();
+        let bands : i32 = 32;
+        let rule : LightGauss = new LightGauss(bands);
+        let mut gram : f64[] = malloc<f64>(81);
+        for (q of 0..81) {
+            gram[q as i64] = 0.0;
+        }
+        let mut vals : f64[] = malloc<f64>(9);
+        for (i of 0..bands) {
+            let y : f64 = rule.node(i);
+            let ring : f64 = sqrtD(1.0 - y * y);
+            for (k of 0..bands * 2) {
+                let phi : f64 = 2.0 * PI_D * (((k as f64) + 0.5) / ((bands * 2) as f64));
+                let b : LightShValues = lightShBasisAt(Vec3::make(
+                    (ring * cosD(phi)) as f32,
+                    y as f32,
+                    (ring * sinD(phi)) as f32
+                ));
+                vals[0] = b.y0 as f64;
+                vals[1] = b.y1 as f64;
+                vals[2] = b.y2 as f64;
+                vals[3] = b.y3 as f64;
+                vals[4] = b.y4 as f64;
+                vals[5] = b.y5 as f64;
+                vals[6] = b.y6 as f64;
+                vals[7] = b.y7 as f64;
+                vals[8] = b.y8 as f64;
+                for (a of 0..9) {
+                    for (d of 0..9) {
+                        let at : i64 = (a * 9 + d) as i64;
+                        gram[at] = gram[at]
+                            + vals[a as i64] * vals[d as i64] * rule.weight(i) * 2.0 * PI_D
+                                / ((bands * 2) as f64);
+                    }
+                }
+            }
+        }
+        for (a of 0..9) {
+            for (d of 0..9) {
+                let mut want : f64 = 0.0;
+                if (a == d) {
+                    want = 1.0;
+                }
+                worstBasis.note(gram[(a * 9 + d) as i64] - want, "pair ${a},${d}");
+            }
+        }
+        worstBasis.within(
+            c,
+            "SH9 basis is orthonormal on the grid (Gram matrix minus identity)",
+            0.00005
+        );
+    }
+
+    // The clamped cosine lobe: the worst case for nine terms.
+    static fn lobe(c : Checks, rng : Pcg32) : void {
+        let axis : Vec3 = Vec3::make(0.3, 0.8, -0.5).normalized();
+        let lobe : LightSh9 = LightSh9::project(new LobeEnvironment(axis), 96);
+        let worstLobe : LightWorst = new LightWorst();
+        let mut peak : f64 = 0.0;
+        for (k of 0..24) {
+            let n : Vec3 = Vec3::make(
+                rng.rangeF32(-1.0, 1.0),
+                rng.rangeF32(-1.0, 1.0),
+                rng.rangeF32(-1.0, 1.0)
+            ).normalized();
+            let exact : f64 = lobeIrradiance(axis, n);
+            if (exact > peak) {
+                peak = exact;
+            }
+            worstLobe.note((lobe.irradiance(n).x as f64) - exact, "n ${lightText(n)}");
+        }
+        let percent : f64 = worstLobe.value() / peak * 100.0;
+        println("  measured SH9 of a clamped cosine lobe: max |error| ${worstLobe.value()} vs peak irradiance/pi ${peak} (${percent} %)");
+        c.that(
+            "SH9 reproduces a clamped cosine lobe's irradiance within 1% of its peak (LIGHTING_MATH.md §5)",
+            worstLobe.value() <= 0.01 * peak
+        );
+    }
+}

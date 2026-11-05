@@ -1,0 +1,223 @@
+// jobs — chunking, the serial reference, and the worker pool.
+//
+// The chunk arithmetic is checked on the boundaries that are easy to get wrong (an empty loop, a grain of
+// zero, a full last chunk, an overflow-sized count). The pool is then held to the same cover the serial
+// reference gives, and to two stronger promises a game depends on: no index runs twice, and a floating-point
+// reduction gives bit-identical results whatever the worker count, because chunk boundaries do not move.
+
+use ludax::{
+    Checks, JobPool, NoopKernel, RangeKernel, chunkBegin, chunkCount, chunkEnd, chunkSize, runSerial
+};
+
+// Squares of the indices, written at the index.
+class SquareKernel : RangeKernel {
+    /** The square of every index the kernel has been asked to run, or -1 where it has not run. */
+    pub out : i64[];
+
+    /** How many times `runRange` has been entered. */
+    pub calls : i32 = 0;
+
+    constructor(count : i32) {
+        self.out = malloc<i64>(count as i64);
+        for (i of 0..count) {
+            self.out[i] = -1;
+        }
+    }
+
+    /** Writes the square of every index in `begin..end`. */
+    pub fn runRange(mut self, begin : i32, end : i32) : void {
+        for (i of begin..end) {
+            self.out[i] = (i as i64) * (i as i64);
+        }
+    }
+}
+
+// Counts how often each index is visited, to prove no index is skipped or run twice.
+class TouchKernel : RangeKernel {
+    /** How many times each index has been visited: one means exactly once. */
+    pub touched : i32[];
+
+    constructor(count : i32) {
+        self.touched = malloc<i32>(count as i64);
+        for (i of 0..count) {
+            self.touched[i] = 0;
+        }
+    }
+
+    /** Records that every index in `begin..end` was visited once. */
+    pub fn runRange(mut self, begin : i32, end : i32) : void {
+        for (i of begin..end) {
+            self.touched[i] = self.touched[i] + 1;
+        }
+    }
+}
+
+// A floating point reduction made deterministic: every chunk sums its own items into its own slot, and the
+// caller adds the slots in chunk order. Float addition is not associative, so this only holds because the
+// chunk boundaries do not depend on the number of workers.
+class PartialSumKernel : RangeKernel {
+    /** The sum of each chunk, at the chunk's index. */
+    pub partials : f64[];
+    grain        : i32;
+
+    constructor(count : i32, grain : i32) {
+        self.grain = grain;
+        self.partials = malloc<f64>(chunkCount(count, grain) as i64);
+    }
+
+    /** Sums `begin..end` into the slot of its chunk. */
+    pub fn runRange(mut self, begin : i32, end : i32) : void {
+        let mut sum : f64 = 0.0;
+        for (i of begin..end) {
+            sum = sum + 1.0 / (1.0 + i as f64);
+        }
+        self.partials[begin / self.grain] = sum;
+    }
+
+    /** Adds the chunk sums in chunk order, the reference the pool must match. */
+    pub fn total(self, count : i32) : f64 {
+        let mut sum : f64 = 0.0;
+        for (chunk of 0..chunkCount(count, self.grain)) {
+            sum = sum + self.partials[chunk];
+        }
+        return sum;
+    }
+}
+
+/** The jobs checks, one static function per topic. */
+pub class JobsSuite {
+    static fn chunking(c : Checks) : void {
+        c.sameInt("10 items by 4 make 3 chunks", chunkCount(10, 4), 3);
+        c.sameInt("exact multiple", chunkCount(8, 4), 2);
+        c.sameInt("nothing makes no chunks", chunkCount(0, 4), 0);
+        c.sameInt("negative count makes no chunks", chunkCount(-5, 4), 0);
+        c.sameInt("grain below 1 counts as 1", chunkCount(3, 0), 3);
+        c.sameInt("chunk size clamps", chunkSize(-2), 1);
+        c.sameInt("first chunk begins at 0", chunkBegin(0, 4), 0);
+        c.sameInt("third chunk begins at 8", chunkBegin(2, 4), 8);
+        c.sameInt("a full chunk ends one grain on", chunkEnd(1, 10, 4), 8);
+        c.sameInt("the last chunk is cut at the count", chunkEnd(2, 10, 4), 10);
+        c.sameInt("huge counts do not overflow", chunkCount(2147483647, 1), 2147483647);
+        c.sameInt("a huge grain is one chunk", chunkEnd(0, 100, 2147483647), 100);
+    }
+
+    static fn serial(c : Checks) : void {
+        let k : SquareKernel = new SquareKernel(10);
+        runSerial(k, 10, 3);
+        let mut right : bool = true;
+        for (i of 0..10) {
+            if (k.out[i] != (i * i) as i64) {
+                right = false;
+            }
+        }
+        c.that("the serial reference covers every index", right);
+    }
+
+    static fn covers(workers : i32, count : i32, grain : i32) : bool {
+        let k : SquareKernel = new SquareKernel(count + 1);
+        let pool : JobPool = new JobPool(workers, k);
+        let ok : bool = pool.run(count, grain);
+        pool.shutdown();
+        let mut right : bool = ok;
+        for (i of 0..count) {
+            if (k.out[i] != (i as i64) * (i as i64)) {
+                right = false;
+            }
+        }
+        if (k.out[count] != -1) {
+            right = false;
+        }
+        return right;
+    }
+
+    static fn pool(c : Checks) : void {
+        c.that("one worker covers a loop", JobsSuite::covers(1, 1000, 7));
+        c.that("four workers cover a loop", JobsSuite::covers(4, 1000, 7));
+        c.that("more workers than chunks", JobsSuite::covers(8, 3, 1));
+        c.that("a grain larger than the loop", JobsSuite::covers(4, 10, 1000));
+        c.that("a single item", JobsSuite::covers(3, 1, 1));
+        c.that("a large loop in small chunks", JobsSuite::covers(4, 100000, 1));
+        c.that("an empty loop is fine", JobsSuite::covers(4, 0, 4));
+        c.that("zero workers become one", JobsSuite::covers(0, 50, 5));
+    }
+
+    static fn reuse(c : Checks) : void {
+        let mut k : SquareKernel = new SquareKernel(1000);
+        let pool : JobPool = new JobPool(3, k);
+        let mut right : bool = true;
+        for (round of 0..200) {
+            for (i of 0..1000) {
+                k.out[i] = -1;
+            }
+            if (!pool.run(1000, 16)) {
+                right = false;
+            }
+            for (i of 0..1000) {
+                if (k.out[i] != (i as i64) * (i as i64)) {
+                    right = false;
+                }
+            }
+        }
+        c.that("a pool runs 200 loops back to back, each complete when run returns", right);
+        pool.shutdown();
+        c.that("run after shutdown does nothing and says so", !pool.run(10, 1));
+        pool.shutdown();
+        c.sameInt("workerCount", pool.workerCount(), 3);
+        c.that("defaultWorkers is at least one", JobPool::defaultWorkers() >= 1);
+    }
+
+    static fn exactlyOnce(c : Checks) : void {
+        let k : TouchKernel = new TouchKernel(50000);
+        let pool : JobPool = new JobPool(4, k);
+        pool.run(50000, 3);
+        pool.shutdown();
+        let mut once : bool = true;
+        for (i of 0..50000) {
+            if (k.touched[i] != 1) {
+                once = false;
+            }
+        }
+        c.that("every index is visited exactly once", once);
+    }
+
+    static fn deterministicReduction(c : Checks) : void {
+        let count : i32 = 100000;
+        let reference : PartialSumKernel = new PartialSumKernel(count, 128);
+        runSerial(reference, count, 128);
+        let want : f64 = reference.total(count);
+        c.near("the reduction is the harmonic number", want, 12.09014612986342, 0.000001);
+
+        let mut identical : bool = true;
+        for (workers of 1..7) {
+            let k : PartialSumKernel = new PartialSumKernel(count, 128);
+            let pool : JobPool = new JobPool(workers, k);
+            for (round of 0..5) {
+                pool.run(count, 128);
+                if (k.total(count) != want) {
+                    identical = false;
+                }
+            }
+            pool.shutdown();
+        }
+        c.that("1 to 6 workers give the same bits as the serial run, every time", identical);
+    }
+
+    static fn noop(c : Checks) : void {
+        let k : NoopKernel = new NoopKernel();
+        let pool : JobPool = new JobPool(2, k);
+        c.that("the no-op kernel runs through the pool", pool.run(1000, 10));
+        pool.shutdown();
+        runSerial(k, 1000, 10);
+    }
+
+    /** Runs the jobs checks. */
+    pub static fn run(c : Checks) : void {
+        JobsSuite::chunking(c);
+        JobsSuite::serial(c);
+        JobsSuite::pool(c);
+        JobsSuite::reuse(c);
+        JobsSuite::noop(c);
+        JobsSuite::exactlyOnce(c);
+        JobsSuite::deterministicReduction(c);
+    }
+}

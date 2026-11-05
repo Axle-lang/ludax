@@ -1,0 +1,456 @@
+// voxlight_bake — the ray bakes: sun visibility, sky access, bounce tint, shell storage, determinism.
+//
+// The bake is a Monte Carlo estimate, so it is held to a closed form wherever one exists — the sun's disc over a
+// half-plane is computed independently in the test — and the worst pixel is judged, not the mean. The shell must
+// be exactly the air cells touching a light-stopping block, and a stored cell must agree with a live read, so a
+// cache miss cannot pass as a hit.
+
+use ludax::{
+    Checks, Pcg32, VoxBakeSettings, VoxLightWorld, VoxelLightSample, Vec3, asinD, cosD, sinD,
+    voxByte
+};
+
+use crate::voxlight_support::{VoxIds, VoxWorldRig};
+
+/** Checks the light bake: open sky, roof shadows, penumbra, determinism and the stored shell. */
+pub class VoxLightBakeSuite {
+    // A flat plain: every cell of the shell sees the whole sun and the whole sky.
+    static fn openSky(c : Checks) : void {
+        let rig : VoxWorldRig = new VoxWorldRig(0, 2, 2, 2, 2);
+        rig.fill(0, 0, 0, 32, 8, 32, VoxIds::stone());
+        let mut s : VoxBakeSettings = VoxBakeSettings {};
+        s.sunDirection = Vec3 { x: 0.3, y: 1.0, z: 0.2 };
+        rig.world.configure(s);
+        rig.world.bakeAll(false);
+        let mut minSun : i32 = 255;
+        let mut minAccess : i32 = 255;
+        let mut minTint : i32 = 255;
+        for (z of 0..32) {
+            for (x of 0..32) {
+                let sun : i32 = rig.sun(x, 8, z);
+                let acc : i32 = rig.access(x, 8, z);
+                if (sun < minSun) { minSun = sun; }
+                if (acc < minAccess) { minAccess = acc; }
+                let t : VoxelLightSample = rig.world.cellSample(x, 8, z);
+                if (t.bounceTint.x < 0.999 || t.bounceTint.y < 0.999) {
+                    minTint = 0;
+                }
+            }
+        }
+        c.sameInt("sun is fully visible on open ground (lowest of 1024 cells)", minSun, 255);
+        c.sameInt("sky access is full on open ground", minAccess, 255);
+        c.sameInt("the bounce tint of open ground is white", minTint, 255);
+        c.sameInt(
+            "the shell holds the 1024 cells above the plain",
+            rig.world.surface.count(),
+            32 * 32
+        );
+        rig.world.close();
+    }
+
+    // Leaves stop only part of the light, but the cells beside them are shaded and must be baked, not read as the
+    // unbaked default (full sun): the shell is built around every block that stops light, not only the opaque ones.
+    static fn leafShell(c : Checks) : void {
+        let rig : VoxWorldRig = new VoxWorldRig(0, 2, 2, 2, 2);
+        rig.fill(0, 0, 0, 32, 4, 32, VoxIds::stone());
+        rig.fill(10, 8, 10, 13, 11, 13, VoxIds::leaves());
+        rig.world.bakeAll(false);
+        let beside : i32 = rig.world.grid.cellId(13, 9, 11);
+        let above : i32 = rig.world.grid.cellId(11, 11, 11);
+        c.that(
+            "a cell beside a leaf block is in the shell",
+            rig.world.surface.ordinalOf(beside) >= 0
+        );
+        c.that("so is a cell above it", rig.world.surface.ordinalOf(above) >= 0);
+        rig.world.close();
+    }
+
+    // A roof over everything: dark under it, bright on it.
+    static fn roof(c : Checks) : void {
+        let rig : VoxWorldRig = new VoxWorldRig(0, 2, 2, 2, 2);
+        rig.fill(0, 0, 0, 32, 4, 32, VoxIds::stone());
+        rig.fill(0, 20, 0, 32, 22, 32, VoxIds::stone());
+        rig.world.bakeAll(false);
+        let mut maxUnder : i32 = 0;
+        let mut minOver : i32 = 255;
+        let mut maxAccess : i32 = 0;
+        // A ray that leaves the box through its side escapes (past the last chunk is open air), so cells close
+        // to the edge are left out: this is a test of the roof, not of the edge.
+        for (z of 12..20) {
+            for (x of 12..20) {
+                let under : i32 = rig.sun(x, 4, z);
+                let over : i32 = rig.sun(x, 22, z);
+                if (under > maxUnder) { maxUnder = under; }
+                if (over < minOver) { minOver = over; }
+                let acc : i32 = rig.access(x, 19, z);
+                if (acc > maxAccess) { maxAccess = acc; }
+            }
+        }
+        c.sameInt(
+            "under a full roof the sun is blocked (highest of 64 interior cells)",
+            maxUnder,
+            0
+        );
+        c.sameInt("on the roof it is fully visible", minOver, 255);
+        c.sameInt("a cell right under the roof sees no sky", maxAccess, 0);
+        rig.world.close();
+    }
+
+    // The F of the unit disc: the share of its area with first coordinate below `a`.
+    static fn discBelow(a : f64) : f64 {
+        if (a <= -1.0) {
+            return 0.0;
+        }
+        if (a >= 1.0) {
+            return 1.0;
+        }
+        return 0.5 + (a * (1.0 - a * a).sqrt() + asinD(a)) / 3.14159265358979;
+    }
+
+    // The visibility the sun's disc predicts for a receiver at ground x_c below a half-plane roof whose edge is
+    // at x = 0 and whose underside is h above the receiver, the sun at elevation e (radians) and disc radius w
+    // (tangent plane at unit distance).
+    static fn predicted(x : f64, h : f64, e : f64, w : f64) : f64 {
+        let rho : f64 = 0.0 - x / h;
+        let se : f64 = sinD(e);
+        let ce : f64 = cosD(e);
+        let den : f64 = w * (se + rho * ce);
+        if (den > -0.000000001 && den < 0.000000001) {
+            return 1.0;
+        }
+        let a : f64 = (ce - rho * se) / den;
+        if (den < 0.0) {
+            // So far from the edge that every ray passes whatever the disc: the inequality flips.
+            return 1.0 - VoxLightBakeSuite::discBelow(a);
+        }
+        return VoxLightBakeSuite::discBelow(a);
+    }
+
+    // x at which the predicted visibility equals `level` (bisection; visibility rises with x).
+    static fn whereVisible(level : f64, h : f64, e : f64, w : f64) : f64 {
+        let mut lo : f64 = -60.0;
+        let mut hi : f64 = 60.0;
+        for (i of 0..60) {
+            let mid : f64 = (lo + hi) / 2.0;
+            if (VoxLightBakeSuite::predicted(mid, h, e, w) < level) {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        return (lo + hi) / 2.0;
+    }
+
+    // The measured 10%..90% width of the penumbra along the row, by linear interpolation of the stored values.
+    static fn measuredWidth(rig : VoxWorldRig, row : i32, from : i32, to : i32) : f64 {
+        let mut x10 : f64 = 0.0;
+        let mut x90 : f64 = 0.0;
+        let mut have10 : bool = false;
+        let mut have90 : bool = false;
+        for (x of from..to) {
+            let a : f64 = rig.sun(x, row, 8) as f64 / 255.0;
+            let b : f64 = rig.sun(x + 1, row, 8) as f64 / 255.0;
+            if (!have10 && a < 0.1 && b >= 0.1) {
+                x10 = x as f64 + 0.5 + (0.1 - a) / (b - a);
+                have10 = true;
+            }
+            if (!have90 && a < 0.9 && b >= 0.9) {
+                x90 = x as f64 + 0.5 + (0.9 - a) / (b - a);
+                have90 = true;
+            }
+        }
+        if (!have10 || !have90) {
+            return -1.0;
+        }
+        return x90 - x10;
+    }
+
+    // Soft shadows: the profile under a roof edge follows the sun's disc, and the penumbra widens in
+    // proportion to the height of the occluder.
+    static fn penumbra(c : Checks) : void {
+        let mut heights : i32[] = malloc<i32>(2);
+        heights[0] = 10;
+        heights[1] = 20;
+        let e : f64 = 0.87266462599716; // 50 degrees
+        let w : f64 = 0.1;
+        let mut widths : f64[] = malloc<f64>(2);
+        for (k of 0..2) {
+            let roofY : i32 = heights[k] + 1;
+            let rig : VoxWorldRig = new VoxWorldRig(-2, 4, 2, 1, 2);
+            rig.fill(-32, 0, 0, 32, 1, 16, VoxIds::stone());
+            rig.fill(-32, roofY, 0, 0, roofY + 1, 16, VoxIds::stone());
+            let mut s : VoxBakeSettings = VoxBakeSettings {};
+            s.sunDirection = Vec3 { x: cosD(e) as f32, y: sinD(e) as f32, z: 0.0 };
+            s.sunHalfAngle = 0.0996687 as f32; // atan(0.1)
+            s.sunRays = 400;
+            s.turned = false;
+            s.reach = 120.0;
+            rig.world.configure(s);
+            rig.world.bakeAll(false);
+            // The receiver centre is half a cell above the ground row, the roof underside at roofY.
+            let h : f64 = roofY as f64 - 1.5;
+            let mut worst : f64 = 0.0;
+            for (x of -30..30) {
+                let want : f64 = VoxLightBakeSuite::predicted(x as f64 + 0.5, h, e, w);
+                let got : f64 = rig.sun(x, 1, 8) as f64 / 255.0;
+                let mut err : f64 = got - want;
+                if (err < 0.0) { err = 0.0 - err; }
+                if (err > worst) { worst = err; }
+            }
+            c.that(
+                "roof at ${roofY}: penumbra profile matches the disc (worst error ${worst})",
+                worst < 0.05
+            );
+            let want10 : f64 = VoxLightBakeSuite::whereVisible(0.1, h, e, w);
+            let want90 : f64 = VoxLightBakeSuite::whereVisible(0.9, h, e, w);
+            widths[k] = VoxLightBakeSuite::measuredWidth(rig, 1, -30, 29);
+            c.near("roof at ${roofY}: 10-90 width", widths[k], want90 - want10, 0.35);
+            rig.world.close();
+        }
+        c.near(
+            "doubling the occluder height doubles the penumbra",
+            widths[1] / widths[0],
+            2.0,
+            0.2
+        );
+    }
+
+    // The bakes run on the pool give the same bytes as the serial reference, at any worker count.
+    static fn determinism(c : Checks) : void {
+        let r : Pcg32 = new Pcg32(11, 2);
+        let rig : VoxWorldRig = new VoxWorldRig(0, 2, 2, 2, 4);
+        for (z of 0..32) {
+            for (x of 0..32) {
+                let h : i32 = 4 + r.range(0, 8);
+                for (y of 0..h) {
+                    rig.fill(x, y, z, x + 1, y + 1, z + 1, VoxIds::grass());
+                }
+            }
+        }
+        for (i of 0..120) {
+            let hx : i32 = r.range(0, 32);
+            let hy : i32 = r.range(2, 8);
+            let hz : i32 = r.range(0, 32);
+            rig.fill(hx, hy, hz, hx + 1, hy + 1, hz + 1, VoxIds::air());
+        }
+        for (i of 0..60) {
+            let x : i32 = r.range(0, 32);
+            let y : i32 = r.range(9, 30);
+            let z : i32 = r.range(0, 32);
+            let mut id : i32 = VoxIds::stone();
+            if (i % 3 == 1) { id = VoxIds::leaves(); }
+            if (i % 3 == 2) { id = VoxIds::redWall(); }
+            rig.fill(x, y, z, x + 1, y + 1, z + 1, id);
+        }
+        rig.world.bakeAll(false);
+        let n : i32 = rig.world.surface.count();
+        let mut serial : i32[] = malloc<i32>(n as i64 * 5);
+        for (i of 0..n) {
+            for (k of 0..5) {
+                serial[i as i64 * 5 + k as i64] = rig.world.surface.bytesOf(i, k);
+            }
+        }
+        rig.world.bakeAll(true);
+        let mut differ : i32 = 0;
+        for (i of 0..n) {
+            for (k of 0..5) {
+                if (serial[i as i64 * 5 + k as i64] != rig.world.surface.bytesOf(i, k)) {
+                    differ = differ + 1;
+                }
+            }
+        }
+        c.sameInt("parallel bake == serial bake (differing bytes)", differ, 0);
+        c.that("a landscape worth comparing: ${n} shell cells", n > 1500);
+        let mut distinct : i32 = 0;
+        for (i of 1..n) {
+            if (serial[i as i64 * 5] != serial[(i as i64 - 1) * 5]) {
+                distinct = distinct + 1;
+            }
+        }
+        c.that("and the sun term is not constant", distinct > 50);
+        rig.world.close();
+        let single : VoxWorldRig = new VoxWorldRig(0, 1, 1, 1, 1);
+        single.fill(0, 0, 0, 16, 5, 16, VoxIds::stone());
+        single.fill(4, 5, 4, 8, 9, 8, VoxIds::stone());
+        single.world.bakeAll(false);
+        let m : i32 = single.world.surface.count();
+        let mut ref1 : i32[] = malloc<i32>(m as i64 * 5);
+        for (i of 0..m) {
+            for (k of 0..5) {
+                ref1[i as i64 * 5 + k as i64] = single.world.surface.bytesOf(i, k);
+            }
+        }
+        single.world.bakeAll(true);
+        let mut d1 : i32 = 0;
+        for (i of 0..m) {
+            for (k of 0..5) {
+                if (ref1[i as i64 * 5 + k as i64] != single.world.surface.bytesOf(i, k)) {
+                    d1 = d1 + 1;
+                }
+            }
+        }
+        c.sameInt("one worker agrees with the serial reference", d1, 0);
+        single.world.close();
+    }
+
+    // A narrow well sees little sky; a cell in a red-walled pit takes on red; open ground stays white.
+    static fn skyAndBounce(c : Checks) : void {
+        let rig : VoxWorldRig = new VoxWorldRig(0, 4, 2, 2, 2);
+        rig.fill(0, 0, 0, 64, 4, 32, VoxIds::grass());
+        // A 1x1 well, 8 deep, in a stone block.
+        rig.fill(2, 4, 2, 7, 12, 7, VoxIds::stone());
+        rig.fill(4, 4, 4, 5, 12, 5, VoxIds::air());
+        // A red pit: 3x3 floor surrounded by tall red walls, far from the well.
+        rig.fill(50, 4, 24, 55, 14, 29, VoxIds::redWall());
+        rig.fill(51, 4, 25, 54, 14, 28, VoxIds::air());
+        rig.world.bakeAll(false);
+        let above : i32 = rig.access(4, 12, 4);
+        let mouth : i32 = rig.access(4, 11, 4);
+        let middle : i32 = rig.access(4, 8, 4);
+        let bottom : i32 = rig.access(4, 4, 4);
+        c.that("above the well the sky is almost all visible (${above})", above > 230);
+        c.that(
+            "access falls steadily down the shaft: ${mouth} > ${middle} > ${bottom}",
+            mouth > middle && middle > bottom
+        );
+        c.that("the bottom of the well sees little (${bottom})", bottom < 40);
+        let pit : VoxelLightSample = rig.world.cellSample(52, 4, 26);
+        let open : VoxelLightSample = rig.world.cellSample(30, 4, 16);
+        c.that(
+            "in the red pit red outweighs green and blue by at least a tenth",
+            pit.bounceTint.x > pit.bounceTint.y + 0.1 && pit.bounceTint.x > pit.bounceTint.z + 0.1
+        );
+        c.that(
+            "while open ground stays white",
+            open.bounceTint.x > 0.95 && open.bounceTint.y > 0.95 && open.bounceTint.z > 0.95
+        );
+        c.that("and the pit sees less sky than open ground", pit.skyAccess + 0.3 < open.skyAccess);
+        let well : VoxelLightSample = rig.world.cellSample(4, 4, 4);
+        let spread : f32 = well.bounceTint.x - well.bounceTint.y;
+        c.that("the stone-walled well bottom is nearly neutral", spread < 0.1 && spread > -0.1);
+        rig.world.close();
+    }
+
+    // Shell storage: exactly the air cells next to a solid, and a small share of the volume.
+    static fn shell(c : Checks) : void {
+        let rig : VoxWorldRig = new VoxWorldRig(0, 2, 2, 2, 1);
+        let r : Pcg32 = new Pcg32(21, 4);
+        for (z of 0..32) {
+            for (x of 0..32) {
+                let h : i32 = 3 + r.range(0, 5);
+                rig.fill(x, 0, z, x + 1, h, z + 1, VoxIds::stone());
+            }
+        }
+        rig.world.rebuildSurface();
+        let mut wrong : i32 = 0;
+        let mut inShell : i32 = 0;
+        for (z of 0..32) {
+            for (y of 0..32) {
+                for (x of 0..32) {
+                    let mut want : bool = false;
+                    if (rig.grid.blockAt(x, y, z) == 0) {
+                        for (dz of -1..2) {
+                            for (dy of -1..2) {
+                                for (dx of -1..2) {
+                                    if (rig.grid.blockAt(x + dx, y + dy, z + dz)
+                                        == VoxIds::stone()) {
+                                        want = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    let has : bool = rig.world.surface.ordinalOf(rig.grid.cellId(x, y, z)) >= 0;
+                    if (has != want) {
+                        wrong = wrong + 1;
+                    }
+                    if (has) {
+                        inShell = inShell + 1;
+                    }
+                }
+            }
+        }
+        c.sameInt("the shell is exactly the air cells touching a solid (cells wrong)", wrong, 0);
+        c.sameInt("count agrees", rig.world.surface.count(), inShell);
+        c.that(
+            "shell cells are a small part of the volume: ${inShell} of 32768",
+            inShell * 4 < 32768 * 3
+        );
+        rig.world.close();
+    }
+
+    // A cell read before it is baked (live) and after (stored) gives the same answer: the shell is a cache.
+    static fn storedEqualsLive(c : Checks) : void {
+        let rig : VoxWorldRig = new VoxWorldRig(0, 2, 2, 2, 2);
+        rig.fill(0, 0, 0, 32, 6, 32, VoxIds::stone());
+        rig.fill(10, 6, 10, 14, 14, 14, VoxIds::stone());
+        rig.fill(18, 8, 18, 22, 9, 22, VoxIds::leaves());
+        rig.world.rebuildLight();
+        rig.world.rebuildSurface();
+        let n : i32 = rig.world.surface.count();
+        let mut live : VoxelLightSample[] = malloc<VoxelLightSample>(n as i64);
+        for (i of 0..n) {
+            let id : i32 = rig.world.surface.cellAt(i);
+            live[i] = rig.world.cellSample(
+                rig.grid.cellX(id),
+                rig.grid.cellY(id),
+                rig.grid.cellZ(id)
+            );
+        }
+        c.that(
+            "before baking, every shell entry is flagged stale",
+            rig.world.surface.stale(0) == 3
+        );
+        rig.world.bakeAll(true);
+        let mut bad : i32 = 0;
+        let mut shaded : i32 = 0;
+        for (i of 0..n) {
+            let id : i32 = rig.world.surface.cellAt(i);
+            let stored : VoxelLightSample = rig.world.cellSample(
+                rig.grid.cellX(id),
+                rig.grid.cellY(id),
+                rig.grid.cellZ(id)
+            );
+            if (stored.sunVisibility != live[i].sunVisibility
+                || stored.skyAccess != live[i].skyAccess
+                || stored.bounceTint.x != live[i].bounceTint.x
+                || stored.bounceTint.y != live[i].bounceTint.y
+                || stored.bounceTint.z != live[i].bounceTint.z) {
+                bad = bad + 1;
+            }
+            if (stored.sunVisibility < 0.99) {
+                shaded = shaded + 1;
+            }
+        }
+        c.sameInt("live read == stored read for all ${n} shell cells (differing)", bad, 0);
+        c.that("some of them are in shadow, so the test is not trivial", shaded > 20);
+        c.that("after baking, nothing is stale", rig.world.surface.stale(0) == 0);
+        // A cell outside the shell is baked on the spot, and is what a direct bake gives.
+        let far : VoxelLightSample = rig.world.cellSample(25, 20, 25);
+        c.that(
+            "a cell out in the open reads as fully lit",
+            far.sunVisibility > 0.999 && far.skyAccess > 0.999
+        );
+        let under : VoxelLightSample = rig.world.cellSample(20, 7, 20);
+        c.that("a cell under the leaves reads as partly shaded", under.sunVisibility < 0.9);
+        rig.world.setLiveFallback(false);
+        c.that(
+            "with the fallback off an unstored cell reads open",
+            rig.world.cellSample(20, 7, 20).sunVisibility == 1.0
+                || rig.world.surface.ordinalOf(rig.grid.cellId(20, 7, 20)) >= 0
+        );
+        rig.world.close();
+    }
+
+    /** Runs every check. */
+    pub static fn run(c : Checks) : void {
+        VoxLightBakeSuite::openSky(c);
+        VoxLightBakeSuite::roof(c);
+        VoxLightBakeSuite::leafShell(c);
+        VoxLightBakeSuite::penumbra(c);
+        VoxLightBakeSuite::determinism(c);
+        VoxLightBakeSuite::skyAndBounce(c);
+        VoxLightBakeSuite::shell(c);
+        VoxLightBakeSuite::storedEqualsLive(c);
+    }
+}

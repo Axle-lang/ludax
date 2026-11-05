@@ -1,0 +1,374 @@
+// light_sky — the Chapman function against brute force, and the analytic sky's physical and monotone laws.
+//
+// Chapman is compared with a 600000-step Simpson integral computed by a different route, at an altitude where
+// a downward ray still clears the ground; its horizon value is also checked against the asymptotic series.
+// The sky is then treated as a physical model: reddening and darkening are monotone as the sun sinks, no
+// radiance exceeds sunlit white, the sun's disc integrates back to its irradiance, and the SH9 dome is within
+// a measured few per cent of a cosine integral.
+
+use ludax::{Checks, Vec3, LightGauss, LightSky, LightSh9, LightSource, LightDirectAmbient};
+use ludax::{lightChapman};
+use ludax::{cosD, sinD, sqrtD, absD, PI_D, PI};
+
+use crate::light_support::{LightWorst, LightSum, lightRel, lightText};
+
+// The brute-force Chapman integral: Simpson's rule on a fine grid of the definition with libm's exp, a
+// different path from the library's Gauss-Legendre panels and its deterministic exponential.
+fn chapmanBrute(x : f64, chi : f64) : f64 {
+    let c : f64 = cosD(chi);
+    let steps : i32 = 600000;
+    let top : f64 = 3000.0;
+    let h : f64 = top / (steps as f64);
+    let sum : LightSum = new LightSum();
+    for (i of 0..steps + 1) {
+        let s : f64 = (i as f64) * h;
+        let r : f64 = sqrtD(x * x + 2.0 * x * s * c + s * s);
+        let mut w : f64 = 2.0;
+        if (i == 0 || i == steps) {
+            w = 1.0;
+        } else if (i % 2 == 1) {
+            w = 4.0;
+        }
+        sum.add(w * (x - r).exp());
+    }
+    return sum.total() * h / 3.0;
+}
+
+fn radians(deg : f64) : f64 {
+    return deg * PI_D / 180.0;
+}
+
+fn sunAt(elevationDeg : f64) : LightSky {
+    let e : f64 = radians(elevationDeg);
+    return new LightSky(Vec3::make((cosD(e)) as f32, sinD(e) as f32, 0.0), 2.0, 0.25);
+}
+
+/** Checks of the Chapman function and the sky. */
+pub class LightSkySuite {
+    /** Runs every check of this suite. */
+    pub static fn run(c : Checks) : void {
+        LightSkySuite::chapman(c);
+        LightSkySuite::bodySun(c);
+        LightSkySuite::bodySunset(c);
+        LightSkySuite::bodyDisc(c);
+        LightSkySuite::colours(c);
+        LightSkySuite::nightColours(c);
+        LightSkySuite::ambient(c);
+    }
+    static fn chapman(c : Checks) : void {
+        let rule : LightGauss = new LightGauss(16);
+        // A point 30 km up (X = 800.1): a ray 5 degrees below the horizontal still clears the ground there.
+        // At sea level every downward ray is blocked, so the identity could not be tested.
+        let earthRadius : f64 = 6371000.0;
+        let scaleHeight : f64 = 8000.0;
+        let altitude : f64 = 30000.0;
+        let ground : f64 = earthRadius / scaleHeight;
+        let x : f64 = (earthRadius + altitude) / scaleHeight;
+        let worst : LightWorst = new LightWorst();
+        let mut angles : f64[] = malloc<f64>(8);
+        angles[0] = 0.0;
+        angles[1] = 30.0;
+        angles[2] = 60.0;
+        angles[3] = 80.0;
+        angles[4] = 89.0;
+        angles[5] = 90.0;
+        angles[6] = 92.0;
+        angles[7] = 95.0;
+        for (k of 0..8) {
+            let degrees : f64 = angles[k as i64];
+            let chi : f64 = radians(degrees);
+            let got : f64 = lightChapman(rule, x, sinD(chi), cosD(chi), ground);
+            let want : f64 = chapmanBrute(x, chi);
+            worst.note(lightRel(got, want, 1.0), "chi ${degrees}");
+        }
+        worst.within(
+            c,
+            "Chapman function (Gauss panels + identity) vs a 600000-step Simpson rule, X = 800.1, chi 0..95 deg",
+            0.000001
+        );
+        c.near("Ch(X, 0) = 1", lightChapman(rule, x, 0.0, 1.0, ground), 1.0, 0.0000000001);
+        // Right angle: Ch(X, 90) ~ sqrt(pi X / 2)(1 + 3/(8X) - 15/(128 X^2) + 105/(1024 X^3)), the Bessel-K1
+        // expansion.
+        let series : f64 = sqrtD(PI_D * x / 2.0)
+            * (1.0 + 3.0 / (8.0 * x) - 15.0 / (128.0 * x * x) + 105.0 / (1024.0 * x * x * x));
+        let horizon : f64 = lightChapman(rule, x, 1.0, 0.0, ground);
+        println("  measured Ch(800.1, 90 deg): ${horizon} vs asymptotic series ${series}");
+        c.near(
+            "Ch(X, 90 deg) matches the asymptotic series of X e^X K1(X)",
+            lightRel(horizon, series, 1.0),
+            0.0,
+            0.0000001
+        );
+        // Secant law for a huge X and 30 degrees.
+        let flat : f64 = lightChapman(
+            rule,
+            1000000.0,
+            sinD(radians(30.0)),
+            cosD(radians(30.0)),
+            1000000.0
+        );
+        c.near(
+            "Ch(1e6, 30 deg) is about 1/cos(30 deg)",
+            lightRel(flat, 1.0 / cosD(radians(30.0)), 1.0),
+            0.0,
+            0.0005
+        );
+        // The identity is continuous across the right angle.
+        let below : f64 = lightChapman(rule, x, cosD(0.0000001), 0.0 - sinD(0.0000001), ground);
+        c.near(
+            "Ch is continuous across 90 degrees (identity vs integral)",
+            lightRel(below, horizon, 1.0),
+            0.0,
+            0.00001
+        );
+        c.near(
+            "a ray dipping into the ground is blocked (-1)",
+            lightChapman(rule, x, sinD(radians(110.0)), cosD(radians(110.0)), ground),
+            -1.0,
+            0.0
+        );
+        c.that(
+            "Ch increases with the angle (denser air on the way)",
+            lightChapman(rule, x, sinD(radians(60.0)), cosD(radians(60.0)), ground) < horizon
+        );
+    }
+
+    // The overhead sun as a body: its irradiance, colour ordering and light-source form.
+    static fn bodySun(c : Checks) : void {
+        let noon : LightSky = sunAt(90.0);
+        c.near(
+            "overhead sun on the ground is the reference sun, green channel pi",
+            noon.sunIrradiance().y as f64,
+            PI as f64,
+            0.0001
+        );
+        c.that(
+            "overhead sun is white-ish: red >= green >= blue",
+            noon.sunIrradiance().x >= noon.sunIrradiance().y
+                && noon.sunIrradiance().y >= noon.sunIrradiance().z
+        );
+        let sunLight : LightSource = noon.sunLight();
+        c.near(
+            "the sun LightSource carries the same irradiance (peak channel)",
+            sunLight.intensity as f64,
+            noon.sunIrradiance().maxComponent() as f64,
+            0.0001
+        );
+        c.near(
+            "the sun LightSource has the disc's angular diameter",
+            sunLight.angularDiameter as f64,
+            0.0093,
+            0.0000001
+        );
+    }
+
+    // Reddening and darkening as the sun sinks, and the moon at night.
+    static fn bodySunset(c : Checks) : void {
+        let noon : LightSky = sunAt(90.0);
+        let mut prevRatio : f64 = 0.0;
+        let mut prevBright : f64 = 100.0;
+        let mut monotone : bool = true;
+        let mut elevs : f64[] = malloc<f64>(7);
+        elevs[0] = 90.0;
+        elevs[1] = 60.0;
+        elevs[2] = 30.0;
+        elevs[3] = 15.0;
+        elevs[4] = 8.0;
+        elevs[5] = 3.0;
+        elevs[6] = 1.0;
+        for (k of 0..7) {
+            let elevation : f64 = elevs[k as i64];
+            let sun : Vec3 = sunAt(elevation).sunIrradiance();
+            let ratio : f64 = (sun.x / sun.z) as f64;
+            println("  measured sun at ${elevation} deg: irradiance ${lightText(sun)} red/blue ${ratio}");
+            if (ratio < prevRatio || (sun.y as f64) > prevBright) {
+                monotone = false;
+            }
+            prevRatio = ratio;
+            prevBright = sun.y as f64;
+        }
+        c.that(
+            "sunset reddening: red/blue rises and green falls monotonically from 90 to 1 degree",
+            monotone
+        );
+        c.that(
+            "a low sun is much redder than the overhead one (red/blue at 1 deg > 10x noon's)",
+            prevRatio > 10.0 * (noon.sunIrradiance().x / noon.sunIrradiance().z) as f64
+        );
+        c.near(
+            "the sun below the horizon gives no light",
+            sunAt(-5.0).sunIrradiance().length() as f64,
+            0.0,
+            0.0
+        );
+        // The moon: 2.5e-6 of the sun's strength when overhead.
+        let midnight : LightSky = sunAt(-90.0);
+        c.near(
+            "a full moon overhead is 2.5e-6 of the reference sun (green)",
+            (midnight.moonIrradiance().y / (PI * 0.9)) as f64,
+            0.0000025,
+            0.0000001
+        );
+        c.near("the sun is out at midnight", midnight.sunIrradiance().length() as f64, 0.0, 0.0);
+    }
+
+    // The radiance over the sun's disc integrates, with the cosine, back to the sun's irradiance.
+    static fn bodyDisc(c : Checks) : void {
+        let noon : LightSky = sunAt(90.0);
+        let sunDir : Vec3 = noon.sunDirection();
+        let rule : LightGauss = new LightGauss(8);
+        let sum : LightSum = new LightSum();
+        let radius : f64 = 0.00465;
+        let t1 : Vec3 = sunDir.anyPerpendicular().normalized();
+        let t2 : Vec3 = sunDir.cross(t1);
+        for (i of 0..8) {
+            let rho : f64 = rule.at(i, 0.0, radius);
+            for (k of 0..12) {
+                let phi : f64 = 2.0 * PI_D * (((k as f64) + 0.5) / 12.0);
+                let dir : Vec3 = sunDir
+                    .scale(cosD(rho) as f32)
+                    .plus(t1.scale((sinD(rho) * cosD(phi)) as f32))
+                    .plus(t2.scale((sinD(rho) * sinD(phi)) as f32));
+                let disc : f64 = (noon.radiance(dir).y - noon.skyRadiance(dir).y) as f64;
+                sum.add(disc * cosD(rho) * sinD(rho) * rule.scaled(i, 0.0, radius) * 2.0 * PI_D
+                    / 12.0);
+            }
+        }
+        println("  measured sun disc: integral L cos dw = ${sum.total()} vs irradiance ${noon.sunIrradiance().y}");
+        c.near(
+            "the sun disc's radiance integrates to the sun's irradiance",
+            lightRel(sum.total(), noon.sunIrradiance().y as f64, 1.0),
+            0.0,
+            0.0002
+        );
+        let outside : Vec3 = sunDir.scale(cosD(0.02) as f32).plus(t1.scale(sinD(0.02) as f32));
+        c.near(
+            "outside the disc there is only sky",
+            (noon.radiance(outside).y - noon.skyRadiance(outside).y) as f64,
+            0.0,
+            0.0
+        );
+    }
+
+    // Zenith and horizon colours, energy bounds, and convergence of the view-ray rule.
+    static fn colours(c : Checks) : void {
+        let sky : LightSky = sunAt(50.0);
+        let zenith : Vec3 = sky.skyRadiance(Vec3::unitY());
+        let away : Vec3 = Vec3::make(-1.0, 0.02, 0.0).normalized();
+        let horizon : Vec3 = sky.skyRadiance(away);
+        println("  measured sky at sun elevation 50: zenith ${lightText(zenith)}, horizon away from the sun ${lightText(horizon)}");
+        c.that("the zenith is blue: blue > 1.5 x red", zenith.z > 1.5 * zenith.x);
+        c.that(
+            "the horizon is whiter than the zenith: its blue/red ratio is smaller",
+            horizon.z / horizon.x < zenith.z / zenith.x
+        );
+        c.that("the horizon is brighter than the zenith", horizon.y > zenith.y);
+        c.that(
+            "the zenith luminance is a plausible 0.02..0.5 of sunlit white",
+            zenith.y > 0.02 && zenith.y < 0.5
+        );
+        // Energy: no direction of the sky is brighter than sunlit white, and the dome's horizontal
+        // irradiance is bounded.
+        let mut peak : f64 = 0.0;
+        for (k of 0..16) {
+            let a : f64 = (k as f64) * PI_D / 32.0;
+            let d : Vec3 = Vec3::make(cosD(a) as f32, sinD(a) as f32, 0.0);
+            let l : Vec3 = sky.skyRadiance(d);
+            if ((l.maxComponent() as f64) > peak) {
+                peak = l.maxComponent() as f64;
+            }
+        }
+        println("  measured brightest sky radiance over a sweep of elevations: ${peak}");
+        c.that(
+            "sky radiance never exceeds sunlit white (1.0) away from the sun's disc",
+            peak < 1.0
+        );
+        // Convergence of the view-ray rule: default order 24 against order 64.
+        let conv : LightWorst = new LightWorst();
+        let mut dirs : f64[] = malloc<f64>(4);
+        dirs[0] = 90.0;
+        dirs[1] = 40.0;
+        dirs[2] = 10.0;
+        dirs[3] = 1.0;
+        for (k of 0..4) {
+            let degrees : f64 = dirs[k as i64];
+            let e : f64 = radians(degrees);
+            let d : Vec3 = Vec3::make(-cosD(e) as f32, sinD(e) as f32, 0.0);
+            let a : Vec3 = sky.skyRadianceWith(d, 24);
+            let b : Vec3 = sky.skyRadianceWith(d, 64);
+            conv.note(lightRel(a.y as f64, b.y as f64, 0.0001), "elevation ${degrees}");
+            conv.note(lightRel(a.z as f64, b.z as f64, 0.0001), "elevation ${degrees}");
+        }
+        conv.within(c, "sky radiance, view-ray rule of 24 nodes vs 64 (relative)", 0.005);
+    }
+
+    // Night: dark but not black, and a ground that still receives the sun.
+    static fn nightColours(c : Checks) : void {
+        let sky : LightSky = sunAt(50.0);
+        let night : LightSky = sunAt(-40.0);
+        let dark : Vec3 = night.skyRadiance(Vec3::unitY());
+        c.that("night sky is dark (below 1e-4) but not black", dark.y < 0.0001 && dark.y > 0.0);
+        c.that("night sky is bluer than day's red", dark.z > dark.x);
+        // Below the horizon: ground bounce, lit by the sun.
+        let ground : Vec3 = sky.skyRadiance(Vec3::make(0.0, -1.0, 0.0));
+        c.that(
+            "the ground below the horizon is lit (positive) and darker than the sunlit white",
+            ground.y > 0.0 && ground.y < 1.0
+        );
+    }
+
+    // The SH9 dome against a brute-force cosine integral of the sky, and voxel's direct/ambient split.
+    static fn ambient(c : Checks) : void {
+        let sky : LightSky = sunAt(50.0);
+        let dome : LightSh9 = sky.ambient(16);
+        let n : Vec3 = Vec3::unitY();
+        // Brute force: E(n)/pi = (1/pi) integral L max(0, n.w) dw over the hemisphere above n, by a midpoint
+        // rule in (y, phi): 24 x 48 cells over the sphere, of which only the upper cells count. The 9-term
+        // series smooths the bright horizon band of the sky, so a few per cent of error are the SH9 limit and
+        // are measured, not hidden.
+        let rings : i32 = 24;
+        let azimuths : i32 = 48;
+        let sum : LightSum = new LightSum();
+        for (i of 0..rings) {
+            let t : f64 = -1.0 + 2.0 * (((i as f64) + 0.5) / (rings as f64));
+            let ring : f64 = sqrtD(1.0 - t * t);
+            for (k of 0..azimuths) {
+                if (t > 0.0) {
+                    let phi : f64 = 2.0 * PI_D * (((k as f64) + 0.5) / (azimuths as f64));
+                    let d : Vec3 = Vec3::make(
+                        (ring * cosD(phi)) as f32,
+                        t as f32,
+                        (ring * sinD(phi)) as f32
+                    );
+                    sum.add((sky.skyRadiance(d).y as f64) * t * 2.0 / (rings as f64) * 2.0 * PI_D
+                        / (azimuths as f64));
+                }
+            }
+        }
+        let brute : f64 = sum.total() / PI_D;
+        let got : f64 = dome.irradiance(n).y as f64;
+        let percent : f64 = (got / brute - 1.0) * 100.0;
+        println("  measured sky dome irradiance/pi at +Y: SH9 ${got} vs quadrature ${brute} (${percent} %)");
+        c.that(
+            "SH9 dome irradiance at +Y is within 5% of the cosine integral of the sky",
+            absD(got / brute - 1.0) <= 0.05
+        );
+        let face : LightDirectAmbient = sky.faceLight(n, dome);
+        c.that(
+            "face light: a lit top face has both direct and ambient",
+            face.direct.y > 0.0 && face.ambient.y > 0.0
+        );
+        c.near(
+            "face light direct: sun irradiance x sin(elevation) / pi",
+            face.direct.y as f64,
+            (sky.sunIrradiance().y as f64) * sinD(radians(50.0)) / PI_D,
+            0.0001
+        );
+        let underside : LightDirectAmbient = sky.faceLight(Vec3::make(0.0, -1.0, 0.0), dome);
+        c.near("the underside gets no direct light", underside.direct.length() as f64, 0.0, 0.0);
+        c.that(
+            "the underside still has ambient light (the ground's bounce)",
+            underside.ambient.y > 0.0
+        );
+    }
+}

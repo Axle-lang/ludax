@@ -1,0 +1,182 @@
+// profile — interned names, the per-frame summary, the ring of frames and the disabled fast path.
+//
+// The profiler is checked through a frame written by hand on a supplied clock, so every expected duration is an
+// integer the check can state exactly rather than a wall-clock reading. The order of the summary and the ring
+// are part of that contract: a disabled profiler must cost nothing and record nothing, and a sample that does
+// not fit must be counted as dropped instead of vanishing.
+
+use ludax::{Checks, ProfileEntry, ProfileNames, Profiler};
+
+// A frame in the profiler's own clock units (nanoseconds): physics 100 .. 700 with a broadphase 200 .. 300
+// and a narrowphase 300 .. 600 inside it, then audio 700 .. 750 and physics again 800 .. 850.
+fn profileDriveFrame(p : Profiler, origin : i64) : void {
+    p.beginFrameAt(origin);
+    let physics : i32 = p.beginAt(0, origin + 100);
+    let broad : i32 = p.beginAt(1, origin + 200);
+    p.endAt(broad, origin + 300);
+    let narrow : i32 = p.beginAt(2, origin + 300);
+    p.endAt(narrow, origin + 600);
+    p.endAt(physics, origin + 700);
+    let audio : i32 = p.beginAt(3, origin + 700);
+    p.endAt(audio, origin + 750);
+    let again : i32 = p.beginAt(0, origin + 800);
+    p.endAt(again, origin + 850);
+    p.endFrameAt(origin + 1000);
+}
+
+/** The profile checks, one static function per topic. */
+pub class ProfileSuite {
+    static fn names(c : Checks) : void {
+        let mut names : ProfileNames = new ProfileNames(3);
+        c.sameInt("the first name gets id 0", names.id("physics"), 0);
+        c.sameInt("the next gets id 1", names.id("audio"), 1);
+        c.sameInt("a repeated name gets its id back", names.id("physics"), 0);
+        c.that("an id maps back to its name", names.name(1) == "audio");
+        c.that("an unknown id has an empty name", names.name(2) == "" && names.name(-1) == "");
+        c.sameInt("count", names.count(), 2);
+        names.id("render");
+        c.sameInt("a full table shares its last id", names.id("overflow"), 2);
+        c.sameInt("capacity", names.capacity(), 3);
+        c.sameInt("a nonsense capacity becomes one", new ProfileNames(0).capacity(), 1);
+    }
+
+    static fn disabled(c : Checks) : void {
+        let mut p : Profiler = new Profiler(4, 16, 8);
+        c.that("a new profiler is off", !p.enabled());
+        p.beginFrameAt(0);
+        let token : i32 = p.beginAt(0, 10);
+        c.sameInt("a disabled profiler hands out token -1", token, -1);
+        p.endAt(token, 20);
+        p.endFrameAt(100);
+        c.sameInt("and records no frame", p.framesRecorded(), 0);
+        c.sameInt("no entries", p.entryCount(), 0);
+        c.sameInt("not even a dropped sample", p.droppedSamples(), 0);
+        c.sameInt("the real-clock begin is also inert", p.begin(0), -1);
+    }
+
+    static fn summary(c : Checks) : void {
+        let mut p : Profiler = new Profiler(4, 16, 8);
+        p.setEnabled(true);
+        profileDriveFrame(p, 5000);
+        c.sameInt("four distinct scopes ran", p.entryCount(), 4);
+        c.sameInt("the frame length", p.lastFrameNanos(), 1000);
+
+        let top : ProfileEntry = p.entry(0);
+        c.sameInt("the costliest scope is physics", top.scope, 0);
+        c.sameInt("it ran twice", top.calls, 2);
+        c.sameInt("inclusive time adds both runs: 600 + 50", top.inclusiveNanos, 650);
+        c.sameInt("self time leaves out its children: 650 - 100 - 300", top.selfNanos, 250);
+
+        let second : ProfileEntry = p.entry(1);
+        c.sameInt("then the narrow phase", second.scope, 2);
+        c.sameInt("a leaf's self time is its inclusive time", second.selfNanos, 300);
+        c.sameInt("then the broad phase", p.entry(2).scope, 1);
+        c.sameInt("its time", p.entry(2).inclusiveNanos, 100);
+        c.sameInt("the cheapest is audio", p.entry(3).scope, 3);
+        c.sameInt("its time is 50", p.entry(3).inclusiveNanos, 50);
+        c.sameInt(
+            "the self times of all scopes add up to the time covered by scopes",
+            p.entry(0).selfNanos + p.entry(1).selfNanos + p.entry(2).selfNanos
+                + p.entry(3).selfNanos,
+            700
+        );
+    }
+
+    static fn ties(c : Checks) : void {
+        let mut p : Profiler = new Profiler(2, 16, 8);
+        p.setEnabled(true);
+        p.beginFrameAt(0);
+        let a : i32 = p.beginAt(5, 0);
+        p.endAt(a, 10);
+        let b : i32 = p.beginAt(2, 10);
+        p.endAt(b, 20);
+        let d : i32 = p.beginAt(7, 20);
+        p.endAt(d, 30);
+        p.endFrameAt(30);
+        c.sameInt("equal costs are ordered by scope id, first", p.entry(0).scope, 2);
+        c.sameInt("second", p.entry(1).scope, 5);
+        c.sameInt("third", p.entry(2).scope, 7);
+    }
+
+    static fn ring(c : Checks) : void {
+        let mut p : Profiler = new Profiler(3, 8, 4);
+        p.setEnabled(true);
+        for (f of 0..5) {
+            p.beginFrameAt(0);
+            let t : i32 = p.beginAt(0, 0);
+            p.endAt(t, 10);
+            p.endFrameAt(100 * (f + 1) as i64);
+        }
+        c.sameInt("five frames recorded", p.framesRecorded(), 5);
+        c.sameInt("the last frame", p.frameNanosAgo(0), 500);
+        c.sameInt("the one before", p.frameNanosAgo(1), 400);
+        c.sameInt("two before", p.frameNanosAgo(2), 300);
+        c.sameInt("a frame older than the ring is gone", p.frameNanosAgo(3), 0);
+        c.sameInt("a negative age is nothing", p.frameNanosAgo(-1), 0);
+        c.sameInt("lastFrameNanos", p.lastFrameNanos(), 500);
+
+        let fresh : Profiler = new Profiler(3, 8, 4);
+        c.sameInt("before any frame the length is 0", fresh.lastFrameNanos(), 0);
+        c.sameInt("and so is any age", fresh.frameNanosAgo(0), 0);
+    }
+
+    static fn limits(c : Checks) : void {
+        let mut p : Profiler = new Profiler(2, 3, 2);
+        p.setEnabled(true);
+        p.beginFrameAt(0);
+        for (i of 0..5) {
+            let t : i32 = p.beginAt(0, i as i64 * 10);
+            p.endAt(t, i as i64 * 10 + 5);
+        }
+        let outside : i32 = p.beginAt(9, 100);
+        c.sameInt("a scope id out of range is refused", outside, -1);
+        p.endAt(outside, 110);
+        p.endFrameAt(200);
+        c.sameInt("only the samples that fit were kept", p.entry(0).calls, 3);
+        c.sameInt("the rest were counted as dropped", p.droppedSamples(), 3);
+
+        p.beginFrameAt(300);
+        c.that("the next frame starts with room again", p.beginAt(1, 300) >= 0);
+    }
+
+    static fn framing(c : Checks) : void {
+        let mut p : Profiler = new Profiler(2, 8, 2);
+        p.setEnabled(true);
+        c.sameInt("a scope outside any frame is refused", p.beginAt(0, 5), -1);
+        p.beginFrameAt(0);
+        let t : i32 = p.beginAt(0, 0);
+        p.setEnabled(false);
+        p.endAt(t, 10);
+        p.endFrameAt(10);
+        c.sameInt("turning it off mid-frame finishes that frame", p.framesRecorded(), 1);
+        p.beginFrameAt(20);
+        c.sameInt("and the next frame is not recorded", p.beginAt(0, 20), -1);
+    }
+
+    static fn realClock(c : Checks) : void {
+        let mut p : Profiler = new Profiler(2, 8, 2);
+        p.setEnabled(true);
+        p.beginFrame();
+        let token : i32 = p.begin(1);
+        sleep(10);
+        p.end(token);
+        p.endFrame();
+        c.that("a real scope measures a 10 ms sleep", p.entry(0).inclusiveNanos >= 10000000);
+        c.that(
+            "and the frame is at least as long",
+            p.lastFrameNanos() >= p.entry(0).inclusiveNanos
+        );
+    }
+
+    /** Runs the profile checks. */
+    pub static fn run(c : Checks) : void {
+        ProfileSuite::names(c);
+        ProfileSuite::disabled(c);
+        ProfileSuite::summary(c);
+        ProfileSuite::ties(c);
+        ProfileSuite::ring(c);
+        ProfileSuite::limits(c);
+        ProfileSuite::framing(c);
+        ProfileSuite::realClock(c);
+    }
+}

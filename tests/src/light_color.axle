@@ -1,0 +1,224 @@
+// light_color — the tone curve (C1 at its knee, monotone, hue-keeping) and sRGB.
+//
+// The tone curve is checked where its contract is stated: identity below the knee, C1 at the knee through
+// shrinking one-sided quotients, monotone and bounded above it, and hue preserved by the colour map. sRGB is
+// checked against the standard's published values and as a bijection over all 256 codes, so an approximation
+// cannot hide behind a round-trip check alone.
+
+use ludax::{
+    Checks, Pcg32, Vec3, LightUnits, LIGHT_TONE_KNEE, lightToneCurve, lightToneMap, lightExpose
+};
+use ludax::{
+    lightSrgbEncode, lightSrgbDecode, lightSrgbEncode8, lightSrgbDecode8, lightDisplay, absD
+};
+
+use crate::light_support::{LightWorst, lightRel};
+
+/** Checks of the tone map and sRGB. */
+pub class LightColorSuite {
+    /** Runs every check of this suite. */
+    pub static fn run(c : Checks) : void {
+        LightColorSuite::toneCurve(c);
+        LightColorSuite::toneMap(c);
+        LightColorSuite::exposure(c);
+        LightColorSuite::srgb(c);
+    }
+
+    static fn toneCurve(c : Checks) : void {
+        let knee : f32 = LIGHT_TONE_KNEE;
+        // The shoulder's width in normalised tone units (1 - knee, with the knee at 0.6); the exponential's
+        // slope at the knee is 1 / shoulder.
+        let shoulder : f64 = 0.4;
+        c.near("T(0) = 0", lightToneCurve(0.0, knee) as f64, 0.0, 0.0);
+        c.near(
+            "T is the identity below the knee",
+            lightToneCurve(0.3, knee) as f64,
+            0.3,
+            0.0000001
+        );
+        c.near("T(knee) = knee", lightToneCurve(knee, knee) as f64, knee as f64, 0.0);
+        // Monotone, bounded by 1, over a log sweep reaching 1000.
+        let mut x : f32 = 0.0;
+        let mut prev : f32 = -1.0;
+        let mut ok : bool = true;
+        let mut bounded : bool = true;
+        while (x < 1000.0) {
+            let t : f32 = lightToneCurve(x, knee);
+            if (t < prev) {
+                ok = false;
+            }
+            if (t > 1.0 || t < 0.0) {
+                bounded = false;
+            }
+            prev = t;
+            x = x + (0.001 as f32) + x * (0.01 as f32);
+        }
+        c.that("T is monotone non-decreasing on 0..1000", ok);
+        c.that("T stays within 0..1", bounded);
+        c.that(
+            "T is strictly increasing in the shoulder (not saturated at 8)",
+            lightToneCurve(8.0, knee) > lightToneCurve(7.0, knee)
+        );
+        // C1 at the knee: the one-sided difference quotients tend to 1 as the step shrinks, the right-hand
+        // one linearly (error h / (2 (1 - knee)), the exact slope of the exponential), so halving h halves
+        // the gap.
+        let left : f64 = ((lightToneCurve(
+            knee,
+            knee
+        )
+            - lightToneCurve(knee - 0.004, knee))
+            / 0.004) as f64;
+        let gap1 : f64 = 1.0
+            - ((lightToneCurve(
+                knee + 0.004,
+                knee
+            )
+                - lightToneCurve(knee, knee))
+                / 0.004) as f64;
+        let gap2 : f64 = 1.0
+            - ((lightToneCurve(
+                knee + 0.002,
+                knee
+            )
+                - lightToneCurve(knee, knee))
+                / 0.002) as f64;
+        println("  measured tone curve slopes at the knee: left ${left}, right gap at h=0.004 ${gap1}, at h=0.002 ${gap2}");
+        c.near("T slope just left of the knee is 1", left, 1.0, 0.0001);
+        c.near(
+            "T right-hand slope gap matches h/(2(1-knee)) at h = 0.004",
+            gap1,
+            0.004 / (2.0 * shoulder),
+            0.0003
+        );
+        c.near(
+            "T right-hand slope gap halves with h (so the slope is 1 at the knee)",
+            gap1 / gap2,
+            2.0,
+            0.1
+        );
+        // Value continuity: T(knee + e) - T(knee - e) -> 0 linearly.
+        c.that(
+            "T is continuous at the knee",
+            absD((lightToneCurve(knee + 0.0001, knee) - lightToneCurve(knee - 0.0001, knee)) as f64)
+                < 0.0003
+        );
+        // The second derivative jumps to -1/(1-knee): the curve bends, so it is not linear above the knee.
+        c.that(
+            "T bends above the knee (second difference is negative)",
+            lightToneCurve(knee + 0.4, knee) < knee + 0.4 - 0.01
+        );
+    }
+
+    // The colour map: channel ratios are kept, no channel exceeds 1, black stays black.
+    static fn toneMap(c : Checks) : void {
+        let knee : f32 = LIGHT_TONE_KNEE;
+        let mapped : Vec3 = lightToneMap(Vec3::make(8.0, 4.0, 2.0), knee);
+        c.near("tone map keeps the ratio r/g", (mapped.x / mapped.y) as f64, 2.0, 0.00001);
+        c.near("tone map keeps the ratio g/b", (mapped.y / mapped.z) as f64, 2.0, 0.00001);
+        c.that("tone map output never exceeds 1", mapped.maxComponent() <= 1.0);
+        c.that(
+            "tone map of a moderate colour is strictly below 1",
+            lightToneMap(Vec3::make(3.0, 1.0, 0.5), knee).maxComponent() < 1.0
+        );
+        c.that(
+            "tone map of black is black",
+            lightToneMap(Vec3::zero(), knee).lengthSquared() == 0.0
+        );
+        c.that(
+            "tone map below the knee is untouched",
+            lightToneMap(Vec3::make(0.5, 0.2, 0.1), knee).approxEq(Vec3::make(0.5, 0.2, 0.1), 0.0)
+        );
+    }
+
+    // Exposure and the sun: the reference sun on white at its own EV lands on T(1).
+    static fn exposure(c : Checks) : void {
+        let white : Vec3 = lightExpose(
+            Vec3::splat(1.0),
+            LightUnits::exposure(LightUnits::ev100ForSunlitWhite())
+        );
+        c.near("sunlit white at its EV is exposed to 1.0", white.x as f64, 1.0, 0.00001);
+        c.near(
+            "doubling the radiance at fixed exposure halves nothing: +1 EV halves the display input",
+            (lightExpose(
+                Vec3::splat(1.0),
+                LightUnits::exposure(10.0)
+            ).x
+                / lightExpose(Vec3::splat(1.0), LightUnits::exposure(11.0)).x) as f64,
+            2.0,
+            0.00001
+        );
+    }
+    static fn srgb(c : Checks) : void {
+        let mut rng : Pcg32 = new Pcg32(3, 3);
+        let trip : LightWorst = new LightWorst();
+        let tripBack : LightWorst = new LightWorst();
+        for (k of 0..5000) {
+            let x : f32 = rng.nextF32();
+            trip.note((lightSrgbDecode(lightSrgbEncode(x)) - x) as f64, "x=${x}");
+            tripBack.note((lightSrgbEncode(lightSrgbDecode(x)) - x) as f64, "y=${x}");
+        }
+        trip.within(c, "sRGB decode(encode(x)) = x, absolute, 5000 draws", 0.0000005);
+        tripBack.within(c, "sRGB encode(decode(y)) = y, absolute, 5000 draws", 0.0000005);
+        // Known values of the standard.
+        c.near(
+            "encode(0.5) = 0.7353569830524495",
+            lightSrgbEncode(0.5) as f64,
+            0.7353569830524495,
+            0.0000005
+        );
+        c.near(
+            "encode(0.2140411404) = 0.5 (middle code)",
+            lightSrgbEncode(0.21404114) as f64,
+            0.5,
+            0.0000005
+        );
+        c.near(
+            "encode(0.0031308) = 0.040449936",
+            lightSrgbEncode(0.0031308) as f64,
+            0.040449936,
+            0.0000005
+        );
+        c.near("encode(1) = 1", lightSrgbEncode(1.0) as f64, 1.0, 0.0000002);
+        c.near("encode(0) = 0", lightSrgbEncode(0.0) as f64, 0.0, 0.0);
+        c.near(
+            "the linear segment: encode(0.001) = 12.92 * 0.001",
+            lightSrgbEncode(0.001) as f64,
+            0.01292,
+            0.0000001
+        );
+        // Continuity at the break.
+        c.that(
+            "encode is continuous at its break",
+            absD((lightSrgbEncode(0.0031309) - lightSrgbEncode(0.0031307)) as f64) < 0.0001
+        );
+        c.that(
+            "encode is monotone and clamps out-of-range input",
+            lightSrgbEncode(-3.0) == 0.0 && lightSrgbEncode(7.0) <= 1.0
+                && lightSrgbEncode(7.0) >= 0.9999998
+        );
+        // The 8-bit pair is an exact bijection.
+        let mut wrong : i32 = 0;
+        let worst8 : LightWorst = new LightWorst();
+        for (i of 0..256) {
+            if (lightSrgbEncode8(lightSrgbDecode8(i)) != i) {
+                wrong = wrong + 1;
+            }
+            worst8.note(
+                (lightSrgbEncode(lightSrgbDecode8(i)) * 255.0 - (i as f32)) as f64,
+                "code ${i}"
+            );
+        }
+        c.sameInt("encode8(decode8(i)) = i for all 256 codes (mismatches)", wrong as i64, 0);
+        worst8.within(c, "sRGB 8-bit codes round trip in the real domain, in code units", 0.00005);
+        c.near("decode8(0) = 0", lightSrgbDecode8(0) as f64, 0.0, 0.0);
+        c.near("decode8(255) = 1", lightSrgbDecode8(255) as f64, 1.0, 0.0000002);
+        // The full display path of a mid-grey.
+        let d : Vec3 = lightDisplay(Vec3::splat(0.18), 1.0, LIGHT_TONE_KNEE);
+        c.near(
+            "display of 0.18 at unit exposure is the standard 0.4614",
+            d.x as f64,
+            0.46135612,
+            0.000002
+        );
+    }
+}

@@ -1,0 +1,178 @@
+// time — the clock helpers, Stopwatch, FixedStep and Timer.
+//
+// FixedStep is checked on supplied nanoseconds rather than a real clock, so the step, the remainder, the cap and
+// the dropped time are exact integers in every check; the same time chunked into different frames must give the
+// same number of ticks, which is what keeps a replay deterministic. Only the two clock checks sleep, and both
+// assert a lower bound so a slow machine cannot make them fail.
+
+use ludax::{Checks, FixedStep, Stopwatch, Timer};
+use ludax::{
+    NANOS_PER_MILLI, NANOS_PER_SECOND, nanosToMillis, nanosToSeconds, nowNanos, secondsToNanos
+};
+
+/** The time checks, one static function per topic. */
+pub class TimeSuite {
+    static fn conversions(c : Checks) : void {
+        c.sameInt("one second is a billion nanoseconds", secondsToNanos(1.0), NANOS_PER_SECOND);
+        c.sameInt("a sixtieth of a second rounds up", secondsToNanos(1.0 / 60.0), 16666667);
+        c.sameInt("negative seconds count as zero", secondsToNanos(-2.0), 0);
+        c.near("nanosToSeconds", nanosToSeconds(1500000000), 1.5, 0.0);
+        c.near("nanosToMillis", nanosToMillis(2 * NANOS_PER_MILLI), 2.0, 0.0);
+    }
+
+    static fn clock(c : Checks) : void {
+        let a : i64 = nowNanos();
+        let b : i64 = nowNanos();
+        c.that("the monotonic clock never goes back", b >= a);
+
+        let watch : Stopwatch = new Stopwatch();
+        sleep(20);
+        c.that("a stopwatch sees a 20 ms sleep", watch.elapsedNanos() >= 20 * NANOS_PER_MILLI);
+        c.that("elapsedSeconds agrees with elapsedNanos", watch.elapsedSeconds() >= 0.02);
+    }
+
+    static fn stopwatchOnSuppliedClock(c : Checks) : void {
+        let mut watch : Stopwatch = new Stopwatch(1000);
+        c.sameInt("elapsed from a supplied reading", watch.elapsedNanosAt(1750), 750);
+        c.sameInt("a lap reports the elapsed time", watch.lapAt(1750), 750);
+        c.sameInt("a lap restarts the measurement", watch.elapsedNanosAt(1800), 50);
+        c.sameInt("laps chain", watch.lapAt(2000), 250);
+    }
+
+    // 60 Hz stepping, 16.67 ms frames, exact integer bookkeeping.
+    static fn fixedStepCounts(c : Checks) : void {
+        let mut fixed : FixedStep = FixedStep::atHertz(60, 5);
+        c.sameInt("a 60 Hz step is 16666666 ns", fixed.stepLength(), 16666666);
+        c.near("stepSeconds", fixed.stepSeconds() as f64, 1.0 / 60.0, 0.000001);
+
+        let mut ticks : i32 = 0;
+        // 120 frames of exactly one step: 120 ticks, nothing left over.
+        for (i of 0..120) {
+            fixed.advanceNanos(16666666);
+            while (fixed.takeStep()) {
+                ticks = ticks + 1;
+            }
+        }
+        c.sameInt("one step per matching frame", ticks, 120);
+        c.sameInt("ticks counts released steps", fixed.ticks(), 120);
+        c.near("alpha is zero after exact frames", fixed.alpha() as f64, 0.0, 0.0);
+        c.near(
+            "simulated time is ticks times the step",
+            fixed.simulatedSeconds(),
+            1.99999992,
+            0.0000001
+        );
+    }
+
+    static fn fixedStepFastDisplay(c : Checks) : void {
+        // A 240 Hz display against a 60 Hz simulation: a step only every fourth frame.
+        let mut fixed : FixedStep = new FixedStep(4000000, 5);
+        let mut ticks : i32 = 0;
+        for (i of 0..100) {
+            fixed.advanceNanos(1000000);
+            while (fixed.takeStep()) {
+                ticks = ticks + 1;
+            }
+        }
+        c.sameInt("100 ms at 250 Hz frames makes 25 steps of 4 ms", ticks, 25);
+
+        fixed.advanceNanos(3000000);
+        c.that("no step is released before a whole one is banked", !fixed.takeStep());
+        c.near("alpha is the banked fraction of a step", fixed.alpha() as f64, 0.75, 0.0);
+    }
+
+    static fn fixedStepSlowDisplay(c : Checks) : void {
+        // A 10 Hz display against a 100 Hz simulation: ten steps per frame, each frame.
+        let mut fixed : FixedStep = new FixedStep(10000000, 20);
+        let mut perFrame : i32 = 0;
+        fixed.advanceNanos(100000000);
+        while (fixed.takeStep()) {
+            perFrame = perFrame + 1;
+        }
+        c.sameInt("a long frame releases several steps", perFrame, 10);
+        c.sameInt("nothing is dropped below the cap", fixed.droppedNanos(), 0);
+    }
+
+    static fn fixedStepCap(c : Checks) : void {
+        let mut fixed : FixedStep = new FixedStep(10000000, 5);
+        fixed.advanceNanos(2000000000);
+        let mut released : i32 = 0;
+        while (fixed.takeStep()) {
+            released = released + 1;
+        }
+        c.sameInt("a frame of 200 steps releases only the cap", released, 5);
+        c.sameInt("the excess is counted as dropped", fixed.droppedNanos(), 2000000000 - 50000000);
+        c.near("alpha is zero once the cap is drained", fixed.alpha() as f64, 0.0, 0.0);
+
+        fixed.advanceNanos(-5);
+        fixed.advanceNanos(0);
+        c.that("negative and zero frames bank nothing", !fixed.takeStep());
+
+        let mut odd : FixedStep = new FixedStep(0, 0);
+        c.sameInt("a nonsense step length becomes one nanosecond", odd.stepLength(), 1);
+        odd.advanceNanos(10);
+        let mut n : i32 = 0;
+        while (odd.takeStep()) {
+            n = n + 1;
+        }
+        c.sameInt("a nonsense cap becomes one step", n, 1);
+    }
+
+    static fn fixedStepDeterminism(c : Checks) : void {
+        // The same irregular frame times give the same tick count however they are chunked into frames.
+        let mut a : FixedStep = new FixedStep(16666666, 100);
+        let mut b : FixedStep = new FixedStep(16666666, 100);
+        for (i of 0..300) {
+            a.advanceNanos(10000000);
+            while (a.takeStep()) {}
+        }
+        for (i of 0..100) {
+            b.advanceNanos(30000000);
+            while (b.takeStep()) {}
+        }
+        c.sameInt(
+            "3 s of time gives the same tick count in 10 ms and in 30 ms frames",
+            a.ticks(),
+            b.ticks()
+        );
+        c.sameInt("and that count is floor(3 s / step)", a.ticks(), 180);
+    }
+
+    static fn timers(c : Checks) : void {
+        let mut once : Timer = new Timer(100, false);
+        c.sameInt("not yet expired", once.advance(60), 0);
+        c.that("not finished before the end", !once.finished());
+        c.sameInt("remaining time", once.remainingNanos(), 40);
+        c.sameInt("expires once", once.advance(60), 1);
+        c.that("finished", once.finished());
+        c.sameInt("a finished one-shot stays silent", once.advance(500), 0);
+        c.near("a finished timer is at fraction one", once.fraction() as f64, 1.0, 0.0);
+        once.restart();
+        c.that("restart clears finished", !once.finished());
+        c.near("restart is at fraction zero", once.fraction() as f64, 0.0, 0.0);
+
+        let mut repeating : Timer = new Timer(100, true);
+        c.sameInt("a repeating timer fires on its period", repeating.advance(100), 1);
+        c.that("a repeating timer is never finished", !repeating.finished());
+        c.sameInt("a long step fires several times", repeating.advance(350), 3);
+        c.sameInt("and keeps the remainder", repeating.remainingNanos(), 50);
+        c.near("fraction is half way", repeating.fraction() as f64, 0.5, 0.0);
+        c.sameInt("zero and negative time does nothing", repeating.advance(-9), 0);
+
+        let tiny : Timer = new Timer(0, false);
+        c.sameInt("a zero duration is clamped to one nanosecond", tiny.remainingNanos(), 1);
+    }
+
+    /** Runs the time checks. */
+    pub static fn run(c : Checks) : void {
+        TimeSuite::conversions(c);
+        TimeSuite::clock(c);
+        TimeSuite::stopwatchOnSuppliedClock(c);
+        TimeSuite::fixedStepCounts(c);
+        TimeSuite::fixedStepFastDisplay(c);
+        TimeSuite::fixedStepSlowDisplay(c);
+        TimeSuite::fixedStepCap(c);
+        TimeSuite::fixedStepDeterminism(c);
+        TimeSuite::timers(c);
+    }
+}

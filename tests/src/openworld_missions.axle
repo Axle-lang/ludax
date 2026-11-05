@@ -1,0 +1,809 @@
+// openworld_missions — checks for mission definitions, their text format and the mission state machine.
+//
+// Every transition of the machine is taken at least once (locked -> available -> active -> completed or
+// failed -> available again), every objective kind is completed, every failure condition is triggered, events
+// are shown to be processed in order, saved state round-trips and damaged saves are refused, and malformed
+// definitions are reported with the line and column they are on.
+
+use ludax::ByteBuf;
+use ludax::Checks;
+use ludax::Crc32;
+use ludax::MissionBoard;
+use ludax::MissionBook;
+use ludax::MissionNote;
+use ludax::MissionText;
+use ludax::ParseReport;
+use ludax::BookCheck;
+use ludax::MISSION_LOCKED;
+use ludax::MISSION_AVAILABLE;
+use ludax::MISSION_ACTIVE;
+use ludax::MISSION_COMPLETED;
+use ludax::MISSION_FAILED;
+use ludax::NOTE_STARTED;
+use ludax::NOTE_FAILED;
+use ludax::FAILED_TIMEOUT;
+use ludax::FAILED_FLAG;
+use ludax::FAILED_DEATH;
+use ludax::FAILED_ESCORT;
+
+// One second in nanoseconds.
+const MIS_S : i64 = 1000000000;
+
+fn misText() : string {
+    return "# test missions\nmission intro \"Welcome\"\n  stage go\n    reach 100 100 10\n  reward xp 50\nend\n\n"
+        + "mission deliver \"Deliver the crate\"\n  requires intro\n  stage pickup\n    collect crate 2\n    reach 500 0 20 optional\n"
+        + "  stage drive\n    escort courier 1000 0 30\n    timer 2.5\n  stage clear\n    kill wolf 3\n    flag gate\n"
+        + "  fail timeout 100\n  fail flag alarm\n  fail death mule\n  reward gold 250\n  reward xp 100\nend\n\n"
+        + "mission bonus \"Bonus\" auto\n  requires deliver\n  stage one\n    timer 1\n  reward gold 5\nend\n";
+}
+
+// The same missions through the builder calls.
+fn misBuilt() : MissionBook {
+    let b : MissionBook = new MissionBook();
+    b.beginMission("intro", "Welcome", false);
+    b.beginStage("go");
+    b.reach(100.0, 100.0, 10.0);
+    b.reward("xp", 50);
+    b.beginMission("deliver", "Deliver the crate", false);
+    b.requires("intro");
+    b.beginStage("pickup");
+    b.collect("crate", 2);
+    b.reach(500.0, 0.0, 20.0);
+    b.markOptional();
+    b.beginStage("drive");
+    b.escort("courier", 1000.0, 0.0, 30.0);
+    b.timer(2.5);
+    b.beginStage("clear");
+    b.kill("wolf", 3);
+    b.flag("gate");
+    b.failAfter(100.0);
+    b.failOnFlag("alarm");
+    b.failOnDeath("mule");
+    b.reward("gold", 250);
+    b.reward("xp", 100);
+    b.beginMission("bonus", "Bonus", true);
+    b.requires("deliver");
+    b.beginStage("one");
+    b.timer(1.0);
+    b.reward("gold", 5);
+    return b;
+}
+
+fn misParsed() : MissionBook {
+    let b : MissionBook = new MissionBook();
+    MissionText::parse(b, misText());
+    return b;
+}
+
+fn misBoard() : MissionBoard {
+    return new MissionBoard(misParsed());
+}
+
+// A board with the first mission done and `deliver` started.
+fn misDelivering() : MissionBoard {
+    let b : MissionBoard = misBoard();
+    b.start("intro");
+    b.postPosition(100.0, 100.0);
+    b.update(0);
+    b.start("deliver");
+    b.clearNotes();
+    return b;
+}
+
+// The note kinds as a string such as "0,1,2", and reads the notes out.
+fn misNotes(b : MissionBoard) : string {
+    let mut out : string = "";
+    for (i of 0..b.noteCount()) {
+        if (i > 0) {
+            out = out + ",";
+        }
+        out = "${out}${b.noteAt(i).kind}";
+    }
+    b.clearNotes();
+    return out;
+}
+
+/** The mission checks. */
+pub class OpenworldMissionSuite {
+    /** Runs every check of the suite. */
+    pub static fn run(c : Checks) : void {
+        misBuilder(c);
+        misValidate(c);
+        misTextFormat(c);
+        misTextErrors(c);
+        misWalkthrough(c);
+        misFailures(c);
+        misOrdering(c);
+        misSave(c);
+    }
+}
+
+fn misBuilder(c : Checks) : void {
+    let b : MissionBook = new MissionBook();
+    c.that(
+        "book: an objective needs a stage",
+        !b.reach(0.0, 0.0, 5.0) && b.lastProblem() == "an objective needs a stage to belong to"
+    );
+    c.that("book: requires needs a mission", !b.requires("x"));
+    c.that("book: a stage needs a mission", !b.beginStage("s"));
+    c.that("book: a reward needs a mission", !b.reward("gold", 5));
+    c.that("book: a failure needs a mission", !b.failAfter(5.0));
+    c.that(
+        "book: a mission name must be one word",
+        !b.beginMission("two words", "t", false) && !b.beginMission("", "t", false)
+            && !b.beginMission("a#b", "t", false)
+    );
+    c.that("book: a good mission begins", b.beginMission("m", "Title", false));
+    c.that(
+        "book: a repeated mission name is refused",
+        !b.beginMission("m", "Other", false)
+            && b.lastProblem() == "there is already a mission called 'm'"
+    );
+    c.that("book: an objective still needs a stage inside a mission", !b.kill("wolf", 1));
+    c.that("book: a stage begins", b.beginStage("s"));
+    c.that("book: a repeated stage name is refused", !b.beginStage("s"));
+    c.that(
+        "book: a radius must be above zero",
+        !b.reach(0.0, 0.0, 0.0) && !b.reach(0.0, 0.0, -1.0) && !b.escort("c", 0.0, 0.0, 0.0)
+    );
+    c.that(
+        "book: a count must be positive",
+        !b.kill("wolf", 0) && !b.collect("crate", -3) && !b.kill("wolf", 2000000)
+    );
+    c.that(
+        "book: a kind must be one word",
+        !b.kill("big wolf", 1) && !b.flag("") && !b.escort("two words", 0.0, 0.0, 1.0)
+    );
+    c.that("book: a timer cannot be negative", !b.timer(-1.0));
+    c.that("book: optional needs an objective", !b.markOptional());
+    c.that("book: a fail timeout must be positive", !b.failAfter(0.0) && !b.failAfter(-2.0));
+    c.that("book: a reward must be positive", !b.reward("gold", 0) && !b.reward("gold", -5));
+    c.that("book: refused calls added nothing", b.totalObjectives() == 0);
+    c.that(
+        "book: a real objective is accepted",
+        b.reach(1.0, 2.0, 3.0) && b.totalObjectives() == 1
+    );
+    c.that("book: optional marks the last one", b.markOptional() && b.objectiveAt(0).optional);
+    c.sameInt("book: the mission count", b.missionCount(), 1);
+    c.sameInt("book: indexOf", b.indexOf("m"), 0);
+    c.sameInt("book: indexOf of nothing", b.indexOf("zz"), -1);
+    c.that(
+        "book: names and titles read back",
+        b.missionName(0) == "m" && b.missionTitle(0) == "Title" && b.stageName(0, 0) == "s"
+    );
+
+    c.that(
+        "book: the text and the builder give identical definitions",
+        misParsed().fingerprint() == misBuilt().fingerprint()
+    );
+    let changed : MissionBook = misBuilt();
+    changed.reward("gold", 1);
+    c.that(
+        "book: and a changed definition changes the fingerprint",
+        changed.fingerprint() != misBuilt().fingerprint()
+    );
+}
+
+fn misValidate(c : Checks) : void {
+    c.that("validate: the test missions are valid", misBuilt().validate().ok());
+    c.that("validate: so is an empty book", new MissionBook().validate().ok());
+
+    let empty : MissionBook = new MissionBook();
+    empty.beginMission("m", "t", false);
+    let r1 : BookCheck = empty.validate();
+    c.that(
+        "validate: a mission with no stage",
+        r1.count() == 1 && r1.messageAt(0) == "mission 'm' has no stage" && r1.missionAt(0) == 0
+    );
+
+    let optionalOnly : MissionBook = new MissionBook();
+    optionalOnly.beginMission("m", "t", false);
+    optionalOnly.beginStage("s");
+    optionalOnly.reach(0.0, 0.0, 1.0);
+    optionalOnly.markOptional();
+    c.that("validate: a stage with only optional objectives", optionalOnly.validate().count() == 1);
+
+    let noObjective : MissionBook = new MissionBook();
+    noObjective.beginMission("m", "t", false);
+    noObjective.beginStage("s");
+    c.that("validate: a stage with no objective", noObjective.validate().count() == 1);
+
+    let unknown : MissionBook = new MissionBook();
+    unknown.beginMission("m", "t", false);
+    unknown.requires("ghost");
+    unknown.beginStage("s");
+    unknown.timer(1.0);
+    c.that(
+        "validate: an unknown prerequisite",
+        unknown.validate().count() == 1
+            && unknown.validate().messageAt(0)
+                == "mission 'm' requires 'ghost', which does not exist"
+    );
+
+    let mine : MissionBook = new MissionBook();
+    mine.beginMission("m", "t", false);
+    mine.requires("m");
+    mine.beginStage("s");
+    mine.timer(1.0);
+    c.that(
+        "validate: a mission requiring itself is reported once",
+        mine.validate().count() == 1
+            && mine.validate().messageAt(0) == "mission 'm' requires itself"
+    );
+
+    let cyc : MissionBook = new MissionBook();
+    cyc.beginMission("a", "t", false);
+    cyc.requires("b");
+    cyc.beginStage("s");
+    cyc.timer(1.0);
+    cyc.beginMission("b", "t", false);
+    cyc.requires("c");
+    cyc.beginStage("s");
+    cyc.timer(1.0);
+    cyc.beginMission("c", "t", false);
+    cyc.requires("a");
+    cyc.beginStage("s");
+    cyc.timer(1.0);
+    cyc.beginMission("d", "t", false);
+    cyc.requires("a");
+    cyc.beginStage("s");
+    cyc.timer(1.0);
+    let lc : BookCheck = cyc.validate();
+    c.sameInt(
+        "validate: a loop of prerequisites is reported for each mission in it, not for one outside",
+        lc.count(),
+        3
+    );
+    c.that(
+        "validate: the loop message",
+        lc.messageAt(0) == "mission 'a' is its own prerequisite through a loop"
+    );
+
+    // A looped book never leaves Locked.
+    let stuck : MissionBoard = new MissionBoard(cyc);
+    c.that(
+        "validate: missions in a loop stay locked",
+        stuck.statusOf("a") == MISSION_LOCKED && stuck.statusOf("d") == MISSION_LOCKED
+    );
+}
+
+fn misTextFormat(c : Checks) : void {
+    let b : MissionBook = new MissionBook();
+    let r : ParseReport = MissionText::parse(b, misText());
+    c.that("text: the documented example reads without a problem", r.ok());
+    c.sameInt("text: three missions", b.missionCount(), 3);
+    c.sameInt("text: with their stages", b.stageCount(1), 3);
+    c.sameInt("text: objectives", b.totalObjectives(), 8);
+    c.that(
+        "text: titles",
+        b.missionTitle(1) == "Deliver the crate" && b.missionTitle(2) == "Bonus"
+    );
+    c.that("text: auto", b.isAuto(2) && !b.isAuto(0));
+    c.that(
+        "text: prerequisites",
+        b.requirementCount(1) == 1 && b.wordText(b.requirementWord(1, 0)) == "intro"
+    );
+    c.that("text: the optional flag", b.objectiveAt(2).optional && !b.objectiveAt(1).optional);
+    c.near("text: a decimal timer", b.objectiveAt(4).nanos as f64, 2500000000.0, 0.0);
+    c.that(
+        "text: failure conditions",
+        b.failCount(1) == 3 && b.failKind(1, 0) == 0 && b.failKind(1, 1) == 1
+            && b.failKind(1, 2) == 2
+    );
+    c.sameInt("text: failure time", b.failNanos(1, 0), 100 * MIS_S);
+    c.that(
+        "text: rewards",
+        b.rewardCount(1) == 2 && b.rewardAmount(1, 0) == 250 && b.rewardAmount(1, 1) == 100
+    );
+
+    let crlf : MissionBook = new MissionBook();
+    let rc : ParseReport = MissionText::parse(
+        crlf,
+        "mission m\r\n  stage s\r\n    timer 1\r\nend\r\n"
+    );
+    c.that("text: Windows line endings", rc.ok() && crlf.missionCount() == 1);
+    let none : MissionBook = new MissionBook();
+    c.that(
+        "text: an empty text is fine",
+        MissionText::parse(none, "").ok() && MissionText::parse(none, "# only a comment\n\n").ok()
+    );
+    let spaced : MissionBook = new MissionBook();
+    let rs : ParseReport = MissionText::parse(
+        spaced,
+        "mission m \"A title # with hash\"   # trailing\n\tstage s\n\t\ttimer   1   # t\nend"
+    );
+    c.that(
+        "text: tabs, extra spaces, a # inside quotes and a last line without a newline",
+        rs.ok() && spaced.missionTitle(0) == "A title # with hash"
+    );
+}
+
+// Parses `text` and answers the report.
+fn misProblems(text : string) : ParseReport {
+    return MissionText::parse(new MissionBook(), text);
+}
+
+fn misTextErrors(c : Checks) : void {
+    let a : ParseReport = misProblems("mission m\n  stage s\n    jump 5\nend\n");
+    c.that(
+        "text error: an unknown statement",
+        a.count() >= 1 && a.lineAt(0) == 3 && a.columnAt(0) == 5
+            && a.messageAt(0) == "unknown statement 'jump'"
+    );
+    let b : ParseReport = misProblems("mission m\n  stage s\n    reach 1 2\nend\n");
+    c.that(
+        "text error: too few arguments, column after the last word",
+        b.count() >= 1 && b.lineAt(0) == 3 && b.columnAt(0) == 15
+            && b.messageAt(0) == "expected 'reach X Z RADIUS'"
+    );
+    let d : ParseReport = misProblems("mission m\n  stage s\n    reach 1 two 3\nend\n");
+    c.that(
+        "text error: a word where a number belongs, at its column",
+        d.lineAt(0) == 3 && d.columnAt(0) == 13 && d.messageAt(0) == "z must be a number, not 'two'"
+    );
+    let e : ParseReport = misProblems("mission m\n  stage s\n    kill wolf 3 now\nend\n");
+    c.that(
+        "text error: an extra word",
+        e.lineAt(0) == 3 && e.columnAt(0) == 17
+            && e.messageAt(0) == "unexpected 'now' after 'kill KIND COUNT'"
+    );
+    let f : ParseReport = misProblems("mission m \"open\n");
+    c.that(
+        "text error: an unclosed quote",
+        f.lineAt(0) == 1 && f.columnAt(0) == 11 && f.messageAt(0) == "a quote is never closed"
+    );
+    let g : ParseReport = misProblems("stage s\n");
+    c.that(
+        "text error: a stage outside a mission",
+        g.lineAt(0) == 1 && g.messageAt(0) == "'stage' belongs inside a mission ... end block"
+    );
+    let h : ParseReport = misProblems("mission m\n  reach 1 2 3\nend\n");
+    c.that(
+        "text error: an objective outside a stage",
+        h.lineAt(0) == 2 && h.messageAt(0) == "'reach' belongs inside a stage"
+    );
+    let i : ParseReport = misProblems("mission m\n  stage s\n    timer 1\n");
+    c.that(
+        "text error: a mission never closed",
+        i.lineAt(0) == 3 && i.messageAt(0) == "mission 'm' is not closed with 'end'"
+    );
+    let j : ParseReport = misProblems("end\n");
+    c.that(
+        "text error: end with no mission",
+        j.lineAt(0) == 1 && j.messageAt(0) == "'end' without a mission"
+    );
+    let k : ParseReport = misProblems("mission m\n  stage s\n    timer 1\nend\nmission m\n  stage s\n    timer 1\nend\n");
+    c.that(
+        "text error: a repeated mission name",
+        k.lineAt(0) == 5 && k.messageAt(0) == "there is already a mission called 'm'"
+    );
+    let l : ParseReport = misProblems("mission a\n  requires ghost\n  stage s\n    timer 1\nend\n");
+    c.that(
+        "text error: an unknown prerequisite is reported on the mission's own line",
+        l.lineAt(0) == 1 && l.messageAt(0) == "mission 'a' requires 'ghost', which does not exist"
+    );
+    let m : ParseReport = misProblems("mission a\n  stage s\n    timer 1\n  fail sometimes 3\nend\n");
+    c.that("text error: a bad failure kind", m.lineAt(0) == 4 && m.columnAt(0) == 8);
+    let n : ParseReport = misProblems("mission a\n  stage s\n    kill wolf -2\nend\n");
+    c.that(
+        "text error: a count the book refuses",
+        n.lineAt(0) == 3 && n.messageAt(0) == "the count must be between 1 and 1000000"
+    );
+    let o : ParseReport = misProblems("mission a\n  stage s\n    timer 1\n  reward gold lots\nend\n");
+    c.that("text error: a reward that is not a number", o.lineAt(0) == 4 && o.columnAt(0) == 15);
+    let p : ParseReport = misProblems("mission\n");
+    c.that("text error: a mission without a name", p.lineAt(0) == 1);
+    let q : ParseReport = misProblems("mission a\nmission b\n  stage s\n    timer 1\nend\n");
+    c.that(
+        "text error: a mission opened inside another",
+        q.lineAt(0) == 2 && q.messageAt(0) == "mission 'a' is not closed with 'end'"
+    );
+    let r : ParseReport = misProblems("mission a\n  stage s\n    reach 1 2 3 optional\nend\n");
+    c.that(
+        "text error: a stage of optional objectives is caught by validation",
+        r.count() == 1 && r.lineAt(0) == 1
+    );
+    let many : ParseReport = misProblems("bogus\nmission a\n  stage s\n    reach 1\n    timer 1\nend\nmore bogus\n");
+    c.sameInt("text error: every bad line is reported, the good ones still read", many.count(), 3);
+    c.that(
+        "text error: on the right lines",
+        many.lineAt(0) == 1 && many.lineAt(1) == 4 && many.lineAt(2) == 7
+    );
+}
+
+fn misWalkthrough(c : Checks) : void {
+    let b : MissionBoard = misBoard();
+    c.that(
+        "walk: a mission with no prerequisite is available",
+        b.statusOf("intro") == MISSION_AVAILABLE
+    );
+    c.that(
+        "walk: one with a prerequisite is locked",
+        b.statusOf("deliver") == MISSION_LOCKED && b.statusOf("bonus") == MISSION_LOCKED
+    );
+    c.sameInt("walk: an unknown mission has no status", b.statusOf("nope"), -1);
+    c.that("walk: a locked mission cannot be started", !b.start("deliver"));
+    c.that("walk: an unknown mission cannot be started", !b.start("nope"));
+    c.sameInt("walk: construction announced the available mission", b.noteCount(), 1);
+    b.clearNotes();
+    c.that("walk: an available mission starts", b.start("intro"));
+    c.that(
+        "walk: it is active, in stage 0",
+        b.statusOf("intro") == MISSION_ACTIVE && b.stageOf("intro") == 0
+    );
+    c.that("walk: and cannot be started twice", !b.start("intro"));
+    c.sameInt("walk: one active mission", b.activeCount(), 1);
+    b.postPosition(300.0, 300.0);
+    b.update(MIS_S);
+    c.that(
+        "walk: a position outside the area changes nothing",
+        b.statusOf("intro") == MISSION_ACTIVE && !b.objectiveDone("intro", 0)
+    );
+    c.sameInt("walk: time is counted while active", b.elapsedNanos("intro"), MIS_S);
+    c.sameInt("walk: events are consumed by update", b.pendingEvents(), 0);
+    misNotes(b);
+    b.postPosition(95.0, 100.0);
+    c.sameInt("walk: a posted event waits for update", b.pendingEvents(), 1);
+    b.update(0);
+    c.that(
+        "walk: a position inside the area completes the one-stage mission",
+        b.statusOf("intro") == MISSION_COMPLETED
+    );
+    c.that("walk: and its reward is paid", b.rewardTotal("xp") == 50 && b.rewardTotal("gold") == 0);
+    c.that(
+        "walk: the notes tell the story in order (objective, stage, completed, reward, unlocked)",
+        misNotes(b) == "1,2,3,5,6"
+    );
+    c.that(
+        "walk: the dependent mission is available now",
+        b.statusOf("deliver") == MISSION_AVAILABLE
+    );
+    c.sameInt("walk: a completed mission reports its stage count", b.stageOf("intro"), 1);
+
+    c.that("walk: deliver starts", b.start("deliver"));
+    b.postCollect("wolf", 5);
+    b.postKill("crate", 5);
+    b.update(0);
+    c.sameInt(
+        "walk: collecting the wrong kind, or killing a collectable, counts nothing",
+        b.objectiveCount("deliver", 0),
+        0
+    );
+    b.postCollect("crate", 1);
+    b.update(0);
+    c.sameInt("walk: one crate counted", b.objectiveCount("deliver", 0), 1);
+    c.that("walk: not done yet", !b.objectiveDone("deliver", 0) && b.stageOf("deliver") == 0);
+    b.postPosition(500.0, 0.0);
+    b.postCollect("crate", 7);
+    b.update(0);
+    c.that(
+        "walk: collecting more than needed completes the objective; the optional one is not needed",
+        b.stageOf("deliver") == 1
+    );
+    c.sameInt("walk: progress of a new stage starts at zero", b.objectiveCount("deliver", 0), 0);
+    misNotes(b);
+
+    b.postEscort("mule", 1000.0, 0.0);
+    b.postEscort("courier", 1100.0, 0.0);
+    b.update(MIS_S);
+    c.that(
+        "walk: another escort, or one out of the area, does not count",
+        !b.objectiveDone("deliver", 0)
+    );
+    b.postEscort("courier", 1010.0, 10.0);
+    b.update(0);
+    c.that("walk: the escort arrives", b.objectiveDone("deliver", 0));
+    c.that(
+        "walk: the stage still waits for its timer",
+        b.stageOf("deliver") == 1 && !b.objectiveDone("deliver", 1)
+    );
+    b.update(MIS_S + MIS_S / 2);
+    c.that(
+        "walk: after 2.5 s in the stage the timer is done and the stage moves on",
+        b.stageOf("deliver") == 2
+    );
+
+    b.postKill("wolf", 2);
+    b.update(0);
+    c.sameInt("walk: two wolves", b.objectiveCount("deliver", 0), 2);
+    b.postKill("wolf", 1);
+    b.update(0);
+    c.that(
+        "walk: the third wolf finishes that objective but not the stage",
+        b.objectiveDone("deliver", 0) && b.stageOf("deliver") == 2
+            && b.statusOf("deliver") == MISSION_ACTIVE
+    );
+    c.that("walk: the flag is not set", !b.flag("gate"));
+    misNotes(b);
+    b.postFlag("gate");
+    b.update(0);
+    c.that(
+        "walk: the flag completes the mission",
+        b.statusOf("deliver") == MISSION_COMPLETED && b.flag("gate")
+    );
+    c.that(
+        "walk: rewards add up per name",
+        b.rewardTotal("gold") == 250 && b.rewardTotal("xp") == 150
+    );
+    c.that(
+        "walk: the auto mission started itself the moment it unlocked",
+        b.statusOf("bonus") == MISSION_ACTIVE
+    );
+    c.that(
+        "walk: notes: flag objective, stage, completed, two rewards, unlocked, started",
+        misNotes(b) == "1,2,3,5,5,6,0"
+    );
+    b.update(MIS_S);
+    c.that(
+        "walk: the bonus completes by time alone",
+        b.statusOf("bonus") == MISSION_COMPLETED && b.rewardTotal("gold") == 255
+    );
+    c.sameInt("walk: nothing is active at the end", b.activeCount(), 0);
+    c.that("walk: a completed mission cannot be restarted", !b.start("intro") && !b.retry("intro"));
+}
+
+fn misFailures(c : Checks) : void {
+    let t : MissionBoard = misDelivering();
+    t.update(99 * MIS_S);
+    c.that("fail: before the limit the mission lives", t.statusOf("deliver") == MISSION_ACTIVE);
+    t.update(MIS_S);
+    c.that("fail: at the time limit it fails", t.statusOf("deliver") == MISSION_FAILED);
+    c.that(
+        "fail: and the note says why",
+        t.noteAt(t.noteCount() - 1).kind == NOTE_FAILED
+            && t.noteAt(t.noteCount() - 1).a == FAILED_TIMEOUT
+    );
+    t.update(500 * MIS_S);
+    c.that(
+        "fail: a failed mission stays failed and its clock stops",
+        t.statusOf("deliver") == MISSION_FAILED && t.elapsedNanos("deliver") == 100 * MIS_S
+    );
+    c.that(
+        "fail: a failed mission cannot be started, only retried",
+        !t.start("deliver") && t.retry("deliver")
+    );
+    c.that(
+        "fail: retry makes it available again, from scratch",
+        t.statusOf("deliver") == MISSION_AVAILABLE && t.stageOf("deliver") == 0
+            && t.elapsedNanos("deliver") == 0
+    );
+    c.that(
+        "fail: and it can run again",
+        t.start("deliver") && t.statusOf("deliver") == MISSION_ACTIVE
+    );
+    c.that(
+        "fail: retry of a mission that did not fail is refused",
+        !t.retry("deliver") && !t.retry("nope")
+    );
+
+    let f : MissionBoard = misDelivering();
+    f.postFlag("alarm");
+    f.update(0);
+    c.that(
+        "fail: a fail flag fails the mission",
+        f.statusOf("deliver") == MISSION_FAILED && f.noteAt(f.noteCount() - 1).a == FAILED_FLAG
+    );
+
+    let d : MissionBoard = misDelivering();
+    d.postDeath("mule");
+    d.update(0);
+    c.that(
+        "fail: a death that matters fails the mission",
+        d.statusOf("deliver") == MISSION_FAILED && d.noteAt(d.noteCount() - 1).a == FAILED_DEATH
+    );
+
+    let other : MissionBoard = misDelivering();
+    other.postDeath("courier");
+    other.update(0);
+    c.that(
+        "fail: the escortee's death is nothing to a stage that does not escort yet",
+        other.statusOf("deliver") == MISSION_ACTIVE
+    );
+
+    let e : MissionBoard = misDelivering();
+    e.postCollect("crate", 2);
+    e.update(0);
+    e.postDeath("courier");
+    e.update(0);
+    c.that(
+        "fail: but fatal in the escort stage",
+        e.statusOf("deliver") == MISSION_FAILED && e.noteAt(e.noteCount() - 1).a == FAILED_ESCORT
+    );
+
+    let late : MissionBoard = misDelivering();
+    late.postCollect("crate", 2);
+    late.postEscort("courier", 1000.0, 0.0);
+    late.update(0);
+    late.update(3 * MIS_S);
+    late.postDeath("courier");
+    late.update(0);
+    c.that(
+        "fail: once the escort has arrived its death is no longer fatal",
+        late.statusOf("deliver") == MISSION_ACTIVE && late.stageOf("deliver") == 2
+    );
+
+    // Completion in the same step as the time limit counts as completion.
+    let race : MissionBook = new MissionBook();
+    race.beginMission("r", "Race", false);
+    race.beginStage("s");
+    race.timer(10.0);
+    race.failAfter(10.0);
+    let rb : MissionBoard = new MissionBoard(race);
+    rb.start("r");
+    rb.update(10 * MIS_S);
+    c.that(
+        "fail: a mission that finishes in the step its time runs out has finished",
+        rb.statusOf("r") == MISSION_COMPLETED
+    );
+
+    // A stage with a zero timer, or a flag that is already set, is done the moment it opens.
+    let instant : MissionBook = new MissionBook();
+    instant.beginMission("i", "Instant", false);
+    instant.beginStage("a");
+    instant.flag("go");
+    instant.beginStage("b");
+    instant.timer(0.0);
+    let ib : MissionBoard = new MissionBoard(instant);
+    ib.postFlag("go");
+    ib.update(0);
+    c.that(
+        "fail: a flag set before its stage opened is already done",
+        ib.start("i") && ib.statusOf("i") == MISSION_COMPLETED
+    );
+    c.that("fail: instant stages complete without time passing", ib.elapsedNanos("i") == 0);
+}
+
+fn misOrdering(c : Checks) : void {
+    // Events are processed in the order posted: kills finishing the objective, then the fail flag.
+    let a : MissionBoard = misDelivering();
+    a.postCollect("crate", 2);
+    a.postEscort("courier", 1000.0, 0.0);
+    a.update(3 * MIS_S);
+    a.postKill("wolf", 3);
+    a.postFlag("gate");
+    a.postFlag("alarm");
+    a.update(0);
+    c.that(
+        "order: the flag that completes the mission came before the one that fails it",
+        a.statusOf("deliver") == MISSION_COMPLETED
+    );
+    let b : MissionBoard = misDelivering();
+    b.postCollect("crate", 2);
+    b.postEscort("courier", 1000.0, 0.0);
+    b.update(3 * MIS_S);
+    b.postKill("wolf", 3);
+    b.postFlag("alarm");
+    b.postFlag("gate");
+    b.update(0);
+    c.that("order: swap them and the mission fails", b.statusOf("deliver") == MISSION_FAILED);
+
+    // Same events, same hash; different events, different hash.
+    let x : MissionBoard = misDelivering();
+    let y : MissionBoard = misDelivering();
+    c.that("order: two identical boards hash alike", x.stateHash() == y.stateHash());
+    x.postCollect("crate", 1);
+    x.update(MIS_S);
+    y.postCollect("crate", 1);
+    y.update(MIS_S);
+    c.that("order: and still do after the same events", x.stateHash() == y.stateHash());
+    y.postCollect("crate", 1);
+    y.update(0);
+    c.that("order: one more event makes them differ", x.stateHash() != y.stateHash());
+
+    // The note log.
+    let n : MissionBoard = misBoard();
+    n.clearNotes();
+    n.start("intro");
+    c.sameInt("order: starting leaves a note", n.noteCount(), 1);
+    let note : MissionNote = n.noteAt(0);
+    c.that(
+        "order: of the right kind about the right mission",
+        note.kind == NOTE_STARTED && note.mission == 0
+    );
+    n.clearNotes();
+    c.sameInt("order: clearNotes empties the log", n.noteCount(), 0);
+}
+
+fn misSave(c : Checks) : void {
+    let a : MissionBoard = misDelivering();
+    a.postCollect("crate", 2);
+    a.postEscort("courier", 1000.0, 0.0);
+    a.postKill("zebra", 9);
+    a.update(MIS_S);
+    a.postFlag("gate");
+    a.postFlag("unmentioned");
+    a.update(MIS_S / 4);
+    let bytes : ByteBuf = a.save();
+    c.that("save: some bytes", bytes.len() > 100 && bytes.tagAt(0, "LXMS"));
+
+    let b : MissionBoard = misBoard();
+    c.that("save: a fresh board differs", b.stateHash() != a.stateHash());
+    c.that("save: loading succeeds", b.load(bytes) == "");
+    c.that("save: and the loaded board hashes like the saved one", b.stateHash() == a.stateHash());
+    c.that(
+        "save: statuses, stage and clocks came back",
+        b.statusOf("deliver") == MISSION_ACTIVE && b.stageOf("deliver") == 1
+            && b.elapsedNanos("deliver") == a.elapsedNanos("deliver")
+    );
+    c.that("save: flags and rewards came back", b.flag("gate") && b.rewardTotal("xp") == 50);
+    c.that(
+        "save: the flag no mission mentions did not",
+        !b.flag("unmentioned") && a.flag("unmentioned")
+    );
+
+    // Continue both with the same events: they stay in step to the end.
+    a.update(3 * MIS_S);
+    b.update(3 * MIS_S);
+    a.postKill("wolf", 3);
+    b.postKill("wolf", 3);
+    a.update(0);
+    b.update(0);
+    c.that(
+        "save: the loaded board plays on exactly like the original",
+        a.stateHash() == b.stateHash() && b.statusOf("deliver") == MISSION_COMPLETED
+    );
+
+    // Round trip of a finished game.
+    let done : ByteBuf = a.save();
+    let z : MissionBoard = misBoard();
+    c.that(
+        "save: a game with completed missions round-trips",
+        z.load(done) == "" && z.stateHash() == a.stateHash()
+            && z.rewardTotal("gold") == a.rewardTotal("gold")
+    );
+
+    // Damage.
+    let before : i64 = z.stateHash();
+    let flipped : ByteBuf = new ByteBuf(16);
+    flipped.pushRange(bytes, 0, bytes.len());
+    flipped.set(60, flipped.get(60) ^ 1);
+    c.that(
+        "save damage: a flipped bit fails the checksum",
+        z.load(flipped) == "the mission save is damaged (checksum differs)"
+    );
+    c.sameInt("save damage: and nothing changed", z.stateHash(), before);
+    let cut : ByteBuf = new ByteBuf(16);
+    cut.pushRange(bytes, 0, bytes.len() - 7);
+    c.that("save damage: a cut save is refused", z.load(cut) != "" && z.stateHash() == before);
+    let tag : ByteBuf = new ByteBuf(16);
+    tag.pushRange(bytes, 0, bytes.len());
+    tag.set(1, 65);
+    c.that(
+        "save damage: a wrong tag is refused",
+        z.load(tag) == "not a mission save (wrong tag or too short)"
+    );
+    c.that("save damage: no bytes are refused", z.load(new ByteBuf(16)) != "");
+
+    // A save made for other definitions is refused.
+    let other : MissionBook = new MissionBook();
+    other.beginMission("x", "X", false);
+    other.beginStage("s");
+    other.timer(1.0);
+    let otherBoard : MissionBoard = new MissionBoard(other);
+    c.that(
+        "save mismatch: a save from different definitions is refused",
+        otherBoard.load(bytes) == "the mission save belongs to different mission definitions"
+    );
+    c.that(
+        "save mismatch: and the board is untouched",
+        otherBoard.statusOf("x") == MISSION_AVAILABLE
+    );
+    let tweaked : MissionBook = misBuilt();
+    tweaked.reward("gold", 1);
+    let tb : MissionBoard = new MissionBoard(tweaked);
+    c.that("save mismatch: even a changed reward changes the fingerprint", tb.load(bytes) != "");
+
+    // A self-consistent save with an impossible stage is refused (rebuilt with a fresh checksum).
+    let evil : ByteBuf = new ByteBuf(16);
+    evil.pushRange(bytes, 0, bytes.len() - 4);
+    evil.set(24 + 24 + 7, 99);
+    evil.pushBe32(misCrc(evil));
+    c.that(
+        "save damage: an impossible stage is refused even with a valid checksum",
+        misBoard().load(evil) == "mission 1 has an impossible stage"
+    );
+}
+
+fn misCrc(b : ByteBuf) : i32 {
+    return new Crc32().sum(b, 0, b.len());
+}

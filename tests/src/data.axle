@@ -1,0 +1,423 @@
+// data — checks for the byte buffer, checksums, inflate and deflate, the PNG codec, the image cache and the
+// texture mip chain.
+//
+// The decoders are checked against streams and files made by other programs (zlib, an imaging library), not
+// only against our own encoder, because a codec that agrees with itself can still disagree with the world.
+// Damaged input is part of the contract: it must produce an error, never an abort or an out-of-range read.
+
+use ludax::ByteBuf;
+use ludax::Checks;
+use ludax::Crc32;
+use ludax::Deflater;
+use ludax::Image;
+use ludax::ImageAssets;
+use ludax::Inflater;
+use ludax::Pcg32;
+use ludax::PngCodec;
+use ludax::Texture;
+use ludax::TextureWrap;
+use ludax::Vec4;
+use ludax::adler32;
+
+// A 6x4 RGBA PNG whose pixels the decode and damage checks both know; every mutation starts from these bytes.
+const DATA_PNG_RGBA_HEX : string = "89504e470d0a1a0a0000000d4948445200000006000000040806000000ad044e430000001d4944415478da63646060f8afc120f2081db330d8883030306062d22500909a08bf831029de0000000049454e44ae426082";
+
+/** The data checks. Helpers are prefixed because top-level names are global to the package. */
+pub class DataSuite {
+    /** Runs every check of the suite. */
+    pub static fn run(c : Checks) : void {
+        println("  data: buffer");
+        dataBufferChecks(c);
+        println("  data: checksum");
+        dataChecksumChecks(c);
+        println("  data: inflate");
+        dataInflateChecks(c);
+        println("  data: deflate");
+        dataDeflateChecks(c);
+        println("  data: png decode");
+        dataPngDecodeChecks(c);
+        println("  data: png roundtrip");
+        dataPngRoundTrip(c);
+        println("  data: png damage");
+        dataPngDamage(c);
+        println("  data: image");
+        dataImageChecks(c);
+        println("  data: asset");
+        dataAssetChecks(c);
+        println("  data: texture");
+        dataTextureChecks(c);
+        println("  data: done");
+    }
+}
+
+// A buffer from hexadecimal text.
+fn dataHex(text : string) : ByteBuf {
+    let out : ByteBuf = new ByteBuf(text.byteLength / 2 + 16);
+    let mut i : i32 = 0;
+    while (i + 1 < text.byteLength) {
+        out.push(dataNibble(text.charAt(i) as i32) * 16 + dataNibble(text.charAt(i + 1) as i32));
+        i = i + 2;
+    }
+    return out;
+}
+
+fn dataNibble(ch : i32) : i32 {
+    if (ch >= 97) {
+        return ch - 87;
+    }
+    return ch - 48;
+}
+
+fn dataText(s : string) : ByteBuf {
+    let b : ByteBuf = new ByteBuf(16);
+    b.pushText(s);
+    return b;
+}
+
+fn dataBufferChecks(c : Checks) : void {
+    let b : ByteBuf = new ByteBuf(1);
+    for (i of 0..100) {
+        b.push(i * 3);
+    }
+    c.sameInt("bytes: growth keeps the bytes", b.get(99), (99 * 3) & 255);
+    c.sameInt("bytes: length", b.len(), 100);
+    b.push(300);
+    c.sameInt("bytes: a push keeps the low 8 bits", b.get(100), 44);
+    b.pushBe32(0x01020304);
+    c.sameInt("bytes: big-endian read", b.be32(101), 0x01020304);
+    c.sameInt("bytes: little-endian read of the same bytes", b.le32(101), 0x04030201);
+    c.sameInt("bytes: a byte above 127 reads as 0..255", dataHex("ff").get(0), 255);
+    c.sameInt("bytes: getOr gives the fallback outside", b.getOr(5000, -7), -7);
+    c.that(
+        "bytes: tagAt",
+        dataText("IHDRx").tagAt(0, "IHDR") && !dataText("IHDRx").tagAt(1, "IHDR")
+    );
+}
+
+fn dataChecksumChecks(c : Checks) : void {
+    let crc : Crc32 = new Crc32();
+    let nine : ByteBuf = dataText("123456789");
+    c.sameInt(
+        "crc32: the standard check value of 123456789",
+        crc.sum(nine, 0, 9) & 4294967295,
+        3421780262
+    );
+    c.sameInt("crc32: of nothing", crc.sum(nine, 0, 0), 0);
+    c.sameInt(
+        "adler32: the Wikipedia example",
+        adler32(dataText("Wikipedia"), 0, 9) & 4294967295,
+        300286872
+    );
+    c.sameInt("adler32: of nothing is 1", adler32(nine, 0, 0), 1);
+}
+
+fn dataInflateChecks(c : Checks) : void {
+    let empty : ByteBuf = dataHex("789c030000000001");
+    let inf : Inflater = new Inflater(1000);
+    c.that(
+        "inflate: the stream of an empty input",
+        inf.zlib(empty, 0, empty.len()) && inf.output().len() == 0
+    );
+
+    // zlib at level 9 over 379 bytes of text: a dynamic Huffman block.
+    let stream : ByteBuf = dataHex("78dac5ce551283401444d1adbccf2871777727ae4006186c8227ac3eb38954befb569d666504a68b0515788bf80688e40d8aabbf6c201eb2c0a1b3c6051f78128901f66771281c89c6e24c22994a67b2b97ca1582a57aab57aa3d96a77babdfe60381a4fa6b3f962b95a6fd8ed6e7f389ece97ebedfee078e1894449c68aaae906799996edb89ebfe4a8ab7f80a7a88f1d1944ec214a05c8000d9b2eb1e817c966e08fe1175a6d842a");
+    let inf2 : Inflater = new Inflater(100000);
+    let ok : bool = inf2.zlib(stream, 0, stream.len());
+    c.that("inflate: a dynamic-Huffman stream from zlib decodes", ok);
+    let mut sum : i32 = 0;
+    for (i of 0..inf2.output().len()) {
+        sum = sum + inf2.output().get(i);
+    }
+    c.sameInt("inflate: ... to 379 bytes", inf2.output().len(), 379);
+    c.sameInt("inflate: ... with the right content (byte sum)", sum, 33833);
+
+    let cut : Inflater = new Inflater(100000);
+    c.that(
+        "inflate: a truncated stream fails",
+        !cut.zlib(stream, 0, stream.len() - 9) && cut.failed()
+    );
+    let flipped : ByteBuf = dataHex("78dac5ce551283401444d1adbccf2871777727ae4006186c8227ac3eb38954befb569d666504a68b0515788bf80688e40d8aabbf6c201eb2c0a1b3c6051f78128901f66771281c89c6e24c22994a67b2b97ca1582a57aab57aa3d96a77babdfe60381a4fa6b3f962b95a6fd8ed6e7f389ece97ebedfee078e1894449c68aaae906799996edb89ebfe4a8ab7f80a7a88f1d1944ec214a05c8000d9b2eb1e817c966e08fe1175a6d842a");
+    flipped.set(30, flipped.get(30) ^ 255);
+    let bad : Inflater = new Inflater(100000);
+    c.that("inflate: a damaged stream fails", !bad.zlib(flipped, 0, flipped.len()));
+    let small : Inflater = new Inflater(100);
+    c.that(
+        "inflate: the output limit stops a stream that would exceed it",
+        !small.zlib(stream, 0, stream.len())
+    );
+    let junk : ByteBuf = dataHex("0102030405060708");
+    c.that("inflate: a header that is not zlib's fails", !new Inflater(100).zlib(junk, 0, 8));
+}
+
+fn dataDeflateChecks(c : Checks) : void {
+    let src : ByteBuf = new ByteBuf(16);
+    for (i of 0..5000) {
+        src.push((i / 7) % 13);
+    }
+    let packed : ByteBuf = new Deflater().zlib(src, 0, src.len());
+    c.that(
+        "deflate: repetitive data shrinks a lot (${packed.len()} of ${src.len()})",
+        packed.len() < src.len() / 8
+    );
+    let inf : Inflater = new Inflater(100000);
+    c.that("deflate: our stream inflates", inf.zlib(packed, 0, packed.len()));
+    let mut same : bool = inf.output().len() == src.len();
+    if (same) {
+        for (i of 0..src.len()) {
+            if (inf.output().get(i) != src.get(i)) {
+                same = false;
+            }
+        }
+    }
+    c.that("deflate: ... to what went in", same);
+
+    let r : Pcg32 = new Pcg32(7, 3);
+    let noise : ByteBuf = new ByteBuf(16);
+    for (i of 0..20000) {
+        noise.push((r.nextF32() * (256.0 as f32)) as i32);
+    }
+    let np : ByteBuf = new Deflater().zlib(noise, 0, noise.len());
+    c.that(
+        "deflate: noise is stored, not inflated (${np.len()} of ${noise.len()})",
+        np.len() < noise.len() + 64
+    );
+    let ni : Inflater = new Inflater(100000);
+    c.that(
+        "deflate: stored noise round-trips",
+        ni.zlib(np, 0, np.len()) && ni.output().len() == noise.len()
+            && ni.output().get(777) == noise.get(777)
+            && ni.output().get(19999) == noise.get(19999)
+    );
+
+    let none : ByteBuf = new ByteBuf(16);
+    let ep : ByteBuf = new Deflater().zlib(none, 0, 0);
+    let ei : Inflater = new Inflater(100);
+    c.that(
+        "deflate: the empty input round-trips",
+        ei.zlib(ep, 0, ep.len()) && ei.output().len() == 0
+    );
+
+    let a : ByteBuf = new Deflater().zlib(src, 0, src.len());
+    let mut same2 : bool = a.len() == packed.len();
+    for (i of 0..packed.len()) {
+        if (same2 && a.get(i) != packed.get(i)) {
+            same2 = false;
+        }
+    }
+    c.that("deflate: the same input gives the same bytes", same2);
+}
+
+fn dataPngDecodeChecks(c : Checks) : void {
+    let codec : PngCodec = new PngCodec();
+    let pal : Image = codec.decode(dataHex("89504e470d0a1a0a0000000d4948445200000005000000030403000000a918d8cb00000030504c5445ff000000ff000000ff0a141e000000000000000000000000000000000000000000000000000000000000000000000000c469b0720000000474524e53ffffff00402aa9f4000000144944415478da636054666012e415605066540000032500994195ee710000000049454e44ae426082"));
+    c.that(
+        "png: a 4-bit palette file decodes (${codec.error()})",
+        pal.width() == 5 && pal.height() == 3
+    );
+    c.sameInt("png: palette index 0 is red", pal.get(0, 0), Image::pack(255, 0, 0, 255));
+    c.sameInt("png: palette index 1 is green", pal.get(1, 0), Image::pack(0, 255, 0, 255));
+    c.sameInt("png: the transparent palette entry has alpha 0", Image::alpha(pal.get(3, 0)), 0);
+    c.sameInt("png: the row wraps at the width", pal.get(0, 1), Image::pack(0, 255, 0, 255));
+
+    let grey : Image = codec.decode(dataHex("89504e470d0a1a0a0000000d4948445200000009000000020100000000a22dcb7e0000000e4944415478da630865605c750d0003dc01d7dcced4880000000049454e44ae426082"));
+    c.that(
+        "png: a 1-bit grey file decodes (${codec.error()})",
+        grey.width() == 9 && grey.height() == 2
+    );
+    c.sameInt("png: 1-bit black", grey.get(0, 0), Image::pack(0, 0, 0, 255));
+    c.sameInt("png: 1-bit white is scaled to 255", grey.get(1, 0), Image::pack(255, 255, 255, 255));
+
+    let rgba : Image = codec.decode(dataHex(DATA_PNG_RGBA_HEX));
+    c.that(
+        "png: an RGBA file with row filters decodes (${codec.error()})",
+        rgba.width() == 6 && rgba.height() == 4
+    );
+    c.sameInt("png: its first pixel", rgba.get(0, 0), Image::pack(0, 0, 0, 255));
+    c.sameInt("png: its second pixel", rgba.get(1, 0), Image::pack(40, 0, 20, 225));
+    c.sameInt("png: a pixel in the middle", rgba.get(3, 2), Image::pack(120, 120, 100, 165));
+}
+
+fn dataPngRoundTrip(c : Checks) : void {
+    let codec : PngCodec = new PngCodec();
+    let img : Image = new Image(37, 23);
+    let r : Pcg32 = new Pcg32(11, 5);
+    for (y of 0..23) {
+        for (x of 0..37) {
+            let v : i32 = (x * 5 + y * 3) & 255;
+            img.set(
+                x,
+                y,
+                Image::pack(v, 255 - v, (r.nextF32() * (8.0 as f32)) as i32 + v / 2, 255)
+            );
+        }
+    }
+    let file : ByteBuf = codec.encode(img);
+    let back : Image = codec.decode(file);
+    c.that("png: an opaque picture round-trips (${codec.error()})", back.same(img));
+
+    img.set(3, 4, Image::pack(10, 20, 30, 128));
+    img.set(36, 22, Image::pack(0, 0, 0, 0));
+    let file2 : ByteBuf = codec.encode(img);
+    c.that("png: a picture with alpha round-trips", codec.decode(file2).same(img));
+    c.that("png: opaque pictures are stored as RGB (smaller)", file.len() < file2.len() + 200);
+
+    let flat : Image = new Image(256, 256);
+    flat.fill(Image::pack(40, 90, 200, 255));
+    let ff : ByteBuf = codec.encode(flat);
+    c.that("png: a flat 256 x 256 picture is tiny (${ff.len()} bytes)", ff.len() < 2500);
+    c.that("png: ... and exact", codec.decode(ff).same(flat));
+    c.sameInt("png: an empty image encodes to nothing", codec.encode(new Image(0, 0)).len(), 0);
+}
+
+fn dataPngDamage(c : Checks) : void {
+    let codec : PngCodec = new PngCodec();
+    let good : ByteBuf = dataHex(DATA_PNG_RGBA_HEX);
+    c.that(
+        "png: nothing is not a PNG",
+        codec.decode(new ByteBuf(16)).isEmpty() && codec.error().byteLength > 0
+    );
+    let sig : ByteBuf = dataHex(DATA_PNG_RGBA_HEX);
+    sig.set(1, 0);
+    c.that("png: a wrong signature is refused", codec.decode(sig).isEmpty());
+    let crc : ByteBuf = dataHex(DATA_PNG_RGBA_HEX);
+    crc.set(17, crc.get(17) ^ 1);
+    c.that("png: a changed header fails its checksum", codec.decode(crc).isEmpty());
+    let cut : ByteBuf = dataHex(DATA_PNG_RGBA_HEX);
+    cut.truncate(cut.len() - 20);
+    c.that("png: a truncated file is refused", codec.decode(cut).isEmpty());
+    let mid : ByteBuf = dataHex(DATA_PNG_RGBA_HEX);
+    mid.set(40, mid.get(40) ^ 255);
+    c.that("png: damaged pixel data is refused", codec.decode(mid).isEmpty());
+    c.that("png: the original still decodes", !codec.decode(good).isEmpty());
+}
+
+fn dataImageChecks(c : Checks) : void {
+    let img : Image = new Image(4, 3);
+    img.set(1, 2, Image::pack(1, 2, 3, 4));
+    c.sameInt("image: a pixel reads back", img.get(1, 2), Image::pack(1, 2, 3, 4));
+    c.sameInt(
+        "image: channels unpack",
+        Image::red(img.get(1, 2)) + Image::green(img.get(1, 2)) * 10
+            + Image::blue(img.get(1, 2)) * 100
+            + Image::alpha(img.get(1, 2)) * 1000,
+        4321
+    );
+    c.sameInt(
+        "image: outside reads transparent black",
+        img.get(-1, 0) + img.get(4, 0) + img.get(0, 3),
+        0
+    );
+    img.set(100, 100, 5);
+    let big : Image = new Image(8, 8);
+    big.blit(img, 2, 2);
+    c.sameInt("image: blit moves pixels", big.get(3, 4), Image::pack(1, 2, 3, 4));
+    c.sameInt(
+        "image: crop takes them back",
+        big.crop(2, 2, 4, 3).get(1, 2),
+        Image::pack(1, 2, 3, 4)
+    );
+    c.that("image: a copy is the same and independent", big.copy().same(big));
+    c.sameInt("image: flipping turns rows over", img.flippedY().get(1, 0), Image::pack(1, 2, 3, 4));
+}
+
+fn dataAssetChecks(c : Checks) : void {
+    let a : ImageAssets = new ImageAssets();
+    let img : Image = new Image(2, 2);
+    img.fill(Image::pack(9, 9, 9, 255));
+    let id : i32 = a.put("grass", img);
+    c.sameInt("assets: the first picture gets id 0", id, 0);
+    c.sameInt("assets: a name finds its id", a.find("grass"), 0);
+    c.sameInt("assets: an unknown name is -1", a.find("lava"), -1);
+    c.sameInt("assets: replacing keeps the id", a.put("grass", new Image(3, 3)), 0);
+    c.sameInt("assets: ... and the new picture", a.get(0).width(), 3);
+    c.sameInt("assets: a second name gets the next id", a.put("stone", new Image(2, 2)), 1);
+    c.sameInt("assets: a missing file is -1", a.load("no-such-file.png"), -1);
+    c.that("assets: ... with a reason", a.lastError().byteLength > 0);
+    c.that("assets: an unknown id is the empty image", a.get(99).isEmpty());
+    c.sameInt("assets: the count", a.count(), 2);
+}
+
+fn dataTextureChecks(c : Checks) : void {
+    let img : Image = new Image(8, 4);
+    img.fill(Image::pack(255, 255, 255, 255));
+    let tex : Texture = new Texture(img, TextureWrap::Repeat);
+    c.sameInt("texture: levels of an 8 x 4 picture (8x4, 4x2, 2x1, 1x1)", tex.levels(), 4);
+    c.sameInt(
+        "texture: level widths",
+        tex.width(0) * 1000 + tex.width(1) * 100 + tex.width(2) * 10 + tex.width(3),
+        8421
+    );
+    c.sameInt(
+        "texture: level heights",
+        tex.height(0) * 1000 + tex.height(1) * 100 + tex.height(2) * 10 + tex.height(3),
+        4211
+    );
+    let white : Vec4 = tex.trilinear((0.3 as f32), (0.6 as f32), (3.0 as f32));
+    c.near(
+        "texture: a white picture stays white through the chain (r)",
+        white.x as f64,
+        1.0,
+        0.0001
+    );
+    c.near("texture: ... and opaque", white.w as f64, 1.0, 0.0001);
+
+    // Black and white stripes: the mean in linear light is 0.5, which is sRGB 188, not 128.
+    let stripes : Image = new Image(4, 4);
+    for (y of 0..4) {
+        for (x of 0..4) {
+            if (x % 2 == 0) {
+                stripes.set(x, y, Image::pack(255, 255, 255, 255));
+            } else {
+                stripes.set(x, y, Image::pack(0, 0, 0, 255));
+            }
+        }
+    }
+    let st : Texture = new Texture(stripes, TextureWrap::Clamp);
+    c.near(
+        "texture: averaging is done in linear light (mip 1 of black and white is 0.5)",
+        st.texel(1, 0, 0).x as f64,
+        0.5,
+        0.001
+    );
+    c.sameInt(
+        "texture: ... which is sRGB 188 when saved back",
+        Image::red(st.levelImage(1).get(0, 0)),
+        188
+    );
+
+    let wrap : Image = new Image(2, 1);
+    wrap.set(0, 0, Image::pack(255, 0, 0, 255));
+    wrap.set(1, 0, Image::pack(0, 0, 255, 255));
+    let rep : Texture = new Texture(wrap, TextureWrap::Repeat);
+    let clamp : Texture = new Texture(wrap, TextureWrap::Clamp);
+    c.near(
+        "texture: repeat wraps a negative coordinate",
+        rep.texel(0, -1, 0).z as f64,
+        1.0,
+        0.0001
+    );
+    c.near("texture: clamp holds the edge", clamp.texel(0, -1, 0).x as f64, 1.0, 0.0001);
+    c.near(
+        "texture: nearest picks the texel under the point",
+        rep.nearest(0, (0.75 as f32), (0.5 as f32)).z as f64,
+        1.0,
+        0.0001
+    );
+    let mid : Vec4 = rep.bilinear(0, (0.5 as f32), (0.5 as f32));
+    c.near("texture: bilinear between two texels is their mean (r)", mid.x as f64, 0.5, 0.0001);
+
+    // A cut-out: opaque green and fully transparent red; the next level must stay green.
+    let leaf : Image = new Image(2, 1);
+    leaf.set(0, 0, Image::pack(0, 255, 0, 255));
+    leaf.set(1, 0, Image::pack(255, 0, 0, 0));
+    let lt : Texture = new Texture(leaf, TextureWrap::Clamp);
+    let lv : Vec4 = lt.texel(1, 0, 0);
+    c.near(
+        "texture: transparent texels do not tint the mip (red stays 0)",
+        lv.x as f64,
+        0.0,
+        0.0001
+    );
+    c.near("texture: ... green stays 1", lv.y as f64, 1.0, 0.0001);
+    c.near("texture: ... and alpha is the mean, 0.5", lv.w as f64, 0.5, 0.0001);
+}

@@ -1,0 +1,1282 @@
+// model — checks for meshes, base64, float bits, and the glTF importer.
+//
+// The importer is checked against documents built in the test: small glTF files whose binary buffers are made
+// with the same float coding the checks verify separately against bit patterns written out by hand (taken
+// from an IEEE 754 reference), and one buffer produced by an outside tool. Numbers read back are compared
+// exactly where they can be exact. Each kind of damage a file can have (a count that runs past its buffer,
+// an index past the last vertex, a loop in the node tree, a cut-short container) must be an error, never an
+// abort. JSON in the sources is written with single quotes for readability and converted.
+
+use ludax::Aabb;
+use ludax::Base64;
+use ludax::ByteBuf;
+use ludax::Checks;
+use ludax::DataText;
+use ludax::GltfImporter;
+use ludax::Ieee;
+use ludax::Mat4;
+use ludax::Mesh;
+use ludax::MeshShapes;
+use ludax::ModelAsset;
+use ludax::ModelChannel;
+use ludax::ModelClip;
+use ludax::ModelMaterial;
+use ludax::ModelNode;
+use ludax::ModelSkin;
+use ludax::Quat;
+use ludax::Vec3;
+use ludax::Vec4;
+use ludax::Vfs;
+
+/** The model checks. */
+pub class ModelSuite {
+    /** Runs every check of the suite. */
+    pub static fn run(c : Checks) : void {
+        mdlIeeeChecks(c);
+        mdlBase64Checks(c);
+        mdlMeshChecks(c);
+        mdlShapeChecks(c);
+        mdlTriangleChecks(c);
+        mdlNodeChecks(c);
+        mdlAccessorChecks(c);
+        mdlPrimitiveModeChecks(c);
+        mdlSkinChecks(c);
+        mdlAnimationChecks(c);
+        mdlGlbChecks(c);
+        mdlVfsChecks(c);
+        mdlGltfDamage(c);
+    }
+}
+
+// ---- helpers ----
+
+// JSON with ' for " (the test sources stay readable).
+fn mdlJson(s : string) : string {
+    let b : ByteBuf = DataText::toBytes(s);
+    for (i of 0..b.len()) {
+        if (b.get(i) == 39) {
+            b.set(i, 34);
+        }
+    }
+    return DataText::fromBytes(b, 0, b.len());
+}
+
+fn mdlFloat(b : ByteBuf, x : f32) : void {
+    b.pushLe32(Ieee::bitsOf(x));
+}
+
+fn mdlVec3s(b : ByteBuf, p0 : Vec3, p1 : Vec3, p2 : Vec3) : void {
+    mdlFloat(b, p0.x);
+    mdlFloat(b, p0.y);
+    mdlFloat(b, p0.z);
+    mdlFloat(b, p1.x);
+    mdlFloat(b, p1.y);
+    mdlFloat(b, p1.z);
+    mdlFloat(b, p2.x);
+    mdlFloat(b, p2.y);
+    mdlFloat(b, p2.z);
+}
+
+fn mdlUri(b : ByteBuf) : string {
+    return "data:application/octet-stream;base64,${Base64::encode(b)}";
+}
+
+// A document with one buffer made of `b`, followed by `rest` (the other root members, no leading comma).
+fn mdlDoc(b : ByteBuf, rest : string) : string {
+    let uri : string = mdlUri(b);
+    return mdlJson("{'asset':{'version':'2.0'},'buffers':[{'byteLength':${b.len()},'uri':'${uri}'}],${rest}}");
+}
+
+fn mdlImport(text : string) : ModelAsset {
+    let vfs : Vfs = new Vfs();
+    return GltfImporter::fromBytes(DataText::toBytes(text), vfs, "");
+}
+
+fn mdlNear(c : Checks, name : string, got : f32, want : f64, tol : f64) : void {
+    c.near(name, got as f64, want, tol);
+}
+
+// Three positions as a buffer view + accessor 0 at the start of a buffer: the smallest valid geometry.
+fn mdlTriBuffer() : ByteBuf {
+    let b : ByteBuf = new ByteBuf(64);
+    mdlVec3s(b, Vec3::make(0.0, 0.0, 0.0), Vec3::make(1.0, 0.0, 0.0), Vec3::make(0.0, 1.0, 0.0));
+    return b;
+}
+
+fn mdlTriRest(extraNodes : string) : string {
+    return "'bufferViews':[{'buffer':0,'byteLength':36}],'accessors':[{'bufferView':0,'componentType':5126,'count':3,'type':'VEC3'}],'meshes':[{'primitives':[{'attributes':{'POSITION':0}}]}],'nodes':[{'mesh':0"
+        + extraNodes
+        + "}],'scenes':[{'nodes':[0]}]";
+}
+
+fn mdlFails(c : Checks, name : string, text : string) : void {
+    let m : ModelAsset = mdlImport(text);
+    c.that("model: rejects ${name} (${m.error()})", !m.ok() && m.error().byteLength > 0);
+}
+
+// ---- float bits ----
+
+fn mdlIeeeChecks(c : Checks) : void {
+    c.sameInt("ieee: 1.0", Ieee::bitsOf(1.0), 1065353216);
+    c.sameInt("ieee: -2.0", Ieee::bitsOf(-2.0), -1073741824);
+    c.sameInt("ieee: 0.1", Ieee::bitsOf(0.1), 1036831949);
+    c.sameInt("ieee: 123.456", Ieee::bitsOf(123.456), 1123477881);
+    c.sameInt("ieee: the largest float", Ieee::bitsOf(3.4028234663852886e38), 2139095039);
+    c.sameInt("ieee: the smallest denormal", Ieee::bitsOf(1.0e-45), 1);
+    c.sameInt("ieee: zero", Ieee::bitsOf(0.0), 0);
+    c.near("ieee: from 0x3F800000", Ieee::toF32(1065353216) as f64, 1.0, 0.0);
+    c.near("ieee: from 0xC0000000", Ieee::toF32(-1073741824) as f64, -2.0, 0.0);
+    c.near(
+        "ieee: from 0x3DCCCCCD is the float nearest 0.1",
+        Ieee::toF32(1036831949) as f64,
+        (0.1 as f32) as f64,
+        0.0
+    );
+    c.near(
+        "ieee: from the largest float",
+        Ieee::toF32(2139095039) as f64,
+        3.4028234663852886e38,
+        0.0
+    );
+    c.that(
+        "ieee: from a denormal is positive and tiny",
+        Ieee::toF32(1) > 0.0 && Ieee::toF32(1) < 0.000000000000000000000000000000000000001
+    );
+    c.that(
+        "ieee: infinity and NaN are flagged",
+        !Ieee::isFinite(2139095040) && !Ieee::isFinite(2143289344) && !Ieee::isFinite(-8388608)
+            && Ieee::isFinite(1065353216)
+            && Ieee::isFinite(0)
+    );
+    let mut ok : bool = true;
+    let mut x : f32 = 0.0001;
+    for (i of 0..400) {
+        x = x * (1.07 as f32);
+        if (Ieee::toF32(Ieee::bitsOf(x)) != x || Ieee::toF32(Ieee::bitsOf(-x)) != -x) {
+            ok = false;
+        }
+    }
+    c.that("ieee: bits round trip across many magnitudes", ok);
+}
+
+// ---- base64 ----
+
+fn mdlB64(text : string) : string {
+    let out : ByteBuf = new ByteBuf(16);
+    if (!Base64::decode(text, out)) {
+        return "<invalid>";
+    }
+    return DataText::fromBytes(out, 0, out.len());
+}
+
+fn mdlBase64Checks(c : Checks) : void {
+    c.that(
+        "base64: RFC 4648 vectors encode",
+        Base64::encode(DataText::toBytes("")) == ""
+            && Base64::encode(DataText::toBytes("f")) == "Zg=="
+            && Base64::encode(DataText::toBytes("fo")) == "Zm8="
+            && Base64::encode(DataText::toBytes("foo")) == "Zm9v"
+            && Base64::encode(DataText::toBytes("foob")) == "Zm9vYg=="
+            && Base64::encode(DataText::toBytes("fooba")) == "Zm9vYmE="
+            && Base64::encode(DataText::toBytes("foobar")) == "Zm9vYmFy"
+    );
+    c.that(
+        "base64: RFC 4648 vectors decode",
+        mdlB64("") == "" && mdlB64("Zg==") == "f" && mdlB64("Zm8=") == "fo"
+            && mdlB64("Zm9v") == "foo"
+            && mdlB64("Zm9vYg==") == "foob"
+            && mdlB64("Zm9vYmE=") == "fooba"
+            && mdlB64("Zm9vYmFy") == "foobar"
+    );
+    c.that("base64: padding may be left off", mdlB64("Zg") == "f" && mdlB64("Zm9vYg") == "foob");
+    c.that(
+        "base64: white space is skipped",
+        mdlB64("Zm9v\nYmFy") == "foobar" && mdlB64(" Zm 9v\r\n") == "foo"
+    );
+    c.that("base64: the URL-safe alphabet is read", mdlB64("-_-_") == mdlB64("+/+/"));
+    c.that(
+        "base64: a bad character is refused",
+        mdlB64("Zm9v!") == "<invalid>" && mdlB64("Zm9é") == "<invalid>"
+    );
+    c.that(
+        "base64: a length that cannot occur is refused",
+        mdlB64("Z") == "<invalid>" && mdlB64("Zm9vY") == "<invalid>"
+    );
+    c.that(
+        "base64: wrong padding is refused",
+        mdlB64("Zg=") == "<invalid>" && mdlB64("Zg===") == "<invalid>"
+            && mdlB64("=Zm9") == "<invalid>"
+            && mdlB64("Zg==Zg==") == "<invalid>"
+    );
+    let all : ByteBuf = new ByteBuf(16);
+    for (i of 0..256) {
+        all.push(i);
+    }
+    let back : ByteBuf = new ByteBuf(16);
+    c.that(
+        "base64: all byte values round trip",
+        Base64::decode(Base64::encode(all), back) && back.len() == 256 && back.get(0) == 0
+            && back.get(255) == 255
+            && back.get(128) == 128
+    );
+    c.sameInt(
+        "base64: a data URI payload starts after the marker",
+        Base64::dataUriStart("data:application/octet-stream;base64,AAAA"),
+        37
+    );
+    c.sameInt("base64: a plain URI is not a data URI", Base64::dataUriStart("model.bin"), -1);
+    c.sameInt(
+        "base64: a data URI without base64 is not read",
+        Base64::dataUriStart("data:text/plain,hello"),
+        -1
+    );
+    c.sameInt("base64: short input", Base64::dataUriStart("data"), -1);
+}
+
+// ---- meshes ----
+
+// Six times the signed volume of a closed mesh (the divergence theorem over its triangles).
+fn mdlVolume(m : Mesh) : f64 {
+    let mut sum : f64 = 0.0;
+    for (t of 0..m.triangleCount()) {
+        let a : Vec3 = m.position(m.index(t * 3));
+        let b : Vec3 = m.position(m.index(t * 3 + 1));
+        let d : Vec3 = m.position(m.index(t * 3 + 2));
+        sum = sum + (a.dot(b.cross(d)) as f64);
+    }
+    return sum / 6.0;
+}
+
+// True when every vertex normal points away from the origin and has unit length.
+fn mdlOutward(m : Mesh) : bool {
+    for (v of 0..m.vertexCount()) {
+        let n : Vec3 = m.normal(v);
+        let l : f32 = n.length();
+        if (l < 0.999 || l > 1.001 || n.dot(m.position(v)) <= 0.0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// True when each triangle's winding agrees with the normal stored at its first vertex.
+fn mdlWinding(m : Mesh) : bool {
+    for (t of 0..m.triangleCount()) {
+        let a : i32 = m.index(t * 3);
+        let p0 : Vec3 = m.position(a);
+        let face : Vec3 = m
+            .position(m.index(t * 3 + 1))
+            .minus(p0)
+            .cross(m.position(m.index(t * 3 + 2)).minus(p0));
+        if (face.lengthSquared() > 0.0000001 && face.dot(m.normal(a)) <= 0.0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn mdlMeshChecks(c : Checks) : void {
+    let m : Mesh = new Mesh();
+    c.that(
+        "mesh: an empty mesh is consistent and has an empty box",
+        m.check() == "" && m.vertexCount() == 0 && m.triangleCount() == 0 && !m.hasNormals()
+            && !m.hasUvs()
+            && !m.hasSkin()
+            && m.bounds().isEmpty()
+    );
+    m.addPosition(Vec3 { x: 0.0, y: 0.0, z: 0.0 });
+    m.addPosition(Vec3 { x: 2.0, y: 0.0, z: 0.0 });
+    m.addPosition(Vec3 { x: 0.0, y: 3.0, z: 0.0 });
+    m.addTriangle(0, 1, 2);
+    c.that(
+        "mesh: positions only is consistent",
+        m.check() == "" && m.vertexCount() == 3 && m.triangleCount() == 1 && m.indexCount() == 3
+    );
+    m.computeNormals();
+    c.that(
+        "mesh: computed normal of a counter-clockwise triangle in XY is +Z",
+        m.hasNormals() && m.normal(0).z == 1.0 && m.normal(1).z == 1.0 && m.normal(2).x == 0.0
+    );
+    let bnd : Aabb = m.bounds();
+    c.that(
+        "mesh: bounds",
+        bnd.min.x == 0.0 && bnd.max.x == 2.0 && bnd.max.y == 3.0 && bnd.min.z == 0.0
+    );
+    m.addTriangle(0, 1, 7);
+    c.that(
+        "mesh: check names an index past the last vertex",
+        m.check() == "an index points past the last vertex"
+    );
+    let broken : Mesh = new Mesh();
+    broken.addPosition(Vec3::zero());
+    broken.pushNormal(Vec3::unitY());
+    broken.pushNormal(Vec3::unitY());
+    c.that(
+        "mesh: check names a normal count mismatch",
+        broken.check() == "the normal count differs from the vertex count"
+    );
+    let partial : Mesh = new Mesh();
+    c.that(
+        "mesh: reading a missing channel answers zeros",
+        partial.uv(0).x == 0.0 && partial.tangent(0).w == 0.0 && partial.joint(0, 0) == 0
+            && partial.weight(0, 0) == 0.0
+    );
+}
+
+fn mdlShapeChecks(c : Checks) : void {
+    let b : Mesh = MeshShapes::box(2.0, 4.0, 6.0);
+    c.that(
+        "shapes: a box has 24 vertices and 12 triangles",
+        b.vertexCount() == 24 && b.triangleCount() == 12 && b.check() == ""
+    );
+    c.that(
+        "shapes: a box has normals, uvs and tangents",
+        b.hasNormals() && b.hasUvs() && b.hasTangents()
+    );
+    let bb : Aabb = b.bounds();
+    c.that(
+        "shapes: the box bounds are its half sizes",
+        bb.min.x == -1.0 && bb.max.x == 1.0 && bb.min.y == -2.0 && bb.max.y == 2.0
+            && bb.min.z == -3.0
+            && bb.max.z == 3.0
+    );
+    c.near("shapes: the box volume from its triangles", mdlVolume(b), 48.0, 0.0001);
+    c.that("shapes: the box is wound counter-clockwise from outside", mdlWinding(b));
+    c.that("shapes: box normals point outward", mdlOutward(b));
+    let mut tangentsOk : bool = true;
+    for (v of 0..b.vertexCount()) {
+        let t : Vec4 = b.tangent(v);
+        let n : Vec3 = b.normal(v);
+        let tv : Vec3 = Vec3 { x: t.x, y: t.y, z: t.z };
+        if (tv.length() < 0.999 || tv.length() > 1.001 || tv.dot(n) > 0.001 || tv.dot(n) < -0.001
+            || (t.w != 1.0 && t.w != -1.0)) {
+            tangentsOk = false;
+        }
+    }
+    c.that("shapes: box tangents are unit, perpendicular to the normal, with a sign", tangentsOk);
+    let u : Mesh = MeshShapes::box(1.0, 1.0, 1.0);
+    let uv : Vec3 = Vec3 { x: u.uv(1).x, y: u.uv(1).y, z: 0.0 };
+    c.that("shapes: box texture coordinates span 0 to 1", uv.x == 1.0 && uv.y == 1.0);
+    let s : Mesh = MeshShapes::sphere(2.0, 32, 16);
+    c.sameInt("shapes: a sphere's vertex count", s.vertexCount(), 33 * 17);
+    c.that("shapes: a sphere is consistent", s.check() == "");
+    c.that("shapes: sphere normals point outward", mdlOutward(s));
+    c.that("shapes: the sphere is wound counter-clockwise from outside", mdlWinding(s));
+    let vol : f64 = mdlVolume(s);
+    let exact : f64 = 4.0 / 3.0 * 3.141592653589793 * 8.0;
+    c.that(
+        "shapes: the sphere volume is close to 4/3 pi r^3 and a little less",
+        vol < exact && vol > exact * 0.97
+    );
+    let sb : Aabb = s.bounds();
+    c.near("shapes: sphere reaches the radius at the poles", sb.max.y as f64, 2.0, 0.0001);
+    c.near("shapes: and at the equator", sb.max.x as f64, 2.0, 0.0001);
+    c.that(
+        "shapes: a sphere with silly arguments is still a mesh",
+        MeshShapes::sphere(1.0, 0, 0).check() == ""
+            && MeshShapes::sphere(1.0, 0, 0).triangleCount() > 0
+    );
+    let p : Mesh = MeshShapes::plane(4.0, 2.0, 2, 1);
+    c.that(
+        "shapes: a plane 2 x 1 has 6 vertices and 4 triangles",
+        p.vertexCount() == 6 && p.triangleCount() == 4 && p.check() == ""
+    );
+    c.that(
+        "shapes: plane faces +Y, wound counter-clockwise seen from above",
+        p.normal(0).y == 1.0 && mdlWinding(p)
+    );
+    let pb : Aabb = p.bounds();
+    c.that(
+        "shapes: plane bounds",
+        pb.min.x == -2.0 && pb.max.x == 2.0 && pb.min.z == -1.0 && pb.max.z == 1.0
+            && pb.max.y == 0.0
+    );
+    c.that(
+        "shapes: a degenerate plane request is clamped",
+        MeshShapes::plane(1.0, 1.0, 0, -3).triangleCount() == 2
+    );
+}
+
+// ---- glTF ----
+
+// The 44-byte buffer of an outside tool: three u16 indices, two bytes of padding, three float positions.
+fn mdlOutsideUri() : string {
+    return "data:application/octet-stream;base64,AAABAAIAAAAAAAAAAAAAAAAAAAAAAIA/AAAAAAAAAAAAAAAAAACAPwAAAAA=";
+}
+
+fn mdlTriangleChecks(c : Checks) : void {
+    let text : string = mdlJson("{'asset':{'version':'2.0','generator':'outside'},'scene':0,'scenes':[{'nodes':[0]}],'nodes':[{'mesh':0,'name':'tri','translation':[1,2,3],'rotation':[0,0,0.70710678,0.70710678],'scale':[2,2,2]}],'meshes':[{'name':'m','primitives':[{'attributes':{'POSITION':1},'indices':0,'material':0}]}],'materials':[{'name':'red','pbrMetallicRoughness':{'baseColorFactor':[0.5,0.25,0.125,1.0],'metallicFactor':0.25,'roughnessFactor':0.5},'emissiveFactor':[0.125,0.25,0.5]}],'buffers':[{'byteLength':44,'uri':'"
+        + mdlOutsideUri()
+        + "'}],'bufferViews':[{'buffer':0,'byteOffset':0,'byteLength':6,'target':34963},{'buffer':0,'byteOffset':8,'byteLength':36,'target':34962}],'accessors':[{'bufferView':0,'componentType':5123,'count':3,'type':'SCALAR'},{'bufferView':1,'componentType':5126,'count':3,'type':'VEC3'}]}");
+    let m : ModelAsset = mdlImport(text);
+    c.that("gltf: the triangle imports (${m.error()})", m.ok() && m.error() == "");
+    c.that(
+        "gltf: counts",
+        m.meshCount() == 1 && m.nodeCount() == 1 && m.materialCount() == 1 && m.skinCount() == 0
+            && m.clipCount() == 0
+            && m.rootCount() == 1
+            && m.root(0) == 0
+    );
+    c.that(
+        "gltf: names",
+        m.mesh(0).name == "m" && m.node(0).name == "tri" && m.material(0).name == "red"
+            && m.name == "outside"
+    );
+    let mesh : Mesh = m.mesh(0).primitive(0);
+    c.that(
+        "gltf: one primitive of three vertices and a triangle",
+        m.mesh(0).primitiveCount() == 1 && mesh.vertexCount() == 3 && mesh.triangleCount() == 1
+            && mesh.check() == ""
+    );
+    c.that(
+        "gltf: positions are exact",
+        mesh.position(0).x == 0.0 && mesh.position(1).x == 1.0 && mesh.position(1).y == 0.0
+            && mesh.position(2).y == 1.0
+            && mesh.position(2).z == 0.0
+    );
+    c.that("gltf: indices", mesh.index(0) == 0 && mesh.index(1) == 1 && mesh.index(2) == 2);
+    c.that(
+        "gltf: missing normals are computed",
+        mesh.hasNormals() && mesh.normal(0).z == 1.0 && !mesh.hasUvs() && !mesh.hasSkin()
+    );
+    c.sameInt("gltf: the primitive's material", m.mesh(0).material(0), 0);
+    let mat : ModelMaterial = m.material(0);
+    c.that(
+        "gltf: base colour factor",
+        mat.baseColor.x == 0.5 && mat.baseColor.y == 0.25 && mat.baseColor.z == 0.125
+            && mat.baseColor.w == 1.0
+    );
+    c.that("gltf: metallic and roughness", mat.metallic == 0.25 && mat.roughness == 0.5);
+    c.that(
+        "gltf: emissive",
+        mat.emissive.x == 0.125 && mat.emissive.y == 0.25 && mat.emissive.z == 0.5
+            && mat.baseColorTexture == -1
+    );
+    let node : ModelNode = m.node(0);
+    c.that(
+        "gltf: translation and scale",
+        node.local.translation.x == 1.0 && node.local.translation.y == 2.0
+            && node.local.translation.z == 3.0
+            && node.local.scale.x == 2.0
+            && !node.hasMatrix
+    );
+    mdlNear(c, "gltf: rotation z", node.local.rotation.z, 0.70710678, 0.000001);
+    mdlNear(c, "gltf: rotation w", node.local.rotation.w, 0.70710678, 0.000001);
+    c.that("gltf: no warnings", m.warnings() == "" && m.externalFiles() == "");
+    // Defaults of a material: white, fully metallic and rough.
+    let plain : ModelMaterial = new ModelMaterial("p");
+    c.that(
+        "gltf: material defaults are the glTF ones",
+        plain.baseColor.x == 1.0 && plain.metallic == 1.0 && plain.roughness == 1.0
+            && plain.emissive.x == 0.0
+    );
+    // A default scene is chosen when the file names none, and unnamed things have empty names.
+    let bare : ModelAsset = mdlImport(mdlDoc(
+        mdlTriBuffer(),
+        "'bufferViews':[{'buffer':0,'byteLength':36}],'accessors':[{'bufferView':0,'componentType':5126,'count':3,'type':'VEC3'}],'meshes':[{'primitives':[{'attributes':{'POSITION':0}}]}],'nodes':[{'mesh':0},{'mesh':0}]"
+    ));
+    c.that(
+        "gltf: without scenes every parentless node is a root",
+        bare.ok() && bare.rootCount() == 2 && bare.mesh(0).material(0) == -1
+            && bare.mesh(0).name == ""
+    );
+}
+
+fn mdlNodeChecks(c : Checks) : void {
+    let buf : ByteBuf = mdlTriBuffer();
+    let head : string = "'bufferViews':[{'buffer':0,'byteLength':36}],'accessors':[{'bufferView':0,'componentType':5126,'count':3,'type':'VEC3'}],'meshes':[{'primitives':[{'attributes':{'POSITION':0}}]}],";
+    // The child is listed before its parent.
+    let tree : ModelAsset = mdlImport(mdlDoc(
+        buf,
+        head
+            + "'nodes':[{'name':'leaf','mesh':0,'translation':[0,0,1]},{'name':'mid','children':[0],'translation':[0,2,0]},{'name':'top','children':[1],'translation':[3,0,0]}],'scenes':[{'nodes':[2]}]"
+    ));
+    c.that(
+        "gltf: a tree imports",
+        tree.ok() && tree.nodeCount() == 3 && tree.rootCount() == 1 && tree.root(0) == 2
+    );
+    c.that(
+        "gltf: parents and children",
+        tree.node(0).parent == 1 && tree.node(1).parent == 2 && tree.node(2).parent == -1
+            && tree.node(2).children.len() == 1
+            && tree.node(2).children.get(0) == 1
+    );
+    let w : Mat4 = tree.worldMatrix(0);
+    c.that(
+        "gltf: the world matrix multiplies up the tree",
+        w.m03 == 3.0 && w.m13 == 2.0 && w.m23 == 1.0
+    );
+    // A matrix node: translation plus a 90 degree turn about Z and a scale of 2 (column-major).
+    let mat : ModelAsset = mdlImport(mdlDoc(
+        buf,
+        head + "'nodes':[{'mesh':0,'matrix':[0,2,0,0, -2,0,0,0, 0,0,2,0, 5,6,7,1]}]"
+    ));
+    c.that("gltf: a matrix node imports", mat.ok() && mat.node(0).hasMatrix);
+    c.that(
+        "gltf: the matrix is kept column-major",
+        mat.node(0).matrix.m10 == 2.0 && mat.node(0).matrix.m01 == -2.0
+            && mat.node(0).matrix.m03 == 5.0
+    );
+    let n : ModelNode = mat.node(0);
+    c.that(
+        "gltf: it is decomposed into translation",
+        n.local.translation.x == 5.0 && n.local.translation.y == 6.0 && n.local.translation.z == 7.0
+    );
+    mdlNear(c, "gltf: and scale", n.local.scale.x, 2.0, 0.00001);
+    mdlNear(c, "gltf: and scale z", n.local.scale.z, 2.0, 0.00001);
+    mdlNear(c, "gltf: and a quarter turn about Z", n.local.rotation.z, 0.70710678, 0.00001);
+    let moved : Vec3 = n.local.transformPoint(Vec3 { x: 1.0, y: 0.0, z: 0.0 });
+    mdlNear(
+        c,
+        "gltf: the decomposition maps (1,0,0) like the matrix does (x)",
+        moved.x,
+        5.0,
+        0.0001
+    );
+    mdlNear(c, "gltf: (y)", moved.y, 8.0, 0.0001);
+    // Unnormalised and zero quaternions.
+    let q : ModelAsset = mdlImport(mdlDoc(
+        buf,
+        head + "'nodes':[{'rotation':[0,0,0,4]},{'rotation':[0,0,0,0]}]"
+    ));
+    c.that(
+        "gltf: rotations are normalised and a zero one becomes the identity",
+        q.ok() && q.node(0).local.rotation.w == 1.0 && q.node(1).local.rotation.w == 1.0
+    );
+}
+
+fn mdlAccessorChecks(c : Checks) : void {
+    // Interleaved positions and normals, stride 24; normalised signed 16-bit texture coordinates after them.
+    let b : ByteBuf = new ByteBuf(64);
+    mdlVec3s(b, Vec3::make(0.0, 0.0, 0.0), Vec3::make(0.0, 0.0, 1.0), Vec3::make(1.0, 0.0, 0.0));
+    mdlVec3s(b, Vec3::make(0.0, 0.0, 1.0), Vec3::make(0.0, 1.0, 0.0), Vec3::make(0.0, 0.0, 1.0));
+    // 36 + 36 = 72 bytes of vertex data; then six 16-bit values.
+    b.push(0x00);
+    b.push(0x80);
+    b.push(0xFF);
+    b.push(0x7F);
+    b.push(0x00);
+    b.push(0x00);
+    b.push(0x00);
+    b.push(0x00);
+    b.push(0x00);
+    b.push(0x40);
+    b.push(0x00);
+    b.push(0xC0);
+    let doc : string = "'bufferViews':[{'buffer':0,'byteOffset':0,'byteLength':72,'byteStride':24},{'buffer':0,'byteOffset':72,'byteLength':12}],'accessors':[{'bufferView':0,'componentType':5126,'count':3,'type':'VEC3'},{'bufferView':0,'byteOffset':12,'componentType':5126,'count':3,'type':'VEC3'},{'bufferView':1,'componentType':5122,'normalized':true,'count':3,'type':'VEC2'}],'meshes':[{'primitives':[{'attributes':{'POSITION':0,'NORMAL':1,'TEXCOORD_0':2}}]}],'nodes':[{'mesh':0}]";
+    let m : ModelAsset = mdlImport(mdlDoc(b, doc));
+    c.that("gltf: strided accessors import (${m.error()})", m.ok());
+    let mesh : Mesh = m.mesh(0).primitive(0);
+    c.that(
+        "gltf: strided positions",
+        mesh.position(0).x == 0.0 && mesh.position(1).x == 1.0 && mesh.position(2).y == 1.0
+            && mesh.position(2).z == 0.0
+    );
+    c.that(
+        "gltf: strided normals follow the offset",
+        mesh.normal(0).z == 1.0 && mesh.normal(1).x == 0.0 && mesh.normal(1).y == 0.0
+            && mesh.normal(2).z == 1.0
+            && mesh.normal(2).y == 0.0
+    );
+    c.that(
+        "gltf: a normalised signed 16-bit value of -32768 is -1 (clamped)",
+        mesh.uv(0).x == -1.0 && mesh.uv(0).y == 1.0
+    );
+    mdlNear(c, "gltf: a normalised value of 16384", mesh.uv(2).x, 16384.0 / 32767.0, 0.0000001);
+    mdlNear(c, "gltf: a normalised value of -16384", mesh.uv(2).y, -16384.0 / 32767.0, 0.0000001);
+    c.that("gltf: the zero value stays zero", mesh.uv(1).x == 0.0 && mesh.uv(1).y == 0.0);
+    // Unsigned 8-bit normalised, unsigned 32-bit indices.
+    let b2 : ByteBuf = new ByteBuf(64);
+    mdlVec3s(b2, Vec3::make(0.0, 0.0, 0.0), Vec3::make(1.0, 0.0, 0.0), Vec3::make(0.0, 1.0, 0.0));
+    b2.push(0);
+    b2.push(255);
+    b2.push(51);
+    b2.push(0);
+    b2.push(255);
+    b2.push(0);
+    b2.push(0);
+    b2.push(0);
+    b2.pushLe32(2);
+    b2.pushLe32(1);
+    b2.pushLe32(0);
+    let doc2 : string = "'bufferViews':[{'buffer':0,'byteLength':36},{'buffer':0,'byteOffset':36,'byteLength':6},{'buffer':0,'byteOffset':44,'byteLength':12}],'accessors':[{'bufferView':0,'componentType':5126,'count':3,'type':'VEC3'},{'bufferView':1,'componentType':5121,'normalized':true,'count':3,'type':'VEC2'},{'bufferView':2,'componentType':5125,'count':3,'type':'SCALAR'}],'meshes':[{'primitives':[{'attributes':{'POSITION':0,'TEXCOORD_0':1},'indices':2}]}],'nodes':[{'mesh':0}]";
+    let m2 : ModelAsset = mdlImport(mdlDoc(b2, doc2));
+    c.that("gltf: u8 and u32 accessors import (${m2.error()})", m2.ok());
+    let mesh2 : Mesh = m2.mesh(0).primitive(0);
+    mdlNear(c, "gltf: a normalised u8 of 51 is 0.2", mesh2.uv(1).x, 0.2, 0.0000001);
+    c.that(
+        "gltf: and 255 is 1",
+        mesh2.uv(0).y == 1.0 && mesh2.uv(0).x == 0.0 && mesh2.uv(1).y == 0.0 && mesh2.uv(2).x == 1.0
+    );
+    c.that("gltf: u32 indices", mesh2.index(0) == 2 && mesh2.index(1) == 1 && mesh2.index(2) == 0);
+}
+
+fn mdlPrimitiveModeChecks(c : Checks) : void {
+    let b : ByteBuf = new ByteBuf(64);
+    mdlVec3s(b, Vec3::make(0.0, 0.0, 0.0), Vec3::make(1.0, 0.0, 0.0), Vec3::make(0.0, 1.0, 0.0));
+    mdlVec3s(b, Vec3::make(1.0, 1.0, 0.0), Vec3::make(0.0, 0.0, 0.0), Vec3::make(0.0, 0.0, 0.0));
+    let head : string = "'bufferViews':[{'buffer':0,'byteLength':72}],'accessors':[{'bufferView':0,'componentType':5126,'count':4,'type':'VEC3'}],'nodes':[{'mesh':0}],'meshes':[{'primitives':[{'attributes':{'POSITION':0},'mode':";
+    let strip : ModelAsset = mdlImport(mdlDoc(b, head + "5}]}]"));
+    c.that(
+        "gltf: a triangle strip imports",
+        strip.ok() && strip.mesh(0).primitive(0).triangleCount() == 2
+    );
+    let s : Mesh = strip.mesh(0).primitive(0);
+    c.that(
+        "gltf: strip triangles alternate their winding",
+        s.index(0) == 0 && s.index(1) == 1 && s.index(2) == 2 && s.index(3) == 2 && s.index(4) == 1
+            && s.index(5) == 3
+    );
+    let fan : ModelAsset = mdlImport(mdlDoc(b, head + "6}]}]"));
+    let f : Mesh = fan.mesh(0).primitive(0);
+    c.that(
+        "gltf: a triangle fan imports",
+        fan.ok() && f.triangleCount() == 2 && f.index(0) == 0 && f.index(1) == 1 && f.index(2) == 2
+            && f.index(3) == 0
+            && f.index(4) == 2
+            && f.index(5) == 3
+    );
+    let points : ModelAsset = mdlImport(mdlDoc(b, head + "0}]}]"));
+    c.that(
+        "gltf: a point primitive is skipped with a warning",
+        points.ok() && points.mesh(0).primitiveCount() == 0 && points.warnings().byteLength > 0
+    );
+    let tris : ModelAsset = mdlImport(mdlDoc(b, head + "4}]}]"));
+    c.that("gltf: four vertices are not whole triangles", !tris.ok());
+}
+
+fn mdlSkinChecks(c : Checks) : void {
+    let b : ByteBuf = new ByteBuf(256);
+    mdlVec3s(b, Vec3::make(0.0, 0.0, 0.0), Vec3::make(1.0, 0.0, 0.0), Vec3::make(0.0, 1.0, 0.0));
+    for (i of 0..12) {
+        b.push(0);
+    }
+    // joints (u8 x4 per vertex): (0,1,0,0) (1,0,0,0) (0,0,0,0)
+    b.set(36 + 1, 1);
+    b.set(36 + 4, 1);
+    mdlFloat(b, 0.75);
+    mdlFloat(b, 0.25);
+    mdlFloat(b, 0.0);
+    mdlFloat(b, 0.0);
+    mdlFloat(b, 1.0);
+    mdlFloat(b, 0.0);
+    mdlFloat(b, 0.0);
+    mdlFloat(b, 0.0);
+    mdlFloat(b, 1.0);
+    mdlFloat(b, 0.0);
+    mdlFloat(b, 0.0);
+    mdlFloat(b, 0.0);
+    // inverse bind matrices: identity, then a translation of (0,-1,0), column-major
+    for (k of 0..2) {
+        for (col of 0..4) {
+            for (row of 0..4) {
+                let mut v : f32 = 0.0;
+                if (col == row) {
+                    v = 1.0;
+                }
+                if (k == 1 && col == 3 && row == 1) {
+                    v = -1.0;
+                }
+                mdlFloat(b, v);
+            }
+        }
+    }
+    let doc : string = "'bufferViews':[{'buffer':0,'byteLength':36},{'buffer':0,'byteOffset':36,'byteLength':12},{'buffer':0,'byteOffset':48,'byteLength':48},{'buffer':0,'byteOffset':96,'byteLength':128}],'accessors':[{'bufferView':0,'componentType':5126,'count':3,'type':'VEC3'},{'bufferView':1,'componentType':5121,'count':3,'type':'VEC4'},{'bufferView':2,'componentType':5126,'count':3,'type':'VEC4'},{'bufferView':3,'componentType':5126,'count':2,'type':'MAT4'}],'meshes':[{'primitives':[{'attributes':{'POSITION':0,'JOINTS_0':1,'WEIGHTS_0':2}}]}],'nodes':[{'name':'skel','children':[1,2]},{'name':'j0'},{'name':'j1','translation':[0,1,0]},{'mesh':0,'skin':0}],'skins':[{'name':'s','joints':[1,2],'inverseBindMatrices':3,'skeleton':0}],'scenes':[{'nodes':[0,3]}]";
+    let m : ModelAsset = mdlImport(mdlDoc(b, doc));
+    c.that("gltf: a skinned model imports (${m.error()})", m.ok() && m.skinCount() == 1);
+    let mesh : Mesh = m.mesh(0).primitive(0);
+    c.that("gltf: the mesh has a skin", mesh.hasSkin() && mesh.check() == "");
+    c.that(
+        "gltf: joints per vertex",
+        mesh.joint(0, 0) == 0 && mesh.joint(0, 1) == 1 && mesh.joint(1, 0) == 1
+            && mesh.joint(2, 3) == 0
+    );
+    c.that(
+        "gltf: weights per vertex",
+        mesh.weight(0, 0) == 0.75 && mesh.weight(0, 1) == 0.25 && mesh.weight(1, 0) == 1.0
+            && mesh.weight(2, 0) == 1.0
+    );
+    let skin : ModelSkin = m.skin(0);
+    c.that(
+        "gltf: skin joints name nodes",
+        skin.name == "s" && skin.jointCount() == 2 && skin.joints.get(0) == 1
+            && skin.joints.get(1) == 2
+            && skin.skeleton == 0
+    );
+    let ibm1 : Mat4 = skin.inverseBindMatrix(1);
+    c.that(
+        "gltf: the inverse bind matrix of joint 1",
+        ibm1.m13 == -1.0 && ibm1.m11 == 1.0 && ibm1.m03 == 0.0 && ibm1.m33 == 1.0
+    );
+    c.that(
+        "gltf: and of joint 0 is the identity",
+        skin.inverseBindMatrix(0).approxEq(Mat4::identity(), 0.0)
+    );
+    c.that(
+        "gltf: a bind matrix out of range reads as the identity",
+        skin.inverseBindMatrix(9).approxEq(Mat4::identity(), 0.0)
+    );
+    c.that(
+        "gltf: the node uses the skin",
+        m.node(3).skin == 0 && m.node(3).mesh == 0 && m.rootCount() == 2
+    );
+    // A skin without matrices gets identities; a skin with no joints is refused.
+    let plain : ModelAsset = mdlImport(mdlDoc(
+        mdlTriBuffer(),
+        "'nodes':[{},{}],'skins':[{'joints':[0,1]}]"
+    ));
+    c.that(
+        "gltf: a skin without matrices gets identities",
+        plain.ok() && plain.skin(0).inverseBindMatrix(1).approxEq(Mat4::identity(), 0.0)
+            && plain.skin(0).inverseBind.len() == 32
+    );
+    mdlFails(
+        c,
+        "a skin with no joints",
+        mdlDoc(mdlTriBuffer(), "'nodes':[{}],'skins':[{'joints':[]}]")
+    );
+    mdlFails(
+        c,
+        "a skin joint that is no node",
+        mdlDoc(mdlTriBuffer(), "'nodes':[{}],'skins':[{'joints':[3]}]")
+    );
+    mdlFails(c, "a node with a missing skin", mdlDoc(mdlTriBuffer(), "'nodes':[{'skin':4}]"));
+}
+
+fn mdlAnimationChecks(c : Checks) : void {
+    let b : ByteBuf = new ByteBuf(256);
+    // 0: times 0,1,2 (12 bytes)   12: linear/step translation values (36 bytes)
+    mdlFloat(b, 0.0);
+    mdlFloat(b, 1.0);
+    mdlFloat(b, 2.0);
+    mdlVec3s(b, Vec3::make(0.0, 0.0, 0.0), Vec3::make(2.0, 4.0, 6.0), Vec3::make(2.0, 4.0, 6.0));
+    // 48: times 0,1 (8 bytes)   56: cubic output (6 vec3 = 72 bytes)
+    mdlFloat(b, 0.0);
+    mdlFloat(b, 1.0);
+    mdlVec3s(b, Vec3::make(0.0, 0.0, 0.0), Vec3::make(0.0, 0.0, 0.0), Vec3::make(3.0, 0.0, 0.0));
+    mdlVec3s(b, Vec3::make(3.0, 0.0, 0.0), Vec3::make(1.0, 0.0, 0.0), Vec3::make(0.0, 0.0, 0.0));
+    // 128: rotations identity, quarter turn about Z (32 bytes)
+    mdlFloat(b, 0.0);
+    mdlFloat(b, 0.0);
+    mdlFloat(b, 0.0);
+    mdlFloat(b, 1.0);
+    mdlFloat(b, 0.0);
+    mdlFloat(b, 0.0);
+    mdlFloat(b, 0.70710678);
+    mdlFloat(b, 0.70710678);
+    let views : string = "'bufferViews':[{'buffer':0,'byteOffset':0,'byteLength':12},{'buffer':0,'byteOffset':12,'byteLength':36},{'buffer':0,'byteOffset':48,'byteLength':8},{'buffer':0,'byteOffset':56,'byteLength':72},{'buffer':0,'byteOffset':128,'byteLength':32}]";
+    let accs : string = "'accessors':[{'bufferView':0,'componentType':5126,'count':3,'type':'SCALAR'},{'bufferView':1,'componentType':5126,'count':3,'type':'VEC3'},{'bufferView':2,'componentType':5126,'count':2,'type':'SCALAR'},{'bufferView':3,'componentType':5126,'count':6,'type':'VEC3'},{'bufferView':4,'componentType':5126,'count':2,'type':'VEC4'}]";
+    let anim : string = "'animations':[{'name':'walk','samplers':[{'input':0,'output':1,'interpolation':'LINEAR'},{'input':0,'output':1,'interpolation':'STEP'},{'input':2,'output':3,'interpolation':'CUBICSPLINE'},{'input':2,'output':4}],'channels':[{'sampler':0,'target':{'node':0,'path':'translation'}},{'sampler':1,'target':{'node':0,'path':'translation'}},{'sampler':2,'target':{'node':0,'path':'translation'}},{'sampler':3,'target':{'node':0,'path':'rotation'}}]}]";
+    let m : ModelAsset = mdlImport(mdlDoc(b, "${views},${accs},'nodes':[{'name':'n'}],${anim}"));
+    c.that("gltf: animations import (${m.error()})", m.ok() && m.clipCount() == 1);
+    let clip : ModelClip = m.clip(0);
+    c.that(
+        "gltf: clip name, channels and duration",
+        clip.name == "walk" && clip.channelCount() == 4 && clip.duration() == 2.0
+    );
+    let lin : ModelChannel = clip.channel(0);
+    c.that(
+        "gltf: a linear channel keeps its keys",
+        lin.node == 0 && lin.keyCount() == 3 && lin.times.get(2) == 2.0 && lin.values.get(3) == 2.0
+            && lin.values.get(5) == 6.0
+            && lin.isConsistent()
+    );
+    mdlNear(c, "anim: linear halfway x", lin.sampleVec3(0.5).x, 1.0, 0.0000001);
+    mdlNear(c, "anim: linear halfway y", lin.sampleVec3(0.5).y, 2.0, 0.0000001);
+    mdlNear(c, "anim: linear quarter z", lin.sampleVec3(0.25).z, 1.5, 0.0000001);
+    mdlNear(c, "anim: linear holds the last key afterwards", lin.sampleVec3(1.5).x, 2.0, 0.0);
+    mdlNear(
+        c,
+        "anim: linear before the first key is the first value",
+        lin.sampleVec3(-3.0).x,
+        0.0,
+        0.0
+    );
+    mdlNear(c, "anim: linear after the last key", lin.sampleVec3(99.0).z, 6.0, 0.0);
+    mdlNear(c, "anim: at a key exactly", lin.sampleVec3(1.0).y, 4.0, 0.0);
+    let step : ModelChannel = clip.channel(1);
+    mdlNear(c, "anim: step holds the earlier key", step.sampleVec3(0.99).x, 0.0, 0.0);
+    mdlNear(c, "anim: and jumps at the next", step.sampleVec3(1.0).x, 2.0, 0.0);
+    let cubic : ModelChannel = clip.channel(2);
+    c.that(
+        "gltf: a cubic channel stores three vectors per key",
+        cubic.keyCount() == 2 && cubic.values.len() == 18 && cubic.isConsistent()
+    );
+    mdlNear(
+        c,
+        "anim: cubic at s = 0.5 follows the Hermite formula",
+        cubic.sampleVec3(0.5).x,
+        0.5,
+        0.0000001
+    );
+    mdlNear(c, "anim: cubic at s = 0.25", cubic.sampleVec3(0.25).x, 0.4375, 0.0000001);
+    mdlNear(c, "anim: cubic at the first key", cubic.sampleVec3(0.0).x, 0.0, 0.0);
+    mdlNear(
+        c,
+        "anim: cubic at the last key is the value, not a tangent",
+        cubic.sampleVec3(1.0).x,
+        1.0,
+        0.0
+    );
+    mdlNear(c, "anim: cubic past the end", cubic.sampleVec3(5.0).x, 1.0, 0.0);
+    let rot : ModelChannel = clip.channel(3);
+    let half : Quat = rot.sampleQuat(0.5);
+    mdlNear(c, "anim: slerp halfway z", half.z, 0.3826834, 0.000001);
+    mdlNear(c, "anim: slerp halfway w", half.w, 0.9238795, 0.000001);
+    mdlNear(c, "anim: slerp stays a unit quaternion", half.length(), 1.0, 0.000001);
+    mdlNear(c, "anim: rotation at the start is the identity", rot.sampleQuat(0.0).w, 1.0, 0.0);
+    mdlNear(
+        c,
+        "anim: and at the end the quarter turn",
+        rot.sampleQuat(1.0).z,
+        0.70710678,
+        0.000001
+    );
+    let empty : ModelChannel = new ModelChannel(0, lin.path, lin.interp);
+    c.that(
+        "anim: a channel with no keys answers neutral values",
+        empty.sampleVec3(1.0).x == 0.0 && empty.sampleScale(1.0).x == 1.0
+            && empty.sampleQuat(1.0).w == 1.0
+            && empty.duration() == 0.0
+    );
+    // Damage.
+    let base : string = "${views},${accs},'nodes':[{}],";
+    mdlFails(
+        c,
+        "a sampler with the wrong output count",
+        mdlDoc(
+            b,
+            base
+                + "'animations':[{'samplers':[{'input':0,'output':3}],'channels':[{'sampler':0,'target':{'node':0,'path':'translation'}}]}]"
+        )
+    );
+    mdlFails(
+        c,
+        "cubic output of the wrong size",
+        mdlDoc(
+            b,
+            base
+                + "'animations':[{'samplers':[{'input':0,'output':1,'interpolation':'CUBICSPLINE'}],'channels':[{'sampler':0,'target':{'node':0,'path':'translation'}}]}]"
+        )
+    );
+    mdlFails(
+        c,
+        "a rotation with three components",
+        mdlDoc(
+            b,
+            base
+                + "'animations':[{'samplers':[{'input':0,'output':1}],'channels':[{'sampler':0,'target':{'node':0,'path':'rotation'}}]}]"
+        )
+    );
+    mdlFails(
+        c,
+        "a channel on a node that is not there",
+        mdlDoc(
+            b,
+            base
+                + "'animations':[{'samplers':[{'input':0,'output':1}],'channels':[{'sampler':0,'target':{'node':5,'path':'translation'}}]}]"
+        )
+    );
+    mdlFails(
+        c,
+        "a missing sampler",
+        mdlDoc(
+            b,
+            base
+                + "'animations':[{'samplers':[],'channels':[{'sampler':0,'target':{'node':0,'path':'translation'}}]}]"
+        )
+    );
+    mdlFails(
+        c,
+        "an unknown interpolation",
+        mdlDoc(
+            b,
+            base
+                + "'animations':[{'samplers':[{'input':0,'output':1,'interpolation':'SPLINE'}],'channels':[{'sampler':0,'target':{'node':0,'path':'translation'}}]}]"
+        )
+    );
+    mdlFails(
+        c,
+        "an unknown property",
+        mdlDoc(
+            b,
+            base
+                + "'animations':[{'samplers':[{'input':0,'output':1}],'channels':[{'sampler':0,'target':{'node':0,'path':'colour'}}]}]"
+        )
+    );
+    let backwards : ByteBuf = new ByteBuf(64);
+    mdlFloat(backwards, 1.0);
+    mdlFloat(backwards, 0.5);
+    mdlVec3s(
+        backwards,
+        Vec3::make(0.0, 0.0, 0.0),
+        Vec3::make(1.0, 1.0, 1.0),
+        Vec3::make(0.0, 0.0, 0.0)
+    );
+    mdlFails(
+        c,
+        "key times that go backwards",
+        mdlDoc(
+            backwards,
+            "'bufferViews':[{'buffer':0,'byteLength':8},{'buffer':0,'byteOffset':8,'byteLength':24}],'accessors':[{'bufferView':0,'componentType':5126,'count':2,'type':'SCALAR'},{'bufferView':1,'componentType':5126,'count':2,'type':'VEC3'}],'nodes':[{}],'animations':[{'samplers':[{'input':0,'output':1}],'channels':[{'sampler':0,'target':{'node':0,'path':'translation'}}]}]"
+        )
+    );
+    let weights : ModelAsset = mdlImport(mdlDoc(
+        b,
+        base
+            + "'animations':[{'samplers':[{'input':0,'output':1}],'channels':[{'sampler':0,'target':{'node':0,'path':'weights'}}]}]"
+    ));
+    c.that(
+        "gltf: a morph weight channel is skipped with a warning",
+        weights.ok() && weights.clip(0).channelCount() == 0 && weights.warnings().byteLength > 0
+    );
+}
+
+// ---- GLB ----
+
+fn mdlGlb(json : string, bin : ByteBuf) : ByteBuf {
+    let j : ByteBuf = DataText::toBytes(json);
+    while (j.len() % 4 != 0) {
+        j.push(32);
+    }
+    let bn : ByteBuf = new ByteBuf(16);
+    bn.pushRange(bin, 0, bin.len());
+    while (bn.len() % 4 != 0) {
+        bn.push(0);
+    }
+    let out : ByteBuf = new ByteBuf(64);
+    out.pushText("glTF");
+    out.pushLe32(2);
+    out.pushLe32(12 + 8 + j.len() + 8 + bn.len());
+    out.pushLe32(j.len());
+    out.pushLe32(0x4E4F534A);
+    out.pushRange(j, 0, j.len());
+    out.pushLe32(bn.len());
+    out.pushLe32(0x004E4942);
+    out.pushRange(bn, 0, bn.len());
+    return out;
+}
+
+fn mdlGlbChecks(c : Checks) : void {
+    let bin : ByteBuf = mdlTriBuffer();
+    let json : string = mdlJson("{'asset':{'version':'2.0'},'buffers':[{'byteLength':36}],"
+        + mdlTriRest(",'translation':[4,5,6]")
+        + "}");
+    let glb : ByteBuf = mdlGlb(json, bin);
+    let vfs : Vfs = new Vfs();
+    let m : ModelAsset = GltfImporter::fromBytes(glb, vfs, "");
+    c.that("glb: a binary glTF imports (${m.error()})", m.ok() && m.meshCount() == 1);
+    c.that(
+        "glb: its buffer is the binary chunk",
+        m.mesh(0).primitive(0).position(1).x == 1.0 && m.mesh(0).primitive(0).position(2).y == 1.0
+            && m.node(0).local.translation.z == 6.0
+    );
+    // A GLB whose JSON chunk is padded and whose binary chunk is longer than the buffer it declares is fine.
+    c.that(
+        "glb: the declared buffer may be shorter than the chunk",
+        GltfImporter::fromBytes(mdlGlb(json, mdlPadded(bin)), vfs, "").ok()
+    );
+    // Cut at every length: always an error, never an abort.
+    let mut allRefused : bool = true;
+    for (len of 0..glb.len()) {
+        let cut : ByteBuf = new ByteBuf(16);
+        cut.pushRange(glb, 0, len);
+        if (GltfImporter::fromBytes(cut, vfs, "").ok()) {
+            allRefused = false;
+        }
+    }
+    c.that("glb: a file cut at any length is refused", allRefused);
+    let flipped : ByteBuf = new ByteBuf(16);
+    flipped.pushRange(glb, 0, glb.len());
+    flipped.set(4, 3);
+    c.that("glb: another version is refused", !GltfImporter::fromBytes(flipped, vfs, "").ok());
+    let lie : ByteBuf = new ByteBuf(16);
+    lie.pushRange(glb, 0, glb.len());
+    lie.set(12, 255);
+    lie.set(13, 255);
+    c.that(
+        "glb: a chunk longer than the file is refused",
+        !GltfImporter::fromBytes(lie, vfs, "").ok()
+    );
+    // No binary chunk, but a buffer without a uri.
+    let jb : ByteBuf = DataText::toBytes(json);
+    while (jb.len() % 4 != 0) {
+        jb.push(32);
+    }
+    let noBin : ByteBuf = new ByteBuf(64);
+    noBin.pushText("glTF");
+    noBin.pushLe32(2);
+    noBin.pushLe32(20 + jb.len());
+    noBin.pushLe32(jb.len());
+    noBin.pushLe32(0x4E4F534A);
+    noBin.pushRange(jb, 0, jb.len());
+    c.that(
+        "glb: a buffer with no uri and no binary chunk is refused",
+        !GltfImporter::fromBytes(noBin, vfs, "").ok()
+    );
+}
+
+fn mdlPadded(b : ByteBuf) : ByteBuf {
+    let out : ByteBuf = new ByteBuf(16);
+    out.pushRange(b, 0, b.len());
+    for (i of 0..16) {
+        out.push(7);
+    }
+    return out;
+}
+
+// ---- files through the Vfs ----
+
+fn mdlVfsChecks(c : Checks) : void {
+    let vfs : Vfs = new Vfs();
+    vfs.addMemory("");
+    let json : string = mdlJson("{'asset':{'version':'2.0'},'buffers':[{'byteLength':36,'uri':'my%20tri.bin'}],"
+        + mdlTriRest("")
+        + "}");
+    try {
+        vfs.write("models/my tri.bin", mdlTriBuffer());
+        vfs.writeText("models/tri.gltf", json);
+    } catch e : IOException {
+        c.that("model: setup writes", false);
+    }
+    let m : ModelAsset = GltfImporter::load(vfs, "models/tri.gltf");
+    c.that(
+        "gltf: an external buffer is read through the Vfs (${m.error()})",
+        m.ok() && m.mesh(0).primitive(0).position(1).x == 1.0
+    );
+    c.that("gltf: the external file is recorded", m.externalFiles() == "models/my tri.bin\n");
+    c.that(
+        "gltf: loading a file that does not exist fails",
+        !GltfImporter::load(vfs, "models/none.gltf").ok()
+    );
+    let missing : Vfs = new Vfs();
+    missing.addMemory("");
+    try {
+        missing.writeText("tri.gltf", json);
+    } catch e : IOException {
+        c.that("model: setup writes", false);
+    }
+    c.that(
+        "gltf: a missing external buffer is an error",
+        !GltfImporter::load(missing, "tri.gltf").ok()
+            && GltfImporter::load(missing, "tri.gltf").error().byteLength > 0
+    );
+    let escape : string = mdlJson("{'asset':{'version':'2.0'},'buffers':[{'byteLength':36,'uri':'../secret.bin'}],"
+        + mdlTriRest("")
+        + "}");
+    c.that(
+        "gltf: a buffer outside the root is refused",
+        !GltfImporter::fromBytes(DataText::toBytes(escape), vfs, "models").ok()
+    );
+}
+
+// ---- damaged glTF ----
+
+fn mdlGltfDamage(c : Checks) : void {
+    let tri : ByteBuf = mdlTriBuffer();
+    let good : string = mdlTriRest("");
+    mdlFails(c, "text that is not JSON", "this is not a model");
+    mdlFails(c, "the empty file", "");
+    mdlFails(c, "JSON that is not an object", "[1,2]");
+    mdlFails(c, "a missing asset version", mdlJson("{'buffers':[]}"));
+    mdlFails(c, "glTF version 1", mdlJson("{'asset':{'version':'1.0'}}"));
+    mdlFails(
+        c,
+        "invalid base64 in a buffer",
+        mdlJson("{'asset':{'version':'2.0'},'buffers':[{'byteLength':36,'uri':'data:application/octet-stream;base64,@@@@'}]}")
+    );
+    mdlFails(
+        c,
+        "a buffer shorter than its byteLength",
+        mdlJson("{'asset':{'version':'2.0'},'buffers':[{'byteLength':400,'uri':'${mdlUri(tri)}'}],${good}}")
+    );
+    mdlFails(
+        c,
+        "a buffer with no byteLength",
+        mdlJson("{'asset':{'version':'2.0'},'buffers':[{'uri':'${mdlUri(tri)}'}],${good}}")
+    );
+    mdlFails(
+        c,
+        "a buffer view past the end of its buffer",
+        mdlDoc(
+            tri,
+            "'bufferViews':[{'buffer':0,'byteOffset':20,'byteLength':36}],'accessors':[{'bufferView':0,'componentType':5126,'count':3,'type':'VEC3'}],'meshes':[{'primitives':[{'attributes':{'POSITION':0}}]}]"
+        )
+    );
+    mdlFails(
+        c,
+        "a buffer view of a buffer that is not there",
+        mdlDoc(
+            tri,
+            "'bufferViews':[{'buffer':3,'byteLength':36}],'accessors':[{'bufferView':0,'componentType':5126,'count':3,'type':'VEC3'}],'meshes':[{'primitives':[{'attributes':{'POSITION':0}}]}]"
+        )
+    );
+    mdlFails(
+        c,
+        "an accessor that reads past its view",
+        mdlDoc(
+            tri,
+            "'bufferViews':[{'buffer':0,'byteLength':36}],'accessors':[{'bufferView':0,'componentType':5126,'count':4,'type':'VEC3'}],'meshes':[{'primitives':[{'attributes':{'POSITION':0}}]}]"
+        )
+    );
+    mdlFails(
+        c,
+        "an accessor with a huge count",
+        mdlDoc(
+            tri,
+            "'bufferViews':[{'buffer':0,'byteLength':36}],'accessors':[{'bufferView':0,'componentType':5126,'count':2000000000,'type':'VEC3'}],'meshes':[{'primitives':[{'attributes':{'POSITION':0}}]}]"
+        )
+    );
+    mdlFails(
+        c,
+        "an accessor with a negative count",
+        mdlDoc(
+            tri,
+            "'bufferViews':[{'buffer':0,'byteLength':36}],'accessors':[{'bufferView':0,'componentType':5126,'count':-1,'type':'VEC3'}],'meshes':[{'primitives':[{'attributes':{'POSITION':0}}]}]"
+        )
+    );
+    mdlFails(
+        c,
+        "an offset that overflows",
+        mdlDoc(
+            tri,
+            "'bufferViews':[{'buffer':0,'byteLength':36}],'accessors':[{'bufferView':0,'byteOffset':2147483647,'componentType':5126,'count':3,'type':'VEC3'}],'meshes':[{'primitives':[{'attributes':{'POSITION':0}}]}]"
+        )
+    );
+    mdlFails(
+        c,
+        "a stride smaller than an element",
+        mdlDoc(
+            tri,
+            "'bufferViews':[{'buffer':0,'byteLength':36,'byteStride':4}],'accessors':[{'bufferView':0,'componentType':5126,'count':3,'type':'VEC3'}],'meshes':[{'primitives':[{'attributes':{'POSITION':0}}]}]"
+        )
+    );
+    mdlFails(
+        c,
+        "an unknown component type",
+        mdlDoc(
+            tri,
+            "'bufferViews':[{'buffer':0,'byteLength':36}],'accessors':[{'bufferView':0,'componentType':1234,'count':3,'type':'VEC3'}],'meshes':[{'primitives':[{'attributes':{'POSITION':0}}]}]"
+        )
+    );
+    mdlFails(
+        c,
+        "an unknown accessor type",
+        mdlDoc(
+            tri,
+            "'bufferViews':[{'buffer':0,'byteLength':36}],'accessors':[{'bufferView':0,'componentType':5126,'count':3,'type':'VEC5'}],'meshes':[{'primitives':[{'attributes':{'POSITION':0}}]}]"
+        )
+    );
+    mdlFails(
+        c,
+        "a sparse accessor",
+        mdlDoc(
+            tri,
+            "'bufferViews':[{'buffer':0,'byteLength':36}],'accessors':[{'bufferView':0,'componentType':5126,'count':3,'type':'VEC3','sparse':{'count':1}}],'meshes':[{'primitives':[{'attributes':{'POSITION':0}}]}]"
+        )
+    );
+    mdlFails(
+        c,
+        "an accessor with no buffer view",
+        mdlDoc(
+            tri,
+            "'accessors':[{'componentType':5126,'count':3,'type':'VEC3'}],'meshes':[{'primitives':[{'attributes':{'POSITION':0}}]}]"
+        )
+    );
+    mdlFails(
+        c,
+        "a position accessor that does not exist",
+        mdlDoc(tri, "'meshes':[{'primitives':[{'attributes':{'POSITION':9}}]}]")
+    );
+    mdlFails(
+        c,
+        "a primitive without POSITION",
+        mdlDoc(tri, "'meshes':[{'primitives':[{'attributes':{}}]}]")
+    );
+    mdlFails(
+        c,
+        "positions that are not VEC3",
+        mdlDoc(
+            tri,
+            "'bufferViews':[{'buffer':0,'byteLength':36}],'accessors':[{'bufferView':0,'componentType':5126,'count':3,'type':'VEC2'}],'meshes':[{'primitives':[{'attributes':{'POSITION':0}}]}]"
+        )
+    );
+    let nan : ByteBuf = new ByteBuf(64);
+    nan.pushLe32(2143289344);
+    for (i of 0..8) {
+        nan.pushLe32(0);
+    }
+    mdlFails(c, "a NaN in a float accessor", mdlDoc(nan, good));
+    let inf : ByteBuf = new ByteBuf(64);
+    inf.pushLe32(2139095040);
+    for (i of 0..8) {
+        inf.pushLe32(0);
+    }
+    mdlFails(c, "an infinity in a float accessor", mdlDoc(inf, good));
+    // Indices.
+    let ib : ByteBuf = mdlTriBuffer();
+    ib.push(0);
+    ib.push(0);
+    ib.push(1);
+    ib.push(0);
+    ib.push(9);
+    ib.push(0);
+    let idxDoc : string = "'bufferViews':[{'buffer':0,'byteLength':36},{'buffer':0,'byteOffset':36,'byteLength':6}],'accessors':[{'bufferView':0,'componentType':5126,'count':3,'type':'VEC3'},{'bufferView':1,'componentType':5123,'count':3,'type':'SCALAR'}],'meshes':[{'primitives':[{'attributes':{'POSITION':0},'indices':1}]}]";
+    mdlFails(c, "an index past the last vertex", mdlDoc(ib, idxDoc));
+    mdlFails(
+        c,
+        "indices that are not scalars",
+        mdlDoc(
+            ib,
+            "'bufferViews':[{'buffer':0,'byteLength':36},{'buffer':0,'byteOffset':36,'byteLength':6}],'accessors':[{'bufferView':0,'componentType':5126,'count':3,'type':'VEC3'},{'bufferView':1,'componentType':5123,'count':1,'type':'VEC3'}],'meshes':[{'primitives':[{'attributes':{'POSITION':0},'indices':1}]}]"
+        )
+    );
+    mdlFails(
+        c,
+        "a normal count that differs from the positions",
+        mdlDoc(
+            tri,
+            "'bufferViews':[{'buffer':0,'byteLength':36}],'accessors':[{'bufferView':0,'componentType':5126,'count':3,'type':'VEC3'},{'bufferView':0,'componentType':5126,'count':2,'type':'VEC3'}],'meshes':[{'primitives':[{'attributes':{'POSITION':0,'NORMAL':1}}]}]"
+        )
+    );
+    // Materials and nodes.
+    mdlFails(
+        c,
+        "a material with a texture that does not exist",
+        mdlDoc(
+            tri,
+            good + ",'materials':[{'pbrMetallicRoughness':{'baseColorTexture':{'index':4}}}]"
+        )
+    );
+    mdlFails(
+        c,
+        "a primitive with a material that does not exist",
+        mdlDoc(
+            tri,
+            "'bufferViews':[{'buffer':0,'byteLength':36}],'accessors':[{'bufferView':0,'componentType':5126,'count':3,'type':'VEC3'}],'meshes':[{'primitives':[{'attributes':{'POSITION':0},'material':2}]}]"
+        )
+    );
+    mdlFails(c, "a node with a mesh that does not exist", mdlDoc(tri, "'nodes':[{'mesh':3}]"));
+    mdlFails(c, "a child that does not exist", mdlDoc(tri, "'nodes':[{'children':[5]}]"));
+    mdlFails(c, "a node that is its own child", mdlDoc(tri, "'nodes':[{'children':[0]}]"));
+    mdlFails(
+        c,
+        "a loop in the node tree",
+        mdlDoc(tri, "'nodes':[{'children':[1]},{'children':[2]},{'children':[0]}]")
+    );
+    mdlFails(
+        c,
+        "a node with two parents",
+        mdlDoc(tri, "'nodes':[{'children':[2]},{'children':[2]},{}]")
+    );
+    mdlFails(
+        c,
+        "a scene with a node that does not exist",
+        mdlDoc(tri, "'nodes':[{}],'scenes':[{'nodes':[7]}]")
+    );
+    mdlFails(
+        c,
+        "a default scene that does not exist",
+        mdlDoc(tri, "'nodes':[{}],'scenes':[{'nodes':[0]}],'scene':3")
+    );
+}

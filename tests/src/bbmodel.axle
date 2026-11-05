@@ -1,0 +1,512 @@
+// bbmodel — checks for the Blockbench importer.
+//
+// A cube is built with known corners and uv rectangles, so the vertices and texture coordinates that come
+// out can be written down by hand: the north face of a box from (0,0,0) to (16,8,4) has its top-left corner
+// at (16,8,0) and its uv rectangle's top-left at (0,0). Rotations of an element and of the group above it
+// are checked on the bounding box of the result. The texture is a real PNG made by our encoder, embedded as
+// base64 the way Blockbench stores it.
+
+use ludax::Aabb;
+use ludax::Base64;
+use ludax::BbModelImporter;
+use ludax::ByteBuf;
+use ludax::Checks;
+use ludax::DataText;
+use ludax::Image;
+use ludax::Mesh;
+use ludax::ModelAsset;
+use ludax::PngCodec;
+use ludax::Vec3;
+use ludax::Vfs;
+
+/** The Blockbench checks. */
+pub class BbModelSuite {
+    /** Runs every check of the suite. */
+    pub static fn run(c : Checks) : void {
+        bbCubeChecks(c);
+        bbTransformChecks(c);
+        bbFaceChecks(c);
+        bbTextureChecks(c);
+        bbDamage(c);
+    }
+}
+
+fn bbJson(s : string) : string {
+    let b : ByteBuf = DataText::toBytes(s);
+    for (i of 0..b.len()) {
+        if (b.get(i) == 39) {
+            b.set(i, 34);
+        }
+    }
+    return DataText::fromBytes(b, 0, b.len());
+}
+
+// A 16 x 16 PNG as a data URI; the pixel at (x, y) has red x * 16 and green y * 16.
+fn bbPngUri() : string {
+    let img : Image = new Image(16, 16);
+    for (y of 0..16) {
+        for (x of 0..16) {
+            img.set(x, y, Image::pack(x * 16, y * 16, 128, 255));
+        }
+    }
+    let codec : PngCodec = new PngCodec();
+    return "data:image/png;base64," + Base64::encode(codec.encode(img));
+}
+
+fn bbImport(text : string) : ModelAsset {
+    let vfs : Vfs = new Vfs();
+    return BbModelImporter::fromBytes(DataText::toBytes(bbJson(text)), vfs, "");
+}
+
+// A cube element from (0,0,0) to (16,8,4) with all six faces mapped onto texture 0.
+fn bbCube(extra : string) : string {
+    return "{'name':'c','type':'cube','uuid':'u1','from':[0,0,0],'to':[16,8,4]" + extra
+        + ",'faces':{'north':{'uv':[0,0,16,8],'texture':0},'east':{'uv':[0,8,4,16],'texture':0},'south':{'uv':[4,0,0,8],'texture':0},'west':{'uv':[0,0,4,8],'texture':0},'up':{'uv':[0,0,16,4],'texture':0},'down':{'uv':[0,4,16,8],'texture':0}}}";
+}
+
+fn bbDoc(element : string, outliner : string) : string {
+    return "{'name':'blk','resolution':{'width':16,'height':16},'elements':[" + element
+        + "],'outliner':"
+        + outliner
+        + ",'textures':[{'name':'t.png','source':'"
+        + bbPngUri()
+        + "'}]}";
+}
+
+fn bbNear(c : Checks, name : string, got : f32, want : f64) : void {
+    c.near(name, got as f64, want, 0.00001);
+}
+
+fn bbFails(c : Checks, name : string, text : string) : void {
+    let m : ModelAsset = bbImport(text);
+    c.that(
+        "bbmodel: rejects ${name} (${m.error()})",
+        !m.ok() && m.error().byteLength > 0
+    );
+}
+
+fn bbCubeChecks(c : Checks) : void {
+    let m : ModelAsset = bbImport(bbDoc(bbCube(""), "['u1']"));
+    c.that("bbmodel: a cube imports (${m.error()})", m.ok() && m.name == "blk");
+    c.that(
+        "bbmodel: one mesh, one node, one root",
+        m.meshCount() == 1 && m.nodeCount() == 1 && m.rootCount() == 1 && m.node(0).mesh == 0
+    );
+    c.that(
+        "bbmodel: the texture is decoded",
+        m.textureCount() == 1 && m.texture(0).width() == 16 && m.texture(0).height() == 16
+    );
+    c.that("bbmodel: with its pixels", m.texture(0).get(3, 5) == Image::pack(48, 80, 128, 255));
+    c.that(
+        "bbmodel: one material per texture, plus one for faces without",
+        m.materialCount() == 2 && m.material(0).baseColorTexture == 0
+            && m.material(1).baseColorTexture == -1
+            && m.material(0).name == "t.png"
+    );
+    c.that(
+        "bbmodel: only the textured primitive exists",
+        m.mesh(0).primitiveCount() == 1 && m.mesh(0).material(0) == 0
+    );
+    let mesh : Mesh = m.mesh(0).primitive(0);
+    c.that(
+        "bbmodel: 24 vertices and 12 triangles",
+        mesh.vertexCount() == 24 && mesh.triangleCount() == 12 && mesh.check() == ""
+    );
+    c.that(
+        "bbmodel: normals and tangents",
+        mesh.hasNormals() && mesh.hasUvs() && mesh.hasTangents()
+    );
+    let box : Aabb = mesh.bounds();
+    bbNear(c, "bbmodel: bounds min x", box.min.x, 0.0);
+    bbNear(c, "bbmodel: bounds max x is 16 / 16", box.max.x, 1.0);
+    bbNear(c, "bbmodel: bounds max y is 8 / 16", box.max.y, 0.5);
+    bbNear(c, "bbmodel: bounds max z is 4 / 16", box.max.z, 0.25);
+    // The north face comes first: top-left (16,8,0), top-right (0,8,0), bottom-right (0,0,0), bottom-left (16,0,0).
+    bbNear(c, "bbmodel: north top-left x", mesh.position(0).x, 1.0);
+    bbNear(c, "bbmodel: north top-left y", mesh.position(0).y, 0.5);
+    bbNear(c, "bbmodel: north top-left z", mesh.position(0).z, 0.0);
+    bbNear(c, "bbmodel: north top-right x", mesh.position(1).x, 0.0);
+    bbNear(c, "bbmodel: north bottom-right y", mesh.position(2).y, 0.0);
+    bbNear(c, "bbmodel: north bottom-left x", mesh.position(3).x, 1.0);
+    bbNear(c, "bbmodel: north normal", mesh.normal(0).z, -1.0);
+    bbNear(c, "bbmodel: north uv top-left u", mesh.uv(0).x, 0.0);
+    bbNear(c, "bbmodel: north uv top-left v", mesh.uv(0).y, 0.0);
+    bbNear(c, "bbmodel: north uv top-right u is 16 / 16", mesh.uv(1).x, 1.0);
+    bbNear(c, "bbmodel: north uv bottom-right v is 8 / 16", mesh.uv(2).y, 0.5);
+    c.that(
+        "bbmodel: the first triangle is top-left, bottom-left, bottom-right",
+        mesh.index(0) == 0 && mesh.index(1) == 3 && mesh.index(2) == 2
+    );
+    c.that(
+        "bbmodel: the second is top-left, bottom-right, top-right",
+        mesh.index(3) == 0 && mesh.index(4) == 2 && mesh.index(5) == 1
+    );
+    // Every triangle faces the way its stored normal says.
+    let mut winding : bool = true;
+    for (t of 0..mesh.triangleCount()) {
+        let a : i32 = mesh.index(t * 3);
+        let p0 : Vec3 = mesh.position(a);
+        let face : Vec3 = mesh
+            .position(mesh.index(t * 3 + 1))
+            .minus(p0)
+            .cross(mesh.position(mesh.index(t * 3 + 2)).minus(p0));
+        if (face.dot(mesh.normal(a)) <= 0.0) {
+            winding = false;
+        }
+    }
+    c.that("bbmodel: all triangles wind counter-clockwise seen from outside", winding);
+    // East: top-left (16,8,4), top-right (16,8,0): the sixth to ninth vertex.
+    bbNear(c, "bbmodel: east top-left z", mesh.position(4).z, 0.25);
+    bbNear(c, "bbmodel: east top-right z", mesh.position(5).z, 0.0);
+    bbNear(c, "bbmodel: east normal", mesh.normal(4).x, 1.0);
+    // Up is the fifth face; its normal is +Y and its top edge is the north side.
+    bbNear(c, "bbmodel: up normal", mesh.normal(16).y, 1.0);
+    bbNear(c, "bbmodel: up top-left z is north", mesh.position(16).z, 0.0);
+    bbNear(c, "bbmodel: down normal", mesh.normal(20).y, -1.0);
+    bbNear(c, "bbmodel: down top-left z is south", mesh.position(20).z, 0.25);
+    // Without an outliner every cube is placed.
+    let flat : ModelAsset = bbImport("{'resolution':{'width':16,'height':16},'elements':["
+        + bbCube("")
+        + "],'textures':[{'name':'t.png','source':'"
+        + bbPngUri()
+        + "'}]}");
+    c.that(
+        "bbmodel: a model with no outliner places its cubes",
+        flat.ok() && flat.mesh(0).primitive(0).vertexCount() == 24
+    );
+    // Inflate grows the box on every side.
+    let fat : ModelAsset = bbImport(bbDoc(bbCube(",'inflate':8"), "['u1']"));
+    bbNear(c, "bbmodel: inflate", fat.mesh(0).primitive(0).bounds().max.x, 1.5);
+}
+
+fn bbTransformChecks(c : Checks) : void {
+    // A quarter turn about Y around (8,0,8) takes the box [0,16]x[0,8]x[0,4] to x in [0,4], z in [0,16].
+    let ry : ModelAsset = bbImport(bbDoc(
+        bbCube(",'origin':[8,0,8],'rotation':[0,90,0]"),
+        "['u1']"
+    ));
+    c.that("bbmodel: a rotated cube imports (${ry.error()})", ry.ok());
+    let b1 : Aabb = ry.mesh(0).primitive(0).bounds();
+    bbNear(c, "bbmodel: rotated min x", b1.min.x, 0.0);
+    bbNear(c, "bbmodel: rotated max x", b1.max.x, 0.25);
+    bbNear(c, "bbmodel: rotated min z", b1.min.z, 0.0);
+    bbNear(c, "bbmodel: rotated max z", b1.max.z, 1.0);
+    bbNear(c, "bbmodel: rotated y is unchanged", b1.max.y, 0.5);
+    bbNear(
+        c,
+        "bbmodel: the north normal turned to +X or -X",
+        ry.mesh(0).primitive(0).normal(0).z,
+        0.0
+    );
+    bbNear(
+        c,
+        "bbmodel: it is now along x",
+        ry.mesh(0).primitive(0).normal(0).x * ry.mesh(0).primitive(0).normal(0).x,
+        1.0
+    );
+    // A group rotated a quarter turn about Z around the origin: x in [-8,0], y in [0,16] (in pixels).
+    let grouped : ModelAsset = bbImport(bbDoc(
+        bbCube(""),
+        "[{'name':'g','origin':[0,0,0],'rotation':[0,0,90],'children':['u1']}]"
+    ));
+    c.that("bbmodel: a group imports (${grouped.error()})", grouped.ok());
+    let b2 : Aabb = grouped.mesh(0).primitive(0).bounds();
+    bbNear(c, "bbmodel: grouped min x", b2.min.x, -0.5);
+    bbNear(c, "bbmodel: grouped max x", b2.max.x, 0.0);
+    bbNear(c, "bbmodel: grouped max y", b2.max.y, 1.0);
+    bbNear(c, "bbmodel: grouped max z", b2.max.z, 0.25);
+    // Groups nest: the inner group turns first, then the outer one.
+    let nested : ModelAsset = bbImport(bbDoc(
+        bbCube(""),
+        "[{'origin':[0,0,0],'rotation':[0,0,90],'children':[{'origin':[0,0,0],'rotation':[0,0,90],'children':['u1']}]}]"
+    ));
+    let b3 : Aabb = nested.mesh(0).primitive(0).bounds();
+    bbNear(c, "bbmodel: two quarter turns make a half turn (min x)", b3.min.x, -1.0);
+    bbNear(c, "bbmodel: (max y)", b3.max.y, 0.0);
+    bbNear(c, "bbmodel: (min y)", b3.min.y, -0.5);
+    // An element rotation and its group's rotation compose, the element's applied first.
+    let both : ModelAsset = bbImport(bbDoc(
+        bbCube(",'origin':[0,0,0],'rotation':[0,0,90]"),
+        "[{'origin':[0,0,0],'rotation':[0,0,90],'children':['u1']}]"
+    ));
+    bbNear(c, "bbmodel: element then group", both.mesh(0).primitive(0).bounds().min.x, -1.0);
+    // Cubes outside every group are placed untouched.
+    let mixed : ModelAsset = bbImport("{'resolution':{'width':16,'height':16},'elements':["
+        + bbCube("")
+        + ",{'type':'cube','uuid':'u2','from':[0,0,0],'to':[16,16,16],'faces':{'up':{'uv':[0,0,16,16],'texture':0}}}],'outliner':[{'rotation':[0,0,90],'origin':[0,0,0],'children':['u1']},'u2'],'textures':[{'name':'t.png','source':'"
+        + bbPngUri()
+        + "'}]}");
+    c.that(
+        "bbmodel: a group does not move its siblings",
+        mixed.ok() && mixed.mesh(0).primitive(0).bounds().max.x == 1.0
+            && mixed.mesh(0).primitive(0).vertexCount() == 28
+    );
+}
+
+fn bbRotCube(degrees : i32) : string {
+    return "{'type':'cube','uuid':'u1','from':[0,0,0],'to':[16,8,4],'faces':{'north':{'uv':[0,0,16,8],'rotation':${degrees},'texture':0}}}";
+}
+
+fn bbFaceChecks(c : Checks) : void {
+    // A face rotation of 90 turns the picture clockwise on the face.
+    let m : ModelAsset = bbImport(bbDoc(bbRotCube(90), "['u1']"));
+    c.that("bbmodel: a face rotation imports (${m.error()})", m.ok());
+    let mesh : Mesh = m.mesh(0).primitive(0);
+    c.that(
+        "bbmodel: one face is four vertices",
+        mesh.vertexCount() == 4 && mesh.triangleCount() == 2
+    );
+    bbNear(
+        c,
+        "bbmodel: rotated face, top-left vertex takes the bottom-left corner (u)",
+        mesh.uv(0).x,
+        0.0
+    );
+    bbNear(c, "bbmodel: (v)", mesh.uv(0).y, 0.5);
+    bbNear(c, "bbmodel: top-right vertex takes the top-left corner (u)", mesh.uv(1).x, 0.0);
+    bbNear(c, "bbmodel: (v)", mesh.uv(1).y, 0.0);
+    // A turn of 360 is none; 180 swaps opposite corners.
+    let half : ModelAsset = bbImport(bbDoc(bbRotCube(180), "['u1']"));
+    bbNear(
+        c,
+        "bbmodel: a half turn, top-left vertex takes the bottom-right corner (u)",
+        half.mesh(0).primitive(0).uv(0).x,
+        1.0
+    );
+    bbNear(c, "bbmodel: (v)", half.mesh(0).primitive(0).uv(0).y, 0.5);
+    // A mirrored uv rectangle (u1 > u2) mirrors the picture.
+    let mirror : ModelAsset = bbImport(bbDoc(
+        "{'type':'cube','uuid':'u1','from':[0,0,0],'to':[16,8,4],'faces':{'north':{'uv':[16,0,0,8],'texture':0}}}",
+        "['u1']"
+    ));
+    bbNear(
+        c,
+        "bbmodel: a mirrored uv puts the right edge on the left vertices",
+        mirror.mesh(0).primitive(0).uv(0).x,
+        1.0
+    );
+    // A face with a null texture is not drawn when the model has textures.
+    let skipped : ModelAsset = bbImport(bbDoc(
+        "{'type':'cube','uuid':'u1','from':[0,0,0],'to':[16,8,4],'faces':{'north':{'uv':[0,0,16,8],'texture':0},'south':{'uv':[0,0,16,8],'texture':null}}}",
+        "['u1']"
+    ));
+    c.that(
+        "bbmodel: a face with a null texture is skipped",
+        skipped.ok() && skipped.mesh(0).primitive(0).vertexCount() == 4
+    );
+    // A face with no uv is not part of the model.
+    let nouv : ModelAsset = bbImport(bbDoc(
+        "{'type':'cube','uuid':'u1','from':[0,0,0],'to':[16,8,4],'faces':{'north':{'uv':[0,0,16,8],'texture':0},'east':{'texture':0}}}",
+        "['u1']"
+    ));
+    c.that(
+        "bbmodel: a face without uv is skipped",
+        nouv.ok() && nouv.mesh(0).primitive(0).vertexCount() == 4
+    );
+    // Elements that are not cubes are skipped with a warning.
+    let locator : ModelAsset = bbImport(bbDoc(
+        bbCube("") + ",{'type':'locator','uuid':'u9','from':[0,0,0]}",
+        "['u1','u9']"
+    ));
+    c.that(
+        "bbmodel: a locator is skipped with a warning",
+        locator.ok() && locator.warnings().byteLength > 0
+            && locator.mesh(0).primitive(0).vertexCount() == 24
+    );
+}
+
+fn bbTextureChecks(c : Checks) : void {
+    // No textures at all: every face is drawn, into the untextured material, uvs relative to the resolution.
+    let plain : ModelAsset = bbImport("{'resolution':{'width':32,'height':16},'elements':[{'type':'cube','uuid':'u1','from':[0,0,0],'to':[16,8,4],'faces':{'north':{'uv':[0,0,16,8],'texture':null},'up':{'uv':[0,0,32,16]}}}],'outliner':['u1']}");
+    c.that(
+        "bbmodel: a model without textures imports (${plain.error()})",
+        plain.ok() && plain.textureCount() == 0
+    );
+    c.that(
+        "bbmodel: it has the untextured material only",
+        plain.materialCount() == 1 && plain.material(0).baseColorTexture == -1
+            && plain.mesh(0).material(0) == 0
+    );
+    c.that(
+        "bbmodel: and draws every face, textured or not",
+        plain.mesh(0).primitive(0).vertexCount() == 8
+    );
+    bbNear(
+        c,
+        "bbmodel: uvs are divided by the resolution",
+        plain.mesh(0).primitive(0).uv(1).x,
+        0.5
+    );
+    // A texture's own uv size wins over the model resolution.
+    let sized : ModelAsset = bbImport("{'resolution':{'width':16,'height':16},'elements':[{'type':'cube','uuid':'u1','from':[0,0,0],'to':[16,8,4],'faces':{'north':{'uv':[0,0,16,8],'texture':0}}}],'textures':[{'name':'t','uv_width':32,'uv_height':32,'source':'"
+        + bbPngUri()
+        + "'}]}");
+    bbNear(c, "bbmodel: a texture's uv_width", sized.mesh(0).primitive(0).uv(1).x, 0.5);
+    bbNear(c, "bbmodel: a texture's uv_height", sized.mesh(0).primitive(0).uv(2).y, 0.25);
+    // Two textures give two primitives.
+    let two : ModelAsset = bbImport("{'resolution':{'width':16,'height':16},'elements':[{'type':'cube','uuid':'a','from':[0,0,0],'to':[1,1,1],'faces':{'north':{'uv':[0,0,1,1],'texture':0}}},{'type':'cube','uuid':'b','from':[2,0,0],'to':[3,1,1],'faces':{'north':{'uv':[0,0,1,1],'texture':1}}}],'outliner':['a','b'],'textures':[{'name':'one','source':'"
+        + bbPngUri()
+        + "'},{'name':'two','source':'"
+        + bbPngUri()
+        + "'}]}");
+    c.that(
+        "bbmodel: two textures give two primitives (${two.error()})",
+        two.ok() && two.mesh(0).primitiveCount() == 2 && two.mesh(0).material(0) == 0
+            && two.mesh(0).material(1) == 1
+            && two.textureCount() == 2
+            && two.materialCount() == 3
+    );
+    // A texture file beside the model, read through the Vfs.
+    let vfs : Vfs = new Vfs();
+    vfs.addMemory("");
+    let img : Image = new Image(2, 2);
+    img.fill(Image::pack(1, 2, 3, 255));
+    let codec : PngCodec = new PngCodec();
+    try {
+        vfs.write("models/side.png", codec.encode(img));
+    } catch e : IOException {
+        c.that("bbmodel: setup writes", false);
+    }
+    let doc : string = "{'resolution':{'width':16,'height':16},'elements':[{'type':'cube','uuid':'u1','from':[0,0,0],'to':[1,1,1],'faces':{'north':{'uv':[0,0,1,1],'texture':0}}}],'textures':[{'name':'side.png'}]}";
+    let beside : ModelAsset = BbModelImporter::fromBytes(
+        DataText::toBytes(bbJson(doc)),
+        vfs,
+        "models"
+    );
+    c.that(
+        "bbmodel: a texture is found beside the model",
+        beside.ok() && beside.texture(0).width() == 2
+            && beside.externalFiles() == "models/side.png\n"
+    );
+    let lost : ModelAsset = BbModelImporter::fromBytes(
+        DataText::toBytes(bbJson(doc)),
+        new Vfs(),
+        "models"
+    );
+    c.that(
+        "bbmodel: a texture that cannot be found is a warning, with an empty picture",
+        lost.ok() && lost.texture(0).isEmpty() && lost.warnings().byteLength > 0
+    );
+    // Through load().
+    try {
+        vfs.writeText("models/m.bbmodel", bbJson(doc));
+    } catch e : IOException {
+        c.that("bbmodel: setup writes", false);
+    }
+    c.that("bbmodel: load reads the file", BbModelImporter::load(vfs, "models/m.bbmodel").ok());
+    c.that(
+        "bbmodel: load of a missing file fails",
+        !BbModelImporter::load(vfs, "models/none.bbmodel").ok()
+    );
+}
+
+fn bbDamage(c : Checks) : void {
+    bbFails(c, "text that is not JSON", "{this is not json");
+    bbFails(c, "the empty file", "");
+    bbFails(c, "a root that is an array", "[1]");
+    bbFails(c, "a model with no elements", "{'elements':[]}");
+    bbFails(c, "a model with no elements member", "{'name':'x'}");
+    bbFails(
+        c,
+        "a cube with two numbers in from",
+        bbDoc("{'type':'cube','uuid':'u1','from':[0,0],'to':[1,1,1],'faces':{}}", "['u1']")
+    );
+    bbFails(
+        c,
+        "a cube with a text in to",
+        bbDoc("{'type':'cube','uuid':'u1','from':[0,0,0],'to':[1,'a',1],'faces':{}}", "['u1']")
+    );
+    bbFails(
+        c,
+        "a cube without to",
+        bbDoc(
+            "{'type':'cube','uuid':'u1','from':[0,0,0],'faces':{'north':{'uv':[0,0,1,1],'texture':0}}}",
+            "['u1']"
+        )
+    );
+    bbFails(c, "an origin that is not three numbers", bbDoc(bbCube(",'origin':[1]"), "['u1']"));
+    bbFails(
+        c,
+        "an outliner entry for an element that does not exist",
+        bbDoc(bbCube(""), "['nope']")
+    );
+    bbFails(c, "an outliner entry that is a number", bbDoc(bbCube(""), "[5]"));
+    bbFails(
+        c,
+        "a face uv with three numbers",
+        bbDoc(
+            "{'type':'cube','uuid':'u1','from':[0,0,0],'to':[1,1,1],'faces':{'north':{'uv':[0,0,1],'texture':0}}}",
+            "['u1']"
+        )
+    );
+    bbFails(
+        c,
+        "a face uv with text",
+        bbDoc(
+            "{'type':'cube','uuid':'u1','from':[0,0,0],'to':[1,1,1],'faces':{'north':{'uv':[0,0,1,'x'],'texture':0}}}",
+            "['u1']"
+        )
+    );
+    bbFails(
+        c,
+        "a face naming a texture that does not exist",
+        bbDoc(
+            "{'type':'cube','uuid':'u1','from':[0,0,0],'to':[1,1,1],'faces':{'north':{'uv':[0,0,1,1],'texture':4}}}",
+            "['u1']"
+        )
+    );
+    bbFails(
+        c,
+        "a model whose cubes have no drawable face",
+        bbDoc("{'type':'cube','uuid':'u1','from':[0,0,0],'to':[1,1,1],'faces':{}}", "['u1']")
+    );
+    bbFails(c, "only locators", "{'elements':[{'type':'locator','uuid':'u1'}],'outliner':['u1']}");
+    bbFails(
+        c,
+        "a resolution of zero",
+        "{'resolution':{'width':0,'height':16},'elements':[{'type':'cube','uuid':'u1','from':[0,0,0],'to':[1,1,1],'faces':{'north':{'uv':[0,0,1,1]}}}]}"
+    );
+    bbFails(
+        c,
+        "a texture with invalid base64",
+        "{'elements':[{'type':'cube','uuid':'u1','from':[0,0,0],'to':[1,1,1],'faces':{'north':{'uv':[0,0,1,1],'texture':0}}}],'textures':[{'source':'data:image/png;base64,@@@@'}]}"
+    );
+    bbFails(
+        c,
+        "a texture that is not a data URI",
+        "{'elements':[{'type':'cube','uuid':'u1','from':[0,0,0],'to':[1,1,1],'faces':{'north':{'uv':[0,0,1,1],'texture':0}}}],'textures':[{'source':'http://example.com/a.png'}]}"
+    );
+    bbFails(
+        c,
+        "a texture that is valid base64 but not a PNG",
+        "{'elements':[{'type':'cube','uuid':'u1','from':[0,0,0],'to':[1,1,1],'faces':{'north':{'uv':[0,0,1,1],'texture':0}}}],'textures':[{'source':'data:image/png;base64,SGVsbG8gd29ybGQ='}]}"
+    );
+    // A PNG cut short.
+    let img : Image = new Image(4, 4);
+    img.fill(Image::pack(9, 9, 9, 255));
+    let codec : PngCodec = new PngCodec();
+    let png : ByteBuf = codec.encode(img);
+    let cut : ByteBuf = new ByteBuf(16);
+    cut.pushRange(png, 0, png.len() - 20);
+    bbFails(
+        c,
+        "a PNG that is cut short",
+        "{'elements':[{'type':'cube','uuid':'u1','from':[0,0,0],'to':[1,1,1],'faces':{'north':{'uv':[0,0,1,1],'texture':0}}}],'textures':[{'source':'data:image/png;base64,"
+            + Base64::encode(cut)
+            + "'}]}"
+    );
+    // Cutting a good file at every length never aborts and never succeeds with fewer bytes than the whole.
+    let whole : ByteBuf = DataText::toBytes(bbJson(bbDoc(bbCube(""), "['u1']")));
+    let vfs : Vfs = new Vfs();
+    let mut refused : bool = true;
+    let mut len : i32 = 0;
+    while (len < whole.len()) {
+        let part : ByteBuf = new ByteBuf(16);
+        part.pushRange(whole, 0, len);
+        if (BbModelImporter::fromBytes(part, vfs, "").ok()) {
+            refused = false;
+        }
+        len = len + 97;
+    }
+    c.that("bbmodel: a file cut at many lengths is refused", refused);
+}

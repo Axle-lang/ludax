@@ -1,0 +1,706 @@
+// kinetic_shapes — checks for shapes, the body store, the broad phase and the narrow phase of kinetic.
+//
+// Mass properties are compared with closed forms and, for the capsule, with an independent numerical
+// integration over a voxel grid. Contacts are checked for normal, depth and point on configurations whose
+// answer is known by hand (aligned stacks, a crossed pair of edges, a capsule lying on a plane).
+
+use ludax::BodyDesc;
+use ludax::BodyKind;
+use ludax::BodyStore;
+use ludax::BroadPhase;
+use ludax::Checks;
+use ludax::ContactBuffer;
+use ludax::DQuat;
+use ludax::DVec3;
+use ludax::DAabb;
+use ludax::EntityId;
+use ludax::Narrow;
+use ludax::Shape;
+use ludax::dynamicBody;
+use ludax::staticBody;
+
+/** The shape, body store, broad phase and narrow phase checks. */
+pub class KineticShapesSuite {
+    /** Runs every check of the suite. */
+    pub static fn run(c : Checks) : void {
+        kinShapeMass(c);
+        kinShapeBounds(c);
+        kinStoreChecks(c);
+        kinBroadChecks(c);
+        kinNarrowSpheres(c);
+        kinNarrowBoxes(c);
+        kinNarrowBoxEdges(c);
+        kinNarrowCapsules(c);
+        kinNarrowPlanes(c);
+    }
+}
+
+fn kinNear(a : DVec3, b : DVec3, tol : f64) : bool {
+    return a.approxEq(b, tol);
+}
+
+// Numerically integrates (y^2 + z^2) and (x^2 + y^2) over the capsule of radius r and half length hy.
+fn kinCapsuleInertiaByVoxels(r : f64, hy : f64, mass : f64) : DVec3 {
+    let step : f64 = 0.04;
+    let mut count : f64 = 0.0;
+    let mut sx : f64 = 0.0;
+    let mut sy : f64 = 0.0;
+    let nx : i32 = ((r + hy + 0.1) / step) as i32;
+    for (ix of (0 - nx)..(nx + 1)) {
+        for (iy of (0 - nx)..(nx + 1)) {
+            for (iz of (0 - nx)..(nx + 1)) {
+                let x : f64 = (ix as f64) * step;
+                let y : f64 = (iy as f64) * step;
+                let z : f64 = (iz as f64) * step;
+                let mut cy : f64 = y;
+                if (cy > hy) {
+                    cy = hy;
+                }
+                if (cy < -hy) {
+                    cy = -hy;
+                }
+                let dy : f64 = y - cy;
+                if (x * x + dy * dy + z * z <= r * r) {
+                    count = count + 1.0;
+                    sx = sx + y * y + z * z;
+                    sy = sy + x * x + z * z;
+                }
+            }
+        }
+    }
+    let m : f64 = mass / count;
+    return DVec3 { x: m * sx, y: m * sy, z: m * sx };
+}
+
+fn kinShapeMass(c : Checks) : void {
+    let sph : Shape = Shape::sphere(0.5);
+    c.near("shape: sphere volume", sph.volume(), 4.0 / 3.0 * 3.14159265358979 * 0.125, 0.000000001);
+    c.near("shape: sphere inertia is 2/5 m r^2", sph.inertia(3.0).x, 0.4 * 3.0 * 0.25, 0.000000001);
+    c.that(
+        "shape: sphere inertia is isotropic",
+        kinNear(sph.inertia(3.0), DVec3::splat(0.3), 0.000000001)
+    );
+
+    let bx : Shape = Shape::cuboid(1.0, 2.0, 3.0);
+    c.near("shape: box volume", bx.volume(), 48.0, 0.000000001);
+    let ib : DVec3 = bx.inertia(12.0);
+    c.near("shape: box Ixx = m/12 (h^2 + d^2)", ib.x, 12.0 / 12.0 * (16.0 + 36.0), 0.000000001);
+    c.near("shape: box Iyy", ib.y, 4.0 + 36.0, 0.000000001);
+    c.near("shape: box Izz", ib.z, 4.0 + 16.0, 0.000000001);
+
+    let cap : Shape = Shape::capsule(0.5, 1.0);
+    let ic : DVec3 = cap.inertia(2.0);
+    let by : DVec3 = kinCapsuleInertiaByVoxels(0.5, 1.0, 2.0);
+    c.near("shape: capsule Iyy matches numerical integration", ic.y, by.y, 0.02 * by.y);
+    c.near("shape: capsule Ixx matches numerical integration", ic.x, by.x, 0.02 * by.x);
+    c.near("shape: capsule Izz equals Ixx", ic.z, ic.x, 0.000000001);
+    let degenerate : Shape = Shape::capsule(0.5, 0.0);
+    c.near(
+        "shape: a capsule with no straight part is a sphere",
+        degenerate.inertia(3.0).y,
+        sph.inertia(3.0).y,
+        0.000000001
+    );
+    c.near("shape: a plane has no volume", Shape::plane(DVec3::unitY(), 0.0).volume(), 0.0, 0.0);
+    c.near(
+        "shape: plane normal is normalised",
+        Shape::plane(DVec3::make(0.0, 4.0, 0.0), 8.0).offset,
+        2.0,
+        0.000000001
+    );
+}
+
+fn kinShapeBounds(c : Checks) : void {
+    let b : Shape = Shape::cuboid(1.0, 2.0, 3.0);
+    let turned : DQuat = DQuat::fromAxisAngle(DVec3::unitZ(), 1.5707963267948966);
+    let box : DAabb = b.aabb(DVec3::make(10.0, 0.0, 0.0), turned);
+    c.that(
+        "bounds: a box turned a quarter about z swaps its x and y reach",
+        kinNear(box.halfSize(), DVec3::make(2.0, 1.0, 3.0), 0.000000001)
+    );
+    c.that(
+        "bounds: the box is centred on the body",
+        kinNear(box.center(), DVec3::make(10.0, 0.0, 0.0), 0.000000001)
+    );
+
+    let eighth : DQuat = DQuat::fromAxisAngle(DVec3::unitY(), 0.7853981633974483);
+    let diag : DAabb = Shape::cuboid(1.0, 1.0, 1.0).aabb(DVec3::zero(), eighth);
+    c.near(
+        "bounds: a cube turned 45 degrees reaches sqrt 2",
+        diag.max.x,
+        1.4142135623730951,
+        0.000000001
+    );
+
+    let cap : DAabb = Shape::capsule(0.5, 1.0).aabb(DVec3::make(0.0, 3.0, 0.0), DQuat::identity());
+    c.that(
+        "bounds: an upright capsule",
+        kinNear(cap.min, DVec3::make(-0.5, 1.5, -0.5), 0.000000001)
+            && kinNear(cap.max, DVec3::make(0.5, 4.5, 0.5), 0.000000001)
+    );
+    let lying : DAabb = Shape::capsule(0.5, 1.0).aabb(
+        DVec3::zero(),
+        DQuat::fromAxisAngle(DVec3::unitZ(), 1.5707963267948966)
+    );
+    c.that(
+        "bounds: a capsule on its side",
+        kinNear(lying.halfSize(), DVec3::make(1.5, 0.5, 0.5), 0.000000001)
+    );
+    c.near(
+        "bounds: sphere",
+        Shape::sphere(2.0).aabb(DVec3::make(1.0, 1.0, 1.0), DQuat::identity()).max.z,
+        3.0,
+        0.000000001
+    );
+}
+
+fn kinStoreChecks(c : Checks) : void {
+    let s : BodyStore = new BodyStore();
+    let a : EntityId = s.add(dynamicBody(Shape::sphere(0.5), DVec3::make(1.0, 2.0, 3.0), 2.0));
+    let b : EntityId = s.add(staticBody(Shape::cuboid(1.0, 1.0, 1.0), DVec3::zero()));
+    c.sameInt("store: two live bodies", s.liveCount(), 2);
+    c.near("store: dynamic inverse mass", s.inverseMass(s.slotOf(a)), 0.5, 0.0);
+    c.near("store: static inverse mass is zero", s.inverseMass(s.slotOf(b)), 0.0, 0.0);
+    c.that(
+        "store: static inverse inertia is zero",
+        kinNear(s.inverseInertia(s.slotOf(b)), DVec3::zero(), 0.0)
+    );
+    c.near(
+        "store: sphere inverse inertia",
+        s.inverseInertia(s.slotOf(a)).x,
+        1.0 / (0.4 * 2.0 * 0.25),
+        0.000000001
+    );
+    c.that(
+        "store: world point of a local point",
+        kinNear(
+            s.worldPoint(s.slotOf(a), DVec3::make(1.0, 0.0, 0.0)),
+            DVec3::make(2.0, 2.0, 3.0),
+            0.000000001
+        )
+    );
+
+    c.that("store: remove succeeds", s.remove(a));
+    c.that("store: a removed handle is stale", s.slotOf(a) < 0);
+    c.that("store: a second remove is refused", !s.remove(a));
+    let d : EntityId = s.add(dynamicBody(Shape::sphere(1.0), DVec3::zero(), 1.0));
+    c.sameInt("store: the freed slot is reused", d.index, a.index);
+    c.that(
+        "store: the generation changes so the old handle stays stale",
+        d.generation != a.generation && s.slotOf(a) < 0 && s.slotOf(d) >= 0
+    );
+    c.near("store: a reused slot carries the new mass", s.massOf(s.slotOf(d)), 1.0, 0.0);
+    c.sameInt("store: body kinds", s.kindOf(s.slotOf(b)), BodyKind::Static.code());
+
+    let mut kd : BodyDesc = dynamicBody(Shape::sphere(0.5), DVec3::zero(), 5.0);
+    kd.userData = 4242;
+    let k : EntityId = s.add(kd);
+    c.sameInt("store: user data is kept", s.userOf(s.slotOf(k)), 4242);
+    let v : DVec3 = s.velocityAt(s.slotOf(k), DVec3::make(1.0, 0.0, 0.0));
+    c.that("store: a body at rest has no point velocity", kinNear(v, DVec3::zero(), 0.0));
+}
+
+fn kinBroadChecks(c : Checks) : void {
+    let s : BodyStore = new BodyStore();
+    // A row of unit spheres at spacing 0.9 (neighbours overlap) and one far away; inserted out of order.
+    let mut order : f64[] = malloc<f64>(6);
+    order[0] = 4.5;
+    order[1] = 0.0;
+    order[2] = 2.7;
+    order[3] = 0.9;
+    order[4] = 100.0;
+    order[5] = 1.8;
+    for (i of 0..6) {
+        s.add(dynamicBody(Shape::sphere(0.5), DVec3::make(order[i as i64], 0.0, 0.0), 1.0));
+    }
+    let bp : BroadPhase = new BroadPhase();
+    let none : i64[] = malloc<i64>(1);
+    bp.update(s, none, 0);
+    // Neighbours in x: 0.0-0.9, 0.9-1.8, 1.8-2.7, 2.7-4.5? (1.8 apart: boxes of width 1 do not touch). Pairs by slot:
+    // slots: 0:4.5 1:0.0 2:2.7 3:0.9 4:100 5:1.8 -> overlapping: (1,3) (3,5) (5,2).
+    c.sameInt("broad: three overlapping pairs", bp.pairCount(), 3);
+    let mut sorted : bool = true;
+    for (k of 1..bp.pairCount()) {
+        let prev : i64 = ((bp.firstOf(k - 1) as i64) << 32) | (bp.secondOf(k - 1) as i64);
+        let cur : i64 = ((bp.firstOf(k) as i64) << 32) | (bp.secondOf(k) as i64);
+        if (cur <= prev) {
+            sorted = false;
+        }
+    }
+    c.that("broad: pairs are ordered by (lower slot, higher slot)", sorted);
+    c.that(
+        "broad: every pair lists the lower slot first",
+        bp.firstOf(0) < bp.secondOf(0) && bp.firstOf(1) < bp.secondOf(1)
+            && bp.firstOf(2) < bp.secondOf(2)
+    );
+    c.sameInt("broad: first pair", (bp.firstOf(0) * 10 + bp.secondOf(0)) as i64, 13);
+    c.sameInt("broad: second pair", (bp.firstOf(1) * 10 + bp.secondOf(1)) as i64, 25);
+    c.sameInt("broad: third pair", (bp.firstOf(2) * 10 + bp.secondOf(2)) as i64, 35);
+
+    // The same scene in another insertion order gives the same pairs by position.
+    let s2 : BodyStore = new BodyStore();
+    for (i of 0..6) {
+        s2.add(dynamicBody(Shape::sphere(0.5), DVec3::make(order[(5 - i) as i64], 0.0, 0.0), 1.0));
+    }
+    let bp2 : BroadPhase = new BroadPhase();
+    bp2.update(s2, none, 0);
+    c.sameInt("broad: insertion order does not change the number of pairs", bp2.pairCount(), 3);
+
+    // Rules: two static bodies never pair; a plane pairs with whatever dips below it; a joint can forbid a pair.
+    let s3 : BodyStore = new BodyStore();
+    s3.add(staticBody(Shape::cuboid(1.0, 1.0, 1.0), DVec3::zero()));
+    s3.add(staticBody(Shape::cuboid(1.0, 1.0, 1.0), DVec3::make(0.5, 0.0, 0.0)));
+    s3.add(staticBody(Shape::plane(DVec3::unitY(), -5.0), DVec3::zero()));
+    s3.add(dynamicBody(Shape::sphere(0.5), DVec3::make(0.0, 0.6, 0.0), 1.0));
+    s3.add(dynamicBody(Shape::sphere(0.5), DVec3::make(0.0, -4.8, 0.0), 1.0));
+    let bp3 : BroadPhase = new BroadPhase();
+    bp3.update(s3, none, 0);
+    // dynamic 3 overlaps both boxes (0,3) (1,3); dynamic 4 touches the plane at y=-5 (2,4); 3 and 4 do not touch.
+    c.sameInt("broad: static pairs are skipped, plane and dynamic bodies pair", bp3.pairCount(), 3);
+    let mut forbid : i64[] = malloc<i64>(2);
+    forbid[0] = (0 << 32) | 3;
+    bp3.update(s3, forbid, 1);
+    c.sameInt("broad: a forbidden pair is left out", bp3.pairCount(), 2);
+
+    let mut deaf : BodyDesc = dynamicBody(Shape::sphere(0.5), DVec3::make(0.0, 0.0, 0.0), 1.0);
+    deaf.group = 2;
+    deaf.mask = 4;
+    let s4 : BodyStore = new BodyStore();
+    s4.add(dynamicBody(Shape::sphere(0.5), DVec3::zero(), 1.0));
+    s4.add(deaf);
+    bp3.update(s4, none, 0);
+    c.sameInt("broad: collision masks keep unrelated groups apart", bp3.pairCount(), 0);
+}
+
+fn kinCollide(
+    a : Shape,
+    pa : DVec3,
+    qa : DQuat,
+    b : Shape,
+    pb : DVec3,
+    qb : DQuat,
+    out : ContactBuffer
+) : bool {
+    return Narrow::collide(a, pa, qa, b, pb, qb, out);
+}
+
+fn kinNarrowSpheres(c : Checks) : void {
+    let out : ContactBuffer = new ContactBuffer();
+    let q : DQuat = DQuat::identity();
+    let s : Shape = Shape::sphere(1.0);
+    let hit : bool = kinCollide(s, DVec3::zero(), q, s, DVec3::make(1.5, 0.0, 0.0), q, out);
+    c.that("sphere-sphere: overlap is found", hit && out.count() == 1);
+    c.that(
+        "sphere-sphere: the normal points from the first to the second",
+        kinNear(out.normal(), DVec3::unitX(), 0.000000001)
+    );
+    c.near("sphere-sphere: depth is the overlap", out.depthAt(0), 0.5, 0.000000001);
+    c.near(
+        "sphere-sphere: the point is in the middle of the overlap",
+        out.pointAt(0).x,
+        0.75,
+        0.000000001
+    );
+    c.that(
+        "sphere-sphere: apart",
+        !kinCollide(s, DVec3::zero(), q, s, DVec3::make(2.5, 0.0, 0.0), q, out)
+    );
+    c.that("sphere-sphere: a failed test leaves no points", out.count() == 0);
+    let flipped : bool = kinCollide(s, DVec3::make(1.5, 0.0, 0.0), q, s, DVec3::zero(), q, out);
+    c.that(
+        "sphere-sphere: swapping the arguments flips the normal",
+        flipped && kinNear(out.normal(), DVec3::make(-1.0, 0.0, 0.0), 0.000000001)
+    );
+
+    let bx : Shape = Shape::cuboid(1.0, 1.0, 1.0);
+    let face : bool = kinCollide(
+        Shape::sphere(0.5),
+        DVec3::make(0.0, 1.3, 0.0),
+        q,
+        bx,
+        DVec3::zero(),
+        q,
+        out
+    );
+    c.that(
+        "sphere-box: resting on a face",
+        face && kinNear(out.normal(), DVec3::make(0.0, -1.0, 0.0), 0.000000001)
+    );
+    c.near("sphere-box: face depth", out.depthAt(0), 0.2, 0.000000001);
+    c.near("sphere-box: face point", out.pointAt(0).y, 0.9, 0.000000001);
+    let corner : bool = kinCollide(
+        Shape::sphere(0.5),
+        DVec3::make(1.3, 1.3, 1.3),
+        q,
+        bx,
+        DVec3::zero(),
+        q,
+        out
+    );
+    c.that("sphere-box: beyond the corner but within the radius is no hit", !corner);
+    let near : bool = kinCollide(
+        Shape::sphere(0.8),
+        DVec3::make(1.3, 1.3, 1.3),
+        q,
+        bx,
+        DVec3::zero(),
+        q,
+        out
+    );
+    let diag : f64 = 0.3 * 1.7320508075688772;
+    c.that("sphere-box: corner hit", near && out.depthAt(0) > 0.0);
+    c.near("sphere-box: corner depth", out.depthAt(0), 0.8 - diag, 0.000000001);
+    c.near(
+        "sphere-box: corner normal is diagonal",
+        out.normal().x,
+        -0.5773502691896258,
+        0.000000001
+    );
+    let inside : bool = kinCollide(
+        Shape::sphere(0.2),
+        DVec3::make(0.0, 0.9, 0.0),
+        q,
+        bx,
+        DVec3::zero(),
+        q,
+        out
+    );
+    c.that(
+        "sphere-box: a centre inside leaves through the nearest face",
+        inside && kinNear(out.normal(), DVec3::make(0.0, -1.0, 0.0), 0.000000001)
+    );
+    c.near(
+        "sphere-box: inside depth is radius plus distance to the face",
+        out.depthAt(0),
+        0.3,
+        0.000000001
+    );
+    let turned : DQuat = DQuat::fromAxisAngle(DVec3::unitZ(), 0.7853981633974483);
+    let rot : bool = kinCollide(
+        Shape::sphere(0.5),
+        DVec3::make(0.0, 1.8, 0.0),
+        q,
+        bx,
+        DVec3::zero(),
+        turned,
+        out
+    );
+    c.that("sphere-box: a turned box presents its corner", rot && out.depthAt(0) > 0.0);
+    c.near(
+        "sphere-box: turned corner depth",
+        out.depthAt(0),
+        0.5 - (1.8 - 1.4142135623730951),
+        0.000000001
+    );
+}
+
+fn kinNarrowBoxes(c : Checks) : void {
+    let out : ContactBuffer = new ContactBuffer();
+    let q : DQuat = DQuat::identity();
+    let bx : Shape = Shape::cuboid(1.0, 1.0, 1.0);
+    let hit : bool = kinCollide(bx, DVec3::zero(), q, bx, DVec3::make(0.0, 1.8, 0.0), q, out);
+    c.that(
+        "box-box: stacked boxes overlap with a four-point face manifold",
+        hit && out.count() == 4
+    );
+    c.that("box-box: stack normal is up", kinNear(out.normal(), DVec3::unitY(), 0.000000001));
+    let mut allDeep : bool = true;
+    let mut xs : f64 = 0.0;
+    let mut zs : f64 = 0.0;
+    for (k of 0..4) {
+        if (out.depthAt(k) < 0.1999999 || out.depthAt(k) > 0.2000001) {
+            allDeep = false;
+        }
+        xs = xs + out.pointAt(k).x;
+        zs = zs + out.pointAt(k).z;
+        c.near("box-box: stack point height", out.pointAt(k).y, 0.9, 0.000000001);
+    }
+    c.that("box-box: every point has the penetration depth", allDeep);
+    c.near("box-box: points are centred (x)", xs, 0.0, 0.000000001);
+    c.near("box-box: points are centred (z)", zs, 0.0, 0.000000001);
+    let mut ids : i32 = 0;
+    for (k of 0..4) {
+        for (m of k + 1..4) {
+            if (out.idAt(k) == out.idAt(m)) {
+                ids = ids + 1;
+            }
+        }
+    }
+    c.sameInt("box-box: feature ids are distinct", ids, 0);
+    let again : bool = kinCollide(bx, DVec3::zero(), q, bx, DVec3::make(0.0, 1.8, 0.0), q, out);
+    let firstId : i32 = out.idAt(0);
+    kinCollide(bx, DVec3::zero(), q, bx, DVec3::make(0.0, 1.79, 0.0), q, out);
+    c.that("box-box: feature ids are stable from step to step", again && out.idAt(0) == firstId);
+
+    c.that(
+        "box-box: separated",
+        !kinCollide(bx, DVec3::zero(), q, bx, DVec3::make(0.0, 2.01, 0.0), q, out)
+    );
+    c.that(
+        "box-box: separated diagonally (edge axis)",
+        !kinCollide(
+            bx,
+            DVec3::zero(),
+            q,
+            bx,
+            DVec3::make(2.3, 2.3, 0.0),
+            DQuat::fromAxisAngle(DVec3::unitZ(), 0.7853981633974483),
+            out
+        )
+    );
+    let flip : bool = kinCollide(bx, DVec3::make(0.0, 1.8, 0.0), q, bx, DVec3::zero(), q, out);
+    c.that(
+        "box-box: reversed order flips the normal",
+        flip && kinNear(out.normal(), DVec3::make(0.0, -1.0, 0.0), 0.000000001)
+    );
+
+    // A small box on a larger one, offset: only the overlap is in the manifold.
+    let small : Shape = Shape::cuboid(0.25, 0.25, 0.25);
+    let off : bool = kinCollide(bx, DVec3::zero(), q, small, DVec3::make(0.9, 1.2, 0.0), q, out);
+    c.that(
+        "box-box: a small box on the edge of a big one has four points",
+        off && out.count() == 4
+    );
+    let mut inside : bool = true;
+    for (k of 0..out.count()) {
+        if (out.pointAt(k).x > 1.0000001 || out.pointAt(k).x < 0.6499999) {
+            inside = false;
+        }
+    }
+    c.that("box-box: the clipped points lie on the overlapping part", inside);
+}
+
+fn kinNarrowBoxEdges(c : Checks) : void {
+    let out : ContactBuffer = new ContactBuffer();
+    let q : DQuat = DQuat::identity();
+    let bx : Shape = Shape::cuboid(1.0, 1.0, 1.0);
+
+    // Crossed edges: a cube on its edge above a cube on its edge, the edges perpendicular.
+    let tiltA : DQuat = DQuat::fromAxisAngle(DVec3::unitZ(), 0.7853981633974483);
+    let tiltB : DQuat = DQuat::fromAxisAngle(DVec3::unitX(), 0.7853981633974483);
+    let half : Shape = Shape::cuboid(0.5, 0.5, 0.5);
+    let edge : bool = kinCollide(
+        half,
+        DVec3::make(0.0, 1.3, 0.0),
+        tiltA,
+        half,
+        DVec3::zero(),
+        tiltB,
+        out
+    );
+    c.that("box-box: crossed edges give one point", edge && out.count() == 1);
+    c.that(
+        "box-box: crossed edges, the normal is down",
+        kinNear(out.normal(), DVec3::make(0.0, -1.0, 0.0), 0.000001)
+    );
+    c.near(
+        "box-box: crossed edges depth",
+        out.depthAt(0),
+        0.7071067811865476 - (1.3 - 0.7071067811865476),
+        0.000001
+    );
+    c.that(
+        "box-box: crossed edges, the point is where they cross",
+        kinNear(out.pointAt(0), DVec3::make(0.0, 0.6500000000000001, 0.0), 0.000001)
+    );
+
+    // A rotated box resting on a flat one (yaw 30 degrees): four corner points in the lower face.
+    let yaw : DQuat = DQuat::fromAxisAngle(DVec3::unitY(), 0.5235987755982988);
+    let yawed : bool = kinCollide(
+        bx,
+        DVec3::zero(),
+        q,
+        half,
+        DVec3::make(0.2, 1.45, 0.1),
+        yaw,
+        out
+    );
+    c.that("box-box: a yawed box on a face has a four-point manifold", yawed && out.count() == 4);
+    c.that("box-box: yawed manifold normal is up", kinNear(out.normal(), DVec3::unitY(), 0.000001));
+    c.near("box-box: yawed manifold depth", out.depthAt(0), 0.05, 0.000001);
+}
+
+fn kinNarrowCapsules(c : Checks) : void {
+    let out : ContactBuffer = new ContactBuffer();
+    let q : DQuat = DQuat::identity();
+    let cap : Shape = Shape::capsule(0.5, 1.0);
+    let sph : Shape = Shape::sphere(0.5);
+    let hit : bool = kinCollide(cap, DVec3::zero(), q, sph, DVec3::make(0.8, 0.5, 0.0), q, out);
+    c.that("capsule-sphere: side hit", hit && kinNear(out.normal(), DVec3::unitX(), 0.000000001));
+    c.near("capsule-sphere: depth", out.depthAt(0), 0.2, 0.000000001);
+    let cap2 : bool = kinCollide(cap, DVec3::zero(), q, sph, DVec3::make(0.0, 1.8, 0.0), q, out);
+    c.that("capsule-sphere: cap hit", cap2 && kinNear(out.normal(), DVec3::unitY(), 0.000000001));
+    c.near("capsule-sphere: cap depth", out.depthAt(0), 0.2, 0.000000001);
+    let swapped : bool = kinCollide(sph, DVec3::make(0.0, 1.8, 0.0), q, cap, DVec3::zero(), q, out);
+    c.that(
+        "capsule-sphere: swapped order flips the normal",
+        swapped && kinNear(out.normal(), DVec3::make(0.0, -1.0, 0.0), 0.000000001)
+    );
+
+    let side : DQuat = DQuat::fromAxisAngle(DVec3::unitZ(), 1.5707963267948966);
+    let cross : bool = kinCollide(
+        cap,
+        DVec3::zero(),
+        q,
+        cap,
+        DVec3::make(0.0, 0.0, 0.9),
+        side,
+        out
+    );
+    c.that("capsule-capsule: crossing axes touch", cross && out.count() == 1);
+    c.that("capsule-capsule: crossing normal", kinNear(out.normal(), DVec3::unitZ(), 0.000000001));
+    c.near("capsule-capsule: crossing depth", out.depthAt(0), 0.1, 0.000000001);
+    let parallel : bool = kinCollide(
+        cap,
+        DVec3::zero(),
+        q,
+        cap,
+        DVec3::make(0.9, 0.5, 0.0),
+        q,
+        out
+    );
+    c.that(
+        "capsule-capsule: parallel capsules side by side make two points",
+        parallel && out.count() == 2
+    );
+    c.near("capsule-capsule: parallel depth", out.depthAt(0), 0.1, 0.000000001);
+    c.that(
+        "capsule-capsule: apart",
+        !kinCollide(cap, DVec3::zero(), q, cap, DVec3::make(1.1, 0.0, 0.0), q, out)
+    );
+
+    let bx : Shape = Shape::cuboid(1.0, 1.0, 1.0);
+    c.that(
+        "capsule-box: a capsule above a box is clear",
+        !kinCollide(cap, DVec3::make(0.0, 3.0, 0.0), side, bx, DVec3::zero(), q, out)
+    );
+    let low : bool = kinCollide(cap, DVec3::make(0.0, 1.45, 0.0), side, bx, DVec3::zero(), q, out);
+    c.that(
+        "capsule-box: lying low, penetrating, the normal points down into the box",
+        low && out.count() == 2 && kinNear(out.normal(), DVec3::make(0.0, -1.0, 0.0), 0.000001)
+    );
+    c.near("capsule-box: depth along the contact line", out.depthAt(0), 0.05, 0.000001);
+    let end : bool = kinCollide(cap, DVec3::make(1.2, 3.1, 0.0), q, bx, DVec3::zero(), q, out);
+    c.that("capsule-box: end cap above a corner region misses", !end);
+    let upright : bool = kinCollide(cap, DVec3::make(0.0, 2.45, 0.0), q, bx, DVec3::zero(), q, out);
+    c.that(
+        "capsule-box: standing on its end",
+        upright && kinNear(out.normal(), DVec3::make(0.0, -1.0, 0.0), 0.000001)
+    );
+    c.near("capsule-box: end depth", out.depthAt(0), 0.05, 0.000001);
+    let rev : bool = kinCollide(bx, DVec3::zero(), q, cap, DVec3::make(0.0, 2.45, 0.0), q, out);
+    c.that(
+        "capsule-box: box first flips the normal",
+        rev && kinNear(out.normal(), DVec3::unitY(), 0.000001)
+    );
+}
+
+fn kinNarrowPlanes(c : Checks) : void {
+    let out : ContactBuffer = new ContactBuffer();
+    let q : DQuat = DQuat::identity();
+    let ground : Shape = Shape::plane(DVec3::unitY(), 0.0);
+    let hit : bool = kinCollide(
+        Shape::sphere(0.5),
+        DVec3::make(3.0, 0.4, 0.0),
+        q,
+        ground,
+        DVec3::zero(),
+        q,
+        out
+    );
+    c.that(
+        "sphere-plane: touching",
+        hit && kinNear(out.normal(), DVec3::make(0.0, -1.0, 0.0), 0.000000001)
+    );
+    c.near("sphere-plane: depth", out.depthAt(0), 0.1, 0.000000001);
+    c.near("sphere-plane: point between the surfaces", out.pointAt(0).y, -0.05, 0.000000001);
+    c.that(
+        "sphere-plane: above",
+        !kinCollide(
+            Shape::sphere(0.5),
+            DVec3::make(0.0, 0.6, 0.0),
+            q,
+            ground,
+            DVec3::zero(),
+            q,
+            out
+        )
+    );
+    let rev : bool = kinCollide(
+        ground,
+        DVec3::zero(),
+        q,
+        Shape::sphere(0.5),
+        DVec3::make(0.0, 0.4, 0.0),
+        q,
+        out
+    );
+    c.that(
+        "sphere-plane: plane first gives the normal up",
+        rev && kinNear(out.normal(), DVec3::unitY(), 0.000000001)
+    );
+    let tilted : Shape = Shape::plane(DVec3::make(1.0, 1.0, 0.0), 0.0);
+    c.that(
+        "sphere-plane: a tilted plane",
+        kinCollide(Shape::sphere(0.5), DVec3::make(0.0, 0.3, 0.0), q, tilted, DVec3::zero(), q, out)
+    );
+    c.near(
+        "sphere-plane: tilted depth",
+        out.depthAt(0),
+        0.5 - 0.3 * 0.7071067811865476,
+        0.000000001
+    );
+
+    let boxHit : bool = kinCollide(
+        Shape::cuboid(1.0, 1.0, 1.0),
+        DVec3::make(0.0, 0.9, 0.0),
+        q,
+        ground,
+        DVec3::zero(),
+        q,
+        out
+    );
+    c.that("box-plane: a flat box has four contact points", boxHit && out.count() == 4);
+    c.near("box-plane: depth", out.depthAt(0), 0.1, 0.000000001);
+    let tip : bool = kinCollide(
+        Shape::cuboid(1.0, 1.0, 1.0),
+        DVec3::make(0.0, 1.3, 0.0),
+        DQuat::fromAxisAngle(DVec3::unitZ(), 0.7853981633974483),
+        ground,
+        DVec3::zero(),
+        q,
+        out
+    );
+    c.that(
+        "box-plane: a box on its edge touches along the edge (two points)",
+        tip && out.count() == 2
+    );
+    c.near("box-plane: edge depth", out.depthAt(0), 1.4142135623730951 - 1.3, 0.000000001);
+
+    let lying : DQuat = DQuat::fromAxisAngle(DVec3::unitZ(), 1.5707963267948966);
+    let capHit : bool = kinCollide(
+        Shape::capsule(0.5, 1.0),
+        DVec3::make(0.0, 0.45, 0.0),
+        lying,
+        ground,
+        DVec3::zero(),
+        q,
+        out
+    );
+    c.that("capsule-plane: a lying capsule has two points", capHit && out.count() == 2);
+    c.near("capsule-plane: depth", out.depthAt(0), 0.05, 0.000000001);
+    let stand : bool = kinCollide(
+        Shape::capsule(0.5, 1.0),
+        DVec3::make(0.0, 1.45, 0.0),
+        q,
+        ground,
+        DVec3::zero(),
+        q,
+        out
+    );
+    c.that("capsule-plane: a standing capsule has one point", stand && out.count() == 1);
+    c.that(
+        "plane-plane: never collide",
+        !kinCollide(ground, DVec3::zero(), q, ground, DVec3::zero(), q, out)
+    );
+}

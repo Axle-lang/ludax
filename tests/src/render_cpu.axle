@@ -1,0 +1,516 @@
+// render_cpu — checks for the CPU backend's rasteriser: coverage, the top-left rule, depth, culling, clipping,
+// textures, alpha and the counters. Pictures are made of emissive-only materials, so a pixel's HDR value is the
+// material's colour and the maths under test is the geometry, not the lighting.
+
+use ludax::{
+    Camera, Checks, DQuat, DVec3, Image, Mat4, MeshData, MeshDataShapes, PassCosts, Pcg32,
+    RenderAssets
+};
+use ludax::{
+    RenderMaterial, RenderScene, Texture, TextureWrap, Vec3, LightAlphaMode, abs, cosD, sinD, sqrtD
+};
+
+use crate::render_cpu_support::{
+    CpuRig, CPU_RIG_WINDOW, cpuAdd, cpuAddAt, cpuGlow, cpuLookCamera, cpuOrtho, cpuQuad, cpuTriangle
+};
+
+/** The rasteriser checks. */
+pub class RenderCpuSuite {
+    /** Runs every check of the suite. */
+    pub static fn run(c : Checks) : void {
+        rcpuSharedEdge(c);
+        rcpuFan(c);
+        rcpuArea(c);
+        rcpuDepth(c);
+        rcpuCulling(c);
+        rcpuClipping(c);
+        rcpuTexture(c);
+        rcpuAlpha(c);
+        rcpuCounters(c);
+    }
+}
+
+fn rcpuRed() : Vec3 {
+    return Vec3::make(1.0, 0.0, 0.0);
+}
+
+fn rcpuNear(a : Vec3, b : Vec3, tol : f32) : bool {
+    return abs(a.x - b.x) <= tol && abs(a.y - b.y) <= tol && abs(a.z - b.z) <= tol;
+}
+
+// A rectangle of two triangles with integer corners: every pixel inside is covered by exactly one of them.
+fn rcpuSharedEdge(c : Checks) : void {
+    let assets : Shared<RenderAssets> = new shared RenderAssets();
+    let quad : i32 = assets.addMesh(cpuQuad(64, 64, 10.0, 10.0, 50.0, 40.0, 0.0));
+    let mat : i32 = assets.addMaterial(cpuGlow(rcpuRed()));
+    let scene : RenderScene = new RenderScene(cpuOrtho(64, 64));
+    cpuAdd(scene, quad, mat, 0);
+    let rig : CpuRig = new CpuRig(assets, scene, 64, 64, 0, Vec3::zero(), false, true);
+    let mut exact : bool = true;
+    let mut inside : i32 = 0;
+    let mut doubled : i32 = 0;
+    let mut missed : i32 = 0;
+    for (y of 0..64) {
+        for (x of 0..64) {
+            let mut want : i32 = 0;
+            if (x >= 10 && x < 50 && y >= 10 && y < 40) {
+                want = 1;
+            }
+            let got : i32 = rig.renderer.coverAt(x, y);
+            if (got != want) {
+                exact = false;
+            }
+            if (want == 1) {
+                inside = inside + 1;
+                if (got > 1) {
+                    doubled = doubled + 1;
+                }
+                if (got == 0) {
+                    missed = missed + 1;
+                }
+            }
+        }
+    }
+    c.that(
+        "raster: a 40 x 30 rectangle of two triangles covers every pixel once and none outside",
+        exact
+    );
+    c.sameInt("raster: and that is 1200 pixels", inside, 1200);
+    c.sameInt("raster: none covered twice along the diagonal", doubled, 0);
+    c.sameInt("raster: none missed along the diagonal", missed, 0);
+    c.that(
+        "raster: the covered pixels show the material",
+        rcpuNear(rig.hdr(20, 20), rcpuRed(), 0.0) && rcpuNear(rig.hdr(5, 5), Vec3::zero(), 0.0)
+    );
+    rig.close();
+}
+
+// A fan of triangles around an arbitrary point: no pixel covered twice, and the covered set is the polygon.
+fn rcpuFan(c : Checks) : void {
+    let assets : Shared<RenderAssets> = new shared RenderAssets();
+    let mat : i32 = assets.addMaterial(cpuGlow(rcpuRed()));
+    let scene : RenderScene = new RenderScene(cpuOrtho(64, 64));
+    let cx : f32 = 32.3;
+    let cy : f32 = 31.7;
+    let sides : i32 = 13;
+    let mut px : f64[] = malloc<f64>((sides + 1) as i64);
+    let mut py : f64[] = malloc<f64>((sides + 1) as i64);
+    let mut rng : Pcg32 = new Pcg32(5, 9);
+    for (i of 0..sides) {
+        let angle : f64 = 6.283185307179586 * (i as f64) / (sides as f64);
+        let r : f64 = 20.0 + (rng.nextF64() * 4.0);
+        px[i] = (cx as f64) + r * cosD(angle);
+        py[i] = (cy as f64) + r * sinD(angle);
+    }
+    for (i of 0..sides) {
+        let j : i32 = (i + 1) % sides;
+        let mesh : i32 = assets.addMesh(cpuTriangle(
+            64,
+            64,
+            cx,
+            cy,
+            px[i] as f32,
+            py[i] as f32,
+            px[j] as f32,
+            py[j] as f32
+        ));
+        cpuAdd(scene, mesh, mat, i);
+    }
+    let rig : CpuRig = new CpuRig(assets, scene, 64, 64, 0, Vec3::zero(), false, true);
+    let mut doubled : i32 = 0;
+    let mut covered : i32 = 0;
+    let mut holes : i32 = 0;
+    for (y of 0..64) {
+        for (x of 0..64) {
+            let n : i32 = rig.renderer.coverAt(x, y);
+            if (n > 1) {
+                doubled = doubled + 1;
+            }
+            if (n > 0) {
+                covered = covered + 1;
+            }
+            // Independent test: the star polygon is the union of the fan triangles; a pixel centre well inside
+            // one of them (by more than the 1/256 pixel snap) must be covered.
+            if (n == 0
+                && rcpuWellInside(
+                    px,
+                    py,
+                    sides,
+                    cx as f64,
+                    cy as f64,
+                    (x as f64) + 0.5,
+                    (y as f64) + 0.5
+                )) {
+                holes = holes + 1;
+            }
+        }
+    }
+    c.sameInt(
+        "raster: a 13-triangle fan at fractional coordinates covers no pixel twice",
+        doubled,
+        0
+    );
+    c.sameInt("raster: and leaves no hole inside any of its triangles", holes, 0);
+    c.that("raster: it covers well over a thousand pixels", covered > 1000);
+    rig.close();
+}
+
+// Whether (qx, qy) lies inside some fan triangle (centre, p[i], p[i+1]) by a margin of 0.02 pixel.
+fn rcpuWellInside(px : f64[], py : f64[], n : i32, cx : f64, cy : f64, qx : f64, qy : f64) : bool {
+    for (i of 0..n) {
+        let j : i32 = (i + 1) % n;
+        let e0 : f64 = rcpuEdge(cx, cy, px[i], py[i], qx, qy);
+        let e1 : f64 = rcpuEdge(px[i], py[i], px[j], py[j], qx, qy);
+        let e2 : f64 = rcpuEdge(px[j], py[j], cx, cy, qx, qy);
+        let l0 : f64 = rcpuLen(cx, cy, px[i], py[i]);
+        let l1 : f64 = rcpuLen(px[i], py[i], px[j], py[j]);
+        let l2 : f64 = rcpuLen(px[j], py[j], cx, cy);
+        let a : bool = e0 / l0 > 0.02 && e1 / l1 > 0.02 && e2 / l2 > 0.02;
+        let b : bool = e0 / l0 < -0.02 && e1 / l1 < -0.02 && e2 / l2 < -0.02;
+        if (a || b) {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn rcpuEdge(ax : f64, ay : f64, bx : f64, by : f64, qx : f64, qy : f64) : f64 {
+    return (bx - ax) * (qy - ay) - (by - ay) * (qx - ax);
+}
+
+fn rcpuLen(ax : f64, ay : f64, bx : f64, by : f64) : f64 {
+    return sqrtD((bx - ax) * (bx - ax) + (by - ay) * (by - ay));
+}
+
+// Covered pixels against the analytic area of a big triangle.
+fn rcpuArea(c : Checks) : void {
+    let assets : Shared<RenderAssets> = new shared RenderAssets();
+    let mat : i32 = assets.addMaterial(cpuGlow(rcpuRed()));
+    let scene : RenderScene = new RenderScene(cpuOrtho(128, 128));
+    let tri : i32 = assets.addMesh(cpuTriangle(128, 128, 10.3, 14.1, 117.9, 30.4, 40.2, 113.7));
+    cpuAdd(scene, tri, mat, 0);
+    let rig : CpuRig = new CpuRig(assets, scene, 128, 128, 0, Vec3::zero(), false, false);
+    let mut count : i32 = 0;
+    for (y of 0..128) {
+        for (x of 0..128) {
+            if (rig.covered(x, y)) {
+                count = count + 1;
+            }
+        }
+    }
+    let area : f64 = 0.5 * abs64(rcpuEdge(10.3, 14.1, 117.9, 30.4, 40.2, 113.7));
+    let err : f64 = abs64((count as f64) - area) / area;
+    println("  measured triangle coverage: " + count.toString() + " pixels vs analytic area "
+        + area.toString()
+        + " ("
+        + (err * 100.0).toString()
+        + " %)");
+    c.that(
+        "raster: a 5000-pixel triangle covers its analytic area within 0.5 percent",
+        err < 0.005
+    );
+    rig.close();
+}
+
+fn abs64(v : f64) : f64 {
+    if (v < 0.0) {
+        return 0.0 - v;
+    }
+    return v;
+}
+
+// The nearer of two overlapping quads wins whatever the order they are drawn in.
+fn rcpuDepth(c : Checks) : void {
+    let green : Vec3 = Vec3::make(0.0, 1.0, 0.0);
+    let mut results : i32[] = malloc<i32>(2);
+    for (order of 0..2) {
+        let assets : Shared<RenderAssets> = new shared RenderAssets();
+        let nearQuad : i32 = assets.addMesh(cpuQuad(64, 64, 30.0, 10.0, 60.0, 50.0, 2.0));
+        let farQuad : i32 = assets.addMesh(cpuQuad(64, 64, 10.0, 20.0, 40.0, 60.0, -2.0));
+        let m0 : i32 = assets.addMaterial(cpuGlow(rcpuRed()));
+        let m1 : i32 = assets.addMaterial(cpuGlow(green));
+        let scene : RenderScene = new RenderScene(cpuOrtho(64, 64));
+        if (order == 0) {
+            cpuAdd(scene, nearQuad, m0, 0);
+            cpuAdd(scene, farQuad, m1, 1);
+        } else {
+            cpuAdd(scene, farQuad, m1, 1);
+            cpuAdd(scene, nearQuad, m0, 0);
+        }
+        let rig : CpuRig = new CpuRig(assets, scene, 64, 64, 0, Vec3::zero(), false, false);
+        let overlap : Vec3 = rig.hdr(35, 30);
+        let onlyFar : Vec3 = rig.hdr(15, 40);
+        let onlyNear : Vec3 = rig.hdr(55, 15);
+        let mut ok : i32 = 0;
+        if (rcpuNear(overlap, rcpuRed(), 0.0) && rcpuNear(onlyFar, green, 0.0)
+            && rcpuNear(onlyNear, rcpuRed(), 0.0)) {
+            ok = 1;
+        }
+        results[order] = ok;
+        c.that(
+            "depth: the stored depth at the overlap is the near quad's",
+            rig.renderer.depthAt(2, 35, 30) < rig.renderer.depthAt(2, 15, 40)
+        );
+        rig.close();
+    }
+    c.that("depth: near over far when the near quad is drawn first", results[0] == 1);
+    c.that("depth: near over far when the near quad is drawn last", results[1] == 1);
+}
+
+// A triangle seen from behind is culled, unless the material is double sided or culling is off.
+fn rcpuCulling(c : Checks) : void {
+    let assets : Shared<RenderAssets> = new shared RenderAssets();
+    let front : i32 = assets.addMesh(cpuTriangle(64, 64, 10.0, 10.0, 10.0, 50.0, 50.0, 30.0));
+    let back : i32 = assets.addMesh(cpuTriangle(64, 64, 10.0, 10.0, 50.0, 30.0, 10.0, 50.0));
+    let single : i32 = assets.addMaterial(cpuGlow(rcpuRed()));
+    let mut both : RenderMaterial = cpuGlow(rcpuRed());
+    both.doubleSided = true;
+    let twice : i32 = assets.addMaterial(both);
+    let sceneFront : RenderScene = new RenderScene(cpuOrtho(64, 64));
+    cpuAdd(sceneFront, front, single, 0);
+    let sceneBack : RenderScene = new RenderScene(cpuOrtho(64, 64));
+    cpuAdd(sceneBack, back, single, 0);
+    let sceneBoth : RenderScene = new RenderScene(cpuOrtho(64, 64));
+    cpuAdd(sceneBoth, back, twice, 0);
+    let sceneOff : RenderScene = new RenderScene(cpuOrtho(64, 64));
+    cpuAdd(sceneOff, back, single, 0);
+    let a : CpuRig = new CpuRig(assets, sceneFront, 64, 64, 0, Vec3::zero(), true, false);
+    let b : CpuRig = new CpuRig(assets, sceneBack, 64, 64, 0, Vec3::zero(), true, false);
+    let d : CpuRig = new CpuRig(assets, sceneBoth, 64, 64, 0, Vec3::zero(), true, false);
+    let e : CpuRig = new CpuRig(assets, sceneOff, 64, 64, 0, Vec3::zero(), false, false);
+    let pixel : i32 = 25;
+    c.that("cull: the counter-clockwise triangle is drawn with culling on", a.covered(20, pixel));
+    c.that("cull: the clockwise one is culled", !b.covered(20, pixel));
+    c.that("cull: a double-sided material is not culled", d.covered(20, pixel));
+    c.that("cull: turning culling off draws it", e.covered(20, pixel));
+    c.that(
+        "cull: one counter was submitted and none rasterised for the culled triangle",
+        b.costs.trianglesSubmitted(1) == 1 && b.costs.trianglesRasterised(1) == 0
+            && a.costs.trianglesRasterised(1) == 1
+    );
+    a.close();
+    b.close();
+    d.close();
+    e.close();
+}
+
+// A floor that runs behind the camera is clipped at the near plane, not dropped or smeared.
+fn rcpuClipping(c : Checks) : void {
+    let assets : Shared<RenderAssets> = new shared RenderAssets();
+    let floor : i32 = assets.addMesh(MeshDataShapes::plane(400.0, 400.0, 1, 1, 1.0, 1.0));
+    let mat : i32 = assets.addMaterial(cpuGlow(rcpuRed()));
+    let cam : Camera = cpuLookCamera(
+        Vec3::make(0.0, 2.0, 0.0),
+        Vec3::make(0.0, 2.0, -10.0),
+        1.2,
+        96,
+        54
+    );
+    let scene : RenderScene = new RenderScene(cam);
+    cpuAddAt(scene, assets, floor, mat, 0, Mat4::translation(Vec3::make(0.0, -2.0, 0.0)), false);
+    let rig : CpuRig = new CpuRig(assets, scene, 96, 54, 0, Vec3::zero(), true, false);
+    let mut below : i32 = 0;
+    let mut above : i32 = 0;
+    for (y of 0..54) {
+        for (x of 0..96) {
+            if (rig.covered(x, y)) {
+                if (y >= 28) {
+                    below = below + 1;
+                }
+                if (y < 27) {
+                    above = above + 1;
+                }
+            }
+        }
+    }
+    c.that("clip: the floor fills the picture from just below the horizon down", below == 96 * 26);
+    c.sameInt("clip: and nothing above the horizon", above, 0);
+    c.that(
+        "clip: the pixel at the bottom centre is the floor",
+        rcpuNear(rig.hdr(48, 53), rcpuRed(), 0.0)
+    );
+    rig.close();
+    // A big triangle crossing the near plane at a grazing angle must not overflow the sub-pixel grid.
+    let tilted : Camera = cpuLookCamera(
+        Vec3::make(0.0, 0.01, 0.0),
+        Vec3::make(0.0, 0.0, -10.0),
+        1.2,
+        96,
+        54
+    );
+    let scene2 : RenderScene = new RenderScene(tilted);
+    cpuAddAt(scene2, assets, floor, mat, 0, Mat4::translation(Vec3::make(0.0, -0.01, 0.0)), false);
+    let rig2 : CpuRig = new CpuRig(assets, scene2, 96, 54, 0, Vec3::zero(), true, false);
+    c.that(
+        "clip: a floor skimming the camera still renders (guard band clipping)",
+        rig2.covered(48, 29)
+    );
+    rig2.close();
+}
+
+fn rcpuChecker(size : i32) : Image {
+    let mut img : Image = new Image(size, size);
+    for (y of 0..size) {
+        for (x of 0..size) {
+            let mut v : i32 = 0;
+            if ((x + y) % 2 == 0) {
+                v = 255;
+            }
+            img.set(x, y, Image::pack(v, v, v, 255));
+        }
+    }
+    return img;
+}
+
+fn rcpuTexture(c : Checks) : void {
+    let assets : Shared<RenderAssets> = new shared RenderAssets();
+    // Four texels: red, green / blue, white, read at the centres of the four quadrants of a quad.
+    let mut four : Image = new Image(2, 2);
+    four.set(0, 0, Image::pack(255, 0, 0, 255));
+    four.set(1, 0, Image::pack(0, 255, 0, 255));
+    four.set(0, 1, Image::pack(0, 0, 255, 255));
+    four.set(1, 1, Image::pack(255, 255, 255, 255));
+    let t4 : i32 = assets.addTexture(new Texture(four, TextureWrap::Clamp));
+    let mut lit : RenderMaterial = cpuGlow(Vec3::make(1.0, 1.0, 1.0));
+    lit.emissiveTexture = t4;
+    let m4 : i32 = assets.addMaterial(lit);
+    let q : i32 = assets.addMesh(cpuQuad(64, 64, 0.0, 0.0, 64.0, 64.0, 0.0));
+    let scene : RenderScene = new RenderScene(cpuOrtho(64, 64));
+    cpuAdd(scene, q, m4, 0);
+    let rig : CpuRig = new CpuRig(assets, scene, 64, 64, 0, Vec3::zero(), true, false);
+    c.that(
+        "texture: the four quadrants show the four texels (red, green, blue, white)",
+        rcpuNear(rig.hdr(16, 16), Vec3::make(1.0, 0.0, 0.0), 0.05)
+            && rcpuNear(rig.hdr(48, 16), Vec3::make(0.0, 1.0, 0.0), 0.05)
+            && rcpuNear(rig.hdr(16, 48), Vec3::make(0.0, 0.0, 1.0), 0.05)
+            && rcpuNear(rig.hdr(48, 48), Vec3::make(1.0, 1.0, 1.0), 0.05)
+    );
+    rig.close();
+
+    // A 64 x 64 checker of single black and white texels squeezed into 8 x 8 pixels: the footprint selects the mip
+    // whose texels are the average, 0.5 in linear light, instead of aliasing between 0 and 1.
+    let assets2 : Shared<RenderAssets> = new shared RenderAssets();
+    let tc : i32 = assets2.addTexture(new Texture(rcpuChecker(64), TextureWrap::Repeat));
+    let mut shrunk : RenderMaterial = cpuGlow(Vec3::make(1.0, 1.0, 1.0));
+    shrunk.emissiveTexture = tc;
+    let mc : i32 = assets2.addMaterial(shrunk);
+    let small : i32 = assets2.addMesh(cpuQuad(16, 16, 4.0, 4.0, 12.0, 12.0, 0.0));
+    let scene2 : RenderScene = new RenderScene(cpuOrtho(16, 16));
+    cpuAdd(scene2, small, mc, 0);
+    let rig2 : CpuRig = new CpuRig(assets2, scene2, 16, 16, 0, Vec3::zero(), true, false);
+    let mut worst : f32 = 0.0;
+    for (y of 5..11) {
+        for (x of 5..11) {
+            worst = max32(worst, abs(rig2.hdr(x, y).x - (0.5 as f32)));
+        }
+    }
+    println("  measured minified checker: worst deviation from the mean 0.5 is "
+        + worst.toString());
+    c.that(
+        "texture: a minified checker is filtered to its mean in linear light (trilinear footprint)",
+        worst < 0.02
+    );
+    rig2.close();
+}
+
+fn max32(a : f32, b : f32) : f32 {
+    if (a > b) {
+        return a;
+    }
+    return b;
+}
+
+fn rcpuAlpha(c : Checks) : void {
+    let blue : Vec3 = Vec3::make(0.0, 0.0, 1.0);
+    // Left texel opaque, right texel fully transparent.
+    let mut cut : Image = new Image(2, 1);
+    cut.set(0, 0, Image::pack(255, 255, 255, 255));
+    cut.set(1, 0, Image::pack(255, 255, 255, 0));
+    let assets : Shared<RenderAssets> = new shared RenderAssets();
+    let tex : i32 = assets.addTexture(new Texture(cut, TextureWrap::Clamp));
+    let q : i32 = assets.addMesh(cpuQuad(64, 32, 8.0, 8.0, 56.0, 24.0, 0.0));
+    let mut masked : RenderMaterial = cpuGlow(Vec3::make(1.0, 1.0, 0.0));
+    masked.baseColorTexture = tex;
+    masked.alphaMode = LightAlphaMode::Mask;
+    let mm : i32 = assets.addMaterial(masked);
+    let scene : RenderScene = new RenderScene(cpuOrtho(64, 32));
+    cpuAdd(scene, q, mm, 0);
+    let rig : CpuRig = new CpuRig(assets, scene, 64, 32, 0, blue, true, false);
+    c.that(
+        "alpha: the opaque half of a mask shows the material",
+        rcpuNear(rig.hdr(16, 16), Vec3::make(1.0, 1.0, 0.0), 0.0001)
+    );
+    c.that(
+        "alpha: the transparent half is cut away to the background",
+        rcpuNear(rig.hdr(48, 16), blue, 0.0) && !rig.covered(48, 16)
+    );
+    rig.close();
+
+    let assets2 : Shared<RenderAssets> = new shared RenderAssets();
+    let q2 : i32 = assets2.addMesh(cpuQuad(32, 32, 8.0, 8.0, 24.0, 24.0, 0.0));
+    let mut glass : RenderMaterial = cpuGlow(Vec3::make(1.0, 1.0, 0.0));
+    glass.alphaMode = LightAlphaMode::Blend;
+    glass.alpha = 0.5;
+    let mg : i32 = assets2.addMaterial(glass);
+    let scene2 : RenderScene = new RenderScene(cpuOrtho(32, 32));
+    cpuAdd(scene2, q2, mg, 0);
+    let rig2 : CpuRig = new CpuRig(assets2, scene2, 32, 32, 0, blue, true, false);
+    c.that(
+        "alpha: a half-transparent yellow over blue is (0.5, 0.5, 0.5)",
+        rcpuNear(rig2.hdr(16, 16), Vec3::make(0.5, 0.5, 0.5), 0.000001)
+    );
+    c.that(
+        "alpha: outside the quad the background is untouched",
+        rcpuNear(rig2.hdr(2, 2), blue, 0.0)
+    );
+    rig2.close();
+}
+
+fn rcpuCounters(c : Checks) : void {
+    let assets : Shared<RenderAssets> = new shared RenderAssets();
+    let ball : i32 = assets.addMesh(MeshDataShapes::uvSphere(1.0, 12, 8));
+    let mat : i32 = assets.addMaterial(cpuGlow(rcpuRed()));
+    let cam : Camera = cpuLookCamera(Vec3::make(0.0, 0.0, 10.0), Vec3::zero(), 0.8, 64, 64);
+    let scene : RenderScene = new RenderScene(cam);
+    cpuAddAt(scene, assets, ball, mat, 0, Mat4::translation(Vec3::make(-1.2, 0.0, -10.0)), false);
+    cpuAddAt(scene, assets, ball, mat, 1, Mat4::translation(Vec3::make(1.2, 0.0, -10.0)), false);
+    let rig : CpuRig = new CpuRig(assets, scene, 64, 64, 0, Vec3::zero(), true, false);
+    let each : i64 = (assets.mesh(ball).triangleCount() as i64);
+    c.sameInt(
+        "counters: the forward pass submitted both spheres' triangles",
+        rig.costs.trianglesSubmitted(1),
+        2 * each
+    );
+    c.that(
+        "counters: back faces were culled, about half were rasterised",
+        rig.costs.trianglesRasterised(1) > each / 2 && rig.costs.trianglesRasterised(1) < 2 * each
+    );
+    c.sameInt(
+        "counters: one draw call for the two instances of one mesh and material",
+        rig.costs.drawCalls(1),
+        1
+    );
+    let mut visible : i64 = 0;
+    for (y of 0..64) {
+        for (x of 0..64) {
+            if (rig.covered(x, y)) {
+                visible = visible + 1;
+            }
+        }
+    }
+    c.sameInt(
+        "counters: every visible pixel was shaded exactly once",
+        rig.costs.pixelsShaded(1),
+        visible
+    );
+    c.sameInt(
+        "counters: the resolve counted the whole picture",
+        rig.costs.pixelsShaded(2),
+        64 * 64
+    );
+    c.that(
+        "counters: the resolve wrote an 8-bit picture",
+        Image::red(rig.renderer.picture(CPU_RIG_WINDOW).get(27, 32)) > 0
+    );
+    rig.close();
+}
