@@ -1,0 +1,163 @@
+// navmesh_grid — a navigation mesh made from a walkability grid.
+//
+// The walkable cells are covered with rectangles, each as large as a greedy scan finds: take the first free
+// open cell in row order, stretch it right as far as the row stays open and free, then down as far as the whole
+// span stays open and free. Rectangles are convex, so they are valid mesh polygons, and a large room becomes
+// a handful of them instead of hundreds of cells. Two rectangles that touch along a side are joined by a
+// doorway as wide as their overlap.
+//
+// The mesh is a snapshot of the map at the moment of the call: cells under a dynamic obstacle count as blocked,
+// traversal costs are ignored, and a changed map needs a new mesh. One cell is `cellSize` units wide, with the
+// corner of cell (0, 0) at the origin and y growing with the row.
+
+use crate::core::collections::vec::Vec;
+use crate::core::math::vec2::Vec2;
+use crate::sim::navigation::grid_map::GridMap;
+use crate::sim::navigation::navmesh::NavMesh;
+
+/** Builds navigation meshes from grids. */
+pub class NavMeshGrid {
+    /** The mesh of the open cells of `map`, built and ready for queries; polygon `i` is the `i`th rectangle in row-major scan order. */
+    pub static fn build(map : GridMap, cellSize : f32) : NavMesh {
+        let w : i32 = map.width();
+        let h : i32 = map.height();
+        let mut owner : i32[] = malloc<i32>((w * h) as i64);
+        for (i of 0..(w * h)) {
+            owner[i] = -1;
+        }
+        let mut rx0 : Vec<i32> = new Vec<i32>();
+        let mut ry0 : Vec<i32> = new Vec<i32>();
+        let mut rx1 : Vec<i32> = new Vec<i32>();
+        let mut ry1 : Vec<i32> = new Vec<i32>();
+        for (y of 0..h) {
+            for (x of 0..w) {
+                if (!map.isWalkable(x, y) || owner[y * w + x] >= 0) {
+                    continue;
+                }
+                let mut x1 : i32 = x + 1;
+                while (x1 < w && map.isWalkable(x1, y) && owner[y * w + x1] < 0) {
+                    x1 = x1 + 1;
+                }
+                let mut y1 : i32 = y + 1;
+                while (y1 < h && NavMeshGrid::rowFree(map, owner, w, y1, x, x1)) {
+                    y1 = y1 + 1;
+                }
+                let id : i32 = rx0.len();
+                for (cy of y..y1) {
+                    for (cx of x..x1) {
+                        owner[cy * w + cx] = id;
+                    }
+                }
+                rx0.push(x);
+                ry0.push(y);
+                rx1.push(x1);
+                ry1.push(y1);
+            }
+        }
+        let mut mesh : NavMesh = new NavMesh();
+        let mut corners : i32[] = malloc<i32>(4);
+        for (r of 0..rx0.len()) {
+            let ax : f32 = (rx0.get(r) as f32) * cellSize;
+            let ay : f32 = (ry0.get(r) as f32) * cellSize;
+            let bx : f32 = (rx1.get(r) as f32) * cellSize;
+            let by : f32 = (ry1.get(r) as f32) * cellSize;
+            corners[0] = mesh.addVertex(ax, ay);
+            corners[1] = mesh.addVertex(bx, ay);
+            corners[2] = mesh.addVertex(bx, by);
+            corners[3] = mesh.addVertex(ax, by);
+            mesh.addPolygon(corners, 4);
+        }
+        for (r of 0..rx0.len()) {
+            NavMeshGrid::joinRight(mesh, owner, w, h, rx1.get(r), ry0.get(r), ry1.get(r), r, cellSize);
+            NavMeshGrid::joinBelow(mesh, owner, w, h, ry1.get(r), rx0.get(r), rx1.get(r), r, cellSize);
+        }
+        mesh.build();
+        return mesh;
+    }
+
+    // True when cells x0..x1 of row y are all open and not yet part of a rectangle.
+    static fn rowFree(map : GridMap, owner : i32[], w : i32, y : i32, x0 : i32, x1 : i32) : bool {
+        for (x of x0..x1) {
+            if (!map.isWalkable(x, y) || owner[y * w + x] >= 0) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // Doorways along the right side (column `x`, rows y0..y1) of rectangle `r`, one per neighbour met there.
+    static fn joinRight(
+        mesh : NavMesh,
+        owner : i32[],
+        w : i32,
+        h : i32,
+        x : i32,
+        y0 : i32,
+        y1 : i32,
+        r : i32,
+        cellSize : f32
+    ) : void {
+        if (x >= w) {
+            return;
+        }
+        let mut runStart : i32 = y0;
+        let mut runOwner : i32 = owner[y0 * w + x];
+        for (y of (y0 + 1)..(y1 + 1)) {
+            let mut here : i32 = -2;
+            if (y < y1) {
+                here = owner[y * w + x];
+            }
+            if (here != runOwner) {
+                if (runOwner >= 0) {
+                    let fx : f32 = (x as f32) * cellSize;
+                    mesh.addPortal(
+                        r,
+                        runOwner,
+                        Vec2::make(fx, (runStart as f32) * cellSize),
+                        Vec2::make(fx, (y as f32) * cellSize)
+                    );
+                }
+                runStart = y;
+                runOwner = here;
+            }
+        }
+    }
+
+    // Doorways along the lower side (row `y`, columns x0..x1) of rectangle `r`.
+    static fn joinBelow(
+        mesh : NavMesh,
+        owner : i32[],
+        w : i32,
+        h : i32,
+        y : i32,
+        x0 : i32,
+        x1 : i32,
+        r : i32,
+        cellSize : f32
+    ) : void {
+        if (y >= h) {
+            return;
+        }
+        let mut runStart : i32 = x0;
+        let mut runOwner : i32 = owner[y * w + x0];
+        for (x of (x0 + 1)..(x1 + 1)) {
+            let mut here : i32 = -2;
+            if (x < x1) {
+                here = owner[y * w + x];
+            }
+            if (here != runOwner) {
+                if (runOwner >= 0) {
+                    let fy : f32 = (y as f32) * cellSize;
+                    mesh.addPortal(
+                        r,
+                        runOwner,
+                        Vec2::make((runStart as f32) * cellSize, fy),
+                        Vec2::make((x as f32) * cellSize, fy)
+                    );
+                }
+                runStart = x;
+                runOwner = here;
+            }
+        }
+    }
+}

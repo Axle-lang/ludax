@@ -1,0 +1,283 @@
+// clip — an animation clip: tracks per bone, a length, a looping flag and event markers.
+//
+// A clip knows nothing about a skeleton except bone indices: each channel names a bone and carries up to three
+// tracks (translation, rotation, scale); a track with no keys leaves that part of the bone as it was in the
+// pose being written. `sample` wraps or clamps the clock, then writes the animated parts into a `Pose`; start
+// from the bind pose (or from another animation) and the bones the clip does not animate keep their values.
+//
+// Event markers (a footstep, a hit frame) are times in `0..duration` with a number the game gives them. They
+// are kept sorted; `ClipEvents` (clip_events) reports the ones a time step crosses.
+//
+// Channels take ownership of the tracks they are given (a class stored in a field is consumed): build the
+// tracks, hand them over, do not use them again.
+
+use std::ffi::runtime::panicMsg;
+
+use crate::core::math::quat::Quat;
+use crate::core::math::transform::Transform;
+use crate::core::math::vec3::Vec3;
+use crate::sim::animation::quat_track::QuatTrack;
+use crate::sim::animation::skeleton::Pose;
+use crate::sim::animation::track::{Vec3Track, TrackMath};
+
+/** A set of bone tracks with a duration, played once or in a loop. */
+pub class AnimationClip {
+    label        : string;
+    length       : f32 = 0.0;
+    loops        : bool;
+    channels     : i32 = 0;
+    room         : i32;
+    bones        : i32[];
+    translations : Vec3Track[];
+    rotations    : QuatTrack[];
+    scales       : Vec3Track[];
+    eventCount   : i32 = 0;
+    eventRoom    : i32;
+    eventTimes   : f32[];
+    eventIds     : i32[];
+
+    /** An empty clip called `label` with room for `channelCapacity` bone channels; `looping` is its default. */
+    constructor(label : string, channelCapacity : i32, looping : bool) {
+        self.label = label;
+        self.loops = looping;
+        let mut room : i32 = channelCapacity;
+        if (room < 1) {
+            room = 1;
+        }
+        self.room = room;
+        self.bones = malloc<i32>(room as i64);
+        self.translations = malloc<Vec3Track>(room as i64);
+        self.rotations = malloc<QuatTrack>(room as i64);
+        self.scales = malloc<Vec3Track>(room as i64);
+        self.eventRoom = 8;
+        self.eventTimes = malloc<f32>(8);
+        self.eventIds = malloc<i32>(8);
+    }
+
+    /**
+     * Adds a channel animating `bone`; pass `Vec3Track::none()` or `QuatTrack::none()` for a part the clip does
+     * not animate. The tracks are consumed. The clip grows to cover the last key. Returns the channel index, or
+     * -1 when the clip is full or already animates that bone.
+     */
+    pub fn addChannel(
+        mut self,
+        bone : i32,
+        own translation : Vec3Track,
+        own rotation : QuatTrack,
+        own scale : Vec3Track
+    ) : i32 {
+        if (self.channels >= self.room || self.channelOf(bone) >= 0) {
+            return -1;
+        }
+        let i : i32 = self.channels;
+        let mut end : f32 = translation.endTime();
+        if (rotation.endTime() > end) {
+            end = rotation.endTime();
+        }
+        if (scale.endTime() > end) {
+            end = scale.endTime();
+        }
+        if (end > self.length) {
+            self.length = end;
+        }
+        self.bones[i] = bone;
+        self.translations[i] = translation;
+        self.rotations[i] = rotation;
+        self.scales[i] = scale;
+        self.channels = self.channels + 1;
+        return i;
+    }
+
+    /** The clip's name. */
+    pub fn name(self) : string {
+        return self.label;
+    }
+
+    /** The length in seconds. */
+    pub fn duration(self) : f32 {
+        return self.length;
+    }
+
+    /** Sets the length (a clip may hold still after its last key, or be cut short). */
+    pub fn setDuration(mut self, seconds : f32) : void {
+        if (seconds > 0.0) {
+            self.length = seconds;
+        }
+    }
+
+    /** True when the clip repeats by default. */
+    pub fn isLooping(self) : bool {
+        return self.loops;
+    }
+
+    /** Sets whether the clip repeats. */
+    pub fn setLooping(mut self, looping : bool) : void {
+        self.loops = looping;
+    }
+
+    /** How many bone channels there are. */
+    pub fn channelCount(self) : i32 {
+        return self.channels;
+    }
+
+    /** The bone animated by channel `i`. */
+    pub fn boneOf(self, i : i32) : i32 {
+        self.check(i);
+        return self.bones[i];
+    }
+
+    /** The channel animating `bone`, or -1. */
+    pub fn channelOf(self, bone : i32) : i32 {
+        for (i of 0..self.channels) {
+            if (self.bones[i] == bone) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    /** The clip time for a clock showing `seconds`: wrapped when looping, clamped otherwise. */
+    pub fn wrap(self, seconds : f32) : f32 {
+        return TrackMath::wrapTime(seconds, self.length, self.loops);
+    }
+
+    /** Like `wrap` for an f64 clock, which stays exact after hours of play; the answer is a clip time in f32. */
+    pub fn wrapClock(self, seconds : f64) : f32 {
+        let d : f64 = self.length as f64;
+        if (!(d > 0.0)) {
+            return 0.0;
+        }
+        if (!self.loops) {
+            if (seconds <= 0.0) {
+                return 0.0;
+            }
+            if (seconds >= d) {
+                return self.length;
+            }
+            return seconds as f32;
+        }
+        let turns : i64 = (seconds / d) as i64;
+        let mut r : f64 = seconds - (turns as f64) * d;
+        if (r < 0.0) {
+            r = r + d;
+        }
+        if (r >= d) {
+            r = 0.0;
+        }
+        return r as f32;
+    }
+
+    /** Writes the animated parts of every channel at an f64 clock reading into `pose`. */
+    pub fn sampleClock(self, seconds : f64, pose : Pose) : void {
+        self.sampleAt(self.wrapClock(seconds), pose);
+    }
+
+    /** The translation of `bone` at clip time `t` (already wrapped); zero when the clip does not animate it. */
+    pub fn translationAt(self, bone : i32, t : f32) : Vec3 {
+        let c : i32 = self.channelOf(bone);
+        if (c < 0) {
+            return Vec3::zero();
+        }
+        return self.translations[c].sample(t);
+    }
+
+    /** The rotation of `bone` at clip time `t` (already wrapped); the identity when not animated. */
+    pub fn rotationAt(self, bone : i32, t : f32) : Quat {
+        let c : i32 = self.channelOf(bone);
+        if (c < 0) {
+            return Quat::identity();
+        }
+        return self.rotations[c].sample(t);
+    }
+
+    /** Writes the animated parts of every channel at clock time `seconds` into `pose`. */
+    pub fn sample(self, seconds : f32, pose : Pose) : void {
+        self.sampleAt(self.wrap(seconds), pose);
+    }
+
+    /** Like `sample` for a clip time that is already wrapped into `0..duration`. */
+    pub fn sampleAt(self, t : f32, pose : Pose) : void {
+        for (i of 0..self.channels) {
+            let bone : i32 = self.bones[i];
+            let old : Transform = pose.get(bone);
+            let mut place : Vec3 = old.translation;
+            let mut turn : Quat = old.rotation;
+            let mut size : Vec3 = old.scale;
+            if (!self.translations[i].isEmpty()) {
+                place = self.translations[i].sample(t);
+            }
+            if (!self.rotations[i].isEmpty()) {
+                turn = self.rotations[i].sample(t);
+            }
+            if (!self.scales[i].isEmpty()) {
+                size = self.scales[i].sample(t);
+            }
+            pose.set(bone, Transform { translation: place, rotation: turn, scale: size });
+        }
+    }
+
+    /**
+     * Adds an event marker `id` at clip time `time`. Times outside `0..duration` are refused (false). Markers
+     * with equal times keep the order they were added in.
+     */
+    pub fn addEvent(mut self, time : f32, id : i32) : bool {
+        if (time < 0.0 || time > self.length) {
+            return false;
+        }
+        if (self.eventCount >= self.eventRoom) {
+            self.growEvents();
+        }
+        let mut at : i32 = self.eventCount;
+        while (at > 0 && self.eventTimes[at - 1] > time) {
+            self.eventTimes[at] = self.eventTimes[at - 1];
+            self.eventIds[at] = self.eventIds[at - 1];
+            at = at - 1;
+        }
+        self.eventTimes[at] = time;
+        self.eventIds[at] = id;
+        self.eventCount = self.eventCount + 1;
+        return true;
+    }
+
+    /** How many event markers there are. */
+    pub fn eventLen(self) : i32 {
+        return self.eventCount;
+    }
+
+    /** The time of marker `i` (markers are sorted by time). */
+    pub fn eventTime(self, i : i32) : f32 {
+        self.checkEvent(i);
+        return self.eventTimes[i];
+    }
+
+    /** The id of marker `i`. */
+    pub fn eventId(self, i : i32) : i32 {
+        self.checkEvent(i);
+        return self.eventIds[i];
+    }
+
+    fn growEvents(mut self) : void {
+        let room : i32 = self.eventRoom * 2;
+        let mut times : f32[] = malloc<f32>(room as i64);
+        let mut ids : i32[] = malloc<i32>(room as i64);
+        for (i of 0..self.eventCount) {
+            times[i] = self.eventTimes[i];
+            ids[i] = self.eventIds[i];
+        }
+        self.eventTimes = times;
+        self.eventIds = ids;
+        self.eventRoom = room;
+    }
+
+    fn check(self, i : i32) : void {
+        if (i < 0 || i >= self.channels) {
+            panicMsg("AnimationClip: channel index out of range");
+        }
+    }
+
+    fn checkEvent(self, i : i32) : void {
+        if (i < 0 || i >= self.eventCount) {
+            panicMsg("AnimationClip: event index out of range");
+        }
+    }
+}

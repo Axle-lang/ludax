@@ -1,0 +1,441 @@
+// narrow_box — contact generation for oriented boxes: against spheres, capsules and each other.
+//
+// Box against box is a separating axis test over the 15 candidate axes (3 faces of each box, 9 edge pairs). The
+// axis of least overlap decides the contact: a face axis gives a face-to-face contact, made by clipping the
+// incident face of one box to the side planes of the reference face of the other and keeping the points below
+// that face (up to four); an edge axis gives one point where the two edges come closest. Face contacts are
+// preferred unless an edge axis is clearly shallower, which keeps a resting stack from flickering between the
+// two. A sphere or capsule against a box is a closest-point test in the box's own frame.
+
+use crate::core::math::dmat3::DMat3;
+use crate::core::math::dquat::DQuat;
+use crate::core::math::dvec3::DVec3;
+use crate::core::math::scalar::{absD, clampD};
+use crate::sim::kinetic::clip_poly::ClipPoly;
+use crate::sim::kinetic::contact_buffer::ContactBuffer;
+use crate::sim::kinetic::kgeom::KGeom;
+use crate::sim::kinetic::shape::Shape;
+
+/** The nearest feature of a box to a sphere centre. */
+struct BoxSphereHit {
+    hit    : bool = false;
+    normal : DVec3 = DVec3 { x: 0.0, y: 1.0, z: 0.0 };
+    depth  : f64 = 0.0;
+    point  : DVec3 = DVec3 { x: 0.0, y: 0.0, z: 0.0 };
+}
+
+/** Narrow-phase tests that involve boxes. */
+pub class NarrowBox {
+    /** A sphere (first) against a box (second). */
+    pub static fn sphereBox(
+        ps : DVec3,
+        rs : f64,
+        box : Shape,
+        pb : DVec3,
+        qb : DQuat,
+        out : ContactBuffer
+    ) : bool {
+        let h : BoxSphereHit = NarrowBox::sphereVsBox(ps, rs, box.half, pb, qb);
+        if (!h.hit) {
+            return false;
+        }
+        out.setNormal(h.normal.negated());
+        out.add(h.point, h.depth, 0);
+        return true;
+    }
+
+    // The sphere at `c` of radius `r` against the box; `normal` points from the box toward the sphere.
+    static fn sphereVsBox(c : DVec3, r : f64, h : DVec3, pb : DVec3, qb : DQuat) : BoxSphereHit {
+        let local : DVec3 = qb.conjugate().rotate(c.minus(pb));
+        let q : DVec3 = DVec3 {
+            x: clampD(local.x, -h.x, h.x),
+            y: clampD(local.y, -h.y, h.y),
+            z: clampD(local.z, -h.z, h.z),
+        };
+        let delta : DVec3 = local.minus(q);
+        let d2 : f64 = delta.lengthSquared();
+        let mut nLocal : DVec3 = DVec3 { x: 0.0, y: 1.0, z: 0.0 };
+        let mut surface : DVec3 = q;
+        let mut depth : f64 = 0.0;
+        if (d2 > 0.000000000000000001) {
+            if (d2 >= r * r) {
+                return BoxSphereHit {};
+            }
+            let dist : f64 = d2.sqrt();
+            nLocal = delta.scale(1.0 / dist);
+            depth = r - dist;
+        } else {
+            // The centre is inside: leave through the nearest face.
+            let gx : f64 = h.x - absD(local.x);
+            let gy : f64 = h.y - absD(local.y);
+            let gz : f64 = h.z - absD(local.z);
+            if (gx <= gy && gx <= gz) {
+                nLocal = DVec3 { x: KGeom::sgn(local.x), y: 0.0, z: 0.0 };
+                surface = DVec3 { x: nLocal.x * h.x, y: local.y, z: local.z };
+                depth = r + gx;
+            } else if (gy <= gz) {
+                nLocal = DVec3 { x: 0.0, y: KGeom::sgn(local.y), z: 0.0 };
+                surface = DVec3 { x: local.x, y: nLocal.y * h.y, z: local.z };
+                depth = r + gy;
+            } else {
+                nLocal = DVec3 { x: 0.0, y: 0.0, z: KGeom::sgn(local.z) };
+                surface = DVec3 { x: local.x, y: local.y, z: nLocal.z * h.z };
+                depth = r + gz;
+            }
+        }
+        let n : DVec3 = qb.rotate(nLocal);
+        let onBox : DVec3 = pb.plus(qb.rotate(surface));
+        let onSphere : DVec3 = c.minus(n.scale(r));
+        return BoxSphereHit { hit: true, normal: n, depth: depth, point: onBox.plus(onSphere).scale(0.5) };
+    }
+
+    /**
+     * A capsule (first) against a box (second). The point of the capsule's axis nearest the box is found by a
+     * golden-section search (the distance to a convex box is convex along a line); that point and both end
+     * caps are each tested as a sphere, and the ones that agree on the normal become contact points.
+     */
+    pub static fn capsuleBox(
+        cap : Shape,
+        pc : DVec3,
+        qc : DQuat,
+        box : Shape,
+        pb : DVec3,
+        qb : DQuat,
+        out : ContactBuffer
+    ) : bool {
+        let c0 : DVec3 = cap.capsuleEnds(pc, qc, false);
+        let c1 : DVec3 = cap.capsuleEnds(pc, qc, true);
+        let inv : DQuat = qb.conjugate();
+        let l0 : DVec3 = inv.rotate(c0.minus(pb));
+        let l1 : DVec3 = inv.rotate(c1.minus(pb));
+        let seg : DVec3 = l1.minus(l0);
+        let mut lo : f64 = 0.0;
+        let mut hi : f64 = 1.0;
+        let g : f64 = 0.6180339887498949;
+        let mut m1 : f64 = hi - g * (hi - lo);
+        let mut m2 : f64 = lo + g * (hi - lo);
+        let mut f1 : f64 = KGeom::distSqToBox(l0.plus(seg.scale(m1)), box.half);
+        let mut f2 : f64 = KGeom::distSqToBox(l0.plus(seg.scale(m2)), box.half);
+        for (it of 0..40) {
+            if (f1 <= f2) {
+                hi = m2;
+                m2 = m1;
+                f2 = f1;
+                m1 = hi - g * (hi - lo);
+                f1 = KGeom::distSqToBox(l0.plus(seg.scale(m1)), box.half);
+            } else {
+                lo = m1;
+                m1 = m2;
+                f1 = f2;
+                m2 = lo + g * (hi - lo);
+                f2 = KGeom::distSqToBox(l0.plus(seg.scale(m2)), box.half);
+            }
+        }
+        let tBest : f64 = (lo + hi) * 0.5;
+        let r : f64 = cap.radius;
+        // Deepest candidate first: it fixes the normal the others must agree with.
+        let mut bestK : i32 = -1;
+        let mut best : BoxSphereHit = BoxSphereHit {};
+        for (k of 0..3) {
+            let mut t : f64 = tBest;
+            if (k == 0) {
+                t = 0.0;
+            } else if (k == 1) {
+                t = 1.0;
+            }
+            let h : BoxSphereHit = NarrowBox::sphereVsBox(
+                c0.plus(c1.minus(c0).scale(t)),
+                r,
+                box.half,
+                pb,
+                qb
+            );
+            if (h.hit && (bestK < 0 || h.depth > best.depth)) {
+                best = h;
+                bestK = k;
+            }
+        }
+        if (bestK < 0) {
+            return false;
+        }
+        out.setNormal(best.normal.negated());
+        out.add(best.point, best.depth, bestK);
+        for (k of 0..3) {
+            if (k == bestK) {
+                continue;
+            }
+            let mut t : f64 = tBest;
+            if (k == 0) {
+                t = 0.0;
+            } else if (k == 1) {
+                t = 1.0;
+            }
+            if (k == 2 && (tBest < 0.001 || tBest > 0.999)) {
+                continue;
+            }
+            let h : BoxSphereHit = NarrowBox::sphereVsBox(
+                c0.plus(c1.minus(c0).scale(t)),
+                r,
+                box.half,
+                pb,
+                qb
+            );
+            if (h.hit && h.normal.dot(best.normal) > 0.9
+                && h.point.distanceSquared(best.point) > 0.0001 * r * r) {
+                out.add(h.point, h.depth, k);
+            }
+        }
+        return true;
+    }
+
+    // Column `i` of a rotation matrix: the i-th local axis of the body in the world.
+    static fn axis(m : DMat3, i : i32) : DVec3 {
+        if (i == 0) {
+            return DVec3 { x: m.m00, y: m.m10, z: m.m20 };
+        }
+        if (i == 1) {
+            return DVec3 { x: m.m01, y: m.m11, z: m.m21 };
+        }
+        return DVec3 { x: m.m02, y: m.m12, z: m.m22 };
+    }
+
+    static fn comp(v : DVec3, i : i32) : f64 {
+        if (i == 0) {
+            return v.x;
+        }
+        if (i == 1) {
+            return v.y;
+        }
+        return v.z;
+    }
+
+    // How far a box reaches along the unit direction `l` from its centre.
+    static fn reach(m : DMat3, h : DVec3, l : DVec3) : f64 {
+        return h.x * absD(NarrowBox::axis(m, 0).dot(l)) + h.y * absD(NarrowBox::axis(m, 1).dot(l))
+            + h.z * absD(NarrowBox::axis(m, 2).dot(l));
+    }
+
+    /** A box (first) against a box (second). */
+    pub static fn boxBox(
+        ha : DVec3,
+        pa : DVec3,
+        qa : DQuat,
+        hb : DVec3,
+        pb : DVec3,
+        qb : DQuat,
+        out : ContactBuffer
+    ) : bool {
+        let ma : DMat3 = qa.toMat3();
+        let mb : DMat3 = qb.toMat3();
+        let d : DVec3 = pb.minus(pa);
+        let mut bestA : f64 = 1.0e300;
+        let mut bestAi : i32 = -1;
+        let mut bestB : f64 = 1.0e300;
+        let mut bestBi : i32 = -1;
+        for (i of 0..3) {
+            let l : DVec3 = NarrowBox::axis(ma, i);
+            let pen : f64 = NarrowBox::reach(ma, ha, l) + NarrowBox::reach(mb, hb, l) - absD(d.dot(l));
+            if (pen < 0.0) {
+                return false;
+            }
+            if (pen < bestA) {
+                bestA = pen;
+                bestAi = i;
+            }
+        }
+        for (i of 0..3) {
+            let l : DVec3 = NarrowBox::axis(mb, i);
+            let pen : f64 = NarrowBox::reach(ma, ha, l) + NarrowBox::reach(mb, hb, l) - absD(d.dot(l));
+            if (pen < 0.0) {
+                return false;
+            }
+            if (pen < bestB) {
+                bestB = pen;
+                bestBi = i;
+            }
+        }
+        let mut bestE : f64 = 1.0e300;
+        let mut bestEi : i32 = -1;
+        let mut bestEj : i32 = -1;
+        let mut bestEn : DVec3 = DVec3::zero();
+        for (i of 0..3) {
+            for (j of 0..3) {
+                let c : DVec3 = NarrowBox::axis(ma, i).cross(NarrowBox::axis(mb, j));
+                let len2 : f64 = c.lengthSquared();
+                if (len2 < 0.000001) {
+                    continue;
+                }
+                let l : DVec3 = c.scale(1.0 / len2.sqrt());
+                let pen : f64 = NarrowBox::reach(ma, ha, l) + NarrowBox::reach(mb, hb, l) - absD(d.dot(l));
+                if (pen < 0.0) {
+                    return false;
+                }
+                if (pen < bestE) {
+                    bestE = pen;
+                    bestEi = i;
+                    bestEj = j;
+                    bestEn = l;
+                }
+            }
+        }
+        let mut face : f64 = bestA;
+        let mut useB : bool = false;
+        if (bestB < bestA * 0.98 - 0.000000001) {
+            face = bestB;
+            useB = true;
+        }
+        if (bestEi >= 0 && bestE + 0.0005 < face * 0.95) {
+            return NarrowBox::edgeContact(ha, pa, ma, hb, pb, mb, d, bestEn, bestEi, bestEj, bestE, out);
+        }
+        return NarrowBox::faceContact(ha, pa, ma, hb, pb, mb, d, useB, bestAi, bestBi, out);
+    }
+
+    static fn edgeContact(
+        ha : DVec3,
+        pa : DVec3,
+        ma : DMat3,
+        hb : DVec3,
+        pb : DVec3,
+        mb : DMat3,
+        d : DVec3,
+        axisN : DVec3,
+        ei : i32,
+        ej : i32,
+        depth : f64,
+        out : ContactBuffer
+    ) : bool {
+        let mut n : DVec3 = axisN;
+        if (n.dot(d) < 0.0) {
+            n = n.negated();
+        }
+        // The edge of each box that lies deepest in the other's direction.
+        let mut ptA : DVec3 = pa;
+        let mut ptB : DVec3 = pb;
+        for (k of 0..3) {
+            if (k != ei) {
+                let ax : DVec3 = NarrowBox::axis(ma, k);
+                ptA = ptA.plus(ax.scale(KGeom::sgn(ax.dot(n)) * NarrowBox::comp(ha, k)));
+            }
+            if (k != ej) {
+                let bx : DVec3 = NarrowBox::axis(mb, k);
+                ptB = ptB.plus(bx.scale(-KGeom::sgn(bx.dot(n)) * NarrowBox::comp(hb, k)));
+            }
+        }
+        let u : DVec3 = NarrowBox::axis(ma, ei);
+        let v : DVec3 = NarrowBox::axis(mb, ej);
+        let w : DVec3 = ptA.minus(ptB);
+        let b : f64 = u.dot(v);
+        let du : f64 = u.dot(w);
+        let ev : f64 = v.dot(w);
+        let denom : f64 = 1.0 - b * b;
+        let mut s : f64 = 0.0;
+        let mut t : f64 = 0.0;
+        if (denom > 0.000000001) {
+            t = (ev - b * du) / denom;
+            s = t * b - du;
+        }
+        s = clampD(s, -NarrowBox::comp(ha, ei), NarrowBox::comp(ha, ei));
+        t = clampD(t, -NarrowBox::comp(hb, ej), NarrowBox::comp(hb, ej));
+        let p1 : DVec3 = ptA.plus(u.scale(s));
+        let p2 : DVec3 = ptB.plus(v.scale(t));
+        out.setNormal(n);
+        out.add(p1.plus(p2).scale(0.5), depth, 100 + ei * 3 + ej);
+        return true;
+    }
+
+    static fn faceContact(
+        ha : DVec3,
+        pa : DVec3,
+        ma : DMat3,
+        hb : DVec3,
+        pb : DVec3,
+        mb : DMat3,
+        d : DVec3,
+        useB : bool,
+        ai : i32,
+        bi : i32,
+        out : ContactBuffer
+    ) : bool {
+        let mut refPos : DVec3 = pa;
+        let mut refM : DMat3 = ma;
+        let mut refH : DVec3 = ha;
+        let mut incPos : DVec3 = pb;
+        let mut incM : DMat3 = mb;
+        let mut incH : DVec3 = hb;
+        let mut k : i32 = ai;
+        if (useB) {
+            refPos = pb;
+            refM = mb;
+            refH = hb;
+            incPos = pa;
+            incM = ma;
+            incH = ha;
+            k = bi;
+        }
+        let refAxis : DVec3 = NarrowBox::axis(refM, k);
+        // Outward normal of the reference face: toward the other box.
+        let mut nref : DVec3 = refAxis;
+        let toOther : DVec3 = incPos.minus(refPos);
+        if (refAxis.dot(toOther) < 0.0) {
+            nref = refAxis.negated();
+        }
+        let refCenter : DVec3 = refPos.plus(nref.scale(NarrowBox::comp(refH, k)));
+        // The incident face: the one of the other box that faces the reference face most squarely.
+        let mut m : i32 = 0;
+        let mut mDot : f64 = 0.0;
+        for (c of 0..3) {
+            let dt : f64 = NarrowBox::axis(incM, c).dot(nref);
+            if (absD(dt) > absD(mDot) || c == 0) {
+                m = c;
+                mDot = dt;
+            }
+        }
+        let incAxis : DVec3 = NarrowBox::axis(incM, m);
+        let mut ninc : DVec3 = incAxis;
+        let mut sideCode : i32 = 1;
+        if (mDot > 0.0) {
+            ninc = incAxis.negated();
+            sideCode = 0;
+        }
+        let ci : DVec3 = incPos.plus(ninc.scale(NarrowBox::comp(incH, m)));
+        let m1 : i32 = (m + 1) % 3;
+        let m2 : i32 = (m + 2) % 3;
+        let u : DVec3 = NarrowBox::axis(incM, m1).scale(NarrowBox::comp(incH, m1));
+        let v : DVec3 = NarrowBox::axis(incM, m2).scale(NarrowBox::comp(incH, m2));
+        let faceCode : i32 = (m * 2 + sideCode) * 4;
+        let base : i32 = (k * 2 + 1) * 64 + faceCode;
+        let polyA : ClipPoly = out.polyA();
+        let polyB : ClipPoly = out.polyB();
+        polyA.clear();
+        polyA.push(ci.plus(u).plus(v), base);
+        polyA.push(ci.minus(u).plus(v), base + 1);
+        polyA.push(ci.minus(u).minus(v), base + 2);
+        polyA.push(ci.plus(u).minus(v), base + 3);
+        let k1 : i32 = (k + 1) % 3;
+        let k2 : i32 = (k + 2) % 3;
+        let s1 : DVec3 = NarrowBox::axis(refM, k1);
+        let s2 : DVec3 = NarrowBox::axis(refM, k2);
+        polyB.clipFrom(polyA, refPos, s1, NarrowBox::comp(refH, k1), 0);
+        polyA.clipFrom(polyB, refPos, s1.negated(), NarrowBox::comp(refH, k1), 1);
+        polyB.clipFrom(polyA, refPos, s2, NarrowBox::comp(refH, k2), 2);
+        polyA.clipFrom(polyB, refPos, s2.negated(), NarrowBox::comp(refH, k2), 3);
+        let mut n : DVec3 = nref;
+        if (useB) {
+            n = nref.negated();
+        }
+        out.setNormal(n);
+        let count : i32 = polyA.count();
+        for (q of 0..count) {
+            let x : DVec3 = polyA.pts.get(q);
+            let dist : f64 = x.minus(refCenter).dot(nref);
+            if (dist <= 0.0) {
+                out.add(x.minus(nref.scale(dist * 0.5)), -dist, polyA.ids.get(q));
+            }
+        }
+        if (out.count() == 0) {
+            return false;
+        }
+        out.reduceToFour();
+        return true;
+    }
+}

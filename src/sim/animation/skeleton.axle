@@ -1,0 +1,267 @@
+// skeleton — the bone hierarchy, and a pose of it.
+//
+// A `Skeleton` is the part of a rig that never changes while it plays: bones in parent-before-child order (a
+// bone's parent has a smaller index, so one pass over the array walks the tree), their names, the local bind
+// transform of each and the inverse bind matrix that carries a vertex from model space into the bone's bind
+// space. A `Pose` is the part that changes: one local transform (translation, rotation, scale) per bone, plus
+// the matrices derived from it. `Pose::update` turns the locals into model-space matrices and from those into
+// skinning matrices (`model * inverseBind`), the f32 `Mat4`s a vertex shader or `Skinning` consumes.
+//
+// The matrices are composed as `Mat4`s, so they are exact for any scale. The `Transform` route
+// (`Pose::modelTransform`) used by the solvers composes TRS triples and is exact for uniform scale only.
+//
+// Plain data on purpose: nothing here depends on the glTF importer; an adapter fills a `Skeleton` with
+// `addBone` and, when the file has its own inverse bind matrices, `setInverseBind`.
+
+use std::ffi::runtime::panicMsg;
+
+use crate::core::id::string_id::{StringId, StringInterner};
+use crate::core::math::mat4::Mat4;
+use crate::core::math::quat::Quat;
+use crate::core::math::transform::Transform;
+
+/** The bones of a rig, parent before child, with their bind pose and inverse bind matrices. */
+pub class Skeleton {
+    count       : i32 = 0;
+    room        : i32;
+    parents     : i32[];
+    nameIds     : i32[];
+    bind        : Transform[];
+    bindModel   : Mat4[];
+    inverseBind : Mat4[];
+    interner    : StringInterner;
+
+    /** An empty skeleton with room for `capacity` bones. */
+    constructor(capacity : i32) {
+        let mut room : i32 = capacity;
+        if (room < 1) {
+            room = 1;
+        }
+        self.room = room;
+        self.parents = malloc<i32>(room as i64);
+        self.nameIds = malloc<i32>(room as i64);
+        self.bind = malloc<Transform>(room as i64);
+        self.bindModel = malloc<Mat4>(room as i64);
+        self.inverseBind = malloc<Mat4>(room as i64);
+        self.interner = new StringInterner();
+    }
+
+    /**
+     * Adds a bone and returns its index. `parent` is -1 for a root, otherwise the index of a bone added
+     * earlier. Answers -1 and adds nothing when the parent is not an earlier bone, the name is already taken or
+     * the capacity is used up. The inverse bind matrix is derived from the bind transforms.
+     */
+    pub fn addBone(mut self, name : string, parent : i32, bindLocal : Transform) : i32 {
+        if (self.count >= self.room || parent >= self.count || parent < -1) {
+            return -1;
+        }
+        if (!self.interner.find(name).isNone()) {
+            return -1;
+        }
+        let i : i32 = self.count;
+        self.parents[i] = parent;
+        self.nameIds[i] = self.interner.intern(name).raw;
+        self.bind[i] = bindLocal;
+        let mut model : Mat4 = bindLocal.toMat4();
+        if (parent >= 0) {
+            model = self.bindModel[parent].mul(model);
+        }
+        self.bindModel[i] = model;
+        self.inverseBind[i] = model.inverseAffine();
+        self.count = self.count + 1;
+        return i;
+    }
+
+    /** Replaces the inverse bind matrix of `bone` (a file's own matrices, which need not match the bind pose). */
+    pub fn setInverseBind(mut self, bone : i32, m : Mat4) : void {
+        self.check(bone);
+        self.inverseBind[bone] = m;
+    }
+
+    /** How many bones there are. */
+    pub fn boneCount(self) : i32 {
+        return self.count;
+    }
+
+    /** The parent of `bone`, or -1 for a root. */
+    pub fn parent(self, bone : i32) : i32 {
+        self.check(bone);
+        return self.parents[bone];
+    }
+
+    /** The name of `bone`, borrowed from the skeleton: copy it to keep it past the skeleton. */
+    pub fn name(self, bone : i32) : string {
+        self.check(bone);
+        return self.interner.name(StringId { raw: self.nameIds[bone] });
+    }
+
+    /** The index of the bone called `name`, or -1. */
+    pub fn find(self, name : string) : i32 {
+        let id : StringId = self.interner.find(name);
+        if (id.isNone()) {
+            return -1;
+        }
+        // Bones are interned in index order, so the string id is the bone index.
+        return id.raw;
+    }
+
+    /** The local bind transform of `bone`. */
+    pub fn bindLocal(self, bone : i32) : Transform {
+        self.check(bone);
+        return self.bind[bone];
+    }
+
+    /** The matrix carrying model space into the bind space of `bone`. */
+    pub fn inverseBindOf(self, bone : i32) : Mat4 {
+        self.check(bone);
+        return self.inverseBind[bone];
+    }
+
+    /** The model-space matrix of `bone` in the bind pose. */
+    pub fn bindModelOf(self, bone : i32) : Mat4 {
+        self.check(bone);
+        return self.bindModel[bone];
+    }
+
+    /** True when `ancestor` is `bone` or one of the bones above it. */
+    pub fn isInSubtree(self, bone : i32, ancestor : i32) : bool {
+        let mut at : i32 = bone;
+        while (at >= 0) {
+            if (at == ancestor) {
+                return true;
+            }
+            at = self.parents[at];
+        }
+        return false;
+    }
+
+    fn check(self, bone : i32) : void {
+        if (bone < 0 || bone >= self.count) {
+            panicMsg("Skeleton: bone index out of range");
+        }
+    }
+}
+
+/** One local transform per bone, and the matrices derived from them by `update`. */
+pub class Pose {
+    count : i32;
+    local : Transform[];
+    model : Mat4[];
+    skin  : Mat4[];
+
+    /** A pose of `count` bones, every one the identity. */
+    constructor(count : i32) {
+        self.count = count;
+        let room : i64 = (count + 1) as i64;
+        self.local = malloc<Transform>(room);
+        self.model = malloc<Mat4>(room);
+        self.skin = malloc<Mat4>(room);
+        for (i of 0..(count + 1)) {
+            self.local[i] = Transform::identity();
+            self.model[i] = Mat4::identity();
+            self.skin[i] = Mat4::identity();
+        }
+    }
+
+    /** A pose holding the bind transforms of `skeleton`. */
+    pub static fn bindOf(skeleton : Skeleton) : Pose {
+        let mut pose : Pose = new Pose(skeleton.boneCount());
+        pose.resetToBind(skeleton);
+        return pose;
+    }
+
+    /** How many bones the pose has. */
+    pub fn boneCount(self) : i32 {
+        return self.count;
+    }
+
+    /** The local transform of `bone`. */
+    pub fn get(self, bone : i32) : Transform {
+        self.check(bone);
+        return self.local[bone];
+    }
+
+    /** Sets the local transform of `bone`. */
+    pub fn set(mut self, bone : i32, t : Transform) : void {
+        self.check(bone);
+        self.local[bone] = t;
+    }
+
+    /** Sets only the local rotation of `bone`. */
+    pub fn setRotation(mut self, bone : i32, q : Quat) : void {
+        self.check(bone);
+        let t : Transform = self.local[bone];
+        self.local[bone] = Transform { translation: t.translation, rotation: q, scale: t.scale };
+    }
+
+    /** Copies the local transforms of `other` (which must have the same number of bones). */
+    pub fn copyFrom(mut self, other : Pose) : void {
+        if (other.count != self.count) {
+            panicMsg("Pose.copyFrom: bone counts differ");
+        }
+        for (i of 0..self.count) {
+            self.local[i] = other.local[i];
+        }
+    }
+
+    /** Sets every bone to its bind transform. */
+    pub fn resetToBind(mut self, skeleton : Skeleton) : void {
+        if (skeleton.boneCount() != self.count) {
+            panicMsg("Pose.resetToBind: bone counts differ");
+        }
+        for (i of 0..self.count) {
+            self.local[i] = skeleton.bindLocal(i);
+        }
+    }
+
+    /** The placement of `bone` in model space, composed from the locals up the chain (uniform scale exact). */
+    pub fn modelTransform(self, skeleton : Skeleton, bone : i32) : Transform {
+        self.check(bone);
+        let mut chain : Transform = self.local[bone];
+        let mut at : i32 = skeleton.parent(bone);
+        while (at >= 0) {
+            chain = self.local[at].mul(chain);
+            at = skeleton.parent(at);
+        }
+        return chain;
+    }
+
+    /** Recomputes the model-space and skinning matrices of every bone from the local transforms. */
+    pub fn update(mut self, skeleton : Skeleton) : void {
+        if (skeleton.boneCount() != self.count) {
+            panicMsg("Pose.update: bone counts differ");
+        }
+        for (i of 0..self.count) {
+            let mut m : Mat4 = self.local[i].toMat4();
+            let p : i32 = skeleton.parent(i);
+            if (p >= 0) {
+                m = self.model[p].mul(m);
+            }
+            self.model[i] = m;
+            self.skin[i] = m.mul(skeleton.inverseBindOf(i));
+        }
+    }
+
+    /** The model-space matrix of `bone` as of the last `update`. */
+    pub fn modelMatrix(self, bone : i32) : Mat4 {
+        self.check(bone);
+        return self.model[bone];
+    }
+
+    /** The skinning matrix of `bone` (model space to model space) as of the last `update`. */
+    pub fn skinMatrix(self, bone : i32) : Mat4 {
+        self.check(bone);
+        return self.skin[bone];
+    }
+
+    /** The array of skinning matrices as of the last `update`, for `Skinning`; do not write to it. */
+    pub fn skinMatrices(self) : Mat4[] {
+        return self.skin;
+    }
+
+    fn check(self, bone : i32) : void {
+        if (bone < 0 || bone >= self.count) {
+            panicMsg("Pose: bone index out of range");
+        }
+    }
+}

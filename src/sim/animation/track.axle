@@ -1,0 +1,264 @@
+// track — keyframe tracks of vectors (translation, scale) sampled by time.
+//
+// A track is a sorted list of keys (a time and a value) and a way to fill the gaps: `Step` holds the value of
+// the key before, `Linear` blends the two keys around the time, `Cubic` follows a Hermite spline whose
+// tangents are stored with the keys (glTF's CUBICSPLINE layout: in-tangent, value, out-tangent). Sampling finds
+// the segment by binary search, so a track of thousands of keys costs the same as one of two. Times outside the
+// keys clamp to the first and last value; looping is the clip's job (`TrackMath::wrapTime`), the track only
+// knows its keys.
+//
+// Keys live in `malloc` arrays (`times`, and `values` with 3 floats per value, 9 per key for `Cubic`).
+
+use std::ffi::runtime::panicMsg;
+
+use crate::core::math::scalar::clamp;
+use crate::core::math::vec3::Vec3;
+
+/** How a track fills the time between two keys. */
+pub enum Interp : i8 {
+    /** The value of the key before the time holds until the next key. */
+    Step = 0,
+    /** A straight blend of the two keys around the time (a shortest-path slerp for rotations). */
+    Linear = 1,
+    /** A Hermite spline through the keys using the stored tangents. */
+    Cubic = 2,
+
+    /** The interpolation whose number is `code` (0 step, 1 linear, 2 cubic); anything else answers Linear. */
+    pub static fn fromCode(code : i32) : Interp {
+        return match code {
+            0 => Interp::Step,
+            2 => Interp::Cubic,
+            _ => Interp::Linear,
+        };
+    }
+
+    /** The number that stands for this interpolation in files. */
+    pub fn code(self) : i32 {
+        return self as i32;
+    }
+}
+
+/** The weights of the two values and two tangents of a cubic segment. */
+pub struct HermiteWeights {
+    /** Weight of the value at the segment start. */
+    pub valueA : f32 = 0.0;
+
+    /** Weight of the out-tangent at the segment start (times the segment length). */
+    pub tanA : f32 = 0.0;
+
+    /** Weight of the value at the segment end. */
+    pub valueB : f32 = 0.0;
+
+    /** Weight of the in-tangent at the segment end (times the segment length). */
+    pub tanB : f32 = 0.0;
+}
+
+/** Time arithmetic shared by tracks, clips and events. */
+pub class TrackMath {
+    /**
+     * The time to sample a clip of length `duration` at when `t` seconds have passed. A looping clip wraps `t`
+     * into `0..duration`; otherwise `t` clamps to `0..duration`. A clip of no length always answers 0.
+     */
+    pub static fn wrapTime(t : f32, duration : f32, looping : bool) : f32 {
+        if (!(duration > 0.0)) {
+            return 0.0;
+        }
+        if (!looping) {
+            return clamp(t, 0.0, duration);
+        }
+        let turns : i64 = (t / duration) as i64;
+        let mut r : f32 = t - (turns as f32) * duration;
+        if (r < 0.0) {
+            r = r + duration;
+        }
+        if (r >= duration) {
+            r = 0.0;
+        }
+        return r;
+    }
+
+    /**
+     * The index `k` of the last key with `times[k] <= t`, for `count >= 2` sorted keys and `t` inside
+     * `times[0]..times[count-1]`; the result is at most `count - 2`, so `k + 1` always exists.
+     */
+    pub static fn segment(times : f32[], count : i32, t : f32) : i32 {
+        let mut lo : i32 = 0;
+        let mut hi : i32 = count - 1;
+        while (hi - lo > 1) {
+            let mid : i32 = (lo + hi) / 2;
+            if (times[mid] <= t) {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        return lo;
+    }
+
+    /** The four Hermite weights of the parameter `s` in `0..1`. */
+    pub(crate) static fn weights(s : f32) : HermiteWeights {
+        let two : f32 = 2.0;
+        let three : f32 = 3.0;
+        let one : f32 = 1.0;
+        let s2 : f32 = s * s;
+        let s3 : f32 = s2 * s;
+        return HermiteWeights {
+            valueA: two * s3 - three * s2 + one,
+            tanA: s3 - two * s2 + s,
+            valueB: three * s2 - two * s3,
+            tanB: s3 - s2,
+        };
+    }
+}
+
+/** A track of `Vec3` keys: a bone's translation or scale over time. */
+pub class Vec3Track {
+    interp : Interp;
+    count  : i32;
+    times  : f32[];
+    values : f32[];
+
+    /** A track of `count` keys, all zero at time zero, to be filled with `setKey`. */
+    constructor(interp : Interp, count : i32) {
+        self.interp = interp;
+        self.count = count;
+        let room : i64 = (count + 1) as i64;
+        self.times = malloc<f32>(room);
+        self.values = malloc<f32>(room * 9);
+        for (i of 0..(count * 9 + 9)) {
+            self.values[i] = 0.0;
+        }
+        for (i of 0..(count + 1)) {
+            self.times[i] = 0.0;
+        }
+    }
+
+    /** A track with no keys: it animates nothing. */
+    pub static fn none() : Vec3Track {
+        return new Vec3Track(Interp::Linear, 0);
+    }
+
+    /** How many keys there are. */
+    pub fn len(self) : i32 {
+        return self.count;
+    }
+
+    /** True when the track has no keys. */
+    pub fn isEmpty(self) : bool {
+        return self.count == 0;
+    }
+
+    /** How the gaps between keys are filled. */
+    pub fn interpolation(self) : Interp {
+        return self.interp;
+    }
+
+    /** The time of the last key; 0 for an empty track. */
+    pub fn endTime(self) : f32 {
+        if (self.count == 0) {
+            return 0.0;
+        }
+        return self.times[self.count - 1];
+    }
+
+    /** The time of key `i`. */
+    pub fn timeAt(self, i : i32) : f32 {
+        self.check(i);
+        return self.times[i];
+    }
+
+    /** The value of key `i`. */
+    pub fn valueAt(self, i : i32) : Vec3 {
+        self.check(i);
+        let at : i32 = i * self.stride() + self.offset();
+        return Vec3 { x: self.values[at], y: self.values[at + 1], z: self.values[at + 2] };
+    }
+
+    /** Sets key `i` to value `v` at time `t` (tangents of a cubic track become zero). Keys must ascend in time. */
+    pub fn setKey(mut self, i : i32, t : f32, v : Vec3) : void {
+        self.check(i);
+        self.times[i] = t;
+        let base : i32 = i * self.stride();
+        let at : i32 = base + self.offset();
+        self.values[at] = v.x;
+        self.values[at + 1] = v.y;
+        self.values[at + 2] = v.z;
+    }
+
+    /** Sets key `i` of a cubic track with its tangents; on other tracks the tangents are ignored. */
+    pub fn setCubicKey(mut self, i : i32, t : f32, inTangent : Vec3, v : Vec3, outTangent : Vec3) : void {
+        self.setKey(i, t, v);
+        if (self.interp == Interp::Cubic) {
+            let base : i32 = i * 9;
+            self.values[base] = inTangent.x;
+            self.values[base + 1] = inTangent.y;
+            self.values[base + 2] = inTangent.z;
+            self.values[base + 6] = outTangent.x;
+            self.values[base + 7] = outTangent.y;
+            self.values[base + 8] = outTangent.z;
+        }
+    }
+
+    /** The value at time `t`; the first or last value outside the keys, zero for an empty track. */
+    pub fn sample(self, t : f32) : Vec3 {
+        if (self.count == 0) {
+            return Vec3::zero();
+        }
+        if (self.count == 1 || t <= self.times[0]) {
+            return self.valueAt(0);
+        }
+        if (t >= self.times[self.count - 1]) {
+            return self.valueAt(self.count - 1);
+        }
+        let k : i32 = TrackMath::segment(self.times, self.count, t);
+        let t0 : f32 = self.times[k];
+        let dt : f32 = self.times[k + 1] - t0;
+        let mut s : f32 = 0.0;
+        if (dt > 0.0) {
+            s = (t - t0) / dt;
+        }
+        let a : Vec3 = self.valueAt(k);
+        let b : Vec3 = self.valueAt(k + 1);
+        return match self.interp {
+            Interp::Step => a,
+            Interp::Linear => a.lerp(b, s),
+            Interp::Cubic => self.hermiteBetween(k, a, b, s, dt),
+        };
+    }
+
+    fn hermiteBetween(self, k : i32, a : Vec3, b : Vec3, s : f32, dt : f32) : Vec3 {
+        let w : HermiteWeights = TrackMath::weights(s);
+        let outA : Vec3 = self.tangent(k, 6);
+        let inB : Vec3 = self.tangent(k + 1, 0);
+        return a
+            .scale(w.valueA)
+            .plus(outA.scale(w.tanA * dt))
+            .plus(b.scale(w.valueB))
+            .plus(inB.scale(w.tanB * dt));
+    }
+
+    fn tangent(self, key : i32, slot : i32) : Vec3 {
+        let at : i32 = key * 9 + slot;
+        return Vec3 { x: self.values[at], y: self.values[at + 1], z: self.values[at + 2] };
+    }
+
+    fn stride(self) : i32 {
+        if (self.interp == Interp::Cubic) {
+            return 9;
+        }
+        return 3;
+    }
+
+    fn offset(self) : i32 {
+        if (self.interp == Interp::Cubic) {
+            return 3;
+        }
+        return 0;
+    }
+
+    fn check(self, i : i32) : void {
+        if (i < 0 || i >= self.count) {
+            panicMsg("Vec3Track: key index out of range");
+        }
+    }
+}

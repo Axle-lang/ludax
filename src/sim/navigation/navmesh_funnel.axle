@@ -1,0 +1,211 @@
+// navmesh_funnel — the path a navigation mesh query returns, and the funnel algorithm that straightens it.
+//
+// A* over a mesh finds the polygons to cross (a corridor) and the doorways between them (portals). The funnel
+// algorithm (the "simple stupid funnel") then walks the portals keeping the narrowest cone of sight from the
+// current corner, and whenever the cone closes it fixes a corner at the vertex that closed it. The result is
+// the shortest path inside the corridor: a polyline whose bends are polygon vertices, never longer than any
+// other route through the same portals (in particular, not longer than the line through their midpoints).
+//
+// Coordinates are a plane (x, y) with y up, so "left" is counter-clockwise: walking along +x, left is +y.
+
+use std::ffi::runtime::panicMsg;
+
+// Points closer than this are the same point.
+const FUNNEL_SAME : f32 = 0.000001;
+
+/** A route over a navigation mesh: the corners of the straight path, start first. */
+pub class NavPath {
+    pts      : f32[];
+    room     : i32;
+    count    : i32 = 0;
+    ok       : bool = false;
+    corridor : f32 = 0.0;
+    crossed  : i32 = 0;
+
+    /** An empty path that found nothing. */
+    constructor() {
+        self.room = 8;
+        self.pts = malloc<f32>(16);
+    }
+
+    /** True when a route was found. */
+    pub fn found(self) : bool {
+        return self.ok;
+    }
+
+    /** How many points the path has (start, corners, goal). */
+    pub fn len(self) : i32 {
+        return self.count;
+    }
+
+    /** The x of point `i`. */
+    pub fn xAt(self, i : i32) : f32 {
+        self.check(i);
+        return self.pts[i * 2];
+    }
+
+    /** The y of point `i`. */
+    pub fn yAt(self, i : i32) : f32 {
+        self.check(i);
+        return self.pts[i * 2 + 1];
+    }
+
+    /** The length of the straight-pulled path. */
+    pub fn length(self) : f32 {
+        let mut sum : f32 = 0.0;
+        for (i of 1..self.count) {
+            let dx : f32 = self.pts[i * 2] - self.pts[i * 2 - 2];
+            let dy : f32 = self.pts[i * 2 + 1] - self.pts[i * 2 - 1];
+            sum = sum + (dx * dx + dy * dy).sqrt();
+        }
+        return sum;
+    }
+
+    /** The length of the polyline from the start through the midpoint of every portal to the goal: what A* minimised. */
+    pub fn corridorLength(self) : f32 {
+        return self.corridor;
+    }
+
+    /** How many polygons the route passes through. */
+    pub fn polygonsCrossed(self) : i32 {
+        return self.crossed;
+    }
+
+    /** Appends a point unless it repeats the last one. */
+    pub fn push(mut self, x : f32, y : f32) : void {
+        if (self.count > 0) {
+            let dx : f32 = x - self.pts[self.count * 2 - 2];
+            let dy : f32 = y - self.pts[self.count * 2 - 1];
+            if (dx * dx + dy * dy <= FUNNEL_SAME * FUNNEL_SAME) {
+                return;
+            }
+        }
+        if (self.count >= self.room) {
+            let room : i32 = self.room * 2;
+            let mut grown : f32[] = malloc<f32>((room * 2) as i64);
+            for (i of 0..(self.count * 2)) {
+                grown[i] = self.pts[i];
+            }
+            self.pts = grown;
+            self.room = room;
+        }
+        self.pts[self.count * 2] = x;
+        self.pts[self.count * 2 + 1] = y;
+        self.count = self.count + 1;
+    }
+
+    /** Records the outcome of the query. */
+    pub fn finish(mut self, found : bool, corridor : f32, crossed : i32) : void {
+        self.ok = found;
+        self.corridor = corridor;
+        self.crossed = crossed;
+    }
+
+    fn check(self, i : i32) : void {
+        if (i < 0 || i >= self.count) {
+            panicMsg("NavPath: index out of range");
+        }
+    }
+}
+
+/** The funnel algorithm. */
+pub class Funnel {
+    /**
+     * Pulls a straight path through `count` portals from (`sx`, `sy`) to (`gx`, `gy`) into `out`. `portals`
+     * holds four numbers per portal, in the order crossed: the left end's x and y, then the right end's, as
+     * seen walking from the start towards the goal.
+     */
+    pub static fn pull(
+        portals : f32[],
+        count : i32,
+        sx : f32,
+        sy : f32,
+        gx : f32,
+        gy : f32,
+        out : NavPath
+    ) : void {
+        out.push(sx, sy);
+        let n : i32 = count + 2;
+        let mut apexX : f32 = sx;
+        let mut apexY : f32 = sy;
+        let mut leftX : f32 = sx;
+        let mut leftY : f32 = sy;
+        let mut rightX : f32 = sx;
+        let mut rightY : f32 = sy;
+        let mut apexIdx : i32 = 0;
+        let mut leftIdx : i32 = 0;
+        let mut rightIdx : i32 = 0;
+        let mut i : i32 = 1;
+        while (i < n) {
+            // Portal 0 is the start and portal n-1 the goal, both of zero width.
+            let mut lx : f32 = gx;
+            let mut ly : f32 = gy;
+            let mut rx : f32 = gx;
+            let mut ry : f32 = gy;
+            if (i <= count) {
+                lx = portals[(i - 1) * 4];
+                ly = portals[(i - 1) * 4 + 1];
+                rx = portals[(i - 1) * 4 + 2];
+                ry = portals[(i - 1) * 4 + 3];
+            }
+            // Narrow the right side.
+            if (Funnel::area(apexX, apexY, rightX, rightY, rx, ry) >= 0.0) {
+                if (Funnel::same(apexX, apexY, rightX, rightY)
+                    || Funnel::area(apexX, apexY, leftX, leftY, rx, ry) < 0.0) {
+                    rightX = rx;
+                    rightY = ry;
+                    rightIdx = i;
+                } else {
+                    // The right side crossed over the left: the left end is a corner.
+                    out.push(leftX, leftY);
+                    apexX = leftX;
+                    apexY = leftY;
+                    apexIdx = leftIdx;
+                    leftX = apexX;
+                    leftY = apexY;
+                    rightX = apexX;
+                    rightY = apexY;
+                    leftIdx = apexIdx;
+                    rightIdx = apexIdx;
+                    i = apexIdx + 1;
+                    continue;
+                }
+            }
+            // Narrow the left side.
+            if (Funnel::area(apexX, apexY, leftX, leftY, lx, ly) <= 0.0) {
+                if (Funnel::same(apexX, apexY, leftX, leftY)
+                    || Funnel::area(apexX, apexY, rightX, rightY, lx, ly) > 0.0) {
+                    leftX = lx;
+                    leftY = ly;
+                    leftIdx = i;
+                } else {
+                    out.push(rightX, rightY);
+                    apexX = rightX;
+                    apexY = rightY;
+                    apexIdx = rightIdx;
+                    leftX = apexX;
+                    leftY = apexY;
+                    rightX = apexX;
+                    rightY = apexY;
+                    leftIdx = apexIdx;
+                    rightIdx = apexIdx;
+                    i = apexIdx + 1;
+                    continue;
+                }
+            }
+            i = i + 1;
+        }
+        out.push(gx, gy);
+    }
+
+    // Twice the signed area of the triangle (a, b, c): positive when c is left of the ray a -> b.
+    static fn area(ax : f32, ay : f32, bx : f32, by : f32, cx : f32, cy : f32) : f32 {
+        return (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
+    }
+
+    static fn same(ax : f32, ay : f32, bx : f32, by : f32) : bool {
+        let dx : f32 = ax - bx;
+        let dy : f32 = ay - by;
+        return dx * dx + dy * dy <= FUNNEL_SAME * FUNNEL_SAME;
+    }
+}

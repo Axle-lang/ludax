@@ -1,0 +1,161 @@
+// sleeper — puts resting groups of bodies to sleep and wakes them when something touches them.
+//
+// A body is resting when both its speeds stay under the thresholds; a timer counts how long. Bodies that touch
+// each other (through contacts or joints) form an island, and an island sleeps only when every dynamic body in
+// it has rested long enough, so a stack never loses its top while the bottom still settles. A sleeping body
+// keeps its place, takes no part in the simulation and costs nothing until an awake body touches it; then the
+// whole island it belongs to wakes together. Static bodies never join an island, and a moving kinematic body
+// keeps whatever touches it awake.
+
+use crate::core::math::dvec3::DVec3;
+use crate::sim::kinetic::body_store::BodyStore;
+use crate::sim::kinetic::contact_set::{ContactSet, Manifold};
+use crate::sim::kinetic::joint_set::{Joint, JointSet};
+use crate::sim::kinetic::settings::PhysicsSettings;
+
+/** Sleep bookkeeping for a physics world. */
+pub class Sleeper {
+    /** Wakes the body in slot `i` and every body that fell asleep in the same island. */
+    pub static fn wakeIsland(s : BodyStore, i : i32) : void {
+        let id : i32 = s.island.get(i);
+        s.wake(i);
+        if (id == 0) {
+            return;
+        }
+        for (k of 0..s.slotCount()) {
+            if (s.isLive(k) && s.asleep.get(k) && s.island.get(k) == id) {
+                s.wake(k);
+                s.island.set(k, 0);
+            }
+        }
+        s.island.set(i, 0);
+    }
+
+    // The root of slot `i` in the union-find forest, with path halving.
+    static fn find(parent : i32[], i : i32) : i32 {
+        let mut x : i32 = i;
+        while (parent[x as i64] != x) {
+            parent[x as i64] = parent[parent[x as i64] as i64];
+            x = parent[x as i64];
+        }
+        return x;
+    }
+
+    // Joins the islands of `a` and `b`; the lower root wins so the result does not depend on call order.
+    static fn join(parent : i32[], a : i32, b : i32) : void {
+        let ra : i32 = Sleeper::find(parent, a);
+        let rb : i32 = Sleeper::find(parent, b);
+        if (ra < rb) {
+            parent[rb as i64] = ra;
+        } else if (rb < ra) {
+            parent[ra as i64] = rb;
+        }
+    }
+
+    /** Advances the rest timers and puts the islands that have rested long enough to sleep. `nextIsland` numbers them. */
+    pub static fn update(
+        s : BodyStore,
+        cs : ContactSet,
+        js : JointSet,
+        cfg : PhysicsSettings,
+        dt : f64,
+        nextIsland : i32
+    ) : i32 {
+        if (!cfg.sleeping) {
+            return nextIsland;
+        }
+        let n : i32 = s.slotCount();
+        let mut parent : i32[] = malloc<i32>((n + 1) as i64);
+        let mut ready : i32[] = malloc<i32>((n + 1) as i64);
+        for (i of 0..n) {
+            parent[i as i64] = i;
+            ready[i as i64] = 1;
+        }
+        for (i of 0..n) {
+            if (!s.isLive(i) || !s.isDynamic(i) || s.asleep.get(i)) {
+                continue;
+            }
+            let calm : bool = s.lin.get(i).length() < cfg.sleepLinearSpeed
+                && s.ang.get(i).length() < cfg.sleepAngularSpeed;
+            if (calm && s.canSleep.get(i)) {
+                s.sleepTimer.set(i, s.sleepTimer.get(i) + dt);
+            } else {
+                s.sleepTimer.set(i, 0.0);
+            }
+        }
+        for (m of 0..cs.manifolds.len()) {
+            let mf : Manifold = cs.manifolds.get(m);
+            Sleeper::link(s, parent, ready, mf.a, mf.b);
+        }
+        for (j of 0..js.items.len()) {
+            let jt : Joint = js.items.get(j);
+            if (jt.active) {
+                Sleeper::link(s, parent, ready, jt.a, jt.b);
+            }
+        }
+        // An island is ready when none of its members is unready; propagate to the roots.
+        let mut blocked : i32[] = malloc<i32>((n + 1) as i64);
+        for (i of 0..n) {
+            blocked[i as i64] = 0;
+        }
+        for (i of 0..n) {
+            if (!s.isLive(i) || !s.isDynamic(i) || s.asleep.get(i)) {
+                continue;
+            }
+            if (s.sleepTimer.get(i) < cfg.sleepTime || ready[i as i64] == 0) {
+                blocked[Sleeper::find(parent, i) as i64] = 1;
+            }
+        }
+        let mut issued : i32 = nextIsland;
+        let mut idOf : i32[] = malloc<i32>((n + 1) as i64);
+        for (i of 0..n) {
+            idOf[i as i64] = 0;
+        }
+        for (i of 0..n) {
+            if (!s.isLive(i) || !s.isDynamic(i) || s.asleep.get(i)) {
+                continue;
+            }
+            let root : i32 = Sleeper::find(parent, i);
+            if (blocked[root as i64] != 0) {
+                continue;
+            }
+            if (idOf[root as i64] == 0) {
+                issued = issued + 1;
+                idOf[root as i64] = issued;
+            }
+            s.asleep.set(i, true);
+            s.island.set(i, idOf[root as i64]);
+            s.lin.set(i, DVec3::zero());
+            s.ang.set(i, DVec3::zero());
+            s.prevLin.set(i, DVec3::zero());
+            s.prevAng.set(i, DVec3::zero());
+        }
+        return issued;
+    }
+
+    // A contact or joint between two bodies: dynamic ones share an island; a moving kinematic one keeps the
+    // dynamic body awake; static ones and the world do nothing.
+    static fn link(s : BodyStore, parent : i32[], ready : i32[], a : i32, b : i32) : void {
+        if (a < 0 || b < 0) {
+            return;
+        }
+        let da : bool = s.isDynamic(a);
+        let db : bool = s.isDynamic(b);
+        if (da && db) {
+            if (!s.asleep.get(a) && !s.asleep.get(b)) {
+                Sleeper::join(parent, a, b);
+            }
+            return;
+        }
+        if (da && s.isKinematic(b) && Sleeper::moving(s, b)) {
+            ready[a as i64] = 0;
+        }
+        if (db && s.isKinematic(a) && Sleeper::moving(s, a)) {
+            ready[b as i64] = 0;
+        }
+    }
+
+    static fn moving(s : BodyStore, k : i32) : bool {
+        return s.lin.get(k).lengthSquared() > 0.0 || s.ang.get(k).lengthSquared() > 0.0;
+    }
+}

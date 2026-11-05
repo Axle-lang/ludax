@@ -1,0 +1,160 @@
+// spatial — where a sound is relative to the listener, and what that does to it.
+//
+// Four effects, each a small pure function so the numbers can be tested one by one: distance attenuation (four
+// models, OpenAL's conventions), equal-power panning by azimuth, the Doppler pitch ratio from relative velocity,
+// and a low-pass amount that grows with distance (air absorbs high frequencies first). `AudioSpatial::solve`
+// combines them for one emitter and one listener. Everything is in f32 and uses the deterministic trig of the
+// core, so the same scene sounds the same on every machine.
+
+use crate::core::math::scalar::PI;
+use crate::core::math::trig::{sin, cos};
+use crate::core::math::vec3::Vec3;
+use crate::sim::audio::amath::AudioMath;
+
+/** Speed of sound in air at 20 C, metres per second. */
+pub const AUDIO_SPEED_OF_SOUND : f32 = 343.0;
+
+/** How loudness falls with distance. Between `minDistance` and `maxDistance` for all models; beyond max the gain stays at its max-distance value. */
+pub enum AudioAttenuation : i8 {
+    /** No attenuation at all. */
+    None = 0,
+    /** min / (min + rolloff * (d - min)): the physical 1/r law for rolloff 1. */
+    Inverse = 1,
+    /** 1 - rolloff * (d - min) / (max - min): a straight ramp, silent at max for rolloff 1. */
+    Linear = 2,
+    /** (d / min) ^ -rolloff: a power law. */
+    Exponential = 3,
+
+    /** The gain (0..1) at `distance`; 1 at or inside `minDistance`. */
+    pub fn gain(self, distance : f32, minDistance : f32, maxDistance : f32, rolloff : f32) : f32 {
+        let lo : f32 = AudioMath::clamp(minDistance, 0.0001, 1000000.0);
+        let hi : f32 = AudioMath::clamp(maxDistance, lo, 1000000.0);
+        let d : f32 = AudioMath::clamp(distance, lo, hi);
+        return match self {
+            AudioAttenuation::None => 1.0,
+            AudioAttenuation::Inverse => lo / (lo + rolloff * (d - lo)),
+            AudioAttenuation::Linear => AudioMath::clamp(
+                (1.0 as f32) - rolloff * (d - lo) / AudioMath::clamp(hi - lo, 0.0001, 1000000.0),
+                0.0,
+                1.0
+            ),
+            AudioAttenuation::Exponential => AudioMath::pow(
+                d as f64 / lo as f64,
+                0.0 - rolloff as f64
+            ) as f32,
+        };
+    }
+}
+
+/** The ears: where they are, where they point and how fast they move. */
+pub struct AudioListener {
+    /** World position. */
+    pub position : Vec3 = Vec3 { x: 0.0, y: 0.0, z: 0.0 };
+
+    /** World velocity, metres per second. */
+    pub velocity : Vec3 = Vec3 { x: 0.0, y: 0.0, z: 0.0 };
+
+    /** Unit vector the listener faces. */
+    pub forward : Vec3 = Vec3 { x: 0.0, y: 0.0, z: -1.0 };
+
+    /** Unit vector pointing up; the listener's right is `forward x up`. */
+    pub up : Vec3 = Vec3 { x: 0.0, y: 1.0, z: 0.0 };
+}
+
+/** A sound source in the world. */
+pub struct AudioEmitter {
+    /** World position. */
+    pub position : Vec3 = Vec3 { x: 0.0, y: 0.0, z: 0.0 };
+
+    /** World velocity, metres per second (drives Doppler). */
+    pub velocity : Vec3 = Vec3 { x: 0.0, y: 0.0, z: 0.0 };
+
+    /** Distance inside which the sound is at full level. */
+    pub minDistance : f32 = 1.0;
+
+    /** Distance at which attenuation stops falling (and the low-pass is fully closed). */
+    pub maxDistance : f32 = 50.0;
+
+    /** How fast the level falls; 1 is the model's natural rate. */
+    pub rolloff : f32 = 1.0;
+
+    /** The distance law. */
+    pub model : AudioAttenuation = AudioAttenuation::Inverse;
+
+    /** Scales Doppler shift: 0 off, 1 physical. */
+    pub doppler : f32 = 1.0;
+}
+
+/** What the world does to one emitter, as heard by one listener. */
+pub struct AudioSpatialResult {
+    /** Distance attenuation, 0..1. */
+    pub gain : f32 = 1.0;
+
+    /** Left-right position, -1 (left) to 1 (right). */
+    pub pan : f32 = 0.0;
+
+    /** Pitch ratio from Doppler; 1 means no shift. */
+    pub doppler : f32 = 1.0;
+
+    /** How closed the low-pass is: 0 open, 1 fully damped. */
+    pub damping : f32 = 0.0;
+
+    /** Distance between emitter and listener. */
+    pub distance : f32 = 0.0;
+}
+
+/** Pure functions of the spatial model. */
+pub class AudioSpatial {
+    /** Left and right gains for a pan position -1..1; L^2 + R^2 = 1 everywhere. Returns (left, right) in x, y. */
+    pub static fn panGains(pan : f32) : Vec3 {
+        let p : f32 = AudioMath::clamp(pan, -1.0, 1.0);
+        let angle : f32 = (p + (1.0 as f32)) * (PI * (0.25 as f32));
+        return Vec3 { x: cos(angle), y: sin(angle), z: 0.0 };
+    }
+
+    /**
+     * Frequency ratio heard by a listener moving at `listenerSpeed` and a source moving at `sourceSpeed`, both
+     * measured along the line from listener to source (positive = away from the listener). Speeds are limited to
+     * 90% of `c` so the ratio stays finite.
+     */
+    pub static fn dopplerRatio(listenerSpeed : f32, sourceSpeed : f32, c : f32) : f32 {
+        let limit : f32 = c * (0.9 as f32);
+        let vl : f32 = AudioMath::clamp(listenerSpeed, -limit, limit);
+        let vs : f32 = AudioMath::clamp(sourceSpeed, -limit, limit);
+        return (c + vl) / (c + vs);
+    }
+
+    /** The azimuth of `direction` seen from `l`, as a pan value: sine of the angle from straight ahead, right positive. */
+    pub static fn panOf(l : AudioListener, direction : Vec3) : f32 {
+        let len : f32 = direction.length();
+        if (len < 0.0001) {
+            return 0.0;
+        }
+        let right : Vec3 = l.forward.cross(l.up).normalized();
+        return AudioMath::clamp(direction.dot(right) / len, -1.0, 1.0);
+    }
+
+    /** Everything the listener hears of `e`. */
+    pub static fn solve(l : AudioListener, e : AudioEmitter) : AudioSpatialResult {
+        let dir : Vec3 = e.position.minus(l.position);
+        let dist : f32 = dir.length();
+        let mut r : AudioSpatialResult = AudioSpatialResult {
+            gain: 1.0,
+            pan: 0.0,
+            doppler: 1.0,
+            damping: 0.0,
+            distance: dist,
+        };
+        r.gain = e.model.gain(dist, e.minDistance, e.maxDistance, e.rolloff);
+        r.pan = AudioSpatial::panOf(l, dir);
+        let span : f32 = AudioMath::clamp(e.maxDistance - e.minDistance, 0.0001, 1000000.0);
+        r.damping = AudioMath::clamp((dist - e.minDistance) / span, 0.0, 1.0);
+        if (dist > 0.0001 && e.doppler > 0.0) {
+            let u : Vec3 = dir.scale((1.0 as f32) / dist);
+            let vs : f32 = e.velocity.dot(u) * e.doppler;
+            let vl : f32 = l.velocity.dot(u) * e.doppler;
+            r.doppler = AudioSpatial::dopplerRatio(vl, vs, AUDIO_SPEED_OF_SOUND);
+        }
+        return r;
+    }
+}

@@ -1,0 +1,366 @@
+// animator — a state machine over clips with crossfades between states.
+//
+// States hold a clip and a playback speed. Transitions say "from this state (or any) to that one, fading for so
+// many seconds, when this condition on a parameter holds"; the first transition of the current state, in the
+// order they were added, whose condition holds starts the crossfade. Parameters are floats by name (a bool is
+// 0 or 1) set by the game before `update`.
+//
+// `update(dt)` is the only thing that moves time, and it moves it by exactly `dt * speed`: no wall clock, no
+// hidden step, so feeding it a fixed step gives the same poses on every run. During a crossfade both the
+// outgoing and the incoming state keep playing and the result is `lerp(outgoing, incoming, w)` with `w` rising
+// from 0 to 1 over the fade; at `w = 0` the pose is the outgoing clip's own and at `w = 1` the incoming one's.
+// A transition cannot start while another fade is running (the first one finishes), which keeps the weights a
+// pair that sums to 1 and the pose easy to predict.
+//
+// Each update also reports the events the clips crossed (all states that were playing) and the root motion of
+// the optional root bone, blended with the same weights.
+//
+// The animator copies the bind pose of the skeleton it is built from and does not keep the skeleton. States
+// consume the clips they are given.
+
+use std::ffi::runtime::panicMsg;
+
+use crate::core::collections::vec::Vec;
+use crate::core::id::string_id::{StringId, StringInterner};
+use crate::sim::animation::blend::PoseBlend;
+use crate::sim::animation::clip::AnimationClip;
+use crate::sim::animation::clip_events::{ClipEvents, EventBuffer};
+use crate::sim::animation::root_motion::{RootMotion, RootDelta};
+use crate::sim::animation::skeleton::{Skeleton, Pose};
+
+// How many parameters and states an animator holds.
+const ANIMATOR_MAX_PARAMS : i32 = 32;
+const ANIMATOR_MAX_STATES : i32 = 32;
+
+/** What must hold for a transition to start. */
+pub enum AnimCond : i8 {
+    /** Always: the state leaves as soon as it is evaluated (after one update). */
+    Always = 0,
+    /** The parameter is greater than the threshold. */
+    Greater = 1,
+    /** The parameter is less than the threshold. */
+    Less = 2,
+    /** The parameter is not zero (a true bool). */
+    IsTrue = 3,
+    /** The parameter is zero (a false bool). */
+    IsFalse = 4,
+    /** The state's clip does not loop and has played to its end. */
+    Finished = 5,
+}
+
+/** One edge of the state machine. */
+pub struct AnimTransition {
+    /** The state it leaves, or -1 for any state. */
+    pub from : i32 = -1;
+
+    /** The state it enters. */
+    pub to : i32 = 0;
+
+    /** Seconds of crossfade; 0 switches at once. */
+    pub duration : f32 = 0.0;
+
+    /** What must hold. */
+    pub cond : AnimCond = AnimCond::Always;
+
+    /** The parameter the condition reads (ignored by `Always` and `Finished`). */
+    pub param : i32 = 0;
+
+    /** The value `Greater` and `Less` compare with. */
+    pub threshold : f32 = 0.0;
+}
+
+/** Plays clips through a state machine and produces a pose. */
+pub class Animator {
+    states       : StringInterner;
+    params       : StringInterner;
+    clips        : AnimationClip[];
+    speeds       : f32[];
+    values       : f32[];
+    transitions  : Vec<AnimTransition>;
+    bind         : Pose;
+    fromPose     : Pose;
+    toPose       : Pose;
+    result       : Pose;
+    fired        : EventBuffer;
+    motion       : RootDelta;
+    rootBone     : i32 = -1;
+    timeScale    : f32 = 1.0;
+    current      : i32 = -1;
+    currentTime  : f64 = 0.0;
+    previous     : i32 = -1;
+    previousTime : f64 = 0.0;
+    fadeLength   : f32 = 0.0;
+    fadeTime     : f32 = 0.0;
+
+    /** An animator for `skeleton` with no states; its pose is the bind pose until a state plays. */
+    constructor(skeleton : Skeleton) {
+        self.states = new StringInterner();
+        self.params = new StringInterner();
+        self.clips = malloc<AnimationClip>(ANIMATOR_MAX_STATES as i64);
+        self.speeds = malloc<f32>(ANIMATOR_MAX_STATES as i64);
+        self.values = malloc<f32>(ANIMATOR_MAX_PARAMS as i64);
+        for (i of 0..ANIMATOR_MAX_PARAMS) {
+            self.values[i] = 0.0;
+        }
+        self.transitions = new Vec<AnimTransition>();
+        self.bind = Pose::bindOf(skeleton);
+        self.fromPose = Pose::bindOf(skeleton);
+        self.toPose = Pose::bindOf(skeleton);
+        self.result = Pose::bindOf(skeleton);
+        self.fired = new EventBuffer();
+        self.motion = RootDelta::none();
+    }
+
+    /** Adds a state playing `clip` at `speed` (1 is normal). Returns its index, or -1 when the name is taken or the animator is full. The clip is consumed. */
+    pub fn addState(mut self, name : string, own clip : AnimationClip, speed : f32) : i32 {
+        if (self.states.len() >= ANIMATOR_MAX_STATES || !self.states.find(name).isNone()) {
+            return -1;
+        }
+        let i : i32 = self.states.intern(name).raw;
+        self.clips[i] = clip;
+        self.speeds[i] = speed;
+        if (self.current < 0) {
+            self.current = i;
+            self.currentTime = 0.0;
+        }
+        return i;
+    }
+
+    /** The index of the state called `name`, or -1. */
+    pub fn stateNamed(self, name : string) : i32 {
+        let id : StringId = self.states.find(name);
+        if (id.isNone()) {
+            return -1;
+        }
+        return id.raw;
+    }
+
+    /** Declares the parameter `name` with a starting value; returns its index (the existing one if declared). -1 when full. */
+    pub fn declare(mut self, name : string, value : f32) : i32 {
+        let known : StringId = self.params.find(name);
+        if (!known.isNone()) {
+            self.values[known.raw] = value;
+            return known.raw;
+        }
+        if (self.params.len() >= ANIMATOR_MAX_PARAMS) {
+            return -1;
+        }
+        let i : i32 = self.params.intern(name).raw;
+        self.values[i] = value;
+        return i;
+    }
+
+    /** Sets a float parameter; an undeclared name is declared. */
+    pub fn setFloat(mut self, name : string, value : f32) : void {
+        self.declare(name, value);
+    }
+
+    /** Sets a bool parameter (stored as 1 or 0). */
+    pub fn setBool(mut self, name : string, value : bool) : void {
+        let mut v : f32 = 0.0;
+        if (value) {
+            v = 1.0;
+        }
+        self.declare(name, v);
+    }
+
+    /** A parameter's value; 0 when it was never declared. */
+    pub fn getFloat(self, name : string) : f32 {
+        let id : StringId = self.params.find(name);
+        if (id.isNone()) {
+            return 0.0;
+        }
+        return self.values[id.raw];
+    }
+
+    /** Adds a transition (see `AnimTransition`). */
+    pub fn addTransition(mut self, t : AnimTransition) : void {
+        self.transitions.push(t);
+    }
+
+    /** Sets the speed of everything this animator plays (1 normal, 0 paused, 2 double). */
+    pub fn setSpeed(mut self, speed : f32) : void {
+        if (speed >= 0.0) {
+            self.timeScale = speed;
+        }
+    }
+
+    /** Names the bone whose movement `rootMotion` reports; -1 for none. */
+    pub fn setRootBone(mut self, bone : i32) : void {
+        self.rootBone = bone;
+    }
+
+    /** Starts a crossfade to `state` now, whatever the transitions say; false for an unknown state. */
+    pub fn crossFade(mut self, state : i32, seconds : f32) : bool {
+        if (state < 0 || state >= self.states.len()) {
+            return false;
+        }
+        if (self.current < 0) {
+            self.current = state;
+            self.currentTime = 0.0;
+            return true;
+        }
+        self.begin(state, seconds);
+        return true;
+    }
+
+    /** Advances the animation by `dt` seconds (times the speed) and recomputes the pose. */
+    pub fn update(mut self, dt : f32) : void {
+        self.fired.clear();
+        self.motion = RootDelta::none();
+        if (self.current < 0) {
+            return;
+        }
+        if (dt > 0.0 && self.timeScale > 0.0) {
+            self.advance(dt * self.timeScale);
+            self.chooseTransition();
+        }
+        self.evaluate();
+    }
+
+    /** The pose as of the last update (call `update(skeleton)` on it for matrices). */
+    pub fn pose(self) : Pose {
+        return self.result;
+    }
+
+    /** The index of the state playing (or fading in), or -1. */
+    pub fn currentState(self) : i32 {
+        return self.current;
+    }
+
+    /** The state fading out, or -1 when no fade is running. */
+    pub fn previousState(self) : i32 {
+        return self.previous;
+    }
+
+    /** True while a crossfade runs. */
+    pub fn isFading(self) : bool {
+        return self.previous >= 0;
+    }
+
+    /** The weight of the incoming state: 1 when no fade runs, else rising from 0 to 1. */
+    pub fn currentWeight(self) : f32 {
+        if (self.previous < 0) {
+            return 1.0;
+        }
+        let mut w : f32 = 1.0;
+        if (self.fadeLength > 0.0) {
+            w = self.fadeTime / self.fadeLength;
+        }
+        if (w > 1.0) {
+            w = 1.0;
+        }
+        return w;
+    }
+
+    /** The weight of the outgoing state: 0 when no fade runs, else falling from 1 to 0. */
+    pub fn previousWeight(self) : f32 {
+        if (self.previous < 0) {
+            return 0.0;
+        }
+        return 1.0 - self.currentWeight();
+    }
+
+    /** The unwrapped playback clock of the current state in seconds of clip time. */
+    pub fn stateClock(self) : f64 {
+        return self.currentTime;
+    }
+
+    /** The events the clips fired during the last update. */
+    pub fn events(self) : EventBuffer {
+        return self.fired;
+    }
+
+    /** The root bone's movement during the last update, blended like the pose. */
+    pub fn rootMotion(self) : RootDelta {
+        return self.motion;
+    }
+
+    fn advance(mut self, step : f32) : void {
+        let dtCur : f64 = (step * self.speeds[self.current]) as f64;
+        let from : f64 = self.currentTime;
+        let to : f64 = from + dtCur;
+        let clip : AnimationClip = self.clips[self.current];
+        ClipEvents::collect(clip, from, to, self.fired);
+        let mut deltaCur : RootDelta = RootDelta::none();
+        if (self.rootBone >= 0) {
+            deltaCur = RootMotion::between(clip, self.rootBone, from, to);
+        }
+        self.currentTime = to;
+        if (self.previous < 0) {
+            self.motion = deltaCur;
+            return;
+        }
+        let dtPrev : f64 = (step * self.speeds[self.previous]) as f64;
+        let pFrom : f64 = self.previousTime;
+        let pTo : f64 = pFrom + dtPrev;
+        let pClip : AnimationClip = self.clips[self.previous];
+        ClipEvents::collect(pClip, pFrom, pTo, self.fired);
+        self.previousTime = pTo;
+        self.fadeTime = self.fadeTime + step;
+        let w : f32 = self.currentWeight();
+        if (self.rootBone >= 0) {
+            let deltaPrev : RootDelta = RootMotion::between(pClip, self.rootBone, pFrom, pTo);
+            self.motion = deltaPrev.weighted(1.0 - w).then(deltaCur.weighted(w));
+        }
+        if (self.fadeTime >= self.fadeLength) {
+            self.previous = -1;
+        }
+    }
+
+    fn chooseTransition(mut self) : void {
+        if (self.previous >= 0) {
+            return;
+        }
+        for (i of 0..self.transitions.len()) {
+            let t : AnimTransition = self.transitions.get(i);
+            if ((t.from == self.current || t.from < 0) && t.to != self.current && self.holds(t)) {
+                self.begin(t.to, t.duration);
+                return;
+            }
+        }
+    }
+
+    fn holds(self, t : AnimTransition) : bool {
+        return match t.cond {
+            AnimCond::Always => true,
+            AnimCond::Greater => self.values[t.param] > t.threshold,
+            AnimCond::Less => self.values[t.param] < t.threshold,
+            AnimCond::IsTrue => self.values[t.param] != 0.0,
+            AnimCond::IsFalse => self.values[t.param] == 0.0,
+            AnimCond::Finished => self.finished(),
+        };
+    }
+
+    fn finished(self) : bool {
+        let clip : AnimationClip = self.clips[self.current];
+        return !clip.isLooping() && self.currentTime >= (clip.duration() as f64);
+    }
+
+    fn begin(mut self, state : i32, seconds : f32) : void {
+        if (seconds > 0.0) {
+            self.previous = self.current;
+            self.previousTime = self.currentTime;
+            self.fadeLength = seconds;
+            self.fadeTime = 0.0;
+        } else {
+            self.previous = -1;
+        }
+        self.current = state;
+        self.currentTime = 0.0;
+    }
+
+    fn evaluate(mut self) : void {
+        self.toPose.copyFrom(self.bind);
+        let clip : AnimationClip = self.clips[self.current];
+        clip.sampleClock(self.currentTime, self.toPose);
+        if (self.previous < 0) {
+            self.result.copyFrom(self.toPose);
+            return;
+        }
+        self.fromPose.copyFrom(self.bind);
+        let outgoing : AnimationClip = self.clips[self.previous];
+        outgoing.sampleClock(self.previousTime, self.fromPose);
+        PoseBlend::lerp(self.fromPose, self.toPose, self.currentWeight(), self.result);
+    }
+}

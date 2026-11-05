@@ -1,0 +1,146 @@
+// flow_field — a Dijkstra map towards one or more goals, for many agents at once.
+//
+// A* answers one agent's question; when fifty agents head for the same place, one sweep from the goal answers
+// all of them. `rebuild` runs Dijkstra outward from the goal cells over the same moves and costs as the
+// pathfinder, storing for every reachable cell the cost still to pay and the neighbouring cell to step to. An
+// agent then needs only a table lookup per step: `stepX`/`stepY` give the direction, `costAt` the distance.
+//
+// The field remembers the map's `revision` it was built at; when obstacles move, `isStale` says so and a
+// `rebuild` brings it up to date. Ties are resolved by the heap's insertion order, so the field is the same on
+// every run. Costs equal the pathfinder's: `costAt(start)` is the cost of the A* path from start to the goal.
+
+use std::ffi::runtime::panicMsg;
+
+use crate::core::collections::heap::Heap;
+use crate::sim::navigation::grid_map::GridMap;
+
+/** Cost to goal and the way there, for every cell of a grid. */
+pub class FlowField {
+    w     : i32;
+    h     : i32;
+    dist  : i32[];
+    next  : i32[];
+    built : i32 = -1;
+    open  : Heap<i32>;
+
+    /** A field for grids of the size of `map`, with no goal yet: everything unreachable. */
+    constructor(map : GridMap) {
+        self.w = map.width();
+        self.h = map.height();
+        let n : i64 = (self.w * self.h) as i64;
+        self.dist = malloc<i32>(n);
+        self.next = malloc<i32>(n);
+        for (i of 0..(self.w * self.h)) {
+            self.dist[i] = -1;
+            self.next[i] = -1;
+        }
+        self.open = new Heap<i32>();
+    }
+
+    /**
+     * Recomputes the field for the goal cells given as parallel arrays `gxs`/`gys` of `count` entries (blocked
+     * goals are skipped). Costs and directions of every cell reachable from a goal are written; the others
+     * read as unreachable.
+     */
+    pub fn rebuild(mut self, map : GridMap, gxs : i32[], gys : i32[], count : i32) : void {
+        if (map.width() != self.w || map.height() != self.h) {
+            panicMsg("FlowField: map size differs from the field's");
+        }
+        for (i of 0..(self.w * self.h)) {
+            self.dist[i] = -1;
+            self.next[i] = -1;
+        }
+        self.open.clear();
+        for (i of 0..count) {
+            if (map.isWalkable(gxs[i], gys[i])) {
+                let at : i32 = map.index(gxs[i], gys[i]);
+                if (self.dist[at] != 0) {
+                    self.dist[at] = 0;
+                    self.open.push(0, at);
+                }
+            }
+        }
+        let dirs : i32 = map.directions();
+        while (!self.open.isEmpty()) {
+            let key : i64 = self.open.peekKey();
+            let here : i32 = self.open.pop();
+            if ((key as i32) != self.dist[here]) {
+                continue;
+            }
+            let x : i32 = here % self.w;
+            let y : i32 = here / self.w;
+            for (k of 0..dirs) {
+                // The move we relax is from the neighbour (px, py) onto this cell, so it runs by (-dx, -dy).
+                let dx : i32 = GridMap::dirX(k);
+                let dy : i32 = GridMap::dirY(k);
+                let px : i32 = x + dx;
+                let py : i32 = y + dy;
+                if (!map.isWalkable(px, py) || !map.canStep(px, py, -dx, -dy)) {
+                    continue;
+                }
+                let step : i32 = map.stepCost(px, py, -dx, -dy);
+                let nd : i32 = self.dist[here] + step;
+                let p : i32 = map.index(px, py);
+                if (self.dist[p] < 0 || nd < self.dist[p]) {
+                    self.dist[p] = nd;
+                    self.next[p] = here;
+                    self.open.push(nd as i64, p);
+                }
+            }
+        }
+        self.built = map.revision();
+    }
+
+    /** Builds the field for a single goal cell. */
+    pub fn rebuildFor(mut self, map : GridMap, gx : i32, gy : i32) : void {
+        let mut xs : i32[] = malloc<i32>(1);
+        let mut ys : i32[] = malloc<i32>(1);
+        xs[0] = gx;
+        ys[0] = gy;
+        self.rebuild(map, xs, ys, 1);
+    }
+
+    /** True when `map` has changed since the field was built (or it was never built). */
+    pub fn isStale(self, map : GridMap) : bool {
+        return self.built != map.revision();
+    }
+
+    /** The cost still to pay from the cell to the nearest goal, or -1 when no goal can be reached. */
+    pub fn costAt(self, x : i32, y : i32) : i32 {
+        if (x < 0 || y < 0 || x >= self.w || y >= self.h) {
+            return -1;
+        }
+        return self.dist[y * self.w + x];
+    }
+
+    /** True when a goal can be reached from the cell. */
+    pub fn reachable(self, x : i32, y : i32) : bool {
+        return self.costAt(x, y) >= 0;
+    }
+
+    /** The column step (-1, 0 or 1) an agent on the cell takes towards the goal; 0 on a goal or when unreachable. */
+    pub fn stepX(self, x : i32, y : i32) : i32 {
+        let n : i32 = self.nextIndex(x, y);
+        if (n < 0) {
+            return 0;
+        }
+        return (n % self.w) - x;
+    }
+
+    /** The row step (-1, 0 or 1) an agent on the cell takes towards the goal; 0 on a goal or when unreachable. */
+    pub fn stepY(self, x : i32, y : i32) : i32 {
+        let n : i32 = self.nextIndex(x, y);
+        if (n < 0) {
+            return 0;
+        }
+        return (n / self.w) - y;
+    }
+
+    /** The row-major index of the cell to step to, or -1 on a goal or an unreachable cell. */
+    pub fn nextIndex(self, x : i32, y : i32) : i32 {
+        if (x < 0 || y < 0 || x >= self.w || y >= self.h) {
+            return -1;
+        }
+        return self.next[y * self.w + x];
+    }
+}

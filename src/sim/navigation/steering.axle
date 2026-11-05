@@ -1,0 +1,239 @@
+// steering — how an agent moves along a path without bumping into its neighbours.
+//
+// Path finding says where to go; steering says how, one step at a time. Everything here is a pure function over
+// plain structs: an agent is a position, a velocity and its limits, a behaviour returns the acceleration it
+// asks for, and `step` applies one fixed time step. No behaviour keeps state of its own, so a game can mix
+// them (`seek + separation`), clamp the sum, and replay the same steps to get the same motion.
+//
+//   * `seek` heads straight for a point at full speed; `arrive` does the same but slows down inside a radius
+//     so the agent stops on the point instead of overshooting it.
+//   * `separation` pushes away from neighbours that are too close, harder the closer they are. The neighbours
+//     are plain arrays of positions; `NeighborGrid` (neighbor_grid) finds those near an agent in one lookup.
+//   * `followPath` turns a list of corners into a moving target: it tracks which segment the agent is on and
+//     aims `lookAhead` units further along the path, which rounds corners smoothly and keeps the agent from
+//     hunting for each corner point.
+//
+// Coordinates are a plane (x, y) like the rest of the navigation code.
+
+use crate::core::math::vec2::Vec2;
+
+// Lengths below this are zero: float division by zero traps, so every divide is guarded by it.
+const STEER_TINY : f32 = 0.000001;
+
+/** A moving agent: where it is, how fast it goes and what it can do. */
+pub struct SteerAgent {
+    /** Position. */
+    pub pos : Vec2 = Vec2 { x: 0.0, y: 0.0 };
+
+    /** Velocity in units per second. */
+    pub vel : Vec2 = Vec2 { x: 0.0, y: 0.0 };
+
+    /** The speed it never exceeds. */
+    pub maxSpeed : f32 = 1.0;
+
+    /** The acceleration it never exceeds, in units per second squared. */
+    pub maxAccel : f32 = 4.0;
+
+    /** Its body radius, for games that want spacing from it (`separation` takes its own range). */
+    pub radius : f32 = 0.3;
+}
+
+/** Where `followPath` wants the agent to go next. */
+pub struct PathFollow {
+    /** The point to steer towards (on the path, `lookAhead` further than the agent's progress). */
+    pub target : Vec2 = Vec2 { x: 0.0, y: 0.0 };
+
+    /** The segment the agent is on; pass it back next time. */
+    pub segment : i32 = 0;
+
+    /** True when the agent is within the reach radius of the path's last point. */
+    pub done : bool = false;
+
+    /** The straight distance from the agent to the path's last point. */
+    pub remaining : f32 = 0.0;
+}
+
+/** Steering behaviours. */
+pub class Steering {
+    /** `v` shortened to at most `max` long. */
+    pub static fn limit(v : Vec2, max : f32) : Vec2 {
+        let len : f32 = v.length();
+        if (len <= max || len < STEER_TINY) {
+            return v;
+        }
+        return v.scale(max / len);
+    }
+
+    /** The acceleration that turns the agent's velocity towards full speed at `target`. */
+    pub static fn seek(a : SteerAgent, target : Vec2) : Vec2 {
+        let want : Vec2 = target.minus(a.pos).normalizedOr(Vec2::zero()).scale(a.maxSpeed);
+        return Steering::toward(a, want);
+    }
+
+    /**
+     * The acceleration that moves the agent's velocity to `want`: proportional to the difference, so that a
+     * difference of a full `maxSpeed` asks for the full `maxAccel` (the velocity settles in about
+     * `maxSpeed / maxAccel` seconds), and never more than `maxAccel`.
+     */
+    pub static fn toward(a : SteerAgent, want : Vec2) : Vec2 {
+        if (!(a.maxSpeed > STEER_TINY)) {
+            return Vec2::zero();
+        }
+        let gain : f32 = a.maxAccel / a.maxSpeed;
+        return Steering::limit(want.minus(a.vel).scale(gain), a.maxAccel);
+    }
+
+    /**
+     * Like `seek`, but inside `slowRadius` of the target the wanted speed falls in proportion to the distance, so
+     * the agent comes to rest on the target. A radius of zero or less is plain `seek`.
+     */
+    pub static fn arrive(a : SteerAgent, target : Vec2, slowRadius : f32) : Vec2 {
+        let to : Vec2 = target.minus(a.pos);
+        let dist : f32 = to.length();
+        if (dist < STEER_TINY) {
+            return Steering::toward(a, Vec2::zero());
+        }
+        let mut speed : f32 = a.maxSpeed;
+        if (slowRadius > 0.0 && dist < slowRadius) {
+            speed = a.maxSpeed * dist / slowRadius;
+        }
+        let want : Vec2 = to.scale(speed / dist);
+        return Steering::toward(a, want);
+    }
+
+    /**
+     * The acceleration away from neighbours closer than `range`. The neighbours are the `count` positions
+     * (`nx[i]`, `ny[i]`); `selfIndex` is the index of the agent itself among them (skipped), or -1 when it is not in
+     * the arrays. Two agents on the same spot are pushed apart in opposite directions, decided by their indices.
+     */
+    pub static fn separation(
+        a : SteerAgent,
+        nx : f32[],
+        ny : f32[],
+        count : i32,
+        selfIndex : i32,
+        range : f32
+    ) : Vec2 {
+        if (!(range > 0.0)) {
+            return Vec2::zero();
+        }
+        let mut push : Vec2 = Vec2::zero();
+        for (j of 0..count) {
+            if (j == selfIndex) {
+                continue;
+            }
+            let off : Vec2 = Vec2 { x: a.pos.x - nx[j], y: a.pos.y - ny[j] };
+            let d : f32 = off.length();
+            if (d >= range) {
+                continue;
+            }
+            let strength : f32 = (range - d) / range;
+            if (d < STEER_TINY) {
+                let mut side : f32 = 1.0;
+                if (selfIndex >= 0 && selfIndex < j) {
+                    side = -1.0;
+                }
+                push = push.plus(Vec2 { x: side * strength, y: 0.0 });
+            } else {
+                push = push.plus(off.scale(strength / d));
+            }
+        }
+        return Steering::limit(push.scale(a.maxAccel), a.maxAccel);
+    }
+
+    /**
+     * Where to steer along the path of `count` corners stored as x, y pairs in `pts`. `segment` is the value
+     * returned last time (0 to start): the agent is on the segment from corner `segment` to the next. The
+     * segment advances when the agent passes the end of it, and the target is `lookAhead` along the path from the
+     * agent's position projected onto it, never beyond the last corner. `reachRadius` sets `done`.
+     */
+    pub static fn followPath(
+        a : SteerAgent,
+        pts : f32[],
+        count : i32,
+        segment : i32,
+        lookAhead : f32,
+        reachRadius : f32
+    ) : PathFollow {
+        if (count < 1) {
+            return PathFollow { target: a.pos, segment: 0, done: true, remaining: 0.0 };
+        }
+        let last : Vec2 = Vec2 { x: pts[(count - 1) * 2], y: pts[(count - 1) * 2 + 1] };
+        let remaining : f32 = last.minus(a.pos).length();
+        if (count == 1) {
+            return PathFollow {
+                target: last,
+                segment: 0,
+                done: remaining <= reachRadius,
+                remaining: remaining,
+            };
+        }
+        let mut seg : i32 = segment;
+        if (seg < 0) {
+            seg = 0;
+        }
+        if (seg > count - 2) {
+            seg = count - 2;
+        }
+        // Move on to the next segment once the agent is past the end of this one.
+        let mut moving : bool = true;
+        while (moving && seg < count - 2) {
+            let p0 : Vec2 = Vec2 { x: pts[seg * 2], y: pts[seg * 2 + 1] };
+            let p1 : Vec2 = Vec2 { x: pts[seg * 2 + 2], y: pts[seg * 2 + 3] };
+            let along : f32 = Steering::progress(a.pos, p0, p1);
+            if (along >= 1.0) {
+                seg = seg + 1;
+            } else {
+                moving = false;
+            }
+        }
+        let p0 : Vec2 = Vec2 { x: pts[seg * 2], y: pts[seg * 2 + 1] };
+        let p1 : Vec2 = Vec2 { x: pts[seg * 2 + 2], y: pts[seg * 2 + 3] };
+        let mut t : f32 = Steering::progress(a.pos, p0, p1);
+        if (t < 0.0) {
+            t = 0.0;
+        }
+        if (t > 1.0) {
+            t = 1.0;
+        }
+        let mut cur : Vec2 = p0.lerp(p1, t);
+        let mut left : f32 = lookAhead;
+        let mut idx : i32 = seg;
+        while (left > 0.0 && idx < count - 1) {
+            let nxt : Vec2 = Vec2 { x: pts[idx * 2 + 2], y: pts[idx * 2 + 3] };
+            let gap : Vec2 = nxt.minus(cur);
+            let d : f32 = gap.length();
+            if (d >= left) {
+                cur = cur.plus(gap.scale(left / d));
+                left = 0.0;
+            } else {
+                left = left - d;
+                cur = nxt;
+                idx = idx + 1;
+            }
+        }
+        return PathFollow { target: cur, segment: seg, done: remaining <= reachRadius, remaining: remaining };
+    }
+
+    /** `a` after one time step `dt` under acceleration `accel`: velocity limited to `maxSpeed`, then position moved. */
+    pub static fn step(a : SteerAgent, accel : Vec2, dt : f32) : SteerAgent {
+        let vel : Vec2 = Steering::limit(a.vel.plus(accel.scale(dt)), a.maxSpeed);
+        return SteerAgent {
+            pos: a.pos.plus(vel.scale(dt)),
+            vel: vel,
+            maxSpeed: a.maxSpeed,
+            maxAccel: a.maxAccel,
+            radius: a.radius,
+        };
+    }
+
+    // How far along the segment p0 -> p1 the point `p` projects: 0 at p0, 1 at p1; 0 for a zero-length segment.
+    static fn progress(p : Vec2, p0 : Vec2, p1 : Vec2) : f32 {
+        let seg : Vec2 = p1.minus(p0);
+        let len2 : f32 = seg.lengthSquared();
+        if (len2 < STEER_TINY) {
+            return 1.0;
+        }
+        return p.minus(p0).dot(seg) / len2;
+    }
+}

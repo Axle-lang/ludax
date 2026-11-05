@@ -1,0 +1,362 @@
+// grid_path — A* on a `GridMap`, the path it returns, and line-of-sight smoothing.
+//
+// `GridPathfinder` runs A* with an octile (or Manhattan, without diagonals) heuristic, which never overestimates
+// because the cheapest cell costs 1. The open list is our `Heap`, ordered by `f` and, among equal `f`, by the
+// smaller remaining estimate (it dives towards the goal instead of flooding); the heap itself breaks any
+// remaining tie by insertion order. Neighbours are visited in a fixed order. So the same map, start and goal
+// always give the same path, on every run and every machine.
+//
+// The finder keeps its working arrays between calls and stamps them with a run number instead of clearing
+// them, so a query costs what it explores, not the size of the map.
+//
+// A path is a list of cells, start first. `GridPath::smoothed` pulls it straight: it keeps only the cells from
+// which the next kept cell is in clear sight (`GridLine::clear`, exact integer arithmetic), giving the corners
+// of an any-angle route over the same cells.
+
+use std::ffi::runtime::panicMsg;
+
+use crate::core::collections::heap::Heap;
+use crate::sim::navigation::grid_map::{GridMap, NAV_STEP_ORTHO, NAV_STEP_DIAG};
+
+// The estimate is capped when it breaks ties between equal f values.
+const GRID_TIE_CAP : i64 = 65535;
+
+/** A route over grid cells, start first. */
+pub class GridPath {
+    pts   : i32[];
+    room  : i32;
+    count : i32 = 0;
+    ok    : bool = false;
+    total : i32 = 0;
+
+    /** An empty path that found nothing. */
+    constructor() {
+        self.room = 16;
+        self.pts = malloc<i32>(32);
+    }
+
+    /** True when the finder reached the goal. */
+    pub fn found(self) : bool {
+        return self.ok;
+    }
+
+    /** How many cells the path lists. */
+    pub fn len(self) : i32 {
+        return self.count;
+    }
+
+    /** The column of cell `i`. */
+    pub fn xAt(self, i : i32) : i32 {
+        self.check(i);
+        return self.pts[i * 2];
+    }
+
+    /** The row of cell `i`. */
+    pub fn yAt(self, i : i32) : i32 {
+        self.check(i);
+        return self.pts[i * 2 + 1];
+    }
+
+    /** The total step cost in `NAV_STEP_ORTHO` units per plain orthogonal step (1000 = one step). */
+    pub fn cost(self) : i32 {
+        return self.total;
+    }
+
+    /** The length in cells of the polyline through the cell centres (diagonals count as the square root of two). */
+    pub fn length(self) : f32 {
+        let mut sum : f32 = 0.0;
+        for (i of 1..self.count) {
+            let dx : f32 = (self.pts[i * 2] - self.pts[i * 2 - 2]) as f32;
+            let dy : f32 = (self.pts[i * 2 + 1] - self.pts[i * 2 - 1]) as f32;
+            sum = sum + (dx * dx + dy * dy).sqrt();
+        }
+        return sum;
+    }
+
+    /** Appends a cell. */
+    pub fn push(mut self, x : i32, y : i32) : void {
+        if (self.count >= self.room) {
+            let room : i32 = self.room * 2;
+            let mut grown : i32[] = malloc<i32>((room * 2) as i64);
+            for (i of 0..(self.count * 2)) {
+                grown[i] = self.pts[i];
+            }
+            self.pts = grown;
+            self.room = room;
+        }
+        self.pts[self.count * 2] = x;
+        self.pts[self.count * 2 + 1] = y;
+        self.count = self.count + 1;
+    }
+
+    /** Marks the result as found or not, with its cost. */
+    pub fn finish(mut self, found : bool, cost : i32) : void {
+        self.ok = found;
+        self.total = cost;
+    }
+
+    /**
+     * The same route with every cell dropped that a straight line can skip: from each kept cell the farthest
+     * later cell in clear sight on `map` is next. Never passes a cell dearer than the dearest one the original
+     * path used between the two, so a detour round mud is not straightened through it.
+     */
+    pub fn smoothed(self, map : GridMap) : GridPath {
+        let mut out : GridPath = new GridPath();
+        out.finish(self.ok, self.total);
+        if (self.count == 0) {
+            return out;
+        }
+        out.push(self.pts[0], self.pts[1]);
+        let mut anchor : i32 = 0;
+        while (anchor < self.count - 1) {
+            let ax : i32 = self.pts[anchor * 2];
+            let ay : i32 = self.pts[anchor * 2 + 1];
+            let mut best : i32 = anchor + 1;
+            let mut dearest : i32 = map.costAt(self.pts[best * 2], self.pts[best * 2 + 1]);
+            let mut j : i32 = anchor + 2;
+            while (j < self.count) {
+                let c : i32 = map.costAt(self.pts[(j - 1) * 2], self.pts[(j - 1) * 2 + 1]);
+                if (c > dearest) {
+                    dearest = c;
+                }
+                let tx : i32 = self.pts[j * 2];
+                let ty : i32 = self.pts[j * 2 + 1];
+                let last : i32 = map.costAt(tx, ty);
+                if (last > dearest) {
+                    dearest = last;
+                }
+                if (GridLine::clear(map, ax, ay, tx, ty, dearest)) {
+                    best = j;
+                }
+                j = j + 1;
+            }
+            out.push(self.pts[best * 2], self.pts[best * 2 + 1]);
+            anchor = best;
+        }
+        return out;
+    }
+
+    fn check(self, i : i32) : void {
+        if (i < 0 || i >= self.count) {
+            panicMsg("GridPath: index out of range");
+        }
+    }
+}
+
+/** Straight lines over the grid. */
+pub class GridLine {
+    /**
+     * True when the straight segment from the centre of cell (`x0`, `y0`) to the centre of (`x1`, `y1`) crosses
+     * only walkable cells of cost at most `maxCost`. A segment through the exact corner shared by four cells
+     * obeys the map's corner rule. Exact: integer arithmetic only.
+     */
+    pub static fn clear(map : GridMap, x0 : i32, y0 : i32, x1 : i32, y1 : i32, maxCost : i32) : bool {
+        if (!map.isWalkable(x0, y0)) {
+            return false;
+        }
+        let nx : i32 = GridLine::absInt(x1 - x0);
+        let ny : i32 = GridLine::absInt(y1 - y0);
+        let mut sx : i32 = 1;
+        if (x1 < x0) {
+            sx = -1;
+        }
+        let mut sy : i32 = 1;
+        if (y1 < y0) {
+            sy = -1;
+        }
+        let mut x : i32 = x0;
+        let mut y : i32 = y0;
+        let mut ix : i32 = 0;
+        let mut iy : i32 = 0;
+        while (ix < nx || iy < ny) {
+            let decision : i32 = (1 + 2 * ix) * ny - (1 + 2 * iy) * nx;
+            if (decision == 0) {
+                // Exactly through the corner of four cells.
+                let a : bool = GridLine::open(map, x + sx, y, maxCost);
+                let b : bool = GridLine::open(map, x, y + sy, maxCost);
+                let allowed : bool = (a && b) || ((a || b) && map.allowsCornerCutting());
+                if (!allowed) {
+                    return false;
+                }
+                x = x + sx;
+                y = y + sy;
+                ix = ix + 1;
+                iy = iy + 1;
+            } else if (decision < 0) {
+                x = x + sx;
+                ix = ix + 1;
+            } else {
+                y = y + sy;
+                iy = iy + 1;
+            }
+            if (!GridLine::open(map, x, y, maxCost)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    static fn open(map : GridMap, x : i32, y : i32, maxCost : i32) : bool {
+        let c : i32 = map.costAt(x, y);
+        return c > 0 && c <= maxCost;
+    }
+
+    static fn absInt(v : i32) : i32 {
+        if (v < 0) {
+            return -v;
+        }
+        return v;
+    }
+}
+
+/** A* over a `GridMap`, reusing its working memory between queries. */
+pub class GridPathfinder {
+    w        : i32;
+    h        : i32;
+    g        : i32[];
+    parent   : i32[];
+    seen     : i32[];
+    closed   : i32[];
+    run      : i32 = 0;
+    open     : Heap<i32>;
+    explored : i32 = 0;
+
+    /** A finder sized for `map` (a map of another size is refused by `find`). */
+    constructor(map : GridMap) {
+        self.w = map.width();
+        self.h = map.height();
+        let n : i64 = (self.w * self.h) as i64;
+        self.g = malloc<i32>(n);
+        self.parent = malloc<i32>(n);
+        self.seen = malloc<i32>(n);
+        self.closed = malloc<i32>(n);
+        for (i of 0..(self.w * self.h)) {
+            self.seen[i] = 0;
+            self.closed[i] = 0;
+        }
+        self.open = new Heap<i32>();
+    }
+
+    /** How many cells the last query closed (a measure of the work done). */
+    pub fn expanded(self) : i32 {
+        return self.explored;
+    }
+
+    /**
+     * The cheapest route from cell (`sx`, `sy`) to (`gx`, `gy`) on `map`, or a path with `found() == false`
+     * when either cell is blocked or the goal is walled off. The path includes both ends.
+     */
+    pub fn find(mut self, map : GridMap, sx : i32, sy : i32, gx : i32, gy : i32) : GridPath {
+        if (map.width() != self.w || map.height() != self.h) {
+            panicMsg("GridPathfinder: map size differs from the finder's");
+        }
+        let mut path : GridPath = new GridPath();
+        self.explored = 0;
+        if (!map.isWalkable(sx, sy) || !map.isWalkable(gx, gy)) {
+            return path;
+        }
+        self.run = self.run + 1;
+        self.open.clear();
+        let start : i32 = map.index(sx, sy);
+        let goal : i32 = map.index(gx, gy);
+        self.g[start] = 0;
+        self.parent[start] = -1;
+        self.seen[start] = self.run;
+        self.open.push(self.key(map, 0, sx, sy, gx, gy), start);
+        let dirs : i32 = map.directions();
+        while (!self.open.isEmpty()) {
+            let here : i32 = self.open.pop();
+            if (self.closed[here] == self.run) {
+                continue;
+            }
+            self.closed[here] = self.run;
+            self.explored = self.explored + 1;
+            if (here == goal) {
+                break;
+            }
+            let x : i32 = here % self.w;
+            let y : i32 = here / self.w;
+            for (k of 0..dirs) {
+                let dx : i32 = GridMap::dirX(k);
+                let dy : i32 = GridMap::dirY(k);
+                if (!map.canStep(x, y, dx, dy)) {
+                    continue;
+                }
+                let next : i32 = map.index(x + dx, y + dy);
+                if (self.closed[next] == self.run) {
+                    continue;
+                }
+                let ng : i32 = self.g[here] + map.stepCost(x, y, dx, dy);
+                if (self.seen[next] != self.run || ng < self.g[next]) {
+                    self.seen[next] = self.run;
+                    self.g[next] = ng;
+                    self.parent[next] = here;
+                    self.open.push(self.key(map, ng, x + dx, y + dy, gx, gy), next);
+                }
+            }
+        }
+        if (self.closed[goal] != self.run) {
+            return path;
+        }
+        return self.trace(goal);
+    }
+
+    // The cells from the start to `goal`, following the parents back.
+    fn trace(self, goal : i32) : GridPath {
+        let mut count : i32 = 0;
+        let mut at : i32 = goal;
+        while (at >= 0) {
+            count = count + 1;
+            at = self.parent[at];
+        }
+        let mut path : GridPath = new GridPath();
+        let mut rev : i32[] = malloc<i32>(count as i64);
+        at = goal;
+        let mut i : i32 = 0;
+        while (at >= 0) {
+            rev[i] = at;
+            i = i + 1;
+            at = self.parent[at];
+        }
+        let mut k : i32 = count - 1;
+        while (k >= 0) {
+            path.push(rev[k] % self.w, rev[k] / self.w);
+            k = k - 1;
+        }
+        path.finish(true, self.g[goal]);
+        return path;
+    }
+
+    // The heap key: f = g + h first, then the estimate h among equal f.
+    fn key(self, map : GridMap, g : i32, x : i32, y : i32, gx : i32, gy : i32) : i64 {
+        let h : i64 = GridPathfinder::estimate(map, x, y, gx, gy);
+        let mut tie : i64 = h;
+        if (tie > GRID_TIE_CAP) {
+            tie = GRID_TIE_CAP;
+        }
+        return ((g as i64) + h) * 65536 + tie;
+    }
+
+    /** The lower bound on the cost from (`x`, `y`) to (`gx`, `gy`): octile with diagonals, Manhattan without. */
+    pub static fn estimate(map : GridMap, x : i32, y : i32, gx : i32, gy : i32) : i64 {
+        let mut dx : i64 = (gx - x) as i64;
+        let mut dy : i64 = (gy - y) as i64;
+        if (dx < 0) {
+            dx = -dx;
+        }
+        if (dy < 0) {
+            dy = -dy;
+        }
+        if (!map.allowsDiagonal()) {
+            return (dx + dy) * (NAV_STEP_ORTHO as i64);
+        }
+        let mut lo : i64 = dx;
+        let mut hi : i64 = dy;
+        if (dy < dx) {
+            lo = dy;
+            hi = dx;
+        }
+        // hi straight steps, of which lo are diagonal: diagonal costs 414 more than an orthogonal step.
+        return hi * (NAV_STEP_ORTHO as i64) + lo * ((NAV_STEP_DIAG - NAV_STEP_ORTHO) as i64);
+    }
+}
