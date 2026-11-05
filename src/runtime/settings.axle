@@ -1,0 +1,541 @@
+// settings — typed settings with defaults, ranges and a change counter.
+//
+// A game declares each setting once: its full key (`graphics.vsync`), its kind (whole number, real number,
+// switch or text), the default and, for numbers and text, the limits. From then on the value can only ever be
+// one the declaration allows: every `set...` checks the range and answers false, changing nothing, for a value
+// outside it. `version` counts accepted changes, so a system that cached something computed from a setting
+// compares one number per frame instead of re-reading every key.
+//
+// The part before the first dot of a key is its section, which is how the text format groups it; a key
+// without a dot is in the unnamed section at the top. Declaration order is the order the writer prints, so a
+// settings file written twice is the same file. `settings_text` reads and writes the file format and the
+// command line.
+
+use crate::core::collections::string_map::StringMap;
+use crate::core::collections::vec::Vec;
+use crate::core::id::string_id::{StringId, StringInterner};
+use crate::runtime::text::TextScan;
+
+/** The kind code of a whole-number setting. */
+pub const SETTING_INT : i32 = 0;
+
+/** The kind code of a real-number setting. */
+pub const SETTING_REAL : i32 = 1;
+
+/** The kind code of a true/false setting. */
+pub const SETTING_BOOL : i32 = 2;
+
+/** The kind code of a text setting. */
+pub const SETTING_TEXT : i32 = 3;
+
+// Bytes the key syntax is made of, named so `validKey` reads as the rule it is.
+const SETTING_DOT : i32 = 46;
+const SETTING_MINUS : i32 = 45;
+const SETTING_UNDERSCORE : i32 = 95;
+const SETTING_ZERO : i32 = 48;
+const SETTING_NINE : i32 = 57;
+const SETTING_UPPER_A : i32 = 65;
+const SETTING_UPPER_Z : i32 = 90;
+const SETTING_LOWER_A : i32 = 97;
+const SETTING_LOWER_Z : i32 = 122;
+
+// The bytes a text value may not hold: the file format has no way to escape them.
+const SETTING_QUOTE : i32 = 34;
+const SETTING_LINE_FEED : i32 = 10;
+const SETTING_CARRIAGE : i32 = 13;
+
+// Everything one setting is. Which fields mean something depends on `kind`.
+struct SettingRow {
+    kind    : i32;
+    section : i32;
+    text    : i32;
+    textDef : i32;
+    maxLen  : i32;
+    i       : i64;
+    iDef    : i64;
+    iLo     : i64;
+    iHi     : i64;
+    f       : f64;
+    fDef    : f64;
+    fLo     : f64;
+    fHi     : f64;
+}
+
+/** A set of declared settings and their current values. */
+pub class Settings {
+    keys     : StringMap<i32>;
+    names    : StringInterner;
+    sections : StringInterner;
+    texts    : StringInterner;
+    rows     : Vec<SettingRow>;
+    changes  : i64 = 0;
+
+    /** No settings declared. */
+    constructor() {
+        self.keys = new StringMap<i32>();
+        self.names = new StringInterner();
+        self.sections = new StringInterner();
+        self.texts = new StringInterner();
+        self.rows = new Vec<SettingRow>();
+    }
+
+    /** True when `key` is a legal key: letters, digits, `_`, `-` and dots between them, none empty. */
+    pub static fn validKey(key : string) : bool {
+        let n : i32 = key.byteLength as i32;
+        if (n == 0) {
+            return false;
+        }
+        let mut previousDot : bool = true;
+        for (i of 0..n) {
+            let b : i32 = key.byteAt(i);
+            if (b == SETTING_DOT) {
+                if (previousDot) {
+                    return false;
+                }
+                previousDot = true;
+            } else {
+                if (!Settings::isKeyChar(b)) {
+                    return false;
+                }
+                previousDot = false;
+            }
+        }
+        return !previousDot;
+    }
+
+    // Letters, digits, `_` and `-` may stand between dots.
+    static fn isKeyChar(b : i32) : bool {
+        let digit : bool = b >= SETTING_ZERO && b <= SETTING_NINE;
+        let upper : bool = b >= SETTING_UPPER_A && b <= SETTING_UPPER_Z;
+        let lower : bool = b >= SETTING_LOWER_A && b <= SETTING_LOWER_Z;
+        return digit || upper || lower || b == SETTING_UNDERSCORE || b == SETTING_MINUS;
+    }
+
+    // The section of a key: the text before its first dot, or "".
+    static fn sectionOf(key : string) : string {
+        for (i of 0..key.byteLength as i32) {
+            if (key.byteAt(i) == SETTING_DOT) {
+                return TextScan::slice(key, 0, i);
+            }
+        }
+        return "";
+    }
+
+    // Adds a row; false when the key is bad or already declared.
+    fn declare(mut self, key : string, row : SettingRow) : bool {
+        if (!Settings::validKey(key) || self.keys.has(key)) {
+            return false;
+        }
+        let mut r : SettingRow = row;
+        r.section = self.sections.intern(Settings::sectionOf(key)).raw;
+        let id : StringId = self.names.intern(key);
+        self.keys.put(key, id.raw);
+        self.rows.push(r);
+        return true;
+    }
+
+    /** Declares a whole number between `lo` and `hi` (inclusive) with default `def`; false for a bad or repeated key or a default outside the range. */
+    pub fn defineInt(mut self, key : string, def : i64, lo : i64, hi : i64) : bool {
+        if (lo > hi || def < lo || def > hi) {
+            return false;
+        }
+        return self.declare(key, Settings::intRow(def, lo, hi));
+    }
+
+    /** Declares a real number between `lo` and `hi`; false for a bad or repeated key or a default outside the range. */
+    pub fn defineReal(mut self, key : string, def : f64, lo : f64, hi : f64) : bool {
+        if (!(lo <= hi) || !(def >= lo) || !(def <= hi)) {
+            return false;
+        }
+        return self.declare(key, Settings::realRow(def, lo, hi));
+    }
+
+    /** Declares a switch. */
+    pub fn defineBool(mut self, key : string, def : bool) : bool {
+        let value : i64 = Settings::bit(def);
+        return self.declare(key, Settings::boolRow(value));
+    }
+
+    /** Declares a text of at most `maxLen` bytes, without quotes or line breaks. */
+    pub fn defineText(mut self, key : string, def : string, maxLen : i32) : bool {
+        if (maxLen < 0 || def.byteLength > maxLen as i64 || !Settings::textOk(def)) {
+            return false;
+        }
+        let id : i32 = self.texts.intern(def).raw;
+        return self.declare(key, Settings::textRow(id, maxLen));
+    }
+
+    // One row per declared kind, so no caller has to fill fields its kind does not use.
+    static fn intRow(def : i64, lo : i64, hi : i64) : SettingRow {
+        return SettingRow {
+            kind: SETTING_INT,
+            section: 0,
+            text: 0,
+            textDef: 0,
+            maxLen: 0,
+            i: def,
+            iDef: def,
+            iLo: lo,
+            iHi: hi,
+            f: 0.0,
+            fDef: 0.0,
+            fLo: 0.0,
+            fHi: 0.0,
+        };
+    }
+
+    static fn realRow(def : f64, lo : f64, hi : f64) : SettingRow {
+        return SettingRow {
+            kind: SETTING_REAL,
+            section: 0,
+            text: 0,
+            textDef: 0,
+            maxLen: 0,
+            i: 0,
+            iDef: 0,
+            iLo: 0,
+            iHi: 0,
+            f: def,
+            fDef: def,
+            fLo: lo,
+            fHi: hi,
+        };
+    }
+
+    static fn boolRow(value : i64) : SettingRow {
+        return SettingRow {
+            kind: SETTING_BOOL,
+            section: 0,
+            text: 0,
+            textDef: 0,
+            maxLen: 0,
+            i: value,
+            iDef: value,
+            iLo: 0,
+            iHi: 1,
+            f: 0.0,
+            fDef: 0.0,
+            fLo: 0.0,
+            fHi: 0.0,
+        };
+    }
+
+    static fn textRow(id : i32, maxLen : i32) : SettingRow {
+        return SettingRow {
+            kind: SETTING_TEXT,
+            section: 0,
+            text: id,
+            textDef: id,
+            maxLen: maxLen,
+            i: 0,
+            iDef: 0,
+            iLo: 0,
+            iHi: 0,
+            f: 0.0,
+            fDef: 0.0,
+            fLo: 0.0,
+            fHi: 0.0,
+        };
+    }
+
+    // True as 1, false as 0: the form a switch row stores.
+    static fn bit(v : bool) : i64 {
+        if (v) {
+            return 1;
+        }
+        return 0;
+    }
+
+    // True for a text with no quote and no line break, which the file format cannot hold.
+    static fn textOk(s : string) : bool {
+        for (i of 0..s.byteLength as i32) {
+            let b : i32 = s.byteAt(i);
+            if (b == SETTING_QUOTE || b == SETTING_LINE_FEED || b == SETTING_CARRIAGE) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /** How many settings are declared. */
+    pub fn count(self) : i32 {
+        return self.rows.len();
+    }
+
+    /** The key of setting `i`, in declaration order. */
+    pub fn keyAt(self, i : i32) : string {
+        return self.names.name(StringId { raw: i }) + "";
+    }
+
+    /** The section of setting `i` ("" for the unnamed one). */
+    pub fn sectionAt(self, i : i32) : string {
+        return self.sections.name(StringId { raw: self.rows.get(i).section }) + "";
+    }
+
+    /** How many sections there are (the unnamed one counts if any key is in it). */
+    pub fn sectionCount(self) : i32 {
+        return self.sections.len();
+    }
+
+    /** Section `s` by order of first declaration. */
+    pub fn sectionName(self, s : i32) : string {
+        return self.sections.name(StringId { raw: s }) + "";
+    }
+
+    /** The section number (order of first declaration) of setting `i`. */
+    pub fn sectionIndexAt(self, i : i32) : i32 {
+        return self.rows.get(i).section;
+    }
+
+    /** True when `key` is declared. */
+    pub fn has(self, key : string) : bool {
+        return self.keys.has(key);
+    }
+
+    /** The declaration number of `key`, or -1. */
+    pub fn indexOf(self, key : string) : i32 {
+        return self.keys.getOr(key, -1);
+    }
+
+    /** The kind code (`SETTING_INT`...) of `key`, or -1 when undeclared. */
+    pub fn kindOf(self, key : string) : i32 {
+        let at : i32 = self.indexOf(key);
+        if (at < 0) {
+            return -1;
+        }
+        return self.rows.get(at).kind;
+    }
+
+    /** The whole number under `key`, or `fallback` when it is not an int setting. */
+    pub fn getInt(self, key : string, fallback : i64) : i64 {
+        let at : i32 = self.indexOf(key);
+        if (at < 0 || self.rows.get(at).kind != SETTING_INT) {
+            return fallback;
+        }
+        return self.rows.get(at).i;
+    }
+
+    /** The real number under `key`, or `fallback`. */
+    pub fn getReal(self, key : string, fallback : f64) : f64 {
+        let at : i32 = self.indexOf(key);
+        if (at < 0 || self.rows.get(at).kind != SETTING_REAL) {
+            return fallback;
+        }
+        return self.rows.get(at).f;
+    }
+
+    /** The switch under `key`, or `fallback`. */
+    pub fn getBool(self, key : string, fallback : bool) : bool {
+        let at : i32 = self.indexOf(key);
+        if (at < 0 || self.rows.get(at).kind != SETTING_BOOL) {
+            return fallback;
+        }
+        return self.rows.get(at).i != 0;
+    }
+
+    /** The text under `key`, or `fallback`. */
+    pub fn getText(self, key : string, fallback : string) : string {
+        let at : i32 = self.indexOf(key);
+        if (at < 0 || self.rows.get(at).kind != SETTING_TEXT) {
+            return fallback + "";
+        }
+        return self.texts.name(StringId { raw: self.rows.get(at).text }) + "";
+    }
+
+    /** Sets a whole number; false (nothing changes) when `key` is not an int setting or `v` is outside its range. */
+    pub fn setInt(mut self, key : string, v : i64) : bool {
+        let at : i32 = self.indexOf(key);
+        if (at < 0) {
+            return false;
+        }
+        let mut r : SettingRow = self.rows.get(at);
+        if (r.kind != SETTING_INT || v < r.iLo || v > r.iHi) {
+            return false;
+        }
+        if (r.i != v) {
+            r.i = v;
+            self.rows.set(at, r);
+            self.changes = self.changes + 1;
+        }
+        return true;
+    }
+
+    /** Sets a real number; false when the key is not a real setting or `v` is outside its range (or not a number). */
+    pub fn setReal(mut self, key : string, v : f64) : bool {
+        let at : i32 = self.indexOf(key);
+        if (at < 0) {
+            return false;
+        }
+        let mut r : SettingRow = self.rows.get(at);
+        if (r.kind != SETTING_REAL || !(v >= r.fLo) || !(v <= r.fHi)) {
+            return false;
+        }
+        if (r.f != v) {
+            r.f = v;
+            self.rows.set(at, r);
+            self.changes = self.changes + 1;
+        }
+        return true;
+    }
+
+    /** Sets a switch. */
+    pub fn setBool(mut self, key : string, v : bool) : bool {
+        let at : i32 = self.indexOf(key);
+        if (at < 0) {
+            return false;
+        }
+        let mut r : SettingRow = self.rows.get(at);
+        if (r.kind != SETTING_BOOL) {
+            return false;
+        }
+        let want : i64 = Settings::bit(v);
+        if (r.i != want) {
+            r.i = want;
+            self.rows.set(at, r);
+            self.changes = self.changes + 1;
+        }
+        return true;
+    }
+
+    /** Sets a text; false when the key is not a text setting or `v` is too long or holds a quote or line break. */
+    pub fn setText(mut self, key : string, v : string) : bool {
+        let at : i32 = self.indexOf(key);
+        if (at < 0) {
+            return false;
+        }
+        let mut r : SettingRow = self.rows.get(at);
+        if (r.kind != SETTING_TEXT || v.byteLength > r.maxLen as i64 || !Settings::textOk(v)) {
+            return false;
+        }
+        let id : i32 = self.texts.intern(v).raw;
+        if (r.text != id) {
+            r.text = id;
+            self.rows.set(at, r);
+            self.changes = self.changes + 1;
+        }
+        return true;
+    }
+
+    /**
+     * Sets `key` from the text of its value, as the file and the command line write it. Answers "" when the
+     * value was accepted, else a sentence saying why not (and changes nothing).
+     */
+    pub fn setFromText(mut self, key : string, value : string) : string {
+        let at : i32 = self.indexOf(key);
+        if (at < 0) {
+            return "unknown setting '${key}'";
+        }
+        let r : SettingRow = self.rows.get(at);
+        if (r.kind == SETTING_INT) {
+            if (!TextScan::isInt(value)) {
+                return "'${key}' needs a whole number, not '${value}'";
+            }
+            if (!self.setInt(key, TextScan::toInt(value))) {
+                return "'${key}' must be between ${r.iLo} and ${r.iHi}";
+            }
+            return "";
+        }
+        if (r.kind == SETTING_REAL) {
+            if (!TextScan::isDecimal(value)) {
+                return "'${key}' needs a number, not '${value}'";
+            }
+            if (!self.setReal(key, TextScan::toDecimal(value))) {
+                return "'${key}' must be between ${r.fLo} and ${r.fHi}";
+            }
+            return "";
+        }
+        if (r.kind == SETTING_BOOL) {
+            let b : i32 = Settings::boolFromText(value);
+            if (b < 0) {
+                return "'${key}' needs true or false, not '${value}'";
+            }
+            self.setBool(key, b == 1);
+            return "";
+        }
+        if (!self.setText(key, value)) {
+            return "'${key}' must be at most ${r.maxLen} characters without quotes";
+        }
+        return "";
+    }
+
+    // A switch value: 1 true, 0 false, -1 neither.
+    static fn boolFromText(v : string) : i32 {
+        if (v == "true" || v == "yes" || v == "on" || v == "1") {
+            return 1;
+        }
+        if (v == "false" || v == "no" || v == "off" || v == "0") {
+            return 0;
+        }
+        return 0 - 1;
+    }
+
+    /** The value of setting `i` as the file writes it (text in quotes). */
+    pub fn valueTextAt(self, i : i32) : string {
+        let r : SettingRow = self.rows.get(i);
+        if (r.kind == SETTING_INT) {
+            return "${r.i}";
+        }
+        if (r.kind == SETTING_REAL) {
+            return "${r.f}";
+        }
+        if (r.kind == SETTING_BOOL) {
+            if (r.i != 0) {
+                return "true";
+            }
+            return "false";
+        }
+        let text : string = self.texts.name(StringId { raw: r.text });
+        return "\"${text}\"";
+    }
+
+    /** True when `key` holds its default. */
+    pub fn isDefault(self, key : string) : bool {
+        let at : i32 = self.indexOf(key);
+        if (at < 0) {
+            return true;
+        }
+        let r : SettingRow = self.rows.get(at);
+        if (r.kind == SETTING_INT || r.kind == SETTING_BOOL) {
+            return r.i == r.iDef;
+        }
+        if (r.kind == SETTING_REAL) {
+            return r.f == r.fDef;
+        }
+        return r.text == r.textDef;
+    }
+
+    /** Puts `key` back to its default; false when undeclared. */
+    pub fn reset(mut self, key : string) : bool {
+        let at : i32 = self.indexOf(key);
+        if (at < 0) {
+            return false;
+        }
+        if (self.isDefault(key)) {
+            return true;
+        }
+        let mut r : SettingRow = self.rows.get(at);
+        r.i = r.iDef;
+        r.f = r.fDef;
+        r.text = r.textDef;
+        self.rows.set(at, r);
+        self.changes = self.changes + 1;
+        return true;
+    }
+
+    /** Puts every setting back to its default. */
+    pub fn resetAll(mut self) : void {
+        for (i of 0..self.rows.len()) {
+            self.reset(self.keyAt(i));
+        }
+    }
+
+    /** Counts accepted changes since the settings were made: unchanged number, unchanged settings. */
+    pub fn version(self) : i64 {
+        return self.changes;
+    }
+
+    /** True when something changed after the version `seen` was read. */
+    pub fn changedSince(self, seen : i64) : bool {
+        return self.changes != seen;
+    }
+}

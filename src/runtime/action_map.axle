@@ -1,0 +1,220 @@
+// action_map — what the player means, not which key they pressed.
+//
+// A game asks for "jump" and "steer", never for key 32 or axis 0. An `ActionMap` holds named actions and the
+// bindings that feed them: a key, a chord (two codes together, like ctrl+S), an analog axis with a dead zone
+// and a scale, or a pair of keys standing in for an axis (A and D for steering). `evaluate` reads one
+// `InputState` and gives every action a value in [-1, 1]; an action is "down" when that value is at least
+// half. When several bindings feed one action, the strongest wins (the first on a tie), so a stick and a key
+// can steer the same wheel. Pressed and released are changes of "down" between two `evaluate` calls, so call it
+// once per simulation step.
+
+use crate::core::collections::vec::Vec;
+use crate::core::id::string_id::{StringId, StringInterner};
+use crate::core::math::scalar::{abs, clamp};
+use crate::runtime::input_state::InputState;
+
+/** An action counts as down at or above this absolute value. */
+pub const ACTION_PRESS_LEVEL : f32 = 0.5;
+
+// The four ways a binding can read the snapshot.
+enum BindKind : i8 {
+    Key = 0,
+    Chord = 1,
+    Axis = 2,
+    KeyPair = 3,
+}
+
+struct ActionBinding {
+    action : i32;
+    kind   : BindKind;
+    code   : i32;
+    other  : i32;
+    scale  : f32;
+    dead   : f32;
+}
+
+/** Named actions and the bindings that drive them. */
+pub class ActionMap {
+    names    : StringInterner;
+    binds    : Vec<ActionBinding>;
+    value    : Vec<f32>;
+    nowDown  : Vec<bool>;
+    prevDown : Vec<bool>;
+
+    /** No actions. */
+    constructor() {
+        self.names = new StringInterner();
+        self.binds = new Vec<ActionBinding>();
+        self.value = new Vec<f32>();
+        self.nowDown = new Vec<bool>();
+        self.prevDown = new Vec<bool>();
+    }
+
+    /** The number of action `name`, declaring it on first use. */
+    pub fn action(mut self, name : string) : i32 {
+        let known : StringId = self.names.find(name);
+        if (!known.isNone()) {
+            return known.raw;
+        }
+        let id : StringId = self.names.intern(name);
+        self.value.push(0.0);
+        self.nowDown.push(false);
+        self.prevDown.push(false);
+        return id.raw;
+    }
+
+    /** The number of action `name`, or -1 when it was never declared. */
+    pub fn find(self, name : string) : i32 {
+        return self.names.find(name).raw;
+    }
+
+    /** How many actions exist. */
+    pub fn count(self) : i32 {
+        return self.value.len();
+    }
+
+    /** The name of action `a`. */
+    pub fn nameOf(self, a : i32) : string {
+        return self.names.name(StringId { raw: a }) + "";
+    }
+
+    /** Action `a` is 1 while key or button `code` is down. */
+    pub fn bindKey(mut self, a : i32, code : i32) : void {
+        self.binds.push(ActionMap::binding(a, BindKind::Key, code, 0, 1.0, 0.0));
+    }
+
+    /** Action `a` is 1 while both `first` and `second` are down (a chord such as ctrl+S). */
+    pub fn bindChord(mut self, a : i32, first : i32, second : i32) : void {
+        self.binds.push(ActionMap::binding(a, BindKind::Chord, first, second, 1.0, 0.0));
+    }
+
+    /**
+     * Action `a` follows analog axis `axis` times `scale`; readings within `dead` of zero count as zero and
+     * the rest is stretched so the value still reaches the full range.
+     */
+    pub fn bindAxis(mut self, a : i32, axis : i32, scale : f32, dead : f32) : void {
+        self.binds.push(ActionMap::binding(a, BindKind::Axis, axis, 0, scale, dead));
+    }
+
+    /** Action `a` is -`scale` while `negative` is down and +`scale` while `positive` is down (both: 0). */
+    pub fn bindKeyPair(mut self, a : i32, negative : i32, positive : i32, scale : f32) : void {
+        self.binds.push(ActionMap::binding(a, BindKind::KeyPair, negative, positive, scale, 0.0));
+    }
+
+    // One binding record, so every `bind...` above reads as its own sentence.
+    static fn binding(
+        a : i32,
+        kind : BindKind,
+        code : i32,
+        other : i32,
+        scale : f32,
+        dead : f32
+    ) : ActionBinding {
+        return ActionBinding { action: a, kind: kind, code: code, other: other, scale: scale, dead: dead };
+    }
+
+    /** Removes every binding of action `a` (rebinding starts with this). */
+    pub fn clearBindings(mut self, a : i32) : void {
+        let mut i : i32 = 0;
+        while (i < self.binds.len()) {
+            if (self.binds.get(i).action == a) {
+                self.binds.removeAt(i);
+            } else {
+                i = i + 1;
+            }
+        }
+    }
+
+    /** How many bindings exist. */
+    pub fn bindingCount(self) : i32 {
+        return self.binds.len();
+    }
+
+    // The dead-zoned reading of an axis value.
+    static fn deadZone(raw : f32, dead : f32) : f32 {
+        let mag : f32 = abs(raw);
+        if (mag <= dead || dead >= 1.0) {
+            return 0.0;
+        }
+        let stretched : f32 = (mag - dead) / ((1.0 as f32) - dead);
+        return signOf(raw) * stretched;
+    }
+
+    // What one binding says about the snapshot.
+    fn read(self, b : ActionBinding, s : InputState) : f32 {
+        return match b.kind {
+            BindKind::Key => ActionMap::held(s.isDown(b.code), b.scale),
+            BindKind::Chord => ActionMap::held(s.isDown(b.code) && s.isDown(b.other), b.scale),
+            BindKind::Axis => ActionMap::deadZone(s.axis(b.code), b.dead) * b.scale,
+            BindKind::KeyPair => ActionMap::pair(s, b),
+        };
+    }
+
+    // +scale while the positive key is down, -scale while the negative one is (both cancel).
+    static fn pair(s : InputState, b : ActionBinding) : f32 {
+        let mut v : f32 = 0.0;
+        if (s.isDown(b.other)) {
+            v = v + b.scale;
+        }
+        if (s.isDown(b.code)) {
+            v = v - b.scale;
+        }
+        return v;
+    }
+
+    // A binding that answers its full scale when held and nothing when not.
+    static fn held(down : bool, scale : f32) : f32 {
+        if (down) {
+            return scale;
+        }
+        return 0.0;
+    }
+
+    /** Reads the snapshot and updates every action's value and its pressed/released state. */
+    pub fn evaluate(mut self, s : InputState) : void {
+        for (a of 0..self.value.len()) {
+            self.prevDown.set(a, self.nowDown.get(a));
+            self.value.set(a, 0.0);
+        }
+        for (i of 0..self.binds.len()) {
+            let b : ActionBinding = self.binds.get(i);
+            let v : f32 = self.read(b, s);
+            if (abs(v) > abs(self.value.get(b.action))) {
+                self.value.set(b.action, v);
+            }
+        }
+        for (a of 0..self.value.len()) {
+            let v : f32 = clamp(self.value.get(a), -1.0, 1.0);
+            self.value.set(a, v);
+            self.nowDown.set(a, abs(v) >= ACTION_PRESS_LEVEL);
+        }
+    }
+
+    /** The value of action `a` from the last `evaluate`, in [-1, 1]. */
+    pub fn valueOf(self, a : i32) : f32 {
+        return self.value.getOr(a, 0.0);
+    }
+
+    /** True while action `a` is down. */
+    pub fn isDown(self, a : i32) : bool {
+        return self.nowDown.getOr(a, false);
+    }
+
+    /** True when action `a` went down in the last `evaluate`. */
+    pub fn wasPressed(self, a : i32) : bool {
+        return self.nowDown.getOr(a, false) && !self.prevDown.getOr(a, false);
+    }
+
+    /** True when action `a` went up in the last `evaluate`. */
+    pub fn wasReleased(self, a : i32) : bool {
+        return !self.nowDown.getOr(a, false) && self.prevDown.getOr(a, false);
+    }
+}
+
+// The sign of a non-zero real: 1 or -1.
+fn signOf(v : f32) : f32 {
+    if (v < 0.0) {
+        return -1.0;
+    }
+    return 1.0;
+}

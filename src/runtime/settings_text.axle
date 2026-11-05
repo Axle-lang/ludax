@@ -1,0 +1,274 @@
+// settings_text — the settings file format and the command line.
+//
+// The file is plain text, one setting per line:
+//
+//     # a comment runs to the end of the line
+//     title = "My game"          # text may be quoted (and then may hold spaces and #)
+//     [graphics]                 # a section: the keys below are `graphics.<key>`
+//     width = 1280
+//     vsync = true
+//     [audio]
+//     master = 0.8
+//
+// `key = value` outside any section sets the key as written; inside `[section]` it sets `section.key`. A later
+// line for the same key wins. Booleans are `true`/`false` (also yes/no, on/off, 1/0). Reading goes on after a
+// bad line: every line that is fine is applied, every other one is reported with its line and column, so one
+// typo does not throw away the rest of a player's file. `write` prints every setting in declaration order,
+// grouped by section, so writing, reading and writing again gives the same text.
+//
+// On the command line `--graphics.vsync=false` sets a key and `--graphics.vsync` alone turns a switch on; an
+// argument that is no setting is reported, not ignored.
+
+use std::lang::IndexOutOfBoundsException;
+use std::sys::process::{argc, argAt};
+
+use crate::runtime::settings::{Settings, SETTING_BOOL};
+use crate::runtime::text::{ParseReport, TextScan};
+
+// The punctuation of the file format.
+const ST_SPACE : i32 = 32;
+const ST_TAB : i32 = 9;
+const ST_QUOTE : i32 = 34;
+const ST_DASH : i32 = 45;
+const ST_EQUALS : i32 = 61;
+const ST_SECTION_OPEN : i32 = 91;
+const ST_SECTION_CLOSE : i32 = 93;
+
+/** Reads and writes settings as text. */
+pub class SettingsText {
+    /** Applies the text `text` to `settings` and reports the lines that could not be applied. */
+    pub static fn read(settings : Settings, text : string) : ParseReport {
+        let report : ParseReport = new ParseReport();
+        let mut section : string = "";
+        let lines : i32 = TextScan::lineCount(text);
+        for (n of 0..lines) {
+            let raw : string = TextScan::lineAt(text, n);
+            let end : i32 = TextScan::commentStart(raw);
+            let first : i32 = SettingsText::skipSpace(raw, 0, end);
+            let last : i32 = SettingsText::trimBack(raw, first, end);
+            if (first >= last) {
+                continue;
+            }
+            let lineNo : i32 = n + 1;
+            if (raw.byteAt(first) == ST_SECTION_OPEN) {
+                section = SettingsText::readSection(raw, first, last, lineNo, report, section);
+            } else {
+                SettingsText::readPair(settings, raw, first, last, lineNo, report, section);
+            }
+        }
+        return report;
+    }
+
+    // First non-blank byte at or after `from`, up to `end`.
+    static fn skipSpace(s : string, from : i32, end : i32) : i32 {
+        let mut i : i32 = from;
+        while (i < end && (s.byteAt(i) == ST_SPACE || s.byteAt(i) == ST_TAB)) {
+            i = i + 1;
+        }
+        return i;
+    }
+
+    // One past the last non-blank byte before `end`, not before `first`.
+    static fn trimBack(s : string, first : i32, end : i32) : i32 {
+        let mut i : i32 = end;
+        while (i > first && (s.byteAt(i - 1) == ST_SPACE || s.byteAt(i - 1) == ST_TAB)) {
+            i = i - 1;
+        }
+        return i;
+    }
+
+    // `[name]`: answers the new section, or the old one when the header is bad.
+    static fn readSection(
+        raw : string,
+        first : i32,
+        last : i32,
+        lineNo : i32,
+        report : ParseReport,
+        old : string
+    ) : string {
+        if (raw.byteAt(last - 1) != ST_SECTION_CLOSE) {
+            report.add(lineNo, last + 1, "a section header must end with ']'");
+            return old;
+        }
+        let name : string = TextScan::slice(raw, first + 1, last - 1);
+        let from : i32 = SettingsText::skipSpace(name, 0, name.byteLength as i32);
+        let to : i32 = SettingsText::trimBack(name, from, name.byteLength as i32);
+        let clean : string = TextScan::slice(name, from, to);
+        if (clean.byteLength == 0) {
+            report.add(lineNo, first + 2, "a section needs a name");
+            return old;
+        }
+        if (!Settings::validKey(clean)) {
+            report.add(lineNo, first + 2 + from, "'${clean}' is not a section name");
+            return old;
+        }
+        return clean;
+    }
+
+    // `key = value`.
+    static fn readPair(
+        settings : Settings,
+        raw : string,
+        first : i32,
+        last : i32,
+        lineNo : i32,
+        report : ParseReport,
+        section : string
+    ) : void {
+        let mut eq : i32 = -1;
+        for (i of first..last) {
+            if (raw.byteAt(i) == ST_EQUALS) {
+                eq = i;
+                break;
+            }
+        }
+        if (eq < 0) {
+            report.add(lineNo, last + 1, "expected 'key = value'");
+            return;
+        }
+        let keyEnd : i32 = SettingsText::trimBack(raw, first, eq);
+        let key : string = TextScan::slice(raw, first, keyEnd);
+        if (key.byteLength == 0) {
+            report.add(lineNo, first + 1, "a setting needs a name before '='");
+            return;
+        }
+        let valueStart : i32 = SettingsText::skipSpace(raw, eq + 1, last);
+        if (valueStart >= last) {
+            report.add(lineNo, eq + 2, "a setting needs a value after '='");
+            return;
+        }
+        let mut value : string = TextScan::slice(raw, valueStart, last);
+        if (value.byteAt(0) == ST_QUOTE) {
+            if (last - valueStart < 2 || raw.byteAt(last - 1) != ST_QUOTE) {
+                report.add(lineNo, valueStart + 1, "text in quotes must end with a quote");
+                return;
+            }
+            value = TextScan::slice(raw, valueStart + 1, last - 1);
+        }
+        let mut full : string = key;
+        if (section.byteLength > 0) {
+            full = "${section}.${key}";
+        }
+        let problem : string = settings.setFromText(full, value);
+        if (problem.byteLength > 0) {
+            let mut column : i32 = valueStart + 1;
+            if (!settings.has(full)) {
+                column = first + 1;
+            }
+            report.add(lineNo, column, problem);
+        }
+    }
+
+    /** All settings as text: the unnamed section first, then each section in declaration order. */
+    pub static fn write(settings : Settings) : string {
+        let mut out : string = "";
+        let mut first : bool = true;
+        for (pass of 0..2) {
+            for (s of 0..settings.sectionCount()) {
+                let name : string = settings.sectionName(s);
+                let unnamed : bool = name.byteLength == 0;
+                if ((pass == 0) != unnamed) {
+                    continue;
+                }
+                if (!first) {
+                    out = "${out}\n";
+                }
+                first = false;
+                if (!unnamed) {
+                    out = "${out}[${name}]\n";
+                }
+                for (i of 0..settings.count()) {
+                    if (settings.sectionIndexAt(i) == s) {
+                        let key : string = settings.keyAt(i);
+                        let skip : i32 = name.byteLength as i32 + SettingsText::dotWidth(name);
+                        let bare : string = TextScan::slice(key, skip, key.byteLength as i32);
+                        let value : string = settings.valueTextAt(i);
+                        out = "${out}${bare} = ${value}\n";
+                    }
+                }
+            }
+        }
+        return out;
+    }
+
+    // The unnamed section has no dot after its (empty) name; the others do.
+    static fn dotWidth(section : string) : i32 {
+        if (section.byteLength == 0) {
+            return 0;
+        }
+        return 1;
+    }
+
+    /** Applies one command-line argument; "" when it was accepted, else what was wrong. */
+    pub static fn applyArg(settings : Settings, arg : string) : string {
+        let n : i32 = arg.byteLength as i32;
+        if (n < 3 || arg.byteAt(0) != ST_DASH || arg.byteAt(1) != ST_DASH) {
+            return "'${arg}' is not a setting: expected --section.key=value";
+        }
+        let mut eq : i32 = -1;
+        for (i of 2..n) {
+            if (arg.byteAt(i) == ST_EQUALS) {
+                eq = i;
+                break;
+            }
+        }
+        if (eq < 0) {
+            let key : string = TextScan::slice(arg, 2, n);
+            if (settings.kindOf(key) == SETTING_BOOL) {
+                return settings.setFromText(key, "true");
+            }
+            return "'${arg}' needs a value: --${key}=value";
+        }
+        return settings.setFromText(TextScan::slice(arg, 2, eq), TextScan::slice(arg, eq + 1, n));
+    }
+
+    /** Applies a list of arguments in order; problems are reported with the argument number as the line. */
+    pub static fn applyArgs(settings : Settings, args : ArgList) : ParseReport {
+        let report : ParseReport = new ParseReport();
+        for (i of 0..args.count()) {
+            let problem : string = SettingsText::applyArg(settings, args.at(i));
+            if (problem.byteLength > 0) {
+                report.add(i + 1, 1, problem);
+            }
+        }
+        return report;
+    }
+
+    /** The settings given to the running program: `--key=value` arguments, the program name skipped. */
+    pub static fn applyProgramArgs(settings : Settings) : ParseReport {
+        let list : ArgList = new ArgList();
+        for (i of 1..argc()) {
+            try {
+                list.add(argAt(i) + "");
+            } catch e : IndexOutOfBoundsException {
+                break;
+            }
+        }
+        return SettingsText::applyArgs(settings, list);
+    }
+}
+
+/** A list of command-line arguments (strings cannot live in our generic containers, so this keeps them in one text). */
+pub class ArgList {
+    joined : string = "";
+    used   : i32 = 0;
+
+    /** An empty list. */
+    constructor() {}
+
+    /** Appends an argument (it must not contain a line break). */
+    pub fn add(mut self, arg : string) : void {
+        self.joined = self.joined + arg + "\n";
+        self.used = self.used + 1;
+    }
+
+    /** How many arguments. */
+    pub fn count(self) : i32 {
+        return self.used;
+    }
+
+    /** Argument `i`. */
+    pub fn at(self, i : i32) : string {
+        return TextScan::lineAt(self.joined, i);
+    }
+}

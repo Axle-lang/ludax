@@ -1,0 +1,397 @@
+// text — the small text tools the runtime's file formats share: lines, words, numbers and error reports.
+//
+// Settings files and mission files are both line-oriented text with `#` comments. Rather than each growing a
+// tokenizer, they share this one: `TextScan` cuts a line into words (quotes keep spaces inside a word) and
+// reads whole numbers and decimals without the floating-point library, so the same text always means the same
+// number on every machine. `ParseReport` collects the problems of one parse, each with the line and column
+// where it was found (both counted from 1), so a loader can go on after a bad line and tell the player about
+// all of them at once.
+
+use std::lang::IndexOutOfBoundsException;
+
+use crate::core::collections::vec::Vec;
+use crate::core::id::string_id::{StringId, StringInterner};
+
+// The bytes the formats are made of, named so the scanners read as rules rather than as ASCII trivia.
+const TEXT_TAB : i32 = 9;
+const TEXT_SPACE : i32 = 32;
+const TEXT_LINE_FEED : i32 = 10;
+const TEXT_CARRIAGE : i32 = 13;
+const TEXT_QUOTE : i32 = 34;
+const TEXT_HASH : i32 = 35;
+const TEXT_PLUS : i32 = 43;
+const TEXT_MINUS : i32 = 45;
+const TEXT_DOT : i32 = 46;
+const TEXT_DIGIT_ZERO : i32 = 48;
+const TEXT_DIGIT_NINE : i32 = 57;
+const TEXT_UPPER_E : i32 = 69;
+const TEXT_LOWER_E : i32 = 101;
+
+/** The problems found while reading a text, with where each one is. */
+pub class ParseReport {
+    lines    : Vec<i32>;
+    columns  : Vec<i32>;
+    messages : StringInterner;
+    texts    : Vec<i32>;
+
+    /** A report with no problem. */
+    constructor() {
+        self.lines = new Vec<i32>();
+        self.columns = new Vec<i32>();
+        self.messages = new StringInterner();
+        self.texts = new Vec<i32>();
+    }
+
+    /** Records a problem at `line` and `column` (1-based). */
+    pub fn add(mut self, line : i32, column : i32, message : string) : void {
+        self.lines.push(line);
+        self.columns.push(column);
+        self.texts.push(self.messages.intern(message).raw);
+    }
+
+    /** How many problems were found. */
+    pub fn count(self) : i32 {
+        return self.lines.len();
+    }
+
+    /** True when nothing was wrong. */
+    pub fn ok(self) : bool {
+        return self.lines.len() == 0;
+    }
+
+    /** The line of problem `i`. */
+    pub fn lineAt(self, i : i32) : i32 {
+        return self.lines.get(i);
+    }
+
+    /** The column of problem `i`. */
+    pub fn columnAt(self, i : i32) : i32 {
+        return self.columns.get(i);
+    }
+
+    /** What was wrong in problem `i`. */
+    pub fn messageAt(self, i : i32) : string {
+        return self.messages.name(StringId { raw: self.texts.get(i) }) + "";
+    }
+
+    /** Problem `i` as one line of text: `line 3, column 7: message`. */
+    pub fn describe(self, i : i32) : string {
+        return "line ${self.lines.get(i)}, column ${self.columns.get(i)}: ${self.messageAt(i)}";
+    }
+
+    /** True when some problem is on `line`. */
+    pub fn hasLine(self, line : i32) : bool {
+        for (i of 0..self.lines.len()) {
+            if (self.lines.get(i) == line) {
+                return true;
+            }
+        }
+        return false;
+    }
+}
+
+/** Cuts lines into words and reads numbers. */
+pub class TextScan {
+    /** The bytes `from..to` of `s` as a string; empty when the range is wrong. */
+    pub static fn slice(s : string, from : i32, to : i32) : string {
+        if (from >= to) {
+            return "";
+        }
+        try {
+            return s.substring(from, to);
+        } catch e : IndexOutOfBoundsException {
+            return "";
+        }
+    }
+
+    /** The number of lines in `text` (a last line without a newline counts; an empty text has none). */
+    pub static fn lineCount(text : string) : i32 {
+        let n : i32 = text.byteLength as i32;
+        if (n == 0) {
+            return 0;
+        }
+        let mut lines : i32 = 0;
+        for (i of 0..n) {
+            if (text.byteAt(i) == TEXT_LINE_FEED) {
+                lines = lines + 1;
+            }
+        }
+        if (text.byteAt(n - 1) != TEXT_LINE_FEED) {
+            lines = lines + 1;
+        }
+        return lines;
+    }
+
+    /** Line `index` (0-based) of `text`, without its newline and without a trailing carriage return. */
+    pub static fn lineAt(text : string, index : i32) : string {
+        let n : i32 = text.byteLength as i32;
+        let mut start : i32 = 0;
+        let mut line : i32 = 0;
+        for (i of 0..n) {
+            if (text.byteAt(i) == TEXT_LINE_FEED) {
+                if (line == index) {
+                    return TextScan::trimEnd(TextScan::slice(text, start, i));
+                }
+                line = line + 1;
+                start = i + 1;
+            }
+        }
+        if (line == index && start < n) {
+            return TextScan::trimEnd(TextScan::slice(text, start, n));
+        }
+        return "";
+    }
+
+    // Drops a carriage return left by a Windows line ending.
+    static fn trimEnd(s : string) : string {
+        let n : i32 = s.byteLength as i32;
+        if (n > 0 && s.byteAt(n - 1) == TEXT_CARRIAGE) {
+            return TextScan::slice(s, 0, n - 1);
+        }
+        return s + "";
+    }
+
+    /** The byte offset where a `#` comment starts in `line` (outside quotes), or the line's length. */
+    pub static fn commentStart(line : string) : i32 {
+        let n : i32 = line.byteLength as i32;
+        let mut quoted : bool = false;
+        for (i of 0..n) {
+            let b : i32 = line.byteAt(i);
+            if (b == TEXT_QUOTE) {
+                quoted = !quoted;
+            } else if (b == TEXT_HASH && !quoted) {
+                return i;
+            }
+        }
+        return n;
+    }
+
+    /**
+     * The words of `line` up to its comment. Words are separated by spaces and tabs; a word in double quotes
+     * keeps its spaces. An unterminated quote makes `ok` false.
+     */
+    pub static fn words(line : string) : TextWords {
+        let mut out : TextWords = new TextWords();
+        let end : i32 = TextScan::commentStart(line);
+        let mut i : i32 = 0;
+        while (i < end) {
+            let b : i32 = line.byteAt(i);
+            if (b == TEXT_SPACE || b == TEXT_TAB) {
+                i = i + 1;
+            } else if (b == TEXT_QUOTE) {
+                let mut j : i32 = i + 1;
+                while (j < end && line.byteAt(j) != TEXT_QUOTE) {
+                    j = j + 1;
+                }
+                if (j >= end) {
+                    out.broken = i + 1;
+                    return out;
+                }
+                out.add(i + 1, TextScan::slice(line, i + 1, j));
+                i = j + 1;
+            } else {
+                let mut j : i32 = i;
+                while (j < end && line.byteAt(j) != TEXT_SPACE && line.byteAt(j) != TEXT_TAB) {
+                    j = j + 1;
+                }
+                out.add(i + 1, TextScan::slice(line, i, j));
+                i = j;
+            }
+        }
+        return out;
+    }
+
+    /** True when `s` is a whole number, with an optional minus sign. */
+    pub static fn isInt(s : string) : bool {
+        let n : i32 = s.byteLength as i32;
+        let mut i : i32 = 0;
+        if (n > 0 && s.byteAt(0) == TEXT_MINUS) {
+            i = 1;
+        }
+        if (i >= n || n - i > 18) {
+            return false;
+        }
+        while (i < n) {
+            let d : i32 = s.byteAt(i);
+            if (d < TEXT_DIGIT_ZERO || d > TEXT_DIGIT_NINE) {
+                return false;
+            }
+            i = i + 1;
+        }
+        return true;
+    }
+
+    /** The whole number written in `s` (0 when `isInt` is false). */
+    pub static fn toInt(s : string) : i64 {
+        if (!TextScan::isInt(s)) {
+            return 0;
+        }
+        let n : i32 = s.byteLength as i32;
+        let mut i : i32 = 0;
+        let mut negative : bool = false;
+        if (s.byteAt(0) == TEXT_MINUS) {
+            negative = true;
+            i = 1;
+        }
+        let mut v : i64 = 0;
+        while (i < n) {
+            v = v * 10 + (s.byteAt(i) - TEXT_DIGIT_ZERO) as i64;
+            i = i + 1;
+        }
+        if (negative) {
+            return 0 - v;
+        }
+        return v;
+    }
+
+    /** True when `s` is a decimal such as `-12`, `0.5`, `.25` or `1.5e3`. */
+    pub static fn isDecimal(s : string) : bool {
+        let n : i32 = s.byteLength as i32;
+        let mut i : i32 = 0;
+        if (n > 0 && (s.byteAt(0) == TEXT_MINUS || s.byteAt(0) == TEXT_PLUS)) {
+            i = 1;
+        }
+        let mut digits : i32 = 0;
+        while (i < n && s.byteAt(i) >= TEXT_DIGIT_ZERO && s.byteAt(i) <= TEXT_DIGIT_NINE) {
+            digits = digits + 1;
+            i = i + 1;
+        }
+        if (i < n && s.byteAt(i) == TEXT_DOT) {
+            i = i + 1;
+            while (i < n && s.byteAt(i) >= TEXT_DIGIT_ZERO && s.byteAt(i) <= TEXT_DIGIT_NINE) {
+                digits = digits + 1;
+                i = i + 1;
+            }
+        }
+        if (digits == 0) {
+            return false;
+        }
+        if (i < n && (s.byteAt(i) == TEXT_LOWER_E || s.byteAt(i) == TEXT_UPPER_E)) {
+            i = i + 1;
+            if (i < n && (s.byteAt(i) == TEXT_MINUS || s.byteAt(i) == TEXT_PLUS)) {
+                i = i + 1;
+            }
+            let mut e : i32 = 0;
+            while (i < n && s.byteAt(i) >= TEXT_DIGIT_ZERO && s.byteAt(i) <= TEXT_DIGIT_NINE) {
+                e = e + 1;
+                i = i + 1;
+            }
+            if (e == 0) {
+                return false;
+            }
+        }
+        return i == n;
+    }
+
+    /**
+     * The decimal written in `s` (0.0 when `isDecimal` is false). The digits are gathered as an integer and
+     * scaled by a power of ten, so the result is the nearest double for up to 15 significant digits.
+     */
+    pub static fn toDecimal(s : string) : f64 {
+        if (!TextScan::isDecimal(s)) {
+            return 0.0;
+        }
+        let n : i32 = s.byteLength as i32;
+        let mut i : i32 = 0;
+        let mut negative : bool = false;
+        if (s.byteAt(0) == TEXT_MINUS || s.byteAt(0) == TEXT_PLUS) {
+            negative = s.byteAt(0) == TEXT_MINUS;
+            i = 1;
+        }
+        let mut mantissa : f64 = 0.0;
+        let mut scale : i32 = 0;
+        while (i < n && s.byteAt(i) >= TEXT_DIGIT_ZERO && s.byteAt(i) <= TEXT_DIGIT_NINE) {
+            mantissa = mantissa * 10.0 + (s.byteAt(i) - TEXT_DIGIT_ZERO) as f64;
+            i = i + 1;
+        }
+        if (i < n && s.byteAt(i) == TEXT_DOT) {
+            i = i + 1;
+            while (i < n && s.byteAt(i) >= TEXT_DIGIT_ZERO && s.byteAt(i) <= TEXT_DIGIT_NINE) {
+                mantissa = mantissa * 10.0 + (s.byteAt(i) - TEXT_DIGIT_ZERO) as f64;
+                scale = scale - 1;
+                i = i + 1;
+            }
+        }
+        if (i < n && (s.byteAt(i) == TEXT_LOWER_E || s.byteAt(i) == TEXT_UPPER_E)) {
+            i = i + 1;
+            let mut eNeg : bool = false;
+            if (s.byteAt(i) == TEXT_MINUS || s.byteAt(i) == TEXT_PLUS) {
+                eNeg = s.byteAt(i) == TEXT_MINUS;
+                i = i + 1;
+            }
+            let mut e : i32 = 0;
+            while (i < n) {
+                e = e * 10 + (s.byteAt(i) - TEXT_DIGIT_ZERO);
+                i = i + 1;
+            }
+            if (eNeg) {
+                scale = scale - e;
+            } else {
+                scale = scale + e;
+            }
+        }
+        let mut v : f64 = mantissa;
+        if (scale < 0) {
+            v = mantissa / TextScan::pow10(0 - scale);
+        } else if (scale > 0) {
+            v = mantissa * TextScan::pow10(scale);
+        }
+        if (negative) {
+            return 0.0 - v;
+        }
+        return v;
+    }
+
+    // 10 to the power n, by repeated squaring (exact up to 10^22).
+    static fn pow10(n : i32) : f64 {
+        let mut result : f64 = 1.0;
+        let mut base : f64 = 10.0;
+        let mut k : i32 = n;
+        while (k > 0) {
+            if ((k & 1) != 0) {
+                result = result * base;
+            }
+            base = base * base;
+            k = k >> 1;
+        }
+        return result;
+    }
+}
+
+/** The words of one line (see `TextScan::words`). */
+pub class TextWords {
+    starts : Vec<i32>;
+    names  : StringInterner;
+    ids    : Vec<i32>;
+
+    /** The 1-based column of an unterminated quote, or 0 when the line was fine. */
+    pub broken : i32 = 0;
+
+    /** No words yet. */
+    constructor() {
+        self.starts = new Vec<i32>();
+        self.names = new StringInterner();
+        self.ids = new Vec<i32>();
+    }
+
+    /** Appends a word found at 1-based column `column`. */
+    pub fn add(mut self, column : i32, text : string) : void {
+        self.starts.push(column);
+        self.ids.push(self.names.intern(text).raw);
+    }
+
+    /** How many words. */
+    pub fn count(self) : i32 {
+        return self.starts.len();
+    }
+
+    /** Word `i`. */
+    pub fn text(self, i : i32) : string {
+        return self.names.name(StringId { raw: self.ids.get(i) }) + "";
+    }
+
+    /** The 1-based column where word `i` starts. */
+    pub fn column(self, i : i32) : i32 {
+        return self.starts.get(i);
+    }
+}
