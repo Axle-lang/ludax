@@ -1,0 +1,286 @@
+// data_lz4 — checks for Lz4: the block stream round trip, damaged streams, the output limit and the rates.
+//
+// The decoder reads files a user can damage, so beside the round trips (every size around the 64 KiB block,
+// data that shrinks and data that does not) most checks hand it something wrong: a raw block that claims more
+// than it holds, a block that claims gigabytes from a few bytes, a stream with no end block, one cut at every
+// length. A refusal is a `false` and an empty output, never an abort and never a large reservation. Two
+// `measured:` lines give the rates.
+
+use ludax::{ByteBuf, Checks, LZ4_TABLE_SIZE, Lz4, nowNanos};
+
+use crate::generic_support::{gsNoise, gsPatterned, gsPrefix, gsSame, gsText};
+
+/** The Lz4 checks. */
+pub class Lz4Suite {
+    /** Runs every check of the suite. */
+    pub static fn run(c : Checks) : void {
+        lz4RoundTripChecks(c);
+        lz4DamageChecks(c);
+        lz4Measure(c);
+    }
+
+    /** Prints the `measured:` lines alone (the rates of the module). */
+    pub static fn measure(c : Checks) : void {
+        lz4Measure(c);
+    }
+}
+
+fn lz4Encode(plain : ByteBuf) : ByteBuf {
+    let out : ByteBuf = new ByteBuf(16);
+    Lz4::encode(plain, 0, plain.len(), out, new i32[LZ4_TABLE_SIZE as i64]);
+    return out;
+}
+
+// A block header by hand: magic, token, compressed length, plain length, checksum.
+fn lz4Header(out : ByteBuf, token : i32, compressed : i32, plain : i32) : void {
+    out.pushText("LZ4Block");
+    out.push(token);
+    out.pushLe32(compressed);
+    out.pushLe32(plain);
+    out.pushLe32(0);
+}
+
+fn lz4EndBlock(out : ByteBuf) : void {
+    lz4Header(out, 22, 0, 0);
+}
+
+// Four kinds of input: compressible, noise, text-like, all zero bytes.
+fn lz4Kind(kind : i32, n : i32, seed : i32) : ByteBuf {
+    if (kind == 0) {
+        return gsPatterned(n, seed);
+    }
+    if (kind == 1) {
+        return gsNoise(n, seed + 1);
+    }
+    if (kind == 2) {
+        return gsText(n, seed + 2);
+    }
+    let zeros : ByteBuf = new ByteBuf(n + 16);
+    zeros.resize(n);
+    return zeros;
+}
+
+fn lz4RoundTripChecks(c : Checks) : void {
+    let out : ByteBuf = new ByteBuf(16);
+    let mut sizes : i32[] = new i32[9];
+    sizes[0] = 0;
+    sizes[1] = 1;
+    sizes[2] = 12;
+    sizes[3] = 13;
+    sizes[4] = 65535;
+    sizes[5] = 65536;
+    sizes[6] = 65537;
+    sizes[7] = 200000;
+    sizes[8] = 131072;
+    for (k of 0..9) {
+        let n : i32 = sizes[k];
+        for (kind of 0..4) {
+            let plain : ByteBuf = lz4Kind(kind, n, k);
+            let packed : ByteBuf = lz4Encode(plain);
+            let ok : bool = Lz4::decode(packed, 0, packed.len(), out, 1 << 26);
+            c.that("lz4: ${n} bytes of kind ${kind} round trip", ok && gsSame(out, plain));
+            c.that(
+                "lz4: ... encoding twice gives the same stream",
+                gsSame(packed, lz4Encode(plain))
+            );
+        }
+    }
+
+    let empty : ByteBuf = lz4Encode(new ByteBuf(16));
+    c.sameInt("lz4: the stream of nothing is the end block alone", empty.len(), 21);
+    c.that(
+        "lz4: ... and decodes to nothing",
+        Lz4::decode(empty, 0, empty.len(), out, 100) && out.len() == 0
+    );
+
+    // A stream inside a larger buffer.
+    let plain : ByteBuf = gsText(70000, 9);
+    let packed : ByteBuf = lz4Encode(plain);
+    let framed : ByteBuf = new ByteBuf(16);
+    framed.push(1);
+    framed.push(2);
+    framed.pushRange(packed, 0, packed.len());
+    framed.push(3);
+    c.that(
+        "lz4: a stream decodes from an offset",
+        Lz4::decode(framed, 2, 2 + packed.len(), out, 1 << 26) && gsSame(out, plain)
+    );
+
+    // The same bytes as the checksum of the format says (low 28 bits of XXH32 with the lz4-java seed).
+    let abc : ByteBuf = new ByteBuf(16);
+    abc.pushText("abc");
+    c.sameInt("lz4: xxh32 of abc", Lz4::xxh32(abc, 0, 3, 0) as i64, 852579327);
+    c.sameInt("lz4: xxh32 of nothing", Lz4::xxh32(abc, 0, 0, 0) as i64, 46947589);
+}
+
+fn lz4DamageChecks(c : Checks) : void {
+    let out : ByteBuf = new ByteBuf(16);
+    let plain : ByteBuf = gsText(100000, 4);
+    let packed : ByteBuf = lz4Encode(plain);
+
+    // A cut anywhere is refused: inside a block, between blocks, or just before the end block.
+    let mut accepted : i32 = 0;
+    let mut n : i32 = 0;
+    while (n < packed.len()) {
+        if (Lz4::decode(packed, 0, n, out, 1 << 26)) {
+            accepted = accepted + 1;
+        }
+        n = n + 97;
+    }
+    c.sameInt("lz4: a stream cut short is refused at every sampled length", accepted, 0);
+    c.that(
+        "lz4: a stream without its end block is refused",
+        !Lz4::decode(packed, 0, packed.len() - 21, out, 1 << 26)
+    );
+
+    // A raw block that claims more than it holds used to read past its data.
+    let rawLong : ByteBuf = new ByteBuf(64);
+    lz4Header(rawLong, 22, 4, 40);
+    rawLong.pushText("abcd");
+    rawLong.pushText("efghijklmnopqrstuvwxyz0123456789ABCDEFGHIJ");
+    lz4EndBlock(rawLong);
+    c.that(
+        "lz4: a raw block with more plain than compressed bytes is refused",
+        !Lz4::decode(rawLong, 0, rawLong.len(), out, 1000)
+    );
+
+    // A raw block, well formed, to prove the hand-built form is accepted.
+    let rawOk : ByteBuf = new ByteBuf(64);
+    lz4Header(rawOk, 16, 4, 4);
+    rawOk.pushText("abcd");
+    lz4EndBlock(rawOk);
+    c.that(
+        "lz4: a well-formed raw block decodes",
+        Lz4::decode(rawOk, 0, rawOk.len(), out, 1000) && out.len() == 4
+    );
+
+    // A block that claims a huge output from a few bytes is refused before anything is reserved.
+    let huge : ByteBuf = new ByteBuf(64);
+    lz4Header(huge, 32, 5, 60000000);
+    huge.pushText("12345");
+    lz4EndBlock(huge);
+    c.that(
+        "lz4: a few bytes claiming 60 MB are refused",
+        !Lz4::decode(huge, 0, huge.len(), out, 64000000)
+    );
+    c.that("lz4: ... without a large output buffer (${out.len()})", out.len() == 0);
+    let overBlock : ByteBuf = new ByteBuf(64);
+    lz4Header(overBlock, 32, 5, 50000000);
+    overBlock.pushText("12345");
+    c.that(
+        "lz4: a block over the format's maximum is refused",
+        !Lz4::decode(overBlock, 0, overBlock.len(), out, 2000000000)
+    );
+
+    let negative : ByteBuf = new ByteBuf(64);
+    lz4Header(negative, 32, -5, 10);
+    c.that(
+        "lz4: a negative compressed length is refused",
+        !Lz4::decode(negative, 0, negative.len(), out, 1000)
+    );
+    let badMethod : ByteBuf = new ByteBuf(64);
+    lz4Header(badMethod, 48, 4, 4);
+    badMethod.pushText("abcd");
+    lz4EndBlock(badMethod);
+    c.that(
+        "lz4: an unknown method is refused",
+        !Lz4::decode(badMethod, 0, badMethod.len(), out, 1000)
+    );
+    let badMagic : ByteBuf = gsPrefix(packed, packed.len());
+    badMagic.set(3, 0);
+    c.that(
+        "lz4: a wrong magic is refused",
+        !Lz4::decode(badMagic, 0, badMagic.len(), out, 1 << 26)
+    );
+
+    // The limit counts the whole stream.
+    c.that(
+        "lz4: a limit below the size refuses the stream",
+        !Lz4::decode(packed, 0, packed.len(), out, 99999)
+    );
+    c.that(
+        "lz4: a limit equal to the size accepts it",
+        Lz4::decode(packed, 0, packed.len(), out, 100000)
+    );
+    c.that(
+        "lz4: a range beyond the buffer is refused",
+        !Lz4::decode(packed, 0, packed.len() + 5, out, 1 << 26)
+    );
+
+    // A block of the LZ4 method whose sequences end short of the claimed size, and a match before the start.
+    let shortBlock : ByteBuf = new ByteBuf(64);
+    lz4Header(shortBlock, 38, 5, 20);
+    shortBlock.push(64);
+    shortBlock.pushText("abcd");
+    lz4EndBlock(shortBlock);
+    c.that(
+        "lz4: an LZ4 block that makes fewer bytes than it claims is refused",
+        !Lz4::decode(shortBlock, 0, shortBlock.len(), out, 1000)
+    );
+    let farMatch : ByteBuf = new ByteBuf(64);
+    lz4Header(farMatch, 38, 4, 5);
+    farMatch.push(16);
+    farMatch.pushText("a");
+    farMatch.push(2);
+    farMatch.push(0);
+    lz4EndBlock(farMatch);
+    c.that(
+        "lz4: a match reaching before the block is refused",
+        !Lz4::decode(farMatch, 0, farMatch.len(), out, 1000)
+    );
+    let nearMatch : ByteBuf = new ByteBuf(64);
+    lz4Header(nearMatch, 38, 4, 5);
+    nearMatch.push(16);
+    nearMatch.pushText("a");
+    nearMatch.push(1);
+    nearMatch.push(0);
+    lz4EndBlock(nearMatch);
+    c.that(
+        "lz4: an overlapping match of offset 1 repeats the byte",
+        Lz4::decode(nearMatch, 0, nearMatch.len(), out, 1000) && out.len() == 5 && out.get(4) == 97
+    );
+
+    // Flipping any byte of a small stream never aborts.
+    let small : ByteBuf = lz4Encode(gsText(3000, 6));
+    let mut survived : i32 = 0;
+    for (i of 0..small.len()) {
+        let copy : ByteBuf = gsPrefix(small, small.len());
+        copy.set(i, copy.get(i) ^ 85);
+        Lz4::decode(copy, 0, copy.len(), out, 1 << 26);
+        survived = survived + 1;
+    }
+    c.sameInt("lz4: every flipped byte of a stream is survived", survived, small.len());
+}
+
+fn lz4Measure(c : Checks) : void {
+    lz4MeasureOne(c, "text", gsText(4 << 20, 1));
+    lz4MeasureOne(c, "patterned", gsPatterned(4 << 20, 1));
+}
+
+fn lz4MeasureOne(c : Checks, label : string, plain : ByteBuf) : void {
+    let table : i32[] = new i32[LZ4_TABLE_SIZE as i64];
+    let packed : ByteBuf = new ByteBuf(plain.len());
+    let out : ByteBuf = new ByteBuf(plain.len() + 16);
+    let mut bestEncode : i64 = (1 as i64) << 60;
+    let mut bestDecode : i64 = (1 as i64) << 60;
+    let mut ok : bool = true;
+    for (run of 0..7) {
+        let t0 : i64 = nowNanos();
+        Lz4::encode(plain, 0, plain.len(), packed, table);
+        let t1 : i64 = nowNanos();
+        ok = ok && Lz4::decode(packed, 0, packed.len(), out, 1 << 26);
+        let t2 : i64 = nowNanos();
+        if (t1 - t0 < bestEncode) {
+            bestEncode = t1 - t0;
+        }
+        if (t2 - t1 < bestDecode) {
+            bestDecode = t2 - t1;
+        }
+    }
+    c.that("lz4: the measured ${label} stream round trips", ok && gsSame(out, plain));
+    let size : i64 = plain.len() as i64;
+    let encodeRate : i64 = (size * 1000) / (bestEncode + 1);
+    let decodeRate : i64 = (size * 1000) / (bestDecode + 1);
+    let shrunk : i32 = packed.len();
+    println("measured: Lz4 ${label} ${size} to ${shrunk}: encode ${encodeRate}, decode ${decodeRate} MB/s");
+}

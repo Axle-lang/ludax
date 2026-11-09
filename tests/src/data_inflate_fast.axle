@@ -1,0 +1,329 @@
+// data_inflate_fast — checks for FastInflater: wrappers, block kinds, damage and the limit.
+//
+// A decoder that reads user files must answer `false` for any damage and never abort, so most of the checks
+// feed it something wrong: a gzip header that is not one, streams cut at every length, a limit below its
+// first buffer. The valid cases compare against the bytes that went in (our `Deflater` writes fixed and
+// stored blocks) and against a dynamic-Huffman stream made by zlib. One `measured:` line gives the decode
+// rate.
+
+use ludax::{ByteBuf, Checks, Deflater, FastInflater, nowNanos};
+
+use crate::generic_support::{
+    gsGzip, gsHex, gsNoise, gsPatterned, gsPrefix, gsRawDeflate, gsSame, gsText
+};
+
+// A zlib stream (level 9) of 379 bytes of text, one dynamic Huffman block, byte sum 33833; in pieces so
+// that each line stays short.
+fn fastDynamicHex() : string {
+    return "78dac5ce551283401444d1adbccf2871777727ae4006186c8227ac3eb38954befb569d666504a68b"
+        + "0515788bf80688e40d8aabbf6c201eb2c0a1b3c6051f78128901f66771281c89c6e24c22994a67b2"
+        + "b97ca1582a57aab57aa3d96a77babdfe60381a4fa6b3f962b95a6fd8ed6e7f389ece97ebedfee078"
+        + "e1894449c68aaae906799996edb89ebfe4a8ab7f80a7a88f1d1944ec214a05c8000d9b2eb1e817c9"
+        + "66e08fe1175a6d842a";
+}
+
+/** The FastInflater checks. */
+pub class FastInflaterSuite {
+    /** Runs every check of the suite. */
+    pub static fn run(c : Checks) : void {
+        fastRoundTripChecks(c);
+        fastVerifiedChecks(c);
+        fastGzipChecks(c);
+        fastDamageChecks(c);
+        fastLimitChecks(c);
+        fastMeasure(c);
+    }
+
+    /** Prints the `measured:` lines alone (the rates of the module). */
+    pub static fn measure(c : Checks) : void {
+        fastMeasure(c);
+    }
+}
+
+fn fastRoundTripChecks(c : Checks) : void {
+    let inflater : FastInflater = new FastInflater(1 << 26);
+    let out : ByteBuf = new ByteBuf(16);
+
+    // Empty input: one empty fixed block.
+    let empty : ByteBuf = new ByteBuf(16);
+    let z0 : ByteBuf = new Deflater().zlib(empty, 0, 0);
+    let ok0 : bool = inflater.zlib(z0, 0, z0.len(), out);
+    c.that("fast inflate: the zlib stream of nothing gives nothing", ok0 && out.len() == 0);
+
+    // Sizes around the 64 KiB buffer and the 258-byte match limit, compressible and not (stored blocks).
+    let mut sizes : i32[] = new i32[8];
+    sizes[0] = 1;
+    sizes[1] = 12;
+    sizes[2] = 258;
+    sizes[3] = 259;
+    sizes[4] = 65535;
+    sizes[5] = 65536;
+    sizes[6] = 65537;
+    sizes[7] = 200000;
+    for (k of 0..8) {
+        let n : i32 = sizes[k];
+        let plain : ByteBuf = gsPatterned(n, k);
+        let z : ByteBuf = new Deflater().zlib(plain, 0, n);
+        let ok : bool = inflater.zlib(z, 0, z.len(), out);
+        c.that(
+            "fast inflate: ${n} patterned bytes round trip through zlib",
+            ok && gsSame(out, plain)
+        );
+
+        let noise : ByteBuf = gsNoise(n, k + 1);
+        let zn : ByteBuf = new Deflater().zlib(noise, 0, n);
+        let okNoise : bool = inflater.zlib(zn, 0, zn.len(), out);
+        c.that(
+            "fast inflate: ${n} noise bytes round trip (stored blocks)",
+            okNoise && gsSame(out, noise)
+        );
+
+        let raw : ByteBuf = gsRawDeflate(plain);
+        let okRaw : bool = inflater.raw(raw, 0, raw.len(), out);
+        c.that("fast inflate: ${n} bytes round trip as raw deflate", okRaw && gsSame(out, plain));
+    }
+
+    // A dynamic-Huffman stream from zlib.
+    let dynamic : ByteBuf = gsHex(fastDynamicHex());
+    let okDynamic : bool = inflater.zlib(dynamic, 0, dynamic.len(), out);
+    let mut sum : i32 = 0;
+    for (i of 0..out.len()) {
+        sum = sum + out.get(i);
+    }
+    c.that("fast inflate: a dynamic-Huffman stream decodes", okDynamic);
+    c.sameInt("fast inflate: ... to 379 bytes", out.len(), 379);
+    c.sameInt("fast inflate: ... with the byte sum of the text", sum, 33833);
+
+    // The same stream twice gives the same bytes, and a decoder is reusable after a failure.
+    let again : ByteBuf = new ByteBuf(16);
+    let fresh : FastInflater = new FastInflater(1 << 26);
+    let okAgain : bool = fresh.zlib(dynamic, 0, dynamic.len(), again);
+    c.that("fast inflate: decoding is deterministic", okAgain && gsSame(out, again));
+    let junk : ByteBuf = gsHex("0102030405060708");
+    c.that("fast inflate: junk fails", !inflater.zlib(junk, 0, 8, out) && inflater.failed());
+    let okRetry : bool = inflater.zlib(dynamic, 0, dynamic.len(), out);
+    c.that("fast inflate: the decoder works again after a failure", okRetry && !inflater.failed());
+}
+
+fn fastVerifiedChecks(c : Checks) : void {
+    let inflater : FastInflater = new FastInflater(1 << 26);
+    let out : ByteBuf = new ByteBuf(16);
+    let plain : ByteBuf = gsText(20000, 6);
+    let z : ByteBuf = new Deflater().zlib(plain, 0, plain.len());
+    let okVerified : bool = inflater.zlibVerified(z, 0, z.len(), out);
+    c.that(
+        "fast inflate: a stream with a good Adler sum verifies",
+        okVerified && gsSame(out, plain)
+    );
+
+    let wrongSum : ByteBuf = gsPrefix(z, z.len());
+    wrongSum.set(z.len() - 1, wrongSum.get(z.len() - 1) ^ 1);
+    c.that(
+        "fast inflate: the plain decoder ignores a wrong sum",
+        inflater.zlib(wrongSum, 0, wrongSum.len(), out)
+    );
+    c.that(
+        "fast inflate: the verifying decoder refuses a wrong sum",
+        !inflater.zlibVerified(wrongSum, 0, wrongSum.len(), out)
+    );
+    c.that("fast inflate: ... and reports it as failed", inflater.failed());
+    let noSum : ByteBuf = gsPrefix(z, z.len() - 4);
+    c.that(
+        "fast inflate: a missing sum is refused by the verifying decoder",
+        !inflater.zlibVerified(noSum, 0, noSum.len(), out)
+    );
+    let short : ByteBuf = gsPrefix(z, z.len() - 1);
+    c.that(
+        "fast inflate: a sum cut short is refused",
+        !inflater.zlibVerified(short, 0, short.len(), out)
+    );
+    let trailing : ByteBuf = gsPrefix(z, z.len());
+    trailing.pushText("junk after the stream");
+    let okTrailing : bool = inflater.zlibVerified(trailing, 0, trailing.len(), out);
+    c.that("fast inflate: bytes after the sum are ignored", okTrailing && gsSame(out, plain));
+
+    // Stored and empty streams verify too (the sum of nothing is 1).
+    let noise : ByteBuf = gsNoise(70000, 2);
+    let zn : ByteBuf = new Deflater().zlib(noise, 0, noise.len());
+    c.that(
+        "fast inflate: a stored-block stream verifies",
+        inflater.zlibVerified(zn, 0, zn.len(), out) && gsSame(out, noise)
+    );
+    let empty : ByteBuf = new ByteBuf(16);
+    let ze : ByteBuf = new Deflater().zlib(empty, 0, 0);
+    c.that(
+        "fast inflate: the empty stream verifies",
+        inflater.zlibVerified(ze, 0, ze.len(), out) && out.len() == 0
+    );
+}
+
+fn fastGzipChecks(c : Checks) : void {
+    let inflater : FastInflater = new FastInflater(1 << 26);
+    let out : ByteBuf = new ByteBuf(16);
+    let plain : ByteBuf = gsPatterned(5000, 2);
+    let gz : ByteBuf = gsGzip(plain);
+    let okGzip : bool = inflater.gzip(gz, 0, gz.len(), out);
+    c.that("fast inflate: a gzip member round trips", okGzip && gsSame(out, plain));
+
+    // A header that is not gzip must answer false, not read before the buffer.
+    let wrong : ByteBuf = gsHex("0102030405060708090a0b0c0d0e0f1011121314");
+    c.that(
+        "fast inflate: gzip with a wrong magic fails",
+        !inflater.gzip(wrong, 0, wrong.len(), out)
+    );
+    let wrongMethod : ByteBuf = gsPrefix(gz, gz.len());
+    wrongMethod.set(2, 7);
+    c.that(
+        "fast inflate: gzip with a wrong method fails",
+        !inflater.gzip(wrongMethod, 0, gz.len(), out)
+    );
+    for (n of 0..19) {
+        let cut : ByteBuf = gsPrefix(gz, n);
+        c.that("fast inflate: gzip cut to ${n} bytes fails", !inflater.gzip(cut, 0, n, out));
+    }
+    c.that("fast inflate: gzip over an empty range fails", !inflater.gzip(gz, 5, 5, out));
+    c.that("fast inflate: gzip over a reversed range fails", !inflater.gzip(gz, 9, 3, out));
+
+    // Optional header fields: FEXTRA, FNAME, FCOMMENT, FHCRC.
+    let body : ByteBuf = gsRawDeflate(plain);
+    let fancy : ByteBuf = new ByteBuf(body.len() + 64);
+    fancy.push(31);
+    fancy.push(139);
+    fancy.push(8);
+    fancy.push(4 | 8 | 16 | 2);
+    fancy.pushLe32(0);
+    fancy.push(0);
+    fancy.push(255);
+    fancy.push(3);
+    fancy.push(0);
+    fancy.push(1);
+    fancy.push(2);
+    fancy.push(3);
+    fancy.pushText("name");
+    fancy.push(0);
+    fancy.pushText("note");
+    fancy.push(0);
+    fancy.push(0);
+    fancy.push(0);
+    fancy.pushRange(body, 0, body.len());
+    fancy.pushLe32(0);
+    fancy.pushLe32(plain.len());
+    let okFancy : bool = inflater.gzip(fancy, 0, fancy.len(), out);
+    c.that(
+        "fast inflate: gzip with extra, name, comment and header CRC decodes",
+        okFancy && gsSame(out, plain)
+    );
+}
+
+fn fastDamageChecks(c : Checks) : void {
+    let inflater : FastInflater = new FastInflater(1 << 26);
+    let out : ByteBuf = new ByteBuf(16);
+    let plain : ByteBuf = gsPatterned(3000, 1);
+    let z : ByteBuf = new Deflater().zlib(plain, 0, plain.len());
+    let mut accepted : i32 = 0;
+    for (n of 0..(z.len() - 4)) {
+        if (inflater.zlib(z, 0, n, out)) {
+            accepted = accepted + 1;
+        }
+    }
+    c.sameInt(
+        "fast inflate: a zlib stream cut at any length before its end is refused",
+        accepted,
+        0
+    );
+
+    let dynamic : ByteBuf = gsHex(fastDynamicHex());
+    let mut dynamicAccepted : i32 = 0;
+    for (n of 0..(dynamic.len() - 6)) {
+        if (inflater.zlib(dynamic, 0, n, out)) {
+            dynamicAccepted = dynamicAccepted + 1;
+        }
+    }
+    c.sameInt("fast inflate: a dynamic stream cut short is refused", dynamicAccepted, 0);
+
+    // Every single-byte flip must end without aborting (the answer may be either).
+    let mut refused : i32 = 0;
+    for (i of 2..dynamic.len()) {
+        let copy : ByteBuf = gsPrefix(dynamic, dynamic.len());
+        copy.set(i, copy.get(i) ^ 255);
+        if (!inflater.zlib(copy, 0, copy.len(), out)) {
+            refused = refused + 1;
+        }
+    }
+    c.that(
+        "fast inflate: flipped bytes are survived and mostly refused (${refused})",
+        refused > 20
+    );
+
+    let reserved : ByteBuf = gsHex("789c0700");
+    c.that(
+        "fast inflate: block type 3 is refused",
+        !inflater.zlib(reserved, 0, reserved.len(), out)
+    );
+    let cutStored : ByteBuf = gsHex("789c010500faff68656c");
+    c.that(
+        "fast inflate: a stored block cut inside its data is refused",
+        !inflater.zlib(cutStored, 0, cutStored.len(), out)
+    );
+    let badStored : ByteBuf = gsHex("789c010500fafe68656c6c6f");
+    c.that(
+        "fast inflate: a stored block with a wrong length check is refused",
+        !inflater.zlib(badStored, 0, badStored.len(), out)
+    );
+}
+
+fn fastLimitChecks(c : Checks) : void {
+    let out : ByteBuf = new ByteBuf(16);
+    let plain : ByteBuf = gsPatterned(5000, 0);
+    let z : ByteBuf = new Deflater().zlib(plain, 0, plain.len());
+
+    let tight : FastInflater = new FastInflater(1000);
+    c.that("fast inflate: a limit of 1000 refuses 5000 bytes", !tight.zlib(z, 0, z.len(), out));
+    c.that(
+        "fast inflate: ... and the output stays within the limit (${out.len()})",
+        out.len() <= 1000
+    );
+    let exact : FastInflater = new FastInflater(5000);
+    c.that(
+        "fast inflate: a limit equal to the size accepts it",
+        exact.zlib(z, 0, z.len(), out) && out.len() == 5000
+    );
+    let under : FastInflater = new FastInflater(4999);
+    c.that("fast inflate: a limit one below the size refuses it", !under.zlib(z, 0, z.len(), out));
+
+    let noise : ByteBuf = gsNoise(100000, 5);
+    let zn : ByteBuf = new Deflater().zlib(noise, 0, noise.len());
+    let stored : FastInflater = new FastInflater(70000);
+    c.that(
+        "fast inflate: a stored stream over the limit is refused",
+        !stored.zlib(zn, 0, zn.len(), out)
+    );
+    let zero : FastInflater = new FastInflater(0);
+    c.that("fast inflate: a limit of 0 refuses any output", !zero.zlib(z, 0, z.len(), out));
+}
+
+fn fastMeasure(c : Checks) : void {
+    fastMeasureOne(c, "text", gsText(4 << 20, 1));
+    fastMeasureOne(c, "patterned", gsPatterned(4 << 20, 1));
+}
+
+fn fastMeasureOne(c : Checks, label : string, plain : ByteBuf) : void {
+    let z : ByteBuf = new Deflater().zlib(plain, 0, plain.len());
+    let inflater : FastInflater = new FastInflater(1 << 26);
+    let out : ByteBuf = new ByteBuf(16);
+    let mut best : i64 = (1 as i64) << 60;
+    let mut ok : bool = true;
+    for (run of 0..7) {
+        let t0 : i64 = nowNanos();
+        ok = ok && inflater.zlib(z, 0, z.len(), out);
+        let dt : i64 = nowNanos() - t0;
+        if (dt < best) {
+            best = dt;
+        }
+    }
+    c.that("fast inflate: the measured ${label} stream decodes", ok && gsSame(out, plain));
+    let size : i64 = plain.len() as i64;
+    let rate : i64 = (size * 1000) / (best + 1);
+    let packed : i32 = z.len();
+    println("measured: FastInflater ${label} ${size} bytes from ${packed}: ${rate} MB/s (best of 7)");
+}

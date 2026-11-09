@@ -1,0 +1,305 @@
+// deflate — compresses bytes into a zlib stream.
+//
+// A greedy LZ77 over a 32 KiB window (hash of three bytes, a bounded chain of earlier positions) coded with the
+// fixed Huffman tables of RFC 1951: no table to transmit, and on the flat or repeating runs of pixel data it
+// gets most of what dynamic coding would. Data that does not shrink is written as stored blocks instead, so the
+// output is never much larger than the input. The same input always gives the same bytes.
+
+use crate::data::bytes::{ByteBuf, adler32};
+use crate::data::image::deflate_tables::{
+    DEFLATE_DISTANCE_CODES, DEFLATE_END_OF_BLOCK, DEFLATE_FIRST_LENGTH, DEFLATE_LENGTH_CODES,
+    DEFLATE_MAX_MATCH, DEFLATE_MIN_MATCH, DeflateTables
+};
+
+// How many earlier positions of a hash chain are tried for each position.
+const DEFLATE_CHAIN : i32 = 24;
+
+// The window a match may reach back over, and the mask that wraps an index into its ring (the window less one,
+// written out because a top-level constant must be a literal).
+const DEFLATE_WINDOW : i32 = 32768;
+const DEFLATE_WINDOW_MASK : i32 = 32767;
+
+// The most bytes one stored block carries, and the size of the three-byte hash table.
+const DEFLATE_STORED_MAX : i32 = 65535;
+const DEFLATE_HASH_SLOTS : i32 = 65536;
+
+// The fixed Huffman code of RFC 1951 section 3.2.6: literal/length symbols come in four ranges, each with its
+// own code length and the code its first symbol gets. Distances are plain five-bit codes.
+const DEFLATE_FIXED_LIT_END : i32 = 144;
+const DEFLATE_FIXED_BYTE_END : i32 = 256;
+const DEFLATE_FIXED_SHORT_END : i32 = 280;
+const DEFLATE_FIXED_LIT_FIRST : i32 = 48;
+const DEFLATE_FIXED_BYTE_FIRST : i32 = 400;
+const DEFLATE_FIXED_LONG_FIRST : i32 = 192;
+const DEFLATE_FIXED_LIT_BITS : i32 = 8;
+const DEFLATE_FIXED_BYTE_BITS : i32 = 9;
+const DEFLATE_FIXED_SHORT_BITS : i32 = 7;
+const DEFLATE_FIXED_DISTANCE_BITS : i32 = 5;
+
+// A block header is the final-block bit and two bits naming the kind; 1 is the fixed-Huffman kind.
+const DEFLATE_BLOCK_FIXED : i32 = 1;
+const DEFLATE_KIND_BITS : i32 = 2;
+
+// Knuth's multiplicative constant (the golden ratio times 2^32) and the shift that keeps the well-mixed high
+// bits of the product, for the three-byte hash.
+const DEFLATE_HASH_MULTIPLIER : i64 = 2654435761;
+const DEFLATE_HASH_SHIFT : i32 = 12;
+const DEFLATE_HASH_MASK : i32 = 65535;
+
+// A byte holds eight bits; a stored block writes its 16-bit length low byte first.
+const DEFLATE_BYTE_BITS : i32 = 8;
+
+// The two bytes of a zlib header: deflate with a 32 KiB window, then the check bits for a fixed-Huffman stream
+// or for one made only of stored blocks.
+const DEFLATE_ZLIB_CMF : i32 = 0x78;
+const DEFLATE_ZLIB_FLG : i32 = 0x9C;
+const DEFLATE_STORED_FLG : i32 = 0x01;
+
+// A stored stream costs a zlib header and Adler sum, plus one 5-byte header per block.
+const DEFLATE_STORED_TRAILER : i32 = 6;
+const DEFLATE_STORED_HEADER : i32 = 5;
+
+/** The longest earlier repeat of the bytes at some position: `length` bytes, `dist` back. */
+struct DeflateMatch {
+    length : i32;
+    dist   : i32;
+}
+
+/** The hash chains of the positions seen so far, over the range `from..to` of `data`. */
+class DeflateIndex {
+    from : i32;
+    to   : i32;
+    head : i32[];
+    prev : i32[];
+
+    constructor(from : i32, to : i32) {
+        self.from = from;
+        self.to = to;
+        self.head = new i32[DEFLATE_HASH_SLOTS as i64];
+        self.prev = new i32[DEFLATE_WINDOW as i64];
+        for (i of 0..DEFLATE_HASH_SLOTS) {
+            self.head[i] = -1;
+        }
+    }
+
+    // Three bytes folded into the 16-bit hash that selects a chain.
+    static fn hash(data : ByteBuf, at : i32) : i32 {
+        let v : i64 = ((data.get(at) << 16) | (data.get(at + 1) << 8) | data.get(at + 2)) as i64;
+        return (((v * DEFLATE_HASH_MULTIPLIER) >>> DEFLATE_HASH_SHIFT) & DEFLATE_HASH_MASK) as i32;
+    }
+
+    // The longest match for the bytes of `data` at `at`, walking the chain of earlier positions that share its three-byte
+    // hash; a length of 0 when there is none.
+    pub(file) fn longest(self, data : ByteBuf, at : i32) : DeflateMatch {
+        let mut best : DeflateMatch = DeflateMatch { length: 0, dist: 0 };
+        if (at + DEFLATE_MIN_MATCH > self.to) {
+            return best;
+        }
+
+        let mut cand : i32 = self.head[DeflateIndex::hash(data, at)];
+        let mut tries : i32 = 0;
+        while (cand >= self.from && at - cand <= DEFLATE_WINDOW && tries < DEFLATE_CHAIN) {
+            let len : i32 = self.matchLength(data, cand, at);
+            if (len > best.length) {
+                best = DeflateMatch { length: len, dist: at - cand };
+            }
+
+            // The chain is a walk back in time: a link to a later position would loop, so stop.
+            let next : i32 = self.prev[cand & DEFLATE_WINDOW_MASK];
+            if (next >= cand) {
+                cand = -1;
+            } else {
+                cand = next;
+            }
+            tries = tries + 1;
+        }
+        return best;
+    }
+
+    // How many bytes from `cand` and from `at` agree, up to the longest match deflate can code.
+    fn matchLength(self, data : ByteBuf, cand : i32, at : i32) : i32 {
+        let mut len : i32 = 0;
+        while (len < DEFLATE_MAX_MATCH && at + len < self.to && data.get(cand + len) == data.get(at + len)) {
+            len = len + 1;
+        }
+        return len;
+    }
+
+    // Enters `count` positions starting at `at` into the chains; the last two bytes of the range have no
+    // three-byte hash and are skipped.
+    pub(file) fn insert(mut self, data : ByteBuf, at : i32, count : i32) : void {
+        for (k of 0..count) {
+            if (at + k + DEFLATE_MIN_MATCH <= self.to) {
+                let h : i32 = DeflateIndex::hash(data, at + k);
+                self.prev[(at + k) & DEFLATE_WINDOW_MASK] = self.head[h];
+                self.head[h] = at + k;
+            }
+        }
+    }
+}
+
+/** One compression: `zlib` gives the whole stream. */
+pub class Deflater {
+    out     : ByteBuf;
+    acc     : i32 = 0;
+    accBits : i32 = 0;
+    tables  : DeflateTables;
+
+    /** A compressor ready for use. */
+    constructor() {
+        self.out = new ByteBuf(1024);
+        self.tables = new DeflateTables();
+    }
+
+    /** The zlib stream (header, deflate data, Adler-32) of bytes `from..to` of `data`. */
+    pub fn zlib(mut self, data : ByteBuf, from : i32, to : i32) : ByteBuf {
+        let size : i32 = to - from;
+        self.out = new ByteBuf((size / 2) + 64);
+        self.acc = 0;
+        self.accBits = 0;
+
+        self.out.push(DEFLATE_ZLIB_CMF);
+        self.out.push(DEFLATE_ZLIB_FLG);
+        self.compress(data, from, to);
+
+        // Incompressible data is cheaper stored: bound what stored blocks would cost and keep whichever is
+        // smaller.
+        let storedSize : i32 = size + DEFLATE_STORED_TRAILER
+            + DEFLATE_STORED_HEADER * ((size / DEFLATE_STORED_MAX) + 1);
+        if (self.out.len() > storedSize) {
+            self.out.clear();
+            self.out.push(DEFLATE_ZLIB_CMF);
+            self.out.push(DEFLATE_STORED_FLG);
+            self.stored(data, from, to);
+        }
+
+        self.out.pushBe32(adler32(data, from, to));
+        return self.out;
+    }
+
+    // Writes the whole range as stored blocks, which need no Huffman coding at all.
+    fn stored(mut self, data : ByteBuf, from : i32, to : i32) : void {
+        // An empty range still needs one final, empty block.
+        if (to == from) {
+            self.storedHeader(1, 0);
+        }
+
+        let mut at : i32 = from;
+        while (at < to) {
+            let mut n : i32 = to - at;
+            if (n > DEFLATE_STORED_MAX) {
+                n = DEFLATE_STORED_MAX;
+            }
+            let mut last : i32 = 0;
+            if (at + n >= to) {
+                last = 1;
+            }
+
+            self.storedHeader(last, n);
+            for (i of 0..n) {
+                self.out.push(data.get(at + i));
+            }
+            at = at + n;
+        }
+    }
+
+    // A stored block's header: the final flag, then LEN and its complement, each low byte first.
+    fn storedHeader(mut self, last : i32, len : i32) : void {
+        let complement : i32 = len ^ DEFLATE_STORED_MAX;
+        self.out.push(last);
+        self.out.push(len);
+        self.out.push(len >>> DEFLATE_BYTE_BITS);
+        self.out.push(complement);
+        self.out.push(complement >>> DEFLATE_BYTE_BITS);
+    }
+
+    // Accumulates one bit; a full byte goes to the stream.
+    fn bit(mut self, b : i32) : void {
+        self.acc = self.acc | (b << self.accBits);
+        self.accBits = self.accBits + 1;
+        if (self.accBits == DEFLATE_BYTE_BITS) {
+            self.out.push(self.acc);
+            self.acc = 0;
+            self.accBits = 0;
+        }
+    }
+
+    // `n` bits of `v`, least significant first (header fields, extra bits).
+    fn put(mut self, v : i32, n : i32) : void {
+        for (i of 0..n) {
+            self.bit((v >>> i) & 1);
+        }
+    }
+
+    // A Huffman code of `n` bits, most significant first.
+    fn code(mut self, v : i32, n : i32) : void {
+        let mut i : i32 = n - 1;
+        while (i >= 0) {
+            self.bit((v >>> i) & 1);
+            i = i - 1;
+        }
+    }
+
+    // A literal or length symbol of the fixed Huffman table.
+    fn symbol(mut self, sym : i32) : void {
+        if (sym < DEFLATE_FIXED_LIT_END) {
+            self.code(DEFLATE_FIXED_LIT_FIRST + sym, DEFLATE_FIXED_LIT_BITS);
+        } else if (sym < DEFLATE_FIXED_BYTE_END) {
+            self.code(DEFLATE_FIXED_BYTE_FIRST + sym - DEFLATE_FIXED_LIT_END, DEFLATE_FIXED_BYTE_BITS);
+        } else if (sym < DEFLATE_FIXED_SHORT_END) {
+            self.code(sym - DEFLATE_FIXED_BYTE_END, DEFLATE_FIXED_SHORT_BITS);
+        } else {
+            self.code(DEFLATE_FIXED_LONG_FIRST + sym - DEFLATE_FIXED_SHORT_END, DEFLATE_FIXED_LIT_BITS);
+        }
+    }
+
+    // A length/distance pair: the length code and its extra bits, then the distance code and its extra bits.
+    fn emitMatch(mut self, len : i32, dist : i32) : void {
+        let t : DeflateTables = self.tables;
+        let mut ls : i32 = DEFLATE_LENGTH_CODES - 1;
+        while (t.lenBase[ls] > len) {
+            ls = ls - 1;
+        }
+        self.symbol(DEFLATE_FIRST_LENGTH + ls);
+        self.put(len - t.lenBase[ls], t.lenExtra[ls]);
+
+        let mut ds : i32 = DEFLATE_DISTANCE_CODES - 1;
+        while (t.dstBase[ds] > dist) {
+            ds = ds - 1;
+        }
+        self.code(ds, DEFLATE_FIXED_DISTANCE_BITS);
+        self.put(dist - t.dstBase[ds], t.dstExtra[ds]);
+    }
+
+    fn compress(mut self, data : ByteBuf, from : i32, to : i32) : void {
+        let index : DeflateIndex = new DeflateIndex(from, to);
+
+        // One final block, coded with the fixed Huffman tables.
+        self.put(1, 1);
+        self.put(DEFLATE_BLOCK_FIXED, DEFLATE_KIND_BITS);
+
+        let mut at : i32 = from;
+        while (at < to) {
+            let best : DeflateMatch = index.longest(data, at);
+
+            let mut step : i32 = 1;
+            if (best.length >= DEFLATE_MIN_MATCH) {
+                self.emitMatch(best.length, best.dist);
+                step = best.length;
+            } else {
+                self.symbol(data.get(at));
+            }
+
+            // Every byte the match covered now enters the hash chains for later positions.
+            index.insert(data, at, step);
+            at = at + step;
+        }
+
+        self.symbol(DEFLATE_END_OF_BLOCK);
+        if (self.accBits > 0) {
+            self.out.push(self.acc);
+            self.acc = 0;
+            self.accBits = 0;
+        }
+    }
+}

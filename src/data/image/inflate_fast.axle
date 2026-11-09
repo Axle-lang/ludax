@@ -1,0 +1,789 @@
+// inflate_fast — a table-driven deflate decoder for streams that are many megabytes in total.
+//
+// `Inflater` (inflate.axle) follows puff: one bit at a time, one code length at a time. That is right for a
+// PNG and wrong for a game that loads thousands of 100 KB chunks or a whole archive of textures. This decoder
+// keeps a 64-bit bit buffer, decodes a literal or length symbol with one table lookup when its code is at
+// most `FAST_INFLATER_FAST_BITS` long (nearly always), and falls back to the canonical bit-by-bit walk for
+// the rare longer code. It writes into a work array that it grows and then copies into a caller-owned
+// `ByteBuf` that the caller reuses between streams, so decoding allocates nothing once the decoder and the
+// buffer are warm.
+//
+// Three wrappers share the core: raw deflate (a zip entry), zlib (a region chunk) and gzip. Checksums are
+// never verified: a container with its own length framing already bounds the data, and the check would cost
+// as much as the decode (a caller that wants the sum calls `adler32` on the output). A damaged or truncated
+// stream sets `failed` and stops, and the output never exceeds `maxOutput`, whatever the stream claims.
+
+use std::ffi::runtime::panicMsg;
+
+use crate::data::bytes::{ByteBuf, adler32, bytesCopy};
+use crate::data::image::deflate_tables::{
+    DEFLATE_DISTANCE_CODES, DEFLATE_END_OF_BLOCK, DEFLATE_FIRST_LENGTH, DEFLATE_LENGTH_CODES, DeflateTables
+};
+
+/** Code lengths up to this many bits are decoded by one table lookup. */
+const FAST_INFLATER_FAST_BITS : i32 = 10;
+const FAST_INFLATER_FAST_SIZE : i32 = 1024;
+const FAST_INFLATER_FAST_MASK : i32 = 1023;
+
+const FAST_INFLATER_MAX_BITS : i32 = 15;
+const FAST_INFLATER_LIT_SYMBOLS : i32 = 288;
+const FAST_INFLATER_CL_SYMBOLS : i32 = 19;
+const FAST_INFLATER_LENS_ROOM : i32 = 320;
+const FAST_INFLATER_MAX_LIT : i32 = 286;
+const FAST_INFLATER_MAX_DIST : i32 = 30;
+const FAST_INFLATER_BYTE_MASK : i32 = 255;
+const FAST_INFLATER_REFILL_LIMIT : i32 = 56;
+const FAST_INFLATER_LEN_MASK : i32 = 15;
+const FAST_INFLATER_SYM_SHIFT : i32 = 4;
+
+const FAST_INFLATER_STORED : i32 = 0;
+const FAST_INFLATER_FIXED : i32 = 1;
+const FAST_INFLATER_DYNAMIC : i32 = 2;
+
+const FAST_INFLATER_ZLIB_HEADER : i32 = 2;
+const FAST_INFLATER_ADLER_BYTES : i32 = 4;
+const FAST_INFLATER_ZLIB_DICT : i32 = 32;
+const FAST_INFLATER_GZIP_ID1 : i32 = 31;
+const FAST_INFLATER_GZIP_ID2 : i32 = 139;
+const FAST_INFLATER_GZIP_FIXED : i32 = 10;
+const FAST_INFLATER_GZIP_TRAILER : i32 = 8;
+const FAST_INFLATER_GZIP_FEXTRA : i32 = 4;
+const FAST_INFLATER_GZIP_FNAME : i32 = 8;
+const FAST_INFLATER_GZIP_FCOMMENT : i32 = 16;
+const FAST_INFLATER_GZIP_FHCRC : i32 = 2;
+
+const FAST_INFLATER_REPEAT_PREV : i32 = 16;
+const FAST_INFLATER_REPEAT_ZERO_SHORT : i32 = 17;
+const FAST_INFLATER_INITIAL_OUT : i32 = 65536;
+const FAST_INFLATER_MAX_LIMIT : i32 = 1073741824;
+const FAST_INFLATER_BLOCK_COPY : i32 = 24;
+const FAST_INFLATER_MAX_MATCH : i32 = 258;
+const FAST_INFLATER_FAST_INPUT : i32 = 8;
+
+/** Decompresses raw deflate, zlib and gzip streams into a reusable buffer. */
+pub class FastInflater {
+    input            : i8[];
+    pos              : i32 = 0;
+    end              : i32 = 0;
+    bitBuf           : u64 = 0;
+    bitCnt           : i32 = 0;
+    output           : i8[];
+    outLen           : i32 = 0;
+    outCap           : i32 = 0;
+    limit            : i32;
+    damaged          : bool = false;
+    literalFast      : i32[];
+    distanceFast     : i32[];
+    literalCount     : i32[];
+    literalSymbol    : i32[];
+    distanceCount    : i32[];
+    distanceSymbol   : i32[];
+    codeLengthCount  : i32[];
+    codeLengthSymbol : i32[];
+    codeLengthFast   : i32[];
+    lengths          : i32[];
+    codeLengths      : i32[];
+    next             : i32[];
+    offsets          : i32[];
+    fixedBuilt       : bool = false;
+    codeLengthOrder  : i32[];
+    tables           : DeflateTables;
+
+    /**
+     * A decoder that refuses to produce more than `maxOutput` bytes per stream (clamped to 0 .. 2^30, so the
+     * work array's size arithmetic cannot overflow).
+     */
+    constructor(maxOutput : i32) {
+        self.limit = maxOutput;
+        if (self.limit < 0) {
+            self.limit = 0;
+        }
+        if (self.limit > FAST_INFLATER_MAX_LIMIT) {
+            self.limit = FAST_INFLATER_MAX_LIMIT;
+        }
+        self.input = new i8[FAST_INFLATER_INITIAL_OUT as i64];
+        self.output = new i8[FAST_INFLATER_INITIAL_OUT as i64];
+        // The usable room never passes the limit, so the literal path needs only the room test.
+        self.outCap = FAST_INFLATER_INITIAL_OUT;
+        if (self.outCap > self.limit) {
+            self.outCap = self.limit;
+        }
+        self.literalFast = new i32[FAST_INFLATER_FAST_SIZE as i64];
+        self.distanceFast = new i32[FAST_INFLATER_FAST_SIZE as i64];
+        self.codeLengthFast = new i32[FAST_INFLATER_FAST_SIZE as i64];
+        self.literalCount = new i32[(FAST_INFLATER_MAX_BITS + 1) as i64];
+        self.literalSymbol = new i32[FAST_INFLATER_LIT_SYMBOLS as i64];
+        self.distanceCount = new i32[(FAST_INFLATER_MAX_BITS + 1) as i64];
+        self.distanceSymbol = new i32[DEFLATE_DISTANCE_CODES as i64];
+        self.codeLengthCount = new i32[(FAST_INFLATER_MAX_BITS + 1) as i64];
+        self.codeLengthSymbol = new i32[FAST_INFLATER_CL_SYMBOLS as i64];
+        self.lengths = new i32[FAST_INFLATER_LENS_ROOM as i64];
+        self.codeLengths = new i32[FAST_INFLATER_LENS_ROOM as i64];
+        self.next = new i32[(FAST_INFLATER_MAX_BITS + 2) as i64];
+        self.offsets = new i32[(FAST_INFLATER_MAX_BITS + 2) as i64];
+        self.codeLengthOrder = FastInflater::clOrder();
+        self.tables = new DeflateTables();
+    }
+
+    static fn clOrder() : i32[] {
+        let mut o : i32[] = new i32[FAST_INFLATER_CL_SYMBOLS as i64];
+        o[0] = 16;
+        o[1] = 17;
+        o[2] = 18;
+        o[3] = 0;
+        o[4] = 8;
+        o[5] = 7;
+        o[6] = 9;
+        o[7] = 6;
+        o[8] = 10;
+        o[9] = 5;
+        o[10] = 11;
+        o[11] = 4;
+        o[12] = 12;
+        o[13] = 3;
+        o[14] = 13;
+        o[15] = 2;
+        o[16] = 14;
+        o[17] = 1;
+        o[18] = 15;
+        return o;
+    }
+
+    /** True when the last stream was damaged, truncated or larger than the limit. */
+    pub fn failed(self) : bool {
+        return self.damaged;
+    }
+
+    // ---- wrappers -----------------------------------------------------------------------------------------
+
+    /**
+     * Inflates the raw deflate data in `data[from..to]` into `into` (replacing its contents); false on
+     * failure.
+     */
+    pub fn raw(mut self, data : ByteBuf, from : i32, to : i32, into : ByteBuf) : bool {
+        self.begin(data, from, to, into);
+        self.blocks();
+        return self.finish(into);
+    }
+
+    /** Inflates the zlib stream in `data[from..to]` into `into`; the Adler sum is not checked. */
+    pub fn zlib(mut self, data : ByteBuf, from : i32, to : i32, into : ByteBuf) : bool {
+        let flg : i32 = data.getOr(from + 1, 0);
+        let cmf : i32 = data.getOr(from, 0);
+        let headerOk : bool = (cmf & FAST_INFLATER_LEN_MASK) == 8 && ((cmf << 8) | flg) % 31 == 0
+            && (flg & FAST_INFLATER_ZLIB_DICT) == 0;
+        self.begin(data, from + FAST_INFLATER_ZLIB_HEADER, to, into);
+        if (!headerOk || to - from < FAST_INFLATER_ZLIB_HEADER) {
+            self.damaged = true;
+            return self.finish(into);
+        }
+        self.blocks();
+        return self.finish(into);
+    }
+
+    /**
+     * Like `zlib`, and also checks the Adler-32 sum that follows the deflate data against the output: false
+     * (and `failed`) when the sum is missing or wrong. For a container with no framing of its own, a PNG for
+     * instance.
+     */
+    pub fn zlibVerified(mut self, data : ByteBuf, from : i32, to : i32, into : ByteBuf) : bool {
+        if (!self.zlib(data, from, to, into)) {
+            return false;
+        }
+
+        // The deflate data ended inside the last byte read into the bit buffer; whole bytes still in it are
+        // unread.
+        let trailer : i32 = from + FAST_INFLATER_ZLIB_HEADER + self.pos - (self.bitCnt >> 3);
+        if (trailer + FAST_INFLATER_ADLER_BYTES > to || data.be32(trailer) != adler32(into, 0, into.len())) {
+            self.damaged = true;
+            return false;
+        }
+        return true;
+    }
+
+    /** Inflates the gzip member in `data[from..to]` into `into`; the CRC is not checked. */
+    pub fn gzip(mut self, data : ByteBuf, from : i32, to : i32, into : ByteBuf) : bool {
+        let start : i32 = FastInflater::gzipBodyStart(data, from, to);
+        if (start < 0) {
+            self.begin(data, 0, 0, into);
+            self.damaged = true;
+            return self.finish(into);
+        }
+        self.begin(data, start, to - FAST_INFLATER_GZIP_TRAILER, into);
+        self.blocks();
+        return self.finish(into);
+    }
+
+    // Where the deflate data of a gzip member begins, or -1 for a bad header.
+    static fn gzipBodyStart(data : ByteBuf, from : i32, to : i32) : i32 {
+        if (to - from < FAST_INFLATER_GZIP_FIXED + FAST_INFLATER_GZIP_TRAILER) {
+            return -1;
+        }
+        if (data.get(from) != FAST_INFLATER_GZIP_ID1 || data.get(from + 1) != FAST_INFLATER_GZIP_ID2
+            || data.get(from + 2) != 8) {
+            return -1;
+        }
+        let flags : i32 = data.get(from + 3);
+        let mut at : i32 = from + FAST_INFLATER_GZIP_FIXED;
+        if ((flags & FAST_INFLATER_GZIP_FEXTRA) != 0) {
+            at = at + 2 + (data.getOr(at, 0) | (data.getOr(at + 1, 0) << 8));
+        }
+        if ((flags & FAST_INFLATER_GZIP_FNAME) != 0) {
+            while (at < to && data.get(at) != 0) {
+                at = at + 1;
+            }
+            at = at + 1;
+        }
+        if ((flags & FAST_INFLATER_GZIP_FCOMMENT) != 0) {
+            while (at < to && data.get(at) != 0) {
+                at = at + 1;
+            }
+            at = at + 1;
+        }
+        if ((flags & FAST_INFLATER_GZIP_FHCRC) != 0) {
+            at = at + 2;
+        }
+        if (at > to - FAST_INFLATER_GZIP_TRAILER) {
+            return -1;
+        }
+        return at;
+    }
+
+    // The decoder owns its input and output arrays: storing the arrays of a `ByteBuf` in fields would make
+    // both objects free them (a double free at teardown), so the input is copied in (one memcpy) and the
+    // output copied out in `finish`.
+    fn begin(mut self, data : ByteBuf, from : i32, to : i32, into : ByteBuf) : void {
+        self.pos = 0;
+        self.end = 0;
+        self.bitBuf = 0;
+        self.bitCnt = 0;
+        self.damaged = false;
+        self.outLen = 0;
+        into.setLen(0);
+        let n : i32 = to - from;
+        if (n < 0 || from < 0 || to > data.len()) {
+            self.damaged = true;
+            return;
+        }
+        if (n + 1 > (self.input.length as i32)) {
+            self.input = new i8[(n + 1) as i64];
+        }
+        bytesCopy(self.input, 0, data.raw(), from, n);
+        self.end = n;
+    }
+
+    fn finish(mut self, into : ByteBuf) : bool {
+        into.reserve(self.outLen + 1);
+        bytesCopy(into.raw(), 0, self.output, 0, self.outLen);
+        into.setLen(self.outLen);
+        return !self.damaged;
+    }
+
+    // ---- bits ---------------------------------------------------------------------------------------------
+
+    fn refill(mut self) : void {
+        while (self.bitCnt <= FAST_INFLATER_REFILL_LIMIT && self.pos < self.end) {
+            let byte : u64 = ((self.input[self.pos] as i32) & FAST_INFLATER_BYTE_MASK) as u64;
+            self.bitBuf = self.bitBuf | (byte << (self.bitCnt as u64));
+            self.bitCnt = self.bitCnt + 8;
+            self.pos = self.pos + 1;
+        }
+    }
+
+    // The next `n` bits (n <= 16), least significant first; the stream ending inside them fails.
+    fn take(mut self, n : i32) : i32 {
+        if (self.bitCnt < n) {
+            self.refill();
+            if (self.bitCnt < n) {
+                self.damaged = true;
+                return 0;
+            }
+        }
+        let v : i32 = (self.bitBuf & (((1 as u64) << (n as u64)) - 1)) as i32;
+        self.bitBuf = self.bitBuf >> (n as u64);
+        self.bitCnt = self.bitCnt - n;
+        return v;
+    }
+
+    // ---- output -------------------------------------------------------------------------------------------
+
+    // Makes room for `extra` more bytes; false when that would pass the limit (checked first, so a limit
+    // below the initial buffer holds too).
+    fn room(mut self, extra : i32) : bool {
+        if (extra > self.limit - self.outLen) {
+            self.damaged = true;
+            return false;
+        }
+        if (self.outLen + extra <= self.outCap) {
+            return true;
+        }
+        let mut cap : i32 = self.outCap * 2;
+        while (cap < self.outLen + extra) {
+            cap = cap * 2;
+        }
+        if (cap > self.limit) {
+            cap = self.limit;
+        }
+        let mut bigger : i8[] = new i8[cap as i64];
+        bytesCopy(bigger, 0, self.output, 0, self.outLen);
+        self.output = bigger;
+        self.outCap = cap;
+        return true;
+    }
+
+    // ---- blocks -------------------------------------------------------------------------------------------
+
+    fn blocks(mut self) : void {
+        let mut last : i32 = 0;
+        while (last == 0 && !self.damaged) {
+            last = self.take(1);
+            let kind : i32 = self.take(2);
+            if (self.damaged) {
+                return;
+            }
+            if (kind == FAST_INFLATER_STORED) {
+                self.stored();
+            } else if (kind == FAST_INFLATER_FIXED) {
+                self.fixed();
+            } else if (kind == FAST_INFLATER_DYNAMIC) {
+                self.dynamic();
+            } else {
+                self.damaged = true;
+            }
+        }
+    }
+
+    fn stored(mut self) : void {
+        // Drop the bits of the current byte, then give back whole bytes the buffer already holds.
+        let spare : i32 = self.bitCnt & 7;
+        self.bitBuf = self.bitBuf >> (spare as u64);
+        self.bitCnt = self.bitCnt - spare;
+        let len : i32 = self.take(16);
+        let inv : i32 = self.take(16);
+        if (self.damaged || len != (inv ^ 65535)) {
+            self.damaged = true;
+            return;
+        }
+        if (!self.room(len)) {
+            return;
+        }
+
+        // Whole bytes the bit buffer already holds come first, then the rest is one copy from the input.
+        let mut left : i32 = len;
+        while (left > 0 && self.bitCnt >= 8) {
+            self.output[self.outLen] = self.take(8) as i8;
+            self.outLen = self.outLen + 1;
+            left = left - 1;
+        }
+        if (left > self.end - self.pos) {
+            self.damaged = true;
+            return;
+        }
+        bytesCopy(self.output, self.outLen, self.input, self.pos, left);
+        self.pos = self.pos + left;
+        self.outLen = self.outLen + left;
+    }
+
+    // Builds the decode structures of a canonical code from `lens[at..at+n]`: `count`/`symbol` for the slow
+    // walk and `fast` for codes up to FAST_INFLATER_FAST_BITS. Returns false for an over-subscribed code.
+    fn construct(mut self, count : i32[], symbol : i32[], fast : i32[], at : i32, n : i32) : bool {
+        for (l of 0..(FAST_INFLATER_MAX_BITS + 1)) {
+            count[l] = 0;
+        }
+        for (s of 0..n) {
+            count[self.lengths[at + s]] = count[self.lengths[at + s]] + 1;
+        }
+        for (i of 0..FAST_INFLATER_FAST_SIZE) {
+            fast[i] = 0;
+        }
+        if (count[0] == n) {
+            return true;
+        }
+
+        let mut left : i32 = 1;
+        for (l of 1..(FAST_INFLATER_MAX_BITS + 1)) {
+            left = left << 1;
+            left = left - count[l];
+            if (left < 0) {
+                return false;
+            }
+        }
+
+        self.offsets[1] = 0;
+        for (l of 1..FAST_INFLATER_MAX_BITS) {
+            self.offsets[l + 1] = self.offsets[l] + count[l];
+        }
+        // The first canonical code of each length, MSB first (RFC 1951 section 3.2.2).
+        let mut next : i32[] = self.next;
+        let mut code : i32 = 0;
+        let mut previous : i32 = 0;
+        for (l of 1..(FAST_INFLATER_MAX_BITS + 1)) {
+            code = (code + previous) << 1;
+            next[l] = code;
+            previous = count[l];
+        }
+        return self.fillTables(count, symbol, fast, at, n, next);
+    }
+
+    fn fillTables(
+        mut self,
+        count : i32[],
+        symbol : i32[],
+        fast : i32[],
+        at : i32,
+        n : i32,
+        next : i32[]
+    ) : bool {
+        for (s of 0..n) {
+            let l : i32 = self.lengths[at + s];
+            if (l == 0) {
+                continue;
+            }
+            symbol[self.offsets[l]] = s;
+            self.offsets[l] = self.offsets[l] + 1;
+            let c : i32 = next[l];
+            next[l] = c + 1;
+            if (l <= FAST_INFLATER_FAST_BITS) {
+                // The table is indexed by the next bits LSB first, so reverse the MSB-first code.
+                let rev : i32 = FastInflater::reverse(c, l);
+                let entry : i32 = (s << FAST_INFLATER_SYM_SHIFT) | l;
+                let mut idx : i32 = rev;
+                while (idx < FAST_INFLATER_FAST_SIZE) {
+                    fast[idx] = entry;
+                    idx = idx + (1 << l);
+                }
+            }
+        }
+        return true;
+    }
+
+    static fn reverse(code : i32, bits : i32) : i32 {
+        let mut r : i32 = 0;
+        let mut c : i32 = code;
+        for (i of 0..bits) {
+            r = (r << 1) | (c & 1);
+            c = c >> 1;
+        }
+        return r;
+    }
+
+    // Slow canonical walk for a code longer than the fast table: one bit at a time, as puff does.
+    fn decodeSlow(mut self, count : i32[], symbol : i32[]) : i32 {
+        let mut code : i32 = 0;
+        let mut first : i32 = 0;
+        let mut index : i32 = 0;
+        for (len of 1..(FAST_INFLATER_MAX_BITS + 1)) {
+            code = code | self.take(1);
+            if (self.damaged) {
+                return -1;
+            }
+            let c : i32 = count[len];
+            if (code - c < first) {
+                return symbol[index + (code - first)];
+            }
+            index = index + c;
+            first = (first + c) << 1;
+            code = code << 1;
+        }
+        return -1;
+    }
+
+    // One symbol of the code in (count, symbol, fast), or -1.
+    fn decode(mut self, count : i32[], symbol : i32[], fast : i32[]) : i32 {
+        if (self.bitCnt < FAST_INFLATER_MAX_BITS) {
+            self.refill();
+        }
+        let e : i32 = fast[(self.bitBuf & (FAST_INFLATER_FAST_MASK as u64)) as i32];
+        if (e != 0) {
+            let l : i32 = e & FAST_INFLATER_LEN_MASK;
+            if (l > self.bitCnt) {
+                self.damaged = true;
+                return -1;
+            }
+            self.bitBuf = self.bitBuf >> (l as u64);
+            self.bitCnt = self.bitCnt - l;
+            return e >> FAST_INFLATER_SYM_SHIFT;
+        }
+        return self.decodeSlow(count, symbol);
+    }
+
+    fn fixed(mut self) : void {
+        if (self.fixedBuilt) {
+            self.codes();
+            return;
+        }
+        for (s of 0..144) {
+            self.lengths[s] = 8;
+        }
+        for (s of 144..256) {
+            self.lengths[s] = 9;
+        }
+        for (s of 256..280) {
+            self.lengths[s] = 7;
+        }
+        for (s of 280..FAST_INFLATER_LIT_SYMBOLS) {
+            self.lengths[s] = 8;
+        }
+        self.construct(self.literalCount, self.literalSymbol, self.literalFast, 0, FAST_INFLATER_LIT_SYMBOLS);
+        for (s of 0..DEFLATE_DISTANCE_CODES) {
+            self.lengths[s] = 5;
+        }
+        self.construct(self.distanceCount, self.distanceSymbol, self.distanceFast, 0, DEFLATE_DISTANCE_CODES);
+        self.fixedBuilt = true;
+        self.codes();
+    }
+
+    fn dynamic(mut self) : void {
+        self.fixedBuilt = false;
+        let nlen : i32 = self.take(5) + DEFLATE_FIRST_LENGTH;
+        let ndist : i32 = self.take(5) + 1;
+        let ncode : i32 = self.take(4) + 4;
+        if (self.damaged || nlen > FAST_INFLATER_MAX_LIT || ndist > FAST_INFLATER_MAX_DIST) {
+            self.damaged = true;
+            return;
+        }
+
+        for (i of 0..FAST_INFLATER_CL_SYMBOLS) {
+            self.lengths[i] = 0;
+        }
+        for (i of 0..ncode) {
+            self.lengths[self.codeLengthOrder[i]] = self.take(3);
+        }
+        if (self.damaged
+            || !self.construct(
+                self.codeLengthCount,
+                self.codeLengthSymbol,
+                self.codeLengthFast,
+                0,
+                FAST_INFLATER_CL_SYMBOLS
+            )) {
+            self.damaged = true;
+            return;
+        }
+
+        let total : i32 = nlen + ndist;
+        let mut lens : i32[] = self.codeLengths;
+        let mut idx : i32 = 0;
+        while (idx < total) {
+            let sym : i32 = self.decode(self.codeLengthCount, self.codeLengthSymbol, self.codeLengthFast);
+            if (sym < 0) {
+                self.damaged = true;
+                return;
+            }
+            if (sym < FAST_INFLATER_REPEAT_PREV) {
+                lens[idx] = sym;
+                idx = idx + 1;
+                continue;
+            }
+            let mut prev : i32 = 0;
+            let mut rep : i32 = 0;
+            if (sym == FAST_INFLATER_REPEAT_PREV) {
+                if (idx == 0) {
+                    self.damaged = true;
+                    return;
+                }
+                prev = lens[idx - 1];
+                rep = 3 + self.take(2);
+            } else if (sym == FAST_INFLATER_REPEAT_ZERO_SHORT) {
+                rep = 3 + self.take(3);
+            } else {
+                rep = 11 + self.take(7);
+            }
+            if (self.damaged || idx + rep > total) {
+                self.damaged = true;
+                return;
+            }
+            for (r of 0..rep) {
+                lens[idx] = prev;
+                idx = idx + 1;
+            }
+        }
+        if (lens[DEFLATE_END_OF_BLOCK] == 0) {
+            self.damaged = true;
+            return;
+        }
+
+        for (i of 0..nlen) {
+            self.lengths[i] = lens[i];
+        }
+        if (!self.construct(self.literalCount, self.literalSymbol, self.literalFast, 0, nlen)) {
+            self.damaged = true;
+            return;
+        }
+        for (i of 0..ndist) {
+            self.lengths[i] = lens[nlen + i];
+        }
+        if (!self.construct(self.distanceCount, self.distanceSymbol, self.distanceFast, 0, ndist)) {
+            self.damaged = true;
+            return;
+        }
+        self.codes();
+    }
+
+    // Decodes literals and matches until the end-of-block symbol: the fast loop while the input and the
+    // output have room for whole symbols, then one careful step, and the fast loop again.
+    fn codes(mut self) : void {
+        while (!self.damaged) {
+            let state : i32 = self.codesFast();
+            if (state != 0) {
+                return;
+            }
+            if (self.step()) {
+                return;
+            }
+        }
+    }
+
+    // The hot loop, with the bit buffer, the cursors and the tables in locals. It runs while 8 input bytes
+    // and 258 output bytes are certain, which covers a length code, its extra bits, a distance code and its
+    // extra bits (at most 48 bits of the 57 a refill gives), so no test for the end of either array is needed
+    // inside it. Answers 1 at the end-of-block symbol, 0 to let `step` take one symbol (a code longer than
+    // the table, or little room left), and -1 when the stream is damaged. A symbol that is given up is
+    // un-read first, so `step` sees it whole.
+    fn codesFast(mut self) : i32 {
+        let src : i8[] = self.input;
+        let mut out : i8[] = self.output;
+        let litFast : i32[] = self.literalFast;
+        let distFast : i32[] = self.distanceFast;
+        let lenBase : i32[] = self.tables.lenBase;
+        let lenExtra : i32[] = self.tables.lenExtra;
+        let dstBase : i32[] = self.tables.dstBase;
+        let dstExtra : i32[] = self.tables.dstExtra;
+        let end : i32 = self.end;
+        let outLimit : i32 = self.outCap - FAST_INFLATER_MAX_MATCH;
+        let mut bb : u64 = self.bitBuf;
+        let mut bc : i32 = self.bitCnt;
+        let mut pos : i32 = self.pos;
+        let mut outLen : i32 = self.outLen;
+        let mut state : i32 = 0;
+
+        while (end - pos >= FAST_INFLATER_FAST_INPUT && outLen <= outLimit) {
+            while (bc <= FAST_INFLATER_REFILL_LIMIT) {
+                bb = bb | ((((src[pos] as i32) & FAST_INFLATER_BYTE_MASK) as u64) << (bc as u64));
+                bc = bc + 8;
+                pos = pos + 1;
+            }
+            let savedBits : u64 = bb;
+            let savedCount : i32 = bc;
+            let savedPos : i32 = pos;
+
+            let e : i32 = litFast[(bb & (FAST_INFLATER_FAST_MASK as u64)) as i32];
+            if (e == 0) {
+                break;
+            }
+            let l : i32 = e & FAST_INFLATER_LEN_MASK;
+            bb = bb >> (l as u64);
+            bc = bc - l;
+            let sym : i32 = e >> FAST_INFLATER_SYM_SHIFT;
+            if (sym < DEFLATE_END_OF_BLOCK) {
+                out[outLen] = sym as i8;
+                outLen = outLen + 1;
+                continue;
+            }
+            if (sym == DEFLATE_END_OF_BLOCK) {
+                state = 1;
+                break;
+            }
+
+            let s : i32 = sym - DEFLATE_FIRST_LENGTH;
+            if (s >= DEFLATE_LENGTH_CODES) {
+                state = -1;
+                break;
+            }
+            let lenBits : i32 = lenExtra[s];
+            let len : i32 = lenBase[s] + ((bb & (((1 as u64) << (lenBits as u64)) - 1)) as i32);
+            bb = bb >> (lenBits as u64);
+            bc = bc - lenBits;
+
+            let de : i32 = distFast[(bb & (FAST_INFLATER_FAST_MASK as u64)) as i32];
+            if (de == 0) {
+                bb = savedBits;
+                bc = savedCount;
+                pos = savedPos;
+                break;
+            }
+            let dl : i32 = de & FAST_INFLATER_LEN_MASK;
+            bb = bb >> (dl as u64);
+            bc = bc - dl;
+            let ds : i32 = de >> FAST_INFLATER_SYM_SHIFT;
+            if (ds >= DEFLATE_DISTANCE_CODES) {
+                state = -1;
+                break;
+            }
+            let distBits : i32 = dstExtra[ds];
+            let dist : i32 = dstBase[ds] + ((bb & (((1 as u64) << (distBits as u64)) - 1)) as i32);
+            bb = bb >> (distBits as u64);
+            bc = bc - distBits;
+            if (dist > outLen) {
+                state = -1;
+                break;
+            }
+
+            // A match may overlap its own output, so an overlapping one copies forward byte by byte.
+            let from : i32 = outLen - dist;
+            if (len <= dist && len >= FAST_INFLATER_BLOCK_COPY) {
+                bytesCopy(out, outLen, out, from, len);
+            } else {
+                for (k of 0..len) {
+                    out[outLen + k] = out[from + k];
+                }
+            }
+            outLen = outLen + len;
+        }
+
+        self.bitBuf = bb;
+        self.bitCnt = bc;
+        self.pos = pos;
+        self.outLen = outLen;
+        if (state < 0) {
+            self.damaged = true;
+        }
+        return state;
+    }
+
+    // One symbol with every check: literals, matches, the end of the input and the output limit. True at the
+    // end of the block or on damage.
+    fn step(mut self) : bool {
+        let sym : i32 = self.decode(self.literalCount, self.literalSymbol, self.literalFast);
+        if (sym < 0) {
+            self.damaged = true;
+            return true;
+        }
+        if (sym < DEFLATE_END_OF_BLOCK) {
+            if (self.outLen >= self.outCap && !self.room(1)) {
+                return true;
+            }
+            self.output[self.outLen] = sym as i8;
+            self.outLen = self.outLen + 1;
+            return false;
+        }
+        if (sym == DEFLATE_END_OF_BLOCK) {
+            return true;
+        }
+
+        let s : i32 = sym - DEFLATE_FIRST_LENGTH;
+        if (s >= DEFLATE_LENGTH_CODES) {
+            self.damaged = true;
+            return true;
+        }
+        let len : i32 = self.tables.lenBase[s] + self.take(self.tables.lenExtra[s]);
+        let ds : i32 = self.decode(self.distanceCount, self.distanceSymbol, self.distanceFast);
+        if (ds < 0 || ds >= DEFLATE_DISTANCE_CODES) {
+            self.damaged = true;
+            return true;
+        }
+        let dist : i32 = self.tables.dstBase[ds] + self.take(self.tables.dstExtra[ds]);
+        if (self.damaged || dist > self.outLen || !self.room(len)) {
+            self.damaged = true;
+            return true;
+        }
+
+        // A match may overlap its own output, so copy forward byte by byte.
+        let from : i32 = self.outLen - dist;
+        for (k of 0..len) {
+            self.output[self.outLen + k] = self.output[from + k];
+        }
+        self.outLen = self.outLen + len;
+        return false;
+    }
+}

@@ -1,0 +1,173 @@
+// image — a picture as 8-bit RGBA pixels.
+//
+// The common currency of the data layer: importers produce `Image`s, the texture builder consumes them. A pixel
+// is one `i32` holding red in the low byte, then green, blue and alpha (`0xAABBGGRR`), straight (not
+// premultiplied) and in sRGB as files store it; conversion to linear light happens in `Texture`, where it
+// belongs. Row 0 is the top row, as in PNG.
+//
+// Out-of-range access is a failure value rather than a crash: `get` reads transparent black and `set` writes
+// nothing outside the image, so a caller that clips by hand needs no bounds check of its own. The constructor is
+// the one strict place, because a negative size leaves no image to give back.
+
+use std::ffi::runtime::panicMsg;
+
+use crate::data::bytes::ByteBuf;
+
+// A pixel is four bytes, one per channel, each holding a value 0..255.
+const IMAGE_BYTES_PER_PIXEL : i32 = 4;
+const IMAGE_CHANNEL_MASK : i32 = 255;
+
+/** A width x height grid of RGBA pixels. */
+pub class Image {
+    w  : i32;
+    h  : i32;
+    px : ByteBuf;
+
+    /** A transparent black image; aborts on a negative size. Width or height 0 gives the empty image. */
+    constructor(width : i32, height : i32) {
+        if (width < 0 || height < 0) {
+            panicMsg("Image: negative size");
+        }
+        self.w = width;
+        self.h = height;
+        self.px = new ByteBuf(16);
+        self.px.resize(width * height * IMAGE_BYTES_PER_PIXEL);
+    }
+
+    /** The pixel packing: red in the low byte, then green, blue, alpha; each 0 to 255. */
+    pub static fn pack(r : i32, g : i32, b : i32, a : i32) : i32 {
+        return (r & IMAGE_CHANNEL_MASK) | ((g & IMAGE_CHANNEL_MASK) << 8) | ((b & IMAGE_CHANNEL_MASK) << 16)
+            | ((a & IMAGE_CHANNEL_MASK) << 24);
+    }
+
+    /** The red channel of a packed pixel, 0 to 255. */
+    pub static fn red(p : i32) : i32 {
+        return p & IMAGE_CHANNEL_MASK;
+    }
+
+    /** The green channel of a packed pixel. */
+    pub static fn green(p : i32) : i32 {
+        return (p >>> 8) & IMAGE_CHANNEL_MASK;
+    }
+
+    /** The blue channel of a packed pixel. */
+    pub static fn blue(p : i32) : i32 {
+        return (p >>> 16) & IMAGE_CHANNEL_MASK;
+    }
+
+    /** The alpha channel of a packed pixel. */
+    pub static fn alpha(p : i32) : i32 {
+        return (p >>> 24) & IMAGE_CHANNEL_MASK;
+    }
+
+    /** Width in pixels. */
+    pub fn width(self) : i32 {
+        return self.w;
+    }
+
+    /** Height in pixels. */
+    pub fn height(self) : i32 {
+        return self.h;
+    }
+
+    /** True for an image with no pixel. */
+    pub fn isEmpty(self) : bool {
+        return self.w == 0 || self.h == 0;
+    }
+
+    // True when (x, y) names a pixel of this image.
+    fn inside(self, x : i32, y : i32) : bool {
+        return x >= 0 && y >= 0 && x < self.w && y < self.h;
+    }
+
+    // The byte offset of the first channel of (x, y); the caller has checked the pixel is inside.
+    fn byteAt(self, x : i32, y : i32) : i32 {
+        return (y * self.w + x) * IMAGE_BYTES_PER_PIXEL;
+    }
+
+    /** The packed pixel at (x, y); 0 (transparent black) outside the image. */
+    pub fn get(self, x : i32, y : i32) : i32 {
+        if (!self.inside(x, y)) {
+            return 0;
+        }
+        let at : i32 = self.byteAt(x, y);
+        return self.px.get(at) | (self.px.get(at + 1) << 8) | (self.px.get(at + 2) << 16)
+            | (self.px.get(at + 3) << 24);
+    }
+
+    /** Writes a packed pixel at (x, y); nothing happens outside the image. */
+    pub fn set(mut self, x : i32, y : i32, p : i32) : void {
+        if (!self.inside(x, y)) {
+            return;
+        }
+        let at : i32 = self.byteAt(x, y);
+        self.px.set(at, p);
+        self.px.set(at + 1, p >>> 8);
+        self.px.set(at + 2, p >>> 16);
+        self.px.set(at + 3, p >>> 24);
+    }
+
+    /** Sets every pixel to `p`. */
+    pub fn fill(mut self, p : i32) : void {
+        for (y of 0..self.h) {
+            for (x of 0..self.w) {
+                self.set(x, y, p);
+            }
+        }
+    }
+
+    /** Copies `src` onto this image with its top-left corner at (dx, dy), clipped; alpha is copied, not blended. */
+    pub fn blit(mut self, src : Image, dx : i32, dy : i32) : void {
+        for (y of 0..src.h) {
+            for (x of 0..src.w) {
+                self.set(dx + x, dy + y, src.get(x, y));
+            }
+        }
+    }
+
+    /** A copy of the rectangle (x, y, cw, ch), clipped to the image: pixels outside it are transparent. */
+    pub fn crop(self, x : i32, y : i32, cw : i32, ch : i32) : Image {
+        let out : Image = new Image(cw, ch);
+        for (j of 0..ch) {
+            for (i of 0..cw) {
+                out.set(i, j, self.get(x + i, y + j));
+            }
+        }
+        return out;
+    }
+
+    /** A copy. */
+    pub fn copy(self) : Image {
+        return self.crop(0, 0, self.w, self.h);
+    }
+
+    /** A copy turned upside down. */
+    pub fn flippedY(self) : Image {
+        let out : Image = new Image(self.w, self.h);
+        for (y of 0..self.h) {
+            for (x of 0..self.w) {
+                out.set(x, self.h - 1 - y, self.get(x, y));
+            }
+        }
+        return out;
+    }
+
+    /** True when the two images have the same size and the same pixels. */
+    pub fn same(self, other : Image) : bool {
+        if (self.w != other.w || self.h != other.h) {
+            return false;
+        }
+        let total : i32 = self.w * self.h * IMAGE_BYTES_PER_PIXEL;
+        for (i of 0..total) {
+            if (self.px.get(i) != other.px.get(i)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /** The bytes (4 per pixel, rows top to bottom), for codecs. */
+    pub fn bytes(self) : ByteBuf {
+        return self.px;
+    }
+}

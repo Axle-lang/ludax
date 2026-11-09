@@ -1,0 +1,380 @@
+// lz4 — the LZ4 block stream (the framing of the lz4-java `LZ4BlockOutputStream`) and its block format.
+//
+// The stream is a sequence of blocks, each with the magic `LZ4Block`, a token byte (high nibble 0x10 =
+// stored, 0x20 = LZ4), the compressed and decompressed lengths (little-endian ints), a 4-byte checksum and
+// the data; a final block of decompressed length 0 ends the stream, and a stream without it is cut and
+// refused. Checksums are not verified on decode, for the reason `FastInflater` skips its own: a container
+// with its own length framing already bounds the data. `encode` writes them, because readers of the format
+// (the JVM's among them) verify.
+//
+// The block format itself is the public LZ4 one: a token with a literal length and a match length (each
+// extended by bytes of 255 while the nibble is 15), the literals, then a 2-byte little-endian offset. The
+// last sequence of a block has literals only.
+//
+// A damaged stream must not cost memory: `decode` refuses a block that claims more than 255 output bytes per
+// input byte (the most LZ4 can expand), more than `LZ4_MAX_BLOCK_BYTES`, or more than the caller's `limit` in
+// all, before it reserves anything.
+
+const LZ4_MAGIC : string = "LZ4Block";
+const LZ4_MAGIC_BYTES : i32 = 8;
+const LZ4_HEADER : i32 = 21;
+const LZ4_METHOD_MASK : i32 = 240;
+const LZ4_METHOD_RAW : i32 = 16;
+const LZ4_METHOD_LZ4 : i32 = 32;
+const LZ4_MIN_MATCH : i32 = 4;
+const LZ4_NIBBLE : i32 = 15;
+const LZ4_EXTEND : i32 = 255;
+const LZ4_BYTE_MASK : i32 = 255;
+const LZ4_BLOCK_COPY : i32 = 16;
+const LZ4_BLOCK : i32 = 65536;
+const LZ4_LEVEL : i32 = 6;
+const LZ4_HASH_BITS : i32 = 12;
+
+/** The size of the hash table `Lz4::encode` needs as its `table` scratch, in ints. */
+pub const LZ4_TABLE_SIZE : i32 = 4096;
+
+/** The largest decompressed block lz4-java writes (32 MiB); a block that claims more is damage. */
+pub const LZ4_MAX_BLOCK_BYTES : i32 = 33554432;
+
+const LZ4_MAX_EXPANSION : i64 = 255;
+const LZ4_HASH_MUL : i32 = -1640531535;
+const LZ4_MAX_OFFSET : i32 = 65535;
+const LZ4_LAST_LITERALS : i32 = 5;
+const LZ4_MF_LIMIT : i32 = 12;
+const LZ4_CHECK_MASK : i32 = 268435455;
+const XXH_SEED : i32 = -1756908916;
+const XXH_P1 : i32 = -1640531535;
+const XXH_P2 : i32 = -2048144777;
+const XXH_P3 : i32 = -1028477379;
+const XXH_P4 : i32 = 668265263;
+const XXH_P5 : i32 = 374761393;
+
+/** Encodes and decodes LZ4 block streams. */
+pub class Lz4 {
+    /**
+     * Decompresses the `LZ4Block` stream in `data[from..to]` into `out` (replacing its contents, at most
+     * `limit` bytes in all). False on a malformed stream: a bad magic or method, a block that claims more
+     * than it can hold or than `limit` allows, or a stream that ends before its empty end block.
+     */
+    pub static fn decode(data : ByteBuf, from : i32, to : i32, out : ByteBuf, limit : i32) : bool {
+        out.setLen(0);
+        if (from < 0 || to > data.len() || limit < 0) {
+            return false;
+        }
+
+        let mut at : i32 = from;
+        let mut written : i32 = 0;
+        while (at + LZ4_HEADER <= to) {
+            if (!data.tagAt(at, "LZ4B") || !data.tagAt(at + 4, "lock")) {
+                return false;
+            }
+            let method : i32 = data.get(at + 8) & LZ4_METHOD_MASK;
+            let compressed : i32 = data.le32(at + 9);
+            let plain : i32 = data.le32(at + 13);
+            at = at + LZ4_HEADER;
+            if (plain == 0) {
+                return true;
+            }
+            if (!Lz4::blockFits(method, compressed, plain, to - at, limit - written)) {
+                return false;
+            }
+
+            out.reserve(written + plain + 1);
+            if (method == LZ4_METHOD_RAW) {
+                bytesCopy(out.raw(), written, data.raw(), at, plain);
+            } else if (!Lz4::block(data.raw(), at, at + compressed, out.raw(), written, plain)) {
+                return false;
+            }
+            written = written + plain;
+            out.setLen(written);
+            at = at + compressed;
+        }
+        return false;
+    }
+
+    // True when a block header is believable: a known method, sizes in range, the data inside the stream, the
+    // output inside what the caller allows, and no more output than the method can make from that input.
+    static fn blockFits(
+        method : i32,
+        compressed : i32,
+        plain : i32,
+        inputLeft : i32,
+        outputLeft : i32
+    ) : bool {
+        if (compressed < 0 || plain < 0 || plain > LZ4_MAX_BLOCK_BYTES) {
+            return false;
+        }
+        if (compressed > inputLeft || plain > outputLeft) {
+            return false;
+        }
+        if (method == LZ4_METHOD_RAW) {
+            return plain <= compressed;
+        }
+        if (method == LZ4_METHOD_LZ4) {
+            return (plain as i64) <= (compressed as i64) * LZ4_MAX_EXPANSION;
+        }
+        return false;
+    }
+
+    // One LZ4 block of `plain` output bytes written at `base`; the output array has room for them and
+    // `src[from..to]` is inside its array (both proved by `decode`).
+    static fn block(src : i8[], from : i32, to : i32, dst : i8[], base : i32, plain : i32) : bool {
+        let mut ip : i32 = from;
+        let mut op : i32 = 0;
+        while (ip < to) {
+            let token : i32 = (src[ip] as i32) & LZ4_BYTE_MASK;
+            ip = ip + 1;
+
+            let mut lit : i32 = token >> 4;
+            if (lit == LZ4_NIBBLE) {
+                let mut more : i32 = LZ4_EXTEND;
+                while (more == LZ4_EXTEND && ip < to) {
+                    more = (src[ip] as i32) & LZ4_BYTE_MASK;
+                    ip = ip + 1;
+                    lit = lit + more;
+                    if (lit > plain) {
+                        return false;
+                    }
+                }
+            }
+            if (lit > to - ip || lit > plain - op) {
+                return false;
+            }
+            // Short runs are cheaper as a loop than as a call to `memcpy`.
+            if (lit >= LZ4_BLOCK_COPY) {
+                bytesCopy(dst, base + op, src, ip, lit);
+            } else {
+                for (i of 0..lit) {
+                    dst[base + op + i] = src[ip + i];
+                }
+            }
+            ip = ip + lit;
+            op = op + lit;
+            if (ip >= to) {
+                return op == plain;
+            }
+
+            if (ip + 2 > to) {
+                return false;
+            }
+            let offset : i32 = ((src[ip] as i32) & LZ4_BYTE_MASK)
+                | (((src[ip + 1] as i32) & LZ4_BYTE_MASK) << 8);
+            ip = ip + 2;
+            let mut len : i32 = token & LZ4_NIBBLE;
+            if (len == LZ4_NIBBLE) {
+                let mut more : i32 = LZ4_EXTEND;
+                while (more == LZ4_EXTEND && ip < to) {
+                    more = (src[ip] as i32) & LZ4_BYTE_MASK;
+                    ip = ip + 1;
+                    len = len + more;
+                    if (len > plain) {
+                        return false;
+                    }
+                }
+            }
+            len = len + LZ4_MIN_MATCH;
+            if (offset == 0 || offset > op || len > plain - op) {
+                return false;
+            }
+
+            // A match may overlap its own output, so an overlapping one copies forward byte by byte.
+            let target : i32 = base + op;
+            if (len <= offset && len >= LZ4_BLOCK_COPY) {
+                bytesCopy(dst, target, dst, target - offset, len);
+            } else {
+                for (k of 0..len) {
+                    dst[target + k] = dst[target + k - offset];
+                }
+            }
+            op = op + len;
+        }
+        return op == plain;
+    }
+
+    // ---- compression
+    // --------------------------------------------------------------------------------------------
+
+    static fn rotl(v : i32, r : i32) : i32 {
+        return (v << r) | (v >>> (32 - r));
+    }
+
+    // The little-endian 32-bit word at `at` of a raw array (the caller proved `at + 4` is inside it).
+    static fn word(raw : i8[], at : i32) : i32 {
+        return ((raw[at] as i32) & LZ4_BYTE_MASK) | (((raw[at + 1] as i32) & LZ4_BYTE_MASK) << 8)
+            | (((raw[at + 2] as i32) & LZ4_BYTE_MASK) << 16)
+            | (((raw[at + 3] as i32) & LZ4_BYTE_MASK) << 24);
+    }
+
+    /**
+     * XXH32 of bytes `from..to` of `b` with `seed`: the checksum LZ4's block stream carries (seed 0x9747b28c,
+     * low 28 bits kept), which the JVM reader verifies, so a stream without it would be refused. Aborts when
+     * the range leaves the buffer.
+     */
+    pub static fn xxh32(b : ByteBuf, from : i32, to : i32, seed : i32) : i32 {
+        if (from < 0 || to > b.len()) {
+            panicMsg("Lz4.xxh32: range out of bounds");
+        }
+        let raw : i8[] = b.raw();
+        let n : i32 = to - from;
+        let mut at : i32 = from;
+        let mut h : i32 = 0;
+        if (n >= 16) {
+            let mut v1 : i32 = seed + XXH_P1 + XXH_P2;
+            let mut v2 : i32 = seed + XXH_P2;
+            let mut v3 : i32 = seed;
+            let mut v4 : i32 = seed - XXH_P1;
+            while (at + 16 <= to) {
+                v1 = Lz4::rotl(v1 + Lz4::word(raw, at) * XXH_P2, 13) * XXH_P1;
+                v2 = Lz4::rotl(v2 + Lz4::word(raw, at + 4) * XXH_P2, 13) * XXH_P1;
+                v3 = Lz4::rotl(v3 + Lz4::word(raw, at + 8) * XXH_P2, 13) * XXH_P1;
+                v4 = Lz4::rotl(v4 + Lz4::word(raw, at + 12) * XXH_P2, 13) * XXH_P1;
+                at = at + 16;
+            }
+            h = Lz4::rotl(v1, 1) + Lz4::rotl(v2, 7) + Lz4::rotl(v3, 12) + Lz4::rotl(v4, 18);
+        } else {
+            h = seed + XXH_P5;
+        }
+        h = h + n;
+        while (at + 4 <= to) {
+            h = Lz4::rotl(h + Lz4::word(raw, at) * XXH_P3, 17) * XXH_P4;
+            at = at + 4;
+        }
+        while (at < to) {
+            h = Lz4::rotl(h + ((raw[at] as i32) & LZ4_BYTE_MASK) * XXH_P5, 11) * XXH_P1;
+            at = at + 1;
+        }
+        h = (h ^ (h >>> 15)) * XXH_P2;
+        h = (h ^ (h >>> 13)) * XXH_P3;
+        return h ^ (h >>> 16);
+    }
+
+    // A length beyond the nibble: bytes of 255 then the remainder.
+    static fn putExtra(out : ByteBuf, extra : i32) : void {
+        let mut e : i32 = extra;
+        while (e >= LZ4_EXTEND) {
+            out.push(LZ4_EXTEND);
+            e = e - LZ4_EXTEND;
+        }
+        out.push(e);
+    }
+
+    // One sequence: literals `anchor..ip` of `src` then (when `matchLen` > 0) a match of that length at
+    // `offset`.
+    static fn sequence(
+        src : ByteBuf,
+        anchor : i32,
+        ip : i32,
+        offset : i32,
+        matchLen : i32,
+        out : ByteBuf
+    ) : void {
+        let lit : i32 = ip - anchor;
+        let mut token : i32 = 0;
+        if (lit >= LZ4_NIBBLE) {
+            token = LZ4_NIBBLE << 4;
+        } else {
+            token = lit << 4;
+        }
+        let ml : i32 = matchLen - LZ4_MIN_MATCH;
+        if (matchLen > 0) {
+            if (ml >= LZ4_NIBBLE) {
+                token = token | LZ4_NIBBLE;
+            } else {
+                token = token | ml;
+            }
+        }
+        out.push(token);
+        if (lit >= LZ4_NIBBLE) {
+            Lz4::putExtra(out, lit - LZ4_NIBBLE);
+        }
+        out.pushRange(src, anchor, ip);
+        if (matchLen > 0) {
+            out.push(offset);
+            out.push(offset >> 8);
+            if (ml >= LZ4_NIBBLE) {
+                Lz4::putExtra(out, ml - LZ4_NIBBLE);
+            }
+        }
+    }
+
+    // One LZ4 block of `src[from..from+n]`, greedy with a 4096-entry hash of 4-byte prefixes, appended to
+    // `out`. True when at least one match was found.
+    static fn compressBlock(src : ByteBuf, from : i32, n : i32, out : ByteBuf, table : i32[]) : bool {
+        let raw : i8[] = src.raw();
+        for (i of 0..LZ4_TABLE_SIZE) {
+            table[i] = -1;
+        }
+        let end : i32 = from + n;
+        let mut anchor : i32 = from;
+        let mut ip : i32 = from;
+        let mut produced : bool = false;
+        while (ip + LZ4_MF_LIMIT < end) {
+            let seq : i32 = Lz4::word(raw, ip);
+            let h : i32 = (seq * LZ4_HASH_MUL) >>> (32 - LZ4_HASH_BITS);
+            let ref : i32 = table[h];
+            table[h] = ip;
+            if (ref >= 0 && ip - ref <= LZ4_MAX_OFFSET && Lz4::word(raw, ref) == seq) {
+                let mut len : i32 = LZ4_MIN_MATCH;
+                while (ip + len < end - LZ4_LAST_LITERALS && raw[ref + len] == raw[ip + len]) {
+                    len = len + 1;
+                }
+                Lz4::sequence(src, anchor, ip, ip - ref, len, out);
+                produced = true;
+                ip = ip + len;
+                anchor = ip;
+            } else {
+                ip = ip + 1;
+            }
+        }
+        Lz4::sequence(src, anchor, end, 0, 0, out);
+        return produced;
+    }
+
+    // The 21-byte header of a block: magic, method token, compressed length, plain length, checksum.
+    static fn putHeader(out : ByteBuf, method : i32, compressed : i32, plain : i32, check : i32) : void {
+        out.pushText(LZ4_MAGIC);
+        out.push(method | LZ4_LEVEL);
+        out.pushLe32(compressed);
+        out.pushLe32(plain);
+        out.pushLe32(check);
+    }
+
+    /**
+     * Compresses `src[from..to]` into `out` (replacing it) as the LZ4 block stream: 64 KiB blocks, each with
+     * its checksum, stored raw when LZ4 does not shrink it, ended by an empty block. `table` is a scratch of
+     * `LZ4_TABLE_SIZE` ints (aborts when smaller). A block is compressed straight into `out` behind its
+     * header and the header's length is patched, so nothing is allocated per call.
+     */
+    pub static fn encode(src : ByteBuf, from : i32, to : i32, out : ByteBuf, table : i32[]) : void {
+        if (from < 0 || to > src.len() || (table.length as i32) < LZ4_TABLE_SIZE) {
+            panicMsg("Lz4.encode: range out of bounds or table too small");
+        }
+        out.clear();
+        let mut at : i32 = from;
+        while (at < to) {
+            let mut n : i32 = to - at;
+            if (n > LZ4_BLOCK) {
+                n = LZ4_BLOCK;
+            }
+            let check : i32 = Lz4::xxh32(src, at, at + n, XXH_SEED) & LZ4_CHECK_MASK;
+
+            let head : i32 = out.len();
+            Lz4::putHeader(out, LZ4_METHOD_LZ4, 0, n, check);
+            Lz4::compressBlock(src, at, n, out, table);
+            let body : i32 = out.len() - head - LZ4_HEADER;
+            if (body < n) {
+                let lengthAt : i32 = head + LZ4_MAGIC_BYTES + 1;
+                out.set(lengthAt, body);
+                out.set(lengthAt + 1, body >> 8);
+                out.set(lengthAt + 2, body >> 16);
+                out.set(lengthAt + 3, body >> 24);
+            } else {
+                out.truncate(head);
+                Lz4::putHeader(out, LZ4_METHOD_RAW, n, n, check);
+                out.pushRange(src, at, at + n);
+            }
+            at = at + n;
+        }
+        Lz4::putHeader(out, LZ4_METHOD_RAW, 0, 0, 0);
+    }
+}
