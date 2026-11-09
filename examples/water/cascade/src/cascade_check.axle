@@ -1,0 +1,489 @@
+// cascade_check — `cascade --check`: the physics of the scene, measured, with the tolerance of each claim stated.
+//
+// The check builds the scene (and a second one at low gravity), runs the engine for simulated minutes, and prints
+// what it measured before each verdict so a failure can be read without a debugger. The exit status is the number of
+// failed claims. What it claims, and why the tolerance is what it is:
+//
+//   inflow and outflow   over twenty simulated seconds the lake's inflow, the water over the lip, the river below the
+//                        pool and the water leaving the grid agree to a quarter: the river is four kilometres long
+//                        and holds minutes of water, so at the start its storage still changes by a few percent;
+//   the pool             passes the fall on: what leaves the downstream end is what went over the lip (the gauge of a
+//                        section just below the pool reads the pool's swirl, not the river, so it is not used);
+//   a wet river          every tenth point of the river's centreline holds water deeper than a decimetre, and the
+//                        last one does too, so water reaches the downstream boundary and leaves there;
+//   the books            the engine's ledger residual is below a millionth of what went in;
+//   persistence          the wet area after a simulated minute is at least nine tenths of the wet area at five seconds;
+//   gravity              the curtain's speed at 3.7 m/s2 over its speed at 9.81 lies between the square and the cube root of
+//                        the gravity ratio (free fall and terminal speed scale with the first, the lip's critical speed
+//                        with the second), a tenth either side;
+//   the books            the compartments read from the engine's state add up to what it holds; the balance is zero;
+//   a pour               V m3 poured in raise the world's water by V and are booked as poured;
+//   a closed world       with no inflow and no open side the water held is constant to float precision while the
+//                        reservoir drains over the lip into the curtain, the pool and the river;
+//   threads              one thread and many draw the same pixels.
+
+use fluidview::{Options, RiverPoint};
+use ludax::{abs, max, sqrt, HydroDyeLedger, HydroLedger, Vec2};
+
+use crate::cascade_books::CascadeLedger;
+use crate::cascade_gauge::CascadeGauge;
+use crate::cascade_markers::CascadeMarkers;
+use crate::cascade_run::CascadeRun;
+use crate::cascade_volumes::CascadeBooks;
+use crate::cascade_world::{CascadeSetup, CascadeWorld};
+
+// Relative tolerance of the flow agreements, and of the fall speed ratio.
+const CHECK_FLOW : f32 = 0.25;
+const CHECK_SPEED : f32 = 0.1;
+
+// The smallest depth a river point may hold, metres, and the step between the points checked.
+const CHECK_DEPTH : f32 = 0.1;
+const CHECK_EVERY : i32 = 10;
+
+// Cells around a record the deepest water is looked for in: the engine's channel follows its own line, a few cells
+// off the record's centre in a bend.
+const CHECK_NEAR : i32 = 4;
+
+// The largest relative ledger residual, and the share of the early wet area that must remain.
+const CHECK_BOOKS : f64 = 0.00001;
+const CHECK_KEEP : f32 = 0.9;
+
+// The moments of the run: when the early wet area is read, when the flow measurement starts and ends, seconds.
+const CHECK_EARLY : f32 = 5.0;
+const CHECK_FLOW_FROM : f32 = 40.0;
+const CHECK_END : f32 = 60.0;
+
+// How many readings of the lip gauge are averaged over the flow window (the lake slops about).
+const CHECK_SAMPLES : i32 = 40;
+
+// The low gravity of the speed check, m/s2, and how long its curtain runs before the speed is read, seconds.
+const CHECK_LOW_GRAVITY : f32 = 3.7;
+const CHECK_LOW_RUN : f32 = 6.0;
+
+// The bands of the fall the free-fall speeds are read in, as shares of its height above the foot.
+const CHECK_LOWER_LOW : f32 = 0.05;
+const CHECK_LOWER_HIGH : f32 = 0.2;
+const CHECK_BAND_HIGH : f32 = 0.45;
+
+// The median's histogram: bin width and count (m/s), and the slowest descent counted (drops hanging in the air are not the curtain).
+const CHECK_BIN : f32 = 0.25;
+const CHECK_BINS : i32 = 320;
+const CHECK_SLOWEST : f32 = 2.0;
+
+// The volume the check pours, m3, how many cells east of the pool's middle, and how closely it must be found again (relative).
+const CHECK_POUR : f64 = 1000.0;
+const CHECK_POUR_OFFSET : i32 = 60;
+const CHECK_POUR_TOLERANCE : f64 = 0.0001;
+
+// How long the closed world runs, seconds, and how often its volume is read.
+const CHECK_CLOSED : f32 = 40.0;
+const CHECK_CLOSED_SAMPLES : i32 = 8;
+
+// The marker check: floats released this far above the lip and this far apart (metres), how long they run (seconds) and how far
+// one must have travelled (metres) to count as carried by the flow.
+const CHECK_FLOATS : i32 = 8;
+const CHECK_FLOAT_BACK : f32 = 6.0;
+const CHECK_FLOAT_GAP : f32 = 2.0;
+const CHECK_FLOAT_RUN : f32 = 240.0;
+const CHECK_FLOAT_RIVER : f32 = 40.0;
+
+// The size of the picture of the thread comparison.
+const CHECK_WIDTH : i32 = 320;
+const CHECK_HEIGHT : i32 = 176;
+
+/** The scene's checks. */
+pub class CascadeCheck {
+    // Prints a verdict; 1 when it failed.
+    static fn verdict(passed : bool, text : string) : i32 {
+        if (passed) {
+            println("  ok    ${text}");
+            return 0;
+        }
+        println("  FAIL  ${text}");
+        return 1;
+    }
+
+    // True when `a` and `b` agree to the relative tolerance `tolerance` of the larger.
+    static fn agree(a : f32, b : f32, tolerance : f32) : bool {
+        return abs(a - b) <= tolerance * max(abs(a), abs(b));
+    }
+
+    // The median descent speed of the particles in the lower part of the fall, m/s, from a histogram of 0.25 m/s bins: the
+    // curtain's typical drop just before it lands. The median is robust where the fastest particle is not (a splash or a
+    // freak parcel decides the peak). Zero when the band is empty.
+    static fn curtainSpeed(scene : CascadeWorld) : f32 {
+        let foot : f32 = scene.terrain.escarpment.footHeight;
+        let fall : f32 = scene.terrain.escarpment.fall;
+        let low : f32 = foot + CHECK_LOWER_LOW * fall;
+        let high : f32 = foot + CHECK_BAND_HIGH * fall;
+        let mut bins : i32[] = new i32[CHECK_BINS as i64];
+        let mut count : i32 = 0;
+        for (k of 0..scene.store.count) {
+            let b : i64 = (k as i64) * 3;
+            let y : f32 = scene.store.positions[b + 1];
+            let speed : f32 = (0.0 as f32) - scene.store.velocities[b + 1];
+            if (y >= low && y <= high && speed >= CHECK_SLOWEST) {
+                let bin : i32 = (speed / CHECK_BIN) as i32;
+                if (bin < CHECK_BINS) {
+                    bins[bin as i64] = bins[bin as i64] + 1;
+                    count = count + 1;
+                }
+            }
+        }
+        let mut seen : i32 = 0;
+        for (bin of 0..CHECK_BINS) {
+            seen = seen + bins[bin as i64];
+            if (seen * 2 >= count) {
+                return ((bin as f32) + (0.5 as f32)) * CHECK_BIN;
+            }
+        }
+        return (0.0 as f32);
+    }
+
+    // The height and speed of the fastest descending particle between heights `low` and `high`.
+    static fn peak(scene : CascadeWorld, low : f32, high : f32) : Vec2 {
+        let mut at : f32 = (0.0 as f32);
+        let mut best : f32 = (0.0 as f32);
+        for (k of 0..scene.store.count) {
+            let b : i64 = (k as i64) * 3;
+            let y : f32 = scene.store.positions[b + 1];
+            let speed : f32 = (0.0 as f32) - scene.store.velocities[b + 1];
+            if (y >= low && y <= high && speed > best) {
+                best = speed;
+                at = y;
+            }
+        }
+        return Vec2::make(at, best);
+    }
+
+    // The river points whose cell holds less than `CHECK_DEPTH` of water, over every tenth point.
+    static fn dryPoints(scene : CascadeWorld) : i32 {
+        let mut dry : i32 = 0;
+        let mut k : i32 = 0;
+        while (k < scene.terrain.riverCount) {
+            if (CascadeCheck::inside(scene, scene.terrain.river[k as i64])
+                && CascadeCheck::depthAtPoint(scene, scene.terrain.river[k as i64]) < CHECK_DEPTH) {
+                dry = dry + 1;
+            }
+            k = k + CHECK_EVERY;
+        }
+        return dry;
+    }
+
+    // True when river point `p` lies over the water window (the record continues into the downstream lake).
+    static fn inside(scene : CascadeWorld, p : RiverPoint) : bool {
+        return p.z < scene.plan.z0 + (scene.plan.rows as f32) * scene.plan.cell;
+    }
+
+    // The last river record over the window.
+    static fn lastInside(scene : CascadeWorld) : i32 {
+        let mut last : i32 = 0;
+        for (k of 0..scene.terrain.riverCount) {
+            if (CascadeCheck::inside(scene, scene.terrain.river[k as i64])) {
+                last = k;
+            }
+        }
+        return last;
+    }
+
+    // The water depth at the cell holding river point `p`, the deepest of the cell and its eight neighbours (the
+    // record's centre may sit a cell off the channel's deepest line).
+    static fn depthAtPoint(scene : CascadeWorld, p : RiverPoint) : f32 {
+        let ci : i32 = ((p.x - scene.plan.x0) / scene.plan.cell) as i32;
+        let cj : i32 = ((p.z - scene.plan.z0) / scene.plan.cell) as i32;
+        let mut best : f32 = (0.0 as f32);
+        for (dj of (0 - CHECK_NEAR)..(CHECK_NEAR + 1)) {
+            for (di of (0 - CHECK_NEAR)..(CHECK_NEAR + 1)) {
+                best = max(best, scene.world.depthOfCell(ci + di, cj + dj));
+            }
+        }
+        return best;
+    }
+
+    /** Runs the checks of the command line's scene; the number of failed claims. */
+    pub static fn run(o : Options) : i32 {
+        let mut failures : i32 = 0;
+        let scene : CascadeWorld = new CascadeWorld(CascadeRun::setup(o));
+        defer scene.close();
+        let ms : f64 = scene.buildMillis;
+        let cells : i32 = scene.plan.cols * scene.plan.rows;
+        let mb : i64 = scene.plan.bytes / 1000000;
+        println("measured scene built in ${ms} ms: ${cells} cells of ${scene.plan.cell} m, ${mb} MB");
+
+        CascadeRun::runFor(scene, CHECK_EARLY);
+        let early : f32 = CascadeGauge::wetArea(scene);
+        CascadeRun::runFor(scene, CHECK_FLOW_FROM - CHECK_EARLY);
+        let before : HydroLedger = scene.ledger();
+        let mut lip : f32 = (0.0 as f32);
+        let river : f32 = (0.0 as f32);
+        for (i of 0..CHECK_SAMPLES) {
+            CascadeRun::runFor(scene, (CHECK_END - CHECK_FLOW_FROM) / (CHECK_SAMPLES as f32));
+            lip = lip + CascadeGauge::lip(scene) / (CHECK_SAMPLES as f32);
+        }
+        let after : HydroLedger = scene.ledger();
+        failures = failures + CascadeCheck::flows(before, after, lip);
+        failures = failures + CascadeCheck::river(scene, after, early);
+        failures = failures + CascadeCheck::books(scene, after);
+        if (o.dye) {
+            failures = failures + CascadeCheck::dye(scene);
+        }
+        failures = failures + CascadeCheck::pour(scene, CascadeCheck::pourVolume(o));
+        let speed : f32 = CascadeCheck::curtainSpeed(scene);
+        failures = failures + CascadeCheck::markers(scene);
+        failures = failures + CascadeCheck::closed(o);
+        failures = failures + CascadeCheck::gravity(o, speed);
+        failures = failures + CascadeCheck::threads(o, scene);
+        println("cascade check: ${failures} failures");
+        return failures;
+    }
+
+    // Inflow, the lip, the river below the pool and the outflow agree.
+    static fn flows(before : HydroLedger, after : HydroLedger, lip : f32) : i32 {
+        let span : f32 = CHECK_END - CHECK_FLOW_FROM;
+        let inflow : f32 = ((after.inflow - before.inflow) / (span as f64)) as f32;
+        let outflow : f32 = ((after.outflow - before.outflow) / (span as f64)) as f32;
+        println("measured inflow ${inflow} m3/s (mean of ${CHECK_SAMPLES} gauge readings below) , over the lip ${lip}, leaving the grid ${outflow}");
+        let mut failures : i32 = 0;
+        failures = failures
+            + CascadeCheck::verdict(
+                CascadeCheck::agree(inflow, outflow, CHECK_FLOW),
+                "outflow equals inflow within a quarter over ${span} s"
+            );
+        failures = failures
+            + CascadeCheck::verdict(
+                CascadeCheck::agree(lip, inflow, CHECK_FLOW),
+                "the discharge over the lip is the lake's inflow"
+            );
+        failures = failures
+            + CascadeCheck::verdict(
+                CascadeCheck::agree(outflow, lip, CHECK_FLOW),
+                "what leaves the downstream end is what went over the lip: the pool passed the fall on to the river"
+            );
+        return failures;
+    }
+
+    // The river is wet everywhere, the books close and the wet area persists.
+    static fn river(scene : CascadeWorld, after : HydroLedger, early : f32) : i32 {
+        let dry : i32 = CascadeCheck::dryPoints(scene);
+        let last : f32 = CascadeCheck::depthAtPoint(
+            scene,
+            scene.terrain.river[CascadeCheck::lastInside(scene) as i64]
+        );
+        let late : f32 = CascadeGauge::wetArea(scene);
+        let total : f64 = after.poured + after.inflow;
+        let residual : f64 = abs(after.residual()) / total;
+        println("measured dry river points ${dry}, depth at the last point ${last} m, ledger residual ${residual} of ${total} m3, wet area ${late} m2 at ${CHECK_END} s");
+        let mut failures : i32 = 0;
+        failures = failures
+            + CascadeCheck::verdict(dry == 0, "the river is wet along every tenth point of its centreline");
+        failures = failures
+            + CascadeCheck::verdict(
+                last >= CHECK_DEPTH && after.outflow > (0.0 as f32),
+                "water reaches the downstream boundary and leaves"
+            );
+        failures = failures + CascadeCheck::verdict(residual < CHECK_BOOKS, "the ledger closes");
+        failures = failures
+            + CascadeCheck::verdict(late >= CHECK_KEEP * early, "the wet area persists after a minute");
+        return failures;
+    }
+
+    // The compartments' volumes, read from the engine's state, add up to what the engine holds and the books balance.
+    static fn books(scene : CascadeWorld, ledger : HydroLedger) : i32 {
+        let b : CascadeBooks = CascadeLedger::read(scene);
+        let engine : f64 = ledger.grid + ledger.airborne;
+        let gap : f64 = abs(b.held - engine) / engine;
+        println("measured reservoir ${b.reservoir} m3, curtain ${b.curtain}, pool ${b.pool}, river ${b.river}, left the grid ${b.left}, inflow so far ${b.source}, poured at the start ${b.poured}");
+        println("measured held ${b.held} m3 (engine grid + air ${engine}), balance ${b.balance} m3 = ${b.relative} of what came in");
+        let mut failures : i32 = 0;
+        failures = failures
+            + CascadeCheck::verdict(gap < CHECK_BOOKS, "the compartments add up to what the engine holds");
+        failures = failures
+            + CascadeCheck::verdict(
+                b.relative < CHECK_BOOKS,
+                "poured + inflow - left - held = 0 to float rounding"
+            );
+        return failures;
+    }
+
+    // The dye the lake was filled with is accounted for like the water: what is in the grid, in the air and what left is what
+    // was put in, to the engine's rounding (`--dye`).
+    static fn dye(scene : CascadeWorld) : i32 {
+        let d : HydroDyeLedger = scene.world.tracerLedger(0);
+        let relative : f64 = abs(d.residual()) / ludax::maxD(d.injected, (1.0 as f32));
+        println("measured dye: in the grid ${d.grid}, in the air ${d.airborne}, left ${d.outflow}, injected ${d.injected}, residual ${relative} of the injected");
+        return CascadeCheck::verdict(relative < CHECK_BOOKS, "the dye is conserved like the water");
+    }
+
+    // The volume `--pour` asks for, or the default of the check, m3.
+    static fn pourVolume(o : Options) : f64 {
+        if (Options::given(o.pour)) {
+            return o.pour;
+        }
+        return CHECK_POUR;
+    }
+
+    // Pouring a known volume raises what the world holds by exactly that, and the engine books it as poured.
+    static fn pour(scene : CascadeWorld, volume : f64) : i32 {
+        let before : CascadeBooks = CascadeLedger::read(scene);
+        let i : i32 = ((scene.plan.pool.x - scene.plan.x0) / scene.plan.cell) as i32 + CHECK_POUR_OFFSET;
+        let j : i32 = ((scene.plan.pool.z - scene.plan.z0) / scene.plan.cell) as i32;
+        scene.pour(i, j, volume);
+        let after : CascadeBooks = CascadeLedger::read(scene);
+        let added : f64 = after.held - before.held;
+        let booked : f64 = after.poured - before.poured;
+        println("measured poured ${volume} m3: the world holds ${added} more, the ledger booked ${booked}");
+        let mut failures : i32 = 0;
+        failures = failures
+            + CascadeCheck::verdict(
+                abs(added - volume) < CHECK_POUR_TOLERANCE * volume,
+                "pouring V raises the water in the world by V"
+            );
+        failures = failures
+            + CascadeCheck::verdict(
+                abs(booked - volume) < CHECK_POUR_TOLERANCE * volume,
+                "the ledger books V as poured"
+            );
+        return failures;
+    }
+
+    // Markers released in the lake just above the lip ride the engine's flow over the fall, land in the pool and leave it for the
+    // river: positions only from the engine, so what is checked is that the engine's water carries them there in sensible times.
+    static fn markers(scene : CascadeWorld) : i32 {
+        let mut made : i32 = 0;
+        for (k of 0..CHECK_FLOATS) {
+            let x : f32 = scene.plan.lip.x
+                + ((k as f32) - (CHECK_FLOATS as f32) * (0.5 as f32)) * CHECK_FLOAT_GAP;
+            if (CascadeMarkers::release(scene, x, scene.plan.lip.z - CHECK_FLOAT_BACK) >= 0) {
+                made = made + 1;
+            }
+        }
+        let first : i32 = scene.world.drifterCount() - made;
+        CascadeRun::runFor(scene, CHECK_FLOAT_RUN);
+        let mut lip : i32 = 0;
+        let mut pool : i32 = 0;
+        let mut river : i32 = 0;
+        let mut left : i32 = 0;
+        let mut slowest : f32 = (0.0 as f32);
+        let mut latest : f32 = (0.0 as f32);
+        let mut total : f32 = (0.0 as f32);
+        for (i of 0..made) {
+            let k : i32 = first + i;
+            if (scene.lipTime[k as i64] >= (0.0 as f32)) {
+                lip = lip + 1;
+                slowest = max(slowest, scene.lipTime[k as i64]);
+            }
+            if (scene.poolIn[k as i64] >= (0.0 as f32)) {
+                pool = pool + 1;
+            }
+            if (scene.poolOut[k as i64] >= (0.0 as f32)) {
+                left = left + 1;
+                latest = max(latest, scene.poolOut[k as i64]);
+                total = total + scene.poolOut[k as i64];
+                if (scene.world.drifterTravel(k) > CHECK_FLOAT_RIVER) {
+                    river = river + 1;
+                }
+            }
+        }
+        let mean : f32 = total / max((left as f32), (1.0 as f32));
+        println("measured ${made} floats released ${CHECK_FLOAT_BACK} m above the lip: ${lip} went over the lip (the slowest after ${slowest} s), ${pool} floated in the pool, ${river} travelled over ${CHECK_FLOAT_RIVER} m, ${left} left the pool (on average at age ${mean} s after release, the last at ${latest} s), in ${CHECK_FLOAT_RUN} s");
+        let mut failures : i32 = 0;
+        failures = failures
+            + CascadeCheck::verdict(
+                made > 0 && lip * 2 >= made,
+                "most floats released above the lip go over it"
+            );
+        failures = failures + CascadeCheck::verdict(pool > 0, "floats land and float in the plunge pool");
+        failures = failures
+            + CascadeCheck::verdict(
+                left * 4 >= made * 3,
+                "at least three quarters of the floats leave the plunge pool within the 240 s run"
+            );
+        failures = failures
+            + CascadeCheck::verdict(
+                river * 2 >= made,
+                "floats keep travelling with the engine's flow (over 40 m down the river in the run)"
+            );
+        return failures;
+    }
+
+    // A closed world (no inflow, no open side) while the lake drains over the lip: what it holds is constant, and the
+    // reservoir's loss is exactly the gain of the curtain, the pool and the river.
+    static fn closed(o : Options) : i32 {
+        let mut setup : CascadeSetup = CascadeRun::setup(o);
+        setup.closed = true;
+        let w : CascadeWorld = new CascadeWorld(setup);
+        defer w.close();
+        let start : CascadeBooks = CascadeLedger::read(w);
+        let mut worst : f64 = (0.0 as f32);
+        for (i of 0..CHECK_CLOSED_SAMPLES) {
+            CascadeRun::runFor(w, CHECK_CLOSED / (CHECK_CLOSED_SAMPLES as f32));
+            let b : CascadeBooks = CascadeLedger::read(w);
+            worst = ludax::maxD(worst, abs(b.held - start.held) / start.held);
+        }
+        let end : CascadeBooks = CascadeLedger::read(w);
+        let lost : f64 = start.reservoir - end.reservoir;
+        let gained : f64 = (end.curtain - start.curtain) + (end.pool - start.pool)
+            + (end.river - start.river);
+        println("measured closed world over ${CHECK_CLOSED} s: held ${end.held} m3 from ${start.held}, worst relative change ${worst}; the reservoir lost ${lost} m3, the curtain, pool and river gained ${gained}");
+        let mut failures : i32 = 0;
+        failures = failures
+            + CascadeCheck::verdict(
+                worst < CHECK_BOOKS,
+                "a closed world keeps its volume to float precision"
+            );
+        failures = failures
+            + CascadeCheck::verdict(
+                lost > (0.0 as f32),
+                "the reservoir drains over the lip into the world below"
+            );
+        failures = failures
+            + CascadeCheck::verdict(
+                abs(lost - gained) < CHECK_BOOKS * start.held,
+                "what the reservoir lost is what the others gained"
+            );
+        return failures;
+    }
+
+    // The cube root by Newton's method (a handful of steps; no libm, so it is the same everywhere).
+    static fn cbrt(x : f32) : f32 {
+        let mut y : f32 = (1.0 as f32);
+        for (i of 0..8) {
+            y = ((2.0 as f32) * y + x / (y * y)) / (3.0 as f32);
+        }
+        return y;
+    }
+
+    // A world at low gravity drops its curtain slower. A body in free fall gains speed as the square root of the gravity,
+    // a body leaving the lip at the critical speed (g q)^(1/3) as its cube root, and the drag-limited terminal speed of a
+    // drop as the square root too, so the ratio of the curtain's speed at the two gravities lies between the square root
+    // and the cube root of the gravity ratio (a tenth either side for the peak of a particle cloud).
+    static fn gravity(o : Options, normal : f32) : i32 {
+        let mut setup : CascadeSetup = CascadeRun::setup(o);
+        let high : f32 = setup.gravity;
+        setup.gravity = CHECK_LOW_GRAVITY;
+        let low : CascadeWorld = new CascadeWorld(setup);
+        defer low.close();
+        CascadeRun::runFor(low, CHECK_LOW_RUN);
+        let slow : f32 = CascadeCheck::curtainSpeed(low);
+        let ratio : f32 = slow / normal;
+        let share : f32 = CHECK_LOW_GRAVITY / high;
+        let least : f32 = sqrt(share) * ((1.0 as f32) - CHECK_SPEED);
+        let most : f32 = CascadeCheck::cbrt(share) * ((1.0 as f32) + CHECK_SPEED);
+        println("measured curtain speed ${normal} m/s at g ${high}, ${slow} m/s at g ${CHECK_LOW_GRAVITY}: ratio ${ratio}, expected between ${least} and ${most}");
+        return CascadeCheck::verdict(
+            ratio >= least && ratio <= most,
+            "gravity slows the fall by about its square root"
+        );
+    }
+
+    // One thread and many draw the same pixels.
+    static fn threads(o : Options, scene : CascadeWorld) : i32 {
+        let mut p : Options = o;
+        p.width = CHECK_WIDTH;
+        p.height = CHECK_HEIGHT;
+        p.samples = 2;
+        let different : i32 = CascadeRun::compare(p, scene);
+        println("measured ${different} differing pixels");
+        return CascadeCheck::verdict(different == 0, "one thread and many draw the same picture");
+    }
+}

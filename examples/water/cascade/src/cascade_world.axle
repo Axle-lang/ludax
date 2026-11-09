@@ -1,0 +1,375 @@
+// cascade_world — the real scene: the generated terrain, the engine that simulates its water, and what the renderer reads.
+//
+// Construction does everything the scene needs before the first frame:
+//   1. generates the `HydroTerrain` of a seed and builds the renderer's `Relief` from it (heights, masks, lake);
+//   2. plans the water window (`CascadePlan`) and resamples the terrain's bed to it with `bedPatch`, so the engine
+//      cells keep the cliff and the channel a coarser grid would round off;
+//   3. fills the whole lake to its equilibrium level (the spill plus the head the inflow needs to pass the lip), adds the
+//      terrain's two inflows where they are, opens the downstream side (or closes the world, `closed`);
+//   4. pre-fills the river: every cell within the channel gets the depth to the river record's water level, so the
+//      whole river carries water from the first frame, and then lets the engine settle for a number of simulated
+//      seconds, faster than real time (the warm-up);
+//   5. keeps the books: the volume in each compartment is read from the engine's state (`cascade_books`). Nothing is
+//      drawn as water that the engine does not hold: the renderer's lake plane is off.
+// `advance` steps the engine, `sync` copies its water and its particles to the window and the drop store.
+
+use fluidview::{
+    DropStore, HydroInflow, MARKER_MAX, HydroTerrain, ReliefTerrain, RiverPoint, TerrainParams,
+    WaterLandscape, WaterWindow
+};
+use ludax::{nanosToMillis, nowNanos, HydroLedger, HydroParams, HydroWorld, HYDRO_SIDE_SOUTH};
+
+use crate::cascade_books::CascadeLedger;
+use crate::cascade_chart::BooksChart;
+use crate::cascade_plan::CascadePlan;
+use crate::cascade_volumes::CascadeBooks;
+use crate::drop_feed::DropFeed;
+use crate::window_feed::WindowFeed;
+
+/** Seconds of simulated time the warm-up runs, and the step it takes them in. */
+const WORLD_WARM : f32 = 12.0;
+const WORLD_WARM_STEP : f32 = 0.5;
+
+/** The notch passes water over more than the lip's nominal width (its crest is a vee, wider as the head rises): measured on the
+ * first run, where a lake started with the nominal width's head sent twice the inflow over the lip. */
+const WORLD_NOTCH : f32 = 1.9;
+
+/** Room the drop store keeps for the engine's aerated parcels (its `aerationCapacity`), on top of the water's own. */
+const WORLD_FROTH : i32 = 150000;
+
+/** The most markers the engine may carry. */
+const WORLD_MARKERS : i32 = 128;
+
+/** The discharge coefficient of a broad-crested weir, Q = C b H^1.5, for the head the lake starts with. */
+const WORLD_WEIR : f32 = 1.705;
+
+/** The least depth a river point is pre-filled to, metres, and the share of the bankfull width the normal flow wets. */
+const WORLD_MIN_DEPTH : f32 = 0.2;
+const WORLD_WETTED : f32 = 0.8;
+
+/** Points ahead of a river point the bed slope is taken over. */
+const WORLD_SLOPE_SPAN : i32 = 10;
+
+/** Cells on a side of the square a pour is spread over. */
+const POUR_SIDE : i32 = 10;
+
+/** The share of a river point's half width inside which cells are pre-filled. */
+const WORLD_CHANNEL : f32 = 1.0;
+
+/** The scene's knobs. */
+pub struct CascadeSetup {
+    /** The terrain's seed. */
+    pub seed : i32 = 7;
+
+    /** Metres a water cell. */
+    pub cell : f32 = (1.5 as f32);
+
+    /** Gravity, m/s2, and the water's viscosity. */
+    pub gravity   : f32 = (9.81 as f32);
+    pub viscosity : f32 = (0.05 as f32);
+
+    /** The most particles alive at once, and the longest gap between those of a curtain, metres. */
+    pub capacity : i32 = 200000;
+    pub spacing  : f32 = (0.4 as f32);
+
+    /** No inflow and no open side: the water in the world is constant. */
+    pub closed : bool = false;
+
+    /** Dye the lake (one tracer carried with the water), so its water can be followed. */
+    pub dye : bool = false;
+
+    /** Worker threads of the generator, the engine and the feeds. */
+    pub threads : i32 = 1;
+}
+
+/** The scene. */
+pub class CascadeWorld {
+    /** The terrain the scene stands on. */
+    pub terrain : HydroTerrain;
+
+    /** Where the water window lies. */
+    pub plan : CascadePlan;
+
+    /** The engine. */
+    pub world : Shared<HydroWorld>;
+
+    /** What the renderer draws. */
+    pub landscape : Shared<WaterLandscape>;
+
+    /** The particles the renderer draws. */
+    pub store : Shared<DropStore>;
+
+    /** Milliseconds the build took, and the warm-up inside it. */
+    pub buildMillis : f64 = (0.0 as f32);
+    pub warmMillis  : f64 = (0.0 as f32);
+
+    /** The cells that belong to the reservoir (the terrain's lake mask over the window): 1 or 0 a cell. */
+    pub lake : u8[];
+
+    /** Whether the world is closed: no inflow and no open side. */
+    pub closed : bool = false;
+
+    /** Whether the lake is dyed. */
+    pub dyed : bool = false;
+
+    /** The head over the lip the lake starts with, metres. */
+    pub head : f32 = (0.0 as f32);
+
+    /** For each marker: its age when it first crossed the lip, first floated in the pool and left it (-1 until then). */
+    pub lipTime : f32[];
+    pub poolIn  : f32[];
+    pub poolOut : f32[];
+
+    /** The history of the books, one sample every half simulated second while `sync` is called. */
+    pub chart : BooksChart;
+
+    feed : WindowFeed;
+
+    /** Builds the scene `setup` describes. */
+    constructor(setup : CascadeSetup) {
+        let begin : i64 = nowNanos();
+        self.terrain = HydroTerrain::generate(setup.seed, TerrainParams {}, setup.threads);
+        let relief = ReliefTerrain::make(self.terrain, false);
+        self.closed = setup.closed;
+        self.dyed = setup.dye;
+        self.plan = CascadePlan::over(self.terrain, setup.cell);
+        self.lake = new u8[(self.plan.cols as i64) * self.plan.rows];
+        let window : Shared<WaterWindow> = share new WaterWindow(
+            self.plan.cols,
+            self.plan.rows,
+            self.plan.cell,
+            self.plan.x0 + (0.5 as f32) * self.plan.cell,
+            self.plan.z0 + (0.5 as f32) * self.plan.cell
+        );
+        self.landscape = share new WaterLandscape(relief, window);
+        self.store = share new DropStore(setup.capacity + WORLD_FROTH);
+        self.world = share new HydroWorld(
+            self.plan.cols,
+            self.plan.rows,
+            self.plan.cell,
+            CascadeWorld::params(setup)
+        );
+        self.world.setOrigin(self.plan.x0 as f64, self.plan.z0 as f64);
+        self.loadBed(window);
+        self.fillLake();
+        self.openRiver();
+        self.feed = new WindowFeed(self.world, window, setup.threads, setup.dye);
+        self.chart = new BooksChart();
+        self.lipTime = new f32[MARKER_MAX as i64];
+        self.poolIn = new f32[MARKER_MAX as i64];
+        self.poolOut = new f32[MARKER_MAX as i64];
+        for (k of 0..MARKER_MAX) {
+            self.lipTime[k as i64] = -(1.0 as f32);
+            self.poolIn[k as i64] = -(1.0 as f32);
+            self.poolOut[k as i64] = -(1.0 as f32);
+        }
+        let warm : i64 = nowNanos();
+        self.settle(WORLD_WARM);
+        self.warmMillis = nanosToMillis(nowNanos() - warm);
+        self.sync();
+        self.buildMillis = nanosToMillis(nowNanos() - begin);
+    }
+
+    // The engine's parameters from the setup.
+    static fn params(setup : CascadeSetup) : HydroParams {
+        let mut p : HydroParams = HydroParams::standard();
+        p.gravity = setup.gravity;
+        p.viscosity = setup.viscosity;
+        p.threads = setup.threads;
+        p.fall.capacity = setup.capacity;
+        p.drifters = WORLD_MARKERS;
+        p.tracers = 0;
+        if (setup.dye) {
+            p.tracers = 1;
+        }
+        p.fall.curtainSpacing = setup.spacing;
+        return p;
+    }
+
+    // The terrain's bed resampled to the window's cells, into the engine and the window.
+    fn loadBed(mut self, window : Shared<WaterWindow>) : void {
+        let bed : f32[] = self.terrain.bedPatch(
+            self.plan.x0,
+            self.plan.z0,
+            self.plan.cols,
+            self.plan.rows,
+            self.plan.cell
+        );
+        self.world.setBed(bed, self.plan.cols, self.plan.rows, self.plan.cell);
+        for (j of 0..self.plan.rows) {
+            for (i of 0..self.plan.cols) {
+                window.setBed(i, j, bed[((j as i64) * (self.plan.cols as i64)) + (i as i64)]);
+            }
+        }
+    }
+
+    // The whole lake, filled to its equilibrium level, and the terrain's inflows where they are. The level is the spill
+    // plus the head H with which a broad-crested weir as wide as the lip's notch passes the inflow, H = (Q / (C b))^(2/3),
+    // so the lake starts at the level it would settle at and the fall carries the inflow from the first second; the
+    // water this adds over the spill level is booked as poured (the initial volume of the reservoir).
+    fn fillLake(mut self) : void {
+        for (j of 0..self.plan.rows) {
+            for (i of 0..self.plan.cols) {
+                let x : f32 = self.plan.x0 + ((i as f32) + (0.5 as f32)) * self.plan.cell;
+                let z : f32 = self.plan.z0 + ((j as f32) + (0.5 as f32)) * self.plan.cell;
+                if (self.terrain.isLakeAt(x, z)) {
+                    self.lake[((j as i64) * (self.plan.cols as i64)) + (i as i64)] = 1 as u8;
+                }
+            }
+        }
+        let third : f32 = CascadeWorld::cbrt(self.plan.inflow
+            / (WORLD_WEIR * self.terrain.escarpment.lipWidth * WORLD_NOTCH));
+        self.head = third * third;
+        if (self.dyed) {
+            self.world.fillToDyed(self.terrain.lake.level + self.head, self.lake, 0);
+        } else {
+            self.world.fillTo(self.terrain.lake.level + self.head, self.lake);
+        }
+        if (self.closed) {
+            return;
+        }
+        for (k of 0..self.terrain.inflowCount) {
+            let at : HydroInflow = self.terrain.inflows[k as i64];
+            self.world.addInflow(at.at.x - self.plan.x0, at.at.z - self.plan.z0, at.discharge);
+        }
+    }
+
+    // The cube root by Newton's method (no libm: the same everywhere).
+    static fn cbrt(x : f32) : f32 {
+        let mut y : f32 = (1.0 as f32);
+        for (i of 0..12) {
+            y = ((2.0 as f32) * y + x / (y * y)) / (3.0 as f32);
+        }
+        return y;
+    }
+
+    // Opens the downstream side and fills the river channel to the river records' water level.
+    fn openRiver(mut self) : void {
+        if (!self.closed) {
+            self.world.setOutflowBoundary(HYDRO_SIDE_SOUTH);
+        }
+        let n : i64 = (self.plan.cols as i64) * self.plan.rows;
+        let mut nearest : f32[] = new f32[n];
+        let mut level : f32[] = new f32[n];
+        for (c of 0..n) {
+            nearest[c] = (1000000.0 as f32);
+            level[c] = -(1000000.0 as f32);
+        }
+        for (k of 0..self.terrain.riverCount) {
+            self.mark(self.terrain.river[k as i64], self.normalDepth(k), nearest, level);
+        }
+        for (j of 0..self.plan.rows) {
+            for (i of 0..self.plan.cols) {
+                let c : i64 = ((j as i64) * (self.plan.cols as i64)) + (i as i64);
+                let depth : f32 = level[c] - self.world.bedAt(i, j);
+                if (nearest[c] < (1000000.0 as f32) && depth > (0.0 as f32)) {
+                    self.world.pour(i, j, depth);
+                }
+            }
+        }
+    }
+
+    // The depth the lake's inflow runs at in the channel at river point `k`: Manning's normal depth for the bed slope
+    // there and the wetted width, within [WORLD_MIN_DEPTH, the channel's own depth]. Pre-filling to the channel's full
+    // depth would start the river with more water than the inflow can carry and drain it for the best part of an hour.
+    fn normalDepth(self, k : i32) : f32 {
+        let p : RiverPoint = self.terrain.river[k as i64];
+        let far : RiverPoint = self.terrain.river[ludax::min(
+            (k + WORLD_SLOPE_SPAN) as f32,
+            (self.terrain.riverCount - 1) as f32
+        ) as i64];
+        let run : f32 = ludax::max(far.arc - p.arc, (1.0 as f32));
+        let slope : f32 = ludax::max((p.bedHeight - far.bedHeight) / run, (0.0001 as f32));
+        let a : f32 = self.plan.inflow * self.world.settings().manning
+            / (p.width * WORLD_WETTED * ludax::sqrt(slope));
+        let mut low : f32 = (0.0 as f32);
+        let mut high : f32 = p.depth;
+        for (i of 0..24) {
+            let mid : f32 = (low + high) * (0.5 as f32);
+            if (mid * mid * mid * mid * mid > a * a * a) {
+                high = mid;
+            } else {
+                low = mid;
+            }
+        }
+        return ludax::max(ludax::min(high, p.depth), WORLD_MIN_DEPTH);
+    }
+
+    // Gives the cells within a river point's half width the point's water level, the nearest point winning.
+    fn mark(self, p : RiverPoint, depth : f32, mut nearest : f32[], mut level : f32[]) : void {
+        let reach : f32 = p.width * (0.5 as f32) * WORLD_CHANNEL;
+        let cells : i32 = (reach / self.plan.cell) as i32 + 1;
+        let ci : i32 = ((p.x - self.plan.x0) / self.plan.cell) as i32;
+        let cj : i32 = ((p.z - self.plan.z0) / self.plan.cell) as i32;
+        for (j of (cj - cells)..(cj + cells + 1)) {
+            for (i of (ci - cells)..(ci + cells + 1)) {
+                if (i < 0 || j < 0 || i >= self.plan.cols || j >= self.plan.rows) {
+                    continue;
+                }
+                let dx : f32 = self.plan.x0 + ((i as f32) + (0.5 as f32)) * self.plan.cell - p.x;
+                let dz : f32 = self.plan.z0 + ((j as f32) + (0.5 as f32)) * self.plan.cell - p.z;
+                let dist : f32 = ludax::sqrt(dx * dx + dz * dz);
+                let c : i64 = ((j as i64) * (self.plan.cols as i64)) + (i as i64);
+                if (dist <= reach && dist < nearest[c]) {
+                    nearest[c] = dist;
+                    level[c] = p.bedHeight + depth;
+                }
+            }
+        }
+    }
+
+    // Runs the engine for `seconds` of simulated time in coarse steps (faster than a frame loop would).
+    fn settle(mut self, seconds : f32) : void {
+        let mut done : f32 = (0.0 as f32);
+        while (done < seconds) {
+            self.world.step(WORLD_WARM_STEP);
+            done = done + WORLD_WARM_STEP;
+        }
+    }
+
+    /** Advances the engine by `dt` simulated seconds. */
+    pub fn advance(mut self, dt : f32) : void {
+        self.world.step(dt);
+        let time : f32 = self.world.time() as f32;
+        if (self.chart.due(time)) {
+            let books : CascadeBooks = CascadeLedger::read(self);
+            self.chart.push(time, books);
+        }
+    }
+
+    /** Copies the engine's water and particles into what the renderer reads. */
+    pub fn sync(mut self) : void {
+        self.feed.sync();
+        DropFeed::copy(self.world, self.store, self.landscape.window);
+        let time : f32 = self.world.time() as f32;
+        if (self.chart.due(time)) {
+            let books : CascadeBooks = CascadeLedger::read(self);
+            self.chart.push(time, books);
+        }
+    }
+
+    /**
+     * Pours `volume` m3 in at the window cell (`i`, `j`), spread evenly over a square of `POUR_SIDE` cells on a side
+     * (so the depth stays reasonable), and says how many m3 it asked for: the engine books it as poured.
+     */
+    pub fn pour(mut self, i : i32, j : i32, volume : f64) : void {
+        let depth : f32 = (volume / ((POUR_SIDE * POUR_SIDE) as f64)
+            / ((self.plan.cell * self.plan.cell) as f64)) as f32;
+        for (dj of 0..POUR_SIDE) {
+            for (di of 0..POUR_SIDE) {
+                self.world.pour(i + di, j + dj, depth);
+            }
+        }
+    }
+
+    /** The engine's books. */
+    pub fn ledger(self) : HydroLedger {
+        return self.world.ledger();
+    }
+
+    /** Stops the worker threads. */
+    pub fn close(mut self) : void {
+        self.feed.close();
+        self.world.close();
+    }
+}

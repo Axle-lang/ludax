@@ -1,0 +1,136 @@
+// window_feed — the engine's water, copied into the renderer's window every frame, on a job pool.
+//
+// The water window is the engine's own grid: window lattice point (i, j) is the centre of engine cell (i, j), so
+// nothing is interpolated. A frame's sync is four passes over rows, each reading what the earlier ones finished and
+// writing only the rows it owns, so one thread and many give the same window: the water (depth, velocity, foam,
+// turbulence), the wet flags, the ground moisture around the water (the nearest wet cell within a few cells, ramped),
+// and the level-0 pyramid of the surface the renderer marches; the serial ends (the height range before, the upper
+// levels after) are the caller's. Nothing here allocates after the constructor, and it never copies a `Shared`
+// inside a pass: the world and the window are read through `self`.
+
+use fluidview::WaterWindow;
+use ludax::{max, saturate, HydroWorld, JobPool, RangeKernel, Vec2, Vec3};
+
+/** Rows of a pass one pool job covers. */
+const FEED_ROWS_PER_JOB : i32 = 4;
+
+/** Depth (metres) a cell must hold to count as wet for the ground's moisture. */
+const FEED_WET : f32 = 0.02;
+
+/** Cells around a wet cell the ground stays damp, and the moisture at the water's edge. */
+const FEED_DAMP_REACH : i32 = 7;
+
+/** The passes of a sync. */
+enum FeedPass : i8 {
+    Water,
+    Moist,
+    Pyramid,
+}
+
+/** The kernel that fills a window from a world. */
+pub class WindowFeed : RangeKernel {
+    world  : Shared<HydroWorld>;
+    window : Shared<WaterWindow>;
+    wet    : u8[];
+    dyed   : bool = false;
+    pass   : FeedPass = FeedPass::Water;
+    pool   : JobPool;
+
+    /** A feed of `window` from `world` (the same cells), on `workers` threads. */
+    constructor(world : Shared<HydroWorld>, window : Shared<WaterWindow>, workers : i32, dyed : bool) {
+        self.dyed = dyed;
+        self.world = world;
+        self.window = window;
+        self.wet = new u8[(window.w as i64) * window.d];
+        self.pool = new JobPool(workers, self);
+    }
+
+    /** Stops the worker threads. */
+    pub fn close(mut self) : void {
+        self.pool.shutdown();
+    }
+
+    /** Does rows `begin` up to `end` of the current pass. */
+    pub fn runRange(mut self, begin : i32, end : i32) : void {
+        match self.pass {
+            FeedPass::Water => self.water(begin, end),
+            FeedPass::Moist => self.moist(begin, end),
+            FeedPass::Pyramid => self.window.top.buildRows(begin, end),
+        }
+    }
+
+    // One pass over all the window's rows.
+    fn run(mut self, which : FeedPass) : void {
+        self.pass = which;
+        let rows : i32 = self.window.d;
+        if (!self.pool.run(rows, FEED_ROWS_PER_JOB)) {
+            self.runRange(0, rows);
+        }
+    }
+
+    /** Copies the world's water into the window and rebuilds the surface's pyramid. */
+    pub fn sync(mut self) : void {
+        self.run(FeedPass::Water);
+        self.run(FeedPass::Moist);
+        self.window.top.prepare();
+        self.run(FeedPass::Pyramid);
+        self.window.top.buildUpper();
+    }
+
+    fn water(mut self, begin : i32, end : i32) : void {
+        let cell : f32 = self.window.cell;
+        for (j of begin..end) {
+            let z : f32 = ((j as f32) + (0.5 as f32)) * cell;
+            for (i of 0..self.window.w) {
+                let x : f32 = ((i as f32) + (0.5 as f32)) * cell;
+                let depth : f32 = self.world.depthOfCell(i, j);
+                let flow : Vec2 = self.world.surfaceVelocityAt(x, z);
+                self.window.feed(
+                    i,
+                    j,
+                    depth,
+                    Vec3 { x: flow.x, y: (0.0 as f32), z: flow.y },
+                    self.world.foamAt(x, z),
+                    self.world.turbulenceAt(x, z)
+                );
+                if (self.dyed) {
+                    self.window.setDye(i, j, self.world.tracerAt(x, z, 0));
+                }
+                let mut flag : u8 = 0;
+                if (depth > FEED_WET) {
+                    flag = 1;
+                }
+                self.wet[((j * self.window.w) + i) as i64] = flag;
+            }
+        }
+    }
+
+    // The ground's moisture: 1 at a wet cell, falling to 0 at `FEED_DAMP_REACH` cells from the nearest one.
+    fn moist(mut self, begin : i32, end : i32) : void {
+        let w : i32 = self.window.w;
+        let d : i32 = self.window.d;
+        let reach : f32 = (FEED_DAMP_REACH as f32) + (1.0 as f32);
+        for (j of begin..end) {
+            for (i of 0..w) {
+                let mut near : f32 = reach;
+                for (dj of (0 - FEED_DAMP_REACH)..(FEED_DAMP_REACH + 1)) {
+                    let nj : i32 = j + dj;
+                    if (nj < 0 || nj >= d) {
+                        continue;
+                    }
+                    for (di of (0 - FEED_DAMP_REACH)..(FEED_DAMP_REACH + 1)) {
+                        let ni : i32 = i + di;
+                        if (ni < 0 || ni >= w) {
+                            continue;
+                        }
+                        if (self.wet[((nj * w) + ni) as i64] != (0 as u8)) {
+                            let dist : f32 = ludax::sqrt(((di * di) + (dj * dj)) as f32);
+                            near = ludax::min(near, dist);
+                        }
+                    }
+                }
+                self.window.setMoist(i, j, saturate((1.0 as f32) - near / reach));
+            }
+        }
+    }
+}

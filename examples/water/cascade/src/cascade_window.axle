@@ -1,0 +1,483 @@
+// cascade_window — the cascade in a window: the engine steps every frame, the renderer draws what it holds.
+//
+// Left and right move along the shot, 1 / 2 / 3 choose the wide, pool and river shot, Q and E slow down and speed up
+// the simulation, P pauses, F12 writes a picture, Esc quits. A frame is: advance the engine by the real time since
+// the last frame times the time scale, but never more than the budget allows (the engine's cost per simulated second
+// is measured, and a frame that would cost more is shortened, so an overloaded machine runs the water in slow motion
+// instead of falling into a spiral of ever longer steps); copy the water to the renderer; draw. While the water or the
+// camera moves the picture is drawn at half size and shown doubled; held still and paused it refines at full size.
+
+use fluidview::{
+    CamOrbit, Hud, RiverPoint, VistaCamera, Options, Pen, VistaRenderer, WaterCamera, WaterViewer,
+    WaterViewerDesc, WHUD_COLUMN, HUD_ACCENT, HUD_DIM, HUD_LEADING, HUD_MARGIN, HUD_TITLE_SCALE
+};
+use ludax::{clamp, cos, max, min, nanosToMillis, nowNanos, sin, Vec3, HALF_PI};
+use smalt::{Frame, PlatformError, Scancode};
+
+use crate::cascade_books::CascadeLedger;
+use crate::cascade_chart::{BooksChart, CHART_HEIGHT, CHART_WIDTH};
+use crate::cascade_gauge::CascadeGauge;
+use crate::cascade_markers::CascadeMarkers;
+use crate::cascade_run::CascadeRun;
+use crate::cascade_shots::{CascadeShot, CascadeShots};
+use crate::cascade_volumes::CascadeBooks;
+use crate::cascade_world::CascadeWorld;
+
+/** Radians of the window's orbit control a unit of position along the shot is worth (the viewer's yaw drives it). */
+const WIN_MOVE : f32 = 0.12;
+
+/** The longest real frame the simulation follows, seconds, and the most the engine may spend on one frame, milliseconds. */
+const WIN_FRAME_LIMIT : f32 = 0.05;
+const WIN_ENGINE_BUDGET : f64 = 24.0;
+
+/** The time scale's range and the factor Q and E change it by in a second. */
+const WIN_SCALE_MIN : f32 = 0.0625;
+const WIN_SCALE_MAX : f32 = 4.0;
+const WIN_SCALE_RATE : f32 = 1.5;
+
+/** Metres above the lip the `--floats` are released. */
+const WIN_FLOAT_BACK : f32 = 20.0;
+
+/** Free orbit: the keys' presets (distance, metres; angles, radians), the pan speed (share of the distance a second), the
+ * metres an eye keeps over the ground and water, and how far the pick ray looks. */
+const PRESET_LIP : f32 = 140.0;
+const PRESET_POOL : f32 = 110.0;
+const PRESET_LAKE : f32 = 600.0;
+const PRESET_RIVER : f32 = 90.0;
+const PRESET_PITCH : f32 = 0.25;
+const PRESET_LAKE_PITCH : f32 = 0.5;
+const PRESET_YAW : f32 = 1.2;
+const PRESET_BELOW : f32 = 8.0;
+const PRESET_ABOVE : f32 = 8.0;
+const PRESET_BEND : i32 = 3;
+const PAN_RATE : f32 = 0.8;
+const CLEAR : f32 = 1.0;
+const PICK_REACH : f32 = 8000.0;
+
+/** Position along a shot a second of the comma or period key moves. */
+const WIN_ALONG : f32 = 0.2;
+
+/** The most floats the HUD lists one line each: their journey times, -1 until reached. */
+const WIN_HUD_FLOATS : i32 = 6;
+
+/** Frames between two readings of the gauges (they walk the grid). */
+const WIN_GAUGE_EVERY : i32 = 30;
+
+/** The weight a new measurement has in the running cost of the engine per simulated second. */
+const WIN_COST_BLEND : f64 = 0.1;
+
+/** The interactive cascade. */
+pub class CascadeWindow {
+    /** Opens the window and runs until it closes; the exit status. */
+    pub static fn run(o : Options) : i32 {
+        try {
+            return CascadeWindow::play(o);
+        } catch e : PlatformError {
+            println(e.message);
+            return 1;
+        }
+    }
+
+    static fn play(o : Options) : i32 ! PlatformError {
+        let scene : CascadeWorld = new CascadeWorld(CascadeRun::setup(o));
+        defer scene.close();
+        if (o.markers > 0) {
+            CascadeMarkers::scatter(scene, o.markers, o.seed);
+        }
+        if (o.floatsRiver > 0) {
+            CascadeMarkers::inRiver(scene, o.floatsRiver);
+        }
+        if (o.floatsLake > 0) {
+            CascadeMarkers::inLake(scene, o.floatsLake);
+        }
+        if (o.floats > 0) {
+            CascadeMarkers::atLip(scene, o.floats, WIN_FLOAT_BACK);
+        }
+        let w : i32 = CascadeRun::width(o);
+        let h : i32 = CascadeRun::height(o);
+        let workers : i32 = CascadeRun::threads(o);
+        let slow : VistaRenderer = CascadeRun::renderer(o, scene, w, h, workers);
+        defer slow.close();
+        let fast : VistaRenderer = CascadeRun::renderer(o, scene, w / 2, h / 2, workers);
+        defer fast.close();
+        let view = new WaterViewer(
+            WaterViewerDesc {
+                title: "Cascade",
+                shot: "cascade.bmp",
+                orbit: CamOrbit {
+                    target: Vec3 { x: (0.0 as f32), y: (0.0 as f32), z: (0.0 as f32) },
+                    dist: 10.0,
+                    yaw: CascadeRun::along(o) / WIN_MOVE,
+                    pitch: 0.5,
+                },
+            },
+            w,
+            h
+        );
+        defer view.close();
+
+        let mut shot : CascadeShot = CascadeRun::shot(o);
+        let mut free : bool = false;
+        let mut dropping : bool = false;
+        let mut seen : WaterCamera = CascadeRun::camera(o, scene);
+        let mut u : f32 = CascadeRun::along(o);
+        let mut scale : f32 = (1.0 as f32);
+        let mut cost : f64 = (0.0 as f32);
+        let mut frame : i32 = 0;
+        let mut books : CascadeBooks = CascadeLedger::read(scene);
+        let mut lip : f32 = (0.0 as f32);
+        let mut wet : f32 = (0.0 as f32);
+        while (view.pump()) {
+            let dt : f32 = min(view.seconds(), WIN_FRAME_LIMIT);
+            shot = CascadeWindow::chosen(view, shot);
+            if (CascadeWindow::chose(view)) {
+                free = false;
+            }
+            let wants : bool = view.held(Scancode::X);
+            if (wants && !dropping) {
+                CascadeWindow::release(scene, seen);
+            }
+            dropping = wants;
+            u = clamp(u + CascadeWindow::along(view) * dt * WIN_ALONG, (0.0 as f32), (1.0 as f32));
+            if (CascadeWindow::preset(view, scene)) {
+                free = true;
+            }
+            if (free) {
+                CascadeWindow::pan(view, dt);
+                if (view.held(Scancode::T)) {
+                    CascadeWindow::pick(view, scene, w, h);
+                }
+            }
+            scale = CascadeWindow::scaled(view, scale, dt);
+            let ticking : bool = !view.paused();
+            let begin : i64 = nowNanos();
+            if (ticking) {
+                let sim : f32 = CascadeWindow::allowed(dt * scale, cost);
+                let t0 : i64 = nowNanos();
+                scene.advance(sim);
+                CascadeMarkers::watch(scene);
+                let spent : f64 = nanosToMillis(nowNanos() - t0);
+                cost = cost + (spent / ((sim as f64) + (0.000001 as f32)) - cost) * WIN_COST_BLEND;
+                scene.sync();
+                CascadeMarkers::sync(scene);
+            }
+            if (frame % WIN_GAUGE_EVERY == 0) {
+                lip = CascadeGauge::lip(scene);
+                wet = CascadeGauge::wetArea(scene);
+                books = CascadeLedger::read(scene);
+            }
+            frame = frame + 1;
+            if (view.visible()) {
+                let moving : bool = ticking || view.moved() || CascadeWindow::steering(view);
+                let mut r : VistaRenderer = slow;
+                let mut zoom : i32 = 1;
+                if (moving) {
+                    r = fast;
+                    zoom = 2;
+                }
+                let mut cam : WaterCamera = CascadeShots::at(
+                    shot,
+                    u,
+                    scene.terrain,
+                    scene.plan,
+                    w / zoom,
+                    h / zoom
+                );
+                if (free) {
+                    cam = CascadeWindow::cleared(
+                        scene,
+                        WaterCamera::orbit(view.orbit, w / zoom, h / zoom),
+                        view.orbit,
+                        w / zoom,
+                        h / zoom
+                    );
+                }
+                seen = cam;
+                r.render(cam, scene.world.time() as f32, ticking);
+                view.fillPixels(r.pixels(), w / zoom, h / zoom, zoom);
+                CascadeWindow::hud(
+                    view.hud,
+                    view.frame(),
+                    scene,
+                    scale,
+                    lip,
+                    wet,
+                    nanosToMillis(nowNanos() - begin)
+                );
+                CascadeWindow::books(view.hud, view.frame(), books, scene.chart, h);
+                CascadeWindow::floats(view.hud, view.frame(), scene);
+                view.present();
+            }
+        }
+        return 0;
+    }
+
+    // X: releases a marker where the middle of the picture meets the ground.
+    static fn release(scene : CascadeWorld, cam : WaterCamera) : void {
+        let t : f32 = scene.landscape.relief.grid.march(cam.eye, cam.forward, (0.1 as f32), PICK_REACH);
+        if (t > (0.0 as f32)) {
+            let at : Vec3 = cam.eye.plus(cam.forward.scale(t));
+            CascadeMarkers::release(scene, at.x, at.z);
+        }
+    }
+
+    /** The first marker's journey: its age at the lip, in the pool, leaving it, and how far it has gone. */
+    pub static fn floats(hud : Hud, f : Frame, scene : CascadeWorld) : void {
+        if (scene.world.drifterCount() <= 0) {
+            return;
+        }
+        let top : i32 = 40 + 4 * HUD_LEADING;
+        let mut shown : i32 = scene.world.drifterCount();
+        if (shown > WIN_HUD_FLOATS) {
+            shown = WIN_HUD_FLOATS;
+        }
+        for (k of 0..shown) {
+            let lip : f32 = scene.lipTime[k as i64];
+            let pin : f32 = scene.poolIn[k as i64];
+            let pout : f32 = scene.poolOut[k as i64];
+            let far : f32 = scene.world.drifterTravel(k);
+            let line : string = "float ${k}: lip ${lip} s  pool ${pin} s  out ${pout} s  travelled ${far} m";
+            let ink : i32 = HUD_ACCENT;
+            hud.text(f, Pen::at(HUD_MARGIN, top + k * HUD_LEADING, ink), line);
+        }
+    }
+
+    // True while any camera key is down: the half-size picture stays until they are released.
+    static fn steering(view : WaterViewer) : bool {
+        return view.held(Scancode::W) || view.held(Scancode::A) || view.held(Scancode::S)
+            || view.held(Scancode::D)
+            || view.held(Scancode::Comma)
+            || view.held(Scancode::Period)
+            || view.held(Scancode::T);
+    }
+
+    // True when a shot key (1, 2, 3) is down: back to the shot's path.
+    static fn chose(view : WaterViewer) : bool {
+        return view.held(Scancode::Num1) || view.held(Scancode::Num2) || view.held(Scancode::Num3);
+    }
+
+    // -1, 0 or 1 from the comma and period keys: along the shot.
+    static fn along(view : WaterViewer) : f32 {
+        let mut a : f32 = (0.0 as f32);
+        if (view.held(Scancode::Comma)) {
+            a = a - (1.0 as f32);
+        }
+        if (view.held(Scancode::Period)) {
+            a = a + (1.0 as f32);
+        }
+        return a;
+    }
+
+    // The place keys: L the lip, J the pool, B a bend of the river, K the lake. They set the free orbit and answer true.
+    static fn preset(view : WaterViewer, scene : CascadeWorld) : bool {
+        let facing : f32 = HALF_PI;
+        if (view.held(Scancode::L)) {
+            let at : Vec3 = Vec3 {
+                x: scene.plan.lip.x,
+                y: scene.terrain.escarpment.crestHeight - PRESET_BELOW,
+                z: scene.plan.lip.z,
+            };
+            CascadeWindow::place(view, at, PRESET_LIP, facing, PRESET_PITCH);
+            return true;
+        }
+        if (view.held(Scancode::J)) {
+            let at : Vec3 = Vec3 {
+                x: scene.plan.pool.x,
+                y: scene.terrain.pool.level + PRESET_ABOVE,
+                z: scene.plan.pool.z,
+            };
+            CascadeWindow::place(view, at, PRESET_POOL, facing, PRESET_PITCH);
+            return true;
+        }
+        if (view.held(Scancode::K)) {
+            let at : Vec3 = Vec3 {
+                x: scene.terrain.lake.center.x,
+                y: scene.terrain.lake.level,
+                z: scene.terrain.lake.center.z,
+            };
+            CascadeWindow::place(view, at, PRESET_LAKE, facing, PRESET_LAKE_PITCH);
+            return true;
+        }
+        if (view.held(Scancode::B)) {
+            let p : RiverPoint = scene.terrain.river[(scene.terrain.riverCount / PRESET_BEND) as i64];
+            let at : Vec3 = Vec3 { x: p.x, y: p.bedHeight + p.depth, z: p.z };
+            CascadeWindow::place(view, at, PRESET_RIVER, PRESET_YAW, PRESET_PITCH);
+            return true;
+        }
+        return false;
+    }
+
+    static fn place(view : WaterViewer, at : Vec3, dist : f32, yaw : f32, pitch : f32) : void {
+        view.orbit.target = at;
+        view.orbit.dist = dist;
+        view.orbit.yaw = yaw;
+        view.orbit.pitch = pitch;
+    }
+
+    // WASD move the orbit's target over the ground, at a speed that follows the distance (a close view pans finely).
+    static fn pan(view : WaterViewer, dt : f32) : void {
+        let fx : f32 = (0.0 as f32) - cos(view.orbit.yaw);
+        let fz : f32 = (0.0 as f32) - sin(view.orbit.yaw);
+        let step : f32 = view.orbit.dist * PAN_RATE * dt;
+        let mut dx : f32 = (0.0 as f32);
+        let mut dz : f32 = (0.0 as f32);
+        if (view.held(Scancode::W)) {
+            dx = dx + fx;
+            dz = dz + fz;
+        }
+        if (view.held(Scancode::S)) {
+            dx = dx - fx;
+            dz = dz - fz;
+        }
+        if (view.held(Scancode::D)) {
+            dx = dx - fz;
+            dz = dz + fx;
+        }
+        if (view.held(Scancode::A)) {
+            dx = dx + fz;
+            dz = dz - fx;
+        }
+        let at : Vec3 = view.orbit.target;
+        view.orbit.target = Vec3 { x: at.x + dx * step, y: at.y, z: at.z + dz * step };
+    }
+
+    // T: the point under the middle of the picture becomes the orbit's target (the ray's hit on the ground).
+    static fn pick(view : WaterViewer, scene : CascadeWorld, w : i32, h : i32) : void {
+        let cam : WaterCamera = WaterCamera::orbit(view.orbit, w, h);
+        let t : f32 = scene.landscape.relief.grid.march(cam.eye, cam.forward, (0.1 as f32), PICK_REACH);
+        if (t > (0.0 as f32)) {
+            view.orbit.target = cam.eye.plus(cam.forward.scale(t));
+            view.orbit.dist = t;
+        }
+    }
+
+    // The camera lifted to stay `CLEAR` metres over the ground and the water under it, looking at the same target.
+    static fn cleared(
+        scene : CascadeWorld,
+        cam : WaterCamera,
+        orbit : CamOrbit,
+        w : i32,
+        h : i32
+    ) : WaterCamera {
+        let mut floor : f32 = scene.landscape.relief.grid.heightAt(cam.eye.x, cam.eye.z);
+        if (scene.landscape.window.covers(cam.eye.x, cam.eye.z)) {
+            floor = max(floor, scene.landscape.window.top.heightAt(cam.eye.x, cam.eye.z));
+        }
+        if (cam.eye.y >= floor + CLEAR) {
+            return cam;
+        }
+        return VistaCamera::lookAt(Vec3 { x: cam.eye.x, y: floor + CLEAR, z: cam.eye.z }, orbit.target, w, h);
+    }
+
+    // The engine's step for a frame wanting `want` simulated seconds at `cost` milliseconds per simulated second.
+    static fn allowed(want : f32, cost : f64) : f32 {
+        if (cost <= (0.0 as f32)) {
+            return want;
+        }
+        let limit : f32 = (WIN_ENGINE_BUDGET / cost) as f32;
+        return min(want, limit);
+    }
+
+    // The shot the number keys choose.
+    static fn chosen(view : WaterViewer, current : CascadeShot) : CascadeShot {
+        if (view.held(Scancode::Num1)) {
+            return CascadeShot::Wide;
+        }
+        if (view.held(Scancode::Num2)) {
+            return CascadeShot::Pool;
+        }
+        if (view.held(Scancode::Num3)) {
+            return CascadeShot::River;
+        }
+        return current;
+    }
+
+    // The time scale after Q (slower) and E (faster) held for `dt` seconds.
+    static fn scaled(view : WaterViewer, scale : f32, dt : f32) : f32 {
+        let mut s : f32 = scale;
+        if (view.held(Scancode::Q)) {
+            s = s / ((1.0 as f32) + (WIN_SCALE_RATE - (1.0 as f32)) * dt * (4.0 as f32));
+        }
+        if (view.held(Scancode::E)) {
+            s = s * ((1.0 as f32) + (WIN_SCALE_RATE - (1.0 as f32)) * dt * (4.0 as f32));
+        }
+        return clamp(s, WIN_SCALE_MIN, WIN_SCALE_MAX);
+    }
+
+    // The HUD: the physics, the inflow and the discharge over the lip, the wet area, the time scale and the frame cost.
+    pub static fn hud(
+        hud : Hud,
+        f : Frame,
+        scene : CascadeWorld,
+        scale : f32,
+        lip : f32,
+        wet : f32,
+        frameMs : f64
+    ) : void {
+        let title : Pen = Pen::at(HUD_MARGIN, HUD_MARGIN, HUD_ACCENT);
+        hud.text(f, title.scaled(HUD_TITLE_SCALE), "Cascade");
+        let line : i32 = 40;
+        hud.fixed(
+            f,
+            Pen::at(HUD_MARGIN, line, HUD_ACCENT),
+            "gravity ",
+            scene.world.settings().gravity as f64,
+            2
+        );
+        hud.fixed(
+            f,
+            Pen::at(WHUD_COLUMN, line, HUD_ACCENT),
+            "viscosity ",
+            scene.world.settings().viscosity as f64,
+            3
+        );
+        hud.fixed(
+            f,
+            Pen::at(HUD_MARGIN, line + HUD_LEADING, HUD_DIM),
+            "inflow m3/s ",
+            CascadeWindow::inflow(scene) as f64,
+            1
+        );
+        hud.fixed(f, Pen::at(WHUD_COLUMN, line + HUD_LEADING, HUD_DIM), "over the lip ", lip as f64, 1);
+        hud.fixed(f, Pen::at(HUD_MARGIN, line + 2 * HUD_LEADING, HUD_DIM), "wet m2 ", wet as f64, 0);
+        hud.fixed(f, Pen::at(WHUD_COLUMN, line + 2 * HUD_LEADING, HUD_DIM), "time x ", scale as f64, 2);
+        hud.fixed(f, Pen::at(HUD_MARGIN, line + 3 * HUD_LEADING, HUD_DIM), "frame ms ", frameMs, 1);
+        hud.whole(
+            f,
+            Pen::at(WHUD_COLUMN, line + 3 * HUD_LEADING, HUD_DIM),
+            "drops ",
+            scene.store.count as i64
+        );
+    }
+
+    /** Draws the whole HUD (physics, flow, the books and the chart) of `scene` on `f`, for a picture of `height` pixels. */
+    pub static fn panel(hud : Hud, f : Frame, scene : CascadeWorld, height : i32, frameMs : f64) : void {
+        let lip : f32 = CascadeGauge::lip(scene);
+        let wet : f32 = CascadeGauge::wetArea(scene);
+        CascadeWindow::hud(hud, f, scene, (1.0 as f32), lip, wet, frameMs);
+        CascadeWindow::books(hud, f, CascadeLedger::read(scene), scene.chart, height);
+    }
+
+    // The inflow in force: the terrain's, or nothing in a closed world.
+    static fn inflow(scene : CascadeWorld) : f32 {
+        if (scene.closed) {
+            return (0.0 as f32);
+        }
+        return scene.plan.inflow;
+    }
+
+    // The ledger panel and the chart, bottom left: the volume of every compartment, the balance and its size, and the
+    // history of the changes, whose sum is the flat white line on the axis.
+    pub static fn books(hud : Hud, f : Frame, b : CascadeBooks, chart : BooksChart, height : i32) : void {
+        let top : i32 = height - CHART_HEIGHT - 8 * HUD_LEADING - HUD_MARGIN;
+        hud.fixed(f, Pen::at(HUD_MARGIN, top, HUD_ACCENT), "reservoir m3 ", b.reservoir, 0);
+        hud.fixed(f, Pen::at(HUD_MARGIN, top + HUD_LEADING, HUD_ACCENT), "curtain  m3 ", b.curtain, 1);
+        hud.fixed(f, Pen::at(HUD_MARGIN, top + 2 * HUD_LEADING, HUD_ACCENT), "pool     m3 ", b.pool, 1);
+        hud.fixed(f, Pen::at(HUD_MARGIN, top + 3 * HUD_LEADING, HUD_ACCENT), "river    m3 ", b.river, 0);
+        hud.fixed(f, Pen::at(HUD_MARGIN, top + 4 * HUD_LEADING, HUD_DIM), "left grid m3 ", b.left, 0);
+        hud.fixed(f, Pen::at(HUD_MARGIN, top + 5 * HUD_LEADING, HUD_DIM), "inflow so far m3 ", b.source, 0);
+        hud.fixed(f, Pen::at(HUD_MARGIN, top + 6 * HUD_LEADING, HUD_ACCENT), "total held m3 ", b.held, 0);
+        hud.fixed(f, Pen::at(HUD_MARGIN, top + 7 * HUD_LEADING, HUD_ACCENT), "balance m3 ", b.balance, 4);
+        chart.draw(f, HUD_MARGIN, height - CHART_HEIGHT - HUD_MARGIN);
+    }
+}

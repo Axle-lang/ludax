@@ -1,0 +1,446 @@
+// cascade_run — the headless jobs of the cascade: a picture, a film, the sheet of times, the thread check, the profile.
+//
+// Every job builds the scene once (see `cascade_world`), then alternates the engine and the renderer the way the window
+// does: step the engine by a fixed frame time, copy its water to the renderer's inputs, draw. The renderer's samples
+// refine a still picture; the engine never steps between samples of one picture. The moment of a picture is the
+// engine's own clock, so `--at 30` is thirty simulated seconds after the warm-up.
+
+use fluidview::{
+    Cli, Hud, VistaCamera, ContactSheet, DropStore, Options, VistaLook, VistaRenderer, VistaRun, WaterCamera
+};
+use ludax::{cos, nanosToMillis, nowNanos, sin, JobPool, Vec3};
+use smalt::{Bmp, Surface};
+
+use crate::cascade_markers::CascadeMarkers;
+use crate::cascade_shots::{CascadeShot, CascadeShots};
+use crate::cascade_window::CascadeWindow;
+use crate::cascade_world::{CascadeSetup, CascadeWorld};
+
+/** The default picture size: native for a 720p window; `--size WxH` changes it (multiples of 16). */
+const RUN_WIDTH : i32 = 1280;
+const RUN_HEIGHT : i32 = 720;
+
+/** Simulated seconds an engine step covers between pictures of a film or the run up to a still. */
+const RUN_FRAME : f32 = 0.05;
+
+/** The exposure of a picture taken from a camera given by hand: a plume filling the view must not darken the whole picture. */
+const RUN_LOCKED_EXPOSURE : f32 = 1.3;
+
+/** Half the width of the box the crown fills, metres: wider than the curtain's foot. */
+const RUN_CROWN_REACH : f32 = 36.0;
+
+/** Seconds a still picture runs the engine for before it is drawn, unless `--at` says. */
+const RUN_MOMENT : f32 = 2.0;
+
+/** The moments of the long-time sheet, seconds. */
+const RUN_SHEET_TIMES : i32 = 4;
+
+/** The columns of a contact sheet. */
+const RUN_COLUMNS : i32 = 4;
+
+/** Default seconds between the frames of a film. */
+const RUN_STEP : f32 = 0.5;
+
+// The curtain's drops are drawn at least this big (metres; a little over half the curtain spacing, so neighbours overlap into a sheet) and each with this opacity.
+const RUN_SHEET_RADIUS : f32 = 0.24;
+const RUN_SHEET_OPACITY : f32 = 0.07;
+
+// Metres above the foot of the fall up to which broadleaf trees and farms reach: the floodplain's own height.
+const RUN_PLAIN_RISE : f32 = 28.0;
+
+// The shutter, seconds: short, so a fast drop is a fine vertical streak and not a long swirling stroke.
+const RUN_SHUTTER : f32 = 0.02;
+
+/** Metres above the lip the `--floats` are released. */
+const FLOAT_BACK : f32 = 20.0;
+
+/** The cascade's headless driver. */
+pub class CascadeRun {
+    /** The setup the command line asks for. */
+    pub static fn setup(o : Options) : CascadeSetup {
+        let mut s : CascadeSetup = CascadeSetup {};
+        s.seed = o.seed;
+        s.threads = CascadeRun::threads(o);
+        s.closed = o.closed;
+        s.dye = o.dye;
+        if (Options::given(o.gravity)) {
+            s.gravity = o.gravity as f32;
+        }
+        if (Options::given(o.viscosity)) {
+            s.viscosity = o.viscosity as f32;
+        }
+        if (Options::given(o.cell)) {
+            s.cell = o.cell as f32;
+        }
+        if (o.drops > 0) {
+            s.capacity = o.drops;
+        }
+        return s;
+    }
+
+    /** The worker threads the command line asks for. */
+    pub static fn threads(o : Options) : i32 {
+        if (o.threads > 0) {
+            return o.threads;
+        }
+        return JobPool::defaultWorkers();
+    }
+
+    /** The picture width of the command line. */
+    pub static fn width(o : Options) : i32 {
+        if (o.width > 0) {
+            return o.width;
+        }
+        return RUN_WIDTH;
+    }
+
+    /** The picture height of the command line. */
+    pub static fn height(o : Options) : i32 {
+        if (o.height > 0) {
+            return o.height;
+        }
+        return RUN_HEIGHT;
+    }
+
+    /** The shot the command line names. */
+    pub static fn shot(o : Options) : CascadeShot {
+        if (o.shot == "pool") {
+            return CascadeShot::Pool;
+        }
+        if (o.shot == "river") {
+            return CascadeShot::River;
+        }
+        if (o.shot == "curtain") {
+            return CascadeShot::Curtain;
+        }
+        if (o.shot == "crown") {
+            return CascadeShot::Crown;
+        }
+        return CascadeShot::Wide;
+    }
+
+    /** The position along the shot the command line gives, 0 to 1. */
+    pub static fn along(o : Options) : f32 {
+        if (Options::given(o.along)) {
+            return o.along as f32;
+        }
+        return (0.0 as f32);
+    }
+
+    /** The camera of the command line's shot over `scene`. */
+    pub static fn camera(o : Options, scene : CascadeWorld) : WaterCamera {
+        if (o.camera) {
+            return CascadeRun::byHand(o);
+        }
+        return CascadeShots::at(
+            CascadeRun::shot(o),
+            CascadeRun::along(o),
+            scene.terrain,
+            scene.plan,
+            CascadeRun::width(o),
+            CascadeRun::height(o)
+        );
+    }
+
+    /** The camera `--camera x,y,z,yaw,pitch` gives: yaw 0 looks along +x, 1.5708 along +z; pitch is above the horizon. */
+    pub static fn byHand(o : Options) : WaterCamera {
+        let yaw : f32 = o.camYaw as f32;
+        let pitch : f32 = o.camPitch as f32;
+        let eye : Vec3 = Vec3 { x: o.camX as f32, y: o.camY as f32, z: o.camZ as f32 };
+        let dir : Vec3 = Vec3 { x: cos(pitch) * cos(yaw), y: sin(pitch), z: cos(pitch) * sin(yaw) };
+        return VistaCamera::lookAt(eye, eye.plus(dir), CascadeRun::width(o), CascadeRun::height(o));
+    }
+
+    /** A renderer of `scene` with the command line's look, on `workers` threads. */
+    pub static fn renderer(
+        o : Options,
+        scene : CascadeWorld,
+        width : i32,
+        height : i32,
+        workers : i32
+    ) : VistaRenderer {
+        let mut r : VistaRenderer = new VistaRenderer(
+            scene.landscape,
+            scene.store,
+            width,
+            height,
+            1,
+            workers
+        );
+        r.look = VistaRun::look(o, VistaLook {});
+        r.look.drops.shutter = RUN_SHUTTER;
+        r.look.drops.sheetRadius = RUN_SHEET_RADIUS;
+        r.look.drops.sheetOpacity = RUN_SHEET_OPACITY;
+        r.look.drops.fallTop = scene.terrain.escarpment.crestHeight;
+        r.look.drops.fallFoot = scene.terrain.escarpment.footHeight;
+        r.look.ground.plainHeight = scene.terrain.escarpment.footHeight + RUN_PLAIN_RISE;
+        if (o.camera) {
+            r.look.post.exposureLock = RUN_LOCKED_EXPOSURE;
+        }
+        r.look.surface.ringX = scene.plan.pool.x;
+        r.look.surface.ringZ = scene.plan.pool.z;
+        r.look.crown.enabled = true;
+        r.look.crown.reach = RUN_CROWN_REACH;
+        r.look.crown.x = scene.plan.pool.x;
+        r.look.crown.z = scene.plan.pool.z;
+        r.look.crown.level = scene.terrain.pool.level - (0.8 as f32);
+        return r;
+    }
+
+    /** Runs the job the command line names; the exit status. */
+    pub static fn run(o : Options) : i32 {
+        let begin : i64 = nowNanos();
+        let scene : CascadeWorld = new CascadeWorld(CascadeRun::setup(o));
+        defer scene.close();
+        if (o.markers > 0) {
+            CascadeMarkers::scatter(scene, o.markers, o.seed);
+        }
+        if (o.floatsRiver > 0) {
+            CascadeMarkers::inRiver(scene, o.floatsRiver);
+        }
+        if (o.floatsLake > 0) {
+            CascadeMarkers::inLake(scene, o.floatsLake);
+        }
+        if (o.floats > 0) {
+            CascadeMarkers::atLip(scene, o.floats, FLOAT_BACK);
+        }
+        if (o.prof) {
+            let lx : f32 = scene.plan.lip.x;
+            let lz : f32 = scene.plan.lip.z;
+            let px : f32 = scene.plan.pool.x;
+            let pz : f32 = scene.plan.pool.z;
+            let crest : f32 = scene.terrain.escarpment.crestHeight;
+            let foot : f32 = scene.terrain.escarpment.footHeight;
+            println("lip (${lx}, ${lz}) crest ${crest} m, pool (${px}, ${pz}) foot ${foot} m");
+            let ms : f64 = scene.buildMillis;
+            let warm : f64 = scene.warmMillis;
+            let cells : i32 = scene.plan.cols * scene.plan.rows;
+            let mb : i64 = scene.plan.bytes / 1000000;
+            let lw : f32 = scene.terrain.escarpment.lipWidth;
+            let hd : f32 = scene.head;
+            println("lip width ${lw} m, initial head ${hd} m");
+            println("scene: ${ms} ms (warm-up ${warm} ms), window ${scene.plan.cols} x ${scene.plan.rows} = ${cells} cells, ${mb} MB");
+        }
+        if (o.checkThreads) {
+            return CascadeRun::compare(o, scene);
+        }
+        if (o.sheet) {
+            return CascadeRun::sheet(o, scene);
+        }
+        if (o.film > 0) {
+            return CascadeRun::film(o, scene);
+        }
+        let status : i32 = CascadeRun::picture(o, scene);
+        let total : f64 = nanosToMillis(nowNanos() - begin);
+        if (o.prof) {
+            println("total ${total} ms");
+        }
+        return status;
+    }
+
+    // Runs the engine for `seconds` in frame-sized steps, syncing the renderer's inputs after the last.
+    pub static fn runFor(scene : CascadeWorld, seconds : f32) : void {
+        let mut done : f32 = (0.0 as f32);
+        while (done < seconds) {
+            scene.advance(RUN_FRAME);
+            CascadeMarkers::watch(scene);
+            done = done + RUN_FRAME;
+        }
+        scene.sync();
+        CascadeMarkers::sync(scene);
+    }
+
+    // The moment the command line asks for, simulated seconds after the warm-up.
+    static fn moment(o : Options) : f32 {
+        if (Options::given(o.at)) {
+            return o.at as f32;
+        }
+        return RUN_MOMENT;
+    }
+
+    // Draws `samples` samples of the scene as it stands, the first restarting the picture.
+    static fn draw(r : VistaRenderer, cam : WaterCamera, scene : CascadeWorld, samples : i32) : void {
+        let time : f32 = scene.world.time() as f32;
+        r.render(cam, time, true);
+        for (i of 1..samples) {
+            r.render(cam, time, false);
+        }
+    }
+
+    static fn picture(o : Options, scene : CascadeWorld) : i32 {
+        let r : VistaRenderer = CascadeRun::renderer(
+            o,
+            scene,
+            CascadeRun::width(o),
+            CascadeRun::height(o),
+            CascadeRun::threads(o)
+        );
+        defer r.close();
+        let stepped : i64 = nowNanos();
+        CascadeRun::runFor(scene, CascadeRun::moment(o));
+        if (o.prof) {
+            let ms : f64 = nanosToMillis(nowNanos() - stepped);
+            let steps : i32 = (CascadeRun::moment(o) / RUN_FRAME) as i32;
+            let per : f64 = ms / ((steps as f64) + (0.0001 as f32));
+            let live : i32 = scene.store.count;
+            println("engine: ${ms} ms for ${steps} steps (${per} ms a step), ${live} particles");
+        }
+        CascadeRun::draw(r, CascadeRun::camera(o, scene), scene, o.samples);
+        if (o.prof) {
+            CascadeRun::journeys(scene);
+            CascadeRun::profile(r);
+        }
+        if (CascadeRun::save(r, o.frame, scene, o.hud)) {
+            return 0;
+        }
+        return 1;
+    }
+
+    // N frames a fixed step apart and the contact sheet of them.
+    static fn film(o : Options, scene : CascadeWorld) : i32 {
+        let r : VistaRenderer = CascadeRun::renderer(
+            o,
+            scene,
+            CascadeRun::width(o),
+            CascadeRun::height(o),
+            CascadeRun::threads(o)
+        );
+        defer r.close();
+        let sheet : ContactSheet = new ContactSheet(o.film, RUN_COLUMNS, r.outWidth, r.outHeight);
+        defer sheet.close();
+        let mut step : f32 = RUN_STEP;
+        if (Options::given(o.step)) {
+            step = o.step as f32;
+        }
+        CascadeRun::runFor(scene, CascadeRun::moment(o));
+        let mut ok : bool = true;
+        for (i of 0..o.film) {
+            CascadeRun::draw(r, CascadeRun::camera(o, scene), scene, o.samples);
+            ok = CascadeRun::save(r, Cli::beside(o.frame, "_${i}"), scene, o.hud) && ok;
+            sheet.addPixels(i, r.pixels(), r.outWidth);
+            CascadeRun::runFor(scene, step);
+        }
+        ok = sheet.save(Cli::beside(o.frame, "_sheet")) && ok;
+        if (ok) {
+            return 0;
+        }
+        return 1;
+    }
+
+    // The scene at 5, 15, 30 and 60 simulated seconds after the warm-up, on one sheet.
+    static fn sheet(o : Options, scene : CascadeWorld) : i32 {
+        let r : VistaRenderer = CascadeRun::renderer(
+            o,
+            scene,
+            CascadeRun::width(o),
+            CascadeRun::height(o),
+            CascadeRun::threads(o)
+        );
+        defer r.close();
+        let sheet : ContactSheet = new ContactSheet(RUN_SHEET_TIMES, 2, r.outWidth, r.outHeight);
+        defer sheet.close();
+        let mut at : f32 = (0.0 as f32);
+        for (i of 0..RUN_SHEET_TIMES) {
+            let target : f32 = CascadeRun::sheetTime(i);
+            CascadeRun::runFor(scene, target - at);
+            at = target;
+            CascadeRun::draw(r, CascadeRun::camera(o, scene), scene, o.samples);
+            sheet.addPixels(i, r.pixels(), r.outWidth);
+        }
+        if (sheet.save(Cli::beside(o.frame, "_times"))) {
+            return 0;
+        }
+        return 1;
+    }
+
+    /** The `i`-th moment of the long-time sheet, seconds. */
+    pub static fn sheetTime(i : i32) : f32 {
+        return match i {
+            0 => (5.0 as f32),
+            1 => (15.0 as f32),
+            2 => (30.0 as f32),
+            _ => (60.0 as f32),
+        };
+    }
+
+    // The same picture at one thread and at many: equal to the bit, or the exit status counts the words that differ.
+    pub static fn compare(o : Options, scene : CascadeWorld) : i32 {
+        let many : i32 = CascadeRun::threads(o);
+        let a : VistaRenderer = CascadeRun::renderer(
+            o,
+            scene,
+            CascadeRun::width(o),
+            CascadeRun::height(o),
+            1
+        );
+        defer a.close();
+        let b : VistaRenderer = CascadeRun::renderer(
+            o,
+            scene,
+            CascadeRun::width(o),
+            CascadeRun::height(o),
+            many
+        );
+        defer b.close();
+        CascadeRun::runFor(scene, CascadeRun::moment(o));
+        let cam : WaterCamera = CascadeRun::camera(o, scene);
+        CascadeRun::draw(a, cam, scene, o.samples);
+        CascadeRun::draw(b, cam, scene, o.samples);
+        let pa : i32[] = a.pixels();
+        let pb : i32[] = b.pixels();
+        let mut different : i32 = 0;
+        for (i of 0..((a.outWidth as i64) * a.outHeight)) {
+            if (pa[i] != pb[i]) {
+                different = different + 1;
+            }
+        }
+        println("check-threads: 1 thread vs ${many} threads: ${different} differing pixels");
+        return different;
+    }
+
+    /** Writes the renderer's picture to a BMP; false when the file could not be written. */
+    pub static fn save(r : VistaRenderer, path : string, scene : CascadeWorld, hud : bool) : bool {
+        let surface = new Surface(r.outWidth, r.outHeight);
+        let mut px : i32[] = surface.pixels();
+        let src : i32[] = r.pixels();
+        for (i of 0..((r.outWidth as i64) * r.outHeight)) {
+            px[i] = src[i];
+        }
+        if (hud) {
+            let text : Hud = new Hud();
+            CascadeWindow::panel(text, surface.frame(), scene, r.outHeight, r.spent[0]);
+            CascadeWindow::floats(text, surface.frame(), scene);
+            text.close();
+        }
+        let ok : bool = Bmp::write(path, surface.frame());
+        surface.close();
+        if (ok) {
+            println("wrote ${path} (${r.samples} samples, ${r.outWidth}x${r.outHeight})");
+        }
+        return ok;
+    }
+
+    /** Prints the journey of every marker: its state, the ages at the lip, in the pool and leaving it, and how far it has gone. */
+    pub static fn journeys(scene : CascadeWorld) : void {
+        for (k of 0..scene.world.drifterCount()) {
+            let state : u8 = scene.world.drifterStates()[k as i64];
+            let lip : f32 = scene.lipTime[k as i64];
+            let pin : f32 = scene.poolIn[k as i64];
+            let pout : f32 = scene.poolOut[k as i64];
+            let far : f32 = scene.world.drifterTravel(k);
+            let age : f32 = scene.world.drifterAge(k);
+            println("marker ${k}: state ${state}, age ${age} s, lip ${lip} s, pool in ${pin} s, pool out ${pout} s, travelled ${far} m");
+        }
+    }
+
+    /** Prints the milliseconds each stage of the last sample took. */
+    pub static fn profile(r : VistaRenderer) : void {
+        let mut line : string = "";
+        for (i of 0..8) {
+            let ms : f64 = r.spent[i as i64];
+            line = "${line} ${ms}";
+        }
+        println("renderer ms (total prepare - project+bin trace splat resolve display):${line}");
+        println("threads ${r.threads()}  ${r.describe()}");
+    }
+}

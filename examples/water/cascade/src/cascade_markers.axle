@@ -1,0 +1,148 @@
+// cascade_markers - flow markers: floats released on the water, their journey, and the copy to the renderer's layer.
+//
+// The markers are the engine's drifters (`HydroWorld.addDrifters`, `addDrifter`): Lagrangian points advected by the
+// engine's own velocity field, thrown ballistically at the lip like curtain parcels, landing in the pool and drifting on
+// down the river. Nothing about their motion is invented here: every position, state, age and trail point is read from
+// the engine. This file copies them into the renderer's `MarkerLayer` and keeps three milestones for each, in the
+// marker's own age: when it first crossed the lip (or flew), when it first floated in the pool, and when it left the pool;
+// the distance it has travelled comes from the engine (`drifterTravel`).
+
+use fluidview::{MarkerLayer, RiverPoint, MARKER_TRAIL};
+use ludax::{sqrt, Vec3};
+
+use crate::cascade_world::CascadeWorld;
+
+/** The pool counts as the circle of this many pool radii for the pool milestones: in at the first, out at the second. */
+const MARKS_IN : f32 = 1.0;
+const MARKS_OUT : f32 = 1.5;
+
+/** Where the river floats start below the pool, and the spacing of both presets, metres; the lake floats' distance behind the lip. */
+const RIVER_FIRST : f32 = 60.0;
+const RIVER_GAP : f32 = 25.0;
+const LAKE_BACK : f32 = 80.0;
+const LAKE_GAP : f32 = 15.0;
+
+/** Metres between floats released along the notch. */
+const MARKS_GAP : f32 = 4.0;
+
+/** Markers. */
+pub class CascadeMarkers {
+    /** Releases `count` markers over the lake's cells, scattered by `seed`; how many were made. */
+    pub static fn scatter(scene : CascadeWorld, count : i32, seed : i32) : i32 {
+        let made : i32 = scene.world.addDrifters(scene.lake, count, seed);
+        CascadeMarkers::forget(scene);
+        return made;
+    }
+
+    /** Releases `count` markers in the notch `back` metres above the lip, four metres apart: floats that go over the fall. */
+    pub static fn atLip(scene : CascadeWorld, count : i32, back : f32) : void {
+        for (k of 0..count) {
+            let x : f32 = scene.plan.lip.x + ((k as f32) - (count as f32) * (0.5 as f32)) * MARKS_GAP;
+            CascadeMarkers::release(scene, x, scene.plan.lip.z - back);
+        }
+    }
+
+    /** Releases `count` markers along the river's centreline, `RIVER_FIRST` metres below the pool and `RIVER_GAP` metres apart. */
+    pub static fn inRiver(scene : CascadeWorld, count : i32) : void {
+        let first : f32 = scene.terrain.river[0].arc + RIVER_FIRST;
+        let mut k : i32 = 0;
+        for (i of 0..count) {
+            let want : f32 = first + (i as f32) * RIVER_GAP;
+            while (k < scene.terrain.riverCount - 1 && scene.terrain.river[k as i64].arc < want) {
+                k = k + 1;
+            }
+            let p : RiverPoint = scene.terrain.river[k as i64];
+            CascadeMarkers::release(scene, p.x, p.z);
+        }
+    }
+
+    /** Releases `count` markers in the lake, 80 to 200 metres behind the lip, spread across the notch's width. */
+    pub static fn inLake(scene : CascadeWorld, count : i32) : void {
+        for (i of 0..count) {
+            let x : f32 = scene.plan.lip.x + (((i % 5) as f32) - (2.0 as f32)) * LAKE_GAP;
+            let z : f32 = scene.plan.lip.z - LAKE_BACK - ((i / 5) as f32) * LAKE_GAP;
+            CascadeMarkers::release(scene, x, z);
+        }
+    }
+
+    /** Releases one marker at the world position (`x`, `z`); its index, or -1 when the engine has no room. */
+    pub static fn release(scene : CascadeWorld, x : f32, z : f32) : i32 {
+        return scene.world.addDrifter(x - scene.plan.x0, z - scene.plan.z0);
+    }
+
+    // Clears the milestones of every marker (new ones are released).
+    static fn forget(scene : CascadeWorld) : void {
+        for (k of 0..scene.world.drifterCount()) {
+            scene.lipTime[k as i64] = -(1.0 as f32);
+            scene.poolIn[k as i64] = -(1.0 as f32);
+            scene.poolOut[k as i64] = -(1.0 as f32);
+        }
+    }
+
+    /** Updates the milestones of every marker after an engine step (cheap: no copying), so none is missed between two pictures. */
+    pub static fn watch(scene : CascadeWorld) : void {
+        for (k of 0..scene.world.drifterCount()) {
+            CascadeMarkers::milestones(scene, k);
+        }
+    }
+
+    /** Copies the engine's markers, states and trails to the renderer's layer and updates the milestones. */
+    pub static fn sync(scene : CascadeWorld) : void {
+        let mut layer : Shared<MarkerLayer> = scene.landscape.markers;
+        let n : i32 = scene.world.drifterCount();
+        layer.shiftX = scene.plan.x0;
+        layer.shiftZ = scene.plan.z0;
+        layer.count = n;
+        for (k of 0..n) {
+            let b : i64 = (k as i64) * 3;
+            layer.positions[b] = scene.world.drifterPositions()[b];
+            layer.positions[b + 1] = scene.world.drifterPositions()[b + 1];
+            layer.positions[b + 2] = scene.world.drifterPositions()[b + 2];
+            layer.states[k as i64] = scene.world.drifterStates()[k as i64];
+            CascadeMarkers::trail(scene, layer, k);
+            CascadeMarkers::milestones(scene, k);
+        }
+    }
+
+    // Marker `k`'s trail, oldest first, newest `MARKER_TRAIL` points.
+    static fn trail(scene : CascadeWorld, mut layer : Shared<MarkerLayer>, k : i32) : void {
+        let total : i32 = scene.world.drifterTrailCount(k);
+        let first : i32 = 0;
+        let mut kept : i32 = total;
+        if (kept > MARKER_TRAIL) {
+            kept = MARKER_TRAIL;
+        }
+        let from : i32 = total - kept;
+        for (i of 0..kept) {
+            let p : Vec3 = scene.world.drifterTrailAt(k, from + i + first);
+            let b : i64 = ((k as i64) * (MARKER_TRAIL as i64) + (i as i64)) * 3;
+            layer.trails[b] = p.x;
+            layer.trails[b + 1] = p.y;
+            layer.trails[b + 2] = p.z;
+        }
+        layer.trailCount[k as i64] = kept;
+    }
+
+    // The three milestones of marker `k`, in its own age.
+    static fn milestones(scene : CascadeWorld, k : i32) : void {
+        let b : i64 = (k as i64) * 3;
+        let age : f32 = scene.world.drifterAge(k);
+        let x : f32 = scene.world.drifterPositions()[b] + scene.plan.x0;
+        let z : f32 = scene.world.drifterPositions()[b + 2] + scene.plan.z0;
+        let airborne : bool = scene.world.drifterStates()[k as i64] == (1 as u8);
+        if (scene.lipTime[k as i64] < (0.0 as f32) && (airborne || z > scene.plan.lip.z)) {
+            scene.lipTime[k as i64] = age;
+        }
+        let dx : f32 = x - scene.plan.pool.x;
+        let dz : f32 = z - scene.plan.pool.z;
+        let away : f32 = sqrt(dx * dx + dz * dz) / scene.terrain.pool.radius;
+        if (scene.lipTime[k as i64] >= (0.0 as f32) && scene.poolIn[k as i64] < (0.0 as f32) && !airborne
+            && away < MARKS_IN) {
+            scene.poolIn[k as i64] = age;
+        }
+        if (scene.poolIn[k as i64] >= (0.0 as f32) && scene.poolOut[k as i64] < (0.0 as f32)
+            && away > MARKS_OUT) {
+            scene.poolOut[k as i64] = age;
+        }
+    }
+}
