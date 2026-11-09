@@ -1,0 +1,172 @@
+// vfs_mount — one source of files in the virtual file system.
+//
+// A mount answers questions about paths relative to its own root: does a file exist there, what are its
+// bytes, what lies in this directory. There are three kinds, a closed set, so one class that branches on the
+// kind rather than a trait (a class cannot be stored in a trait-typed field in Axle 0.19):
+//
+//   Memory   files held in a `VfsArchive` that can be written and removed; for generated data and tests.
+//   Disk     a directory of the real file system, read and written through `DataFiles`. The standard library
+//            cannot list a directory, so a disk mount cannot list its files: `exists`, `read` and `write` work.
+//   Archive  an "LDXA" container opened from bytes, read-only.
+//
+// The `Vfs` that owns the mounts has already normalised the path and removed the mount point.
+
+use std::path::Path;
+
+use crate::data::bytes::ByteBuf;
+use crate::data::files::DataFiles;
+use crate::data::vfs::vfs_archive::VfsArchive;
+use crate::data::vfs::vfs_listing::VfsListing;
+use crate::data::vfs::vfs_path::VfsPath;
+
+/** What backs a mount. */
+pub enum VfsMountKind : i8 {
+    Memory = 0,
+    Disk = 1,
+    Archive = 2,
+
+    /** The kind's name, for messages. */
+    pub fn label(self) : string {
+        return match self {
+            VfsMountKind::Memory => "memory",
+            VfsMountKind::Disk => "disk",
+            VfsMountKind::Archive => "archive",
+        };
+    }
+}
+
+/** A source of files, answering for paths below its mount point. */
+pub(crate) class VfsMount {
+    kind   : VfsMountKind;
+    anchor : string;
+    root   : string;
+    store  : VfsArchive;
+
+    constructor(kind : VfsMountKind, point : string, root : string, own store : VfsArchive) {
+        self.kind = kind;
+        self.anchor = point;
+        self.root = root;
+        self.store = store;
+    }
+
+    /** The logical directory the mount appears at ("" for the root). */
+    pub(crate) fn point(self) : string {
+        return self.anchor;
+    }
+
+    /** What backs the mount. */
+    pub(crate) fn backing(self) : VfsMountKind {
+        return self.kind;
+    }
+
+    /** True when `write` and `remove` can work on this mount. */
+    pub(crate) fn writable(self) : bool {
+        return self.kind != VfsMountKind::Archive;
+    }
+
+    // True when `p` lies strictly below the directory `inner`.
+    static fn below(inner : string, p : string) : bool {
+        return p.byteLength > inner.byteLength && VfsPath::isUnder(inner, p);
+    }
+
+    fn diskPath(self, inner : string) : string {
+        if (inner.byteLength == 0) {
+            return self.root;
+        }
+        return "${self.root}/${inner}";
+    }
+
+    /** True when a file lies at `inner`. */
+    pub(crate) fn hasFile(self, inner : string) : bool {
+        if (self.kind == VfsMountKind::Disk) {
+            return Path::from(self.diskPath(inner)).isFile();
+        }
+        return self.store.has(inner);
+    }
+
+    /** True when `inner` is a directory of this mount (the root of the mount always is). */
+    pub(crate) fn hasDirectory(self, inner : string) : bool {
+        if (inner.byteLength == 0) {
+            return true;
+        }
+        if (self.kind == VfsMountKind::Disk) {
+            return Path::from(self.diskPath(inner)).isDirectory();
+        }
+
+        let mut slot : i32 = self.store.firstSlot();
+        while (slot >= 0) {
+            if (VfsMount::below(inner, self.store.pathAt(slot))) {
+                return true;
+            }
+            slot = self.store.nextSlot(slot);
+        }
+        return false;
+    }
+
+    /** The bytes of the file at `inner`. */
+    pub(crate) fn read(self, inner : string) : ByteBuf ! IOException {
+        if (self.kind == VfsMountKind::Disk) {
+            return DataFiles::read(self.diskPath(inner));
+        }
+        if (!self.store.has(inner)) {
+            throw IOException("not found: ${inner}");
+        }
+        return self.store.get(inner);
+    }
+
+    /** Stores `bytes` at `inner`, replacing the file; a disk mount creates the directories on the way. */
+    pub(crate) fn write(mut self, inner : string, bytes : ByteBuf) : void ! IOException {
+        if (self.kind == VfsMountKind::Archive) {
+            throw IOException("an archive mount is read-only: ${inner}");
+        }
+        if (inner.byteLength == 0) {
+            throw IOException("cannot write to a directory");
+        }
+
+        if (self.kind == VfsMountKind::Memory) {
+            self.store.put(inner, bytes);
+            return;
+        }
+
+        let full : string = self.diskPath(inner);
+        let parent : string = VfsPath::parent(inner);
+        if (parent.byteLength > 0) {
+            Path::from(self.diskPath(parent)).mkdirs();
+        }
+        DataFiles::write(full, bytes);
+    }
+
+    /** Deletes the file at `inner`; true when there was one. */
+    pub(crate) fn remove(mut self, inner : string) : bool ! IOException {
+        if (self.kind == VfsMountKind::Archive) {
+            throw IOException("an archive mount is read-only: ${inner}");
+        }
+        if (self.kind == VfsMountKind::Memory) {
+            return self.store.remove(inner);
+        }
+
+        let p : Path = Path::from(self.diskPath(inner));
+        if (!p.isFile()) {
+            return false;
+        }
+        p.delete();
+        return true;
+    }
+
+    /** Adds the children of the directory `inner` to `listing`. A disk mount adds nothing. */
+    pub(crate) fn listInto(self, inner : string, listing : VfsListing) : void {
+        if (self.kind == VfsMountKind::Disk) {
+            return;
+        }
+
+        let mut slot : i32 = self.store.firstSlot();
+        while (slot >= 0) {
+            let p : string = self.store.pathAt(slot);
+            if (VfsMount::below(inner, p)) {
+                let rel : string = VfsPath::relative(inner, p);
+                listing.add(VfsPath::firstSegment(rel), VfsPath::hasMore(rel));
+            }
+            slot = self.store.nextSlot(slot);
+        }
+    }
+}

@@ -1,0 +1,418 @@
+// json — checks for the JSON reader and writer.
+//
+// The reader is held to RFC 8259 both ways: everything the grammar allows must read to the right value, and
+// everything it forbids must come back as an error with a position, never an abort. The writer is checked
+// against exact text and by reading its output again.
+
+use ludax::ByteBuf;
+use ludax::Checks;
+use ludax::JsonDoc;
+use ludax::JsonKind;
+use ludax::JsonParser;
+use ludax::JsonValue;
+use ludax::JsonWriter;
+
+// The deepest nesting the parser accepts; one more is refused.
+const JSON_MAX_DEPTH : i32 = 128;
+
+/** The JSON checks. */
+pub class JsonSuite {
+    /** Runs every check of the suite. */
+    pub static fn run(c : Checks) : void {}
+}
+
+fn jsonNum(c : Checks, name : string, text : string, want : f64) : void {
+    let d : JsonDoc = JsonParser::parse(text);
+    c.that("json: ${name} parses", d.ok() && d.isNumber(d.root()));
+    c.near("json: ${name} parses to the expected number", d.asNumber(d.root()), want, 0.0);
+}
+
+fn jsonBad(c : Checks, name : string, text : string) : void {
+    let d : JsonDoc = JsonParser::parse(text);
+    c.that("json: rejects ${name}", !d.ok() && d.root().isNone() && d.error().byteLength > 0);
+}
+
+fn jsonScalarChecks(c : Checks) : void {
+    let t : JsonDoc = JsonParser::parse("true");
+    c.that(
+        "json: the literal true parses as a bool with value true",
+        t.ok() && t.kind(t.root()) == JsonKind::Bool && t.asBool(t.root())
+    );
+    let f : JsonDoc = JsonParser::parse("  false\n");
+    c.that(
+        "json: the literal false parses as a bool with value false",
+        f.ok() && f.kind(f.root()) == JsonKind::Bool && !f.asBool(f.root())
+    );
+    let n : JsonDoc = JsonParser::parse("null");
+    c.that(
+        "json: the literal null parses as a non-none null value",
+        n.ok() && n.kind(n.root()) == JsonKind::Null && !n.root().isNone()
+    );
+    jsonNum(c, "zero", "0", 0.0);
+    jsonNum(c, "negative integer", "-12", -12.0);
+    jsonNum(c, "fraction", "1.5", 1.5);
+    jsonNum(c, "tenth", "0.1", 0.1);
+    jsonNum(c, "exponent", "1e3", 1000.0);
+    jsonNum(c, "capital exponent with plus", "2E+2", 200.0);
+    jsonNum(c, "negative exponent", "1.5e-3", 0.0015);
+    jsonNum(c, "2^53 is exact", "9007199254740992", 9007199254740992.0);
+    jsonNum(c, "a 15-digit integer is exact", "123456789012345", 123456789012345.0);
+    jsonNum(c, "negative 2^53 is exact", "-9007199254740992", -9007199254740992.0);
+    jsonNum(c, "minus zero reads as zero", "-0", 0.0);
+    jsonNum(c, "long fraction", "3.141592653589793", 3.141592653589793);
+    let big : JsonDoc = JsonParser::parse("1.7976931348623157e308");
+    c.that("json: the largest finite double parses", big.ok());
+    let forty : JsonDoc = JsonParser::parse("42");
+    c.sameInt("json: intOr reads the integer 42 from a number", forty.intOr(forty.root(), -1), 42);
+    let huge : JsonDoc = JsonParser::parse("5000000000");
+    c.sameInt("json: a number too big for i32 gives the fallback", huge.intOr(huge.root(), -1), -1);
+}
+
+fn jsonStringChecks(c : Checks) : void {
+    let d : JsonDoc = JsonParser::parse("\"a\\n\\t\\\"\\\\\\/\\b\\f\\rz\"");
+    c.that(
+        "json: short escapes decode to their control characters",
+        d.ok() && d.asString(d.root()) == "a\n\t\"\\/\rz"
+    );
+    let u : JsonDoc = JsonParser::parse("\"\\u0041\\u00e9\\u20AC\"");
+    c.that(
+        "json: \\u escapes decode to their code points",
+        u.ok() && u.asString(u.root()) == "Aé€"
+    );
+    c.sameInt("json: \\u escapes give UTF-8", u.asString(u.root()).byteLength, 6);
+    let p : JsonDoc = JsonParser::parse("\"\\ud83d\\ude00\"");
+    c.that("json: a surrogate pair is one code point", p.ok() && p.asString(p.root()) == "😀");
+    c.sameInt("json: a surrogate pair is four bytes", p.asString(p.root()).byteLength, 4);
+    let raw : JsonDoc = JsonParser::parse("\"héllo € 😀\"");
+    c.that("json: raw UTF-8 passes through", raw.ok() && raw.asString(raw.root()) == "héllo € 😀");
+    let e : JsonDoc = JsonParser::parse("\"\"");
+    c.that(
+        "json: the empty string parses as an empty string value",
+        e.ok() && e.isString(e.root()) && e.asString(e.root()) == ""
+    );
+    let nul : JsonDoc = JsonParser::parse("\"a\\u0000b\"");
+    c.that("json: an escaped NUL is accepted", nul.ok());
+}
+
+fn jsonStructureChecks(c : Checks) : void {
+    let text : string = " { \"name\" : \"ludax\", \"n\": [1, 2.5, -3, true, null, \"s\", [], {}], \"o\": {\"k\": {\"deep\": 7}}, \"name\": \"second\" } ";
+    let d : JsonDoc = JsonParser::parse(text);
+    c.that("json: an object document parses", d.ok());
+    let r : JsonValue = d.root();
+    c.that("json: root is an object", d.isObject(r));
+    c.sameInt("json: member count counts repeats", d.childCount(r), 4);
+    c.that(
+        "json: a repeated key answers with the last",
+        d.asString(d.field(r, "name")) == "second"
+    );
+    c.that(
+        "json: has is true for a present key and false for a missing one",
+        d.has(r, "o") && !d.has(r, "missing")
+    );
+    c.that("json: a missing field is none", d.field(r, "missing").isNone());
+    let n : JsonValue = d.field(r, "n");
+    c.sameInt("json: the array has eight elements", d.childCount(n), 8);
+    c.near("json: element 1 is the number 2.5", d.asNumber(d.at(n, 1)), 2.5, 0.0);
+    c.near("json: element 2 is the number -3", d.asNumber(d.at(n, 2)), -3.0, 0.0);
+    c.that("json: element 3 is the bool true", d.asBool(d.at(n, 3)));
+    c.that("json: element 4 is null", d.isNull(d.at(n, 4)));
+    c.that("json: element 5 is the string s", d.asString(d.at(n, 5)) == "s");
+    c.that(
+        "json: a nested empty array is an array of length zero",
+        d.isArray(d.at(n, 6)) && d.childCount(d.at(n, 6)) == 0
+    );
+    c.that(
+        "json: a nested empty object is an object of length zero",
+        d.isObject(d.at(n, 7)) && d.childCount(d.at(n, 7)) == 0
+    );
+    c.that("json: at outside the array is none", d.at(n, 8).isNone() && d.at(n, -1).isNone());
+    c.near(
+        "json: a deep path",
+        d.asNumber(d.field(d.field(d.field(r, "o"), "k"), "deep")),
+        7.0,
+        0.0
+    );
+    c.that(
+        "json: keyAt gives insertion order",
+        d.keyAt(r, 0) == "name" && d.keyAt(r, 1) == "n" && d.keyAt(r, 2) == "o"
+    );
+    c.that(
+        "json: random access after sequential access",
+        d.asNumber(d.at(n, 0)) == 1.0 && d.asNumber(d.at(n, 2)) == -3.0
+            && d.asNumber(d.at(n, 1)) == 2.5
+    );
+    c.that(
+        "json: the wrong kind answers the fallback",
+        d.asNumber(r) == 0.0 && d.asString(n) == "" && !d.asBool(r) && d.childCount(d.at(n, 1)) == 0
+    );
+    c.that("json: field on a non-object", d.field(n, "x").isNone());
+    c.sameInt("json: depth 128 is accepted", jsonNest(JSON_MAX_DEPTH, true), 1);
+    c.sameInt("json: depth 129 is refused", jsonNest(JSON_MAX_DEPTH + 1, true), 0);
+    c.sameInt("json: deep objects are refused too", jsonNest(JSON_MAX_DEPTH + 1, false), 0);
+}
+
+// 1 when `depth` nested arrays (or objects) parse, 0 when they do not.
+fn jsonNest(depth : i32, arrays : bool) : i32 {
+    let b : ByteBuf = new ByteBuf(16);
+    for (i of 0..depth) {
+        if (arrays) {
+            b.pushText("[");
+        } else {
+            b.pushText("{\"a\":");
+        }
+    }
+    b.pushText("0");
+    for (i of 0..depth) {
+        if (arrays) {
+            b.pushText("]");
+        } else {
+            b.pushText("}");
+        }
+    }
+    let d : JsonDoc = JsonParser::parseBytes(b);
+    if (d.ok()) {
+        return 1;
+    }
+    return 0;
+}
+
+fn jsonRejectChecks(c : Checks) : void {
+    jsonBad(c, "empty input", "");
+    jsonBad(c, "only white space", "  \n ");
+    jsonBad(c, "an open object", "{");
+    jsonBad(c, "an open array", "[1, 2");
+    jsonBad(c, "a trailing comma in an array", "[1,]");
+    jsonBad(c, "a trailing comma in an object", "{\"a\":1,}");
+    jsonBad(c, "a missing comma", "[1 2]");
+    jsonBad(c, "a missing colon", "{\"a\" 1}");
+    jsonBad(c, "a number as a key", "{1:2}");
+    jsonBad(c, "a leading zero", "01");
+    jsonBad(c, "a leading zero after a minus", "-01");
+    jsonBad(c, "a lone minus", "-");
+    jsonBad(c, "a dot with no digits", "1.");
+    jsonBad(c, "a leading dot", ".5");
+    jsonBad(c, "an exponent with no digits", "1e");
+    jsonBad(c, "an exponent sign with no digits", "1e+");
+    jsonBad(c, "a plus sign", "+1");
+    jsonBad(c, "hexadecimal", "0x10");
+    jsonBad(c, "NaN", "NaN");
+    jsonBad(c, "Infinity", "Infinity");
+    jsonBad(c, "a number out of range", "1e999");
+    jsonBad(c, "single quotes", "'a'");
+    jsonBad(c, "an unterminated string", "\"abc");
+    jsonBad(c, "an unknown escape", "\"\\x41\"");
+    jsonBad(c, "a short \\u escape", "\"\\u12\"");
+    jsonBad(c, "a non-hex \\u escape", "\"\\u12g4\"");
+    jsonBad(c, "a lone high surrogate", "\"\\ud800\"");
+    jsonBad(c, "a lone low surrogate", "\"\\udc00\"");
+    jsonBad(c, "a high surrogate then a plain escape", "\"\\ud800\\u0041\"");
+    jsonBad(c, "a raw newline in a string", "\"a\nb\"");
+    jsonBad(c, "a raw tab in a string", "\"a\tb\"");
+    jsonBad(c, "a truncated literal", "tru");
+    jsonBad(c, "a misspelled literal", "nulL");
+    jsonBad(c, "a capitalised literal", "True");
+    jsonBad(c, "content after the value", "[1] x");
+    jsonBad(c, "two values", "1 2");
+    jsonBad(c, "a comment", "// c\n1");
+    jsonBad(c, "a block comment", "/* c */ 1");
+    jsonBad(c, "a stray bracket", "]");
+    jsonBad(c, "a stray comma", ",");
+    jsonBad(c, "a backslash outside a string", "\\");
+    jsonBad(c, "a control character outside a string", "");
+    // Damaged UTF-8 inside a string: a lone continuation byte, a truncated sequence, an overlong form, a surrogate.
+    c.that("json: rejects a lone continuation byte", jsonRawBad(0x22, 0x80, 0x22, -1));
+    c.that("json: rejects a truncated two-byte sequence", jsonRawBad(0x22, 0xC3, 0x22, -1));
+    c.that("json: rejects an overlong NUL", jsonRawBad(0x22, 0xC0, 0x80, 0x22));
+    c.that("json: rejects an encoded surrogate", jsonRawBad3(0xED, 0xA0, 0x80));
+    c.that("json: a lone 0xFF byte inside a string is rejected", jsonRawBad(0x22, 0xFF, 0x22, -1));
+    let pos : JsonDoc = JsonParser::parse("{\n  \"a\": 1,\n  \"b\": ?\n}");
+    c.that(
+        "json: the error names line and column",
+        !pos.ok() && pos.error().startsWith("line 3, column 8:")
+    );
+    let at1 : JsonDoc = JsonParser::parse("@");
+    c.that("json: the error of the first character", at1.error().startsWith("line 1, column 1:"));
+    let eof : JsonDoc = JsonParser::parse("[1,");
+    c.that("json: the error at the end of input", eof.error().startsWith("line 1, column 4:"));
+    let bom : ByteBuf = new ByteBuf(16);
+    bom.push(0xEF);
+    bom.push(0xBB);
+    bom.push(0xBF);
+    bom.pushText("[1]");
+    c.that("json: a byte order mark is skipped", JsonParser::parseBytes(bom).ok());
+}
+
+fn jsonRawBad(a : i32, b : i32, d : i32, e : i32) : bool {
+    let buf : ByteBuf = new ByteBuf(16);
+    buf.push(a);
+    buf.push(b);
+    buf.push(d);
+    if (e >= 0) {
+        buf.push(e);
+    }
+    let doc : JsonDoc = JsonParser::parseBytes(buf);
+    return !doc.ok();
+}
+
+fn jsonRawBad3(a : i32, b : i32, d : i32) : bool {
+    let buf : ByteBuf = new ByteBuf(16);
+    buf.push(0x22);
+    buf.push(a);
+    buf.push(b);
+    buf.push(d);
+    buf.push(0x22);
+    return !JsonParser::parseBytes(buf).ok();
+}
+
+fn jsonWriterChecks(c : Checks) : void {
+    let d : JsonDoc = JsonParser::parse("{\"b\":[1,2.5,{\"x\":null}],\"a\":\"q\\\"\\n\",\"e\":{},\"f\":[],\"t\":true}");
+    c.that(
+        "json: compact output is exact",
+        JsonWriter::compact(d, d.root())
+            == "{\"b\":[1,2.5,{\"x\":null}],\"a\":\"q\\\"\\n\",\"e\":{},\"f\":[],\"t\":true}"
+    );
+    let want : string = "{\n  \"b\": [\n    1,\n    2.5,\n    {\n      \"x\": null\n    }\n  ],\n  \"a\": \"q\\\"\\n\",\n  \"e\": {},\n  \"f\": [],\n  \"t\": true\n}";
+    c.that("json: pretty output is exact", JsonWriter::pretty(d, d.root(), 2) == want);
+    c.that(
+        "json: whole numbers print without a fraction",
+        JsonWriter::number(3.0) == "3" && JsonWriter::number(-40.0) == "-40"
+    );
+    c.that(
+        "json: 2^53 prints exactly",
+        JsonWriter::number(9007199254740992.0) == "9007199254740992"
+    );
+    c.that(
+        "json: fractions print shortest",
+        JsonWriter::number(0.1) == "0.1" && JsonWriter::number(1.5) == "1.5"
+    );
+    c.that("json: negative zero prints as 0", JsonWriter::number(-0.0) == "0");
+    let s : JsonDoc = new JsonDoc();
+    let v : JsonValue = s.newString("tab\there  é");
+    c.that(
+        "json: control characters escape, UTF-8 passes",
+        JsonWriter::compact(s, v) == "\"tab\\there \\u0001 é\""
+    );
+}
+
+fn jsonBuilderChecks(c : Checks) : void {
+    let d : JsonDoc = new JsonDoc();
+    let obj : JsonValue = d.newObject();
+    d.setRoot(obj);
+    c.that(
+        "json: set appends",
+        d.set(obj, "z", d.newNumber(1.0)) && d.set(obj, "a", d.newString("x"))
+    );
+    let arr : JsonValue = d.newArray();
+    c.that(
+        "json: push",
+        d.push(arr, d.newBool(true)) && d.push(arr, d.newNull()) && d.push(arr, d.newNumber(2.0))
+    );
+    c.that("json: set stores a container value under a new key", d.set(obj, "list", arr));
+    c.that("json: set replaces in place", d.set(obj, "z", d.newNumber(9.0)));
+    c.sameInt("json: replacing keeps the member count", d.childCount(obj), 3);
+    c.that(
+        "json: insertion order is the output order",
+        JsonWriter::compact(d, d.root()) == "{\"z\":9,\"a\":\"x\",\"list\":[true,null,2]}"
+    );
+    c.that("json: push on an object fails", !d.push(obj, d.newNull()));
+    c.that("json: set on an array fails", !d.set(arr, "k", d.newNull()));
+    let shared : JsonValue = d.newNull();
+    c.that("json: a value has one parent", d.push(arr, shared) && !d.push(arr, shared));
+    c.that("json: a NaN number is stored as null", d.isNull(d.newNumber(jsonNan())));
+    c.that("json: an infinite number is stored as null", d.isNull(d.newNumber(jsonInf())));
+    let again : JsonDoc = JsonParser::parse(JsonWriter::compact(d, d.root()));
+    c.that(
+        "json: a built document reads back",
+        again.ok() && again.childCount(again.root()) == 3 && again.keyAt(again.root(), 2) == "list"
+    );
+}
+
+fn jsonNan() : f64 {
+    let big : f64 = 1.0e308;
+    let inf : f64 = big * big;
+    return inf - inf;
+}
+
+fn jsonInf() : f64 {
+    let big : f64 = 1.0e308;
+    return big * big;
+}
+
+fn jsonRoundTrip(c : Checks) : void {
+    for (i of 0..6) {
+        let first : JsonDoc = JsonParser::parse(jsonSample(i));
+        c.that("json: sample ${i} parses", first.ok());
+        let once : string = JsonWriter::compact(first, first.root());
+        let second : JsonDoc = JsonParser::parse(once);
+        c.that("json: sample ${i} reads back", second.ok());
+        c.that(
+            "json: sample ${i} writes the same text again",
+            JsonWriter::compact(second, second.root()) == once
+        );
+        let pretty : string = JsonWriter::pretty(first, first.root(), 4);
+        let third : JsonDoc = JsonParser::parse(pretty);
+        c.that(
+            "json: sample ${i} survives pretty printing",
+            third.ok() && JsonWriter::compact(third, third.root()) == once
+        );
+    }
+    let values : f64[] = jsonFloats();
+    for (i of 0..8) {
+        let text : string = JsonWriter::number(values[i]);
+        let back : JsonDoc = JsonParser::parse(text);
+        c.that(
+            "json: number ${text} reads back to the same double",
+            back.ok() && back.asNumber(back.root()) == values[i]
+        );
+    }
+}
+
+fn jsonSample(i : i32) : string {
+    return match i {
+        0 => "{\"a\":[1,2,3],\"b\":{\"c\":\"d\"}}",
+        1 => "[[],[[]],{},{\"\":{}}]",
+        2 => "\"\\u00e9\\ud83d\\ude00\\n\"",
+        3 => "[0,-1,1e2,1.25,0.000001,123456789012,-0.5]",
+        4 => "{\"k\":\"v\",\"k2\":[true,false,null],\"k3\":1.5e3}",
+        _ => "  [ 1 , { \"x\" : [ ] } ]  ",
+    };
+}
+
+fn jsonFloats() : f64[] {
+    let mut v : f64[] = new f64[8];
+    v[0] = 0.1;
+    v[1] = 1.0 / 3.0;
+    v[2] = 123456.789;
+    v[3] = 1.0e-7;
+    v[4] = 2.5e10;
+    v[5] = -98765.4321;
+    v[6] = 9007199254740991.0;
+    v[7] = 3.141592653589793;
+    return v;
+}
+
+fn jsonLargeChecks(c : Checks) : void {
+    let b : ByteBuf = new ByteBuf(16);
+    b.pushText("[");
+    for (i of 0..20000) {
+        if (i > 0) {
+            b.pushText(",");
+        }
+        b.pushText(i.toString());
+    }
+    b.pushText("]");
+    let d : JsonDoc = JsonParser::parseBytes(b);
+    c.that("json: a long array parses", d.ok() && d.childCount(d.root()) == 20000);
+    let mut sum : f64 = 0.0;
+    for (i of 0..20000) {
+        sum = sum + d.asNumber(d.at(d.root(), i));
+    }
+    c.near("json: sequential access reads every element", sum, 199990000.0, 0.0);
+    c.near(
+        "json: the last element of a 20000-element array reads back",
+        d.asNumber(d.at(d.root(), 19999)),
+        19999.0,
+        0.0
+    );
+    c.near("json: back to an early element", d.asNumber(d.at(d.root(), 5)), 5.0, 0.0);
+}

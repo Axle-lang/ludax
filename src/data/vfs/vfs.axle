@@ -1,0 +1,233 @@
+// vfs — the virtual file system: layered mounts under one tree of logical paths.
+//
+// A game asks for "textures/grass.png" and does not care whether the bytes sit in a directory during
+// development, in an archive when shipped, or in memory because a test made them. Sources are mounted in
+// order, each at a logical directory (the root unless said otherwise); a lookup asks the mounts from the last
+// to the first, so a later mount overrides an earlier one, the way a patch or a mod overrides the base game.
+//
+// Every path is normalised first (`VfsPath`), and a path that would climb above the root is an error, never a
+// silent clamp. Reading a file that is not there raises an `IOException`; `exists` asks without raising. A
+// write goes to the topmost writable mount that covers the path, so an archive laid over a memory mount hides
+// what is written into it: mount the writable layer last when it should win. Mounting is by explicit calls
+// and nothing is cached, so a file changed on disk is seen by the next read (hot reload relies on that).
+
+use crate::data::bytes::ByteBuf;
+use crate::data::text::DataText;
+use crate::data::vfs::vfs_archive::VfsArchive;
+use crate::data::vfs::vfs_listing::VfsListing;
+use crate::data::vfs::vfs_mount::{VfsMount, VfsMountKind};
+use crate::data::vfs::vfs_path::VfsPath;
+
+// How many mounts an empty file system has room for before it grows.
+const VFS_MOUNT_ROOM : i32 = 4;
+
+// The index answered when a mount cannot be added or no mount has the file.
+const VFS_NO_MOUNT : i32 = -1;
+
+/** Layered sources of files addressed by logical path. */
+pub class Vfs {
+    mounts : VfsMount[];
+    used   : i32 = 0;
+    room   : i32 = VFS_MOUNT_ROOM;
+    err    : string;
+
+    /** A file system with nothing mounted. */
+    constructor() {
+        self.mounts = new VfsMount[VFS_MOUNT_ROOM as i64];
+        self.err = "";
+    }
+
+    /** Why the last mount call failed, or an empty string. */
+    pub fn error(self) : string {
+        return self.err;
+    }
+
+    /** How many mounts there are. */
+    pub fn mountCount(self) : i32 {
+        return self.used;
+    }
+
+    fn add(mut self, kind : VfsMountKind, point : string, root : string, own store : VfsArchive) : i32 {
+        if (VfsPath::escapes(point)) {
+            self.err = "the mount point climbs above the root: ${point}";
+            return VFS_NO_MOUNT;
+        }
+
+        if (self.used == self.room) {
+            let mut bigger : VfsMount[] = new VfsMount[(self.room * 2) as i64];
+            for (i of 0..self.used) {
+                bigger[i] = self.mounts[i];
+            }
+            self.mounts = bigger;
+            self.room = self.room * 2;
+        }
+
+        self.mounts[self.used] = new VfsMount(kind, VfsPath::normalize(point), root, store);
+        self.used = self.used + 1;
+        self.err = "";
+        return self.used - 1;
+    }
+
+    /** Mounts an empty, writable, in-memory directory at `point` ("" for the root); returns the mount's index, or -1 (see `error`). */
+    pub fn addMemory(mut self, point : string) : i32 {
+        return self.add(VfsMountKind::Memory, point, "", new VfsArchive());
+    }
+
+    /** Mounts the real directory `dir` at `point`; returns the mount's index, or -1 (see `error`). A disk mount cannot list its files. */
+    pub fn addDisk(mut self, dir : string, point : string) : i32 {
+        return self.add(VfsMountKind::Disk, point, dir, new VfsArchive());
+    }
+
+    /** Mounts the "LDXA" container `bytes` (copied) at `point`, read-only; returns the mount's index, or -1 for a damaged archive (see `error`). */
+    pub fn addArchive(mut self, bytes : ByteBuf, point : string) : i32 {
+        let archive : VfsArchive = VfsArchive::open(bytes);
+        if (!archive.ok()) {
+            self.err = DataText::copy(archive.error());
+            return VFS_NO_MOUNT;
+        }
+        return self.add(VfsMountKind::Archive, point, "", archive);
+    }
+
+    // True when mount `i` covers `path` (the path is at or below its mount point).
+    fn covers(self, i : i32, path : string) : bool {
+        return VfsPath::isUnder(self.mounts[i].point(), path);
+    }
+
+    // True when mount `i` holds files at `path`: it covers the path, and the path is below its mount point,
+    // which is itself always a directory.
+    fn holds(self, i : i32, path : string) : bool {
+        return self.covers(i, path) && path.byteLength > self.mounts[i].point().byteLength;
+    }
+
+    // True when the mount point lies strictly below `dir`, so `dir` shows the mount as a subdirectory.
+    fn hasMountBelow(self, i : i32, dir : string) : bool {
+        let point : string = self.mounts[i].point();
+        return point.byteLength > dir.byteLength && VfsPath::isUnder(dir, point);
+    }
+
+    fn innerOf(self, i : i32, path : string) : string {
+        return VfsPath::relative(self.mounts[i].point(), path);
+    }
+
+    /** The index of the topmost mount that has a file at `path`, or -1. */
+    pub fn sourceOf(self, path : string) : i32 {
+        if (VfsPath::escapes(path)) {
+            return VFS_NO_MOUNT;
+        }
+        let clean : string = VfsPath::normalize(path);
+
+        let mut i : i32 = self.used - 1;
+        while (i >= 0) {
+            if (self.holds(i, clean) && self.mounts[i].hasFile(self.innerOf(i, clean))) {
+                return i;
+            }
+            i = i - 1;
+        }
+        return VFS_NO_MOUNT;
+    }
+
+    /** True when a file exists at `path`. */
+    pub fn exists(self, path : string) : bool {
+        return self.sourceOf(path) >= 0;
+    }
+
+    /** True when `path` is a directory in some mount (the root always is). */
+    pub fn isDirectory(self, path : string) : bool {
+        if (VfsPath::escapes(path)) {
+            return false;
+        }
+        let clean : string = VfsPath::normalize(path);
+        if (clean.byteLength == 0) {
+            return true;
+        }
+
+        for (i of 0..self.used) {
+            if (self.covers(i, clean) && self.mounts[i].hasDirectory(self.innerOf(i, clean))) {
+                return true;
+            }
+            if (self.hasMountBelow(i, clean)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** The bytes of the file at `path`, from the topmost mount that has it. */
+    pub fn read(self, path : string) : ByteBuf ! IOException {
+        if (VfsPath::escapes(path)) {
+            throw IOException("the path climbs above the root: ${path}");
+        }
+        let clean : string = VfsPath::normalize(path);
+        let at : i32 = self.sourceOf(clean);
+        if (at < 0) {
+            throw IOException("not found: ${clean}");
+        }
+        return self.mounts[at].read(self.innerOf(at, clean));
+    }
+
+    /** The file at `path` as text (UTF-8). */
+    pub fn readText(self, path : string) : string ! IOException {
+        let bytes : ByteBuf = self.read(path);
+        return DataText::fromBytes(bytes, 0, bytes.len());
+    }
+
+    /** The children of the directory `dir`, merged over all mounts and sorted; empty when there are none. */
+    pub fn list(self, dir : string) : VfsListing {
+        let out : VfsListing = new VfsListing();
+        if (VfsPath::escapes(dir)) {
+            return out;
+        }
+        let clean : string = VfsPath::normalize(dir);
+
+        for (i of 0..self.used) {
+            if (self.covers(i, clean)) {
+                self.mounts[i].listInto(self.innerOf(i, clean), out);
+            } else if (self.hasMountBelow(i, clean)) {
+                out.add(VfsPath::firstSegment(VfsPath::relative(clean, self.mounts[i].point())), true);
+            }
+        }
+        return out;
+    }
+
+    /** Writes `bytes` to `path` in the topmost writable mount that covers it. */
+    pub fn write(mut self, path : string, bytes : ByteBuf) : void ! IOException {
+        if (VfsPath::escapes(path)) {
+            throw IOException("the path climbs above the root: ${path}");
+        }
+        let clean : string = VfsPath::normalize(path);
+
+        let mut i : i32 = self.used - 1;
+        while (i >= 0) {
+            if (self.mounts[i].writable() && self.holds(i, clean)) {
+                self.mounts[i].write(self.innerOf(i, clean), bytes);
+                return;
+            }
+            i = i - 1;
+        }
+        throw IOException("no writable mount covers ${clean}");
+    }
+
+    /** Writes text (UTF-8) to `path`. */
+    pub fn writeText(mut self, path : string, text : string) : void ! IOException {
+        self.write(path, DataText::toBytes(text));
+    }
+
+    /** Deletes the file at `path` from the topmost writable mount that has it; true when one was deleted. */
+    pub fn remove(mut self, path : string) : bool ! IOException {
+        if (VfsPath::escapes(path)) {
+            throw IOException("the path climbs above the root: ${path}");
+        }
+        let clean : string = VfsPath::normalize(path);
+
+        let mut i : i32 = self.used - 1;
+        while (i >= 0) {
+            if (self.mounts[i].writable() && self.holds(i, clean)) {
+                if (self.mounts[i].remove(self.innerOf(i, clean))) {
+                    return true;
+                }
+            }
+            i = i - 1;
+        }
+        return false;
+    }
+}

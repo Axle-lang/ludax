@@ -1,0 +1,283 @@
+// vfs_archive — a set of files by path, and the container format that stores it in one `ByteBuf`.
+//
+// In memory an archive is a map from logical path to the bytes of a file, kept in insertion order so that
+// writing it out twice gives the same bytes. The same class is the storage of an in-memory mount (files come
+// and go) and of a read-only archive mount (opened from bytes, then only read).
+//
+// The container format, "LDXA" version 1, all numbers 32-bit little-endian:
+//
+//     offset 0   magic        the four bytes 'L' 'D' 'X' 'A'
+//     offset 4   version      1
+//     offset 8   count        how many files
+//     offset 12  dataStart    offset of the first byte of file contents
+//     offset 16  table        count entries, each:
+//                               pathLength   bytes of the path that follow (1 to 4096)
+//                               path         UTF-8, normalised (see `VfsPath`), unique
+//                               offset       of the contents, counted from dataStart
+//                               size         of the contents in bytes
+//                               crc32        of the contents (the checksum PNG uses)
+//     dataStart  contents     the files one after the other, in table order, no padding
+//
+// Opening checks everything it will later trust: the magic and version, that the table lies between the
+// header and `dataStart`, that every path is a well-formed, normalised, unique path, that every range of
+// contents lies inside the file, and every checksum. A damaged container is an error with a reason, never an
+// abort or a read past the end.
+
+use crate::core::collections::string_map::StringMap;
+use crate::data::bytes::{ByteBuf, Crc32};
+use crate::data::text::DataText;
+use crate::data::vfs::vfs_path::VfsPath;
+
+// The fixed header: magic, version, count and dataStart.
+const ARCHIVE_HEADER : i32 = 16;
+
+// Positions of the header fields after the magic.
+const ARCHIVE_VERSION_AT : i32 = 4;
+const ARCHIVE_COUNT_AT : i32 = 8;
+const ARCHIVE_DATA_START_AT : i32 = 12;
+
+const ARCHIVE_VERSION : i32 = 1;
+
+// The width of an entry's path length field, and the fixed part of an entry after its path: offset, size
+// and crc32.
+const ARCHIVE_LENGTH_BYTES : i32 = 4;
+const ARCHIVE_ENTRY_FIXED : i32 = 12;
+
+// The largest path an archive entry may have; an entry always has at least one byte of path.
+const ARCHIVE_MAX_PATH : i32 = 4096;
+const ARCHIVE_MIN_PATH : i32 = 1;
+
+// A deliberately loose lower bound on an entry, used to reject a count the file cannot possibly hold.
+const ARCHIVE_MIN_ENTRY : i32 = 16;
+
+// The four magic bytes at the start of a container.
+const ARCHIVE_MAGIC : string = "LDXA";
+
+// Where the size and the checksum sit inside an entry's fixed part (the offset comes first, at 0).
+const ARCHIVE_ENTRY_SIZE_AT : i32 = 4;
+const ARCHIVE_ENTRY_CRC_AT : i32 = 8;
+
+// How many files an empty archive has room for before it grows, and the starting room of the buffers that
+// build a table of contents and the file contents; a stored copy keeps a little slack.
+const ARCHIVE_FILE_ROOM : i32 = 8;
+const ARCHIVE_TABLE_ROOM : i32 = 256;
+const ARCHIVE_DATA_ROOM : i32 = 1024;
+const ARCHIVE_COPY_SLACK : i32 = 16;
+
+// What a lookup answers for a path that is not there.
+const ARCHIVE_NO_FILE : i32 = -1;
+
+/** A set of files by logical path, readable from and writable to the "LDXA" container. */
+pub class VfsArchive {
+    index : StringMap<i32>;
+    files : ByteBuf[];
+    used  : i32 = 0;
+    room  : i32 = ARCHIVE_FILE_ROOM;
+    err   : string;
+
+    /** An empty archive. */
+    constructor() {
+        self.index = new StringMap<i32>();
+        self.files = new ByteBuf[ARCHIVE_FILE_ROOM as i64];
+        self.err = "";
+    }
+
+    /** Why `open` failed, or an empty string. */
+    pub fn error(self) : string {
+        return self.err;
+    }
+
+    /** True when `open` found nothing wrong with the container. */
+    pub fn ok(self) : bool {
+        return self.err.byteLength == 0;
+    }
+
+    /** How many files it holds. */
+    pub fn count(self) : i32 {
+        return self.index.len();
+    }
+
+    /** The first slot in insertion order (for walking the files with `nextSlot`), or -1 when empty. */
+    pub fn firstSlot(self) : i32 {
+        return self.index.first();
+    }
+
+    /** The slot after `slot`, or -1 at the end. */
+    pub fn nextSlot(self, slot : i32) : i32 {
+        return self.index.next(slot);
+    }
+
+    /** The path stored in `slot` (borrowed; copy to keep). */
+    pub fn pathAt(self, slot : i32) : string {
+        return self.index.keyAt(slot);
+    }
+
+    /** True when a file is stored under `path` (a normalised path). */
+    pub fn has(self, path : string) : bool {
+        return self.index.has(path);
+    }
+
+    /** The size in bytes of the file at `path`, or -1 when there is none. */
+    pub fn sizeOf(self, path : string) : i32 {
+        let slot : i32 = self.index.find(path);
+        if (slot < 0) {
+            return ARCHIVE_NO_FILE;
+        }
+        return self.files[self.index.valueAt(slot)].len();
+    }
+
+    /** A copy of the file at `path`; an empty buffer when there is none (ask `has` first). */
+    pub fn get(self, path : string) : ByteBuf {
+        let slot : i32 = self.index.find(path);
+        let out : ByteBuf = new ByteBuf(ARCHIVE_COPY_SLACK);
+        if (slot >= 0) {
+            let src : ByteBuf = self.files[self.index.valueAt(slot)];
+            out.pushRange(src, 0, src.len());
+        }
+        return out;
+    }
+
+    /**
+     * Stores a copy of `bytes` under `path`, replacing a file of that name. The path is normalised first; false
+     * (and nothing stored) when it is empty or climbs above the root.
+     */
+    pub fn put(mut self, path : string, bytes : ByteBuf) : bool {
+        if (VfsPath::escapes(path)) {
+            return false;
+        }
+        let clean : string = VfsPath::normalize(path);
+        if (clean.byteLength == 0) {
+            return false;
+        }
+
+        let copy : ByteBuf = new ByteBuf(bytes.len() + ARCHIVE_COPY_SLACK);
+        copy.pushRange(bytes, 0, bytes.len());
+
+        let slot : i32 = self.index.find(clean);
+        if (slot >= 0) {
+            self.files[self.index.valueAt(slot)] = copy;
+            return true;
+        }
+
+        if (self.used == self.room) {
+            let mut bigger : ByteBuf[] = new ByteBuf[(self.room * 2) as i64];
+            for (i of 0..self.used) {
+                bigger[i] = self.files[i];
+            }
+            self.files = bigger;
+            self.room = self.room * 2;
+        }
+        self.files[self.used] = copy;
+        self.index.put(clean, self.used);
+        self.used = self.used + 1;
+        return true;
+    }
+
+    /** Forgets the file at `path`; true when there was one. */
+    pub fn remove(mut self, path : string) : bool {
+        return self.index.remove(path);
+    }
+
+    /** The container bytes of the whole archive. */
+    pub fn toBytes(self) : ByteBuf {
+        let crc : Crc32 = new Crc32();
+        let table : ByteBuf = new ByteBuf(ARCHIVE_TABLE_ROOM);
+        let data : ByteBuf = new ByteBuf(ARCHIVE_DATA_ROOM);
+
+        let mut slot : i32 = self.index.first();
+        while (slot >= 0) {
+            let path : string = self.index.keyAt(slot);
+            let file : ByteBuf = self.files[self.index.valueAt(slot)];
+            let encoded : ByteBuf = DataText::toBytes(path);
+            table.pushLe32(encoded.len());
+            table.pushRange(encoded, 0, encoded.len());
+            table.pushLe32(data.len());
+            table.pushLe32(file.len());
+            table.pushLe32(crc.sum(file, 0, file.len()));
+            data.pushRange(file, 0, file.len());
+            slot = self.index.next(slot);
+        }
+
+        let out : ByteBuf = new ByteBuf(ARCHIVE_HEADER + table.len() + data.len());
+        out.pushText(ARCHIVE_MAGIC);
+        out.pushLe32(ARCHIVE_VERSION);
+        out.pushLe32(self.index.len());
+        out.pushLe32(ARCHIVE_HEADER + table.len());
+        out.pushRange(table, 0, table.len());
+        out.pushRange(data, 0, data.len());
+        return out;
+    }
+
+    static fn broken(why : string) : VfsArchive {
+        let mut bad : VfsArchive = new VfsArchive();
+        bad.err = why;
+        return bad;
+    }
+
+    /** The archive stored in `bytes`; on a damaged container `ok()` is false and `error()` says why. */
+    pub static fn open(bytes : ByteBuf) : VfsArchive {
+        let total : i32 = bytes.len();
+        if (total < ARCHIVE_HEADER || !bytes.tagAt(0, ARCHIVE_MAGIC)) {
+            return VfsArchive::broken("not an LDXA archive");
+        }
+
+        let version : i32 = bytes.le32(ARCHIVE_VERSION_AT);
+        if (version != ARCHIVE_VERSION) {
+            return VfsArchive::broken("unsupported archive version ${version}");
+        }
+        let count : i32 = bytes.le32(ARCHIVE_COUNT_AT);
+        let dataStart : i32 = bytes.le32(ARCHIVE_DATA_START_AT);
+        if (count < 0 || count > (total - ARCHIVE_HEADER) / ARCHIVE_MIN_ENTRY || dataStart < ARCHIVE_HEADER
+            || dataStart > total) {
+            return VfsArchive::broken("the archive header is damaged");
+        }
+
+        let avail : i32 = total - dataStart;
+        let crc : Crc32 = new Crc32();
+        let out : VfsArchive = new VfsArchive();
+        let mut at : i32 = ARCHIVE_HEADER;
+        for (entry of 0..count) {
+            if (at + ARCHIVE_LENGTH_BYTES > dataStart) {
+                return VfsArchive::broken("the table of contents runs into the file contents");
+            }
+            let plen : i32 = bytes.le32(at);
+            at = at + ARCHIVE_LENGTH_BYTES;
+            if (plen < ARCHIVE_MIN_PATH || plen > ARCHIVE_MAX_PATH
+                || at + plen + ARCHIVE_ENTRY_FIXED > dataStart) {
+                return VfsArchive::broken("entry ${entry} has a damaged table entry");
+            }
+            if (!DataText::isValidUtf8(bytes, at, at + plen)) {
+                return VfsArchive::broken("entry ${entry} has a path that is not UTF-8");
+            }
+
+            let path : string = DataText::fromBytes(bytes, at, at + plen);
+            at = at + plen;
+            let offset : i32 = bytes.le32(at);
+            let size : i32 = bytes.le32(at + ARCHIVE_ENTRY_SIZE_AT);
+            let sum : i32 = bytes.le32(at + ARCHIVE_ENTRY_CRC_AT);
+            at = at + ARCHIVE_ENTRY_FIXED;
+
+            if (VfsPath::escapes(path) || VfsPath::normalize(path) != path || path.byteLength == 0) {
+                return VfsArchive::broken("entry ${entry} has a path that is not a normalised path");
+            }
+            if (out.has(path)) {
+                return VfsArchive::broken("the path ${path} occurs twice");
+            }
+            if (offset < 0 || size < 0 || size > avail || offset > avail - size) {
+                return VfsArchive::broken("the contents of ${path} lie outside the archive");
+            }
+            if (crc.sum(bytes, dataStart + offset, dataStart + offset + size) != sum) {
+                return VfsArchive::broken("the contents of ${path} do not match their checksum");
+            }
+
+            let body : ByteBuf = new ByteBuf(size + ARCHIVE_COPY_SLACK);
+            body.pushRange(bytes, dataStart + offset, dataStart + offset + size);
+            out.put(path, body);
+        }
+
+        if (at != dataStart) {
+            return VfsArchive::broken("the table of contents and the contents do not meet");
+        }
+        return out;
+    }
+}

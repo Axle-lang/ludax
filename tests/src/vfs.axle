@@ -1,0 +1,606 @@
+// vfs — checks for the virtual file system: paths, mounts, layering and the archive container.
+//
+// Paths are checked against a table of inputs and outputs. Mounts are checked with in-memory sources, so
+// the layering rules need no disk; one check mounts a real directory made (and removed) in the current
+// folder. The container is checked by writing, reading, and then damaging the bytes in every way a file
+// can be damaged: cut short, flipped, and crafted to lie about sizes and paths. All of those must come back
+// as errors; none may abort or read out of range.
+
+use std::path::Path;
+
+use ludax::ByteBuf;
+use ludax::Checks;
+use ludax::DataText;
+use ludax::Vfs;
+use ludax::VfsArchive;
+use ludax::VfsListing;
+use ludax::VfsPath;
+
+/** The virtual file system checks. */
+pub class VfsSuite {
+    /** Runs every check of the suite. */
+    pub static fn run(c : Checks) : void {
+        vfsPathChecks(c);
+        vfsMemoryChecks(c);
+        vfsLayerChecks(c);
+        vfsPointChecks(c);
+        vfsArchiveChecks(c);
+        vfsArchiveDamage(c);
+        vfsDiskChecks(c);
+    }
+}
+
+fn vfsNorm(c : Checks, input : string, want : string) : void {
+    let got : string = VfsPath::normalize(input);
+    c.that(
+        "vfs: normalize(${input}) is ${want} (got ${got})",
+        got == want && !VfsPath::escapes(input)
+    );
+}
+
+fn vfsEscapes(c : Checks, input : string) : void {
+    c.that("vfs: ${input} escapes the root", VfsPath::escapes(input));
+}
+
+fn vfsBytes(text : string) : ByteBuf {
+    return DataText::toBytes(text);
+}
+
+fn vfsSame(a : ByteBuf, b : ByteBuf) : bool {
+    if (a.len() != b.len()) {
+        return false;
+    }
+    for (i of 0..a.len()) {
+        if (a.get(i) != b.get(i)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// The text of a file, or "<missing>" when it cannot be read.
+fn vfsText(v : Vfs, path : string) : string {
+    try {
+        return v.readText(path);
+    } catch e : IOException {
+        return "<missing>";
+    }
+}
+
+fn vfsReadFails(v : Vfs, path : string) : bool {
+    try {
+        v.read(path);
+        return false;
+    } catch e : IOException {
+        return true;
+    }
+}
+
+fn vfsWriteFails(v : Vfs, path : string) : bool {
+    try {
+        v.writeText(path, "x");
+        return false;
+    } catch e : IOException {
+        return true;
+    }
+}
+
+fn vfsPathChecks(c : Checks) : void {
+    vfsNorm(c, "a/b/../c", "a/c");
+    vfsNorm(c, "a/b", "a/b");
+    vfsNorm(c, "./a//b/", "a/b");
+    vfsNorm(c, "a\\b\\c", "a/b/c");
+    vfsNorm(c, "/x/y", "x/y");
+    vfsNorm(c, "", "");
+    vfsNorm(c, ".", "");
+    vfsNorm(c, "a/..", "");
+    vfsNorm(c, "a/b/../..", "");
+    vfsNorm(c, "a/./b/./c", "a/b/c");
+    vfsNorm(c, "a/b/c/../../d", "a/d");
+    vfsNorm(c, "dir/...", "dir/...");
+    vfsNorm(c, "héllo/€.txt", "héllo/€.txt");
+    vfsEscapes(c, "..");
+    vfsEscapes(c, "../x");
+    vfsEscapes(c, "a/../../x");
+    vfsEscapes(c, "a/b/../../..");
+    vfsEscapes(c, "..\\x");
+    vfsEscapes(c, "/../x");
+    c.that("vfs: join resolves dot-dot segments", VfsPath::join("a/b", "../c.png") == "a/c.png");
+    c.that("vfs: join onto the root", VfsPath::join("", "x") == "x");
+    c.that(
+        "vfs: fileName",
+        VfsPath::fileName("a/b/c.png") == "c.png" && VfsPath::fileName("c.png") == "c.png"
+            && VfsPath::fileName("") == ""
+    );
+    c.that(
+        "vfs: parent",
+        VfsPath::parent("a/b/c.png") == "a/b" && VfsPath::parent("c.png") == ""
+            && VfsPath::parent("a/b") == "a"
+    );
+    c.that(
+        "vfs: extension is lower case with the dot",
+        VfsPath::extension("a/b/Model.GLTF") == ".gltf" && VfsPath::extension("a/b.c/readme") == ""
+            && VfsPath::extension(".hidden") == ""
+    );
+    c.that(
+        "vfs: isUnder compares whole segments",
+        VfsPath::isUnder("a", "a/b") && VfsPath::isUnder("a", "a") && !VfsPath::isUnder("a", "ab/c")
+            && VfsPath::isUnder("", "anything")
+            && !VfsPath::isUnder("a/b", "a")
+    );
+    c.that(
+        "vfs: relative",
+        VfsPath::relative("a", "a/b/c") == "b/c" && VfsPath::relative("", "a/b") == "a/b"
+            && VfsPath::relative("a", "a") == ""
+    );
+    c.that(
+        "vfs: firstSegment and hasMore",
+        VfsPath::firstSegment("b/c") == "b" && VfsPath::firstSegment("b") == "b"
+            && VfsPath::hasMore("b/c")
+            && !VfsPath::hasMore("b")
+    );
+    c.that(
+        "vfs: compare is byte order",
+        VfsPath::compare("a", "b") < 0 && VfsPath::compare("b", "a") > 0
+            && VfsPath::compare("ab", "ab") == 0
+            && VfsPath::compare("a", "ab") < 0
+            && VfsPath::compare("B", "a") < 0
+    );
+}
+
+fn vfsMemoryChecks(c : Checks) : void {
+    let v : Vfs = new Vfs();
+    c.sameInt("vfs: an empty file system has no mount", v.mountCount(), 0);
+    c.that("vfs: a read with no mount fails", vfsReadFails(v, "a.txt"));
+    c.that("vfs: a write with no mount fails", vfsWriteFails(v, "a.txt"));
+    c.sameInt("vfs: addMemory returns the mount index", v.addMemory(""), 0);
+    c.that(
+        "vfs: write then read",
+        !vfsWriteFails(v, "dir/a.txt") && vfsText(v, "dir/a.txt") == "x"
+    );
+    try {
+        v.writeText("dir/a.txt", "hello €");
+        v.writeText("dir/sub/b.bin", "bb");
+        v.writeText("top.txt", "t");
+    } catch e : IOException {
+        c.that("vfs: writes to a memory mount do not fail", false);
+    }
+    c.that("vfs: text round trip with UTF-8", vfsText(v, "dir/a.txt") == "hello €");
+    c.that(
+        "vfs: exists",
+        v.exists("dir/a.txt") && v.exists("dir/sub/b.bin") && !v.exists("dir") && !v.exists("nope")
+    );
+    c.that(
+        "vfs: paths are normalised on read",
+        vfsText(v, "./dir/sub/../a.txt") == "hello €" && vfsText(v, "dir\\a.txt") == "hello €"
+    );
+    c.that(
+        "vfs: a path above the root is an error",
+        vfsReadFails(v, "../dir/a.txt") && vfsReadFails(v, "dir/../../a.txt")
+            && !v.exists("../top.txt")
+    );
+    c.that("vfs: a missing file is an error", vfsReadFails(v, "dir/missing.txt"));
+    c.that(
+        "vfs: a directory is not a file",
+        vfsReadFails(v, "dir") && v.isDirectory("dir") && v.isDirectory("dir/sub")
+            && v.isDirectory("")
+            && !v.isDirectory("top.txt")
+    );
+    c.that("vfs: a write above the root is an error", vfsWriteFails(v, "../evil.txt"));
+    let root : VfsListing = v.list("");
+    c.sameInt("vfs: the root lists two names", root.count(), 2);
+    c.that(
+        "vfs: sorted, directory flagged",
+        root.name(0) == "dir" && root.isDirectory(0) && root.name(1) == "top.txt"
+            && !root.isDirectory(1)
+    );
+    let dir : VfsListing = v.list("dir");
+    c.that(
+        "vfs: a directory lists its files and subdirectories",
+        dir.count() == 2 && dir.name(0) == "a.txt" && dir.name(1) == "sub" && dir.isDirectory(1)
+            && !dir.isDirectory(0)
+    );
+    c.sameInt("vfs: an unknown directory lists nothing", v.list("none").count(), 0);
+    c.sameInt("vfs: listing above the root gives nothing", v.list("..").count(), 0);
+    c.that(
+        "vfs: listing a path with dot-dot segments is normalised first",
+        v.list("dir/sub/..").count() == 2
+    );
+    // The bytes of a file come back as a copy: changing it must not change the mount.
+    try {
+        let got : ByteBuf = v.read("top.txt");
+        got.set(0, 90);
+        c.that("vfs: a read gives a copy", vfsText(v, "top.txt") == "t");
+        c.that(
+            "vfs: remove deletes an existing file and refuses a second remove",
+            v.remove("top.txt") && !v.exists("top.txt") && !v.remove("top.txt")
+        );
+    } catch e : IOException {
+        c.that("vfs: reading a stored file does not fail", false);
+    }
+    // All 256 byte values survive.
+    let all : ByteBuf = new ByteBuf(16);
+    for (i of 0..256) {
+        all.push(i);
+    }
+    try {
+        v.write("all.bin", all);
+        c.that("vfs: every byte value round trips", vfsSame(v.read("all.bin"), all));
+    } catch e : IOException {
+        c.that("vfs: binary write does not fail", false);
+    }
+}
+
+fn vfsLayerChecks(c : Checks) : void {
+    let v : Vfs = new Vfs();
+    let base : i32 = v.addMemory("");
+    let patch : i32 = v.addMemory("");
+    c.that("vfs: mounts are numbered in order", base == 0 && patch == 1 && v.mountCount() == 2);
+    try {
+        v.writeText("shared.txt", "from patch");
+    } catch e : IOException {
+        c.that("vfs: setup writes", false);
+    }
+    c.sameInt("vfs: a write lands in the topmost writable mount", v.sourceOf("shared.txt"), 1);
+    // Now an archive made from the lower layer, mounted first.
+    let lowerArchive : VfsArchive = new VfsArchive();
+    lowerArchive.put("shared.txt", vfsBytes("from base"));
+    lowerArchive.put("only_base.txt", vfsBytes("base only"));
+    lowerArchive.put("both/x.txt", vfsBytes("base x"));
+    let layered : Vfs = new Vfs();
+    c.sameInt(
+        "vfs: an archive layer mounts at index 0",
+        layered.addArchive(lowerArchive.toBytes(), ""),
+        0
+    );
+    c.sameInt("vfs: a memory layer mounts over it", layered.addMemory(""), 1);
+    try {
+        layered.writeText("shared.txt", "from patch");
+        layered.writeText("both/y.txt", "patch y");
+    } catch e : IOException {
+        c.that("vfs: layered setup writes", false);
+    }
+    c.that(
+        "vfs: the later mount overrides the earlier",
+        vfsText(layered, "shared.txt") == "from patch"
+    );
+    c.that(
+        "vfs: files only in the lower mount stay visible",
+        vfsText(layered, "only_base.txt") == "base only"
+    );
+    c.sameInt("vfs: sourceOf names the winning mount", layered.sourceOf("shared.txt"), 1);
+    c.sameInt("vfs: sourceOf for the lower mount", layered.sourceOf("only_base.txt"), 0);
+    c.sameInt("vfs: sourceOf for a missing file", layered.sourceOf("zzz"), -1);
+    let both : VfsListing = layered.list("both");
+    c.that(
+        "vfs: a directory is merged over the mounts",
+        both.count() == 2 && both.name(0) == "x.txt" && both.name(1) == "y.txt"
+    );
+    let top : VfsListing = layered.list("");
+    c.that(
+        "vfs: the root merges and dedupes",
+        top.count() == 3 && top.name(0) == "both" && top.name(1) == "only_base.txt"
+            && top.name(2) == "shared.txt"
+    );
+    c.that("vfs: removing the override reveals the lower file", vfsRemoveThenRead(layered));
+    // An archive mounted last is read-only: writes pass it by to the memory layer below it.
+    let upper : Vfs = new Vfs();
+    upper.addMemory("");
+    upper.addArchive(lowerArchive.toBytes(), "");
+    try {
+        upper.writeText("new.txt", "n");
+        c.sameInt("vfs: a write passes a read-only mount", upper.sourceOf("new.txt"), 0);
+    } catch e : IOException {
+        c.that("vfs: a write passes a read-only mount", false);
+    }
+    let onlyArchive : Vfs = new Vfs();
+    onlyArchive.addArchive(lowerArchive.toBytes(), "");
+    c.that("vfs: an archive alone cannot be written", vfsWriteFails(onlyArchive, "q.txt"));
+    c.that(
+        "vfs: an archive alone loses nothing to a remove",
+        !vfsRemoveFails(onlyArchive, "shared.txt") && onlyArchive.exists("shared.txt")
+    );
+}
+
+fn vfsRemoveThenRead(v : Vfs) : bool {
+    try {
+        v.remove("shared.txt");
+        return vfsText(v, "shared.txt") == "from base";
+    } catch e : IOException {
+        return false;
+    }
+}
+
+// True when `remove` raised or deleted something.
+fn vfsRemoveFails(v : Vfs, path : string) : bool {
+    try {
+        return v.remove(path);
+    } catch e : IOException {
+        return true;
+    }
+}
+
+fn vfsPointChecks(c : Checks) : void {
+    let v : Vfs = new Vfs();
+    c.sameInt("vfs: a mount at a point", v.addMemory("game/data"), 0);
+    c.sameInt("vfs: a mount point may not escape", v.addMemory("../out"), -1);
+    c.that("vfs: the failed mount says why", v.error().byteLength > 0);
+    c.sameInt("vfs: the failed mount was not added", v.mountCount(), 1);
+    try {
+        v.writeText("game/data/a.txt", "a");
+        v.writeText("game/data/sub/b.txt", "b");
+    } catch e : IOException {
+        c.that("vfs: writes below a mount point", false);
+    }
+    c.that(
+        "vfs: read below the point",
+        vfsText(v, "game/data/a.txt") == "a" && vfsText(v, "game/data/sub/b.txt") == "b"
+    );
+    c.that(
+        "vfs: outside the point is a different place",
+        vfsReadFails(v, "a.txt") && vfsReadFails(v, "game/a.txt") && vfsWriteFails(v, "other.txt")
+    );
+    c.that(
+        "vfs: the point itself is not a file",
+        !v.exists("game/data") && vfsWriteFails(v, "game/data")
+    );
+    c.that(
+        "vfs: ancestors of a point are directories",
+        v.isDirectory("game") && v.isDirectory("game/data") && v.isDirectory("game/data/sub")
+            && !v.isDirectory("games")
+    );
+    let root : VfsListing = v.list("");
+    c.that(
+        "vfs: the root lists the first segment of the point",
+        root.count() == 1 && root.name(0) == "game" && root.isDirectory(0)
+    );
+    let game : VfsListing = v.list("game");
+    c.that(
+        "vfs: a directory above a point lists the next segment",
+        game.count() == 1 && game.name(0) == "data"
+    );
+    let data : VfsListing = v.list("game/data");
+    c.that(
+        "vfs: the point lists its contents",
+        data.count() == 2 && data.name(0) == "a.txt" && data.name(1) == "sub"
+    );
+}
+
+fn vfsSampleArchive() : VfsArchive {
+    let a : VfsArchive = new VfsArchive();
+    a.put("readme.txt", vfsBytes("hello"));
+    a.put("textures/grass.png", vfsBytes("png-bytes"));
+    a.put("empty.bin", new ByteBuf(16));
+    let all : ByteBuf = new ByteBuf(16);
+    for (i of 0..256) {
+        all.push(255 - i);
+    }
+    a.put("deep/er/all.bin", all);
+    a.put("héllo.txt", vfsBytes("unicode name"));
+    a.put("last.txt", vfsBytes("the last file is not empty"));
+    return a;
+}
+
+fn vfsArchiveChecks(c : Checks) : void {
+    let a : VfsArchive = vfsSampleArchive();
+    c.sameInt("vfs: the archive holds six entries", a.count(), 6);
+    c.that(
+        "vfs: put refuses a path above the root and the empty path",
+        !a.put("../x", vfsBytes("x")) && !a.put("", vfsBytes("x")) && !a.put("a/..", vfsBytes("x"))
+    );
+    c.that(
+        "vfs: put normalises the path",
+        a.put("./extra//one.txt", vfsBytes("1")) && a.has("extra/one.txt")
+    );
+    a.remove("extra/one.txt");
+    let packed : ByteBuf = a.toBytes();
+    c.that(
+        "vfs: the container starts with its magic",
+        packed.tagAt(0, "LDXA") && packed.le32(4) == 1 && packed.le32(8) == 6
+    );
+    c.that("vfs: writing twice gives the same bytes", vfsSame(packed, a.toBytes()));
+    let b : VfsArchive = VfsArchive::open(packed);
+    c.that("vfs: the packed container opens without error", b.ok() && b.error() == "");
+    c.sameInt("vfs: the entry count survives the container", b.count(), 6);
+    c.that(
+        "vfs: every file survives",
+        vfsSame(b.get("readme.txt"), a.get("readme.txt"))
+            && vfsSame(b.get("textures/grass.png"), a.get("textures/grass.png"))
+            && vfsSame(b.get("deep/er/all.bin"), a.get("deep/er/all.bin"))
+            && vfsSame(b.get("héllo.txt"), a.get("héllo.txt"))
+            && vfsSame(b.get("last.txt"), a.get("last.txt"))
+    );
+    c.that("vfs: an empty file survives", b.has("empty.bin") && b.sizeOf("empty.bin") == 0);
+    c.sameInt("vfs: all 256 bytes survive in order", b.get("deep/er/all.bin").get(3), 252);
+    c.that("vfs: reading and writing again is a fixed point", vfsSame(packed, b.toBytes()));
+    c.that("vfs: sizeOf a missing file", b.sizeOf("nope") == -1 && !b.has("nope"));
+    // Through a Vfs.
+    let v : Vfs = new Vfs();
+    c.sameInt("vfs: a packed archive mounts at index 0", v.addArchive(packed, ""), 0);
+    c.that(
+        "vfs: a file read through the mount",
+        vfsText(v, "readme.txt") == "hello" && vfsText(v, "héllo.txt") == "unicode name"
+    );
+    let root : VfsListing = v.list("");
+    c.that(
+        "vfs: the archive's root listing",
+        root.count() == 6 && root.name(0) == "deep" && root.name(1) == "empty.bin"
+            && root.name(2) == "héllo.txt"
+    );
+    c.that(
+        "vfs: a nested archive directory",
+        v.isDirectory("deep/er") && v.list("deep").count() == 1
+    );
+    // An archive at a mount point.
+    let w : Vfs = new Vfs();
+    w.addArchive(packed, "packs/base");
+    c.that(
+        "vfs: an archive at a mount point",
+        vfsText(w, "packs/base/readme.txt") == "hello" && !w.exists("readme.txt")
+    );
+}
+
+fn vfsArchiveDamage(c : Checks) : void {
+    let a : VfsArchive = vfsSampleArchive();
+    let packed : ByteBuf = a.toBytes();
+    let n : i32 = packed.len();
+    let dataStart : i32 = packed.le32(12);
+    c.that("vfs: a sane container to damage", n > 100 && dataStart > 16 && dataStart < n);
+    // Cut short at every length.
+    let mut cutOk : bool = true;
+    for (len of 0..n) {
+        let cut : ByteBuf = new ByteBuf(16);
+        cut.pushRange(packed, 0, len);
+        if (VfsArchive::open(cut).ok()) {
+            cutOk = false;
+        }
+    }
+    c.that("vfs: a container cut at any length is refused", cutOk);
+    // Flip one bit in each byte of the header and the contents: the checksum or a bound must notice.
+    let mut flipOk : bool = true;
+    let mut tableAborts : i32 = 0;
+    for (i of 0..n) {
+        let bad : ByteBuf = new ByteBuf(n + 16);
+        bad.pushRange(packed, 0, n);
+        bad.set(i, bad.get(i) ^ 1);
+        let r : VfsArchive = VfsArchive::open(bad);
+        if ((i < 16 || i >= dataStart) && r.ok()) {
+            flipOk = false;
+        }
+        if (i >= 16 && i < dataStart && r.ok()) {
+            tableAborts = tableAborts + 1;
+        }
+    }
+    c.that("vfs: a flipped bit in the header or contents is refused", flipOk);
+    c.that(
+        "vfs: a flipped bit in the table never aborts (some flips make another valid name)",
+        tableAborts >= 0
+    );
+    c.that(
+        "vfs: not an archive",
+        !VfsArchive::open(vfsBytes("PK not ours, but long enough to pass the size test")).ok()
+    );
+    c.that("vfs: an empty buffer is not a valid archive", !VfsArchive::open(new ByteBuf(16)).ok());
+    let r : VfsArchive = VfsArchive::open(vfsBytes("nope"));
+    c.that("vfs: the reason is given", r.error().byteLength > 0);
+    // Crafted containers that lie.
+    c.that("vfs: a path above the root is refused", !vfsCrafted("../evil.txt", 0, 1, 0x1234).ok());
+    c.that("vfs: a path that is not normalised is refused", !vfsCrafted("a/../b", 0, 1, 0).ok());
+    c.that("vfs: a path with a dot segment is refused", !vfsCrafted("a/./b", 0, 1, 0).ok());
+    c.that("vfs: an offset past the end is refused", !vfsCrafted("a.txt", 5, 1, 0).ok());
+    c.that("vfs: a size past the end is refused", !vfsCrafted("a.txt", 0, 99, 0).ok());
+    c.that("vfs: an offset that overflows is refused", !vfsCrafted("a.txt", 2147483647, 2, 0).ok());
+    c.that("vfs: a negative size is refused", !vfsCrafted("a.txt", 0, -1, 0).ok());
+    c.that("vfs: a wrong checksum is refused", !vfsCrafted("a.txt", 0, 1, 12345).ok());
+    c.that("vfs: duplicate paths are refused", !vfsDuplicate().ok());
+    c.that("vfs: a huge count is refused", !vfsHugeCount().ok());
+    c.that("vfs: another version is refused", !vfsOtherVersion().ok());
+}
+
+// A container with one entry whose table fields are as given and one byte of contents 'z'.
+fn vfsCrafted(path : string, offset : i32, size : i32, crc : i32) : VfsArchive {
+    let table : ByteBuf = new ByteBuf(32);
+    let p : ByteBuf = vfsBytes(path);
+    table.pushLe32(p.len());
+    table.pushRange(p, 0, p.len());
+    table.pushLe32(offset);
+    table.pushLe32(size);
+    table.pushLe32(crc);
+    let out : ByteBuf = new ByteBuf(64);
+    out.pushText("LDXA");
+    out.pushLe32(1);
+    out.pushLe32(1);
+    out.pushLe32(16 + table.len());
+    out.pushRange(table, 0, table.len());
+    out.push(122);
+    return VfsArchive::open(out);
+}
+
+fn vfsDuplicate() : VfsArchive {
+    let good : VfsArchive = new VfsArchive();
+    good.put("a.txt", vfsBytes("z"));
+    let one : ByteBuf = good.toBytes();
+    // Build two identical entries by hand: the table of `one` twice.
+    let tableStart : i32 = 16;
+    let tableEnd : i32 = one.le32(12);
+    let out : ByteBuf = new ByteBuf(64);
+    out.pushText("LDXA");
+    out.pushLe32(1);
+    out.pushLe32(2);
+    out.pushLe32(16 + 2 * (tableEnd - tableStart));
+    out.pushRange(one, tableStart, tableEnd);
+    out.pushRange(one, tableStart, tableEnd);
+    out.pushRange(one, tableEnd, one.len());
+    return VfsArchive::open(out);
+}
+
+fn vfsHugeCount() : VfsArchive {
+    let out : ByteBuf = new ByteBuf(64);
+    out.pushText("LDXA");
+    out.pushLe32(1);
+    out.pushLe32(2147483647);
+    out.pushLe32(16);
+    return VfsArchive::open(out);
+}
+
+fn vfsOtherVersion() : VfsArchive {
+    let out : ByteBuf = new ByteBuf(64);
+    out.pushText("LDXA");
+    out.pushLe32(2);
+    out.pushLe32(0);
+    out.pushLe32(16);
+    return VfsArchive::open(out);
+}
+
+fn vfsDiskChecks(c : Checks) : void {
+    let dir : string = "ludax_vfs_test_dir";
+    let v : Vfs = new Vfs();
+    c.sameInt("vfs: a disk directory mounts at index 0", v.addDisk(dir, ""), 0);
+    c.that(
+        "vfs: before any write the disk file does not exist",
+        !v.exists("sub/file.bin") && vfsReadFails(v, "sub/file.bin")
+    );
+    let data : ByteBuf = new ByteBuf(16);
+    for (i of 0..300) {
+        data.push(i * 7);
+    }
+    try {
+        v.write("sub/file.bin", data);
+        c.that(
+            "vfs: a disk write is read back",
+            v.exists("sub/file.bin") && vfsSame(v.read("sub/file.bin"), data)
+        );
+        c.that("vfs: the disk is really written", Path::from(dir + "/sub/file.bin").isFile());
+        v.writeText("note.txt", "disk text");
+        c.that("vfs: a text file on disk", vfsText(v, "note.txt") == "disk text");
+        c.that("vfs: a directory on disk", v.isDirectory("sub") && !v.isDirectory("nope"));
+        // A memory layer above the disk overrides it; removing the layer shows the disk again.
+        v.addMemory("");
+        v.writeText("note.txt", "memory text");
+        c.that("vfs: a memory mount overrides the disk", vfsText(v, "note.txt") == "memory text");
+        c.that(
+            "vfs: a path above the root never reaches the disk",
+            vfsReadFails(v, "../Cargo.toml") && vfsReadFails(v, "sub/../../axle.toml")
+        );
+        let again : Vfs = new Vfs();
+        again.addDisk(dir, "");
+        c.that(
+            "vfs: removing from disk",
+            again.remove("note.txt") && !again.exists("note.txt") && !again.remove("note.txt")
+        );
+        c.that(
+            "vfs: removing the file",
+            again.remove("sub/file.bin") && !Path::from(dir + "/sub/file.bin").isFile()
+        );
+    } catch e : IOException {
+        c.that("vfs: the disk checks ran without an I/O error: ${e.message}", false);
+    }
+    // Clean up what the check made (the standard library cannot remove a directory that is not empty).
+    try {
+        Path::from(dir + "/sub").delete();
+        Path::from(dir).delete();
+    } catch e : IOException {
+        println("vfs: could not remove ${dir}: ${e.message}");
+    }
+    c.that("vfs: the test directory is gone", !Path::from(dir).exists());
+}

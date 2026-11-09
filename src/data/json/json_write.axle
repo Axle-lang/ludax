@@ -1,0 +1,223 @@
+// json_write — a `JsonDoc` value back to JSON text.
+//
+// Compact (no space at all) or pretty (one element per line, a chosen indent). Members come out in the order
+// they were inserted, so a document read and written again keeps its key order. Strings escape `"`, `\` and
+// the control characters (`\n`, `\t`, … or `\u00XX`) and pass every other byte through, so the output is
+// UTF-8. A number that is a whole number below 2^53 prints without a fraction or exponent; any other prints
+// as the shortest decimal that reads back as the same f64. Negative zero prints as `0` (JSON has the form,
+// but nothing in the engine needs it).
+
+use crate::core::math::scalar::maxI;
+use crate::data::bytes::ByteBuf;
+use crate::data::json::json_doc::{JsonDoc, JsonKind, JsonValue};
+use crate::data::text::DataText;
+
+// Initial room for the output buffer; most documents fit without growing.
+const JSONW_ROOM : i32 = 256;
+
+// The `step` that means "no whitespace at all": compact output.
+const JSONW_COMPACT : i32 = -1;
+
+// The smallest indent `pretty` accepts.
+const JSONW_MIN_INDENT : i32 = 1;
+
+// The largest integer a double holds exactly. Beyond it a whole double prints as a double, since a cast
+// through `i64` could silently change it.
+const JSONW_WHOLE_LIMIT : f64 = 9007199254740992.0;
+
+// A hex digit is a nibble: four bits.
+const JSONW_NIBBLE_BITS : i32 = 4;
+const JSONW_NIBBLE_MASK : i32 = 15;
+
+// The bytes the writer emits, in ASCII order; naming them keeps a `push` from being an unexplained number.
+const JSONW_BACKSPACE : i32 = 8;
+const JSONW_TAB : i32 = 9;
+const JSONW_LF : i32 = 10;
+const JSONW_FORMFEED : i32 = 12;
+const JSONW_CR : i32 = 13;
+const JSONW_SPACE : i32 = 32;
+const JSONW_QUOTE : i32 = 34;
+const JSONW_COMMA : i32 = 44;
+const JSONW_COLON : i32 = 58;
+const JSONW_LBRACKET : i32 = 91;
+const JSONW_BACKSLASH : i32 = 92;
+const JSONW_RBRACKET : i32 = 93;
+const JSONW_LBRACE : i32 = 123;
+const JSONW_RBRACE : i32 = 125;
+
+// What one write carries from node to node: the document read, the bytes written, and the spaces per level
+// (negative for compact output).
+struct JsonPen {
+    doc  : JsonDoc;
+    out  : ByteBuf;
+    step : i32;
+}
+
+/** Writes JSON text. */
+pub class JsonWriter {
+    /** `v` as compact JSON text. */
+    pub static fn compact(doc : JsonDoc, v : JsonValue) : string {
+        let out : ByteBuf = JsonWriter::render(doc, v, JSONW_COMPACT);
+        return DataText::fromBytes(out, 0, out.len());
+    }
+
+    /** `v` as indented JSON text, `indent` spaces per level (at least 1). */
+    pub static fn pretty(doc : JsonDoc, v : JsonValue, indent : i32) : string {
+        let step : i32 = maxI(indent, JSONW_MIN_INDENT);
+        let out : ByteBuf = JsonWriter::render(doc, v, step);
+        return DataText::fromBytes(out, 0, out.len());
+    }
+
+    /** The UTF-8 bytes of `v` as compact JSON, for writing to a file. */
+    pub static fn compactBytes(doc : JsonDoc, v : JsonValue) : ByteBuf {
+        return JsonWriter::render(doc, v, JSONW_COMPACT);
+    }
+
+    static fn render(doc : JsonDoc, v : JsonValue, step : i32) : ByteBuf {
+        let out : ByteBuf = new ByteBuf(JSONW_ROOM);
+        let pen : JsonPen = JsonPen { doc: doc, out: out, step: step };
+        JsonWriter::emit(pen, v, 0);
+        return out;
+    }
+
+    static fn newline(out : ByteBuf, step : i32, level : i32) : void {
+        if (step < 0) {
+            return;
+        }
+        out.push(JSONW_LF);
+        for (i of 0..(step * level)) {
+            out.push(JSONW_SPACE);
+        }
+    }
+
+    static fn emit(pen : JsonPen, v : JsonValue, level : i32) : void {
+        let doc : JsonDoc = pen.doc;
+        let out : ByteBuf = pen.out;
+        let kind : JsonKind = doc.kind(v);
+        match kind {
+            JsonKind::Null => {
+                out.pushText("null");
+            },
+            JsonKind::Bool => {
+                if (doc.asBool(v)) {
+                    out.pushText("true");
+                } else {
+                    out.pushText("false");
+                }
+            },
+            JsonKind::Number => {
+                out.pushText(JsonWriter::number(doc.asNumber(v)));
+            },
+            JsonKind::String => {
+                JsonWriter::quoted(doc.asString(v), out);
+            },
+            JsonKind::Array => {
+                JsonWriter::array(pen, v, level);
+            },
+            JsonKind::Object => {
+                JsonWriter::object(pen, v, level);
+            },
+        }
+    }
+
+    static fn array(pen : JsonPen, v : JsonValue, level : i32) : void {
+        let doc : JsonDoc = pen.doc;
+        let out : ByteBuf = pen.out;
+        let step : i32 = pen.step;
+        out.push(JSONW_LBRACKET);
+
+        let mut child : JsonValue = doc.firstChild(v);
+        let mut first : bool = true;
+        while (!child.isNone()) {
+            if (!first) {
+                out.push(JSONW_COMMA);
+            }
+            first = false;
+
+            JsonWriter::newline(out, step, level + 1);
+            JsonWriter::emit(pen, child, level + 1);
+            child = doc.nextSibling(child);
+        }
+
+        if (!first) {
+            JsonWriter::newline(out, step, level);
+        }
+        out.push(JSONW_RBRACKET);
+    }
+
+    static fn object(pen : JsonPen, v : JsonValue, level : i32) : void {
+        let doc : JsonDoc = pen.doc;
+        let out : ByteBuf = pen.out;
+        let step : i32 = pen.step;
+        out.push(JSONW_LBRACE);
+
+        let mut child : JsonValue = doc.firstChild(v);
+        let mut first : bool = true;
+        while (!child.isNone()) {
+            if (!first) {
+                out.push(JSONW_COMMA);
+            }
+            first = false;
+
+            JsonWriter::newline(out, step, level + 1);
+            JsonWriter::quoted(doc.keyOf(child), out);
+            out.push(JSONW_COLON);
+            if (step >= 0) {
+                out.push(JSONW_SPACE);
+            }
+            JsonWriter::emit(pen, child, level + 1);
+            child = doc.nextSibling(child);
+        }
+
+        if (!first) {
+            JsonWriter::newline(out, step, level);
+        }
+        out.push(JSONW_RBRACE);
+    }
+
+    /** The text of a number as this writer prints it. */
+    pub static fn number(x : f64) : string {
+        if (x > -JSONW_WHOLE_LIMIT && x < JSONW_WHOLE_LIMIT) {
+            let whole : i64 = x as i64;
+            if ((whole as f64) == x) {
+                return whole.toString();
+            }
+        }
+        return x.toString();
+    }
+
+    static fn quoted(s : string, out : ByteBuf) : void {
+        let digits : string = "0123456789abcdef";
+        out.push(JSONW_QUOTE);
+
+        for (i of 0..(s.byteLength as i32)) {
+            let c : i32 = s.byteAt(i) as i32;
+            let esc : string = JsonWriter::shortEscape(c);
+            if (esc != "") {
+                out.pushText(esc);
+            } else if (c < JSONW_SPACE) {
+                // The remaining control characters have only the four-digit form.
+                out.pushText("\\u00");
+                out.push(digits.charAt((c >> JSONW_NIBBLE_BITS) & JSONW_NIBBLE_MASK) as i32);
+                out.push(digits.charAt(c & JSONW_NIBBLE_MASK) as i32);
+            } else {
+                out.push(c);
+            }
+        }
+        out.push(JSONW_QUOTE);
+    }
+
+    // The two-character escape for `c`, or an empty string when it has none.
+    static fn shortEscape(c : i32) : string {
+        return match c {
+            JSONW_QUOTE => "\\\"",
+            JSONW_BACKSLASH => "\\\\",
+            JSONW_LF => "\\n",
+            JSONW_CR => "\\r",
+            JSONW_TAB => "\\t",
+            JSONW_BACKSPACE => "\\b",
+            JSONW_FORMFEED => "\\f",
+            _ => "",
+        };
+    }
+}

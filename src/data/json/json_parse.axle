@@ -1,0 +1,531 @@
+// json_parse — JSON text to a `JsonDoc`, strictly as RFC 8259 defines it.
+//
+// A recursive-descent reader over the bytes of the text. It accepts exactly the grammar of the RFC: the four
+// whitespace characters, numbers without leading zeros or a bare dot, strings with the eight short escapes
+// and `\uXXXX` (surrogate pairs joined; a lone surrogate is refused, because it has no UTF-8 form), and
+// UTF-8 that is well-formed. It refuses comments, trailing commas, single quotes, control characters inside
+// strings, content after the value, and nesting deeper than `JSON_MAX_DEPTH` (a malicious file must not
+// exhaust the stack). A leading byte order mark is skipped. Failure never aborts: the document comes back
+// with `ok()` false and `error()` naming the line and column.
+
+use crate::data::bytes::ByteBuf;
+use crate::data::json::json_doc::{JsonDoc, JsonValue};
+use crate::data::text::DataText;
+
+// How many arrays and objects may be open at once.
+const JSON_MAX_DEPTH : i32 = 128;
+
+// How many hex digits make one `\uXXXX` escape, the base they are in, and the value of the letter `a`.
+const JSON_HEX_DIGITS : i32 = 4;
+const JSON_HEX_BASE : i32 = 16;
+const JSON_HEX_LETTER_BASE : i32 = 10;
+
+// The UTF-8 byte order mark, which a file may start with and which is not part of the text.
+const JSON_BOM_LEN : i32 = 3;
+const JSON_BOM_0 : i32 = 0xEF;
+const JSON_BOM_1 : i32 = 0xBB;
+const JSON_BOM_2 : i32 = 0xBF;
+
+// UTF-16 surrogates: a `\u` escape past the basic plane is a high surrogate then a low one, which carry ten bits
+// each of the code point less 0x10000.
+const JSON_HIGH_FIRST : i32 = 0xD800;
+const JSON_HIGH_LAST : i32 = 0xDBFF;
+const JSON_LOW_FIRST : i32 = 0xDC00;
+const JSON_LOW_LAST : i32 = 0xDFFF;
+const JSON_SUPPLEMENTARY : i32 = 0x10000;
+const JSON_SURROGATE_BITS : i32 = 10;
+
+// The bytes of the RFC 8259 grammar, in ASCII order. Naming them keeps a comparison in the reader from being
+// an unexplained number. `JSON_LOWER_F` is both the `false` literal and the letter of the `\f` escape.
+const JSON_BACKSPACE : i32 = 8;
+const JSON_TAB : i32 = 9;
+const JSON_LF : i32 = 10;
+const JSON_FORMFEED : i32 = 12;
+const JSON_CR : i32 = 13;
+const JSON_SPACE : i32 = 32;
+const JSON_PRINTABLE_LO : i32 = 33;
+const JSON_QUOTE : i32 = 34;
+const JSON_PLUS : i32 = 43;
+const JSON_COMMA : i32 = 44;
+const JSON_MINUS : i32 = 45;
+const JSON_DOT : i32 = 46;
+const JSON_SLASH : i32 = 47;
+const JSON_DIGIT_0 : i32 = 48;
+const JSON_DIGIT_9 : i32 = 57;
+const JSON_COLON : i32 = 58;
+const JSON_UPPER_A : i32 = 65;
+const JSON_UPPER_E : i32 = 69;
+const JSON_UPPER_F : i32 = 70;
+const JSON_LBRACKET : i32 = 91;
+const JSON_BACKSLASH : i32 = 92;
+const JSON_RBRACKET : i32 = 93;
+const JSON_LOWER_A : i32 = 97;
+const JSON_LOWER_B : i32 = 98;
+const JSON_LOWER_E : i32 = 101;
+const JSON_LOWER_F : i32 = 102;
+const JSON_LOWER_N : i32 = 110;
+const JSON_LOWER_R : i32 = 114;
+const JSON_LOWER_T : i32 = 116;
+const JSON_LOWER_U : i32 = 117;
+const JSON_LBRACE : i32 = 123;
+const JSON_RBRACE : i32 = 125;
+const JSON_PRINTABLE_HI : i32 = 126;
+const JSON_ASCII_LIMIT : i32 = 128;
+
+// The three bare literals, each of which builds its one value.
+enum JsonLiteral : i8 {
+    False,
+    True,
+    Null,
+}
+
+/** Reads JSON text. */
+pub class JsonParser {
+    src     : ByteBuf;
+    pos     : i32 = 0;
+    doc     : JsonDoc;
+    bad     : bool = false;
+    scratch : ByteBuf;
+
+    constructor(bytes : ByteBuf) {
+        self.src = new ByteBuf(bytes.len() + 16);
+        self.src.pushRange(bytes, 0, bytes.len());
+        self.doc = new JsonDoc();
+        self.scratch = new ByteBuf(64);
+    }
+
+    /** The document in `text`; on malformed text `ok()` is false and `error()` says where and why. */
+    pub static fn parse(text : string) : JsonDoc {
+        return JsonParser::parseBytes(DataText::toBytes(text));
+    }
+
+    /** The document in the UTF-8 bytes `bytes`. */
+    pub static fn parseBytes(bytes : ByteBuf) : JsonDoc {
+        let p : JsonParser = new JsonParser(bytes);
+        return p.run();
+    }
+
+    fn run(mut self) : JsonDoc {
+        let hasBom : bool = self.src.len() >= JSON_BOM_LEN && self.src.get(0) == JSON_BOM_0
+            && self.src.get(1) == JSON_BOM_1
+            && self.src.get(2) == JSON_BOM_2;
+        if (hasBom) {
+            self.pos = JSON_BOM_LEN;
+        }
+
+        // `value` skips leading space itself.
+        let v : JsonValue = self.value(0);
+        if (self.bad) {
+            return self.doc;
+        }
+
+        self.skipSpace();
+        if (self.pos < self.src.len()) {
+            self.fail("unexpected content after the value");
+            return self.doc;
+        }
+        self.doc.setRoot(v);
+        return self.doc;
+    }
+
+    fn fail(mut self, why : string) : void {
+        if (self.bad) {
+            return;
+        }
+        self.bad = true;
+
+        let mut line : i32 = 1;
+        let mut column : i32 = 1;
+        let mut stop : i32 = self.pos;
+        if (stop > self.src.len()) {
+            stop = self.src.len();
+        }
+        for (i of 0..stop) {
+            if (self.src.get(i) == JSON_LF) {
+                line = line + 1;
+                column = 1;
+            } else {
+                column = column + 1;
+            }
+        }
+        self.doc.fail("line ${line}, column ${column}: ${why}");
+    }
+
+    fn skipSpace(mut self) : void {
+        while (self.pos < self.src.len() && JsonParser::isSpace(self.src.get(self.pos))) {
+            self.pos = self.pos + 1;
+        }
+    }
+
+    static fn isSpace(c : i32) : bool {
+        return c == JSON_SPACE || c == JSON_TAB || c == JSON_LF || c == JSON_CR;
+    }
+
+    static fn isDigit(c : i32) : bool {
+        return c >= JSON_DIGIT_0 && c <= JSON_DIGIT_9;
+    }
+
+    fn peek(self) : i32 {
+        return self.src.getOr(self.pos, -1);
+    }
+
+    fn value(mut self, depth : i32) : JsonValue {
+        self.skipSpace();
+        let c : i32 = self.peek();
+        if (c < 0) {
+            self.fail("unexpected end of input");
+            return JsonValue::none();
+        }
+
+        if (c == JSON_LBRACE || c == JSON_LBRACKET) {
+            if (depth >= JSON_MAX_DEPTH) {
+                self.fail("nesting is deeper than ${JSON_MAX_DEPTH}");
+                return JsonValue::none();
+            }
+            if (c == JSON_LBRACE) {
+                return self.object(depth);
+            }
+            return self.array(depth);
+        }
+
+        if (c == JSON_QUOTE) {
+            let s : string = self.text();
+            if (self.bad) {
+                return JsonValue::none();
+            }
+            return self.doc.newString(s);
+        }
+        if (c == JSON_LOWER_T) {
+            return self.literal("true", JsonLiteral::True);
+        }
+        if (c == JSON_LOWER_F) {
+            return self.literal("false", JsonLiteral::False);
+        }
+        if (c == JSON_LOWER_N) {
+            return self.literal("null", JsonLiteral::Null);
+        }
+        if (c == JSON_MINUS || JsonParser::isDigit(c)) {
+            return self.number();
+        }
+
+        self.fail("unexpected character ${JsonParser::describe(c)}");
+        return JsonValue::none();
+    }
+
+    static fn describe(c : i32) : string {
+        if (c >= JSON_PRINTABLE_LO && c <= JSON_PRINTABLE_HI) {
+            let b : ByteBuf = new ByteBuf(4);
+            b.push(c);
+            return "'${DataText::fromBytes(b, 0, 1)}'";
+        }
+        return "0x${JsonParser::hex2(c)}";
+    }
+
+    static fn hex2(c : i32) : string {
+        let digits : string = "0123456789abcdef";
+        let hi : i32 = (c >> 4) & 15;
+        let lo : i32 = c & 15;
+        let b : ByteBuf = new ByteBuf(4);
+        b.push(digits.charAt(hi) as i32);
+        b.push(digits.charAt(lo) as i32);
+        return DataText::fromBytes(b, 0, 2);
+    }
+
+    fn literal(mut self, w : string, kind : JsonLiteral) : JsonValue {
+        let n : i32 = w.byteLength as i32;
+        if (self.pos + n > self.src.len()) {
+            self.fail("unexpected end of input");
+            return JsonValue::none();
+        }
+        for (i of 0..n) {
+            if (self.src.get(self.pos + i) != (w.charAt(i) as i32)) {
+                self.fail("invalid literal");
+                return JsonValue::none();
+            }
+        }
+        self.pos = self.pos + n;
+
+        return match kind {
+            JsonLiteral::False => self.doc.newBool(false),
+            JsonLiteral::True => self.doc.newBool(true),
+            JsonLiteral::Null => self.doc.newNull(),
+        };
+    }
+
+    fn object(mut self, depth : i32) : JsonValue {
+        self.pos = self.pos + 1;
+        let node : JsonValue = self.doc.newObject();
+
+        self.skipSpace();
+        if (self.peek() == JSON_RBRACE) {
+            self.pos = self.pos + 1;
+            return node;
+        }
+
+        while (true) {
+            self.skipSpace();
+            if (self.peek() != JSON_QUOTE) {
+                self.fail("expected a string as a member name");
+                return JsonValue::none();
+            }
+            let key : string = self.text();
+            if (self.bad) {
+                return JsonValue::none();
+            }
+
+            self.skipSpace();
+            if (self.peek() != JSON_COLON) {
+                self.fail("expected ':' after a member name");
+                return JsonValue::none();
+            }
+            self.pos = self.pos + 1;
+
+            let v : JsonValue = self.value(depth + 1);
+            if (self.bad) {
+                return JsonValue::none();
+            }
+            self.doc.attach(node, v, key, true);
+
+            self.skipSpace();
+            let c : i32 = self.peek();
+            if (c == JSON_COMMA) {
+                self.pos = self.pos + 1;
+            } else if (c == JSON_RBRACE) {
+                self.pos = self.pos + 1;
+                return node;
+            } else {
+                self.fail("expected ',' or '}' in an object");
+                return JsonValue::none();
+            }
+        }
+        return node;
+    }
+
+    fn array(mut self, depth : i32) : JsonValue {
+        self.pos = self.pos + 1;
+        let node : JsonValue = self.doc.newArray();
+
+        self.skipSpace();
+        if (self.peek() == JSON_RBRACKET) {
+            self.pos = self.pos + 1;
+            return node;
+        }
+
+        while (true) {
+            let v : JsonValue = self.value(depth + 1);
+            if (self.bad) {
+                return JsonValue::none();
+            }
+            self.doc.attach(node, v, "", false);
+
+            self.skipSpace();
+            let c : i32 = self.peek();
+            if (c == JSON_COMMA) {
+                self.pos = self.pos + 1;
+            } else if (c == JSON_RBRACKET) {
+                self.pos = self.pos + 1;
+                return node;
+            } else {
+                self.fail("expected ',' or ']' in an array");
+                return JsonValue::none();
+            }
+        }
+        return node;
+    }
+
+    // Four hexadecimal digits at `pos`, or -1 (and `pos` stays put).
+    fn hex4(mut self) : i32 {
+        if (self.pos + JSON_HEX_DIGITS > self.src.len()) {
+            return -1;
+        }
+        let mut v : i32 = 0;
+        for (i of 0..JSON_HEX_DIGITS) {
+            let d : i32 = JsonParser::hexValue(self.src.get(self.pos + i));
+            if (d < 0) {
+                return -1;
+            }
+            v = v * JSON_HEX_BASE + d;
+        }
+        self.pos = self.pos + JSON_HEX_DIGITS;
+        return v;
+    }
+
+    // The value of the hex digit `c`, or -1 when it is not one.
+    static fn hexValue(c : i32) : i32 {
+        if (JsonParser::isDigit(c)) {
+            return c - JSON_DIGIT_0;
+        }
+        if (c >= JSON_UPPER_A && c <= JSON_UPPER_F) {
+            return c - JSON_UPPER_A + JSON_HEX_LETTER_BASE;
+        }
+        if (c >= JSON_LOWER_A && c <= JSON_LOWER_F) {
+            return c - JSON_LOWER_A + JSON_HEX_LETTER_BASE;
+        }
+        return -1;
+    }
+
+    // The string whose opening quote is at `pos`; leaves `pos` after the closing quote.
+    fn text(mut self) : string {
+        self.pos = self.pos + 1;
+        self.scratch.clear();
+        while (true) {
+            if (self.pos >= self.src.len()) {
+                self.fail("unterminated string");
+                return "";
+            }
+            let c : i32 = self.src.get(self.pos);
+            if (c == JSON_QUOTE) {
+                self.pos = self.pos + 1;
+                return DataText::fromBytes(self.scratch, 0, self.scratch.len());
+            }
+            if (c < JSON_SPACE) {
+                self.fail("control character inside a string");
+                return "";
+            }
+
+            if (c == JSON_BACKSLASH) {
+                self.pos = self.pos + 1;
+                if (!self.escape()) {
+                    return "";
+                }
+            } else if (c < JSON_ASCII_LIMIT) {
+                self.scratch.push(c);
+                self.pos = self.pos + 1;
+            } else {
+                let n : i32 = DataText::sequenceLength(self.src, self.pos, self.src.len());
+                if (n == 0) {
+                    self.fail("invalid UTF-8 inside a string");
+                    return "";
+                }
+                for (k of 0..n) {
+                    self.scratch.push(self.src.get(self.pos + k));
+                }
+                self.pos = self.pos + n;
+            }
+        }
+        return "";
+    }
+
+    // The escape after a backslash (`pos` is on the letter); false when it is not valid.
+    fn escape(mut self) : bool {
+        let c : i32 = self.peek();
+        self.pos = self.pos + 1;
+
+        let plain : i32 = JsonParser::shortEscape(c);
+        if (plain >= 0) {
+            self.scratch.push(plain);
+            return true;
+        }
+        if (c != JSON_LOWER_U) {
+            self.fail("unknown escape in a string");
+            return false;
+        }
+        return self.unicodeEscape();
+    }
+
+    // The byte that the one-letter escape `\c` stands for, or -1 when `c` names no such escape.
+    static fn shortEscape(c : i32) : i32 {
+        return match c {
+            JSON_QUOTE => JSON_QUOTE,
+            JSON_BACKSLASH => JSON_BACKSLASH,
+            JSON_SLASH => JSON_SLASH,
+            JSON_LOWER_B => JSON_BACKSPACE,
+            JSON_LOWER_F => JSON_FORMFEED,
+            JSON_LOWER_N => JSON_LF,
+            JSON_LOWER_R => JSON_CR,
+            JSON_LOWER_T => JSON_TAB,
+            _ => -1,
+        };
+    }
+
+    // The `\uXXXX` escape whose `u` was just read: one code point, or a surrogate pair joined into one.
+    fn unicodeEscape(mut self) : bool {
+        let hi : i32 = self.hex4();
+        if (hi < 0) {
+            self.fail("bad \\u escape");
+            return false;
+        }
+
+        let mut cp : i32 = hi;
+        if (hi >= JSON_HIGH_FIRST && hi <= JSON_HIGH_LAST) {
+            let followedByEscape : bool = self.peek() == JSON_BACKSLASH
+                && self.src.getOr(self.pos + 1, -1) == JSON_LOWER_U;
+            if (!followedByEscape) {
+                self.fail("a high surrogate must be followed by a low one");
+                return false;
+            }
+            self.pos = self.pos + 2;
+            let lo : i32 = self.hex4();
+            if (lo < JSON_LOW_FIRST || lo > JSON_LOW_LAST) {
+                self.fail("a high surrogate must be followed by a low one");
+                return false;
+            }
+            cp = JSON_SUPPLEMENTARY + ((hi - JSON_HIGH_FIRST) << JSON_SURROGATE_BITS) + (lo - JSON_LOW_FIRST);
+        } else if (hi >= JSON_LOW_FIRST && hi <= JSON_LOW_LAST) {
+            self.fail("a low surrogate without a high one");
+            return false;
+        }
+        DataText::pushCodePoint(self.scratch, cp);
+        return true;
+    }
+
+    fn digits(mut self) : i32 {
+        let mut n : i32 = 0;
+        while (self.pos < self.src.len() && JsonParser::isDigit(self.src.get(self.pos))) {
+            n = n + 1;
+            self.pos = self.pos + 1;
+        }
+        return n;
+    }
+
+    fn number(mut self) : JsonValue {
+        let start : i32 = self.pos;
+        if (self.peek() == JSON_MINUS) {
+            self.pos = self.pos + 1;
+        }
+
+        let first : i32 = self.peek();
+        if (first == JSON_DIGIT_0) {
+            self.pos = self.pos + 1;
+            if (JsonParser::isDigit(self.peek())) {
+                self.fail("a number must not have leading zeros");
+                return JsonValue::none();
+            }
+        } else if (JsonParser::isDigit(first)) {
+            self.digits();
+        } else {
+            self.fail("a '-' must be followed by a digit");
+            return JsonValue::none();
+        }
+
+        if (self.peek() == JSON_DOT) {
+            self.pos = self.pos + 1;
+            if (self.digits() == 0) {
+                self.fail("a '.' must be followed by a digit");
+                return JsonValue::none();
+            }
+        }
+
+        let e : i32 = self.peek();
+        if (e == JSON_LOWER_E || e == JSON_UPPER_E) {
+            self.pos = self.pos + 1;
+            let sign : i32 = self.peek();
+            if (sign == JSON_PLUS || sign == JSON_MINUS) {
+                self.pos = self.pos + 1;
+            }
+            if (self.digits() == 0) {
+                self.fail("an exponent needs digits");
+                return JsonValue::none();
+            }
+        }
+
+        let literal : string = DataText::fromBytes(self.src, start, self.pos);
+        try {
+            let x : f64 = literal.toF64();
+            return self.doc.newNumber(x);
+        } catch e : ParseException {
+            self.fail("number out of range");
+            return JsonValue::none();
+        }
+    }
+}
