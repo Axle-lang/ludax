@@ -1,0 +1,333 @@
+// world — checks for the world, component stores, scene tree and transforms, and the spatial grid.
+//
+// The properties a game leans on: an id outlives nothing (a stale id finds no component, even after its slot is
+// reused), destroying a parent destroys its subtree, world transforms are the composition down the tree and
+// are recomputed after any change above them, and the grid finds what shares a cell exactly once.
+
+use ludax::Checks;
+use ludax::ComponentStore;
+use ludax::DAabb;
+use ludax::DQuat;
+use ludax::DTransform;
+use ludax::DVec3;
+use ludax::EntityId;
+use ludax::Join2;
+use ludax::Join3;
+use ludax::Scene;
+use ludax::SceneInspector;
+use ludax::SpatialGrid;
+use ludax::Vec;
+use ludax::World;
+
+struct WorldHealth {
+    hp    : i32;
+    armor : f64;
+}
+
+/** The world checks. Helpers are prefixed because top-level names are global to the package. */
+pub class WorldSuite {
+    /** Runs every check of the suite. */
+    pub static fn run(c : Checks) : void {
+        worldIdChecks(c);
+        worldStoreChecks(c);
+        worldStoreJoin(c);
+        worldJoinChecks(c);
+        worldSceneNames(c);
+        worldSceneTree(c);
+        worldSceneTransforms(c);
+        worldSpatialChecks(c);
+        worldInspectChecks(c);
+    }
+}
+
+fn worldIdChecks(c : Checks) : void {
+    let w : World = new World();
+    let a : EntityId = w.create();
+    let b : EntityId = w.create();
+    c.sameInt("world: two entities, two slots", a.index + b.index, 1);
+    c.sameInt("world: the count is the number alive", w.count(), 2);
+    c.that("world: a destroy is accepted once", w.destroy(a) && !w.destroy(a));
+    c.that("world: a destroyed id is not alive", !w.isAlive(a) && w.isAlive(b));
+    let again : EntityId = w.create();
+    c.sameInt("world: the free slot is reused", again.index, a.index);
+    c.that(
+        "world: the reused slot has a new generation",
+        again.generation != a.generation && !w.isAlive(a)
+    );
+    c.that("world: idAt finds the tenant", w.idAt(again.index).same(again));
+}
+
+fn worldStoreChecks(c : Checks) : void {
+    let w : World = new World();
+    let hp : ComponentStore<WorldHealth> = new ComponentStore<WorldHealth>();
+    let a : EntityId = w.create();
+    let b : EntityId = w.create();
+    c.that(
+        "store: a living entity gets a component",
+        hp.add(w, a, WorldHealth { hp: 10, armor: 0.5 })
+    );
+    hp.add(w, b, WorldHealth { hp: 20, armor: 0.0 });
+    c.sameInt("store: len counts the components", hp.len(), 2);
+    c.sameInt(
+        "store: a component reads back",
+        hp.getOr(w, a, WorldHealth { hp: -1, armor: 0.0 }).hp,
+        10
+    );
+    c.that(
+        "store: set replaces the value of a live entity",
+        hp.set(w, a, WorldHealth { hp: 11, armor: 0.5 })
+    );
+    c.sameInt(
+        "store: the replacement reads back",
+        hp.getOr(w, a, WorldHealth { hp: -1, armor: 0.0 }).hp,
+        11
+    );
+    w.destroy(a);
+    c.that("store: a dead entity has no component", !hp.has(w, a));
+    c.sameInt(
+        "store: a dead entity reads the fallback",
+        hp.getOr(w, a, WorldHealth { hp: -1, armor: 0.0 }).hp,
+        -1
+    );
+    c.that(
+        "store: nothing can be added to a dead entity",
+        !hp.add(w, a, WorldHealth { hp: 1, armor: 0.0 })
+    );
+    c.sameInt("store: sweep drops the dead entity's component", hp.sweep(w), 1);
+    c.sameInt("store: one component is left", hp.len(), 1);
+    let reborn : EntityId = w.create();
+    c.that("store: the reused slot starts without the old component", !hp.has(w, reborn));
+    c.that("store: remove takes it away", hp.remove(b) && !hp.has(w, b));
+    c.that("store: a second remove says no", !hp.remove(b));
+}
+
+fn worldStoreJoin(c : Checks) : void {
+    let w : World = new World();
+    let pos : ComponentStore<f64> = new ComponentStore<f64>();
+    let vel : ComponentStore<f64> = new ComponentStore<f64>();
+    for (i of 0..100) {
+        let e : EntityId = w.create();
+        pos.add(w, e, i as f64);
+        if (i % 3 == 0) {
+            vel.add(w, e, 2.0);
+        }
+    }
+    let mut sum : f64 = 0.0;
+    let mut joined : i32 = 0;
+    for (d of 0..vel.len()) {
+        let e : EntityId = vel.entityAt(d);
+        if (pos.has(w, e)) {
+            sum = sum + pos.getOr(w, e, 0.0) * vel.valueAt(d);
+            joined = joined + 1;
+        }
+    }
+    c.sameInt("join: the entities with both kinds", joined, 34);
+    c.near("join: the sum over the join", sum, 2.0 * 1683.0, 0.000001);
+}
+
+fn worldSceneNames(c : Checks) : void {
+    let s : Scene = new Scene();
+    let a : EntityId = s.add("hero");
+    let b : EntityId = s.add("");
+    c.that("scene: find returns the named entity", s.find("hero").same(a));
+    c.that("scene: an unknown name finds nothing", s.find("villain").isNone());
+    c.that("scene: the name reads back", s.nameOf(a) == "hero" && s.nameOf(b) == "");
+    let twin : EntityId = s.add("hero");
+    c.that("scene: the latest of two equal names wins", s.find("hero").same(twin));
+    s.destroy(twin);
+    c.that("scene: a destroyed entity cannot be found", s.find("hero").isNone());
+    c.sameInt("scene: the count follows the entities created", s.count(), 2);
+}
+
+fn worldSceneTree(c : Checks) : void {
+    let s : Scene = new Scene();
+    let root : EntityId = s.add("root");
+    let a : EntityId = s.addChild(root, "a", DTransform::identity());
+    let b : EntityId = s.addChild(root, "b", DTransform::identity());
+    let a1 : EntityId = s.addChild(a, "a1", DTransform::identity());
+    c.sameInt("tree: a root with two children counts two", s.childCount(root), 2);
+    c.that("tree: the first child is the first attached", s.firstChild(root).same(a));
+    c.that("tree: siblings follow in order", s.nextSibling(a).same(b) && s.nextSibling(b).isNone());
+    c.that("tree: the parent is known", s.parent(a1).same(a) && s.parent(root).isNone());
+    c.that("tree: a cycle is refused", !s.attach(root, a1));
+    c.that("tree: an entity is not its own parent", !s.attach(a, a));
+    c.that("tree: a move is accepted", s.attach(a1, b));
+    c.sameInt("tree: the old parent lost its child", s.childCount(a), 0);
+    c.sameInt("tree: the new parent has it", s.childCount(b), 1);
+    c.sameInt("tree: destroying a parent takes the subtree", s.destroy(root), 4);
+    c.sameInt("tree: destroying everything leaves no entities", s.count(), 0);
+    c.sameInt("tree: a destroyed id destroys nothing", s.destroy(root), 0);
+}
+
+fn worldSceneTransforms(c : Checks) : void {
+    let s : Scene = new Scene();
+    let parent : EntityId = s.add("parent");
+    s.setLocal(parent, DTransform::fromTranslation(DVec3::make(10.0, 0.0, 0.0)));
+    let child : EntityId = s.addChild(
+        parent,
+        "child",
+        DTransform::fromTranslation(DVec3::make(0.0, 5.0, 0.0))
+    );
+    let w : DVec3 = s.worldTransform(child).translation;
+    c.that(
+        "transform: a child's world position adds the parent's",
+        w.approxEq(DVec3::make(10.0, 5.0, 0.0), 0.000001)
+    );
+    s.setLocal(parent, DTransform::fromTranslation(DVec3::make(-3.0, 0.0, 0.0)));
+    let moved : DVec3 = s.worldTransform(child).translation;
+    c.that(
+        "transform: moving the parent moves the child",
+        moved.approxEq(DVec3::make(-3.0, 5.0, 0.0), 0.000001)
+    );
+
+    let turn : DQuat = DQuat::fromAxisAngle(DVec3::unitY(), 1.5707963267948966);
+    s.setLocal(parent, DTransform::make(DVec3::zero(), turn, DVec3::splat(2.0)));
+    s.setLocal(child, DTransform::fromTranslation(DVec3::make(1.0, 0.0, 0.0)));
+    let turned : DVec3 = s.worldTransform(child).translation;
+    c.that(
+        "transform: rotation and scale of the parent apply",
+        turned.approxEq(DVec3::make(0.0, 0.0, -2.0), 0.000001)
+    );
+
+    let other : EntityId = s.add("other");
+    s.setLocal(other, DTransform::fromTranslation(DVec3::make(4.0, 4.0, 4.0)));
+    let before : DVec3 = s.worldTransform(child).translation;
+    c.that("transform: attachKeepWorld succeeds on a live parent", s.attachKeepWorld(child, other));
+    let after : DVec3 = s.worldTransform(child).translation;
+    c.that(
+        "transform: keeping the world position when moving to a new parent",
+        after.approxEq(before, 0.000001)
+    );
+    s.detach(child);
+    c.that(
+        "transform: detaching keeps it too",
+        s.worldTransform(child).translation.approxEq(before, 0.000001)
+    );
+    c.that("transform: a root has no parent", s.parent(child).isNone());
+}
+
+fn worldSpatialChecks(c : Checks) : void {
+    let w : World = new World();
+    let grid : SpatialGrid = new SpatialGrid(10.0);
+    let near : EntityId = w.create();
+    let far : EntityId = w.create();
+    let wide : EntityId = w.create();
+    let neg : EntityId = w.create();
+    grid.insert(near, DAabb::make(DVec3::make(1.0, 1.0, 1.0), DVec3::make(3.0, 3.0, 3.0)));
+    grid.insert(far, DAabb::make(DVec3::make(500.0, 0.0, 0.0), DVec3::make(502.0, 2.0, 2.0)));
+    grid.insert(wide, DAabb::make(DVec3::make(-400.0, 0.0, 0.0), DVec3::make(400.0, 1.0, 1.0)));
+    grid.insert(neg, DAabb::make(DVec3::make(-3.0, -3.0, -3.0), DVec3::make(-1.0, -1.0, -1.0)));
+    c.sameInt("spatial: the grid holds four items", grid.count(), 4);
+    let out : Vec<i64> = new Vec<i64>();
+    let n : i32 = grid.query(
+        DAabb::make(DVec3::make(0.0, 0.0, 0.0), DVec3::make(4.0, 4.0, 4.0)),
+        out
+    );
+    let mut hasNear : bool = false;
+    let mut hasWide : bool = false;
+    let mut hasFar : bool = false;
+    for (i of 0..out.len()) {
+        let id : EntityId = EntityId::fromBits(out.get(i));
+        if (id.same(near)) {
+            hasNear = true;
+        }
+        if (id.same(wide)) {
+            hasWide = true;
+        }
+        if (id.same(far)) {
+            hasFar = true;
+        }
+    }
+    c.that(
+        "spatial: finds the box in the cell, the wide one, not the far one",
+        hasNear && hasWide && !hasFar
+    );
+    c.sameInt(
+        "spatial: each entity once (near and wide; the box in cell -1 is out of reach)",
+        n,
+        2
+    );
+    let out2 : Vec<i64> = new Vec<i64>();
+    let all : i32 = grid.query(
+        DAabb::make(DVec3::make(-1000.0, -10.0, -10.0), DVec3::make(1000.0, 10.0, 10.0)),
+        out2
+    );
+    c.sameInt("spatial: a huge query sees everything once", all, 4);
+    grid.clear();
+    let out3 : Vec<i64> = new Vec<i64>();
+    c.sameInt(
+        "spatial: clear forgets",
+        grid.query(DAabb::make(DVec3::zero(), DVec3::splat(4.0)), out3),
+        0
+    );
+}
+
+fn worldJoinChecks(c : Checks) : void {
+    let w : World = new World();
+    let a : ComponentStore<f64> = new ComponentStore<f64>();
+    let b : ComponentStore<i32> = new ComponentStore<i32>();
+    let d : ComponentStore<bool> = new ComponentStore<bool>();
+    let ids : Vec<i64> = new Vec<i64>();
+    for (i of 0..50) {
+        let e : EntityId = w.create();
+        ids.push(e.bits());
+        a.add(w, e, i as f64);
+        if (i % 2 == 0) {
+            b.add(w, e, i);
+        }
+        if (i % 5 == 0) {
+            d.add(w, e, true);
+        }
+    }
+    let j : Join2<f64, i32> = new Join2<f64, i32>(a.len(), b.len());
+    let mut n : i32 = 0;
+    let mut sum : i32 = 0;
+    while (j.next(w, a, b)) {
+        n = n + 1;
+        sum = sum + b.get(j.entity());
+        if (a.get(j.entity()) != (b.get(j.entity()) as f64)) {
+            sum = -1000000;
+        }
+    }
+    c.sameInt("join2: entities with both kinds (the even ones)", n, 25);
+    c.sameInt("join2: and their components agree", sum, 600);
+    // Walking from the smaller store gives the same set, in that store's order.
+    let k : Join2<i32, f64> = new Join2<i32, f64>(b.len(), a.len());
+    let mut m : i32 = 0;
+    while (k.next(w, b, a)) {
+        m = m + 1;
+    }
+    c.sameInt("join2: argument order does not change the set", m, 25);
+    let t : Join3<f64, i32, bool> = new Join3<f64, i32, bool>();
+    let mut three : i32 = 0;
+    while (t.next(w, a, b, d)) {
+        three = three + 1;
+    }
+    c.sameInt("join3: multiples of ten up to 40", three, 5);
+    w.destroy(EntityId::fromBits(ids.get(10)));
+    let u : Join2<f64, i32> = new Join2<f64, i32>(a.len(), b.len());
+    let mut after : i32 = 0;
+    while (u.next(w, a, b)) {
+        after = after + 1;
+    }
+    c.sameInt("join2: a destroyed entity is skipped before the sweep", after, 24);
+}
+
+fn worldInspectChecks(c : Checks) : void {
+    let s : Scene = new Scene();
+    let root : EntityId = s.add("root");
+    s.setLocal(root, DTransform::fromTranslation(DVec3::make(1.0, 2.0, -3.5)));
+    let a : EntityId = s.addChild(
+        root,
+        "a",
+        DTransform::fromTranslation(DVec3::make(0.0, 0.25, 0.0))
+    );
+    s.addChild(a, "", DTransform::identity());
+    s.addChild(root, "b", DTransform::identity());
+    let text : string = SceneInspector::dump(s);
+    let want : string = "root (0.1) at 1.000 2.000 -3.500\n  a (1.1) at 1.000 2.250 -3.500\n    (unnamed) (2.1) at 1.000 2.250 -3.500\n  b (3.1) at 1.000 2.000 -3.500\n";
+    c.that(
+        "inspect: the tree, children in attach order, world positions (got: ${text})",
+        text == want
+    );
+}

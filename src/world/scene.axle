@@ -1,0 +1,326 @@
+// scene — entities with names, a parent/child tree and transforms.
+//
+// A scene is a `World` plus what nearly every game wants on top of it: an optional name per entity, a forest of
+// parents and children, and a local transform per entity whose composition down the tree is the world
+// transform. Local transforms are f64 (large worlds); `placed` results are f64 too, and the renderer narrows
+// them camera-relative. World transforms are recomputed lazily and only below what changed: setting a local
+// transform marks that entity, and `update` recomputes it and its descendants, walking roots in slot order and
+// children in attach order, so the result never depends on anything but the calls made.
+//
+// Destroying an entity destroys its whole subtree. Names need not be unique; `find` answers with the most
+// recently created living entity of that name.
+
+use crate::core::collections::string_map::StringMap;
+use crate::core::collections::vec::Vec;
+use crate::core::id::entity_id::EntityId;
+use crate::core::id::string_id::{StringId, StringInterner};
+use crate::core::math::dtransform::DTransform;
+use crate::world::hierarchy::Hierarchy;
+use crate::world::world::World;
+
+// The `nameOf` entry of an entity that was added without a name.
+const SCENE_NO_NAME : i32 = -1;
+
+/** Entities, their names, tree and transforms. */
+pub class Scene {
+    world   : World;
+    tree    : Hierarchy;
+    local   : Vec<DTransform>;
+    placed  : Vec<DTransform>;
+    dirty   : Vec<bool>;
+    moved   : Vec<bool>;
+    nameOf  : Vec<i32>;
+    names   : StringInterner;
+    byName  : StringMap<i64>;
+    stack   : Vec<i32>;
+    pending : bool = false;
+
+    /** An empty scene. */
+    constructor() {
+        self.world = new World();
+        self.tree = new Hierarchy();
+        self.local = new Vec<DTransform>();
+        self.placed = new Vec<DTransform>();
+        self.dirty = new Vec<bool>();
+        self.moved = new Vec<bool>();
+        self.nameOf = new Vec<i32>();
+        self.names = new StringInterner();
+        self.byName = new StringMap<i64>();
+        self.stack = new Vec<i32>();
+    }
+
+    /** The set of living entities, for stores that want to ask whether an id is alive. */
+    pub fn entities(self) : World {
+        return self.world;
+    }
+
+    /** How many entities are alive. */
+    pub fn count(self) : i32 {
+        return self.world.count();
+    }
+
+    /** True when `id` names a living entity. */
+    pub fn isAlive(self, id : EntityId) : bool {
+        return self.world.isAlive(id);
+    }
+
+    /** A new root entity at the identity transform. An empty `name` leaves it unnamed. */
+    pub fn add(mut self, name : string) : EntityId {
+        let id : EntityId = self.world.create();
+        let slot : i32 = id.index;
+        self.ensureSlot(slot);
+        self.tree.reset(slot);
+        self.local.set(slot, DTransform::identity());
+        self.placed.set(slot, DTransform::identity());
+        self.dirty.set(slot, true);
+        self.nameOf.set(slot, SCENE_NO_NAME);
+        self.pending = true;
+        if (name.byteLength > 0) {
+            let sid : StringId = self.names.intern(name);
+            self.nameOf.set(slot, sid.raw);
+            self.byName.put(name, id.bits());
+        }
+        return id;
+    }
+
+    /** A new entity under `parent` with the local transform `t`; the root of nothing (the none id) when `parent` is dead. */
+    pub fn addChild(mut self, parent : EntityId, name : string, t : DTransform) : EntityId {
+        if (!self.world.isAlive(parent)) {
+            return EntityId::none();
+        }
+        let id : EntityId = self.add(name);
+        self.tree.attach(id.index, parent.index);
+        self.local.set(id.index, t);
+        return id;
+    }
+
+    /** The name `id` was added with, or an empty string. */
+    pub fn nameOf(self, id : EntityId) : string {
+        if (!self.world.isAlive(id) || self.nameOf.get(id.index) == SCENE_NO_NAME) {
+            return "";
+        }
+        return self.names.name(StringId { raw: self.nameOf.get(id.index) });
+    }
+
+    /** The most recently added living entity called `name`, or the none id. */
+    pub fn find(self, name : string) : EntityId {
+        if (!self.byName.has(name)) {
+            return EntityId::none();
+        }
+        let id : EntityId = EntityId::fromBits(self.byName.get(name));
+        if (!self.world.isAlive(id)) {
+            return EntityId::none();
+        }
+        return id;
+    }
+
+    /** Destroys `id` and everything below it; returns how many entities went (0 when `id` was not alive). */
+    pub fn destroy(mut self, id : EntityId) : i32 {
+        if (!self.world.isAlive(id)) {
+            return 0;
+        }
+        self.tree.detach(id.index);
+        let mut gone : i32 = 0;
+        self.stack.clear();
+        self.stack.push(id.index);
+        while (!self.stack.isEmpty()) {
+            let slot : i32 = self.stack.pop();
+            self.pushChildren(slot);
+
+            let dead : EntityId = self.world.idAt(slot);
+            self.forgetName(dead);
+            self.world.destroy(dead);
+            gone = gone + 1;
+        }
+        return gone;
+    }
+
+    // A name map entry is dropped when it still points at the entity that is going.
+    fn forgetName(mut self, id : EntityId) : void {
+        let n : i32 = self.nameOf.get(id.index);
+        if (n == SCENE_NO_NAME) {
+            return;
+        }
+        let text : string = self.names.name(StringId { raw: n });
+        if (self.byName.has(text) && self.byName.get(text) == id.bits()) {
+            self.byName.remove(text);
+        }
+        self.nameOf.set(id.index, SCENE_NO_NAME);
+    }
+
+    /** The parent of `id`, or the none id for a root or a dead entity. */
+    pub fn parent(self, id : EntityId) : EntityId {
+        if (!self.world.isAlive(id)) {
+            return EntityId::none();
+        }
+        return self.world.idAt(self.tree.parentOf(id.index));
+    }
+
+    /** How many children `id` has. */
+    pub fn childCount(self, id : EntityId) : i32 {
+        if (!self.world.isAlive(id)) {
+            return 0;
+        }
+        return self.tree.childCount(id.index);
+    }
+
+    /** The first child of `id`, or the none id. Walk the rest with `nextSibling`. */
+    pub fn firstChild(self, id : EntityId) : EntityId {
+        if (!self.world.isAlive(id)) {
+            return EntityId::none();
+        }
+        return self.world.idAt(self.tree.firstChild(id.index));
+    }
+
+    /** The child attached after `id` under the same parent, or the none id. */
+    pub fn nextSibling(self, id : EntityId) : EntityId {
+        if (!self.world.isAlive(id)) {
+            return EntityId::none();
+        }
+        return self.world.idAt(self.tree.nextSibling(id.index));
+    }
+
+    /** The bits (`EntityId::fromBits`) of the children of `id` in reverse attach order, so a stack pops them in attach order. */
+    pub(crate) fn childrenReversed(self, id : EntityId) : Vec<i64> {
+        let kids : Vec<i64> = new Vec<i64>();
+        let mut c : EntityId = self.firstChild(id);
+        while (!c.isNone()) {
+            kids.push(c.bits());
+            c = self.nextSibling(c);
+        }
+        for (i of 0..(kids.len() / 2)) {
+            kids.swap(i, kids.len() - 1 - i);
+        }
+        return kids;
+    }
+
+    /** Makes `child` the last child of `newParent`, keeping its local transform (so it moves in the world). False for a cycle or a dead id. */
+    pub fn attach(mut self, child : EntityId, newParent : EntityId) : bool {
+        if (!self.world.isAlive(child) || !self.world.isAlive(newParent)) {
+            return false;
+        }
+        if (!self.tree.attach(child.index, newParent.index)) {
+            return false;
+        }
+        self.touch(child.index);
+        return true;
+    }
+
+    /** Like `attach`, but changes the local transform so the entity stays where it is in the world. */
+    pub fn attachKeepWorld(mut self, child : EntityId, newParent : EntityId) : bool {
+        if (!self.world.isAlive(child) || !self.world.isAlive(newParent)) {
+            return false;
+        }
+        let before : DTransform = self.worldTransform(child);
+        let parentWorld : DTransform = self.worldTransform(newParent);
+        if (!self.tree.attach(child.index, newParent.index)) {
+            return false;
+        }
+        self.local.set(child.index, parentWorld.inverse().mul(before));
+        self.touch(child.index);
+        return true;
+    }
+
+    /** Makes `child` a root, keeping where it is in the world. */
+    pub fn detach(mut self, child : EntityId) : void {
+        if (!self.world.isAlive(child)) {
+            return;
+        }
+        let before : DTransform = self.worldTransform(child);
+        self.tree.detach(child.index);
+        self.local.set(child.index, before);
+        self.touch(child.index);
+    }
+
+    /** Sets where `id` is relative to its parent (or the world, for a root). */
+    pub fn setLocal(mut self, id : EntityId, t : DTransform) : void {
+        if (!self.world.isAlive(id)) {
+            return;
+        }
+        self.local.set(id.index, t);
+        self.touch(id.index);
+    }
+
+    /** Where `id` is relative to its parent; the identity for a dead entity. */
+    pub fn localTransform(self, id : EntityId) : DTransform {
+        if (!self.world.isAlive(id)) {
+            return DTransform::identity();
+        }
+        return self.local.get(id.index);
+    }
+
+    /** Where `id` is in the world, with every ancestor applied; brings the whole scene up to date first. */
+    pub fn worldTransform(mut self, id : EntityId) : DTransform {
+        if (!self.world.isAlive(id)) {
+            return DTransform::identity();
+        }
+        self.update();
+        return self.placed.get(id.index);
+    }
+
+    // Gives slot `slot` the default entry in every per-slot array, growing them as needed.
+    fn ensureSlot(mut self, slot : i32) : void {
+        while (self.local.len() <= slot) {
+            self.local.push(DTransform::identity());
+            self.placed.push(DTransform::identity());
+            self.dirty.push(false);
+            self.moved.push(false);
+            self.nameOf.push(SCENE_NO_NAME);
+        }
+    }
+
+    fn touch(mut self, slot : i32) : void {
+        self.dirty.set(slot, true);
+        self.pending = true;
+    }
+
+    // Puts the children of slot `s` on the work stack.
+    fn pushChildren(mut self, slot : i32) : void {
+        let mut c : i32 = self.tree.firstChild(slot);
+        while (c >= 0) {
+            self.stack.push(c);
+            c = self.tree.nextSibling(c);
+        }
+    }
+
+    // Recomputes the world transform of slot `s` when it or its parent changed, and marks it moved for its children.
+    fn refresh(mut self, slot : i32) : void {
+        let p : i32 = self.tree.parentOf(slot);
+        let parentMoved : bool = p >= 0 && self.moved.get(p);
+        if (!self.dirty.get(slot) && !parentMoved) {
+            return;
+        }
+
+        if (p >= 0) {
+            self.placed.set(slot, self.placed.get(p).mul(self.local.get(slot)));
+        } else {
+            self.placed.set(slot, self.local.get(slot));
+        }
+        self.moved.set(slot, true);
+        self.dirty.set(slot, false);
+    }
+
+    /** Recomputes the world transform of everything that changed and of what hangs below it. */
+    pub fn update(mut self) : void {
+        if (!self.pending) {
+            return;
+        }
+        let n : i32 = self.world.slots();
+        for (slot of 0..n) {
+            self.moved.set(slot, false);
+        }
+        for (root of 0..n) {
+            if (self.world.idAt(root).isNone() || self.tree.parentOf(root) >= 0) {
+                continue;
+            }
+            self.stack.clear();
+            self.stack.push(root);
+            while (!self.stack.isEmpty()) {
+                let slot : i32 = self.stack.pop();
+                self.refresh(slot);
+                self.pushChildren(slot);
+            }
+        }
+        self.pending = false;
+    }
+}

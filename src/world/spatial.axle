@@ -1,0 +1,206 @@
+// spatial — a uniform grid that answers "what is near this box".
+//
+// The broad phase of everything that needs neighbours: culling, overlap tests, area triggers. Boxes are put in
+// every cell they touch (a hash from the cell to a chain of entries, no allocation per insert); a query walks
+// the cells its box touches and returns each entity once. Boxes much larger than a cell would touch thousands of
+// cells, so they go to a short list that every query checks exactly. The grid is rebuilt rather than updated
+// (`clear`, then `insert` each box): for things that move every frame that is cheaper than moving entries, and
+// it keeps results a pure function of the inserts. Answers come in cell order, then insertion order.
+
+use std::ffi::runtime::panicMsg;
+
+use crate::core::collections::map::Map;
+use crate::core::collections::vec::Vec;
+use crate::core::id::entity_id::EntityId;
+use crate::core::math::dgeom::DAabb;
+
+// The cells a box touches: both corners, inclusive.
+struct SpatialCells {
+    x0 : i32;
+    y0 : i32;
+    z0 : i32;
+    x1 : i32;
+    y1 : i32;
+    z1 : i32;
+
+    // The widest extent, in cells, on any axis.
+    fn span(self) : i32 {
+        let sx : i32 = self.x1 - self.x0;
+        let sy : i32 = self.y1 - self.y0;
+        let sz : i32 = self.z1 - self.z0;
+        let mut widest : i32 = sx;
+        if (sy > widest) {
+            widest = sy;
+        }
+        if (sz > widest) {
+            widest = sz;
+        }
+        return widest;
+    }
+}
+
+// A box wider than this many cells on any axis is not chained into cells.
+const SPATIAL_BIG_CELLS : i32 = 12;
+
+// A query wider than this many cells on any axis walks every chain instead of every covered cell: four times
+// `SPATIAL_BIG_CELLS`, written out because a top-level constant must be a literal.
+const SPATIAL_WALK_CELLS : i32 = 48;
+
+// Cell coordinates are packed 21 bits each; this bias makes negative coordinates non-negative before masking.
+const SPATIAL_COORD_BIAS : i64 = 1048576;
+
+// The 21-bit mask that keeps one packed coordinate.
+const SPATIAL_COORD_MASK : i64 = 2097151;
+
+// The end of a chain, and the head of a cell nobody is in.
+const SPATIAL_END : i32 = -1;
+
+// The bits one packed cell coordinate takes in a key.
+const SPATIAL_COORD_BITS : i64 = 21;
+
+/** A grid of cubic cells over boxes of entities. */
+pub class SpatialGrid {
+    cell    : f64;
+    heads   : Map<i64, i32>;
+    bits    : Vec<i64>;
+    chain   : Vec<i32>;
+    bigBits : Vec<i64>;
+    bigBox  : Vec<DAabb>;
+    seen    : Map<i64, i32>;
+    boxes   : i32 = 0;
+
+    /** A grid whose cells are `cellSize` wide; aborts when that is not positive. A cell about as large as a typical box works best. */
+    constructor(cellSize : f64) {
+        if (cellSize <= 0.0) {
+            panicMsg("SpatialGrid: cell size must be positive");
+        }
+        self.cell = cellSize;
+        self.heads = new Map<i64, i32>();
+        self.bits = new Vec<i64>();
+        self.chain = new Vec<i32>();
+        self.bigBits = new Vec<i64>();
+        self.bigBox = new Vec<DAabb>();
+        self.seen = new Map<i64, i32>();
+    }
+
+    /** Forgets every box. */
+    pub fn clear(mut self) : void {
+        self.heads.clear();
+        self.bits.clear();
+        self.chain.clear();
+        self.bigBits.clear();
+        self.bigBox.clear();
+        self.boxes = 0;
+    }
+
+    /** How many boxes were inserted since the last `clear`. */
+    pub fn count(self) : i32 {
+        return self.boxes;
+    }
+
+    /** Puts `id` in the grid with the box `box`. */
+    pub fn insert(mut self, id : EntityId, box : DAabb) : void {
+        self.boxes = self.boxes + 1;
+        let c : SpatialCells = self.cellsOf(box);
+        if (c.span() >= SPATIAL_BIG_CELLS) {
+            self.bigBits.push(id.bits());
+            self.bigBox.push(box);
+            return;
+        }
+        for (z of c.z0..(c.z1 + 1)) {
+            for (y of c.y0..(c.y1 + 1)) {
+                for (x of c.x0..(c.x1 + 1)) {
+                    let key : i64 = SpatialGrid::key(x, y, z);
+                    let head : i32 = self.heads.getOr(key, SPATIAL_END);
+                    self.bits.push(id.bits());
+                    self.chain.push(head);
+                    self.heads.put(key, self.bits.len() - 1);
+                }
+            }
+        }
+    }
+
+    // Appends the entities of the chain starting at entry `head` that `seen` has not met; returns how many.
+    fn collectChain(mut self, head : i32, out : Vec<i64>) : i32 {
+        let mut added : i32 = 0;
+        let mut e : i32 = head;
+        while (e != SPATIAL_END) {
+            if (self.seen.put(self.bits.get(e), 1)) {
+                out.push(self.bits.get(e));
+                added = added + 1;
+            }
+            e = self.chain.get(e);
+        }
+        return added;
+    }
+
+    /**
+     * Appends to `out` the bits (`EntityId::fromBits`) of every entity whose box shares a cell with `box`, once
+     * each, and returns how many were appended. The answer may include boxes that miss `box` by less than a
+     * cell; the large boxes are tested exactly.
+     */
+    pub fn query(mut self, box : DAabb, out : Vec<i64>) : i32 {
+        let c : SpatialCells = self.cellsOf(box);
+        let mut added : i32 = 0;
+        self.seen.clear();
+        for (i of 0..self.bigBits.len()) {
+            if (SpatialGrid::overlaps(self.bigBox.get(i), box) && self.seen.put(self.bigBits.get(i), 1)) {
+                out.push(self.bigBits.get(i));
+                added = added + 1;
+            }
+        }
+        if (c.span() >= SPATIAL_WALK_CELLS) {
+            // A query this large is cheaper as a walk over every chain than over every cell it covers.
+            let mut s : i32 = self.heads.first();
+            while (s >= 0) {
+                added = added + self.collectChain(self.heads.valueAt(s), out);
+                s = self.heads.next(s);
+            }
+            return added;
+        }
+        for (z of c.z0..(c.z1 + 1)) {
+            for (y of c.y0..(c.y1 + 1)) {
+                for (x of c.x0..(c.x1 + 1)) {
+                    let head : i32 = self.heads.getOr(SpatialGrid::key(x, y, z), SPATIAL_END);
+                    added = added + self.collectChain(head, out);
+                }
+            }
+        }
+        return added;
+    }
+
+    fn cellsOf(self, box : DAabb) : SpatialCells {
+        return SpatialCells {
+            x0: self.cellOf(box.min.x),
+            y0: self.cellOf(box.min.y),
+            z0: self.cellOf(box.min.z),
+            x1: self.cellOf(box.max.x),
+            y1: self.cellOf(box.max.y),
+            z1: self.cellOf(box.max.z),
+        };
+    }
+
+    // The cell a coordinate falls in, rounding toward negative infinity.
+    fn cellOf(self, v : f64) : i32 {
+        let q : f64 = v / self.cell;
+        let mut t : i32 = q as i32;
+        if ((t as f64) > q) {
+            t = t - 1;
+        }
+        return t;
+    }
+
+    // Three cell coordinates packed in 21 bits each; worlds up to a million cells either way keep them distinct.
+    static fn key(x : i32, y : i32, z : i32) : i64 {
+        let bx : i64 = ((x as i64) + SPATIAL_COORD_BIAS) & SPATIAL_COORD_MASK;
+        let by : i64 = ((y as i64) + SPATIAL_COORD_BIAS) & SPATIAL_COORD_MASK;
+        let bz : i64 = ((z as i64) + SPATIAL_COORD_BIAS) & SPATIAL_COORD_MASK;
+        return bx | (by << SPATIAL_COORD_BITS) | (bz << (2 * SPATIAL_COORD_BITS));
+    }
+
+    static fn overlaps(a : DAabb, b : DAabb) : bool {
+        return a.min.x <= b.max.x && a.max.x >= b.min.x && a.min.y <= b.max.y && a.max.y >= b.min.y
+            && a.min.z <= b.max.z
+            && a.max.z >= b.min.z;
+    }
+}
