@@ -1,0 +1,291 @@
+// anim_clip — clips written into poses, event markers and root motion.
+//
+// The clips are built here rather than loaded, so every expected number is visible: two keys make the
+// sampling, wrapping and root-motion arithmetic checkable by hand. Event collection is checked at the hard
+// boundaries — the loop point, many small steps of an awkward size, and the last frame of a one-shot clip —
+// because those are where a marker is most easily lost or fired twice.
+
+use ludax::{
+    Checks, Vec3, Quat, Transform, Skeleton, Pose, TrackInterpolation, Vec3Track, QuatTrack,
+    AnimationClip, EventBuffer, ClipEvents, RootMotion, RootDelta, HALF_PI
+};
+
+use crate::math_support::{MATH_TOL, MATH_TOL_COARSE, MATH_TOL_LOOSE, nearVec3, sameQuat, nearF};
+
+// The clip's turn at half a cycle and after three whole cycles.
+const ANIM_CLIP_QUARTER_TURN : f32 = 0.785398163;
+const ANIM_CLIP_THREE_QUARTER_TURNS : f32 = 4.71238899;
+
+/** A two-bone skeleton: a root and an arm one unit along X. */
+pub fn animPairSkeleton() : Skeleton {
+    let s : Skeleton = new Skeleton(4);
+    s.addBone("root", -1, Transform::identity());
+    s.addBone("arm", 0, Transform::fromTranslation(Vec3::make(1.0, 0.0, 0.0)));
+    return s;
+}
+
+/** A clip of two seconds in which bone 0 slides 4 units along X and turns a quarter turn about Y. */
+pub fn animSlideClip(looping : bool) : AnimationClip {
+    let clip : AnimationClip = new AnimationClip("slide", 2, looping);
+    let slide : Vec3Track = new Vec3Track(TrackInterpolation::Linear, 2);
+    slide.setKey(0, 0.0, Vec3::make(0.0, 0.0, 0.0));
+    slide.setKey(1, 2.0, Vec3::make(4.0, 0.0, 0.0));
+    let turn : QuatTrack = new QuatTrack(TrackInterpolation::Linear, 2);
+    turn.setKey(0, 0.0, Quat::identity());
+    turn.setKey(1, 2.0, Quat::fromAxisAngle(Vec3::unitY(), HALF_PI));
+    clip.addChannel(0, slide, turn, Vec3Track::none());
+    return clip;
+}
+
+fn animClipTestSampling(c : Checks) : void {
+    let s : Skeleton = animPairSkeleton();
+    let clip : AnimationClip = animSlideClip(true);
+    let pose : Pose = Pose::bindOf(s);
+    nearF(c, "the clip is as long as its last key", clip.duration(), 2.0, 0.0);
+    clip.sample(1.0, pose);
+    nearVec3(
+        c,
+        "halfway the root is at x = 2",
+        pose.get(0).translation,
+        Vec3::make(2.0, 0.0, 0.0),
+        MATH_TOL
+    );
+    nearF(
+        c,
+        "and has turned 45 degrees",
+        pose.get(0).rotation.angle(),
+        ANIM_CLIP_QUARTER_TURN,
+        MATH_TOL_LOOSE
+    );
+    nearVec3(
+        c,
+        "an unanimated bone keeps its bind translation",
+        pose.get(1).translation,
+        Vec3::make(1.0, 0.0, 0.0),
+        0.0
+    );
+    clip.sample(2.5, pose);
+    nearVec3(
+        c,
+        "a looping clip wraps: 2.5 s is 0.5 s",
+        pose.get(0).translation,
+        Vec3::make(1.0, 0.0, 0.0),
+        MATH_TOL
+    );
+    clip.sample(-0.5, pose);
+    nearVec3(
+        c,
+        "a looping clip wraps a negative clock: -0.5 s is 1.5 s",
+        pose.get(0).translation,
+        Vec3::make(3.0, 0.0, 0.0),
+        MATH_TOL
+    );
+    let once : AnimationClip = animSlideClip(false);
+    once.sample(9.0, pose);
+    nearVec3(
+        c,
+        "a clip that does not loop holds its last frame",
+        pose.get(0).translation,
+        Vec3::make(4.0, 0.0, 0.0),
+        0.0
+    );
+    once.sampleClock(1.0, pose);
+    nearVec3(
+        c,
+        "sampleClock agrees with sample",
+        pose.get(0).translation,
+        Vec3::make(2.0, 0.0, 0.0),
+        MATH_TOL
+    );
+    // An hour of looping play: with the f64 clock, 3600.5 s is still exactly 0.5 s into a 2 s loop.
+    clip.sampleClock(3600.5, pose);
+    nearVec3(
+        c,
+        "an f64 clock an hour in is still exact",
+        pose.get(0).translation,
+        Vec3::make(1.0, 0.0, 0.0),
+        MATH_TOL
+    );
+    c.sameInt("channelOf finds the channel that animates bone 0", clip.channelOf(0) as i64, 0);
+    c.sameInt("no channel for an unanimated bone", clip.channelOf(1) as i64, -1);
+    let other : AnimationClip = new AnimationClip("dup", 1, false);
+    c.sameInt(
+        "a channel is added",
+        other.addChannel(1, Vec3Track::none(), QuatTrack::none(), Vec3Track::none()) as i64,
+        0
+    );
+    c.sameInt(
+        "a bone gets one channel only",
+        other.addChannel(1, Vec3Track::none(), QuatTrack::none(), Vec3Track::none()) as i64,
+        -1
+    );
+}
+
+fn animClipEventsClip() : AnimationClip {
+    let clip : AnimationClip = animSlideClip(true);
+    clip.addEvent(1.5, 9);
+    clip.addEvent(0.5, 7);
+    return clip;
+}
+
+fn animClipTestEvents(c : Checks) : void {
+    let clip : AnimationClip = animClipEventsClip();
+    c.that(
+        "events are kept sorted by time",
+        clip.eventTime(0) == 0.5 && clip.eventId(0) == 7 && clip.eventId(1) == 9
+    );
+    c.that(
+        "an event outside the clip is refused",
+        !clip.addEvent(5.0, 1) && !clip.addEvent(-1.0, 1)
+    );
+    let out : EventBuffer = new EventBuffer();
+    ClipEvents::collect(clip, 0.0, 1.0, out);
+    c.sameInt("the first half second pass fires the first marker", out.len() as i64, 1);
+    c.sameInt("it is marker 7", out.idAt(0) as i64, 7);
+    out.clear();
+    ClipEvents::collect(clip, 1.9, 2.6, out);
+    c.sameInt("a step across the loop point fires the marker just after it", out.len() as i64, 1);
+    c.sameInt("which is marker 7 of the second pass", out.idAt(0) as i64, 7);
+    c.near("an event emitted at clock 2.5 reports time 2.5", out.timeAt(0), 2.5, 0.000001);
+    out.clear();
+    ClipEvents::collect(clip, 0.0, 6.1, out);
+    c.sameInt("a step over three loops fires marker 7 three times", out.countOf(7) as i64, 3);
+    c.sameInt("and marker 9 three times", out.countOf(9) as i64, 3);
+    c.sameInt("events are emitted in time order", out.idAt(0) as i64 * 10 + out.idAt(1) as i64, 79);
+    out.clear();
+    ClipEvents::collect(clip, 1.0, 1.0, out);
+    ClipEvents::collect(clip, 5.0, 4.0, out);
+    c.sameInt("an empty or backwards step fires nothing", out.len() as i64, 0);
+
+    // Many small steps of an awkward size: every marker fires exactly once per pass, none is lost or doubled.
+    out.clear();
+    let mut clock : f64 = 0.0;
+    for (i of 0..100) {
+        let next : f64 = clock + 0.1;
+        ClipEvents::collect(clip, clock, next, out);
+        clock = next;
+    }
+    // Clock 10 s = five passes of 2 s.
+    c.sameInt("100 steps of 0.1 s: marker 7 fired once per loop", out.countOf(7) as i64, 5);
+    c.sameInt("100 steps of 0.1 s: marker 9 fired once per loop", out.countOf(9) as i64, 5);
+    out.clear();
+    clock = 0.0;
+    for (i of 0..30) {
+        let next : f64 = clock + 0.7;
+        ClipEvents::collect(clip, clock, next, out);
+        clock = next;
+    }
+    // 21 s: markers at 0.5 + 2k < 21 (k = 0..10 -> 11 of them) and 1.5 + 2k < 21 (k = 0..9 -> 10).
+    c.sameInt("30 steps of 0.7 s: marker 7 count", out.countOf(7) as i64, 11);
+    c.sameInt("30 steps of 0.7 s: marker 9 count", out.countOf(9) as i64, 10);
+
+    // A clip that does not loop fires each marker once, including one at the very end.
+    let once : AnimationClip = animSlideClip(false);
+    once.addEvent(1.0, 3);
+    once.addEvent(2.0, 4);
+    out.clear();
+    ClipEvents::collect(once, 0.0, 1.5, out);
+    ClipEvents::collect(once, 1.5, 2.0, out);
+    ClipEvents::collect(once, 2.0, 3.0, out);
+    ClipEvents::collect(once, 3.0, 4.0, out);
+    c.sameInt("a one-shot clip: marker 3 fires once", out.countOf(3) as i64, 1);
+    c.sameInt("a one-shot clip: the marker at the end fires once", out.countOf(4) as i64, 1);
+}
+
+fn animClipTestRootMotion(c : Checks) : void {
+    let clip : AnimationClip = animSlideClip(true);
+    let a : RootDelta = RootMotion::between(clip, 0, 0.5, 1.5);
+    nearVec3(
+        c,
+        "a second of the slide moves the root 2",
+        a.translation,
+        Vec3::make(2.0, 0.0, 0.0),
+        MATH_TOL
+    );
+    let wrap : RootDelta = RootMotion::between(clip, 0, 1.5, 2.5);
+    nearVec3(
+        c,
+        "across the loop point the root does not jump back",
+        wrap.translation,
+        Vec3::make(2.0, 0.0, 0.0),
+        MATH_TOL
+    );
+    let far : RootDelta = RootMotion::between(clip, 0, 0.0, 6.0);
+    nearVec3(
+        c,
+        "three whole cycles slide three times as far",
+        far.translation,
+        Vec3::make(12.0, 0.0, 0.0),
+        MATH_TOL_LOOSE
+    );
+    nearF(
+        c,
+        "three quarter turns",
+        far.rotation.angle(),
+        ANIM_CLIP_THREE_QUARTER_TURNS,
+        MATH_TOL_COARSE
+    );
+    let split1 : RootDelta = RootMotion::between(clip, 0, 0.3, 4.1);
+    let split2 : RootDelta = RootMotion::between(clip, 0, 4.1, 7.9);
+    let whole : RootDelta = RootMotion::between(clip, 0, 0.3, 7.9);
+    nearVec3(
+        c,
+        "deltas add up over consecutive steps",
+        split1.translation.plus(split2.translation),
+        whole.translation,
+        MATH_TOL_LOOSE
+    );
+    let once : AnimationClip = animSlideClip(false);
+    nearVec3(
+        c,
+        "a clip that stops stops the root",
+        RootMotion::between(once, 0, 1.0, 5.0).translation,
+        Vec3::make(2.0, 0.0, 0.0),
+        MATH_TOL
+    );
+    nearVec3(
+        c,
+        "a bone the clip does not animate has no motion",
+        RootMotion::between(clip, 1, 0.0, 1.0).translation,
+        Vec3::zero(),
+        0.0
+    );
+    sameQuat(
+        c,
+        "no time, no turn",
+        RootMotion::between(clip, 0, 1.0, 1.0).rotation,
+        Quat::identity(),
+        0.0
+    );
+
+    let s : Skeleton = animPairSkeleton();
+    let pose : Pose = Pose::bindOf(s);
+    clip.sample(1.0, pose);
+    RootMotion::lockRoot(pose, s, 0, true);
+    nearVec3(
+        c,
+        "lockRoot puts the root back at its bind translation",
+        pose.get(0).translation,
+        Vec3::zero(),
+        0.0
+    );
+    c.that("lockRoot leaves the rotation", pose.get(0).rotation.angle() > 0.5);
+    let weighted : RootDelta = a.weighted(0.5);
+    nearVec3(
+        c,
+        "a half-weighted delta moves half as far",
+        weighted.translation,
+        Vec3::make(1.0, 0.0, 0.0),
+        MATH_TOL
+    );
+}
+
+/** The clip, event and root motion suite. */
+pub class AnimClipSuite {
+    /** Runs the clip checks. */
+    pub static fn run(c : Checks) : void {
+        animClipTestSampling(c);
+        animClipTestEvents(c);
+        animClipTestRootMotion(c);
+    }
+}

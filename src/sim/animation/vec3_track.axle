@@ -1,0 +1,175 @@
+// vec3_track — keyframe tracks of vectors (translation, scale) sampled by time.
+//
+// A track is a sorted list of keys (a time and a value) and a way to fill the gaps: `Step` holds the value of
+// the key before, `Linear` blends the two keys around the time, `Cubic` follows a Hermite spline whose
+// tangents are stored with the keys (glTF's CUBICSPLINE layout: in-tangent, value, out-tangent). Sampling finds
+// the segment by binary search, so a track of thousands of keys costs the same as one of two. Times outside the
+// keys clamp to the first and last value; looping is the clip's job (`TrackMath::wrapTime`), the track only
+// knows its keys.
+//
+// Keys live in `malloc` arrays (`times`, and `values` with 3 floats per value, 9 per key for `Cubic`).
+
+use std::ffi::runtime::panicMsg;
+
+use crate::core::math::vec3::Vec3;
+use crate::sim::animation::track_math::{TrackInterpolation, TrackMath, HermiteWeights};
+
+// Floats per key: a plain key is one value; a cubic key is in-tangent, value, out-tangent. A track allocates the
+// cubic size whatever its interpolation, so switching never needs a reallocation.
+const VEC3_TRACK_FLOATS : i32 = 3;
+const VEC3_TRACK_CUBIC_FLOATS : i32 = 9;
+const VEC3_TRACK_VALUE_SLOT : i32 = 3;
+const VEC3_TRACK_OUT_SLOT : i32 = 6;
+
+/** A track of `Vec3` keys: a bone's translation or scale over time. */
+pub class Vec3Track {
+    interp : TrackInterpolation;
+    count  : i32;
+    times  : f32[];
+    values : f32[];
+
+    /** A track of `count` keys, all zero at time zero, to be filled with `setKey`. */
+    constructor(interp : TrackInterpolation, count : i32) {
+        self.interp = interp;
+        self.count = count;
+        let room : i64 = (count + 1) as i64;
+        self.times = new f32[room];
+        self.values = new f32[room * (VEC3_TRACK_CUBIC_FLOATS as i64)];
+        for (i of 0..(count * VEC3_TRACK_CUBIC_FLOATS + VEC3_TRACK_CUBIC_FLOATS)) {
+            self.values[i] = 0.0;
+        }
+        for (i of 0..(count + 1)) {
+            self.times[i] = 0.0;
+        }
+    }
+
+    /** A track with no keys: it animates nothing. */
+    pub static fn none() : Vec3Track {
+        return new Vec3Track(TrackInterpolation::Linear, 0);
+    }
+
+    /** How many keys there are. */
+    pub fn len(self) : i32 {
+        return self.count;
+    }
+
+    /** True when the track has no keys. */
+    pub fn isEmpty(self) : bool {
+        return self.count == 0;
+    }
+
+    /** How the gaps between keys are filled. */
+    pub fn interpolation(self) : TrackInterpolation {
+        return self.interp;
+    }
+
+    /** The time of the last key; 0 for an empty track. */
+    pub fn endTime(self) : f32 {
+        if (self.count == 0) {
+            return 0.0;
+        }
+        return self.times[self.count - 1];
+    }
+
+    /** The time of key `i`. */
+    pub fn timeAt(self, i : i32) : f32 {
+        self.check(i);
+        return self.times[i];
+    }
+
+    /** The value of key `i`. */
+    pub fn valueAt(self, i : i32) : Vec3 {
+        self.check(i);
+        let at : i32 = i * self.stride() + self.offset();
+        return Vec3 { x: self.values[at], y: self.values[at + 1], z: self.values[at + 2] };
+    }
+
+    /** Sets key `i` to value `v` at time `t` (tangents of a cubic track become zero). Keys must ascend in time. */
+    pub fn setKey(mut self, i : i32, t : f32, v : Vec3) : void {
+        self.check(i);
+        self.times[i] = t;
+        let base : i32 = i * self.stride();
+        let at : i32 = base + self.offset();
+        self.values[at] = v.x;
+        self.values[at + 1] = v.y;
+        self.values[at + 2] = v.z;
+    }
+
+    /** Sets key `i` of a cubic track with its tangents; on other tracks the tangents are ignored. */
+    pub fn setCubicKey(mut self, i : i32, t : f32, inTangent : Vec3, v : Vec3, outTangent : Vec3) : void {
+        self.setKey(i, t, v);
+        if (self.interp == TrackInterpolation::Cubic) {
+            let base : i32 = i * VEC3_TRACK_CUBIC_FLOATS;
+            let out : i32 = base + VEC3_TRACK_OUT_SLOT;
+            self.values[base] = inTangent.x;
+            self.values[base + 1] = inTangent.y;
+            self.values[base + 2] = inTangent.z;
+            self.values[out] = outTangent.x;
+            self.values[out + 1] = outTangent.y;
+            self.values[out + 2] = outTangent.z;
+        }
+    }
+
+    /** The value at time `t`; the first or last value outside the keys, zero for an empty track. */
+    pub fn sample(self, t : f32) : Vec3 {
+        if (self.count == 0) {
+            return Vec3::zero();
+        }
+        if (self.count == 1 || t <= self.times[0]) {
+            return self.valueAt(0);
+        }
+        if (t >= self.times[self.count - 1]) {
+            return self.valueAt(self.count - 1);
+        }
+        let k : i32 = TrackMath::segment(self.times, self.count, t);
+        let t0 : f32 = self.times[k];
+        let dt : f32 = self.times[k + 1] - t0;
+        let mut s : f32 = 0.0;
+        if (dt > 0.0) {
+            s = (t - t0) / dt;
+        }
+        let a : Vec3 = self.valueAt(k);
+        let b : Vec3 = self.valueAt(k + 1);
+        return match self.interp {
+            TrackInterpolation::Step => a,
+            TrackInterpolation::Linear => a.lerp(b, s),
+            TrackInterpolation::Cubic => self.hermiteBetween(k, a, b, s, dt),
+        };
+    }
+
+    fn hermiteBetween(self, k : i32, a : Vec3, b : Vec3, s : f32, dt : f32) : Vec3 {
+        let w : HermiteWeights = TrackMath::weights(s);
+        let outA : Vec3 = self.tangent(k, VEC3_TRACK_OUT_SLOT);
+        let inB : Vec3 = self.tangent(k + 1, 0);
+        return a
+            .scale(w.valueA)
+            .plus(outA.scale(w.tanA * dt))
+            .plus(b.scale(w.valueB))
+            .plus(inB.scale(w.tanB * dt));
+    }
+
+    fn tangent(self, key : i32, slot : i32) : Vec3 {
+        let at : i32 = key * VEC3_TRACK_CUBIC_FLOATS + slot;
+        return Vec3 { x: self.values[at], y: self.values[at + 1], z: self.values[at + 2] };
+    }
+
+    fn stride(self) : i32 {
+        if (self.interp == TrackInterpolation::Cubic) {
+            return VEC3_TRACK_CUBIC_FLOATS;
+        }
+        return VEC3_TRACK_FLOATS;
+    }
+
+    fn offset(self) : i32 {
+        if (self.interp == TrackInterpolation::Cubic) {
+            return VEC3_TRACK_VALUE_SLOT;
+        }
+        return 0;
+    }
+
+    fn check(self, i : i32) : void {
+        if (i < 0 || i >= self.count) {
+            panicMsg("Vec3Track: key index out of range");
+        }
+    }
+}

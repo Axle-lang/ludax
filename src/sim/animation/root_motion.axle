@@ -1,0 +1,105 @@
+// root_motion — the movement a clip's root bone makes, as a delta to hand to the character.
+//
+// A walk cycle animates the hips forward; if the pose keeps that translation the character walks on the spot
+// while sliding its feet. Root motion splits it: `RootMotion::between` measures how far the root bone travelled
+// (and turned) between two clock readings, the game moves the character body by that amount, and `lockRoot`
+// removes the same movement from the pose so it is not applied twice.
+//
+// The clock is unwrapped (it keeps growing while the clip loops). A step across the loop point is the sum of
+// "from here to the end" and "from the start to there", so the root does not jump back; a step across several
+// loops adds one whole cycle (end minus start) for each. Translation is measured in the clip's model space; the
+// game rotates it by the character's heading.
+
+use crate::core::math::quat::Quat;
+use crate::core::math::transform::Transform;
+use crate::core::math::vec3::Vec3;
+use crate::sim::animation::animation_clip::AnimationClip;
+use crate::sim::animation::pose::Pose;
+use crate::sim::animation::skeleton::Skeleton;
+use crate::sim::animation::track_math::TrackMath;
+
+/** How far a bone moved and how much it turned. */
+pub struct RootDelta {
+    /** The movement of the bone's translation. */
+    pub translation : Vec3 = Vec3 { x: 0.0, y: 0.0, z: 0.0 };
+
+    /** The turn the bone made, to apply on top of the previous heading. */
+    pub rotation : Quat = Quat { x: 0.0, y: 0.0, z: 0.0, w: 1.0 };
+
+    /** No movement. */
+    pub static fn none() : RootDelta {
+        return RootDelta {};
+    }
+
+    /** This delta followed by `next`. */
+    pub fn then(self, next : RootDelta) : RootDelta {
+        return RootDelta {
+            translation: self.translation.plus(next.translation),
+            rotation: next.rotation.mul(self.rotation).normalized(),
+        };
+    }
+
+    /** This delta scaled by `w`: the translation by `w`, the rotation `w` of the way from none. */
+    pub fn weighted(self, w : f32) : RootDelta {
+        return RootDelta {
+            translation: self.translation.scale(w),
+            rotation: Quat::identity().slerp(self.rotation, w),
+        };
+    }
+}
+
+/** Measures and removes the movement of a clip's root bone. */
+pub class RootMotion {
+    /** The movement of `bone` in `clip` while the clock ran from `from` to `to` (seconds, unwrapped). */
+    pub static fn between(clip : AnimationClip, bone : i32, from : f64, to : f64) : RootDelta {
+        let length : f64 = clip.duration() as f64;
+        let forwards : bool = to > from;
+        let hasLength : bool = length > 0.0;
+        if (!forwards || !hasLength || clip.channelOf(bone) < 0) {
+            return RootDelta::none();
+        }
+        if (!clip.isLooping()) {
+            return RootMotion::span(clip, bone, clip.wrapClock(from), clip.wrapClock(to));
+        }
+        // A looping clip may cross its end: the rest of the first pass, whole cycles, then the start of the last.
+        let loopsFrom : i64 = TrackMath::floorDiv(from, length);
+        let loopsTo : i64 = TrackMath::floorDiv(to, length);
+        let a : f32 = clip.wrapClock(from);
+        let b : f32 = clip.wrapClock(to);
+        if (loopsTo == loopsFrom) {
+            return RootMotion::span(clip, bone, a, b);
+        }
+
+        let end : f32 = clip.duration();
+        let mut total : RootDelta = RootMotion::span(clip, bone, a, end);
+        let cycle : RootDelta = RootMotion::span(clip, bone, 0.0, end);
+        let mut whole : i64 = loopsTo - loopsFrom - 1;
+        while (whole > 0) {
+            total = total.then(cycle);
+            whole = whole - 1;
+        }
+        return total.then(RootMotion::span(clip, bone, 0.0, b));
+    }
+
+    /**
+     * Removes the root translation from `pose`: the bone goes back to its bind translation on `x` and `z`, and
+     * on `y` too unless `keepHeight` (bobbing hips keep their height). The rotation is left alone.
+     */
+    pub static fn lockRoot(pose : Pose, skeleton : Skeleton, bone : i32, keepHeight : bool) : void {
+        let now : Transform = pose.get(bone);
+        let bind : Transform = skeleton.bindLocal(bone);
+        let mut y : f32 = bind.translation.y;
+        if (keepHeight) {
+            y = now.translation.y;
+        }
+        let place : Vec3 = Vec3 { x: bind.translation.x, y: y, z: bind.translation.z };
+        pose.set(bone, Transform { translation: place, rotation: now.rotation, scale: now.scale });
+    }
+
+    // The movement between two wrapped clip times of one pass.
+    static fn span(clip : AnimationClip, bone : i32, a : f32, b : f32) : RootDelta {
+        let moved : Vec3 = clip.translationAt(bone, b).minus(clip.translationAt(bone, a));
+        let turned : Quat = clip.rotationAt(bone, b).mul(clip.rotationAt(bone, a).conjugate());
+        return RootDelta { translation: moved, rotation: turned.normalized() };
+    }
+}

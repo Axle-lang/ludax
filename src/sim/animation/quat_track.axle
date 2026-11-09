@@ -1,0 +1,174 @@
+// quat_track — keyframe tracks of rotations sampled by time.
+//
+// The twin of `Vec3Track` for a bone's rotation. `Linear` is a slerp along the shortest arc (a key and its
+// negative are the same rotation, so the blend flips one of them when the dot product is negative), `Step`
+// holds the key before, `Cubic` follows glTF's spline (in-tangent, value, out-tangent, four floats each) and
+// renormalises. Every answer is a unit quaternion. Times outside the keys clamp to the first and last value.
+
+use std::ffi::runtime::panicMsg;
+
+use crate::core::math::quat::Quat;
+use crate::sim::animation::track_math::{TrackInterpolation, TrackMath, HermiteWeights};
+
+// A rotation key stores four floats for each of in-tangent, value and out-tangent (the tangents only matter
+// to `Cubic`, but every track allocates them so the layout does not depend on the interpolation).
+const QUAT_TRACK_KEY_FLOATS : i32 = 12;
+const QUAT_TRACK_IN_SLOT : i32 = 0;
+const QUAT_TRACK_VALUE_SLOT : i32 = 4;
+const QUAT_TRACK_OUT_SLOT : i32 = 8;
+
+/** A track of rotation keys: a bone's rotation over time. */
+pub class QuatTrack {
+    interp : TrackInterpolation;
+    count  : i32;
+    times  : f32[];
+    values : f32[];
+
+    /** A track of `count` keys, all the identity at time zero, to be filled with `setKey`. */
+    constructor(interp : TrackInterpolation, count : i32) {
+        self.interp = interp;
+        self.count = count;
+        let room : i64 = (count + 1) as i64;
+        self.times = new f32[room];
+        self.values = new f32[room * (QUAT_TRACK_KEY_FLOATS as i64)];
+        for (i of 0..(count + 1)) {
+            self.times[i] = 0.0;
+            let base : i32 = i * QUAT_TRACK_KEY_FLOATS;
+            for (j of 0..QUAT_TRACK_KEY_FLOATS) {
+                self.values[base + j] = 0.0;
+            }
+
+            // The identity's w, so an unset key is a valid rotation.
+            self.values[base + QUAT_TRACK_VALUE_SLOT + 3] = 1.0;
+        }
+    }
+
+    /** A track with no keys: it animates nothing. */
+    pub static fn none() : QuatTrack {
+        return new QuatTrack(TrackInterpolation::Linear, 0);
+    }
+
+    /** How many keys there are. */
+    pub fn len(self) : i32 {
+        return self.count;
+    }
+
+    /** True when the track has no keys. */
+    pub fn isEmpty(self) : bool {
+        return self.count == 0;
+    }
+
+    /** How the gaps between keys are filled. */
+    pub fn interpolation(self) : TrackInterpolation {
+        return self.interp;
+    }
+
+    /** The time of the last key; 0 for an empty track. */
+    pub fn endTime(self) : f32 {
+        if (self.count == 0) {
+            return 0.0;
+        }
+        return self.times[self.count - 1];
+    }
+
+    /** The time of key `i`. */
+    pub fn timeAt(self, i : i32) : f32 {
+        self.check(i);
+        return self.times[i];
+    }
+
+    /** The rotation of key `i`. */
+    pub fn valueAt(self, i : i32) : Quat {
+        self.check(i);
+        return self.read(i, QUAT_TRACK_VALUE_SLOT);
+    }
+
+    /** Sets key `i` to rotation `q` (normalised on the way in) at time `t`. Keys must ascend in time. */
+    pub fn setKey(mut self, i : i32, t : f32, q : Quat) : void {
+        self.check(i);
+        self.times[i] = t;
+        let n : Quat = q.normalized();
+        let at : i32 = i * QUAT_TRACK_KEY_FLOATS + QUAT_TRACK_VALUE_SLOT;
+        self.values[at] = n.x;
+        self.values[at + 1] = n.y;
+        self.values[at + 2] = n.z;
+        self.values[at + 3] = n.w;
+    }
+
+    /** Sets a cubic key with its tangents (four components each, not normalised); other tracks ignore them. */
+    pub fn setCubicKey(mut self, i : i32, t : f32, inTangent : Quat, q : Quat, outTangent : Quat) : void {
+        self.setKey(i, t, q);
+        if (self.interp == TrackInterpolation::Cubic) {
+            let into : i32 = i * QUAT_TRACK_KEY_FLOATS + QUAT_TRACK_IN_SLOT;
+            let out : i32 = i * QUAT_TRACK_KEY_FLOATS + QUAT_TRACK_OUT_SLOT;
+            self.values[into] = inTangent.x;
+            self.values[into + 1] = inTangent.y;
+            self.values[into + 2] = inTangent.z;
+            self.values[into + 3] = inTangent.w;
+            self.values[out] = outTangent.x;
+            self.values[out + 1] = outTangent.y;
+            self.values[out + 2] = outTangent.z;
+            self.values[out + 3] = outTangent.w;
+        }
+    }
+
+    /** The rotation at time `t`; the first or last key outside the keys, the identity for an empty track. */
+    pub fn sample(self, t : f32) : Quat {
+        if (self.count == 0) {
+            return Quat::identity();
+        }
+        if (self.count == 1 || t <= self.times[0]) {
+            return self.valueAt(0);
+        }
+        if (t >= self.times[self.count - 1]) {
+            return self.valueAt(self.count - 1);
+        }
+        let k : i32 = TrackMath::segment(self.times, self.count, t);
+        let t0 : f32 = self.times[k];
+        let dt : f32 = self.times[k + 1] - t0;
+        let mut s : f32 = 0.0;
+        if (dt > 0.0) {
+            s = (t - t0) / dt;
+        }
+        let a : Quat = self.valueAt(k);
+        let b : Quat = self.valueAt(k + 1);
+        return match self.interp {
+            TrackInterpolation::Step => a,
+            TrackInterpolation::Linear => a.slerp(b, s),
+            TrackInterpolation::Cubic => self.hermiteBetween(k, a, b, s, dt),
+        };
+    }
+
+    fn hermiteBetween(self, k : i32, a : Quat, b : Quat, s : f32, dt : f32) : Quat {
+        let w : HermiteWeights = TrackMath::weights(s);
+        let outA : Quat = self.read(k, QUAT_TRACK_OUT_SLOT);
+        let inB : Quat = self.read(k + 1, QUAT_TRACK_IN_SLOT);
+        let wa : f32 = w.valueA;
+        let wb : f32 = w.valueB;
+        let wOut : f32 = w.tanA * dt;
+        let wIn : f32 = w.tanB * dt;
+        return Quat {
+            x: a.x * wa + outA.x * wOut + b.x * wb + inB.x * wIn,
+            y: a.y * wa + outA.y * wOut + b.y * wb + inB.y * wIn,
+            z: a.z * wa + outA.z * wOut + b.z * wb + inB.z * wIn,
+            w: a.w * wa + outA.w * wOut + b.w * wb + inB.w * wIn,
+        }.normalized();
+    }
+
+    // Four floats of key `key` starting at `slot` (a `QUAT_*_SLOT`) as a quaternion.
+    fn read(self, key : i32, slot : i32) : Quat {
+        let at : i32 = key * QUAT_TRACK_KEY_FLOATS + slot;
+        return Quat {
+            x: self.values[at],
+            y: self.values[at + 1],
+            z: self.values[at + 2],
+            w: self.values[at + 3],
+        };
+    }
+
+    fn check(self, i : i32) : void {
+        if (i < 0 || i >= self.count) {
+            panicMsg("QuatTrack: key index out of range");
+        }
+    }
+}

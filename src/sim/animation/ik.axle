@@ -1,0 +1,323 @@
+// ik — inverse kinematics: reach a target by turning bones.
+//
+// Three solvers, all working on a `Pose` in the model space of the skeleton and changing only local rotations
+// (bone lengths and offsets stay as authored):
+//
+//   * `TwoBoneIk` — the analytic solution for an arm or a leg (root, mid, end). The law of cosines gives the
+//     bend at the mid joint, one rotation aims the chain at the target and an optional pole vector says which
+//     way the elbow or knee points. A target beyond reach is clamped: the limb stretches straight towards it.
+//   * `FabrikChain` — iterative FABRIK over a chain of bones of any length (a tail, a spine, a tentacle),
+//     stopping inside a tolerance or after a number of iterations.
+//   * `LookAt` — turns one bone so a chosen local axis points at a target, with a weight and a turn limit.
+//
+// Positions come from `Pose::modelTransform`, which composes translation, rotation and scale; the solvers are
+// exact when the chain's scale is uniform. Every function is a pure computation over the pose it is given:
+// the same pose and target always give the same rotations.
+
+use crate::core::math::quat::Quat;
+use crate::core::math::scalar::{clamp, min, max, abs};
+use crate::core::math::transform::Transform;
+use crate::core::math::trig::{acos, atan2};
+use crate::core::math::vec3::Vec3;
+use crate::sim::animation::pose::Pose;
+use crate::sim::animation::skeleton::Skeleton;
+
+// Lengths below this are treated as zero: a bone with no length has no direction.
+const IK_TINY : f32 = 0.000001;
+
+// The model-space rotation of the parent of `bone` (the identity for a root): the frame its local rotation is
+// measured in, so a model rotation becomes local by undoing this one.
+fn ikParentRotation(pose : Pose, skeleton : Skeleton, bone : i32) : Quat {
+    let up : i32 = skeleton.parent(bone);
+    if (up < 0) {
+        return Quat::identity();
+    }
+    return pose.modelTransform(skeleton, up).rotation;
+}
+
+// The bend at the mid joint, in radians, of a limb of lengths `l1` and `l2` whose end is `rawDist` from its
+// root: the law of cosines at a distance no longer than full extension and no shorter than fully folded.
+fn ikBendFor(l1 : f32, l2 : f32, rawDist : f32) : f32 {
+    let mut d : f32 = min(rawDist, l1 + l2);
+    d = max(d, max(abs(l1 - l2), IK_TINY));
+    let two : f32 = 2.0;
+    let cos : f32 = clamp((l1 * l1 + l2 * l2 - d * d) / (two * l1 * l2), -1.0, 1.0);
+    return acos(cos);
+}
+
+// The twist about the root-to-target line that brings the mid joint to the pole's side; `applies` is false
+// when either offset has no part across the line (the mid joint or the pole lies on it).
+struct IkTwist {
+    applies  : bool = false;
+    rotation : Quat = Quat { x: 0.0, y: 0.0, z: 0.0, w: 1.0 };
+}
+
+fn ikPoleTwist(root : Vec3, mid : Vec3, wanted : Vec3, pole : Vec3) : IkTwist {
+    let line : Vec3 = wanted.normalized();
+    let offset : Vec3 = mid.minus(root);
+    let have : Vec3 = offset.minus(line.scale(offset.dot(line)));
+    let toPole : Vec3 = pole.minus(root);
+    let want : Vec3 = toPole.minus(line.scale(toPole.dot(line)));
+    if (!(have.length() > IK_TINY && want.length() > IK_TINY)) {
+        return IkTwist {};
+    }
+    let angle : f32 = atan2(have.cross(want).dot(line), have.dot(want));
+    return IkTwist { applies: true, rotation: Quat::fromAxisAngle(line, angle) };
+}
+
+// A chain point moved to lie `length` from `anchor` along the direction towards where it was.
+fn ikPlaceFrom(anchor : Vec3, was : Vec3, length : f32) : Vec3 {
+    return anchor.plus(was.minus(anchor).normalizedOr(Vec3::unitY()).scale(length));
+}
+
+/** What an iterative solver achieved. */
+pub struct IkResult {
+    /** True when the end of the chain finished within the tolerance of the target. */
+    pub reached : bool = false;
+
+    /** How many iterations were run (0 when the chain started within tolerance). */
+    pub iterations : i32 = 0;
+
+    /** The distance from the end of the chain to the target when the solver stopped. */
+    pub error : f32 = 0.0;
+}
+
+/** Three bones of a limb, as skeleton indices: `mid` is a child of `root` and `end` a child of `mid`. */
+pub struct IkLimb {
+    /** The first bone (the hip or the shoulder). */
+    pub root : i32 = 0;
+
+    /** The middle bone (the knee or the elbow). */
+    pub mid : i32 = 1;
+
+    /** The last bone (the ankle or the wrist), the one that is placed. */
+    pub end : i32 = 2;
+
+    /** The limb through bones `root`, `mid` and `end`. */
+    pub static fn make(root : i32, mid : i32, end : i32) : IkLimb {
+        return IkLimb { root: root, mid: mid, end: end };
+    }
+}
+
+/** Where the mid joint of a limb should point, if anywhere. */
+pub struct IkPole {
+    /** True when the mid joint is steered towards `at`. */
+    pub used : bool = false;
+
+    /** The model-space point the mid joint turns towards (such as "in front of the knee"). */
+    pub at : Vec3 = Vec3 {};
+
+    /** No steering: the mid joint bends wherever the limb already bends. */
+    pub static fn none() : IkPole {
+        return IkPole {};
+    }
+
+    /** The mid joint is turned to lie on the side of the model-space point `at`. */
+    pub static fn towards(at : Vec3) : IkPole {
+        return IkPole { used: true, at: at };
+    }
+}
+
+/** The analytic solver for a chain of three bones: root, mid and end. */
+pub class TwoBoneIk {
+    /**
+     * Bends `limb` so that its end reaches `target` (a point in model space), with the mid joint turned to the
+     * side of `pole` when it is used. Returns true when the target was in reach; otherwise the limb is
+     * stretched straight towards it and false is returned. Also false (and the pose untouched) when the bones
+     * are not a chain or have no length.
+     */
+    pub static fn solve(
+        pose : Pose,
+        skeleton : Skeleton,
+        limb : IkLimb,
+        target : Vec3,
+        pole : IkPole
+    ) : bool {
+        let root : i32 = limb.root;
+        let mid : i32 = limb.mid;
+        let end : i32 = limb.end;
+        if (skeleton.parent(mid) != root || skeleton.parent(end) != mid) {
+            return false;
+        }
+        let tr : Transform = pose.modelTransform(skeleton, root);
+        let tm : Transform = pose.modelTransform(skeleton, mid);
+        let te : Transform = pose.modelTransform(skeleton, end);
+        let a : Vec3 = tr.translation;
+        let b : Vec3 = tm.translation;
+        let c : Vec3 = te.translation;
+        let l1 : f32 = b.minus(a).length();
+        let l2 : f32 = c.minus(b).length();
+        if (l1 < IK_TINY || l2 < IK_TINY) {
+            return false;
+        }
+        let wanted : Vec3 = target.minus(a);
+        let rawDist : f32 = wanted.length();
+        let reachable : bool = rawDist <= l1 + l2;
+        let bendWant : f32 = ikBendFor(l1, l2, rawDist);
+
+        let u : Vec3 = a.minus(b);
+        let v : Vec3 = c.minus(b);
+        let cosNow : f32 = clamp(u.dot(v) / (l1 * l2), -1.0, 1.0);
+        let bendNow : f32 = acos(cosNow);
+        let mut axis : Vec3 = u.cross(v);
+        if (axis.length() < IK_TINY) {
+            axis = u.anyPerpendicular();
+        }
+
+        // 1. Open or close the mid joint to the wanted angle.
+        let fold : Quat = Quat::fromAxisAngle(axis.normalized(), bendWant - bendNow);
+        let mut rootRot : Quat = tr.rotation;
+        let mut midRot : Quat = fold.mul(tm.rotation);
+        let reachNow : Vec3 = b.plus(fold.rotate(v)).minus(a);
+
+        // 2. Swing the whole limb about the root so the end points at the target.
+        let swing : Quat = Quat::fromTo(reachNow, wanted);
+        rootRot = swing.mul(rootRot);
+        midRot = swing.mul(midRot);
+        let midPos : Vec3 = a.plus(swing.rotate(b.minus(a)));
+
+        // 3. Twist about the root-to-target line so the mid joint faces the pole.
+        if (pole.used && rawDist > IK_TINY) {
+            let twist : IkTwist = ikPoleTwist(a, midPos, wanted, pole.at);
+            if (twist.applies) {
+                rootRot = twist.rotation.mul(rootRot);
+                midRot = twist.rotation.mul(midRot);
+            }
+        }
+
+        // Back to local rotations: a child's local is its parent's model rotation undone, then its own.
+        let above : Quat = ikParentRotation(pose, skeleton, root);
+        pose.setRotation(root, above.conjugate().mul(rootRot).normalized());
+        pose.setRotation(mid, rootRot.conjugate().mul(midRot).normalized());
+        return reachable;
+    }
+}
+
+/** The iterative solver for a chain of any length. */
+pub class FabrikChain {
+    /**
+     * Moves the end of the chain `bones` (listed root first, each the parent of the next) towards `target`.
+     * The root bone stays where it is; every other joint is placed by alternately pulling the end onto the
+     * target and the root back to its place, keeping the bone lengths. Stops when the end is within
+     * `tolerance` of the target or after `maxIterations` rounds. A target beyond the chain's length leaves
+     * the chain straight, pointing at it (`reached` false).
+     */
+    pub static fn solve(
+        pose : Pose,
+        skeleton : Skeleton,
+        bones : i32[],
+        count : i32,
+        target : Vec3,
+        tolerance : f32,
+        maxIterations : i32
+    ) : IkResult {
+        if (count < 2) {
+            return IkResult {};
+        }
+        for (i of 1..count) {
+            if (skeleton.parent(bones[i]) != bones[i - 1]) {
+                return IkResult {};
+            }
+        }
+        let mut pts : Vec3[] = new Vec3[count as i64];
+        let mut lens : f32[] = new f32[count as i64];
+        for (i of 0..count) {
+            pts[i] = pose.modelTransform(skeleton, bones[i]).translation;
+        }
+        let mut total : f32 = 0.0;
+        for (i of 0..(count - 1)) {
+            lens[i] = pts[i + 1].minus(pts[i]).length();
+            total = total + lens[i];
+        }
+        let root : Vec3 = pts[0];
+        let mut iterations : i32 = 0;
+        if (target.minus(root).length() >= total) {
+            // Out of reach: lay the chain straight along the line to the target.
+            let line : Vec3 = target.minus(root).normalizedOr(Vec3::unitY());
+            for (i of 1..count) {
+                pts[i] = pts[i - 1].plus(line.scale(lens[i - 1]));
+            }
+        } else {
+            while (iterations < maxIterations && pts[count - 1].distance(target) > tolerance) {
+                pts[count - 1] = target;
+                let mut i : i32 = count - 2;
+                while (i >= 0) {
+                    pts[i] = ikPlaceFrom(pts[i + 1], pts[i], lens[i]);
+                    i = i - 1;
+                }
+                pts[0] = root;
+                for (j of 0..(count - 1)) {
+                    pts[j + 1] = ikPlaceFrom(pts[j], pts[j + 1], lens[j]);
+                }
+                iterations = iterations + 1;
+            }
+        }
+        FabrikChain::applyPositions(pose, skeleton, bones, count, pts);
+        let error : f32 = pose.modelTransform(skeleton, bones[count - 1]).translation.distance(target);
+        return IkResult { reached: error <= tolerance, iterations: iterations, error: error };
+    }
+
+    // Turns each bone, root first, so that its child ends up where the solver put it.
+    static fn applyPositions(
+        pose : Pose,
+        skeleton : Skeleton,
+        bones : i32[],
+        count : i32,
+        pts : Vec3[]
+    ) : void {
+        let mut parentModel : Transform = Transform::identity();
+        let up : i32 = skeleton.parent(bones[0]);
+        if (up >= 0) {
+            parentModel = pose.modelTransform(skeleton, up);
+        }
+        for (i of 0..(count - 1)) {
+            let here : Transform = parentModel.mul(pose.get(bones[i]));
+            let childLocal : Transform = pose.get(bones[i + 1]);
+            let childNow : Vec3 = here.transformPoint(childLocal.translation);
+            let swing : Quat = Quat::fromTo(
+                childNow.minus(here.translation),
+                pts[i + 1].minus(here.translation)
+            );
+            let turned : Quat = swing.mul(here.rotation).normalized();
+            pose.setRotation(bones[i], parentModel.rotation.conjugate().mul(turned).normalized());
+            parentModel = Transform { translation: here.translation, rotation: turned, scale: here.scale };
+        }
+    }
+}
+
+/** Turns a bone to face a point. */
+pub class LookAt {
+    /**
+     * Turns `bone` so that its local axis `forward` (for example +Z for a head that faces +Z) points at
+     * `target`, a model-space point. `weight` (0..1) blends from the current rotation to the full turn and
+     * `maxAngle` (radians) limits how far the bone may turn from where it was. Returns the angle turned.
+     */
+    pub static fn apply(
+        pose : Pose,
+        skeleton : Skeleton,
+        bone : i32,
+        target : Vec3,
+        forward : Vec3,
+        weight : f32,
+        maxAngle : f32
+    ) : f32 {
+        let model : Transform = pose.modelTransform(skeleton, bone);
+        let facing : Vec3 = model.rotation.rotate(forward);
+        let wanted : Vec3 = target.minus(model.translation);
+        if (wanted.length() < IK_TINY || facing.length() < IK_TINY) {
+            return 0.0;
+        }
+        let full : Quat = Quat::fromTo(facing, wanted);
+        let mut turn : Quat = Quat::identity().slerp(full, clamp(weight, 0.0, 1.0));
+        // `fromTo` takes the short way, so the turn is at most half a revolution.
+        let mut angle : f32 = turn.angle();
+        if (angle > maxAngle && angle > IK_TINY) {
+            turn = Quat::identity().slerp(turn, maxAngle / angle);
+            angle = maxAngle;
+        }
+        let turned : Quat = turn.mul(model.rotation).normalized();
+        let above : Quat = ikParentRotation(pose, skeleton, bone);
+        pose.setRotation(bone, above.conjugate().mul(turned).normalized());
+        return angle;
+    }
+}
