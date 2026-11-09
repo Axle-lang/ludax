@@ -1,0 +1,429 @@
+// data_region — checks for RegionFile: every slot, rewrites, external chunks, a failed write.
+//
+// A region file is the one structure here that is written in place, so the checks that matter are about not
+// losing what is already there: a chunk rewritten at a larger size moves and its old sectors are reused by
+// the next chunk, and a write that fails (an external file that cannot be created, a closed file) leaves the
+// previous chunk readable and its sectors reserved. The files live in the working directory under a name no
+// game uses and are removed.
+
+use std::ffi::libc::fs;
+use std::io::path::Path;
+use std::lang::IOException;
+
+use ludax::{
+    ByteBuf, Checks, REGION_COMPRESSION_LZ4, REGION_COMPRESSION_NONE, REGION_COMPRESSION_ZLIB,
+    REGION_SLOTS, RandomFile, RegionFile, RegionScratch, nowNanos
+};
+
+use crate::generic_support::{gsNoise, gsPatterned, gsSame, gsText};
+
+// The region coordinates of the checks; far from any real world.
+const REGION_TEST_RX : i32 = 7001;
+const REGION_TEST_RZ : i32 = 7002;
+
+/** The RegionFile checks. */
+pub class RegionFileSuite {
+    /** Runs every check of the suite. */
+    pub static fn run(c : Checks) : void {
+        regionRoundTripChecks(c);
+        regionRewriteChecks(c);
+        regionExternalChecks(c);
+        regionFailureChecks(c);
+        regionDamageChecks(c);
+        regionMeasure(c);
+    }
+
+    /** Prints the `measured:` line alone. */
+    pub static fn measure(c : Checks) : void {
+        regionMeasure(c);
+    }
+}
+
+fn regionSize(rx : i32, rz : i32) : i64 {
+    let file : RandomFile = RandomFile::openRead(RegionFile::pathOf(".", rx, rz));
+    let bytes : i64 = file.length();
+    file.close();
+    return bytes;
+}
+
+fn regionRemove(rx : i32, rz : i32) : void {
+    fs::remove(RegionFile::pathOf(".", rx, rz));
+}
+
+// A chunk payload that depends on the slot and a round, from a few bytes to several sectors.
+fn regionPayload(slot : i32, round : i32) : ByteBuf {
+    let size : i32 = 40 + ((slot * 37 + round * 101) % 9000);
+    return gsText(size, slot + round * 1000);
+}
+
+fn regionSlotsMatch(region : RegionFile, scratch : RegionScratch, round : i32, only : i32) : i32 {
+    let out : ByteBuf = new ByteBuf(16);
+    let mut wrong : i32 = 0;
+    for (slot of 0..REGION_SLOTS) {
+        if (only >= 0 && slot % only != 0) {
+            continue;
+        }
+        if (!region.read(slot, scratch, out) || !gsSame(out, regionPayload(slot, round))) {
+            wrong = wrong + 1;
+        }
+    }
+    return wrong;
+}
+
+fn regionRoundTripChecks(c : Checks) : void {
+    let scratch : RegionScratch = new RegionScratch();
+    regionRemove(REGION_TEST_RX, REGION_TEST_RZ);
+
+    let writer : RegionFile = RegionFile::openWrite(".", REGION_TEST_RX, REGION_TEST_RZ);
+    c.that("region: a new region opens for writing", writer.isOpen() && writer.isWriter());
+    c.sameInt("region: ... empty", writer.chunkCount(), 0);
+    let mut failed : i32 = 0;
+    for (slot of 0..REGION_SLOTS) {
+        if (!writer.write(slot, regionPayload(slot, 0), 1000 + slot, scratch)) {
+            failed = failed + 1;
+        }
+    }
+    c.sameInt("region: all 1024 slots are written", failed, 0);
+    c.sameInt("region: ... and counted", writer.chunkCount(), REGION_SLOTS);
+    c.that("region: has answers true for a written slot", writer.has(0) && writer.has(1023));
+    c.sameInt("region: the timestamp is kept", writer.timestamp(5), 1005);
+    c.sameInt("region: the slot of chunk (3, 2) is 67", RegionFile::slotOf(3, 2), 67);
+    c.sameInt("region: the slot of chunk (-1, -1) is 1023", RegionFile::slotOf(-1, -1), 1023);
+    c.sameInt(
+        "region: every slot reads back before the flush",
+        regionSlotsMatch(writer, scratch, 0, -1),
+        0
+    );
+    writer.finish();
+
+    let reader : RegionFile = RegionFile::openRead(".", REGION_TEST_RX, REGION_TEST_RZ);
+    c.that("region: the file reopens for reading", reader.isOpen() && !reader.isWriter());
+    c.sameInt("region: ... with every chunk", reader.chunkCount(), REGION_SLOTS);
+    c.sameInt(
+        "region: ... and every slot reads back after a reopen",
+        regionSlotsMatch(reader, scratch, 0, -1),
+        0
+    );
+    c.sameInt("region: ... with its timestamp", reader.timestamp(1000), 2000);
+    c.that("region: a reader refuses a write", !reader.write(0, gsText(10, 1), 5, scratch));
+    let out : ByteBuf = new ByteBuf(16);
+    c.that("region: a missing slot index reads as absent", RegionFile::slotOf(0, 0) == 0);
+    reader.close();
+
+    let missing : RegionFile = RegionFile::openRead(".", REGION_TEST_RX + 50, REGION_TEST_RZ);
+    c.that(
+        "region: a missing region is closed and empty",
+        !missing.isOpen() && missing.chunkCount() == 0
+    );
+    c.that("region: ... and refuses reads", !missing.read(0, scratch, out));
+    c.that(
+        "region: exists answers false for it",
+        !RegionFile::exists(".", REGION_TEST_RX + 50, REGION_TEST_RZ)
+    );
+    c.that(
+        "region: exists answers true for a region on disk",
+        RegionFile::exists(".", REGION_TEST_RX, REGION_TEST_RZ)
+    );
+    regionRemove(REGION_TEST_RX, REGION_TEST_RZ);
+}
+
+fn regionRewriteChecks(c : Checks) : void {
+    let scratch : RegionScratch = new RegionScratch();
+    let out : ByteBuf = new ByteBuf(16);
+    regionRemove(REGION_TEST_RX, REGION_TEST_RZ);
+    let region : RegionFile = RegionFile::openWrite(".", REGION_TEST_RX, REGION_TEST_RZ);
+    for (slot of 0..64) {
+        region.write(slot, regionPayload(slot, 0), 1, scratch);
+    }
+    region.flush();
+
+    // A chunk that grows moves; one that shrinks keeps or frees; a freed run is reused by the next chunk.
+    let big : ByteBuf = gsNoise(20000, 3);
+    c.that("region: a chunk rewritten larger is accepted", region.write(10, big, 2, scratch));
+    c.that("region: ... and reads back larger", region.read(10, scratch, out) && gsSame(out, big));
+    let tiny : ByteBuf = gsText(50, 4);
+    c.that("region: a chunk rewritten smaller is accepted", region.write(10, tiny, 3, scratch));
+    c.that(
+        "region: ... and reads back smaller",
+        region.read(10, scratch, out) && gsSame(out, tiny)
+    );
+    c.sameInt("region: ... with the new timestamp", region.timestamp(10), 3);
+    let mut others : i32 = 0;
+    for (slot of 0..64) {
+        if (slot != 10
+            && (!region.read(slot, scratch, out) || !gsSame(out, regionPayload(slot, 0)))) {
+            others = others + 1;
+        }
+    }
+    c.sameInt("region: the other chunks are untouched by the rewrites", others, 0);
+
+    // Erase, then a new chunk takes the freed sectors: the file does not grow.
+    region.flush();
+    let before : i64 = regionSize(REGION_TEST_RX, REGION_TEST_RZ);
+    region.erase(20);
+    c.that("region: an erased slot is empty", !region.has(20) && region.timestamp(20) == 0);
+    c.that("region: ... and does not read", !region.read(20, scratch, out));
+    c.sameInt("region: ... leaving the others counted", region.chunkCount(), 63);
+    region.erase(20);
+    c.sameInt("region: erasing twice is harmless", region.chunkCount(), 63);
+    let same : ByteBuf = regionPayload(20, 0);
+    c.that(
+        "region: a chunk of the erased size is written into the hole",
+        region.write(21, same, 4, scratch)
+    );
+    region.flush();
+    let after : i64 = regionSize(REGION_TEST_RX, REGION_TEST_RZ);
+    c.that("region: the file did not grow (${before} then ${after})", after <= before);
+    region.finish();
+
+    // Reopen and compare: the table on disk is what the session left.
+    let again : RegionFile = RegionFile::openRead(".", REGION_TEST_RX, REGION_TEST_RZ);
+    c.that(
+        "region: the rewritten chunk survives a reopen",
+        again.read(10, scratch, out) && gsSame(out, tiny)
+    );
+    c.that("region: the erased slot stays erased", !again.has(20));
+    c.that(
+        "region: the chunk written into the hole reads",
+        again.read(21, scratch, out) && gsSame(out, same)
+    );
+    again.close();
+
+    // The other compression types of a payload.
+    let writer : RegionFile = RegionFile::openWrite(".", REGION_TEST_RX, REGION_TEST_RZ);
+    let plain : ByteBuf = gsPatterned(30000, 1);
+    let packed : ByteBuf = new ByteBuf(16);
+    let reader : ByteBuf = new ByteBuf(16);
+    RegionFile::compress(REGION_COMPRESSION_LZ4, plain, scratch.deflater, scratch.lz4, packed);
+    c.that(
+        "region: an LZ4 payload is stored",
+        writer.writePayload(30, REGION_COMPRESSION_LZ4, packed, 9)
+    );
+    c.that("region: ... and reads back", writer.read(30, scratch, reader) && gsSame(reader, plain));
+    RegionFile::compress(REGION_COMPRESSION_NONE, plain, scratch.deflater, scratch.lz4, packed);
+    c.that(
+        "region: a stored payload is stored",
+        writer.writePayload(31, REGION_COMPRESSION_NONE, packed, 9)
+    );
+    c.that("region: ... and reads back", writer.read(31, scratch, reader) && gsSame(reader, plain));
+    RegionFile::compress(REGION_COMPRESSION_ZLIB, plain, scratch.deflater, scratch.lz4, packed);
+    c.that(
+        "region: a zlib payload is stored",
+        writer.writePayload(32, REGION_COMPRESSION_ZLIB, packed, 9)
+    );
+    c.that("region: ... and reads back", writer.read(32, scratch, reader) && gsSame(reader, plain));
+    writer.finish();
+    regionRemove(REGION_TEST_RX, REGION_TEST_RZ);
+}
+
+fn regionExternalChecks(c : Checks) : void {
+    let scratch : RegionScratch = new RegionScratch();
+    let out : ByteBuf = new ByteBuf(16);
+    regionRemove(REGION_TEST_RX, REGION_TEST_RZ);
+    let region : RegionFile = RegionFile::openWrite(".", REGION_TEST_RX, REGION_TEST_RZ);
+
+    // Noise does not shrink, so 1.1 MB of it passes the 255-sector limit and goes to the `.mcc` file.
+    let huge : ByteBuf = gsNoise(1100000, 2);
+    let cx : i32 = REGION_TEST_RX * 32 + 3;
+    let cz : i32 = REGION_TEST_RZ * 32 + 4;
+    let slot : i32 = RegionFile::slotOf(cx, cz);
+    c.that("region: a chunk over 255 sectors is written", region.write(slot, huge, 7, scratch));
+    let external : string = "./c.${cx}.${cz}.mcc";
+    c.that("region: ... to its own file", Path::from(external).isFile());
+    c.that(
+        "region: ... and reads back through it",
+        region.read(slot, scratch, out) && gsSame(out, huge)
+    );
+    region.finish();
+
+    let reopened : RegionFile = RegionFile::openRead(".", REGION_TEST_RX, REGION_TEST_RZ);
+    c.that(
+        "region: the external chunk survives a reopen",
+        reopened.read(slot, scratch, out) && gsSame(out, huge)
+    );
+    reopened.close();
+    fs::remove(external);
+    let orphan : RegionFile = RegionFile::openRead(".", REGION_TEST_RX, REGION_TEST_RZ);
+    c.that(
+        "region: an external chunk whose file is gone is damaged, not fatal",
+        !orphan.read(slot, scratch, out)
+    );
+    orphan.close();
+    regionRemove(REGION_TEST_RX, REGION_TEST_RZ);
+}
+
+fn regionFailureChecks(c : Checks) : void {
+    let scratch : RegionScratch = new RegionScratch();
+    let out : ByteBuf = new ByteBuf(16);
+    regionRemove(REGION_TEST_RX, REGION_TEST_RZ);
+    let region : RegionFile = RegionFile::openWrite(".", REGION_TEST_RX, REGION_TEST_RZ);
+
+    // Slot 5 holds three sectors; slot 6 follows it.
+    let first : ByteBuf = gsNoise(10000, 6);
+    let neighbour : ByteBuf = gsNoise(10000, 7);
+    region.write(5, first, 1, scratch);
+    region.write(6, neighbour, 1, scratch);
+    region.flush();
+
+    // Rewrite slot 5 as an external chunk while a directory sits where its `.mcc` file must go: the write
+    // fails.
+    let cx : i32 = REGION_TEST_RX * 32 + 5;
+    let cz : i32 = REGION_TEST_RZ * 32;
+    let blocker : string = "./c.${cx}.${cz}.mcc";
+    let made : bool = regionMakeDirectory(blocker);
+    c.that("region: the blocking directory is made", made);
+    let huge : ByteBuf = gsNoise(1100000, 8);
+    c.that(
+        "region: a write whose external file cannot be created fails",
+        !region.write(5, huge, 2, scratch)
+    );
+    c.that(
+        "region: ... and the previous chunk is still there",
+        region.has(5) && region.timestamp(5) == 1
+    );
+    c.that("region: ... and still reads", region.read(5, scratch, out) && gsSame(out, first));
+
+    // The sectors of the old record must still be reserved: new chunks must not land on them.
+    let mut clobbered : i32 = 0;
+    for (slot of 7..12) {
+        region.write(slot, gsNoise(5000, slot), 3, scratch);
+    }
+    if (!region.read(5, scratch, out) || !gsSame(out, first)) {
+        clobbered = clobbered + 1;
+    }
+    if (!region.read(6, scratch, out) || !gsSame(out, neighbour)) {
+        clobbered = clobbered + 1;
+    }
+    c.sameInt(
+        "region: chunks written after a failed write do not overwrite the old ones",
+        clobbered,
+        0
+    );
+    region.finish();
+    regionRemoveDirectory(blocker);
+
+    let reopened : RegionFile = RegionFile::openRead(".", REGION_TEST_RX, REGION_TEST_RZ);
+    c.that(
+        "region: the old chunk survives the reopen",
+        reopened.read(5, scratch, out) && gsSame(out, first)
+    );
+    reopened.close();
+
+    // A closed file: the write fails and the slot keeps its record.
+    let closed : RegionFile = RegionFile::openWrite(".", REGION_TEST_RX, REGION_TEST_RZ);
+    closed.close();
+    c.that(
+        "region: a write on a closed file fails",
+        !closed.write(5, gsNoise(20000, 1), 5, scratch)
+    );
+    c.that("region: ... and leaves the slot as it was", closed.has(5) && closed.timestamp(5) == 1);
+    c.that("region: a write to a closed file leaves the other slots", closed.has(6));
+    regionRemove(REGION_TEST_RX, REGION_TEST_RZ);
+}
+
+fn regionMakeDirectory(path : string) : bool {
+    try {
+        Path::from(path).mkdir();
+    } catch e : IOException {
+        return false;
+    }
+    return true;
+}
+
+fn regionRemoveDirectory(path : string) : void {
+    try {
+        Path::from(path).delete();
+    } catch e : IOException {
+        return;
+    }
+}
+
+// Overwrites the 4-byte location entry of `slot` with the given bytes, as a damaged file would have it.
+fn regionSetLocation(slot : i32, b0 : i32, b1 : i32, b2 : i32, b3 : i32) : void {
+    let file : RandomFile = RandomFile::openUpdate(RegionFile::pathOf(
+        ".",
+        REGION_TEST_RX,
+        REGION_TEST_RZ
+    ));
+    let entry : ByteBuf = new ByteBuf(16);
+    entry.push(b0);
+    entry.push(b1);
+    entry.push(b2);
+    entry.push(b3);
+    file.write((slot * 4) as i64, entry, 0, 4);
+    file.close();
+}
+
+fn regionDamageChecks(c : Checks) : void {
+    let scratch : RegionScratch = new RegionScratch();
+    let out : ByteBuf = new ByteBuf(16);
+    regionRemove(REGION_TEST_RX, REGION_TEST_RZ);
+    let region : RegionFile = RegionFile::openWrite(".", REGION_TEST_RX, REGION_TEST_RZ);
+    region.write(1, gsText(500, 1), 1, scratch);
+    region.write(2, gsText(500, 2), 1, scratch);
+    region.write(3, gsText(500, 3), 1, scratch);
+    region.finish();
+
+    // Slot 1 points far past the end of the file (sector 65535, 255 sectors); slot 3 points at slot 2's
+    // record with the right sector but a size that is too small to hold the record head (count 0).
+    regionSetLocation(1, 0, 255, 255, 255);
+    regionSetLocation(3, 0, 0, 2, 0);
+    let reader : RegionFile = RegionFile::openRead(".", REGION_TEST_RX, REGION_TEST_RZ);
+    c.that("region: a good slot reads beside damaged ones", reader.read(2, scratch, out));
+    c.that(
+        "region: a location past the end of the file does not read",
+        !reader.read(1, scratch, out)
+    );
+    c.that("region: a location with no sectors does not read", !reader.read(3, scratch, out));
+    reader.close();
+
+    // Writing and erasing over a damaged table must not abort either.
+    let damaged : RegionFile = RegionFile::openWrite(".", REGION_TEST_RX, REGION_TEST_RZ);
+    damaged.erase(1);
+    c.that("region: erasing a slot whose location is outside the file is safe", !damaged.has(1));
+    c.that("region: a good slot still reads after it", damaged.read(2, scratch, out));
+    let fresh : ByteBuf = gsText(700, 9);
+    c.that("region: writing over a damaged slot succeeds", damaged.write(3, fresh, 4, scratch));
+    c.that("region: ... and reads back", damaged.read(3, scratch, out) && gsSame(out, fresh));
+    damaged.finish();
+    regionRemove(REGION_TEST_RX, REGION_TEST_RZ);
+}
+
+fn regionMeasure(c : Checks) : void {
+    let scratch : RegionScratch = new RegionScratch();
+    let out : ByteBuf = new ByteBuf(1 << 16);
+    regionRemove(REGION_TEST_RX, REGION_TEST_RZ);
+    let region : RegionFile = RegionFile::openWrite(".", REGION_TEST_RX, REGION_TEST_RZ);
+    let chunk : ByteBuf = gsText(100000, 3);
+    let mut bestWrite : i64 = (1 as i64) << 60;
+    let mut ok : bool = true;
+    for (run of 0..3) {
+        let t0 : i64 = nowNanos();
+        for (slot of 0..64) {
+            ok = ok && region.write(slot, chunk, 1, scratch);
+        }
+        let dt : i64 = nowNanos() - t0;
+        if (dt < bestWrite) {
+            bestWrite = dt;
+        }
+    }
+    region.finish();
+    let reader : RegionFile = RegionFile::openRead(".", REGION_TEST_RX, REGION_TEST_RZ);
+    let mut bestRead : i64 = (1 as i64) << 60;
+    for (run of 0..5) {
+        let t0 : i64 = nowNanos();
+        for (slot of 0..64) {
+            ok = ok && reader.read(slot, scratch, out);
+        }
+        let dt : i64 = nowNanos() - t0;
+        if (dt < bestRead) {
+            bestRead = dt;
+        }
+    }
+    reader.close();
+    regionRemove(REGION_TEST_RX, REGION_TEST_RZ);
+    c.that("region: the measured chunks write and read", ok && gsSame(out, chunk));
+    let writeUs : i64 = bestWrite / 64000;
+    let readUs : i64 = bestRead / 64000;
+    println("measured: RegionFile 100 KB chunk: write ${writeUs} us (zlib), read ${readUs} us");
+}

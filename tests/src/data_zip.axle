@@ -1,0 +1,353 @@
+// data_zip — checks for ZipReader: entries, duplicate names, damaged directories, the rate.
+//
+// The archives are built here, byte by byte, so every field the reader trusts can be made wrong on purpose: a
+// method that does not fit a byte, a directory that ends before its names do, an offset and a size that
+// overflow when added, the same name twice. A damaged archive must answer `isOpen` false (or a failed read),
+// never abort. A `measured:` line gives the entries read per second.
+
+use std::ffi::libc::fs;
+
+use ludax::{ByteBuf, Checks, RandomFile, ZipReader, nowNanos};
+
+use crate::generic_support::{gsNoise, gsPatterned, gsPrefix, gsRawDeflate, gsSame, gsText};
+
+/** A zip archive under construction: the local records, the central directory, and the end record. */
+pub class ZipMaker {
+    /** The local records written so far. */
+    pub body : ByteBuf;
+
+    /** The central directory records written so far. */
+    pub directory : ByteBuf;
+
+    /** How many entries were added. */
+    pub entries : i32 = 0;
+
+    /** An archive with no entries. */
+    constructor() {
+        self.body = new ByteBuf(1024);
+        self.directory = new ByteBuf(1024);
+    }
+
+    /** Appends `v` as 2 bytes, least significant first. */
+    pub static fn put16(out : ByteBuf, v : i32) : void {
+        out.push(v);
+        out.push(v >> 8);
+    }
+
+    /**
+     * Adds one entry: `stored` holds the bytes as they sit in the archive, `plain` is the size the directory
+     * declares.
+     */
+    pub fn add(mut self, name : string, method : i32, stored : ByteBuf, plain : i32) : void {
+        let offset : i32 = self.body.len();
+        self.body.pushLe32(0x04034b50);
+        ZipMaker::put16(self.body, 20);
+        ZipMaker::put16(self.body, 0);
+        ZipMaker::put16(self.body, method);
+        self.body.pushLe32(0);
+        self.body.pushLe32(0);
+        self.body.pushLe32(stored.len());
+        self.body.pushLe32(plain);
+        ZipMaker::put16(self.body, name.byteLength as i32);
+        ZipMaker::put16(self.body, 0);
+        self.body.pushText(name);
+        self.body.pushRange(stored, 0, stored.len());
+
+        self.directory.pushLe32(0x02014b50);
+        ZipMaker::put16(self.directory, 20);
+        ZipMaker::put16(self.directory, 20);
+        ZipMaker::put16(self.directory, 0);
+        ZipMaker::put16(self.directory, method);
+        self.directory.pushLe32(0);
+        self.directory.pushLe32(0);
+        self.directory.pushLe32(stored.len());
+        self.directory.pushLe32(plain);
+        ZipMaker::put16(self.directory, name.byteLength as i32);
+        ZipMaker::put16(self.directory, 0);
+        ZipMaker::put16(self.directory, 0);
+        ZipMaker::put16(self.directory, 0);
+        ZipMaker::put16(self.directory, 0);
+        self.directory.pushLe32(0);
+        self.directory.pushLe32(offset);
+        self.directory.pushText(name);
+        self.entries = self.entries + 1;
+    }
+
+    /** Adds an entry of method 0. */
+    pub fn addStored(mut self, name : string, data : ByteBuf) : void {
+        self.add(name, 0, data, data.len());
+    }
+
+    /** Adds an entry of method 8. */
+    pub fn addDeflated(mut self, name : string, data : ByteBuf) : void {
+        self.add(name, 8, gsRawDeflate(data), data.len());
+    }
+
+    /** The archive bytes: the records, the directory and an end record carrying `comment`. */
+    pub fn bytes(self, comment : string) : ByteBuf {
+        let out : ByteBuf = new ByteBuf(self.body.len() + self.directory.len() + 64);
+        out.pushRange(self.body, 0, self.body.len());
+        out.pushRange(self.directory, 0, self.directory.len());
+        ZipMaker::endRecord(out, self.entries, self.directory.len(), self.body.len(), comment);
+        return out;
+    }
+
+    /** Appends an end-of-central-directory record with the given (possibly false) numbers. */
+    pub static fn endRecord(
+        out : ByteBuf,
+        entries : i32,
+        dirSize : i32,
+        dirOffset : i32,
+        comment : string
+    ) : void {
+        out.pushLe32(0x06054b50);
+        ZipMaker::put16(out, 0);
+        ZipMaker::put16(out, 0);
+        ZipMaker::put16(out, entries);
+        ZipMaker::put16(out, entries);
+        out.pushLe32(dirSize);
+        out.pushLe32(dirOffset);
+        ZipMaker::put16(out, comment.byteLength as i32);
+        out.pushText(comment);
+    }
+}
+
+/** The ZipReader checks. */
+pub class ZipSuite {
+    /** Runs every check of the suite. */
+    pub static fn run(c : Checks) : void {
+        zipReadChecks(c);
+        zipDuplicateChecks(c);
+        zipDamageChecks(c);
+        zipMeasure(c);
+    }
+
+    /** Prints the `measured:` line alone. */
+    pub static fn measure(c : Checks) : void {
+        zipMeasure(c);
+    }
+}
+
+// Writes `bytes` to `path`; the file is removed by the caller.
+fn zipWrite(path : string, bytes : ByteBuf) : bool {
+    let file : RandomFile = RandomFile::create(path);
+    let ok : bool = file.isOpen() && file.write(0, bytes, 0, bytes.len());
+    file.close();
+    return ok;
+}
+
+// True when the archive at `path` opens; the file is closed again so it can be removed.
+fn zipOpens(path : string) : bool {
+    let reader : ZipReader = new ZipReader(path);
+    let ok : bool = reader.isOpen();
+    reader.close();
+    return ok;
+}
+
+fn zipReadChecks(c : Checks) : void {
+    let path : string = "ludax_test_zip_read.zip";
+    let text : ByteBuf = gsText(5000, 3);
+    let noise : ByteBuf = gsNoise(3000, 4);
+    let empty : ByteBuf = new ByteBuf(16);
+    let zip : ZipMaker = new ZipMaker();
+    zip.addStored("a/stored.txt", text);
+    zip.addDeflated("b/deflated.txt", text);
+    zip.addStored("c/noise.bin", noise);
+    zip.addDeflated("d/empty.bin", empty);
+    c.that("zip: the test archive is written", zipWrite(path, zip.bytes("")));
+
+    let reader : ZipReader = new ZipReader(path);
+    let out : ByteBuf = new ByteBuf(16);
+    c.that("zip: a well-formed archive opens", reader.isOpen());
+    c.sameInt("zip: ... with 4 entries", reader.count(), 4);
+    c.sameInt("zip: find answers the entry index", reader.find("c/noise.bin"), 2);
+    c.sameInt("zip: find answers -1 for an absent name", reader.find("nope"), -1);
+    c.that("zip: has agrees with find", reader.has("a/stored.txt") && !reader.has("a"));
+    c.that("zip: name answers the entry's name", reader.name(1) == "b/deflated.txt");
+    c.sameInt("zip: sizeOf answers the uncompressed size", reader.sizeOf(1), 5000);
+    c.that("zip: a stored entry reads back", reader.read(0, out) && gsSame(out, text));
+    c.that(
+        "zip: a deflated entry reads back",
+        reader.readNamed("b/deflated.txt", out) && gsSame(out, text)
+    );
+    c.that("zip: noise reads back", reader.readNamed("c/noise.bin", out) && gsSame(out, noise));
+    c.that(
+        "zip: an empty entry reads back empty",
+        reader.readNamed("d/empty.bin", out) && out.len() == 0
+    );
+    c.that("zip: an index below 0 is refused", !reader.read(-1, out));
+    c.that("zip: an index past the end is refused", !reader.read(4, out));
+    c.that("zip: an absent name is refused", !reader.readNamed("nope", out));
+    reader.close();
+    c.that("zip: a closed reader refuses reads", !reader.isOpen() && !reader.read(0, out));
+    fs::remove(path);
+
+    // A comment after the end record is skipped; no entries is a valid archive.
+    let commented : ZipMaker = new ZipMaker();
+    commented.addStored("only", text);
+    c.that(
+        "zip: the commented archive is written",
+        zipWrite(path, commented.bytes("an archive comment of some length"))
+    );
+    let withComment : ZipReader = new ZipReader(path);
+    c.that(
+        "zip: an end record followed by a comment is found",
+        withComment.isOpen() && withComment.count() == 1
+    );
+    c.that("zip: ... and its entry reads", withComment.readNamed("only", out) && gsSame(out, text));
+    withComment.close();
+    fs::remove(path);
+
+    let none : ZipMaker = new ZipMaker();
+    c.that("zip: the empty archive is written", zipWrite(path, none.bytes("")));
+    let nothing : ZipReader = new ZipReader(path);
+    c.that(
+        "zip: an archive without entries opens with none",
+        nothing.isOpen() && nothing.count() == 0
+    );
+    nothing.close();
+    fs::remove(path);
+
+    let missing : ZipReader = new ZipReader("ludax_test_zip_missing.zip");
+    c.that("zip: a missing file is a closed reader", !missing.isOpen() && missing.count() == 0);
+    missing.close();
+}
+
+fn zipDuplicateChecks(c : Checks) : void {
+    let path : string = "ludax_test_zip_dup.zip";
+    let one : ByteBuf = gsText(100, 1);
+    let two : ByteBuf = gsText(200, 2);
+    let three : ByteBuf = gsText(300, 3);
+    let zip : ZipMaker = new ZipMaker();
+    zip.addStored("same", one);
+    zip.addStored("other", two);
+    zip.addStored("same", three);
+    zip.addStored("last", one);
+    c.that("zip: the duplicate-name archive is written", zipWrite(path, zip.bytes("")));
+    let reader : ZipReader = new ZipReader(path);
+    let out : ByteBuf = new ByteBuf(16);
+    c.that("zip: an archive with a repeated name opens", reader.isOpen());
+    c.sameInt("zip: ... counting every entry", reader.count(), 4);
+    c.that("zip: entry 3 keeps its own name", reader.name(3) == "last");
+    c.that("zip: entry 2 keeps its own name", reader.name(2) == "same");
+    c.that("zip: find answers the first of a repeated name", reader.find("same") == 0);
+    c.that(
+        "zip: find of a later name is not shifted",
+        reader.find("last") == 3 && reader.find("other") == 1
+    );
+    c.that("zip: entry 3 reads its own bytes", reader.read(3, out) && gsSame(out, one));
+    c.that(
+        "zip: the second entry of the repeated name is readable by index",
+        reader.read(2, out) && gsSame(out, three)
+    );
+    reader.close();
+    fs::remove(path);
+}
+
+fn zipDamageChecks(c : Checks) : void {
+    let path : string = "ludax_test_zip_bad.zip";
+    let text : ByteBuf = gsText(2000, 5);
+    let out : ByteBuf = new ByteBuf(16);
+
+    // A method that does not fit a byte must not read as 8 (264 = 0x108) or 0 (256).
+    let wide : ZipMaker = new ZipMaker();
+    wide.add("method264", 264, gsRawDeflate(text), text.len());
+    wide.add("method256", 256, text, text.len());
+    c.that("zip: the wide-method archive is written", zipWrite(path, wide.bytes("")));
+    let wideReader : ZipReader = new ZipReader(path);
+    c.that(
+        "zip: a method of 264 is not read as deflate",
+        wideReader.isOpen() && !wideReader.read(0, out)
+    );
+    c.that("zip: a method of 256 is not read as stored", !wideReader.read(1, out));
+    wideReader.close();
+    fs::remove(path);
+
+    // Directory fields that lie: offset plus size overflows, a name longer than the directory, a short
+    // directory.
+    let good : ZipMaker = new ZipMaker();
+    good.addStored("name", text);
+    let overflow : ByteBuf = new ByteBuf(1024);
+    overflow.pushRange(good.body, 0, good.body.len());
+    overflow.pushRange(good.directory, 0, good.directory.len());
+    ZipMaker::endRecord(overflow, 1, 2147483000, 2147483000, "");
+    c.that("zip: the overflow archive is written", zipWrite(path, overflow));
+    c.that("zip: a directory offset and size that overflow are refused", !zipOpens(path));
+    fs::remove(path);
+
+    let longName : ByteBuf = good.bytes("");
+    let nameLenAt : i32 = good.body.len() + 28;
+    longName.set(nameLenAt, 255);
+    longName.set(nameLenAt + 1, 255);
+    c.that("zip: the long-name archive is written", zipWrite(path, longName));
+    c.that("zip: a name longer than the directory is refused", !zipOpens(path));
+    fs::remove(path);
+
+    let moreEntries : ByteBuf = good.bytes("");
+    moreEntries.set(moreEntries.len() - 22 + 10, 5);
+    moreEntries.set(moreEntries.len() - 22 + 8, 5);
+    c.that("zip: the count-mismatch archive is written", zipWrite(path, moreEntries));
+    c.that("zip: more entries than the directory holds are refused", !zipOpens(path));
+    fs::remove(path);
+
+    // Cut at every length: never an abort; a cut that keeps the end record is a complete archive.
+    let whole : ByteBuf = good.bytes("");
+    let mut opened : i32 = 0;
+    for (n of 0..(whole.len() - 1)) {
+        let cut : ByteBuf = gsPrefix(whole, n);
+        zipWrite(path, cut);
+        let r : ZipReader = new ZipReader(path);
+        if (r.isOpen()) {
+            opened = opened + 1;
+        }
+        r.close();
+    }
+    fs::remove(path);
+    c.sameInt("zip: an archive cut anywhere before its end record is refused", opened, 0);
+
+    // Garbage and noise.
+    zipWrite(path, gsNoise(5000, 8));
+    c.that("zip: noise is not an archive", !zipOpens(path));
+    fs::remove(path);
+
+    // A local header that disagrees with the directory (a bad signature) fails the read, not the program.
+    let badLocal : ByteBuf = good.bytes("");
+    badLocal.set(0, 0);
+    zipWrite(path, badLocal);
+    let reader : ZipReader = new ZipReader(path);
+    c.that("zip: a bad local signature fails the read", reader.isOpen() && !reader.read(0, out));
+    reader.close();
+    fs::remove(path);
+}
+
+fn zipMeasure(c : Checks) : void {
+    let path : string = "ludax_test_zip_rate.zip";
+    let zip : ZipMaker = new ZipMaker();
+    let mut total : i64 = 0;
+    for (i of 0..2000) {
+        let data : ByteBuf = gsText(2048 + (i % 7) * 100, i);
+        total = total + (data.len() as i64);
+        zip.addDeflated("entries/e${i}.txt", data);
+    }
+    c.that("zip: the measured archive is written", zipWrite(path, zip.bytes("")));
+    let reader : ZipReader = new ZipReader(path);
+    let out : ByteBuf = new ByteBuf(1 << 16);
+    let mut best : i64 = (1 as i64) << 60;
+    let mut ok : bool = reader.isOpen();
+    for (run of 0..5) {
+        let t0 : i64 = nowNanos();
+        for (i of 0..2000) {
+            ok = ok && reader.read(i, out);
+        }
+        let dt : i64 = nowNanos() - t0;
+        if (dt < best) {
+            best = dt;
+        }
+    }
+    reader.close();
+    fs::remove(path);
+    c.that("zip: every measured entry reads", ok);
+    let perSecond : i64 = (2000 as i64) * 1000000000 / (best + 1);
+    let rate : i64 = total * 1000 / (best + 1);
+    println("measured: ZipReader 2000 entries (${total} bytes): ${perSecond} entries/s, ${rate} MB/s");
+}

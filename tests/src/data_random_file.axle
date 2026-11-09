@@ -1,0 +1,174 @@
+// data_random_file — checks for RandomFile: positional read and write, growth, failure values.
+//
+// A failed open is a value, so most checks are about what a closed or misused file answers: false, never an
+// abort, and no change to the file. The files are written under a name no game uses in the working directory
+// and removed. A `measured:` line gives the rate of 4 KB positional reads.
+
+use std::ffi::libc::fs;
+
+use ludax::{ByteBuf, Checks, RandomFile, nowNanos};
+
+use crate::generic_support::{gsNoise, gsPatterned, gsSame};
+
+/** The RandomFile checks. */
+pub class RandomFileSuite {
+    /** Runs every check of the suite. */
+    pub static fn run(c : Checks) : void {
+        randomFileChecks(c);
+        randomFileFailureChecks(c);
+        randomFileMeasure(c);
+    }
+
+    /** Prints the `measured:` line alone. */
+    pub static fn measure(c : Checks) : void {
+        randomFileMeasure(c);
+    }
+}
+
+fn randomFileChecks(c : Checks) : void {
+    let path : string = "ludax_test_random_file.bin";
+    let data : ByteBuf = gsPatterned(10000, 2);
+    let out : ByteBuf = new ByteBuf(16);
+
+    let file : RandomFile = RandomFile::create(path);
+    c.that("random file: a file is created", file.isOpen());
+    c.sameInt("random file: ... empty", file.length(), 0);
+    c.that("random file: a write succeeds", file.write(0, data, 0, data.len()));
+    c.sameInt("random file: ... and the length follows", file.length(), 10000);
+    c.that("random file: the whole file reads back", file.read(0, 10000, out) && gsSame(out, data));
+    c.that(
+        "random file: a middle range reads back",
+        file.read(1234, 100, out) && out.len() == 100 && out.get(0) == data.get(1234)
+    );
+    c.that("random file: a read of zero bytes succeeds", file.read(50, 0, out) && out.len() == 0);
+    c.that(
+        "random file: a read ending at the end succeeds",
+        file.read(9990, 10, out) && out.get(9) == data.get(9999)
+    );
+    c.that("random file: a read past the end fails", !file.read(9990, 11, out));
+    c.that("random file: a read starting past the end fails", !file.read(10001, 1, out));
+    c.that("random file: a negative offset fails", !file.read(-1, 1, out));
+    c.that("random file: a negative count fails", !file.read(0, -1, out));
+
+    // An overwrite in the middle changes only that range; a write at the end extends.
+    let patch : ByteBuf = gsNoise(300, 3);
+    c.that("random file: an overwrite in the middle succeeds", file.write(5000, patch, 0, 300));
+    c.sameInt("random file: ... without changing the length", file.length(), 10000);
+    c.that(
+        "random file: ... and reads back changed",
+        file.read(5000, 300, out) && gsSame(out, patch)
+    );
+    c.that(
+        "random file: ... leaving the bytes before it",
+        file.read(4990, 10, out) && out.get(0) == data.get(4990)
+    );
+    c.that("random file: a write at the end extends the file", file.write(10000, patch, 100, 200));
+    c.sameInt("random file: ... by its size", file.length(), 10100);
+    c.that(
+        "random file: a write inside a larger buffer takes the right slice",
+        file.read(10000, 100, out) && out.get(0) == patch.get(100)
+    );
+    c.that(
+        "random file: a write beyond the end leaves a gap and extends",
+        file.write(10200, patch, 0, 10)
+    );
+    c.sameInt("random file: ... to the end of the write", file.length(), 10210);
+    c.that(
+        "random file: ... with zeros in the gap",
+        file.read(10100, 100, out) && out.get(0) == 0 && out.get(99) == 0
+    );
+    file.flush();
+    file.close();
+    c.that("random file: a closed file reports closed", !file.isOpen());
+    file.close();
+    c.that("random file: closing twice is harmless", !file.isOpen());
+    c.that("random file: a closed file refuses reads", !file.read(0, 1, out));
+    c.that("random file: a closed file refuses writes", !file.write(0, patch, 0, 1));
+
+    // Update mode keeps the content; read mode refuses to change it.
+    let update : RandomFile = RandomFile::openUpdate(path);
+    c.that(
+        "random file: an existing file opens for update",
+        update.isOpen() && update.length() == 10210
+    );
+    c.that(
+        "random file: ... with its content kept",
+        update.read(5000, 300, out) && gsSame(out, patch)
+    );
+    c.that("random file: ... and is writable", update.write(0, patch, 0, 4));
+    update.close();
+    let reader : RandomFile = RandomFile::openRead(path);
+    c.that(
+        "random file: the update was kept on disk",
+        reader.read(0, 4, out) && out.get(2) == patch.get(2)
+    );
+    reader.close();
+
+    // Create replaces.
+    let fresh : RandomFile = RandomFile::create(path);
+    c.sameInt("random file: create truncates an existing file", fresh.length(), 0);
+    fresh.close();
+    fs::remove(path);
+}
+
+fn randomFileFailureChecks(c : Checks) : void {
+    let out : ByteBuf = new ByteBuf(16);
+    let data : ByteBuf = gsPatterned(100, 1);
+    let missing : RandomFile = RandomFile::openRead("ludax_test_no_such_file.bin");
+    c.that("random file: a missing file is closed, not fatal", !missing.isOpen());
+    c.sameInt("random file: ... with length 0", missing.length(), 0);
+    c.that("random file: ... refusing reads", !missing.read(0, 1, out));
+    c.that("random file: ... and writes", !missing.write(0, data, 0, 10));
+    missing.flush();
+    missing.close();
+    c.that(
+        "random file: update of a missing file fails",
+        !RandomFile::openUpdate("ludax_test_no_such_file.bin").isOpen()
+    );
+
+    let path : string = "ludax_test_random_bad.bin";
+    let file : RandomFile = RandomFile::create(path);
+    file.write(0, data, 0, 100);
+    c.that("random file: a reversed range is refused", !file.write(0, data, 10, 5));
+    c.that("random file: a range past the buffer is refused", !file.write(0, data, 50, 101));
+    c.that("random file: a negative start is refused", !file.write(0, data, -1, 5));
+    c.that("random file: a negative offset is refused", !file.write(-5, data, 0, 5));
+    c.sameInt("random file: refused writes leave the length", file.length(), 100);
+    c.that(
+        "random file: a write past the file size limit is refused",
+        !file.write(2147483640, data, 0, 100)
+    );
+    c.sameInt("random file: ... and leaves the length", file.length(), 100);
+    c.that(
+        "random file: the data is intact after the refusals",
+        file.read(0, 100, out) && gsSame(out, data)
+    );
+    file.close();
+    fs::remove(path);
+}
+
+fn randomFileMeasure(c : Checks) : void {
+    let path : string = "ludax_test_random_rate.bin";
+    let data : ByteBuf = gsNoise(1 << 20, 4);
+    let file : RandomFile = RandomFile::create(path);
+    file.write(0, data, 0, data.len());
+    file.flush();
+    let out : ByteBuf = new ByteBuf(8192);
+    let mut best : i64 = (1 as i64) << 60;
+    let mut ok : bool = true;
+    for (run of 0..7) {
+        let t0 : i64 = nowNanos();
+        for (k of 0..256) {
+            ok = ok && file.read(((k * 7919) % 250) as i64 * 4096, 4096, out);
+        }
+        let dt : i64 = nowNanos() - t0;
+        if (dt < best) {
+            best = dt;
+        }
+    }
+    file.close();
+    fs::remove(path);
+    c.that("random file: the measured reads succeed", ok && out.len() == 4096);
+    let rate : i64 = 256 * 4096 * 1000 / (best + 1);
+    println("measured: RandomFile 256 positional reads of 4 KiB: ${rate} MB/s (best of 7)");
+}

@@ -1,0 +1,537 @@
+// data_nbt — checks for NbtReader and NbtWriter: every tag type, nesting, damage, hostile counts.
+//
+// The writer and the reader are each other's test: a document with one tag of every type is written, read
+// back value by value, and written again from the reader's raw bytes. The rest is what a damaged file does to
+// a reader that must not abort: nesting past the limit, a document cut at every length, and counts that would
+// wrap around 32 bits (an int array of 2^30 ints is 2^32 bytes, which is 0 once truncated). Each must end in
+// `failed`. A `measured:` line gives the rate of a walk over a 100 KB document.
+
+use ludax::{
+    ByteBuf, Checks, NBT_TAG_BYTE, NBT_TAG_BYTE_ARRAY, NBT_TAG_COMPOUND, NBT_TAG_DOUBLE,
+    NBT_TAG_END, NBT_TAG_FLOAT, NBT_TAG_INT, NBT_TAG_INT_ARRAY, NBT_TAG_LIST, NBT_TAG_LONG,
+    NBT_TAG_LONG_ARRAY, NBT_TAG_SHORT, NBT_TAG_STRING, NbtReader, NbtWriter, nowNanos
+};
+
+use crate::generic_support::{gsHex, gsPrefix, gsSame};
+
+/** The NBT checks. */
+pub class NbtSuite {
+    /** Runs every check of the suite. */
+    pub static fn run(c : Checks) : void {
+        nbtRoundTripChecks(c);
+        nbtShapeChecks(c);
+        nbtDamageChecks(c);
+        nbtHostileChecks(c);
+        nbtMeasure(c);
+    }
+
+    /** Prints the `measured:` line alone. */
+    pub static fn measure(c : Checks) : void {
+        nbtMeasure(c);
+    }
+}
+
+// A reader over a copy of `bytes` (the reader takes its buffer, and the checks keep theirs).
+fn nbtOver(bytes : ByteBuf) : NbtReader {
+    return new NbtReader(gsPrefix(bytes, bytes.len()));
+}
+
+// A document with one tag of every type, 3 elements in each array and list.
+fn nbtSample() : ByteBuf {
+    let w : NbtWriter = new NbtWriter(256);
+    w.beginRoot("root");
+    w.putByte("byte", -5);
+    w.putShort("short", -300);
+    w.putInt("int", -70000);
+    w.putLong("long", -5000000000);
+    w.putFloat("float", 1.5 as f32);
+    w.putDouble("double", -2.25);
+    w.putString("string", "héllo");
+    w.beginByteArray("bytes", 3);
+    w.pushByte(1);
+    w.pushByte(255);
+    w.pushByte(7);
+    w.beginIntArray("ints", 3);
+    w.pushInt(10);
+    w.pushInt(-20);
+    w.pushInt(30);
+    w.beginLongArray("longs", 3);
+    w.pushLong(1);
+    w.pushLong(-2);
+    w.pushLong(4000000000);
+    w.beginList("intList", NBT_TAG_INT, 3);
+    w.putIntItem(5);
+    w.putIntItem(6);
+    w.putIntItem(7);
+    w.beginList("stringList", NBT_TAG_STRING, 2);
+    w.putStringItem("a");
+    w.putStringItem("bc");
+    w.beginList("compoundList", NbtWriter::compoundType(), 2);
+    w.putInt("n", 1);
+    w.end();
+    w.putInt("n", 2);
+    w.end();
+    w.beginCompound("inner");
+    w.putInt("deep", 99);
+    w.end();
+    w.end();
+    return w.bytes();
+}
+
+fn nbtRoundTripChecks(c : Checks) : void {
+    let doc : ByteBuf = nbtSample();
+    let r : NbtReader = nbtOver(doc);
+    c.that("nbt: the root is a compound", r.readRoot());
+    let mut seen : i32 = 0;
+    let mut values : i32 = 0;
+    while (r.next()) {
+        seen = seen + 1;
+        if (r.nameIs("byte") && r.isTag(NBT_TAG_BYTE) && r.readByte() == -5) {
+            values = values + 1;
+        } else if (r.nameIs("short") && r.readShort() == -300) {
+            values = values + 1;
+        } else if (r.nameIs("int") && r.readInt() == -70000) {
+            values = values + 1;
+        } else if (r.nameIs("long") && r.readLong() == -5000000000) {
+            values = values + 1;
+        } else if (r.nameIs("float") && r.readFloat() == (1.5 as f32)) {
+            values = values + 1;
+        } else if (r.nameIs("double") && r.readDouble() == -2.25) {
+            values = values + 1;
+        } else if (r.nameIs("string") && r.readString() == "héllo") {
+            values = values + 1;
+        } else if (r.nameIs("bytes")) {
+            values = values + nbtCheckBytes(r);
+        } else if (r.nameIs("ints")) {
+            values = values + nbtCheckInts(r);
+        } else if (r.nameIs("longs")) {
+            values = values + nbtCheckLongs(r);
+        } else if (r.nameIs("intList")) {
+            values = values + nbtCheckIntList(r);
+        } else if (r.nameIs("stringList")) {
+            values = values + nbtCheckStrings(r);
+        } else if (r.nameIs("compoundList")) {
+            values = values + nbtCheckCompounds(r);
+        } else if (r.nameIs("inner")) {
+            values = values + nbtCheckInner(r);
+        } else {
+            r.skipValue();
+        }
+    }
+    c.sameInt("nbt: every entry of the root is met", seen, 14);
+    c.sameInt("nbt: every value reads back", values, 14);
+    c.that(
+        "nbt: the reader ends without failure at the end of the document",
+        !r.failed() && r.atEnd()
+    );
+
+    // Skipping everything gives the same end position as reading everything.
+    let skipper : NbtReader = nbtOver(doc);
+    skipper.readRoot();
+    while (skipper.next()) {
+        skipper.skipValue();
+    }
+    c.that(
+        "nbt: skipValue over every tag type ends at the end",
+        !skipper.failed() && skipper.atEnd()
+    );
+
+    // Writing the document again from its own bytes gives the same bytes; two builds are identical.
+    c.that("nbt: two builds of the document are the same bytes", gsSame(doc, nbtSample()));
+    let copy : NbtWriter = new NbtWriter(16);
+    copy.copyRaw(doc, 0, doc.len());
+    c.that("nbt: copyRaw reproduces the bytes", gsSame(copy.bytes(), doc));
+    copy.clear();
+    c.sameInt("nbt: clear empties the writer", copy.bytes().len(), 0);
+
+    // Entry names and raw copies: entryStart is where the tag header began.
+    let named : NbtReader = nbtOver(doc);
+    named.readRoot();
+    named.next();
+    c.that("nbt: name answers the entry's name", named.name() == "byte");
+    let out : ByteBuf = new ByteBuf(16);
+    named.nameInto(out);
+    c.sameInt("nbt: nameInto appends the name bytes", out.len(), 4);
+    c.sameInt("nbt: the first entry starts after the root header", named.entryStart(), 1 + 2 + 4);
+}
+
+fn nbtCheckBytes(r : NbtReader) : i32 {
+    let n : i32 = r.beginByteArray();
+    let mut out : u8[] = new u8[3];
+    r.readBytesInto(out, 0, n);
+    if (n == 3 && out[0] == 1 && out[1] == 255 && out[2] == 7) {
+        return 1;
+    }
+    return 0;
+}
+
+fn nbtCheckInts(r : NbtReader) : i32 {
+    let n : i32 = r.beginIntArray();
+    let a : i32 = r.readInt();
+    let b : i32 = r.readInt();
+    let c : i32 = r.readInt();
+    if (n == 3 && a == 10 && b == -20 && c == 30) {
+        return 1;
+    }
+    return 0;
+}
+
+fn nbtCheckLongs(r : NbtReader) : i32 {
+    let n : i32 = r.beginLongArray();
+    let mut out : u64[] = new u64[3];
+    r.readLongsInto(out, n);
+    if (n == 3 && out[0] == 1 && (out[1] as i64) == -2 && out[2] == 4000000000) {
+        return 1;
+    }
+    return 0;
+}
+
+fn nbtCheckIntList(r : NbtReader) : i32 {
+    r.beginList();
+    let mut sum : i32 = 0;
+    for (i of 0..r.listCount()) {
+        sum = sum + r.readInt();
+    }
+    if (r.listType() == NBT_TAG_INT && r.listCount() == 3 && sum == 18) {
+        return 1;
+    }
+    return 0;
+}
+
+fn nbtCheckStrings(r : NbtReader) : i32 {
+    r.beginList();
+    let first : bool = r.stringIs("a");
+    let second : bool = r.stringIs("xx");
+    if (r.listType() == NBT_TAG_STRING && first && !second && !r.failed()) {
+        return 1;
+    }
+    return 0;
+}
+
+fn nbtCheckCompounds(r : NbtReader) : i32 {
+    r.beginList();
+    let mut total : i32 = 0;
+    for (i of 0..r.listCount()) {
+        while (r.next()) {
+            if (r.nameIs("n")) {
+                total = total + r.readInt();
+            } else {
+                r.skipValue();
+            }
+        }
+    }
+    if (r.listType() == NBT_TAG_COMPOUND && total == 3) {
+        return 1;
+    }
+    return 0;
+}
+
+fn nbtCheckInner(r : NbtReader) : i32 {
+    let mut deep : i32 = 0;
+    while (r.next()) {
+        if (r.nameIs("deep")) {
+            deep = r.readInt();
+        } else {
+            r.skipValue();
+        }
+    }
+    if (deep == 99) {
+        return 1;
+    }
+    return 0;
+}
+
+fn nbtShapeChecks(c : Checks) : void {
+    // The empty compound.
+    let empty : NbtWriter = new NbtWriter(16);
+    empty.beginRoot("");
+    empty.end();
+    let r : NbtReader = nbtOver(empty.bytes());
+    c.that("nbt: an empty root reads", r.readRoot() && !r.next() && !r.failed() && r.atEnd());
+
+    // A root that is not a compound is refused; the reused-buffer form works across documents.
+    let notCompound : ByteBuf = gsHex("0100000000");
+    let bad : NbtReader = nbtOver(notCompound);
+    c.that("nbt: a root that is not a compound is refused", !bad.readRoot() && bad.failed());
+    let reused : NbtReader = new NbtReader();
+    let doc : ByteBuf = nbtSample();
+    reused.buffer().pushRange(doc, 0, doc.len());
+    reused.reset();
+    c.that(
+        "nbt: a reader with its own buffer reads after reset",
+        reused.readRoot() && reused.next()
+    );
+    reused.buffer().clear();
+    reused.buffer().pushRange(empty.bytes(), 0, empty.bytes().len());
+    reused.reset();
+    c.that(
+        "nbt: ... and again after another document",
+        reused.readRoot() && !reused.next() && !reused.failed()
+    );
+
+    // A list of zero elements and a list of one million bytes skip at once.
+    let lists : NbtWriter = new NbtWriter(16);
+    lists.beginRoot("");
+    lists.beginList("none", NBT_TAG_INT, 0);
+    lists.beginList("bytes", NBT_TAG_BYTE, 1000000);
+    for (i of 0..1000000) {
+        lists.pushByte(i);
+    }
+    lists.putInt("after", 4);
+    lists.end();
+    let walk : NbtReader = nbtOver(lists.bytes());
+    walk.readRoot();
+    let mut after : i32 = 0;
+    while (walk.next()) {
+        if (walk.nameIs("after")) {
+            after = walk.readInt();
+        } else {
+            walk.skipValue();
+        }
+    }
+    c.that(
+        "nbt: lists of 0 and of 1 000 000 bytes skip and the next tag reads",
+        after == 4 && !walk.failed()
+    );
+
+    // Nesting: the limit is 512 compounds below the root's entry.
+    c.that("nbt: 513 nested compounds are skipped", nbtNested(513));
+    c.that("nbt: 514 nested compounds are refused", !nbtNested(514));
+    c.that("nbt: 5000 nested compounds are refused without exhausting the stack", !nbtNested(5000));
+}
+
+// True when a chain of `depth` nested compounds can be skipped.
+fn nbtNested(depth : i32) : bool {
+    let w : NbtWriter = new NbtWriter(depth * 8 + 64);
+    w.beginRoot("");
+    for (i of 0..depth) {
+        w.beginCompound("c");
+    }
+    for (i of 0..depth) {
+        w.end();
+    }
+    w.end();
+    let r : NbtReader = nbtOver(w.bytes());
+    r.readRoot();
+    while (r.next()) {
+        r.skipValue();
+    }
+    return !r.failed();
+}
+
+fn nbtDamageChecks(c : Checks) : void {
+    let doc : ByteBuf = nbtSample();
+
+    // A document cut at every length must end in `failed` (or at a legal end), never abort.
+    let mut accepted : i32 = 0;
+    for (n of 0..(doc.len() - 1)) {
+        let cut : ByteBuf = gsPrefix(doc, n);
+        let r : NbtReader = nbtOver(cut);
+        if (r.readRoot()) {
+            while (r.next()) {
+                r.skipValue();
+            }
+        }
+        if (!r.failed()) {
+            accepted = accepted + 1;
+        }
+    }
+    c.sameInt("nbt: a document cut short always fails", accepted, 0);
+
+    // The same by typed reads (the loops of a real consumer end when the reader fails).
+    let mut survived : i32 = 0;
+    for (n of 0..(doc.len() - 1)) {
+        let r : NbtReader = nbtOver(gsPrefix(doc, n));
+        r.readRoot();
+        while (r.next()) {
+            if (r.nameIs("ints")) {
+                let count : i32 = r.beginIntArray();
+                for (i of 0..count) {
+                    r.readInt();
+                }
+            } else if (r.nameIs("longs")) {
+                let count : i32 = r.beginLongArray();
+                let mut out : u64[] = new u64[3];
+                r.readLongsInto(out, count);
+            } else if (r.nameIs("stringList")) {
+                r.beginList();
+                r.readString();
+                r.readString();
+            } else {
+                r.skipValue();
+            }
+        }
+        survived = survived + 1;
+    }
+    c.sameInt("nbt: typed reads over every cut end without an abort", survived, doc.len() - 1);
+
+    // Flipped bytes: never an abort.
+    let mut flips : i32 = 0;
+    for (i of 0..doc.len()) {
+        let copy : ByteBuf = gsPrefix(doc, doc.len());
+        copy.set(i, copy.get(i) ^ 255);
+        let r : NbtReader = nbtOver(copy);
+        if (r.readRoot()) {
+            while (r.next()) {
+                r.skipValue();
+            }
+        }
+        flips = flips + 1;
+    }
+    c.sameInt("nbt: every flipped byte is survived", flips, doc.len());
+
+    // Reads past the end answer zero and set `failed`.
+    let tiny : NbtReader = nbtOver(gsHex("0a00"));
+    tiny.readRoot();
+    c.that("nbt: a root header cut inside its name fails", tiny.failed());
+    c.sameInt("nbt: a read after failure answers zero", tiny.readInt(), 0);
+    c.that("nbt: a unknown tag type fails", nbtUnknownTag());
+}
+
+fn nbtUnknownTag() : bool {
+    let r : NbtReader = nbtOver(gsHex("0a0000990001780000"));
+    r.readRoot();
+    return !r.next() && r.failed();
+}
+
+// A root compound holding one entry of type `t` followed by the given bytes, read with skipValue.
+fn nbtHostile(t : i32, value : string) : bool {
+    let doc : ByteBuf = gsHex("0a0000");
+    doc.push(t);
+    doc.push(0);
+    doc.push(1);
+    doc.push(120);
+    let tail : ByteBuf = gsHex(value);
+    doc.pushRange(tail, 0, tail.len());
+    let r : NbtReader = nbtOver(doc);
+    r.readRoot();
+    r.next();
+    r.skipValue();
+    return r.failed();
+}
+
+fn nbtHostileCounts(t : i32, value : string) : bool {
+    let doc : ByteBuf = gsHex("0a0000");
+    doc.push(t);
+    doc.push(0);
+    doc.push(1);
+    doc.push(120);
+    let tail : ByteBuf = gsHex(value);
+    doc.pushRange(tail, 0, tail.len());
+    let r : NbtReader = nbtOver(doc);
+    r.readRoot();
+    r.next();
+    if (t == NBT_TAG_INT_ARRAY) {
+        r.beginIntArray();
+    } else if (t == NBT_TAG_LONG_ARRAY) {
+        r.beginLongArray();
+    } else {
+        r.beginByteArray();
+    }
+    return r.failed();
+}
+
+fn nbtHostileChecks(c : Checks) : void {
+    // Counts whose byte size wraps to 0 or a small number in 32 bits.
+    c.that(
+        "nbt: an int array of 2^30 ints (4 GiB) is refused",
+        nbtHostile(NBT_TAG_INT_ARRAY, "40000000")
+    );
+    c.that(
+        "nbt: a long array of 2^29 longs (4 GiB) is refused",
+        nbtHostile(NBT_TAG_LONG_ARRAY, "20000000")
+    );
+    c.that(
+        "nbt: a long array of 2^29 + 1 longs is refused",
+        nbtHostile(NBT_TAG_LONG_ARRAY, "20000001ffffffffffffffff")
+    );
+    c.that(
+        "nbt: an int array of 2^30 + 3 ints is refused",
+        nbtHostile(NBT_TAG_INT_ARRAY, "40000003000000010000000200000003")
+    );
+    c.that(
+        "nbt: a byte array of 2^31 - 1 bytes is refused",
+        nbtHostile(NBT_TAG_BYTE_ARRAY, "7fffffff")
+    );
+    c.that("nbt: a negative array count is refused", nbtHostile(NBT_TAG_INT_ARRAY, "ffffffff"));
+    c.that("nbt: a list of 2^29 longs is refused", nbtHostile(NBT_TAG_LIST, "0420000000"));
+    c.that("nbt: a list of 2^30 ints is refused", nbtHostile(NBT_TAG_LIST, "0340000000"));
+    c.that(
+        "nbt: a list of 2^31 - 1 compounds fails when the data ends",
+        nbtHostile(NBT_TAG_LIST, "0a7fffffff00")
+    );
+    c.that(
+        "nbt: beginIntArray refuses a wrapping count",
+        nbtHostileCounts(NBT_TAG_INT_ARRAY, "40000000")
+    );
+    c.that(
+        "nbt: beginLongArray refuses a wrapping count",
+        nbtHostileCounts(NBT_TAG_LONG_ARRAY, "20000000")
+    );
+    c.that(
+        "nbt: beginByteArray refuses a count past the end",
+        nbtHostileCounts(NBT_TAG_BYTE_ARRAY, "7fffffff")
+    );
+    c.that(
+        "nbt: an honest empty int array is accepted",
+        !nbtHostile(NBT_TAG_INT_ARRAY, "00000000")
+    );
+}
+
+fn nbtMeasure(c : Checks) : void {
+    // About 100 KB: a compound of chunk-like entries with arrays, lists and strings.
+    let w : NbtWriter = new NbtWriter(1 << 17);
+    w.beginRoot("");
+    for (section of 0..24) {
+        w.beginCompound("section");
+        w.putInt("y", section);
+        w.beginLongArray("data", 256);
+        for (i of 0..256) {
+            w.pushLong((section * 1000 + i) as i64);
+        }
+        w.beginByteArray("light", 512);
+        for (i of 0..512) {
+            w.pushByte(i);
+        }
+        w.beginList("palette", NBT_TAG_STRING, 6);
+        for (i of 0..6) {
+            w.putStringItem("minecraft:stone_${i}");
+        }
+        w.putString("note", "a short string value");
+        w.end();
+    }
+    w.end();
+    let doc : ByteBuf = w.bytes();
+
+    let mut best : i64 = (1 as i64) << 60;
+    let mut ok : bool = true;
+    let mut sum : i64 = 0;
+    for (run of 0..9) {
+        let r : NbtReader = nbtOver(doc);
+        let t0 : i64 = nowNanos();
+        r.readRoot();
+        while (r.next()) {
+            while (r.next()) {
+                if (r.nameIs("data")) {
+                    let n : i32 = r.beginLongArray();
+                    let mut longs : u64[] = new u64[256];
+                    r.readLongsInto(longs, n);
+                    sum = sum + (longs[5] as i64);
+                } else if (r.nameIs("y")) {
+                    sum = sum + (r.readInt() as i64);
+                } else {
+                    r.skipValue();
+                }
+            }
+        }
+        let dt : i64 = nowNanos() - t0;
+        ok = ok && !r.failed();
+        if (dt < best) {
+            best = dt;
+        }
+    }
+    c.that("nbt: the measured document walks without failure", ok && sum > 0);
+    let size : i64 = doc.len() as i64;
+    let rate : i64 = size * 1000 / (best + 1);
+    println("measured: NbtReader walk of ${size} bytes in ${best / 1000} us = ${rate} MB/s (best of 9)");
+}

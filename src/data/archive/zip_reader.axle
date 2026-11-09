@@ -1,0 +1,241 @@
+// zip_reader — reads entries out of a zip archive (a jar, an asset pack) without loading it.
+//
+// A 38 MB archive of 30000 entries is common and an importer wants a few thousand of them. A `ZipReader`
+// reads only the central directory (the table at the end of the file: one record per entry with its name,
+// sizes, compression method and the offset of its local header), keeps the names in an interner and the
+// numbers in flat arrays, and reads an entry's bytes on demand with one positional read and, for method 8,
+// one inflate. Method 0 (stored) and method 8 (deflate) are read; any other method, encryption and zip64 are
+// refused (`isOpen` is false for zip64, a read of an entry of another method fails). Offsets and sizes are
+// `i32`: the archives this reads are far below 2 GB.
+//
+// Every number of the directory is checked against the directory and the file before it is used, so a damaged
+// archive is a closed reader or a failed read, never an abort. The same name may appear twice (legal in the
+// format): every entry keeps its own index and its own name, and `find` answers the first.
+//
+// The directory costs about 2 MB for 30000 entries while the reader is open; closing it frees the arrays with
+// the object.
+
+use crate::core::id::string_id::{StringId, StringInterner};
+use crate::data::archive::random_file::RandomFile;
+use crate::data::bytes::ByteBuf;
+use crate::data::image::inflate_fast::FastInflater;
+use crate::data::text::DataText;
+
+const ZIP_EOCD_SIG : i32 = 0x06054b50;
+const ZIP_CENTRAL_SIG : i32 = 0x02014b50;
+const ZIP_LOCAL_SIG : i32 = 0x04034b50;
+const ZIP_EOCD_FIXED : i32 = 22;
+const ZIP_MAX_COMMENT : i32 = 65535;
+const ZIP_CENTRAL_FIXED : i32 = 46;
+const ZIP_LOCAL_FIXED : i32 = 30;
+const ZIP_METHOD_STORED : i32 = 0;
+const ZIP_METHOD_DEFLATE : i32 = 8;
+const ZIP_UNZIP_LIMIT : i32 = 268435456;
+const ZIP_FLAG_ENCRYPTED : i32 = 1;
+const ZIP_METHOD_UNSUPPORTED : i32 = 255;
+const ZIP_ZIP64_ENTRIES : i32 = 65535;
+
+/** An open zip archive. */
+pub class ZipReader {
+    file     : RandomFile;
+    names    : StringInterner;
+    count    : i32 = 0;
+    nameIds  : i32[];
+    firstOf  : i32[];
+    offsets  : i32[];
+    packed   : i32[];
+    sizes    : i32[];
+    methods  : u8[];
+    inflater : FastInflater;
+    scratch  : ByteBuf;
+    good     : bool = false;
+
+    /** Opens the archive at `path` and reads its directory; check `isOpen`. */
+    constructor(path : string) {
+        self.file = RandomFile::openRead(path);
+        self.names = new StringInterner();
+        self.nameIds = new i32[1];
+        self.firstOf = new i32[1];
+        self.offsets = new i32[1];
+        self.packed = new i32[1];
+        self.sizes = new i32[1];
+        self.methods = new u8[1];
+        self.inflater = new FastInflater(ZIP_UNZIP_LIMIT);
+        self.scratch = new ByteBuf(1 << 16);
+        if (self.file.isOpen()) {
+            self.good = self.readDirectory();
+        }
+    }
+
+    /** True when the archive opened and its directory is usable. */
+    pub fn isOpen(self) : bool {
+        return self.good;
+    }
+
+    /** How many entries it has. */
+    pub fn count(self) : i32 {
+        return self.count;
+    }
+
+    /** The name of entry `i` (borrowed from the directory; copy it to keep it). */
+    pub fn name(self, i : i32) : string {
+        return self.names.name(StringId { raw: self.nameIds[i] });
+    }
+
+    /** The index of the first entry called `name`, or -1. */
+    pub fn find(self, name : string) : i32 {
+        let id : i32 = self.names.find(name).raw;
+        if (id < 0) {
+            return -1;
+        }
+        return self.firstOf[id];
+    }
+
+    /** True when the archive has an entry called `name`. */
+    pub fn has(self, name : string) : bool {
+        return self.find(name) >= 0;
+    }
+
+    /** The uncompressed size of entry `i` as the directory declares it. */
+    pub fn sizeOf(self, i : i32) : i32 {
+        return self.sizes[i];
+    }
+
+    // The end-of-central-directory record is the last 22 bytes unless a comment follows; search back for it.
+    fn readDirectory(mut self) : bool {
+        let total : i32 = self.file.length() as i32;
+        if (total < ZIP_EOCD_FIXED) {
+            return false;
+        }
+        let mut span : i32 = ZIP_EOCD_FIXED + ZIP_MAX_COMMENT;
+        if (span > total) {
+            span = total;
+        }
+        if (!self.file.read((total - span) as i64, span, self.scratch)) {
+            return false;
+        }
+
+        let mut at : i32 = span - ZIP_EOCD_FIXED;
+        while (at >= 0 && self.scratch.le32(at) != ZIP_EOCD_SIG) {
+            at = at - 1;
+        }
+        if (at < 0) {
+            return false;
+        }
+        let entries : i32 = self.scratch.get(at + 10) | (self.scratch.get(at + 11) << 8);
+        let dirSize : i32 = self.scratch.le32(at + 12);
+        let dirOffset : i32 = self.scratch.le32(at + 16);
+        if (entries == ZIP_ZIP64_ENTRIES || dirOffset < 0 || dirSize < 0) {
+            return false;
+        }
+        if ((dirOffset as i64) + (dirSize as i64) > (total as i64)) {
+            return false;
+        }
+
+        let dir : ByteBuf = new ByteBuf(dirSize + 16);
+        if (!self.file.read(dirOffset as i64, dirSize, dir)) {
+            return false;
+        }
+        self.offsets = new i32[entries as i64];
+        self.packed = new i32[entries as i64];
+        self.sizes = new i32[entries as i64];
+        self.methods = new u8[entries as i64];
+        self.nameIds = new i32[entries as i64];
+        self.firstOf = new i32[entries as i64];
+        for (k of 0..entries) {
+            self.firstOf[k] = -1;
+        }
+
+        let mut pos : i32 = 0;
+        for (i of 0..entries) {
+            if (!self.readRecord(dir, pos, i)) {
+                return false;
+            }
+            pos = pos + ZIP_CENTRAL_FIXED + self.recordTail(dir, pos);
+        }
+        self.count = entries;
+        return true;
+    }
+
+    // The bytes of a central record after its fixed part: name, extra field and comment.
+    fn recordTail(self, dir : ByteBuf, pos : i32) : i32 {
+        return (dir.get(pos + 28) | (dir.get(pos + 29) << 8)) + (dir.get(pos + 30) | (dir.get(pos + 31) << 8))
+            + (dir.get(pos + 32) | (dir.get(pos + 33) << 8));
+    }
+
+    // Takes record `i` of the directory, at `pos`, into the arrays; false when it does not fit the directory.
+    fn readRecord(mut self, dir : ByteBuf, pos : i32, i : i32) : bool {
+        if (pos + ZIP_CENTRAL_FIXED > dir.len() || dir.le32(pos) != ZIP_CENTRAL_SIG) {
+            return false;
+        }
+        let nameLen : i32 = dir.get(pos + 28) | (dir.get(pos + 29) << 8);
+        if (pos + ZIP_CENTRAL_FIXED + self.recordTail(dir, pos) > dir.len()) {
+            return false;
+        }
+
+        let flags : i32 = dir.get(pos + 8) | (dir.get(pos + 9) << 8);
+        let method : i32 = dir.get(pos + 10) | (dir.get(pos + 11) << 8);
+        self.packed[i] = dir.le32(pos + 20);
+        self.sizes[i] = dir.le32(pos + 24);
+        self.offsets[i] = dir.le32(pos + 42);
+        self.methods[i] = method as u8;
+        if (method > ZIP_METHOD_UNSUPPORTED || (flags & ZIP_FLAG_ENCRYPTED) != 0) {
+            self.methods[i] = ZIP_METHOD_UNSUPPORTED as u8;
+        }
+
+        let id : i32 = self.names.intern(DataText::fromBytes(
+            dir,
+            pos + ZIP_CENTRAL_FIXED,
+            pos + ZIP_CENTRAL_FIXED + nameLen
+        )).raw;
+        self.nameIds[i] = id;
+        if (self.firstOf[id] < 0) {
+            self.firstOf[id] = i;
+        }
+        return true;
+    }
+
+    /** Reads and decompresses entry `i` into `out` (replacing its contents); false when it cannot be read. */
+    pub fn read(mut self, i : i32, out : ByteBuf) : bool {
+        if (!self.good || i < 0 || i >= self.count) {
+            return false;
+        }
+        let method : i32 = self.methods[i] as i32;
+        if (method != ZIP_METHOD_STORED && method != ZIP_METHOD_DEFLATE) {
+            return false;
+        }
+
+        // The local header repeats the name and carries its own extra field, so its length must be read.
+        if (!self.file.read(self.offsets[i] as i64, ZIP_LOCAL_FIXED, self.scratch)) {
+            return false;
+        }
+        if (self.scratch.le32(0) != ZIP_LOCAL_SIG) {
+            return false;
+        }
+        let nameLen : i32 = self.scratch.get(26) | (self.scratch.get(27) << 8);
+        let extraLen : i32 = self.scratch.get(28) | (self.scratch.get(29) << 8);
+        let dataAt : i64 = (self.offsets[i] as i64) + (ZIP_LOCAL_FIXED as i64) + (nameLen as i64)
+            + (extraLen as i64);
+        if (!self.file.read(dataAt, self.packed[i], self.scratch)) {
+            return false;
+        }
+        if (method == ZIP_METHOD_STORED) {
+            out.clear();
+            out.reserve(self.packed[i] + 1);
+            out.pushRange(self.scratch, 0, self.packed[i]);
+            return true;
+        }
+        return self.inflater.raw(self.scratch, 0, self.packed[i], out);
+    }
+
+    /** Reads the entry called `name` into `out`; false when absent or unreadable. */
+    pub fn readNamed(mut self, name : string, out : ByteBuf) : bool {
+        return self.read(self.find(name), out);
+    }
+
+    /** Closes the archive. */
+    pub fn close(mut self) : void {
+        self.file.close();
+        self.good = false;
+    }
+}

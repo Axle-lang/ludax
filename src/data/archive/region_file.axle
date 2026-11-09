@@ -1,0 +1,711 @@
+// region_file — sector-addressed files of many small records: a grid of chunk slots in fixed-size sectors.
+//
+// The file starts with two tables of one entry per slot: the locations (a 3-byte sector offset and a 1-byte
+// sector count) and the last-modified times. A record sits at its offset: a 4-byte big-endian length, a
+// 1-byte compression type, and the compressed bytes; a type with the external bit set means the bytes live in
+// a file of their own beside the region. A slot is addressed by the chunk's coordinates modulo the side, `(z
+// & mask) << sideBits | (x & mask)`.
+//
+// Everything that varies between users of the layout is a `RegionFormat`: the side and sector sizes, the
+// largest record kept in the file, the compression type numbers and the two file names.
+// `RegionFormat::anvil()` is the layout of the Minecraft Anvil format (32 x 32 slots, 4 KiB sectors,
+// `r.X.Z.mca`, `c.X.Z.mcc`), and the shortcut constructors (`openRead`, `openWrite`) use it. The entry layout
+// itself (24-bit offset, 8-bit count) is fixed.
+//
+// Reading seeks to the record and decompresses into a caller-owned buffer, so a loop over a region reuses its
+// memory. Writing keeps the rules of the format so its own readers accept the file: a record is padded to
+// whole sectors, a rewritten chunk keeps its place when its sector count is unchanged and otherwise moves to
+// the first free run (or the end of the file), and the table entry and the timestamp are rewritten in place
+// on `flush`. The sector map used for allocation is built when a region is opened for writing and costs one
+// byte per sector.
+//
+// A moved chunk is written to its new run while its old run is still reserved, and the old run is freed only
+// once the new record is on disk: a write that fails leaves the old record and the sector map intact, and a
+// crash before `flush` leaves a table that still names the intact old record. A chunk rewritten in place has
+// no such protection.
+
+use std::io::path::Path;
+
+use crate::data::archive::random_file::RandomFile;
+use crate::data::bytes::ByteBuf;
+use crate::data::codec::lz4::{LZ4_TABLE_SIZE, Lz4};
+use crate::data::image::deflate::Deflater;
+use crate::data::image::inflate_fast::FastInflater;
+
+/** Bytes in one sector of an Anvil region file. */
+pub const REGION_SECTOR_BYTES : i32 = 4096;
+
+/** Chunk slots along one side of an Anvil region. */
+pub const REGION_SIDE : i32 = 32;
+
+/** Chunk slots in an Anvil region. */
+pub const REGION_SLOTS : i32 = 1024;
+
+/** Compression type: gzip. */
+pub const REGION_COMPRESSION_GZIP : i32 = 1;
+
+/** Compression type: zlib, what the game writes by default. */
+pub const REGION_COMPRESSION_ZLIB : i32 = 2;
+
+/** Compression type: stored. */
+pub const REGION_COMPRESSION_NONE : i32 = 3;
+
+/** Compression type: LZ4 block stream. */
+pub const REGION_COMPRESSION_LZ4 : i32 = 4;
+
+const REGION_ANVIL_SIDE_BITS : i32 = 5;
+const REGION_ANVIL_SECTOR_BITS : i32 = 12;
+const REGION_ANVIL_EXTERNAL : i32 = 128;
+const REGION_RECORD_HEAD : i32 = 5;
+const REGION_ENTRY_BYTES : i32 = 4;
+const REGION_MAX_SECTOR_COUNT : i32 = 255;
+const REGION_UNZIP_LIMIT : i32 = 64000000;
+const REGION_GROW : i32 = 1024;
+
+/**
+ * The layout of one family of region files. `RegionFormat::anvil()` is the Minecraft layout; a copy with
+ * other numbers is another family, as long as it keeps the 24-bit offset and 8-bit count of a location entry.
+ */
+pub struct RegionFormat {
+    /** Chunk slots along one side, as a power of two: 5 means 32 x 32 slots. */
+    pub sideBits : i32;
+
+    /** Bytes in a sector, as a power of two: 12 means 4096. */
+    pub sectorBits : i32;
+
+    /**
+     * The most sectors a record may span in the region file, at most 255; a larger chunk goes to its own
+     * file.
+     */
+    pub maxSectors : i32;
+
+    /** The bit of the type byte that says "the bytes are in a file of their own". */
+    pub externalFlag : i32;
+
+    /** The type number of gzip. */
+    pub gzip : i32;
+
+    /** The type number of zlib, the type `write` uses. */
+    pub zlib : i32;
+
+    /** The type number of stored bytes. */
+    pub none : i32;
+
+    /** The type number of the LZ4 block stream. */
+    pub lz4 : i32;
+
+    /** The extension of a region file, with its dot. */
+    pub extension : string;
+
+    /** The extension of an external chunk file, with its dot. */
+    pub externalExtension : string;
+}
+
+/** The reusable memory of chunk reads and writes: one per loading thread. */
+pub class RegionScratch {
+    /** The raw record read from disk. */
+    pub raw : ByteBuf;
+
+    /** The inflater with its tables. */
+    pub inflater : FastInflater;
+
+    /** The compressor used on writes. */
+    pub deflater : Deflater;
+
+    /** A second buffer for LZ4 or external data. */
+    pub spare : ByteBuf;
+
+    /**
+     * The LZ4 compressor hash table (`LZ4_TABLE_SIZE` ints). A public bag of buffers is acceptable here: it
+     * is a per-thread scratch.
+     */
+    pub lz4 : i32[];
+
+    /** Fresh buffers; they grow to the largest chunk seen and stay. */
+    constructor() {
+        self.raw = new ByteBuf(REGION_SECTOR_BYTES * 16);
+        self.spare = new ByteBuf(REGION_SECTOR_BYTES * 16);
+        self.inflater = new FastInflater(REGION_UNZIP_LIMIT);
+        self.deflater = new Deflater();
+        self.lz4 = new i32[LZ4_TABLE_SIZE as i64];
+    }
+}
+
+/** One open region file. */
+pub class RegionFile {
+    file              : RandomFile;
+    folder            : string;
+    sideBits          : i32;
+    sectorBits        : i32;
+    maxSectors        : i32;
+    externalFlag      : i32;
+    gzipType          : i32;
+    zlibType          : i32;
+    noneType          : i32;
+    lz4Type           : i32;
+    extension         : string;
+    externalExtension : string;
+    regionX           : i32;
+    regionZ           : i32;
+    locations         : i32[];
+    times             : i32[];
+    writable          : bool;
+    sectors           : u8[];
+    sectorsUsed       : i32 = 0;
+    tableDirty        : bool = false;
+    body              : ByteBuf;
+    slotCount         : i32 = 0;
+    sectorBytes       : i32 = 0;
+    headerSectors     : i32 = 0;
+
+    // Reads the two header tables of an open file; an unreadable header leaves every slot empty.
+    constructor(
+        own file : RandomFile,
+        format : RegionFormat,
+        folder : string,
+        regionX : i32,
+        regionZ : i32,
+        writer : bool
+    ) {
+        self.file = file;
+        self.sideBits = format.sideBits;
+        self.sectorBits = format.sectorBits;
+        self.maxSectors = format.maxSectors;
+        self.externalFlag = format.externalFlag;
+        self.gzipType = format.gzip;
+        self.zlibType = format.zlib;
+        self.noneType = format.none;
+        self.lz4Type = format.lz4;
+        self.extension = format.extension;
+        self.externalExtension = format.externalExtension;
+        self.folder = folder;
+        self.regionX = regionX;
+        self.regionZ = regionZ;
+        self.writable = writer;
+        self.slotCount = 1 << (self.sideBits * 2);
+        self.sectorBytes = 1 << self.sectorBits;
+        self.headerSectors = 2
+            * RegionFile::sectorsFor(self.slotCount * REGION_ENTRY_BYTES, self.sectorBytes);
+        self.locations = new i32[self.slotCount as i64];
+        self.times = new i32[self.slotCount as i64];
+        self.sectors = new u8[1];
+        self.body = new ByteBuf(self.sectorBytes * 4);
+
+        let tableBytes : i32 = self.headerBytes();
+        let head : ByteBuf = new ByteBuf(tableBytes);
+        if (self.file.isOpen() && self.file.read(0, tableBytes, head)) {
+            let timesAt : i32 = tableBytes / 2;
+            for (i of 0..self.slotCount) {
+                self.locations[i] = head.be32(i * REGION_ENTRY_BYTES);
+                self.times[i] = head.be32(timesAt + i * REGION_ENTRY_BYTES);
+            }
+        }
+        if (writer) {
+            self.buildSectorMap();
+        }
+    }
+
+    // The layout this region was opened with, as a value.
+    fn layout(self) : RegionFormat {
+        return RegionFormat {
+            sideBits: self.sideBits,
+            sectorBits: self.sectorBits,
+            maxSectors: self.maxSectors,
+            externalFlag: self.externalFlag,
+            gzip: self.gzipType,
+            zlib: self.zlibType,
+            none: self.noneType,
+            lz4: self.lz4Type,
+            extension: self.extension,
+            externalExtension: self.externalExtension,
+        };
+    }
+
+    // How many sectors of `sectorBytes` hold `bytes`.
+    static fn sectorsFor(bytes : i32, sectorBytes : i32) : i32 {
+        return (bytes + sectorBytes - 1) / sectorBytes;
+    }
+
+    // The bytes of both header tables.
+    fn headerBytes(self) : i32 {
+        return self.headerSectors * self.sectorBytes;
+    }
+
+    /**
+     * The layout of the Minecraft Anvil format: 32 x 32 slots, 4 KiB sectors, `.mca` files, `.mcc` for
+     * oversize chunks.
+     */
+    pub static fn anvil() : RegionFormat {
+        return RegionFormat {
+            sideBits: REGION_ANVIL_SIDE_BITS,
+            sectorBits: REGION_ANVIL_SECTOR_BITS,
+            maxSectors: REGION_MAX_SECTOR_COUNT,
+            externalFlag: REGION_ANVIL_EXTERNAL,
+            gzip: REGION_COMPRESSION_GZIP,
+            zlib: REGION_COMPRESSION_ZLIB,
+            none: REGION_COMPRESSION_NONE,
+            lz4: REGION_COMPRESSION_LZ4,
+            extension: ".mca",
+            externalExtension: ".mcc",
+        };
+    }
+
+    /** Opens `folder/r.<rx>.<rz>.mca` for reading; `isOpen` is false when the file is missing. */
+    pub static fn openRead(folder : string, rx : i32, rz : i32) : RegionFile {
+        return RegionFile::openReadAs(RegionFile::anvil(), folder, rx, rz);
+    }
+
+    /**
+     * Opens region (rx, rz) of `format` in `folder` for reading; `isOpen` is false when the file is missing.
+     */
+    pub static fn openReadAs(format : RegionFormat, folder : string, rx : i32, rz : i32) : RegionFile {
+        let file : RandomFile = RandomFile::openRead(RegionFile::pathOfAs(format, folder, rx, rz));
+        return new RegionFile(file, format, folder, rx, rz, false);
+    }
+
+    /**
+     * Opens `folder/r.<rx>.<rz>.mca` for reading and writing, creating an empty region when it does not
+     * exist.
+     */
+    pub static fn openWrite(folder : string, rx : i32, rz : i32) : RegionFile {
+        return RegionFile::openWriteAs(RegionFile::anvil(), folder, rx, rz);
+    }
+
+    /**
+     * Opens region (rx, rz) of `format` for reading and writing, creating an empty region when it does not
+     * exist.
+     */
+    pub static fn openWriteAs(format : RegionFormat, folder : string, rx : i32, rz : i32) : RegionFile {
+        let path : string = RegionFile::pathOfAs(format, folder, rx, rz);
+        let mut file : RandomFile = RandomFile::openUpdate(path);
+        if (!file.isOpen()) {
+            file = RandomFile::create(path);
+            let slots : i32 = 1 << (format.sideBits * 2);
+            let sectorBytes : i32 = 1 << format.sectorBits;
+            let bytes : i32 = 2 * RegionFile::sectorsFor(slots * REGION_ENTRY_BYTES, sectorBytes)
+                * sectorBytes;
+            let blank : ByteBuf = new ByteBuf(bytes);
+            blank.resize(bytes);
+            file.write(0, blank, 0, bytes);
+        }
+        return new RegionFile(file, format, folder, rx, rz, true);
+    }
+
+    /** The path of Anvil region (rx, rz) in `folder`. */
+    pub static fn pathOf(folder : string, rx : i32, rz : i32) : string {
+        return RegionFile::pathOfAs(RegionFile::anvil(), folder, rx, rz);
+    }
+
+    /** The path of region (rx, rz) of `format` in `folder`. */
+    pub static fn pathOfAs(format : RegionFormat, folder : string, rx : i32, rz : i32) : string {
+        let extension : string = format.extension;
+        return "${folder}/r.${rx}.${rz}${extension}";
+    }
+
+    /** True when `folder` has the Anvil region file (rx, rz). */
+    pub static fn exists(folder : string, rx : i32, rz : i32) : bool {
+        return Path::from(RegionFile::pathOf(folder, rx, rz)).isFile();
+    }
+
+    /** A region that is not open: the placeholder of an empty cache slot. */
+    pub static fn closed() : RegionFile {
+        return new RegionFile(RandomFile::openRead(""), RegionFile::anvil(), "", 0, 0, false);
+    }
+
+    /** True when the region was opened for writing. */
+    pub fn isWriter(self) : bool {
+        return self.writable;
+    }
+
+    /** True when the file opened. */
+    pub fn isOpen(self) : bool {
+        return self.file.isOpen();
+    }
+
+    /** The slot index of chunk (cx, cz) inside its Anvil region (0..1023). */
+    pub static fn slotOf(cx : i32, cz : i32) : i32 {
+        return RegionFile::slotOfAs(RegionFile::anvil(), cx, cz);
+    }
+
+    /** The slot index of chunk (cx, cz) inside its region of `format`. */
+    pub static fn slotOfAs(format : RegionFormat, cx : i32, cz : i32) : i32 {
+        let mask : i32 = (1 << format.sideBits) - 1;
+        return ((cz & mask) << format.sideBits) | (cx & mask);
+    }
+
+    /** True when the slot holds a chunk. */
+    pub fn has(self, slot : i32) : bool {
+        return self.locations[slot] != 0;
+    }
+
+    /** The last-modified time (seconds) of the slot's chunk, 0 when absent. */
+    pub fn timestamp(self, slot : i32) : i32 {
+        return self.times[slot];
+    }
+
+    /** How many slots hold a chunk. */
+    pub fn chunkCount(self) : i32 {
+        let mut n : i32 = 0;
+        for (i of 0..self.slotCount) {
+            if (self.locations[i] != 0) {
+                n = n + 1;
+            }
+        }
+        return n;
+    }
+
+    /** Closes the file. */
+    pub fn close(mut self) : void {
+        self.file.close();
+    }
+
+    // ---- reading
+    // ---------------------------------------------------------------------------------------------
+
+    /**
+     * Reads the compressed record of `slot` into `into` (replacing its contents) and answers its compression
+     * type (`format.gzip` ...), or -1 when the slot is empty or damaged. Cheap, and the only part of a chunk
+     * load that touches the disk, so a loader can do it on one thread and decompress on many.
+     */
+    pub fn readPayload(mut self, slot : i32, scratch : RegionScratch, into : ByteBuf) : i32 {
+        let loc : i32 = self.locations[slot];
+        if (loc == 0) {
+            return -1;
+        }
+        let shift : i64 = self.sectorBits as i64;
+        let at : i64 = ((loc >>> 8) as i64) << shift;
+        let mut size : i64 = ((loc & REGION_MAX_SECTOR_COUNT) as i64) << shift;
+        if (at + size > self.file.length()) {
+            size = self.file.length() - at;
+        }
+        if (size < (REGION_RECORD_HEAD as i64) || !self.file.read(at, size as i32, scratch.raw)) {
+            return -1;
+        }
+
+        let length : i32 = scratch.raw.be32(0);
+        let kind : i32 = scratch.raw.get(4);
+        if (length < 1 || length + 4 > scratch.raw.len()) {
+            return -1;
+        }
+        into.clear();
+        let flag : i32 = self.externalFlag;
+        if ((kind & flag) != 0) {
+            if (!self.readExternal(slot, scratch, into)) {
+                return -1;
+            }
+            return kind & (flag - 1);
+        }
+        into.reserve(length + 1);
+        into.pushRange(scratch.raw, REGION_RECORD_HEAD, 4 + length);
+        return kind;
+    }
+
+    /**
+     * Reads and decompresses the chunk of `slot` into `out` (replacing its contents). False when the slot is
+     * empty or its record is damaged. Allocates nothing once `scratch` and `out` are warm.
+     */
+    pub fn read(mut self, slot : i32, scratch : RegionScratch, out : ByteBuf) : bool {
+        let kind : i32 = self.readPayload(slot, scratch, scratch.spare);
+        if (kind < 0) {
+            return false;
+        }
+        return RegionFile::decompressAs(
+            self.layout(),
+            kind,
+            scratch.spare,
+            0,
+            scratch.spare.len(),
+            scratch.inflater,
+            out
+        );
+    }
+
+    // The path of the external file of `slot`'s chunk.
+    fn externalPath(self, slot : i32) : string {
+        let side : i32 = 1 << self.sideBits;
+        let mask : i32 = side - 1;
+        let cx : i32 = self.regionX * side + (slot & mask);
+        let cz : i32 = self.regionZ * side + (slot >> self.sideBits);
+        let extension : string = self.externalExtension;
+        return "${self.folder}/c.${cx}.${cz}${extension}";
+    }
+
+    // Reads the oversize chunk's data file into `into`.
+    fn readExternal(self, slot : i32, scratch : RegionScratch, into : ByteBuf) : bool {
+        let path : string = self.externalPath(slot);
+        if (!Path::from(path).isFile()) {
+            return false;
+        }
+        let ext : RandomFile = RandomFile::openRead(path);
+        if (!ext.isOpen() || !ext.read(0, ext.length() as i32, into)) {
+            ext.close();
+            return false;
+        }
+        ext.close();
+        return true;
+    }
+
+    /** Decompresses `data[from..to]` of Anvil compression type `kind` into `out` with `inflater`. */
+    pub static fn decompress(
+        kind : i32,
+        data : ByteBuf,
+        from : i32,
+        to : i32,
+        inflater : FastInflater,
+        out : ByteBuf
+    ) : bool {
+        return RegionFile::decompressAs(RegionFile::anvil(), kind, data, from, to, inflater, out);
+    }
+
+    /** Decompresses `data[from..to]` of compression type `kind` of `format` into `out` with `inflater`. */
+    pub static fn decompressAs(
+        format : RegionFormat,
+        kind : i32,
+        data : ByteBuf,
+        from : i32,
+        to : i32,
+        inflater : FastInflater,
+        out : ByteBuf
+    ) : bool {
+        if (kind == format.zlib) {
+            return inflater.zlib(data, from, to, out);
+        }
+        if (kind == format.gzip) {
+            return inflater.gzip(data, from, to, out);
+        }
+        if (kind == format.none) {
+            if (from < 0 || to > data.len() || to < from) {
+                return false;
+            }
+            out.clear();
+            out.reserve(to - from + 1);
+            out.pushRange(data, from, to);
+            return true;
+        }
+        if (kind == format.lz4) {
+            return Lz4::decode(data, from, to, out, REGION_UNZIP_LIMIT);
+        }
+        return false;
+    }
+
+    // ---- writing
+    // ---------------------------------------------------------------------------------------------
+
+    // One byte per sector of the file: 1 when a chunk record or the header occupies it.
+    fn buildSectorMap(mut self) : void {
+        let total : i32 = RegionFile::sectorsFor(self.file.length() as i32, self.sectorBytes);
+        self.sectors = new u8[(total + REGION_GROW) as i64];
+        self.sectorsUsed = total;
+        for (s of 0..self.headerSectors) {
+            self.sectors[s] = 1;
+        }
+        for (i of 0..self.slotCount) {
+            self.mark(self.locations[i], 1);
+        }
+    }
+
+    // Sets the map entries of the run a location entry names to `value`; entries past the map are skipped (a
+    // damaged table can name any sector).
+    fn mark(mut self, location : i32, value : i32) : void {
+        if (location == 0) {
+            return;
+        }
+        let first : i32 = location >>> 8;
+        let count : i32 = location & REGION_MAX_SECTOR_COUNT;
+        let limit : i32 = self.sectors.length as i32;
+        for (s of first..(first + count)) {
+            if (s < limit) {
+                self.sectors[s] = value as u8;
+            }
+        }
+    }
+
+    // The first sector of a free run of `count` sectors, extending the file when none fits.
+    fn allocate(mut self, count : i32) : i32 {
+        let mut run : i32 = 0;
+        let mut s : i32 = self.headerSectors;
+        while (s < self.sectorsUsed) {
+            if (self.sectors[s] == 0) {
+                run = run + 1;
+                if (run == count) {
+                    return s - count + 1;
+                }
+            } else {
+                run = 0;
+            }
+            s = s + 1;
+        }
+        let start : i32 = self.sectorsUsed - run;
+        self.sectorsUsed = start + count;
+        if (self.sectorsUsed + REGION_MAX_SECTOR_COUNT >= self.sectors.length) {
+            let mut bigger : u8[] = new u8[(self.sectors.length * 2 + self.sectorsUsed) as i64];
+            for (i of 0..self.sectors.length) {
+                bigger[i] = self.sectors[i];
+            }
+            self.sectors = bigger;
+        }
+        return start;
+    }
+
+    /**
+     * Compresses chunk bytes with `kind` (Anvil type numbers) into `out`. Zlib is what the game wrote until
+     * 24w04a; LZ4 compresses several times faster for a file about a third larger; stored (type 3) is the
+     * fastest and biggest. `table` is the `LZ4_TABLE_SIZE`-int scratch of the LZ4 compressor.
+     */
+    pub static fn compress(
+        kind : i32,
+        nbt : ByteBuf,
+        deflater : Deflater,
+        table : i32[],
+        out : ByteBuf
+    ) : void {
+        if (kind == REGION_COMPRESSION_LZ4) {
+            Lz4::encode(nbt, 0, nbt.len(), out, table);
+            return;
+        }
+        out.clear();
+        if (kind == REGION_COMPRESSION_NONE) {
+            out.pushRange(nbt, 0, nbt.len());
+            return;
+        }
+        let z : ByteBuf = deflater.zlib(nbt, 0, nbt.len());
+        out.pushRange(z, 0, z.len());
+    }
+
+    /**
+     * Stores already-compressed chunk data (`packed`, of compression type `kind`) as the chunk of `slot` with
+     * last-modified `time`. False on a write failure, with the previous chunk, the sector map and the table
+     * unchanged (when the chunk has to move; one rewritten in place at the same size may be partly
+     * overwritten). The table is rewritten on `flush`.
+     */
+    pub fn writePayload(mut self, slot : i32, kind : i32, packed : ByteBuf, time : i32) : bool {
+        if (!self.writable) {
+            return false;
+        }
+        let record : i32 = packed.len() + REGION_RECORD_HEAD;
+        let mut count : i32 = RegionFile::sectorsFor(record, self.sectorBytes);
+        let external : bool = count > self.maxSectors;
+        if (external) {
+            count = 1;
+        }
+
+        // The new run is found while the old one is still reserved, so the two never overlap.
+        let old : i32 = self.locations[slot];
+        let inPlace : bool = old != 0 && (old & REGION_MAX_SECTOR_COUNT) == count;
+        let mut first : i32 = old >>> 8;
+        if (!inPlace) {
+            first = self.allocate(count);
+            self.mark((first << 8) | count, 1);
+        }
+
+        if (!self.storeRecord(slot, kind, packed, first, count, external)) {
+            if (!inPlace) {
+                self.mark((first << 8) | count, 0);
+            }
+            return false;
+        }
+        if (!inPlace) {
+            self.mark(old, 0);
+        }
+        self.locations[slot] = (first << 8) | count;
+        self.times[slot] = time;
+        self.tableDirty = true;
+        return true;
+    }
+
+    // Writes the record of a chunk (and its external file when it has one) at sector `first`.
+    fn storeRecord(
+        mut self,
+        slot : i32,
+        kind : i32,
+        packed : ByteBuf,
+        first : i32,
+        count : i32,
+        external : bool
+    ) : bool {
+        let body : ByteBuf = self.body;
+        body.clear();
+        if (external) {
+            body.pushBe32(1);
+            body.push(kind | self.externalFlag);
+            if (!self.writeExternal(slot, packed)) {
+                return false;
+            }
+        } else {
+            body.pushBe32(packed.len() + 1);
+            body.push(kind);
+            body.pushRange(packed, 0, packed.len());
+        }
+
+        // Pad to whole sectors with zeros in one pass over the storage.
+        let padded : i32 = count * self.sectorBytes;
+        body.reserve(padded + 1);
+        let mut raw : i8[] = body.raw();
+        for (i of body.len()..padded) {
+            raw[i] = 0;
+        }
+        body.setLen(padded);
+
+        let at : i64 = (first as i64) << (self.sectorBits as i64);
+        return self.file.write(at, body, 0, padded);
+    }
+
+    fn writeExternal(self, slot : i32, packed : ByteBuf) : bool {
+        let ext : RandomFile = RandomFile::create(self.externalPath(slot));
+        let ok : bool = ext.isOpen() && ext.write(0, packed, 0, packed.len());
+        ext.close();
+        return ok;
+    }
+
+    /** Compresses `nbt` (zlib) and stores it: the convenience form of `compress` then `writePayload`. */
+    pub fn write(mut self, slot : i32, nbt : ByteBuf, time : i32, scratch : RegionScratch) : bool {
+        RegionFile::compress(self.zlibType, nbt, scratch.deflater, scratch.lz4, scratch.spare);
+        return self.writePayload(slot, self.zlibType, scratch.spare, time);
+    }
+
+    /**
+     * Removes the chunk of `slot` from the table (its sectors become free). An external file of the chunk is
+     * left on disk; the next write of the slot replaces it.
+     */
+    pub fn erase(mut self, slot : i32) : void {
+        let old : i32 = self.locations[slot];
+        if (!self.writable || old == 0) {
+            return;
+        }
+        self.mark(old, 0);
+        self.locations[slot] = 0;
+        self.times[slot] = 0;
+        self.tableDirty = true;
+    }
+
+    /** Writes the location and timestamp tables and flushes; call after a batch of writes. */
+    pub fn flush(mut self) : void {
+        if (!self.writable || !self.tableDirty) {
+            return;
+        }
+        let head : ByteBuf = new ByteBuf(self.headerBytes());
+        for (i of 0..self.slotCount) {
+            head.pushBe32(self.locations[i]);
+        }
+
+        // The locations table fills whole sectors; zeros take the rest, then the times follow.
+        let half : i32 = self.headerBytes() / 2;
+        let mut raw : i8[] = head.raw();
+        for (i of head.len()..half) {
+            raw[i] = 0;
+        }
+        head.setLen(half);
+        for (i of 0..self.slotCount) {
+            head.pushBe32(self.times[i]);
+        }
+        self.file.write(0, head, 0, head.len());
+        self.file.flush();
+        self.tableDirty = false;
+    }
+
+    /** Flushes and closes. */
+    pub fn finish(mut self) : void {
+        self.flush();
+        self.file.close();
+    }
+}

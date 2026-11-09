@@ -1,0 +1,203 @@
+// name_table — names to small integers, in flat arrays that many threads may read at once.
+//
+// Names (a block, a property, a label) are looked up while records are decoded on worker threads. A
+// `StringMap` or an interner keeps its strings in reference-counted storage, and a lookup that touches those
+// counts from several threads corrupts them (the counts are not atomic in Axle 0.18.3). This table is plain
+// data instead: one `u8[]` holding every name back to back, an offset array, and an open-addressing hash
+// table of indices, all immutable once built. A lookup hashes the bytes where they are (a range of a decoded
+// NBT buffer, say), probes, and compares bytes: no string is made, nothing is counted, and any number of
+// threads can look up at once. Building (`add`) is single-threaded.
+//
+// Indices are handed out in insertion order, so two tables built from the same names in the same order agree
+// on every index. It lives in the data layer because it takes names as `ByteBuf` ranges.
+
+use std::ffi::runtime::panicMsg;
+
+use crate::data::bytes::ByteBuf;
+use crate::data::text::DataText;
+
+const NAME_TABLE_FNV_OFFSET : i32 = -2128831035;
+const NAME_TABLE_FNV_PRIME : i32 = 16777619;
+const NAME_TABLE_MIN_TABLE : i32 = 64;
+const NAME_TABLE_EMPTY : i32 = -1;
+const NAME_TABLE_MIN_BLOB : i32 = 256;
+const NAME_TABLE_BYTE_MASK : i32 = 255;
+
+/** A set of names numbered in insertion order. */
+pub class NameTable {
+    blob    : u8[];
+    blobAt  : i32 = 0;
+    offsets : i32[];
+    count   : i32 = 0;
+    table   : i32[];
+    mask    : i32;
+
+    /** An empty table. */
+    constructor() {
+        self.blob = new u8[NAME_TABLE_MIN_BLOB as i64];
+        self.offsets = new i32[(NAME_TABLE_MIN_TABLE / 2 + 1) as i64];
+        self.table = new i32[NAME_TABLE_MIN_TABLE as i64];
+        self.mask = NAME_TABLE_MIN_TABLE - 1;
+        for (i of 0..NAME_TABLE_MIN_TABLE) {
+            self.table[i] = NAME_TABLE_EMPTY;
+        }
+    }
+
+    /** How many names. */
+    pub fn count(self) : i32 {
+        return self.count;
+    }
+
+    /** True when `index` numbers a name of the table. */
+    pub fn has(self, index : i32) : bool {
+        return index >= 0 && index < self.count;
+    }
+
+    // Hash of bytes `from..to` of a raw buffer array.
+    static fn hashRaw(raw : i8[], from : i32, to : i32) : i32 {
+        let mut h : i32 = NAME_TABLE_FNV_OFFSET;
+        for (i of from..to) {
+            h = (h ^ ((raw[i] as i32) & NAME_TABLE_BYTE_MASK)) * NAME_TABLE_FNV_PRIME;
+        }
+        return h;
+    }
+
+    // Hash of the bytes of entry `e`, the same function as `hashRaw`.
+    fn hashEntry(self, e : i32) : i32 {
+        let mut h : i32 = NAME_TABLE_FNV_OFFSET;
+        for (i of self.offsets[e]..self.offsets[e + 1]) {
+            h = (h ^ (self.blob[i] as i32)) * NAME_TABLE_FNV_PRIME;
+        }
+        return h;
+    }
+
+    // True when entry `e` equals bytes `from..to` of a raw buffer array.
+    fn same(self, e : i32, raw : i8[], from : i32, to : i32) : bool {
+        let start : i32 = self.offsets[e];
+        let n : i32 = to - from;
+        if (self.offsets[e + 1] - start != n) {
+            return false;
+        }
+        for (i of 0..n) {
+            if ((self.blob[start + i] as i32) != ((raw[from + i] as i32) & NAME_TABLE_BYTE_MASK)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * The index of the name in bytes `from..to` of `b`, or -1 (also for a range outside the buffer). Safe to
+     * call from many threads.
+     */
+    pub fn findBytes(self, b : ByteBuf, from : i32, to : i32) : i32 {
+        if (from < 0 || to < from || to > b.len()) {
+            return -1;
+        }
+        let raw : i8[] = b.raw();
+        let mut slot : i32 = NameTable::hashRaw(raw, from, to) & self.mask;
+        while (self.table[slot] != NAME_TABLE_EMPTY) {
+            if (self.same(self.table[slot], raw, from, to)) {
+                return self.table[slot];
+            }
+            slot = (slot + 1) & self.mask;
+        }
+        return -1;
+    }
+
+    /** The index of `text`, or -1 (main-thread convenience: it makes a temporary buffer). */
+    pub fn find(self, text : string) : i32 {
+        let b : ByteBuf = DataText::toBytes(text);
+        return self.findBytes(b, 0, b.len());
+    }
+
+    /** Adds the name in bytes `from..to` of `b` (or finds it) and returns its index. Build time only. */
+    pub fn addBytes(mut self, b : ByteBuf, from : i32, to : i32) : i32 {
+        let known : i32 = self.findBytes(b, from, to);
+        if (known >= 0) {
+            return known;
+        }
+        if (from < 0 || to < from || to > b.len()) {
+            return -1;
+        }
+        if ((self.count + 1) * 2 > self.table.length as i32) {
+            self.rehash();
+        }
+        let n : i32 = to - from;
+        while (self.blobAt + n > self.blob.length as i32) {
+            let mut bigger : u8[] = new u8[(self.blob.length * 2) as i64];
+            for (i of 0..self.blobAt) {
+                bigger[i] = self.blob[i];
+            }
+            self.blob = bigger;
+        }
+        if (self.count + 2 > self.offsets.length as i32) {
+            let mut bigger : i32[] = new i32[(self.offsets.length * 2) as i64];
+            for (i of 0..(self.count + 1)) {
+                bigger[i] = self.offsets[i];
+            }
+            self.offsets = bigger;
+        }
+        let raw : i8[] = b.raw();
+        for (i of 0..n) {
+            self.blob[self.blobAt + i] = raw[from + i] as u8;
+        }
+        self.offsets[self.count] = self.blobAt;
+        self.blobAt = self.blobAt + n;
+        self.offsets[self.count + 1] = self.blobAt;
+        let id : i32 = self.count;
+        self.count = self.count + 1;
+        self.place(id, NameTable::hashRaw(raw, from, to));
+        return id;
+    }
+
+    /** Adds `text` (or finds it). Build time only. */
+    pub fn add(mut self, text : string) : i32 {
+        let b : ByteBuf = DataText::toBytes(text);
+        return self.addBytes(b, 0, b.len());
+    }
+
+    fn place(mut self, id : i32, hash : i32) : void {
+        let mut slot : i32 = hash & self.mask;
+        while (self.table[slot] != NAME_TABLE_EMPTY) {
+            slot = (slot + 1) & self.mask;
+        }
+        self.table[slot] = id;
+    }
+
+    // Doubles the probe table and re-places every name.
+    fn rehash(mut self) : void {
+        let size : i32 = (self.table.length as i32) * 2;
+        self.table = new i32[size as i64];
+        self.mask = size - 1;
+        for (i of 0..size) {
+            self.table[i] = NAME_TABLE_EMPTY;
+        }
+        for (e of 0..self.count) {
+            self.place(e, self.hashEntry(e));
+        }
+    }
+
+    /**
+     * The name with index `i` as a fresh string (allocates; not for hot paths); aborts when `has(i)` is
+     * false.
+     */
+    pub fn name(self, i : i32) : string {
+        if (!self.has(i)) {
+            panicMsg("NameTable.name: index out of range");
+        }
+        let b : ByteBuf = new ByteBuf(self.offsets[i + 1] - self.offsets[i] + 1);
+        for (k of self.offsets[i]..self.offsets[i + 1]) {
+            b.push(self.blob[k] as i32);
+        }
+        return DataText::fromBytes(b, 0, b.len());
+    }
+
+    /** The name with index `i`, or `fallback` when `has(i)` is false. */
+    pub fn nameOr(self, i : i32, fallback : string) : string {
+        if (!self.has(i)) {
+            return fallback;
+        }
+        return self.name(i);
+    }
+}

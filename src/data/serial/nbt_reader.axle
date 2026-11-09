@@ -1,0 +1,570 @@
+// nbt_reader — a pull parser for NBT, the binary tree format of Minecraft saves and many tools.
+//
+// A document is a tree of a few thousand tags, of which a program wants a handful. Building the tree would
+// allocate a node per tag; this reader walks the bytes in place instead and the caller asks for what it knows
+// and skips the rest. The loop is always the same:
+//
+//     r.readRoot();                       // the unnamed-or-named root compound
+//     while (r.next()) {                  // the next entry of the current compound; false at its end
+//         if (r.nameIs("xPos")) { x = r.readInt(); } else { r.skipValue(); }
+//     }
+//
+// `next` leaves the cursor at the entry's value: the caller must consume it (a typed read, `skipValue`, or a
+// nested loop for a compound) before calling `next` again. A list is entered with `beginList`, then each
+// element is read like a value of `listType()`. `nameIs` compares bytes in the buffer, so reading an entry's
+// name costs no string. All numbers are big-endian. A read past the end of the buffer, a count that cannot
+// fit in what is left, or a nesting deeper than `NBT_NESTING_LIMIT` sets `failed` and answers zero rather
+// than aborting: a damaged file must not take the program down, and every loop this reader drives ends when
+// the buffer does. Sizes are checked by division against the bytes left, so a hostile count cannot wrap
+// around 32 bits into a small number.
+//
+// Strings are Modified UTF-8 in the format; they are read as plain UTF-8, which differs only for NUL and for
+// characters outside the basic plane.
+
+use crate::data::bytes::ByteBuf;
+use crate::data::text::DataText;
+
+/** Tag type ids of the format. */
+pub const NBT_TAG_END : i32 = 0;
+
+/** A signed byte. */
+pub const NBT_TAG_BYTE : i32 = 1;
+
+/** A signed 16-bit integer. */
+pub const NBT_TAG_SHORT : i32 = 2;
+
+/** A signed 32-bit integer. */
+pub const NBT_TAG_INT : i32 = 3;
+
+/** A signed 64-bit integer. */
+pub const NBT_TAG_LONG : i32 = 4;
+
+/** A 32-bit float. */
+pub const NBT_TAG_FLOAT : i32 = 5;
+
+/** A 64-bit float. */
+pub const NBT_TAG_DOUBLE : i32 = 6;
+
+/** A length-prefixed run of bytes. */
+pub const NBT_TAG_BYTE_ARRAY : i32 = 7;
+
+/** A length-prefixed string. */
+pub const NBT_TAG_STRING : i32 = 8;
+
+/** A typed list. */
+pub const NBT_TAG_LIST : i32 = 9;
+
+/** A set of named tags ended by `NBT_TAG_END`. */
+pub const NBT_TAG_COMPOUND : i32 = 10;
+
+/** A length-prefixed run of 32-bit integers. */
+pub const NBT_TAG_INT_ARRAY : i32 = 11;
+
+/** A length-prefixed run of 64-bit integers. */
+pub const NBT_TAG_LONG_ARRAY : i32 = 12;
+
+const NBT_BYTE_BITS : i32 = 8;
+const NBT_BYTE_MASK : i32 = 255;
+const NBT_SIGN16 : i32 = 32768;
+const NBT_RANGE16 : i32 = 65536;
+const NBT_SIGN8 : i32 = 128;
+const NBT_RANGE8 : i32 = 256;
+const NBT_WORD_BITS : i32 = 32;
+const NBT_SIZE_SHORT : i32 = 2;
+const NBT_SIZE_INT : i32 = 4;
+const NBT_SIZE_LONG : i32 = 8;
+const NBT_NESTING_LIMIT : i32 = 512;
+const NBT_INITIAL_ROOM : i32 = 65536;
+
+/** Reads one NBT document from a byte buffer without building a tree. */
+pub class NbtReader {
+    source       : ByteBuf;
+    cursor       : i32 = 0;
+    end          : i32;
+    damaged      : bool = false;
+    kind         : i32 = 0;
+    nameAt       : i32 = 0;
+    nameLen      : i32 = 0;
+    elementType  : i32 = 0;
+    elementsLeft : i32 = 0;
+
+    /** A reader that takes `buf` and reads all of it from its first byte. */
+    constructor(own buf : ByteBuf) {
+        self.source = buf;
+        self.end = self.source.len();
+    }
+
+    /**
+     * A reader with an empty buffer of its own: fill `buffer()`, then `reset()`. One reader serves many
+     * chunks.
+     */
+    constructor() {
+        self.source = new ByteBuf(NBT_INITIAL_ROOM);
+    }
+
+    /** Rewinds to the start of `buffer()` after it was refilled, clearing `failed`. */
+    pub fn reset(mut self) : void {
+        self.cursor = 0;
+        self.end = self.source.len();
+        self.damaged = false;
+        self.kind = 0;
+    }
+
+    /** True when a read ran past the end or met a malformed tag; later reads answer zero. */
+    pub fn failed(self) : bool {
+        return self.damaged;
+    }
+
+    /** The cursor position in the buffer. */
+    pub fn position(self) : i32 {
+        return self.cursor;
+    }
+
+    /** Moves the cursor (to re-read or to resume after a raw copy). */
+    pub fn seek(mut self, at : i32) : void {
+        self.cursor = at;
+    }
+
+    /** The buffer being read. */
+    pub fn buffer(self) : ByteBuf {
+        return self.source;
+    }
+
+    /** True when the cursor reached the end of the data. */
+    pub fn atEnd(self) : bool {
+        return self.cursor >= self.end;
+    }
+
+    // True when `n` more bytes are there; the comparison is against the bytes left, so it cannot overflow.
+    fn need(mut self, n : i32) : bool {
+        if (self.damaged || n < 0 || n > self.end - self.cursor) {
+            self.damaged = true;
+            return false;
+        }
+        return true;
+    }
+
+    // True when `count` items of `size` bytes each are there. A count that cannot fit is damage, and the
+    // product is never formed unless it fits, so no hostile count wraps around 32 bits into a small positive
+    // number.
+    fn needItems(mut self, count : i32, size : i32) : bool {
+        if (self.damaged || count < 0 || count > (self.end - self.cursor) / size) {
+            self.damaged = true;
+            return false;
+        }
+        return true;
+    }
+
+    fn takeByte(mut self) : i32 {
+        if (!self.need(1)) {
+            return 0;
+        }
+        let v : i32 = self.source.get(self.cursor);
+        self.cursor = self.cursor + 1;
+        return v;
+    }
+
+    // ---- structure ----------------------------------------------------------------------------------------
+
+    /**
+     * Reads the root tag's type and name and leaves the cursor at its value. True when the root is a
+     * compound, which every file of the format has.
+     */
+    pub fn readRoot(mut self) : bool {
+        let t : i32 = self.takeByte();
+        if (t != NBT_TAG_COMPOUND) {
+            self.damaged = true;
+            return false;
+        }
+        self.nameLen = self.takeShort();
+        self.nameAt = self.cursor;
+        self.skipBytes(self.nameLen);
+        return !self.damaged;
+    }
+
+    /**
+     * Advances to the next entry of the compound being read: sets `tag()` and the name and leaves the cursor
+     * at the value. False at the compound's end (the end tag is consumed) or on damage.
+     */
+    pub fn next(mut self) : bool {
+        let t : i32 = self.takeByte();
+        if (self.damaged || t == NBT_TAG_END) {
+            self.kind = NBT_TAG_END;
+            return false;
+        }
+        if (t > NBT_TAG_LONG_ARRAY) {
+            self.damaged = true;
+            return false;
+        }
+        self.kind = t;
+        self.nameLen = self.takeShort();
+        self.nameAt = self.cursor;
+        self.skipBytes(self.nameLen);
+        return !self.damaged;
+    }
+
+    /** The type id of the current entry (or of the elements being read from a list after `beginList`). */
+    pub fn tag(self) : i32 {
+        return self.kind;
+    }
+
+    /** True when the current entry's name is exactly `text`; allocates nothing. */
+    pub fn nameIs(self, text : string) : bool {
+        if ((text.byteLength as i32) != self.nameLen) {
+            return false;
+        }
+        for (i of 0..self.nameLen) {
+            if (self.source.get(self.nameAt + i) != (text.byteAt(i) as i32)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /** The current entry's name as a string (allocates). */
+    pub fn name(self) : string {
+        return DataText::fromBytes(self.source, self.nameAt, self.nameAt + self.nameLen);
+    }
+
+    /** The byte offset where the current entry's header (type byte) began, for copying the entry raw. */
+    pub fn entryStart(self) : i32 {
+        return self.nameAt - NBT_SIZE_SHORT - 1;
+    }
+
+    /**
+     * Skips one value of tag type `t` at the cursor (a list element, or an entry whose type you already
+     * hold).
+     */
+    pub fn skipTyped(mut self, t : i32) : void {
+        self.skipOf(t, 0);
+    }
+
+    /**
+     * Skips one compound body from the cursor to just past its end tag (a list element that is a compound).
+     */
+    pub fn skipBody(mut self) : void {
+        self.skipCompound(0);
+    }
+
+    /** Skips the value of the current entry (or of the current list element). */
+    pub fn skipValue(mut self) : void {
+        self.skipOf(self.kind, 0);
+    }
+
+    // Skips a value of type `t`; compounds and lists recurse, bounded so a hostile file cannot overflow the
+    // stack.
+    fn skipOf(mut self, t : i32, depth : i32) : void {
+        if (self.damaged) {
+            return;
+        }
+        if (depth > NBT_NESTING_LIMIT) {
+            self.damaged = true;
+            return;
+        }
+        if (t == NBT_TAG_BYTE) {
+            self.skipBytes(1);
+        } else if (t == NBT_TAG_SHORT) {
+            self.skipBytes(NBT_SIZE_SHORT);
+        } else if (t == NBT_TAG_INT || t == NBT_TAG_FLOAT) {
+            self.skipBytes(NBT_SIZE_INT);
+        } else if (t == NBT_TAG_LONG || t == NBT_TAG_DOUBLE) {
+            self.skipBytes(NBT_SIZE_LONG);
+        } else if (t == NBT_TAG_BYTE_ARRAY) {
+            self.skipBytes(self.takeInt());
+        } else if (t == NBT_TAG_STRING) {
+            self.skipBytes(self.takeShort());
+        } else if (t == NBT_TAG_INT_ARRAY) {
+            self.skipItems(self.takeInt(), NBT_SIZE_INT);
+        } else if (t == NBT_TAG_LONG_ARRAY) {
+            self.skipItems(self.takeInt(), NBT_SIZE_LONG);
+        } else if (t == NBT_TAG_LIST) {
+            self.skipList(depth);
+        } else if (t == NBT_TAG_COMPOUND) {
+            self.skipCompound(depth);
+        } else {
+            self.damaged = true;
+        }
+    }
+
+    // The bytes of one value of a fixed-size type, 0 for the types whose size is in the data.
+    static fn fixedSize(t : i32) : i32 {
+        if (t == NBT_TAG_BYTE) {
+            return 1;
+        }
+        if (t == NBT_TAG_SHORT) {
+            return NBT_SIZE_SHORT;
+        }
+        if (t == NBT_TAG_INT || t == NBT_TAG_FLOAT) {
+            return NBT_SIZE_INT;
+        }
+        if (t == NBT_TAG_LONG || t == NBT_TAG_DOUBLE) {
+            return NBT_SIZE_LONG;
+        }
+        return 0;
+    }
+
+    // Skips a list: at once when its elements have a fixed size, element by element otherwise.
+    fn skipList(mut self, depth : i32) : void {
+        let et : i32 = self.takeByte();
+        let n : i32 = self.takeInt();
+        if (n <= 0) {
+            return;
+        }
+        let size : i32 = NbtReader::fixedSize(et);
+        if (size > 0) {
+            self.skipItems(n, size);
+            return;
+        }
+        for (i of 0..n) {
+            if (self.damaged) {
+                return;
+            }
+            self.skipOf(et, depth + 1);
+        }
+    }
+
+    fn skipCompound(mut self, depth : i32) : void {
+        while (!self.damaged) {
+            let t : i32 = self.takeByte();
+            if (self.damaged || t == NBT_TAG_END) {
+                return;
+            }
+            self.skipBytes(self.takeShort());
+            self.skipOf(t, depth + 1);
+        }
+    }
+
+    fn skipBytes(mut self, n : i32) : void {
+        if (self.need(n)) {
+            self.cursor = self.cursor + n;
+        }
+    }
+
+    // Skips `count` items of `size` bytes in one step.
+    fn skipItems(mut self, count : i32, size : i32) : void {
+        if (self.needItems(count, size)) {
+            self.cursor = self.cursor + count * size;
+        }
+    }
+
+    /**
+     * Starts reading a list value: afterwards `listType()` is the element type and `listCount()` the length,
+     * and each element is read like a value of that type (compounds with their own `next` loop).
+     */
+    pub fn beginList(mut self) : void {
+        self.elementType = self.takeByte();
+        self.elementsLeft = self.takeInt();
+        if (self.elementsLeft < 0) {
+            self.elementsLeft = 0;
+        }
+        self.kind = self.elementType;
+    }
+
+    /** The element type of the list begun last. */
+    pub fn listType(self) : i32 {
+        return self.elementType;
+    }
+
+    /** The number of elements of the list begun last. */
+    pub fn listCount(self) : i32 {
+        return self.elementsLeft;
+    }
+
+    // ---- values
+    // ---------------------------------------------------------------------------------------------
+
+    fn takeShort(mut self) : i32 {
+        if (!self.need(NBT_SIZE_SHORT)) {
+            return 0;
+        }
+        let v : i32 = (self.source.get(self.cursor) << NBT_BYTE_BITS) | self.source.get(self.cursor + 1);
+        self.cursor = self.cursor + NBT_SIZE_SHORT;
+        return v;
+    }
+
+    fn takeInt(mut self) : i32 {
+        if (!self.need(NBT_SIZE_INT)) {
+            return 0;
+        }
+        let v : i32 = self.source.be32(self.cursor);
+        self.cursor = self.cursor + NBT_SIZE_INT;
+        return v;
+    }
+
+    /** A byte value, signed. */
+    pub fn readByte(mut self) : i32 {
+        let v : i32 = self.takeByte();
+        if (v >= NBT_SIGN8) {
+            return v - NBT_RANGE8;
+        }
+        return v;
+    }
+
+    /** A short value, signed. */
+    pub fn readShort(mut self) : i32 {
+        let v : i32 = self.takeShort();
+        if (v >= NBT_SIGN16) {
+            return v - NBT_RANGE16;
+        }
+        return v;
+    }
+
+    /** An int value. */
+    pub fn readInt(mut self) : i32 {
+        return self.takeInt();
+    }
+
+    /** A long value. */
+    pub fn readLong(mut self) : i64 {
+        let hi : i32 = self.takeInt();
+        let lo : i32 = self.takeInt();
+        return ((hi as i64) << NBT_WORD_BITS) | ((lo as i64) & 0xFFFFFFFF);
+    }
+
+    /** A float value. */
+    pub fn readFloat(mut self) : f32 {
+        let bits : i32 = self.takeInt();
+        let slot : i32 = bits;
+        unsafe {
+            let view : ptr<f32> = (&slot) as ptr<f32>;
+            return *view;
+        }
+    }
+
+    /** A double value. */
+    pub fn readDouble(mut self) : f64 {
+        let bits : i64 = self.readLong();
+        let slot : i64 = bits;
+        unsafe {
+            let view : ptr<f64> = (&slot) as ptr<f64>;
+            return *view;
+        }
+    }
+
+    /** Appends the bytes of the string value at the cursor to `out` and consumes it; allocates no string. */
+    pub fn readStringInto(mut self, out : ByteBuf) : void {
+        let n : i32 = self.takeShort();
+        if (!self.need(n)) {
+            return;
+        }
+        out.pushRange(self.source, self.cursor, self.cursor + n);
+        self.cursor = self.cursor + n;
+    }
+
+    /** Appends the bytes of the current entry's name to `out`. */
+    pub fn nameInto(self, out : ByteBuf) : void {
+        out.pushRange(self.source, self.nameAt, self.nameAt + self.nameLen);
+    }
+
+    /** A string value (allocates). */
+    pub fn readString(mut self) : string {
+        let n : i32 = self.takeShort();
+        if (!self.need(n)) {
+            return "";
+        }
+        let s : string = DataText::fromBytes(self.source, self.cursor, self.cursor + n);
+        self.cursor = self.cursor + n;
+        return s;
+    }
+
+    /**
+     * Compares the string value at the cursor with `text` and consumes it; allocates nothing. Used to match
+     * palette names against known blocks.
+     */
+    pub fn stringIs(mut self, text : string) : bool {
+        let n : i32 = self.takeShort();
+        if (!self.need(n)) {
+            return false;
+        }
+        let at : i32 = self.cursor;
+        self.cursor = self.cursor + n;
+        if ((text.byteLength as i32) != n) {
+            return false;
+        }
+        for (i of 0..n) {
+            if (self.source.get(at + i) != (text.byteAt(i) as i32)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /** Starts a byte-array value and answers its length; the bytes follow, read with `readBytesInto`. */
+    pub fn beginByteArray(mut self) : i32 {
+        let n : i32 = self.takeInt();
+        if (n < 0 || !self.need(n)) {
+            self.damaged = true;
+            return 0;
+        }
+        return n;
+    }
+
+    /** Copies `n` bytes of a byte array (after `beginByteArray`) into `out` starting at index `at`. */
+    pub fn readBytesInto(mut self, out : u8[], at : i32, n : i32) : void {
+        if (!self.need(n)) {
+            return;
+        }
+        let raw : i8[] = self.source.raw();
+        let from : i32 = self.cursor;
+        for (i of 0..n) {
+            out[at + i] = raw[from + i] as u8;
+        }
+        self.cursor = from + n;
+    }
+
+    /** Starts a long-array value and answers its length (0 on damage); read the longs with `readLongInto`. */
+    pub fn beginLongArray(mut self) : i32 {
+        let n : i32 = self.takeInt();
+        if (n < 0 || !self.needItems(n, NBT_SIZE_LONG)) {
+            self.damaged = true;
+            return 0;
+        }
+        return n;
+    }
+
+    /** Reads the next long of a long array into `out[at]`, as the same 64 bits. */
+    pub fn readLongInto(mut self, out : u64[], at : i32) : void {
+        out[at] = self.readLong() as u64;
+    }
+
+    /**
+     * Reads the next `n` longs of a long array (after `beginLongArray`, which proved the bytes are there)
+     * into `out[0..n]`, straight from the buffer's bytes: eight loads and shifts per long, no per-call bounds
+     * bookkeeping.
+     */
+    pub fn readLongsInto(mut self, out : u64[], n : i32) : void {
+        let raw : i8[] = self.source.raw();
+        let mut p : i32 = self.cursor;
+        for (k of 0..n) {
+            let hi : u64 = ((((raw[p] as i32) & 255) << 24) | (((raw[p + 1] as i32) & 255) << 16)
+                | (((raw[p + 2] as i32) & 255) << 8)
+                | ((raw[p + 3] as i32) & 255)) as u32 as u64;
+            let lo : u64 = ((((raw[p + 4] as i32) & 255) << 24) | (((raw[p + 5] as i32) & 255) << 16)
+                | (((raw[p + 6] as i32) & 255) << 8)
+                | ((raw[p + 7] as i32) & 255)) as u32 as u64;
+            out[k] = (hi << 32) | lo;
+            p = p + 8;
+        }
+        self.cursor = p;
+    }
+
+    /** Starts an int-array value and answers its length (0 on damage). */
+    pub fn beginIntArray(mut self) : i32 {
+        let n : i32 = self.takeInt();
+        if (n < 0 || !self.needItems(n, NBT_SIZE_INT)) {
+            self.damaged = true;
+            return 0;
+        }
+        return n;
+    }
+
+    /** Copies the bytes `from..to` of the buffer onto `out` (a raw tag lifted out for later writing). */
+    pub fn copyRaw(self, out : ByteBuf, from : i32, to : i32) : void {
+        out.pushRange(self.source, from, to);
+    }
+
+    /** True when the entry's value is the tag type `t`. */
+    pub fn isTag(self, t : i32) : bool {
+        return self.kind == t;
+    }
+}

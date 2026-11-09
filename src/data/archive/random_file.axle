@@ -1,0 +1,136 @@
+// random_file — positional reads and writes of a file on disk, without loading it.
+//
+// `DataFiles` reads whole files, which is wrong for a 38 MB archive (the importer wants three entries) and
+// for a region file of 20 MB (the game wants one chunk). A `RandomFile` keeps the C stream open and seeks to
+// an offset for each call. A failed open is a value, not an exception: `isOpen` is false and every call
+// answers failure, so a missing file is an ordinary "that record does not exist" for the caller.
+//
+// Offsets are `i64` in the interface, but the file is limited to `RANDOM_FILE_MAX_BYTES` (2 GiB - 1): the C
+// binding behind `fseek` and `ftell` takes a `long`, which is 32 bits on Windows, so a larger offset would
+// wrap there. Reads and writes that would pass the limit answer false rather than wrap. Counts are `i32`
+// because every record this library reads is far below that. A read fills a caller-owned `ByteBuf`, so a loop
+// over thousands of records reuses one buffer.
+
+use std::ffi::libc::fs;
+use std::text::{addrAsPtr, bufferAddr};
+
+use crate::data::bytes::ByteBuf;
+
+/** The largest file, and so the largest offset plus count, a `RandomFile` serves. */
+pub const RANDOM_FILE_MAX_BYTES : i64 = 2147483647;
+
+const RANDOM_FILE_MODE_READ : string = "rb";
+const RANDOM_FILE_MODE_UPDATE : string = "r+b";
+const RANDOM_FILE_MODE_CREATE : string = "w+b";
+
+const RANDOM_FILE_SEEK_SET : i32 = 0;
+const RANDOM_FILE_SEEK_END : i32 = 2;
+
+/** A file opened for positional access. */
+pub class RandomFile {
+    stream : i64 = 0;
+    bytes  : i64 = 0;
+
+    // Wraps the result of fopen; a null pointer is a failed open.
+    constructor(stream : ptr) {
+        self.stream = RandomFile::addressOf(stream);
+        if (self.stream != 0) {
+            fs::fseek(RandomFile::streamOf(self.stream), 0, RANDOM_FILE_SEEK_END);
+            self.bytes = fs::ftell(RandomFile::streamOf(self.stream));
+        }
+    }
+
+    static fn addressOf(p : ptr) : i64 {
+        unsafe {
+            return p as i64;
+        }
+    }
+
+    static fn streamOf(address : i64) : ptr {
+        unsafe {
+            return address as ptr;
+        }
+    }
+
+    /** Opens an existing file for reading; check `isOpen`. */
+    pub static fn openRead(path : string) : RandomFile {
+        return new RandomFile(fs::fopen(path, RANDOM_FILE_MODE_READ));
+    }
+
+    /** Opens an existing file for reading and writing (nothing is truncated); check `isOpen`. */
+    pub static fn openUpdate(path : string) : RandomFile {
+        return new RandomFile(fs::fopen(path, RANDOM_FILE_MODE_UPDATE));
+    }
+
+    /** Creates the file (replacing any), for reading and writing; check `isOpen`. */
+    pub static fn create(path : string) : RandomFile {
+        return new RandomFile(fs::fopen(path, RANDOM_FILE_MODE_CREATE));
+    }
+
+    /** True when the file opened. */
+    pub fn isOpen(self) : bool {
+        return self.stream != 0;
+    }
+
+    /**
+     * The file's length in bytes as of the last open or write (a byte count, hence `length` and not `count`).
+     */
+    pub fn length(self) : i64 {
+        return self.bytes;
+    }
+
+    /**
+     * Reads `count` bytes at `at` into `into`, replacing its contents. False when the file is closed or ends
+     * before `count` bytes; `into` is then unspecified.
+     */
+    pub fn read(mut self, at : i64, count : i32, into : ByteBuf) : bool {
+        if (self.stream == 0 || at < 0 || count < 0 || at + (count as i64) > self.bytes) {
+            return false;
+        }
+        into.reserve(count + 1);
+        let stream : ptr = RandomFile::streamOf(self.stream);
+        fs::fseek(stream, at, RANDOM_FILE_SEEK_SET);
+        let got : i64 = fs::fread(addrAsPtr(bufferAddr(into.raw())), 1, count as i64, stream);
+        into.setLen(count);
+        return got == (count as i64);
+    }
+
+    /**
+     * Writes bytes `from..to` of `data` at offset `at`, extending the file when it ends inside (a gap before
+     * `at` reads as zeros). False on failure, including a range outside `data` or an end past
+     * `RANDOM_FILE_MAX_BYTES`; nothing is written then.
+     */
+    pub fn write(mut self, at : i64, data : ByteBuf, from : i32, to : i32) : bool {
+        if (self.stream == 0 || at < 0 || to < from || from < 0 || to > data.len()) {
+            return false;
+        }
+        let n : i32 = to - from;
+        if (at + (n as i64) > RANDOM_FILE_MAX_BYTES) {
+            return false;
+        }
+
+        let stream : ptr = RandomFile::streamOf(self.stream);
+        fs::fseek(stream, at, RANDOM_FILE_SEEK_SET);
+        let source : ptr = addrAsPtr(bufferAddr(data.raw()) + (from as i64));
+        let put : i64 = fs::fwrite(source, 1, n as i64, stream);
+        if (at + (n as i64) > self.bytes) {
+            self.bytes = at + (n as i64);
+        }
+        return put == (n as i64);
+    }
+
+    /** Flushes buffered writes to the operating system. */
+    pub fn flush(mut self) : void {
+        if (self.stream != 0) {
+            fs::fflush(RandomFile::streamOf(self.stream));
+        }
+    }
+
+    /** Closes the file; calling it twice is harmless. */
+    pub fn close(mut self) : void {
+        if (self.stream != 0) {
+            fs::fclose(RandomFile::streamOf(self.stream));
+            self.stream = 0;
+        }
+    }
+}
