@@ -1,0 +1,397 @@
+// openworld_vehicle_drive — checks for how the arcade vehicle model is driven: circles, steering, slides, gears.
+//
+// A lap of a circle with a scripted driver that comes back to where it started, steering that gets less sharp
+// with speed, tyres that slide when asked too much, gear changes that follow the revs, and a run that repeats
+// exactly. The stepping helper is shared through `openworld_vehicle_support`.
+
+use ludax::Checks;
+use ludax::FlatGround;
+use ludax::RollingGround;
+use ludax::VehicleInput;
+use ludax::VehicleModel;
+use ludax::VehicleParams;
+use ludax::VehicleState;
+use ludax::absD;
+use ludax::atan2D;
+use ludax::cosD;
+use ludax::sinD;
+use ludax::sqrtD;
+use ludax::wrapAngleD;
+
+use crate::openworld_vehicle_support::{VEHT_DT, vehFull, vehRun};
+
+/** The vehicle driving checks. */
+pub class OpenworldVehicleDriveSuite {
+    /** Runs every check of the suite. */
+    pub static fn run(c : Checks) : void {
+        vehCircle(c);
+        vehSteering(c);
+        vehSlide(c);
+        vehGears(c);
+        vehDeterminism(c);
+    }
+}
+
+// Steers a car round the circle of radius `r` about (`cx`, `cz`), counter-clockwise, by pure pursuit of a point ahead on it.
+fn vehCircleInput(s : VehicleState, cx : f64, cz : f64, r : f64, speed : f64) : VehicleInput {
+    let theta : f64 = atan2D(s.z - cz, s.x - cx);
+    let ahead : f64 = theta + 14.0 / r;
+    let tx : f64 = cx + r * cosD(ahead);
+    let tz : f64 = cz + r * sinD(ahead);
+    let want : f64 = atan2D(tz - s.z, tx - s.x);
+    let err : f64 = wrapAngleD(want - s.yaw);
+    let mut steer : f64 = err * 2.0;
+    if (steer > 1.0) {
+        steer = 1.0;
+    }
+    if (steer < -1.0) {
+        steer = -1.0;
+    }
+    let mut throttle : f64 = (speed - s.vf) * 0.5;
+    if (throttle > 1.0) {
+        throttle = 1.0;
+    }
+    if (throttle < 0.0) {
+        throttle = 0.0;
+    }
+    return VehicleInput {
+        throttle: throttle,
+        brake: 0.0,
+        steer: steer,
+        reverse: false,
+        handbrake: false,
+    };
+}
+
+fn vehSame(a : VehicleState, b : VehicleState) : bool {
+    return a.x == b.x && a.y == b.y && a.z == b.z && a.yaw == b.yaw && a.vf == b.vf && a.vl == b.vl
+        && a.vy == b.vy
+        && a.pitch == b.pitch
+        && a.roll == b.roll
+        && a.gear == b.gear
+        && a.rpm == b.rpm;
+}
+
+fn vehCircle(c : Checks) : void {
+    let p : VehicleParams = VehicleParams::arcade();
+    let g : FlatGround = new FlatGround(0.0);
+    let r : f64 = 60.0;
+    let mut s : VehicleState = VehicleModel::placeAtRest(p, r, 0.0, 1.5707963267948966, g);
+    let mut swept : f64 = 0.0;
+    let mut last : f64 = 0.0;
+    let mut worst : f64 = 0.0;
+    let mut steps : i32 = 0;
+    let mut sliding : i32 = 0;
+    while (swept < 6.283185307179586 && steps < 6000) {
+        let input : VehicleInput = vehCircleInput(s, 0.0, 0.0, r, 20.0);
+        s = VehicleModel::step(p, s, input, g, VEHT_DT);
+        let theta : f64 = atan2D(s.z, s.x);
+        swept = swept + wrapAngleD(theta - last);
+        last = theta;
+        let off : f64 = absD(sqrtD(s.x * s.x + s.z * s.z) - r);
+        if (steps > 300 && off > worst) {
+            worst = off;
+        }
+        if (s.sliding) {
+            sliding = sliding + 1;
+        }
+        steps = steps + 1;
+    }
+    c.that("circle: the car swept a full turn around the circle", swept >= 6.283185307179586);
+    c.that(
+        "circle: in about the time 2 pi r / v allows (19 s plus the run-up)",
+        steps > 1100 && steps < 1500
+    );
+    let dx : f64 = s.x - r;
+    let dz : f64 = s.z;
+    c.that("circle: it ends within 3 m of where it started", sqrtD(dx * dx + dz * dz) < 3.0);
+    c.that("circle: and stayed within 1.5 m of the circle once going", worst < 1.5);
+    c.that("circle: at 6.7 m/s^2 of cornering the tyres hold", sliding < 5);
+    c.that("circle: the wheels never left the ground", s.wheelsDown == 4);
+
+    // Open loop: fixed wheel, fixed speed. The turning radius follows the bicycle model at low speed.
+    let mut t : VehicleState = VehicleModel::placeAtRest(p, 0.0, 0.0, 0.0, g);
+    t.vf = 6.0;
+    t.gear = 2;
+    let input : VehicleInput = VehicleInput {
+        throttle: 0.18,
+        brake: 0.0,
+        steer: 0.5,
+        reverse: false,
+        handbrake: false,
+    };
+    t = vehRun(p, t, input, g, 300);
+    let delta : f64 = t.steerAngle;
+    let expect : f64 = p.wheelBase / (sinD(delta) / cosD(delta));
+    let speed : f64 = t.groundSpeed();
+    let measured : f64 = speed / absD(t.yawRate);
+    c.near(
+        "circle: at low speed the turning radius is wheelBase / tan(steer angle)",
+        measured,
+        expect,
+        expect * 0.1
+    );
+}
+
+fn vehSteering(c : Checks) : void {
+    let p : VehicleParams = VehicleParams::arcade();
+    let g : FlatGround = new FlatGround(0.0);
+    let lock : VehicleInput = VehicleInput {
+        throttle: 0.0,
+        brake: 0.0,
+        steer: 1.0,
+        reverse: false,
+        handbrake: false,
+    };
+    let mut slow : VehicleState = VehicleModel::placeAtRest(p, 0.0, 0.0, 0.0, g);
+    slow.vf = 3.0;
+    let mut fast : VehicleState = VehicleModel::placeAtRest(p, 0.0, 0.0, 0.0, g);
+    fast.vf = 40.0;
+    fast.gear = 5;
+    let a : VehicleState = vehRun(p, slow, lock, g, 60);
+    let b : VehicleState = vehRun(p, fast, lock, g, 60);
+    c.that(
+        "steering: at a walking pace the full lock is nearly the maximum angle",
+        a.steerAngle > 0.5 * p.maxSteer * 0.9
+    );
+    c.that(
+        "steering: at speed the same wheel turns the front wheels far less",
+        b.steerAngle < a.steerAngle * 0.4
+    );
+    c.near(
+        "steering: the angle has halved at the reference speed",
+        vehAngleAt(p.steerSpeedRef),
+        p.maxSteer * 0.5,
+        0.02
+    );
+    c.near(
+        "steering: and follows maxSteer / (1 + (v / ref)^2) at 40 m/s",
+        vehAngleAt(40.0),
+        p.maxSteer / (1.0 + 4.0),
+        0.02
+    );
+    c.that("steering: positive input turns towards positive yaw", a.yawRate > 0.0);
+    let mirror : VehicleInput = VehicleInput {
+        throttle: 0.0,
+        brake: 0.0,
+        steer: -1.0,
+        reverse: false,
+        handbrake: false,
+    };
+    let m : VehicleState = vehRun(p, slow, mirror, g, 60);
+    c.near(
+        "steering: and the mirror input gives the mirror turn",
+        m.yawRate,
+        0.0 - a.yawRate,
+        0.0001
+    );
+    // The wheel does not jump: after 0.1 s it has moved no more than rate * time.
+    let jump : VehicleState = vehRun(p, slow, lock, g, 6);
+    c.that(
+        "steering: the wheels turn at a limited rate",
+        jump.steerAngle <= p.steerRate * 0.1 + 0.000001
+    );
+}
+
+// The wheel angle the car settles at holding `speed` (drag and rolling resistance off so the speed hardly changes).
+fn vehAngleAt(speed : f64) : f64 {
+    let mut q : VehicleParams = VehicleParams::arcade();
+    q.dragArea = 0.0;
+    q.rolling = 0.0;
+    let g : FlatGround = new FlatGround(0.0);
+    let lock : VehicleInput = VehicleInput {
+        throttle: 0.0,
+        brake: 0.0,
+        steer: 1.0,
+        reverse: false,
+        handbrake: false,
+    };
+    let mut s : VehicleState = VehicleModel::placeAtRest(q, 0.0, 0.0, 0.0, g);
+    s.vf = speed;
+    s.gear = 3;
+    return vehRun(q, s, lock, g, 90).steerAngle;
+}
+
+fn vehSlide(c : Checks) : void {
+    let p : VehicleParams = VehicleParams::arcade();
+    let g : FlatGround = new FlatGround(0.0);
+    let mut gentle : VehicleState = VehicleModel::placeAtRest(p, 0.0, 0.0, 0.0, g);
+    gentle.vf = 15.0;
+    gentle.gear = 3;
+    let soft : VehicleInput = VehicleInput {
+        throttle: 0.3,
+        brake: 0.0,
+        steer: 0.1,
+        reverse: false,
+        handbrake: false,
+    };
+    let a : VehicleState = vehRun(p, gentle, soft, g, 180);
+    c.that("slide: a gentle turn grips", !a.sliding && a.slip < 0.1);
+    c.that(
+        "slide: and has a little slip (the tyres need some to make a side force)",
+        a.slip > 0.001 || absD(a.yawRate) < 0.2
+    );
+
+    // Full lock at 40 m/s with the brake on: the friction circle is spent, the car slides.
+    let mut hard : VehicleState = VehicleModel::placeAtRest(p, 0.0, 0.0, 0.0, g);
+    hard.vf = 40.0;
+    hard.gear = 5;
+    let slam : VehicleInput = VehicleInput {
+        throttle: 0.0,
+        brake: 1.0,
+        steer: 1.0,
+        reverse: false,
+        handbrake: false,
+    };
+    let mut slid : i32 = 0;
+    let mut peakSlip : f64 = 0.0;
+    for (i of 0..120) {
+        hard = VehicleModel::step(p, hard, slam, g, VEHT_DT);
+        if (hard.sliding) {
+            slid = slid + 1;
+        }
+        if (hard.slip > peakSlip) {
+            peakSlip = hard.slip;
+        }
+    }
+    c.that("slide: braking and turning at once spends the grip: the tyres slide", slid > 10);
+    c.that("slide: a hard turn produces a measurable slip", peakSlip > 0.05);
+
+    // The handbrake leaves almost no side grip: a drift.
+    let mut drift : VehicleState = VehicleModel::placeAtRest(p, 0.0, 0.0, 0.0, g);
+    drift.vf = 25.0;
+    drift.gear = 4;
+    let pull : VehicleInput = VehicleInput {
+        throttle: 0.0,
+        brake: 0.0,
+        steer: 0.6,
+        reverse: false,
+        handbrake: true,
+    };
+    let d : VehicleState = vehRun(p, drift, pull, g, 40);
+    let mut grip : VehicleState = drift;
+    let hold : VehicleInput = VehicleInput {
+        throttle: 0.0,
+        brake: 0.0,
+        steer: 0.6,
+        reverse: false,
+        handbrake: false,
+    };
+    grip = vehRun(p, grip, hold, g, 40);
+    c.that(
+        "slide: the handbrake makes the car slide more than the same turn without it",
+        d.slip > grip.slip * 3.0 && d.sliding
+    );
+}
+
+fn vehGears(c : Checks) : void {
+    let p : VehicleParams = VehicleParams::arcade();
+    let g : FlatGround = new FlatGround(0.0);
+    let mut s : VehicleState = VehicleModel::placeAtRest(p, 0.0, 0.0, 0.0, g);
+    let mut gearsSeen : i32 = 0;
+    let mut lastGear : i32 = 1;
+    let mut rpmOk : bool = true;
+    let mut monotone : bool = true;
+    let mut lastSpeed : f64 = 0.0;
+    for (i of 0..900) {
+        s = VehicleModel::step(p, s, vehFull(), g, VEHT_DT);
+        if (s.gear != lastGear) {
+            gearsSeen = gearsSeen + 1;
+            lastGear = s.gear;
+        }
+        if (s.rpm < p.idleRpm - 0.001 || s.rpm > p.redlineRpm + 400.0) {
+            rpmOk = false;
+        }
+        if (s.vf < lastSpeed - 0.0001 && s.shiftLeft <= 0.0) {
+            monotone = false;
+        }
+        lastSpeed = s.vf;
+    }
+    c.that(
+        "gears: full throttle for 15 s climbs the gearbox one gear at a time",
+        gearsSeen >= 4 && gearsSeen <= 6
+    );
+    c.that("gears: the engine never runs below idle or far over the redline", rpmOk);
+    c.that(
+        "gears: and the car never slows down under full throttle on the flat, except while the gearbox changes gear",
+        monotone
+    );
+    c.that(
+        "gears: the torque curve peaks where it says",
+        p.torqueAt(p.peakRpm) >= p.torqueAt(p.peakRpm - 500.0)
+            && p.torqueAt(p.peakRpm) >= p.torqueAt(p.peakRpm + 500.0)
+    );
+    c.near(
+        "gears: the peak torque is the peak torque",
+        p.torqueAt(p.peakRpm),
+        p.peakTorque,
+        0.0001
+    );
+    c.near("gears: past the redline there is none", p.torqueAt(p.redlineRpm + 1.0), 0.0, 0.0);
+    c.that(
+        "gears: the unknown gear has no ratio",
+        p.ratio(0) == 0.0 && p.ratio(9) == 0.0 && p.ratio(1) > p.ratio(2)
+    );
+    c.that(
+        "gears: setting a ratio works and bad ones are refused",
+        p.setGear(1, 3.8) && p.ratio(1) == 3.8 && !p.setGear(0, 2.0) && !p.setGear(2, -1.0)
+    );
+
+    // Reverse.
+    let mut r : VehicleState = VehicleModel::placeAtRest(p, 0.0, 0.0, 0.0, g);
+    let back : VehicleInput = VehicleInput {
+        throttle: 1.0,
+        brake: 0.0,
+        steer: 0.0,
+        reverse: true,
+        handbrake: false,
+    };
+    for (i of 0..300) {
+        r = VehicleModel::step(p, r, back, g, VEHT_DT);
+    }
+    c.that(
+        "reverse: engaged at a standstill the car goes backwards",
+        r.vf < -5.0 && r.gear == -1 && r.x < 0.0
+    );
+    c.that("reverse: and tops out at its own, lower, speed limit", r.vf > 0.0 - p.reverseMax - 1.0);
+    let forward : VehicleState = vehRun(p, r, vehFull(), g, 600);
+    c.that(
+        "reverse: releasing the lever and pressing on drives forwards again",
+        forward.vf > 5.0 && forward.gear >= 1
+    );
+}
+
+fn vehDeterminism(c : Checks) : void {
+    let p : VehicleParams = VehicleParams::arcade();
+    let rough : RollingGround = new RollingGround(1.5, 40.0);
+    let mut a : VehicleState = VehicleModel::placeAtRest(p, 3.0, 4.0, 0.2, rough);
+    let mut b : VehicleState = VehicleModel::placeAtRest(p, 3.0, 4.0, 0.2, rough);
+    for (i of 0..1500) {
+        let input : VehicleInput = VehicleInput {
+            throttle: 0.8,
+            brake: 0.0,
+            steer: sinD(i as f64 * 0.05),
+            reverse: false,
+            handbrake: i % 300 > 280,
+        };
+        a = VehicleModel::step(p, a, input, rough, VEHT_DT);
+        b = VehicleModel::step(p, b, input, rough, VEHT_DT);
+    }
+    c.that("vehicle determinism: the same inputs give the same state, bit for bit", vehSame(a, b));
+    let input : VehicleInput = VehicleInput {
+        throttle: 1.0,
+        brake: 0.0,
+        steer: 0.0,
+        reverse: false,
+        handbrake: false,
+    };
+    let c1 : VehicleState = VehicleModel::step(p, a, input, rough, VEHT_DT);
+    c.that(
+        "vehicle determinism: stepping does not change the state passed in",
+        vehSame(a, b) && !vehSame(a, c1)
+    );
+    c.that(
+        "vehicle determinism: a zero step is the identity",
+        vehSame(VehicleModel::step(p, a, input, rough, 0.0), a)
+    );
+}

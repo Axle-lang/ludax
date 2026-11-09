@@ -1,0 +1,380 @@
+// openworld_sky — checks for the day/night clock and the weather machine.
+//
+// The sun must be where the lighting library's sky puts it, the clock must not drift however time is chopped
+// up, and the weather must be a function of its seed and the time that passed: same seed, same weather;
+// only allowed transitions; spells of the right length; smooth blends.
+
+use ludax::Checks;
+use ludax::LightSky;
+use ludax::SkyClock;
+use ludax::SkyState;
+use ludax::Vec3;
+use ludax::Weather;
+use ludax::WeatherKind;
+use ludax::WeatherState;
+use ludax::absD;
+use ludax::maxD;
+use ludax::minD;
+
+/** The tolerance for a time of day or sky direction: f32 fractions of a day, exact to rounding. */
+const SKY_TOL : f64 = 0.0000001;
+
+/** The tolerance for a sun direction computed through trigonometry. */
+const SKY_TOL_LOOSE : f64 = 0.000001;
+
+const SKY_S : i64 = 1000000000;
+
+/** The sky and weather checks. */
+pub class OpenworldSkySuite {
+    /** Runs every check of the suite. */
+    pub static fn run(c : Checks) : void {
+        skySun(c);
+        skyClock(c);
+        skyWeather(c);
+        skyWeatherStats(c);
+    }
+}
+
+fn skySun(c : Checks) : void {
+    let noon : SkyState = SkyClock::at(0.5, 0.0);
+    c.near("sky: at noon the sun is straight overhead", noon.sun.y, 1.0, SKY_TOL_LOOSE);
+    c.near("sky: the direction is a unit vector", noon.sun.length(), 1.0, SKY_TOL_LOOSE);
+    c.that("sky: it is day at noon, with full daylight", noon.isDay && noon.daylight > 0.99);
+    let rise : SkyState = SkyClock::at(0.25, 0.0);
+    c.that(
+        "sky: sunrise, the sun sits on the horizon in the east",
+        absD(rise.sun.y) < 0.000001 && rise.sun.x > 0.99
+    );
+    let set : SkyState = SkyClock::at(0.75, 0.0);
+    c.that(
+        "sky: sunset, on the horizon in the west",
+        absD(set.sun.y) < 0.000001 && set.sun.x < -0.99
+    );
+    let night : SkyState = SkyClock::at(0.0, 0.0);
+    c.that(
+        "sky: midnight, the sun is below and there is no daylight",
+        night.sun.y < -0.99 && !night.isDay && night.daylight == 0.0
+    );
+    c.near("sky: the moon is opposite the sun", noon.moon.y, 0.0 - noon.sun.y, 0.0);
+    c.that("sky: at midnight the moon is overhead", night.moon.y > 0.99);
+    c.that(
+        "sky: the night sun gives no light",
+        night.sunRed == 0.0 && night.sunGreen == 0.0 && night.sunBlue == 0.0
+    );
+
+    let mut last : f64 = -1.0;
+    let mut monotone : bool = true;
+    for (i of 0..51) {
+        let t : f64 = 0.25 + (i as f64) * 0.005;
+        let d : f64 = SkyClock::at(t, 0.0).daylight;
+        if (d < last - 0.0000001) {
+            monotone = false;
+        }
+        last = d;
+    }
+    c.that("sky: daylight rises monotonically from sunrise to noon", monotone);
+    c.that(
+        "sky: and is partial around the horizon",
+        SkyClock::at(0.26, 0.0).daylight > 0.0 && SkyClock::at(0.26, 0.0).daylight < 0.95
+    );
+
+    let low : SkyState = SkyClock::at(0.27, 0.0);
+    let high : SkyState = SkyClock::at(0.45, 0.0);
+    c.that(
+        "sky: a low sun is redder than a high one (blue over red)",
+        low.sunBlue / low.sunRed < high.sunBlue / high.sunRed
+    );
+    c.that(
+        "sky: colour channels stay in 0..1",
+        low.sunRed <= 1.0 && high.sunBlue <= 1.0 && high.sunGreen > 0.9
+    );
+
+    // The lighting library's sky agrees about where the sun is.
+    let mut worst : f64 = 0.0;
+    for (i of 0..8) {
+        let t : f64 = (i as f64) / 8.0 + 0.01;
+        let mine : SkyState = SkyClock::at(t, 0.2);
+        let theirs : Vec3 = LightSky::atDayTime(t, 0.2 as f32).sunDirection();
+        let dx : f64 = mine.sun.x - (theirs.x as f64);
+        let dy : f64 = mine.sun.y - (theirs.y as f64);
+        let dz : f64 = mine.sun.z - (theirs.z as f64);
+        let e : f64 = absD(dx) + absD(dy) + absD(dz);
+        if (e > worst) {
+            worst = e;
+        }
+    }
+    c.that(
+        "sky: the sun is where LightSky::atDayTime puts it, to single precision",
+        worst < 0.00001
+    );
+    c.that("sky: a tilted path leans the sun towards z", SkyClock::at(0.5, 0.5).sun.z > 0.4);
+}
+
+fn skyClock(c : Checks) : void {
+    let clock : SkyClock = new SkyClock(24.0, 0.0, 0.1);
+    c.near("clock: the clock starts at its start time", clock.timeOfDay(), 0.0, 0.0);
+    clock.advance(6 * SKY_S);
+    c.near("clock: 6 s of a 24 s day is a quarter", clock.timeOfDay(), 0.25, 0.0);
+    clock.advance(20 * SKY_S);
+    c.near("clock: it wraps at the end of the day", clock.timeOfDay(), 2.0 / 24.0, SKY_TOL);
+    c.sameInt("clock: the first day is counted as day 1", clock.dayCount(), 1);
+    clock.advance(0 - 5);
+    c.near("clock: a negative time step is ignored", clock.timeOfDay(), 2.0 / 24.0, SKY_TOL);
+    c.near("clock: tilt reads back what was set", clock.tilt(), 0.1, 0.0);
+    c.sameInt("clock: the day length reads back what was set", clock.dayLength(), 24 * SKY_S);
+    clock.advance(3 * 24 * SKY_S);
+    c.sameInt("clock: whole days add up to the day count", clock.dayCount(), 4);
+    c.near("clock: and leave the time of day alone", clock.timeOfDay(), 2.0 / 24.0, SKY_TOL);
+
+    // Chopping time into tiny pieces gives exactly the same answer as one big piece.
+    let a : SkyClock = new SkyClock(600.0, 0.3, 0.0);
+    let b : SkyClock = new SkyClock(600.0, 0.3, 0.0);
+    for (i of 0..100000) {
+        a.advance(16666667);
+    }
+    b.advance(100000 as i64 * 16666667);
+    c.that(
+        "clock: a hundred thousand frames equal one long step, exactly",
+        a.timeOfDay() == b.timeOfDay() && a.dayCount() == b.dayCount()
+    );
+
+    let w : SkyClock = new SkyClock(100.0, -0.25, 0.0);
+    c.near("clock: a negative start time wraps", w.timeOfDay(), 0.75, SKY_TOL);
+    let big : SkyClock = new SkyClock(100.0, 3.5, 0.0);
+    c.near("clock: a start time over one wraps", big.timeOfDay(), 0.5, SKY_TOL);
+    w.setTimeOfDay(0.5);
+    c.near("clock: setTimeOfDay sets the time of day", w.timeOfDay(), 0.5, SKY_TOL);
+    w.setTimeOfDay(1.25);
+    c.near("clock: setTimeOfDay wraps a value past one day", w.timeOfDay(), 0.25, SKY_TOL);
+    let short : SkyClock = new SkyClock(0.001, 0.0, 0.0);
+    c.sameInt("clock: a day length below a second is raised to a second", short.dayLength(), SKY_S);
+    let noonClock : SkyClock = new SkyClock(60.0, 0.5, 0.0);
+    c.that(
+        "clock: state() is the sky at the clock's time",
+        noonClock.state().sun.y > 0.999 && noonClock.state().timeOfDay == 0.5
+    );
+}
+
+// A hash of the weather over `steps` steps of `dt`.
+fn skyWeatherTrace(seed : u64, steps : i32, dt : i64) : i64 {
+    let w : Weather = new Weather(seed, 30.0, 90.0, 10.0);
+    let mut h : i64 = 7;
+    for (i of 0..steps) {
+        w.advance(dt);
+        let s : WeatherState = w.state();
+        h = h * 31 + (s.kind.code() as i64) * 5 + (s.next.code() as i64);
+        h = h * 31 + (s.blend * 1000.0) as i64;
+    }
+    return h;
+}
+
+/** The weather's own clock: spells last between these many seconds, transitions this many, in the checks below. */
+const SKY_SPELL_MIN : f64 = 30.0;
+const SKY_SPELL_MAX : f64 = 90.0;
+const SKY_TRANSITION : f64 = 10.0;
+
+// A weather with the spell and transition lengths every check here uses.
+fn skyWeatherOf(seed : u64) : Weather {
+    return new Weather(seed, SKY_SPELL_MIN, SKY_SPELL_MAX, SKY_TRANSITION);
+}
+
+// Same seed, same weather; and chopping time up does not change it.
+fn skyWeatherDeterminism(c : Checks) : void {
+    let trace : i64 = skyWeatherTrace(5, 5000, SKY_S);
+    c.that(
+        "weather: the same seed gives the same weather",
+        trace == skyWeatherTrace(5, 5000, SKY_S)
+    );
+    c.that("weather: another seed gives other weather", trace != skyWeatherTrace(6, 5000, SKY_S));
+
+    // One hour in 1 s steps or in 10 s steps.
+    let a : Weather = skyWeatherOf(9);
+    let b : Weather = skyWeatherOf(9);
+    for (i of 0..3600) {
+        a.advance(SKY_S);
+    }
+    for (i of 0..360) {
+        b.advance(10 * SKY_S);
+    }
+    let sa : WeatherState = a.state();
+    let sb : WeatherState = b.state();
+    let sameState : bool = sa.kind == sb.kind && sa.next == sb.next && sa.blend == sb.blend;
+    c.that(
+        "weather: an hour in 1 s steps and in 10 s steps end alike",
+        sameState && a.changeCount() == b.changeCount()
+    );
+}
+
+// The first state of a weather: clear, with little cloud and full sun.
+fn skyWeatherStart(c : Checks) : void {
+    let s0 : WeatherState = skyWeatherOf(1).state();
+    c.that(
+        "weather: it starts clear and not changing",
+        s0.kind == WeatherKind::Clear && s0.blend == 0.0 && s0.next == WeatherKind::Clear
+    );
+    c.near(
+        "weather: clear sky has little cloud and full sun",
+        s0.cloud + s0.sunlight,
+        0.1 + 1.0,
+        0.0
+    );
+}
+
+/** What a long run of the weather showed: how it changed, and whether every change was legal. */
+struct SkyChangeLog {
+    changes  : i32;
+    allowed  : bool;
+    distinct : bool;
+    spellsOk : bool;
+    blendOk  : bool;
+    sawBlend : bool;
+}
+
+// Runs the weather for 5.5 hours in tenths of a second and records every change: each goes to a kind the table
+// allows, never to the same kind, spells have the right length, and a blend never falls within a transition.
+fn skyWatchChanges() : SkyChangeLog {
+    let w : Weather = skyWeatherOf(33);
+    let step : i64 = SKY_S / 10;
+    let mut log : SkyChangeLog = SkyChangeLog {
+        changes: 0,
+        allowed: true,
+        distinct: true,
+        spellsOk: true,
+        blendOk: true,
+        sawBlend: false,
+    };
+    let mut prev : WeatherKind = WeatherKind::Clear;
+    let mut lastChangeAt : i64 = 0;
+    let mut lastBlend : f64 = 0.0;
+    let mut clock : i64 = 0;
+    for (i of 0..200000) {
+        w.advance(step);
+        clock = clock + step;
+        let s : WeatherState = w.state();
+
+        if (s.blend > 0.0) {
+            log.sawBlend = true;
+            let fell : bool = s.blend < lastBlend - SKY_TOL && lastBlend < 1.0;
+            if (fell) {
+                log.blendOk = false;
+            }
+            lastBlend = s.blend;
+        } else {
+            lastBlend = 0.0;
+        }
+        if (w.changeCount() <= log.changes) {
+            continue;
+        }
+
+        log.changes = w.changeCount();
+        if (s.kind == prev) {
+            log.distinct = false;
+        }
+        if (prev.weightTo(s.kind) == 0) {
+            log.allowed = false;
+        }
+
+        // A spell plus its transition: between 30 + 10 and 90 + 10 seconds (0.1 s of slack for the step).
+        let spell : i64 = clock - lastChangeAt;
+        let outOfRange : bool = spell < 40 * SKY_S - SKY_S / 5 || spell > 100 * SKY_S + SKY_S / 5;
+        if (outOfRange && log.changes > 1) {
+            log.spellsOk = false;
+        }
+        lastChangeAt = clock;
+        prev = s.kind;
+    }
+    return log;
+}
+
+// Many legal changes over a long run.
+fn skyWeatherChanges(c : Checks) : void {
+    let log : SkyChangeLog = skyWatchChanges();
+    c.that("weather: many changes happened over 5.5 hours", log.changes > 150);
+    c.that("weather: the weather never 'changes' to the same kind", log.distinct);
+    c.that("weather: every change is one the table allows", log.allowed);
+    c.that("weather: every spell and its transition last between 40 and 100 seconds", log.spellsOk);
+    c.that(
+        "weather: blends were seen and rise smoothly within a transition",
+        log.sawBlend && log.blendOk
+    );
+}
+
+// Values stay in range and interpolate halfway through a transition.
+fn skyWeatherValues(c : Checks) : void {
+    let mid : Weather = new Weather(2, 1.0, 1.0, SKY_TRANSITION);
+    mid.advance(6 * SKY_S);
+    let m : WeatherState = mid.state();
+    c.that(
+        "weather: halfway through a transition the blend is about a half",
+        m.blend > 0.45 && m.blend < 0.55
+    );
+
+    let lo : f64 = m.kind.cloud();
+    let hi : f64 = m.next.cloud();
+    let betweenKinds : bool = m.cloud >= minD(lo, hi) - SKY_TOL
+        && m.cloud <= maxD(lo, hi) + SKY_TOL;
+    c.that("weather: and the values lie between the two kinds'", betweenKinds);
+
+    let rainOk : bool = m.rain >= 0.0 && m.rain <= 1.0;
+    let fogOk : bool = m.fog >= 0.0 && m.fog <= 1.0;
+    let sunOk : bool = m.sunlight > 0.0 && m.sunlight <= 1.0;
+    c.that("weather: all values are in range", rainOk && fogOk && sunOk && m.wind >= 0.0);
+}
+
+// The table of kinds: codes, and how the kinds compare.
+fn skyWeatherKinds(c : Checks) : void {
+    c.that(
+        "weather: kinds have codes",
+        WeatherKind::fromCode(3) == WeatherKind::Storm && WeatherKind::Storm.code() == 3
+            && WeatherKind::fromCode(99) == WeatherKind::Clear
+    );
+    c.that(
+        "weather: a storm is the wettest and windiest",
+        WeatherKind::Storm.rain() > WeatherKind::Rain.rain()
+            && WeatherKind::Storm.wind() > WeatherKind::Rain.wind()
+    );
+    c.that(
+        "weather: fog has more fog than a storm",
+        WeatherKind::Fog.fog() > WeatherKind::Storm.fog()
+    );
+    c.that(
+        "weather: clear sky lets most sun through, storms least",
+        WeatherKind::Clear.sunlight() > WeatherKind::Cloudy.sunlight()
+            && WeatherKind::Cloudy.sunlight() > WeatherKind::Storm.sunlight()
+    );
+    c.that(
+        "weather: a kind never follows itself",
+        WeatherKind::Rain.weightTo(WeatherKind::Rain) == 0
+    );
+    c.that(
+        "weather: a storm does not clear up at once",
+        WeatherKind::Storm.weightTo(WeatherKind::Clear) == 0
+    );
+}
+
+fn skyWeather(c : Checks) : void {
+    skyWeatherDeterminism(c);
+    skyWeatherStart(c);
+    skyWeatherChanges(c);
+    skyWeatherValues(c);
+    skyWeatherKinds(c);
+}
+
+fn skyWeatherStats(c : Checks) : void {
+    // From clear, cloudy is the most likely next weather (weights 6 of 9).
+    let mut cloudy : i32 = 0;
+    let mut total : i32 = 0;
+    for (seed of 0..300) {
+        let probe : Weather = new Weather(seed as u64, 1.0, 1.0, 1.0);
+        probe.advance(SKY_S + SKY_S / 2);
+        total = total + 1;
+        if (probe.state().next == WeatherKind::Cloudy) {
+            cloudy = cloudy + 1;
+        }
+    }
+    let share : f64 = (cloudy as f64) / (total as f64);
+    c.that(
+        "weather stats: the first change is to cloud about two times in three",
+        share > 0.55 && share < 0.78
+    );
+}

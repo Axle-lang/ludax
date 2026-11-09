@@ -1,0 +1,380 @@
+// streamer — keeps the cells around the player alive as entities, and only those.
+//
+// Each `update` is given the player's position. Cells within `loadRadius` of it (distance to the cell's nearest
+// edge) are made active: their content list is spawned as entities in the scene. Cells that are active but
+// farther than `loadRadius + hysteresis` are despawned. The gap between the two radii is the hysteresis: a
+// player pacing back and forth across the edge of the load radius does not make a cell flicker in and out.
+// Loads and unloads per update are budgeted so a long jump spreads its cost over frames; within a budget the
+// cells go in a fixed order (nearest first to load, farthest first to unload, ties by cell key), so what is
+// active after N updates depends on the positions given and nothing else — not on hash order, not on the
+// order cells were visited in earlier.
+//
+// Every spawned entity is registered with the cell it came from, so it can be despawned with its cell, and a
+// test (or a debug overlay) can ask any entity "whose are you?". Despawning destroys exactly the entities the
+// cell spawned; nothing the game made itself is touched, and nothing is leaked.
+
+use crate::core::collections::map::Map;
+use crate::core::collections::vec::Vec;
+use crate::core::id::entity_id::EntityId;
+use crate::core::id::hash::{hashCombine, hashMix};
+use crate::core::math::dquat::DQuat;
+use crate::core::math::dtransform::DTransform;
+use crate::core::math::dvec2::DVec2;
+use crate::core::math::dvec3::DVec3;
+use crate::openworld::partition::{CellEntry, Cells, WorldPartition};
+use crate::openworld::terrain::GroundHeight;
+use crate::world::scene::Scene;
+use crate::world::store::ComponentStore;
+
+/** How a streamer is tuned. */
+pub struct StreamConfig {
+    /** Cells whose nearest edge is within this many metres of the player are active. */
+    pub loadRadius : f64;
+
+    /** Extra metres beyond `loadRadius` a cell may stay active before it is released. */
+    pub hysteresis : f64;
+
+    /** The most cells one update may activate. */
+    pub maxLoads : i32;
+
+    /** The most cells one update may release. */
+    pub maxUnloads : i32;
+}
+
+// The default tuning: a cell loads within 600 m and stays until 800 m, a few cells per update so a long jump
+// spreads its cost over frames.
+const STREAM_DEFAULT_LOAD_RADIUS : f64 = 600.0;
+const STREAM_DEFAULT_HYSTERESIS : f64 = 200.0;
+const STREAM_DEFAULT_MAX_LOADS : i32 = 8;
+const STREAM_DEFAULT_MAX_UNLOADS : i32 = 16;
+
+// What a lookup answers when the entity is not a member.
+const STREAM_NONE : i32 = -1;
+
+// Content hashes round positions to the millimetre.
+const STREAM_MM_PER_METRE : f64 = 1000.0;
+
+// What the registry knows about a spawned entity.
+struct StreamMember {
+    cell     : i64;
+    template : i32;
+}
+
+/** Activates and releases cells around a moving point. */
+pub class CellStreamer {
+    cfg          : StreamConfig;
+    active       : Map<i64, i32>;
+    members      : ComponentStore<StreamMember>;
+    spawnedAll   : i64 = 0;
+    removedAll   : i64 = 0;
+    loadedLast   : i32 = 0;
+    unloadedLast : i32 = 0;
+    peakCells    : i32 = 0;
+    peakEntities : i32 = 0;
+    candKeys     : Vec<i64>;
+    candDist     : Vec<f64>;
+    doomed       : Vec<i64>;
+
+    /** A streamer with nothing active. */
+    constructor(cfg : StreamConfig) {
+        self.cfg = cfg;
+        self.active = new Map<i64, i32>();
+        self.members = new ComponentStore<StreamMember>();
+        self.candKeys = new Vec<i64>();
+        self.candDist = new Vec<f64>();
+        self.doomed = new Vec<i64>();
+    }
+
+    /** A sensible tuning: load 600 m, release at 800 m, at most 8 loads and 16 releases per update. */
+    pub static fn defaultConfig() : StreamConfig {
+        return StreamConfig {
+            loadRadius: STREAM_DEFAULT_LOAD_RADIUS,
+            hysteresis: STREAM_DEFAULT_HYSTERESIS,
+            maxLoads: STREAM_DEFAULT_MAX_LOADS,
+            maxUnloads: STREAM_DEFAULT_MAX_UNLOADS,
+        };
+    }
+
+    /**
+     * Moves the active set towards what the position (`px`, `pz`) asks for, spawning into and despawning from
+     * `scene`. Content for new cells is made on `ground`. After enough updates at one place the set is exactly the
+     * cells within the load radius plus those held by hysteresis.
+     */
+    pub fn update(
+        mut self,
+        scene : Scene,
+        part : WorldPartition,
+        ground : GroundHeight,
+        px : f64,
+        pz : f64
+    ) : void {
+        let player : DVec2 = DVec2::make(px, pz);
+        self.unloadedLast = self.releaseFar(scene, part, player);
+        self.loadedLast = self.activateNear(scene, part, ground, player);
+
+        if (self.active.len() > self.peakCells) {
+            self.peakCells = self.active.len();
+        }
+        if (self.members.len() > self.peakEntities) {
+            self.peakEntities = self.members.len();
+        }
+    }
+
+    // Despawns far cells, farthest first, up to the budget. Answers how many went.
+    fn releaseFar(mut self, scene : Scene, part : WorldPartition, player : DVec2) : i32 {
+        let limit : f64 = self.cfg.loadRadius + self.cfg.hysteresis;
+        let size : f64 = part.cellSize();
+
+        self.candKeys.clear();
+        self.candDist.clear();
+        let mut slot : i32 = self.active.first();
+        while (slot >= 0) {
+            let key : i64 = self.active.keyAt(slot);
+            let cx : i32 = Cells::keyX(key);
+            let cz : i32 = Cells::keyZ(key);
+            let d : f64 = Cells::distance(cx, cz, size, player.x, player.y);
+            if (d > limit) {
+                self.insertCandidate(key, d, false);
+            }
+            slot = self.active.next(slot);
+        }
+
+        let mut gone : i32 = 0;
+        for (i of 0..self.candKeys.len()) {
+            if (gone >= self.cfg.maxUnloads) {
+                break;
+            }
+            self.despawnCell(scene, self.candKeys.get(i));
+            gone = gone + 1;
+        }
+        return gone;
+    }
+
+    // Spawns the nearest inactive cells within the load radius, up to the budget. Answers how many came.
+    fn activateNear(
+        mut self,
+        scene : Scene,
+        part : WorldPartition,
+        ground : GroundHeight,
+        player : DVec2
+    ) : i32 {
+        let size : f64 = part.cellSize();
+        let reach : i32 = (self.cfg.loadRadius / size) as i32 + 1;
+        let ox : i32 = Cells::index(player.x, size);
+        let oz : i32 = Cells::index(player.y, size);
+
+        self.candKeys.clear();
+        self.candDist.clear();
+        for (dz of 0 - reach..reach + 1) {
+            for (dx of 0 - reach..reach + 1) {
+                let cx : i32 = ox + dx;
+                let cz : i32 = oz + dz;
+                let key : i64 = Cells::key(cx, cz);
+                if (self.active.has(key)) {
+                    continue;
+                }
+                let d : f64 = Cells::distance(cx, cz, size, player.x, player.y);
+                if (d <= self.cfg.loadRadius) {
+                    self.insertCandidate(key, d, true);
+                }
+            }
+        }
+
+        let mut came : i32 = 0;
+        for (i of 0..self.candKeys.len()) {
+            if (came >= self.cfg.maxLoads) {
+                break;
+            }
+            self.spawnCell(scene, part, ground, self.candKeys.get(i));
+            came = came + 1;
+        }
+        return came;
+    }
+
+    // Inserts into the candidate list kept sorted: nearest first when `nearFirst`, else farthest first; ties by key.
+    fn insertCandidate(mut self, key : i64, d : f64, nearFirst : bool) : void {
+        let mut at : i32 = self.candKeys.len();
+        self.candKeys.push(key);
+        self.candDist.push(d);
+        while (at > 0) {
+            let pd : f64 = self.candDist.get(at - 1);
+            let pk : i64 = self.candKeys.get(at - 1);
+            if (!CellStreamer::ranksBefore(d, key, pd, pk, nearFirst)) {
+                break;
+            }
+            self.candKeys.set(at, pk);
+            self.candDist.set(at, pd);
+            at = at - 1;
+        }
+        self.candKeys.set(at, key);
+        self.candDist.set(at, d);
+    }
+
+    // True when a candidate at distance `d` with key `key` goes ahead of the one at `pd` with key `pk`: nearer
+    // when `nearFirst`, else farther, and the smaller key on a tie.
+    static fn ranksBefore(d : f64, key : i64, pd : f64, pk : i64, nearFirst : bool) : bool {
+        if (d == pd) {
+            return key < pk;
+        }
+        if (nearFirst) {
+            return d < pd;
+        }
+        return d > pd;
+    }
+
+    // Makes the entities of one cell.
+    fn spawnCell(mut self, scene : Scene, part : WorldPartition, ground : GroundHeight, key : i64) : void {
+        let cx : i32 = Cells::keyX(key);
+        let cz : i32 = Cells::keyZ(key);
+        part.ensure(cx, cz, ground);
+        let mut n : i32 = 0;
+        let mut i : i32 = part.firstIn(key);
+        while (i >= 0) {
+            let e : CellEntry = part.entry(i);
+            let id : EntityId = scene.add("");
+            let turn : DQuat = DQuat::fromAxisAngle(DVec3::unitY(), e.yaw);
+            scene.setLocal(id, DTransform::make(DVec3::make(e.x, e.y, e.z), turn, DVec3::splat(1.0)));
+            self.members.add(scene.entities(), id, StreamMember { cell: key, template: e.template });
+            n = n + 1;
+            i = part.nextIn(i);
+        }
+        self.active.put(key, n);
+        self.spawnedAll = self.spawnedAll + n as i64;
+    }
+
+    // Destroys every entity the cell spawned.
+    fn despawnCell(mut self, scene : Scene, key : i64) : void {
+        self.doomed.clear();
+        for (d of 0..self.members.len()) {
+            if (self.members.valueAt(d).cell == key) {
+                self.doomed.push(self.members.entityAt(d).bits());
+            }
+        }
+        for (i of 0..self.doomed.len()) {
+            self.removedAll = self.removedAll + scene.destroy(EntityId::fromBits(self.doomed.get(i))) as i64;
+        }
+        self.members.sweep(scene.entities());
+        self.active.remove(key);
+    }
+
+    /** Despawns everything this streamer spawned. */
+    pub fn clear(mut self, scene : Scene) : void {
+        while (self.active.len() > 0) {
+            self.despawnCell(scene, self.active.keyAt(self.active.first()));
+        }
+    }
+
+    /** How many cells are active. */
+    pub fn activeCount(self) : i32 {
+        return self.active.len();
+    }
+
+    /** True when cell (`cx`, `cz`) is active. */
+    pub fn isActive(self, cx : i32, cz : i32) : bool {
+        return self.active.has(Cells::key(cx, cz));
+    }
+
+    /** The key of the `i`-th active cell (in the order they became active). */
+    pub fn activeKeyAt(self, i : i32) : i64 {
+        let mut slot : i32 = self.active.first();
+        let mut n : i32 = 0;
+        while (slot >= 0) {
+            if (n == i) {
+                return self.active.keyAt(slot);
+            }
+            n = n + 1;
+            slot = self.active.next(slot);
+        }
+        return 0;
+    }
+
+    /** How many entities this streamer has spawned that are alive now. */
+    pub fn entityCount(self) : i32 {
+        return self.members.len();
+    }
+
+    // What a lookup answers for an entity that is not a member.
+    static fn missing() : StreamMember {
+        return StreamMember { cell: STREAM_NONE as i64, template: STREAM_NONE };
+    }
+
+    /** The cell key `id` was spawned by, or `Cells::key` of nothing: check `isMember` first. */
+    pub fn cellOf(self, scene : Scene, id : EntityId) : i64 {
+        return self.members.getOr(scene.entities(), id, CellStreamer::missing()).cell;
+    }
+
+    /** The template number of a spawned entity, or -1. */
+    pub fn templateOf(self, scene : Scene, id : EntityId) : i32 {
+        return self.members.getOr(scene.entities(), id, CellStreamer::missing()).template;
+    }
+
+    /** True when this streamer spawned `id` and it is still alive. */
+    pub fn isMember(self, scene : Scene, id : EntityId) : bool {
+        return self.members.has(scene.entities(), id);
+    }
+
+    /** The `d`-th registered entity (0 to `entityCount() - 1`). */
+    pub fn memberAt(self, d : i32) : EntityId {
+        return self.members.entityAt(d);
+    }
+
+    /** Cells activated by the last update. */
+    pub fn lastLoaded(self) : i32 {
+        return self.loadedLast;
+    }
+
+    /** Cells released by the last update. */
+    pub fn lastUnloaded(self) : i32 {
+        return self.unloadedLast;
+    }
+
+    /** Entities spawned over the streamer's life. */
+    pub fn totalSpawned(self) : i64 {
+        return self.spawnedAll;
+    }
+
+    /** Entities destroyed over the streamer's life. */
+    pub fn totalRemoved(self) : i64 {
+        return self.removedAll;
+    }
+
+    /** The most cells that were ever active at once. */
+    pub fn peakActiveCells(self) : i32 {
+        return self.peakCells;
+    }
+
+    /** The most spawned entities that ever lived at once. */
+    pub fn peakEntityCount(self) : i32 {
+        return self.peakEntities;
+    }
+
+    /** A hash of the set of active cells that does not depend on the order they became active. */
+    pub fn activeSetHash(self) : i64 {
+        let mut h : i64 = 0;
+        let mut slot : i32 = self.active.first();
+        while (slot >= 0) {
+            h = h + hashMix(self.active.keyAt(slot));
+            slot = self.active.next(slot);
+        }
+        return h;
+    }
+
+    /**
+     * A hash of what exists in the world — each spawned entity's template and position (to the millimetre) —
+     * that does not depend on entity ids or spawn order: two runs that end in the same state hash alike.
+     */
+    pub fn contentHash(self, scene : Scene) : i64 {
+        let mut h : i64 = 0;
+        for (d of 0..self.members.len()) {
+            let id : EntityId = self.members.entityAt(d);
+            let t : DTransform = scene.localTransform(id);
+            let px : i64 = (t.translation.x * STREAM_MM_PER_METRE) as i64;
+            let py : i64 = (t.translation.y * STREAM_MM_PER_METRE) as i64;
+            let pz : i64 = (t.translation.z * STREAM_MM_PER_METRE) as i64;
+            let withX : i64 = hashCombine(self.members.valueAt(d).template as i64, px);
+            let withXY : i64 = hashCombine(withX, py);
+            h = h + hashMix(hashCombine(withXY, pz));
+        }
+        return h;
+    }
+}

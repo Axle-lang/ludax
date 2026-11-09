@@ -1,0 +1,340 @@
+// openworld_missions — checks for mission definitions and their text format.
+//
+// The builder and the validator accept and refuse what they should, the text format round-trips, and malformed
+// definitions are reported with the line and column they are on. The state machine that plays a book is
+// checked in `openworld_missions_play`.
+
+use ludax::BookCheck;
+use ludax::Checks;
+use ludax::MISSION_LOCKED;
+use ludax::MissionBoard;
+use ludax::MissionBook;
+use ludax::MissionText;
+use ludax::ParseReport;
+
+use crate::openworld_missions_support::{MIS_S, misBuilt, misParsed, misText};
+
+/** The mission definition checks. */
+pub class OpenworldMissionSuite {
+    /** Runs every check of the suite. */
+    pub static fn run(c : Checks) : void {
+        misBuilder(c);
+        misValidate(c);
+        misTextFormat(c);
+        misTextErrors(c);
+    }
+}
+
+fn misBuilder(c : Checks) : void {
+    let b : MissionBook = new MissionBook();
+    c.that(
+        "book: an objective needs a stage",
+        !b.reach(0.0, 0.0, 5.0) && b.lastProblem() == "an objective needs a stage to belong to"
+    );
+    c.that("book: requires without an open mission is refused", !b.requires("x"));
+    c.that("book: a stage needs a mission", !b.beginStage("s"));
+    c.that("book: a reward needs a mission", !b.reward("gold", 5));
+    c.that("book: a failure needs a mission", !b.failAfter(5.0));
+    c.that(
+        "book: a mission name must be one word",
+        !b.beginMission("two words", "t", false) && !b.beginMission("", "t", false)
+            && !b.beginMission("a#b", "t", false)
+    );
+    c.that("book: a good mission begins", b.beginMission("m", "Title", false));
+    c.that(
+        "book: a repeated mission name is refused",
+        !b.beginMission("m", "Other", false)
+            && b.lastProblem() == "there is already a mission called 'm'"
+    );
+    c.that("book: an objective still needs a stage inside a mission", !b.kill("wolf", 1));
+    c.that("book: a stage begins", b.beginStage("s"));
+    c.that("book: a repeated stage name is refused", !b.beginStage("s"));
+    c.that(
+        "book: a radius must be above zero",
+        !b.reach(0.0, 0.0, 0.0) && !b.reach(0.0, 0.0, -1.0) && !b.escort("c", 0.0, 0.0, 0.0)
+    );
+    c.that(
+        "book: a count must be positive",
+        !b.kill("wolf", 0) && !b.collect("crate", -3) && !b.kill("wolf", 2000000)
+    );
+    c.that(
+        "book: a kind must be one word",
+        !b.kill("big wolf", 1) && !b.flag("") && !b.escort("two words", 0.0, 0.0, 1.0)
+    );
+    c.that("book: a timer cannot be negative", !b.timer(-1.0));
+    c.that("book: optional needs an objective", !b.markOptional());
+    c.that("book: a fail timeout must be positive", !b.failAfter(0.0) && !b.failAfter(-2.0));
+    c.that("book: a reward must be positive", !b.reward("gold", 0) && !b.reward("gold", -5));
+    c.that("book: refused calls added nothing", b.totalObjectives() == 0);
+    c.that(
+        "book: a real objective is accepted",
+        b.reach(1.0, 2.0, 3.0) && b.totalObjectives() == 1
+    );
+    c.that("book: optional marks the last one", b.markOptional() && b.objectiveAt(0).optional);
+    c.sameInt("book: one begun mission is counted by missionCount", b.missionCount(), 1);
+    c.sameInt("book: indexOf answers the position of a begun mission", b.indexOf("m"), 0);
+    c.sameInt("book: indexOf an unknown id answers -1", b.indexOf("zz"), -1);
+    c.that(
+        "book: names and titles read back",
+        b.missionName(0) == "m" && b.missionTitle(0) == "Title" && b.stageName(0, 0) == "s"
+    );
+
+    c.that(
+        "book: the text and the builder give identical definitions",
+        misParsed().fingerprint() == misBuilt().fingerprint()
+    );
+    let changed : MissionBook = misBuilt();
+    changed.reward("gold", 1);
+    c.that(
+        "book: and a changed definition changes the fingerprint",
+        changed.fingerprint() != misBuilt().fingerprint()
+    );
+}
+
+fn misValidate(c : Checks) : void {
+    c.that("validate: the test missions are valid", misBuilt().validate().ok());
+    c.that("validate: an empty book is valid too", new MissionBook().validate().ok());
+
+    let empty : MissionBook = new MissionBook();
+    empty.beginMission("m", "t", false);
+    let r1 : BookCheck = empty.validate();
+    c.that(
+        "validate: a mission with no stage",
+        r1.count() == 1 && r1.messageAt(0) == "mission 'm' has no stage" && r1.missionAt(0) == 0
+    );
+
+    let optionalOnly : MissionBook = new MissionBook();
+    optionalOnly.beginMission("m", "t", false);
+    optionalOnly.beginStage("s");
+    optionalOnly.reach(0.0, 0.0, 1.0);
+    optionalOnly.markOptional();
+    c.that("validate: a stage with only optional objectives", optionalOnly.validate().count() == 1);
+
+    let noObjective : MissionBook = new MissionBook();
+    noObjective.beginMission("m", "t", false);
+    noObjective.beginStage("s");
+    c.that(
+        "validate: a stage with no objective gives exactly one problem",
+        noObjective.validate().count() == 1
+    );
+
+    let unknown : MissionBook = new MissionBook();
+    unknown.beginMission("m", "t", false);
+    unknown.requires("ghost");
+    unknown.beginStage("s");
+    unknown.timer(1.0);
+    c.that(
+        "validate: an unknown prerequisite",
+        unknown.validate().count() == 1
+            && unknown.validate().messageAt(0)
+                == "mission 'm' requires 'ghost', which does not exist"
+    );
+
+    let mine : MissionBook = new MissionBook();
+    mine.beginMission("m", "t", false);
+    mine.requires("m");
+    mine.beginStage("s");
+    mine.timer(1.0);
+    c.that(
+        "validate: a mission requiring itself is reported once",
+        mine.validate().count() == 1
+            && mine.validate().messageAt(0) == "mission 'm' requires itself"
+    );
+
+    let cyc : MissionBook = new MissionBook();
+    cyc.beginMission("a", "t", false);
+    cyc.requires("b");
+    cyc.beginStage("s");
+    cyc.timer(1.0);
+    cyc.beginMission("b", "t", false);
+    cyc.requires("c");
+    cyc.beginStage("s");
+    cyc.timer(1.0);
+    cyc.beginMission("c", "t", false);
+    cyc.requires("a");
+    cyc.beginStage("s");
+    cyc.timer(1.0);
+    cyc.beginMission("d", "t", false);
+    cyc.requires("a");
+    cyc.beginStage("s");
+    cyc.timer(1.0);
+    let lc : BookCheck = cyc.validate();
+    c.sameInt(
+        "validate: a loop of prerequisites is reported for each mission in it, not for one outside",
+        lc.count(),
+        3
+    );
+    c.that(
+        "validate: the loop message",
+        lc.messageAt(0) == "mission 'a' is its own prerequisite through a loop"
+    );
+
+    // A looped book never leaves Locked.
+    let stuck : MissionBoard = new MissionBoard(cyc);
+    c.that(
+        "validate: missions in a loop stay locked",
+        stuck.statusOf("a") == MISSION_LOCKED && stuck.statusOf("d") == MISSION_LOCKED
+    );
+}
+
+fn misTextFormat(c : Checks) : void {
+    let b : MissionBook = new MissionBook();
+    let r : ParseReport = MissionText::parse(b, misText());
+    c.that("text: the documented example reads without a problem", r.ok());
+    c.sameInt("text: the text defines three missions", b.missionCount(), 3);
+    c.sameInt("text: the second mission has three stages", b.stageCount(1), 3);
+    c.sameInt("text: the book totals eight objectives", b.totalObjectives(), 8);
+    c.that(
+        "text: titles",
+        b.missionTitle(1) == "Deliver the crate" && b.missionTitle(2) == "Bonus"
+    );
+    c.that(
+        "text: the third mission is automatic and the first is not",
+        b.isAuto(2) && !b.isAuto(0)
+    );
+    c.that(
+        "text: prerequisites",
+        b.requirementCount(1) == 1 && b.wordText(b.requirementWord(1, 0)) == "intro"
+    );
+    c.that(
+        "text: the optional flag is read for the right objectives",
+        b.objectiveAt(2).optional && !b.objectiveAt(1).optional
+    );
+    c.near(
+        "text: a decimal timer reads as 2.5 seconds in nanoseconds",
+        b.objectiveAt(4).nanos as f64,
+        2500000000.0,
+        0.0
+    );
+    c.that(
+        "text: failure conditions",
+        b.failCount(1) == 3 && b.failKind(1, 0) == 0 && b.failKind(1, 1) == 1
+            && b.failKind(1, 2) == 2
+    );
+    c.sameInt(
+        "text: a failure time reads as 100 seconds in nanoseconds",
+        b.failNanos(1, 0),
+        100 * MIS_S
+    );
+    c.that(
+        "text: rewards",
+        b.rewardCount(1) == 2 && b.rewardAmount(1, 0) == 250 && b.rewardAmount(1, 1) == 100
+    );
+
+    let crlf : MissionBook = new MissionBook();
+    let rc : ParseReport = MissionText::parse(
+        crlf,
+        "mission m\r\n  stage s\r\n    timer 1\r\nend\r\n"
+    );
+    c.that("text: a text with Windows line endings parses", rc.ok() && crlf.missionCount() == 1);
+    let none : MissionBook = new MissionBook();
+    c.that(
+        "text: an empty text is fine",
+        MissionText::parse(none, "").ok() && MissionText::parse(none, "# only a comment\n\n").ok()
+    );
+    let spaced : MissionBook = new MissionBook();
+    let rs : ParseReport = MissionText::parse(
+        spaced,
+        "mission m \"A title # with hash\"   # trailing\n\tstage s\n\t\ttimer   1   # t\nend"
+    );
+    c.that(
+        "text: tabs, extra spaces, a # inside quotes and a last line without a newline",
+        rs.ok() && spaced.missionTitle(0) == "A title # with hash"
+    );
+}
+
+// Parses `text` and answers the report.
+fn misProblems(text : string) : ParseReport {
+    return MissionText::parse(new MissionBook(), text);
+}
+
+fn misTextErrors(c : Checks) : void {
+    let a : ParseReport = misProblems("mission m\n  stage s\n    jump 5\nend\n");
+    c.that(
+        "text error: an unknown statement",
+        a.count() >= 1 && a.lineAt(0) == 3 && a.columnAt(0) == 5
+            && a.messageAt(0) == "unknown statement 'jump'"
+    );
+    let b : ParseReport = misProblems("mission m\n  stage s\n    reach 1 2\nend\n");
+    c.that(
+        "text error: too few arguments, column after the last word",
+        b.count() >= 1 && b.lineAt(0) == 3 && b.columnAt(0) == 15
+            && b.messageAt(0) == "expected 'reach X Z RADIUS'"
+    );
+    let d : ParseReport = misProblems("mission m\n  stage s\n    reach 1 two 3\nend\n");
+    c.that(
+        "text error: a word where a number belongs, at its column",
+        d.lineAt(0) == 3 && d.columnAt(0) == 13 && d.messageAt(0) == "z must be a number, not 'two'"
+    );
+    let e : ParseReport = misProblems("mission m\n  stage s\n    kill wolf 3 now\nend\n");
+    c.that(
+        "text error: an extra word",
+        e.lineAt(0) == 3 && e.columnAt(0) == 17
+            && e.messageAt(0) == "unexpected 'now' after 'kill KIND COUNT'"
+    );
+    let f : ParseReport = misProblems("mission m \"open\n");
+    c.that(
+        "text error: an unclosed quote",
+        f.lineAt(0) == 1 && f.columnAt(0) == 11 && f.messageAt(0) == "a quote is never closed"
+    );
+    let g : ParseReport = misProblems("stage s\n");
+    c.that(
+        "text error: a stage outside a mission",
+        g.lineAt(0) == 1 && g.messageAt(0) == "'stage' belongs inside a mission ... end block"
+    );
+    let h : ParseReport = misProblems("mission m\n  reach 1 2 3\nend\n");
+    c.that(
+        "text error: an objective outside a stage",
+        h.lineAt(0) == 2 && h.messageAt(0) == "'reach' belongs inside a stage"
+    );
+    let i : ParseReport = misProblems("mission m\n  stage s\n    timer 1\n");
+    c.that(
+        "text error: a mission never closed",
+        i.lineAt(0) == 3 && i.messageAt(0) == "mission 'm' is not closed with 'end'"
+    );
+    let j : ParseReport = misProblems("end\n");
+    c.that(
+        "text error: end with no mission",
+        j.lineAt(0) == 1 && j.messageAt(0) == "'end' without a mission"
+    );
+    let k : ParseReport = misProblems("mission m\n  stage s\n    timer 1\nend\nmission m\n  stage s\n    timer 1\nend\n");
+    c.that(
+        "text error: a repeated mission name",
+        k.lineAt(0) == 5 && k.messageAt(0) == "there is already a mission called 'm'"
+    );
+    let l : ParseReport = misProblems("mission a\n  requires ghost\n  stage s\n    timer 1\nend\n");
+    c.that(
+        "text error: an unknown prerequisite is reported on the mission's own line",
+        l.lineAt(0) == 1 && l.messageAt(0) == "mission 'a' requires 'ghost', which does not exist"
+    );
+    let m : ParseReport = misProblems("mission a\n  stage s\n    timer 1\n  fail sometimes 3\nend\n");
+    c.that(
+        "text error: a bad failure kind is reported at line 4 column 8",
+        m.lineAt(0) == 4 && m.columnAt(0) == 8
+    );
+    let n : ParseReport = misProblems("mission a\n  stage s\n    kill wolf -2\nend\n");
+    c.that(
+        "text error: a count the book refuses",
+        n.lineAt(0) == 3 && n.messageAt(0) == "the count must be between 1 and 1000000"
+    );
+    let o : ParseReport = misProblems("mission a\n  stage s\n    timer 1\n  reward gold lots\nend\n");
+    c.that("text error: a reward that is not a number", o.lineAt(0) == 4 && o.columnAt(0) == 15);
+    let p : ParseReport = misProblems("mission\n");
+    c.that("text error: a mission without a name is reported at line 1", p.lineAt(0) == 1);
+    let q : ParseReport = misProblems("mission a\nmission b\n  stage s\n    timer 1\nend\n");
+    c.that(
+        "text error: a mission opened inside another",
+        q.lineAt(0) == 2 && q.messageAt(0) == "mission 'a' is not closed with 'end'"
+    );
+    let r : ParseReport = misProblems("mission a\n  stage s\n    reach 1 2 3 optional\nend\n");
+    c.that(
+        "text error: a stage of optional objectives is caught by validation",
+        r.count() == 1 && r.lineAt(0) == 1
+    );
+    let many : ParseReport = misProblems("bogus\nmission a\n  stage s\n    reach 1\n    timer 1\nend\nmore bogus\n");
+    c.sameInt("text error: every bad line is reported, the good ones still read", many.count(), 3);
+    c.that(
+        "text error: on the right lines",
+        many.lineAt(0) == 1 && many.lineAt(1) == 4 && many.lineAt(2) == 7
+    );
+}

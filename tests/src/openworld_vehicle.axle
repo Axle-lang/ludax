@@ -1,0 +1,444 @@
+// openworld_vehicle — checks for the arcade vehicle model at rest, at speed and on uneven ground.
+//
+// Measurable behaviour, not smoke: the top speed the drag allows (against a force balance solved separately),
+// the braking distance grip allows (and how it scales with speed and downforce), and a car that never ends a
+// step with a wheel mount inside the ground however hard it lands. Cornering, tyres, gears and repeatability
+// are in `openworld_vehicle_drive`.
+
+use ludax::Checks;
+use ludax::FlatGround;
+use ludax::GroundHeight;
+use ludax::RollingGround;
+use ludax::VehicleInput;
+use ludax::VehicleModel;
+use ludax::VehicleParams;
+use ludax::VehicleState;
+use ludax::absD;
+use ludax::minD;
+use ludax::sinD;
+use ludax::sqrtD;
+
+use crate::openworld_vehicle_support::{VEHT_DT, vehFull, vehRun};
+
+/** The vehicle checks. */
+pub class OpenworldVehicleSuite {
+    /** Runs every check of the suite. */
+    pub static fn run(c : Checks) : void {
+        vehRest(c);
+        vehTopSpeed(c);
+        vehBraking(c);
+        vehGround(c);
+    }
+}
+
+// A ground with a cliff: 5 m higher beyond x = 100, to see that nothing tunnels through a wall.
+class VehCliff : GroundHeight {
+    constructor() {}
+
+    /** Flat ground until x = 100, then a 5 m cliff. */
+    pub fn heightAt(self, x : f64, z : f64) : f64 {
+        if (x > 100.0) {
+            return 5.0;
+        }
+        return 0.0;
+    }
+}
+
+// A steady slope: 10 cm up per metre along x.
+class VehSlope : GroundHeight {
+    constructor() {}
+
+    /** Ten centimetres of rise per metre along x. */
+    pub fn heightAt(self, x : f64, z : f64) : f64 {
+        return 0.1 * x;
+    }
+}
+
+// A ramp: rises 2 m over x in [50, 60], then drops to the flat after x = 60.
+class VehRamp : GroundHeight {
+    constructor() {}
+
+    /** Rises 2 m over x in [50, 60], then flat again. */
+    pub fn heightAt(self, x : f64, z : f64) : f64 {
+        if (x > 50.0 && x <= 60.0) {
+            return (x - 50.0) * 0.2;
+        }
+        return 0.0;
+    }
+}
+
+// The top speed where the best gear's push equals drag plus rolling resistance, found by bisection.
+fn vehBalance(p : VehicleParams) : f64 {
+    let mut lo : f64 = 1.0;
+    let mut hi : f64 = 120.0;
+    for (n of 0..60) {
+        let mid : f64 = 0.5 * (lo + hi);
+        let mut best : f64 = 0.0;
+        for (g of 1..p.gearCount() + 1) {
+            if (p.rpmAt(g, mid) < p.redlineRpm && p.engineForce(g, mid) > best) {
+                best = p.engineForce(g, mid);
+            }
+        }
+        if (best > p.dragForce(mid) + p.rollingForce()) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    return lo;
+}
+
+// Brakes from `speed` to a stop on flat ground; answers the distance. The longest run is 20 s.
+fn vehStop(p : VehicleParams, speed : f64, pedal : f64) : f64 {
+    let g : FlatGround = new FlatGround(0.0);
+    let mut s : VehicleState = VehicleModel::placeAtRest(p, 0.0, 0.0, 0.0, g);
+    s.vf = speed;
+    s.gear = 5;
+    let brake : VehicleInput = VehicleInput {
+        throttle: 0.0,
+        brake: pedal,
+        steer: 0.0,
+        reverse: false,
+        handbrake: false,
+    };
+    for (i of 0..1200) {
+        s = VehicleModel::step(p, s, brake, g, VEHT_DT);
+        if (s.vf <= 0.0) {
+            break;
+        }
+    }
+    return s.x;
+}
+
+fn vehRest(c : Checks) : void {
+    let p : VehicleParams = VehicleParams::arcade();
+    let g : FlatGround = new FlatGround(10.0);
+    let s0 : VehicleState = VehicleModel::placeAtRest(p, 5.0, 7.0, 0.3, g);
+    c.near(
+        "vehicle rest: placed with its springs at their static sag",
+        s0.y,
+        10.0 + 0.45 - 1200.0 * 9.81 / (4.0 * 60000.0),
+        0.000001
+    );
+    let s : VehicleState = vehRun(p, s0, VehicleInput::idle(), g, 600);
+    c.near(
+        "vehicle rest: an idle car on flat ground stays put",
+        sqrtD((s.x - 5.0) * (s.x - 5.0) + (s.z - 7.0) * (s.z - 7.0)),
+        0.0,
+        0.001
+    );
+    c.near("vehicle rest: an idle car sits at its ride height", s.y, s0.y, 0.002);
+    c.that(
+        "vehicle rest: with four wheels down and no tilt",
+        s.wheelsDown == 4 && absD(s.pitch) < 0.001 && absD(s.roll) < 0.001
+    );
+    c.that(
+        "vehicle rest: an idle car has no forward or sideways speed",
+        absD(s.vf) < 0.001 && absD(s.vl) < 0.001
+    );
+    c.that(
+        "vehicle rest: the mounts clear the ground by the spring's rest gap less the sag",
+        VehicleModel::clearance(p, s, g) > p.minGap
+    );
+}
+
+fn vehTopSpeed(c : Checks) : void {
+    let g : FlatGround = new FlatGround(0.0);
+    let p : VehicleParams = VehicleParams::arcade();
+    let predicted : f64 = vehBalance(p);
+    let s : VehicleState = vehRun(
+        p,
+        VehicleModel::placeAtRest(p, 0.0, 0.0, 0.0, g),
+        vehFull(),
+        g,
+        12000
+    );
+    c.that(
+        "top speed: the predicted balance is in a sane range",
+        predicted > 55.0 && predicted < 80.0
+    );
+    c.near(
+        "top speed: full throttle ends at the speed where thrust equals drag",
+        s.vf,
+        predicted,
+        predicted * 0.03
+    );
+    c.that("top speed: the engine runs below the rev limit", p.rpmAt(s.gear, s.vf) < p.redlineRpm);
+    c.that("top speed: the car is in top gear", s.gear == p.gearCount());
+    c.that("top speed: the car still drives straight", absD(s.z) < 0.01 && absD(s.vl) < 0.001);
+
+    let mut slick : VehicleParams = VehicleParams::arcade();
+    slick.dragArea = 0.0001;
+    let fast : VehicleState = vehRun(
+        slick,
+        VehicleModel::placeAtRest(slick, 0.0, 0.0, 0.0, g),
+        vehFull(),
+        g,
+        12000
+    );
+    let limit : f64 = slick.redlineRpm
+        / (slick.ratio(slick.gearCount()) * slick.finalDrive * 9.549296585513721)
+        * slick.wheelRadius;
+    c.near("top speed: with no drag the rev limiter sets it", fast.vf, limit, limit * 0.02);
+    c.that("top speed: and is faster than with drag", fast.vf > s.vf + 5.0);
+
+    let mut heavy : VehicleParams = VehicleParams::arcade();
+    heavy.dragArea = 1.3;
+    let slow : VehicleState = vehRun(
+        heavy,
+        VehicleModel::placeAtRest(heavy, 0.0, 0.0, 0.0, g),
+        vehFull(),
+        g,
+        12000
+    );
+    c.that("top speed: double the drag area is slower", slow.vf < s.vf - 3.0);
+    c.near(
+        "top speed: and matches its own balance",
+        slow.vf,
+        vehBalance(heavy),
+        vehBalance(heavy) * 0.03
+    );
+    // Thrust ~ 1/v and drag ~ v^2 at top speed: doubling drag lowers the top speed by well under a factor 2^(1/2) ... but never raises it.
+    c.that(
+        "top speed: top speed falls as drag rises, monotonically",
+        slow.vf < s.vf && s.vf < fast.vf
+    );
+
+    let mid : VehicleState = vehRun(
+        p,
+        VehicleModel::placeAtRest(p, 0.0, 0.0, 0.0, g),
+        vehFull(),
+        g,
+        300
+    );
+    c.that(
+        "top speed: after 5 s the car is moving briskly but nowhere near top speed",
+        mid.vf > 15.0 && mid.vf < 40.0
+    );
+    c.that("top speed: and has moved up the gearbox", mid.gear >= 2);
+}
+
+fn vehBraking(c : Checks) : void {
+    let p : VehicleParams = VehicleParams::arcade();
+    let d30 : f64 = vehStop(p, 30.0, 1.0);
+    let d15 : f64 = vehStop(p, 15.0, 1.0);
+    c.that(
+        "braking: from 30 m/s the car stops in about the distance grip allows",
+        d30 > 39.0 && d30 < 45.0
+    );
+    let ideal : f64 = 30.0 * 30.0 / (2.0 * p.grip * 9.81);
+    c.that(
+        "braking: a few percent shorter than friction alone (drag and rolling resistance help), not more",
+        d30 < ideal && d30 > ideal * 0.93
+    );
+    c.that("braking: distance grows with the square of speed", d30 / d15 > 3.6 && d30 / d15 < 4.4);
+    c.that("braking: a lighter pedal stops later", vehStop(p, 30.0, 0.5) > d30 * 1.6);
+    let mut grippy : VehicleParams = VehicleParams::arcade();
+    grippy.grip = 0.5;
+    c.that(
+        "braking: less grip stops later (about twice as far at half the grip)",
+        vehStop(grippy, 30.0, 1.0) > d30 * 1.8
+    );
+
+    let g : FlatGround = new FlatGround(0.0);
+    let mut s : VehicleState = VehicleModel::placeAtRest(p, 0.0, 0.0, 0.0, g);
+    s.vf = 20.0;
+    s.gear = 4;
+    let brake : VehicleInput = VehicleInput {
+        throttle: 0.0,
+        brake: 1.0,
+        steer: 0.0,
+        reverse: false,
+        handbrake: false,
+    };
+    let mut reversed : bool = false;
+    for (i of 0..900) {
+        s = VehicleModel::step(p, s, brake, g, VEHT_DT);
+        if (s.vf < 0.0) {
+            reversed = true;
+        }
+    }
+    c.that(
+        "braking: holding the brake stops the car and does not push it backwards",
+        !reversed && s.vf == 0.0
+    );
+
+    // Downforce: at 50 m/s a car with a big wing has more grip and stops shorter.
+    let mut wing : VehicleParams = VehicleParams::arcade();
+    wing.downforceArea = 4.0;
+    c.that(
+        "braking: downforce adds grip at speed",
+        vehStop(wing, 50.0, 1.0) < vehStop(p, 50.0, 1.0) * 0.93
+    );
+    c.near(
+        "braking: but changes nothing at a standstill start (no speed, no downforce)",
+        wing.downforce(0.0),
+        0.0,
+        0.0
+    );
+
+    // Coasting: drag and rolling resistance alone slow the car, but gently.
+    let coast : VehicleState = vehRun(p, s0At(p, g, 30.0), VehicleInput::idle(), g, 300);
+    c.that(
+        "braking: coasting for 5 s costs some speed, not all of it",
+        coast.vf < 30.0 && coast.vf > 22.0
+    );
+}
+
+fn s0At(p : VehicleParams, g : GroundHeight, speed : f64) : VehicleState {
+    let mut s : VehicleState = VehicleModel::placeAtRest(p, 0.0, 0.0, 0.0, g);
+    s.vf = speed;
+    s.gear = 4;
+    return s;
+}
+
+fn vehGround(c : Checks) : void {
+    let p : VehicleParams = VehicleParams::arcade();
+    // Rough ground at speed with a driver who swerves.
+    let rough : RollingGround = new RollingGround(3.0, 20.0);
+    let mut s : VehicleState = VehicleModel::placeAtRest(p, 0.0, 0.0, 0.0, rough);
+    let mut low : f64 = 1000.0;
+    let mut airborne : i32 = 0;
+    for (i of 0..2400) {
+        let wheel : f64 = sinD(i as f64 * 0.03);
+        let input : VehicleInput = VehicleInput {
+            throttle: 1.0,
+            brake: 0.0,
+            steer: wheel,
+            reverse: false,
+            handbrake: false,
+        };
+        s = VehicleModel::step(p, s, input, rough, VEHT_DT);
+        let gap : f64 = VehicleModel::clearance(p, s, rough);
+        if (gap < low) {
+            low = gap;
+        }
+        if (s.wheelsDown == 0) {
+            airborne = airborne + 1;
+        }
+    }
+    c.that(
+        "ground: over 40 s of rough ground no wheel mount ever ends a step inside the ground",
+        low >= p.minGap - 0.000000001
+    );
+    c.that(
+        "ground: the car drives more than 100 m from the origin",
+        s.x * s.x + s.z * s.z > 10000.0
+    );
+
+    // A drop from 50 m, already moving at 40 m/s, then onto flat ground.
+    let flat : FlatGround = new FlatGround(0.0);
+    let mut d : VehicleState = VehicleModel::placeAtRest(p, 0.0, 0.0, 0.0, flat);
+    d.y = 50.0;
+    d.vf = 40.0;
+    let mut lowest : f64 = 1000.0;
+    let mut hardest : f64 = 0.0;
+    for (i of 0..600) {
+        d = VehicleModel::step(p, d, VehicleInput::idle(), flat, VEHT_DT);
+        lowest = minD(lowest, VehicleModel::clearance(p, d, flat));
+        hardest = minD(hardest, d.vy);
+    }
+    c.that(
+        "ground: dropped from 50 m the mounts never get below the stop",
+        lowest >= p.minGap - 0.000000001
+    );
+    c.that("ground: it fell fast (over 25 m/s)", hardest < -25.0);
+    c.that(
+        "ground: and ended on its springs, four wheels down, not bouncing",
+        d.wheelsDown == 4 && absD(d.vy) < 0.05
+    );
+
+    // Absurd speed straight down: the stop still holds.
+    let mut k : VehicleState = VehicleModel::placeAtRest(p, 0.0, 0.0, 0.0, flat);
+    k.y = 30.0;
+    k.vy = -150.0;
+    let mut kLow : f64 = 1000.0;
+    for (i of 0..300) {
+        k = VehicleModel::step(p, k, VehicleInput::idle(), flat, VEHT_DT);
+        kLow = minD(kLow, VehicleModel::clearance(p, k, flat));
+    }
+    c.that("ground: even at 150 m/s downwards", kLow >= p.minGap - 0.000000001);
+
+    // A 5 m cliff at 50 m/s.
+    let cliff : VehCliff = new VehCliff();
+    let mut w : VehicleState = VehicleModel::placeAtRest(p, 0.0, 0.0, 0.0, cliff);
+    w.vf = 50.0;
+    w.gear = 5;
+    let mut wLow : f64 = 1000.0;
+    for (i of 0..300) {
+        w = VehicleModel::step(p, w, VehicleInput::idle(), cliff, VEHT_DT);
+        wLow = minD(wLow, VehicleModel::clearance(p, w, cliff));
+    }
+    c.that(
+        "ground: driving into a 5 m wall does not pass through it",
+        wLow >= p.minGap - 0.000000001
+    );
+    c.that(
+        "ground: the wall shoves the car up and over, or it is stopped",
+        w.y > 4.0 || w.x < 101.0
+    );
+
+    // A ramp: the car leaves the ground.
+    let ramp : VehRamp = new VehRamp();
+    let mut r : VehicleState = VehicleModel::placeAtRest(p, 0.0, 0.0, 0.0, ramp);
+    r.vf = 30.0;
+    r.gear = 4;
+    let mut flew : i32 = 0;
+    for (i of 0..240) {
+        r = VehicleModel::step(p, r, VehicleInput::idle(), ramp, VEHT_DT);
+        if (r.wheelsDown == 0) {
+            flew = flew + 1;
+        }
+    }
+    c.that("ground: a ramp at 30 m/s throws the car into the air for a while", flew > 5);
+    c.that(
+        "ground: and it comes down onto its wheels",
+        r.wheelsDown == 4 && VehicleModel::clearance(p, r, ramp) >= p.minGap - 0.000000001
+    );
+
+    // A slope: held by the brake, the car sits nose-up at the slope's angle.
+    let slope : VehSlope = new VehSlope();
+    let held : VehicleInput = VehicleInput {
+        throttle: 0.0,
+        brake: 1.0,
+        steer: 0.0,
+        reverse: false,
+        handbrake: false,
+    };
+    let up : VehicleState = vehRun(
+        p,
+        VehicleModel::placeAtRest(p, 0.0, 0.0, 0.0, slope),
+        held,
+        slope,
+        300
+    );
+    c.near(
+        "ground: on a 10 percent slope the car pitches up by the slope's angle",
+        up.pitch,
+        0.09967,
+        0.015
+    );
+    c.near("ground: a car on flat ground does not roll", up.roll, 0.0, 0.005);
+    c.near("ground: staying where the brake holds it", up.x, 0.0, 0.01);
+    let down : VehicleState = vehRun(
+        p,
+        VehicleModel::placeAtRest(p, 0.0, 0.0, 3.14159265358979, slope),
+        held,
+        slope,
+        300
+    );
+    c.near("ground: facing downhill the nose is down", down.pitch, -0.09967, 0.015);
+    let rolling : VehicleState = vehRun(
+        p,
+        VehicleModel::placeAtRest(p, 0.0, 0.0, 0.0, slope),
+        VehicleInput::idle(),
+        slope,
+        600
+    );
+    c.that("ground: released on the slope the car does not roll uphill", rolling.vf <= 0.0001);
+    let ride : f64 = rolling.y - slope.heightAt(rolling.x, rolling.z);
+    c.that(
+        "ground: the body follows the ground's height under the wheels",
+        ride > 0.3 && ride < 0.45
+    );
+}

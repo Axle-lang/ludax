@@ -1,0 +1,658 @@
+// vehicle_model — an arcade car as a pure function: (parameters, state, input, ground) -> next state.
+//
+// The model keeps nothing between calls. `step` takes the state the car was in and the driver's input and
+// returns the state `dt` seconds later, so a fixed step makes a run a function of the starting state and the
+// list of inputs: replays, ghosts and netcode are all the same thing. It uses only `sinD`/`cosD`/`sqrtD`
+// and arithmetic, never the platform's libm, so the answer is the same on every machine.
+//
+// What it models, and how plainly:
+//   - Engine: a torque curve through gears (automatic, with a shift delay and a rev limiter) to a drive force
+//     at the road; the driven wheels' grip caps it.
+//   - Brakes, air drag (quadratic), rolling resistance and the pull of slopes act against motion and can bring
+//     the car to rest but never push it backwards.
+//   - Steering: the angle shrinks with speed; the yaw rate follows the kinematic bicycle `v tan(delta) / L`, and
+//     is held below what the tyres can corner at, so a car pushed too hard understeers.
+//   - Tyres: sideways slip is pulled out at a rate limited by what grip is left after the longitudinal force
+//     (the friction circle); asked for more, the car slides (`sliding`, `slip`). Downforce adds grip with speed.
+//     The handbrake leaves little sideways grip, which is how you drift.
+//   - Suspension: four springs and dampers at the corners, whose lengths come from the ground height under
+//     each wheel, give heave, pitch and roll. A bump stop and a final clamp keep every mount at least
+//     `minGap` above the ground at the end of every step, however fast the car arrives: no tunnelling.
+// The whole step runs `substeps` times at a fraction of `dt`.
+//
+// One substep reads in the order the physics runs: the wheel loads, the gearbox, the forces along the car, the
+// tyres' sideways answer, the steering, the body's heave, then the move and the ground clamp.
+
+use crate::core::math::dvec2::DVec2;
+use crate::core::math::scalar::{absD, maxD, minD, clampD, signD, maxI};
+use crate::core::math::trig::{sinD, cosD, sqrtD};
+use crate::openworld::terrain::GroundHeight;
+use crate::openworld::vehicle_params::{VehicleParams, PARAMS_GRAVITY, PARAMS_RAD_PER_SEC_TO_RPM};
+use crate::openworld::vehicle_state::{VehicleInput, VehicleState};
+
+// A stand-in for "no value" in a minimum or maximum over the wheels.
+const VEH_HUGE : f64 = 1000000.0;
+
+// Wheels, the share of the car each carries, and how much harder the bump stop pushes past full travel.
+const VEH_WHEELS : i32 = 4;
+const VEH_WHEEL_SHARE : f64 = 0.25;
+const VEH_BUMP_STIFFNESS : f64 = 10.0;
+
+// The wheels sit half a wheelbase ahead of and behind the centre of mass.
+const VEH_HALF : f64 = 0.5;
+
+// The mean of the two wheels of one side, or one end: the ground heights are summed over a pair.
+const VEH_PAIR_MEAN : f64 = 0.5;
+
+// A downshift pauses the drive for this share of a full shift time.
+const VEH_DOWNSHIFT_SHARE : f64 = 0.5;
+
+// The handbrake adds this share of the full braking force.
+const VEH_HANDBRAKE_BRAKE : f64 = 0.25;
+
+// Steering and grip limits.
+const VEH_GRIP_USE : f64 = 0.95;
+const VEH_YAW_MIN_SPEED : f64 = 0.5;
+const VEH_SLIDE_MARGIN : f64 = 1.0001;
+
+// The body stops tilting beyond this angle, and a slip ratio is measured above this speed.
+const VEH_TILT_MAX : f64 = 0.6;
+const VEH_SLIP_FLOOR : f64 = 1.0;
+
+// Below this forward speed a selected reverse gear engages (and above it, the car is still rolling forwards).
+const VEH_REVERSE_FORWARD : f64 = 1.0;
+
+// The gear a car in reverse is in.
+const VEH_REVERSE_GEAR : i32 = -1;
+
+// Where one wheel sits relative to the centre of mass: ahead of it (negative behind) and to the side.
+struct VehicleWheel {
+    ahead : f64 = 0.0;
+    side  : f64 = 0.0;
+}
+
+// The car's heading as the sine and cosine every wheel position of a substep is rotated by.
+struct VehicleHeading {
+    cosYaw : f64 = 1.0;
+    sinYaw : f64 = 0.0;
+
+    // The heading of a car turned `yaw` radians.
+    pub(crate) static fn turned(yaw : f64) : VehicleHeading {
+        return VehicleHeading { cosYaw: cosD(yaw), sinYaw: sinD(yaw) };
+    }
+}
+
+// The car's heading and its velocity in world axes, which every wheel and force calculation of a substep uses.
+struct VehicleMotion {
+    heading : VehicleHeading;
+    worldVx : f64 = 0.0;
+    worldVz : f64 = 0.0;
+}
+
+// What one substep starts from: the state the car is in, the driver's input and the substep's length.
+struct VehicleSlice {
+    state : VehicleState;
+    input : VehicleInput;
+    h     : f64;
+}
+
+// The gearbox's answer for one substep: the selected gear (negative is reverse) and the shift pause left.
+struct VehicleGear {
+    gear      : i32 = 1;
+    shiftLeft : f64 = 0.0;
+}
+
+// What the wheels can do for the drive and the brakes: the gearing, the wheel speed and the load on the tyres.
+struct VehicleTraction {
+    ratio    : f64 = 0.0;
+    wheelRpm : f64 = 0.0;
+    normal   : f64 = 0.0;
+}
+
+// The pull of the slope on the car, along it and sideways; zero for a car in the air.
+struct VehicleSlope {
+    along : f64 = 0.0;
+    side  : f64 = 0.0;
+}
+
+// What the drivetrain, brakes and slope do along the car in one substep: the drive and brake forces, the speed
+// before and after the retarding forces, the tyre normal load, the sideways slope force and the wheel rpm.
+struct VehicleThrust {
+    drive     : f64 = 0.0;
+    brake     : f64 = 0.0;
+    pushed    : f64 = 0.0;
+    vf        : f64 = 0.0;
+    normal    : f64 = 0.0;
+    slopeSide : f64 = 0.0;
+    wheelRpm  : f64 = 0.0;
+}
+
+// The sideways answer of a substep: the new sideways speed, the change the tyres made, whether they gave way.
+struct VehicleSlip {
+    vl      : f64 = 0.0;
+    tireDv  : f64 = 0.0;
+    sliding : bool = false;
+}
+
+// The steering answer of a substep: the wheel angle and the yaw rate it leaves.
+struct VehicleTurn {
+    angle   : f64 = 0.0;
+    yawRate : f64 = 0.0;
+}
+
+// The body's answer of a substep: vertical speed and the pitch and roll rates.
+struct VehicleHeave {
+    vy        : f64 = 0.0;
+    pitchRate : f64 = 0.0;
+    rollRate  : f64 = 0.0;
+}
+
+// A tilt angle (pitch or roll) and the rate it changes at.
+struct VehicleTilt {
+    angle : f64 = 0.0;
+    rate  : f64 = 0.0;
+}
+
+// One wheel-load pass: how many wheels touch, the spring forces and their moments, and the ground heights
+// summed over the front, rear, left and right pairs of wheels.
+struct VehicleLoad {
+    contacts    : i32 = 0;
+    springForce : f64 = 0.0;
+    pitchMoment : f64 = 0.0;
+    rollMoment  : f64 = 0.0;
+    frontGround : f64 = 0.0;
+    rearGround  : f64 = 0.0;
+    leftGround  : f64 = 0.0;
+    rightGround : f64 = 0.0;
+
+    // True when at least one wheel is on the ground.
+    pub(crate) fn touching(self) : bool {
+        return self.contacts > 0;
+    }
+
+    // Adds the ground height `under` the wheel to the sums of the two pairs it belongs to.
+    pub(crate) fn noteGround(mut self, wheel : VehicleWheel, under : f64) : void {
+        if (wheel.ahead > 0.0) {
+            self.frontGround = self.frontGround + under;
+        } else {
+            self.rearGround = self.rearGround + under;
+        }
+        if (wheel.side < 0.0) {
+            self.leftGround = self.leftGround + under;
+        } else {
+            self.rightGround = self.rightGround + under;
+        }
+    }
+
+    // Adds the push `force` of the spring of `wheel` and the moments it makes about the centre of mass.
+    pub(crate) fn noteSpring(mut self, wheel : VehicleWheel, force : f64) : void {
+        self.contacts = self.contacts + 1;
+        self.springForce = self.springForce + force;
+        self.pitchMoment = self.pitchMoment + force * wheel.ahead;
+        self.rollMoment = self.rollMoment + force * wheel.side;
+    }
+}
+
+/** The vehicle model's functions. */
+pub class VehicleModel {
+    /** A car at rest on `ground` at (`x`, `z`), heading `yaw`, springs settled under its own weight. */
+    pub static fn placeAtRest(
+        p : VehicleParams,
+        x : f64,
+        z : f64,
+        yaw : f64,
+        ground : GroundHeight
+    ) : VehicleState {
+        let heading : VehicleHeading = VehicleHeading::turned(yaw);
+
+        let mut groundSum : f64 = 0.0;
+        for (i of 0..VEH_WHEELS) {
+            let wheel : VehicleWheel = VehicleModel::wheel(p, i);
+            let spot : DVec2 = VehicleModel::wheelSpot(x, z, heading, wheel);
+            groundSum = groundSum + ground.heightAt(spot.x, spot.y);
+        }
+        let meanGround : f64 = groundSum / (VEH_WHEELS as f64);
+
+        // Each spring carries a quarter of the weight and is compressed by the same amount.
+        let sag : f64 = p.mass * PARAMS_GRAVITY / (VEH_WHEELS as f64 * p.springK);
+        return VehicleState {
+            x: x,
+            y: meanGround + p.restLength - sag,
+            z: z,
+            yaw: yaw,
+            vf: 0.0,
+            vl: 0.0,
+            vy: 0.0,
+            yawRate: 0.0,
+            pitch: 0.0,
+            roll: 0.0,
+            pitchRate: 0.0,
+            rollRate: 0.0,
+            steerAngle: 0.0,
+            gear: 1,
+            shiftLeft: 0.0,
+            rpm: p.idleRpm,
+            slip: 0.0,
+            sliding: false,
+            wheelsDown: VEH_WHEELS,
+        };
+    }
+
+    /** Distance of wheel `i` ahead of the centre of mass (wheels 0 and 1 are the front ones). */
+    pub static fn wheelAhead(p : VehicleParams, i : i32) : f64 {
+        if (i < 2) {
+            return p.wheelBase * VEH_HALF;
+        }
+        return 0.0 - p.wheelBase * VEH_HALF;
+    }
+
+    /** Distance of wheel `i` along the sideways axis (even wheels on the negative side). */
+    pub static fn wheelSide(p : VehicleParams, i : i32) : f64 {
+        if ((i & 1) == 0) {
+            return 0.0 - p.halfTrack;
+        }
+        return p.halfTrack;
+    }
+
+    /**
+     * The smallest height of any wheel mount above the ground under it; the model keeps this at `minGap` or
+     * more.
+     */
+    pub static fn clearance(p : VehicleParams, s : VehicleState, ground : GroundHeight) : f64 {
+        let heading : VehicleHeading = VehicleHeading::turned(s.yaw);
+
+        let mut lowest : f64 = VEH_HUGE;
+        for (i of 0..VEH_WHEELS) {
+            let wheel : VehicleWheel = VehicleModel::wheel(p, i);
+            let spot : DVec2 = VehicleModel::wheelSpot(s.x, s.z, heading, wheel);
+            let under : f64 = ground.heightAt(spot.x, spot.y);
+            lowest = minD(lowest, VehicleModel::mountHeight(s, wheel) - under);
+        }
+        return lowest;
+    }
+
+    /** Advances the car by `dt` seconds (in `substeps` slices). Answers the new state; `s` is not changed. */
+    pub static fn step(
+        p : VehicleParams,
+        s : VehicleState,
+        input : VehicleInput,
+        ground : GroundHeight,
+        dt : f64
+    ) : VehicleState {
+        if (dt <= 0.0) {
+            return s;
+        }
+
+        let substeps : i32 = maxI(p.substeps, 1);
+        let h : f64 = dt / (substeps as f64);
+        let mut current : VehicleState = s;
+        for (k of 0..substeps) {
+            let slice : VehicleSlice = VehicleSlice { state: current, input: input, h: h };
+            current = VehicleModel::substep(p, slice, ground);
+        }
+        return current;
+    }
+
+    // Wheel `i` of the car, where it sits relative to the centre of mass.
+    static fn wheel(p : VehicleParams, i : i32) : VehicleWheel {
+        return VehicleWheel {
+            ahead: VehicleModel::wheelAhead(p, i),
+            side: VehicleModel::wheelSide(p, i),
+        };
+    }
+
+    // Where `wheel` is on the ground plane, as (x, z), for a car at (x, z) with the given heading.
+    static fn wheelSpot(x : f64, z : f64, heading : VehicleHeading, wheel : VehicleWheel) : DVec2 {
+        let spotX : f64 = x + heading.cosYaw * wheel.ahead - heading.sinYaw * wheel.side;
+        let spotZ : f64 = z + heading.sinYaw * wheel.ahead + heading.cosYaw * wheel.side;
+        return DVec2::make(spotX, spotZ);
+    }
+
+    // The height of the mount of `wheel`: the body's height tilted by the pitch and the roll.
+    static fn mountHeight(s : VehicleState, wheel : VehicleWheel) : f64 {
+        return s.y + s.pitch * wheel.ahead + s.roll * wheel.side;
+    }
+
+    // How fast the mount of `wheel` moves up: the body's vertical speed plus the tilt rates at the wheel.
+    static fn mountSpeed(s : VehicleState, wheel : VehicleWheel) : f64 {
+        return s.vy + s.pitchRate * wheel.ahead + s.rollRate * wheel.side;
+    }
+
+    // The push of one spring, from its compression and the speed it closes at; the bump stop adds a much
+    // stiffer spring past full travel, and a spring never pulls.
+    static fn springPush(p : VehicleParams, compression : f64, closing : f64) : f64 {
+        let travel : f64 = p.restLength - p.minGap;
+        let mut force : f64 = p.springK * compression + p.damperC * closing;
+        if (compression > travel) {
+            force = force + p.springK * VEH_BUMP_STIFFNESS * (compression - travel);
+        }
+        return maxD(force, 0.0);
+    }
+
+    // One pass over the four wheels: spring forces, their moments and the ground height under each.
+    static fn loads(
+        p : VehicleParams,
+        slice : VehicleSlice,
+        ground : GroundHeight,
+        motion : VehicleMotion
+    ) : VehicleLoad {
+        let s : VehicleState = slice.state;
+        let h : f64 = slice.h;
+
+        let load : VehicleLoad = VehicleLoad {};
+        for (i of 0..VEH_WHEELS) {
+            let wheel : VehicleWheel = VehicleModel::wheel(p, i);
+            let spot : DVec2 = VehicleModel::wheelSpot(s.x, s.z, motion.heading, wheel);
+            let under : f64 = ground.heightAt(spot.x, spot.y);
+            let moved : DVec2 = DVec2::make(spot.x + motion.worldVx * h, spot.y + motion.worldVz * h);
+            let groundRate : f64 = (ground.heightAt(moved.x, moved.y) - under) / h;
+            load.noteGround(wheel, under);
+
+            // A wheel whose spring is compressed pushes the body up; one in the air does nothing.
+            let compression : f64 = p.restLength - (VehicleModel::mountHeight(s, wheel) - under);
+            if (compression <= 0.0) {
+                continue;
+            }
+
+            let closing : f64 = 0.0 - (VehicleModel::mountSpeed(s, wheel) - groundRate);
+            load.noteSpring(wheel, VehicleModel::springPush(p, compression, closing));
+        }
+        return load;
+    }
+
+    // The gear and the remaining shift pause after a substep: reverse engages when asked at a standstill, and
+    // the automatic box shifts at the rpm limits, pausing the drive for the shift time.
+    static fn gearbox(p : VehicleParams, slice : VehicleSlice) : VehicleGear {
+        let s : VehicleState = slice.state;
+        let mut gear : i32 = s.gear;
+        let mut shiftLeft : f64 = maxD(s.shiftLeft - slice.h, 0.0);
+
+        if (slice.input.reverse && s.vf <= VEH_REVERSE_FORWARD) {
+            gear = VEH_REVERSE_GEAR;
+        } else if (!slice.input.reverse && gear < 0) {
+            gear = 1;
+            shiftLeft = 0.0;
+        }
+
+        if (gear > 0 && shiftLeft <= 0.0) {
+            let engine : f64 = p.rpmAt(gear, s.vf);
+            if (engine > p.upshiftRpm && gear < p.gearCount()) {
+                gear = gear + 1;
+                shiftLeft = p.shiftTime;
+            } else if (engine < p.downshiftRpm && gear > 1) {
+                gear = gear - 1;
+                shiftLeft = p.shiftTime * VEH_DOWNSHIFT_SHARE;
+            }
+        }
+        return VehicleGear { gear: gear, shiftLeft: shiftLeft };
+    }
+
+    // The gearing, wheel speed and tyre load of a car in gear `gear` with `contacts` wheels on the ground.
+    static fn traction(p : VehicleParams, s : VehicleState, gear : i32, contacts : i32) : VehicleTraction {
+        let share : f64 = (contacts as f64) * VEH_WHEEL_SHARE;
+        let speedAbs : f64 = absD(s.vf);
+
+        let mut ratio : f64 = p.reverseRatio;
+        if (gear > 0) {
+            ratio = p.ratio(gear);
+        }
+        let wheelRpm : f64 = speedAbs / p.wheelRadius * ratio * p.finalDrive * PARAMS_RAD_PER_SEC_TO_RPM;
+        let normal : f64 = (p.mass * PARAMS_GRAVITY + p.downforce(speedAbs)) * share;
+        return VehicleTraction { ratio: ratio, wheelRpm: wheelRpm, normal: normal };
+    }
+
+    // The force the engine puts on the road for a pedal position, held to what the driven wheels can grip;
+    // negative when the car is in reverse.
+    static fn driveForce(p : VehicleParams, pedal : f64, tyres : VehicleTraction, reversing : bool) : f64 {
+        let launching : f64 = maxD(tyres.wheelRpm, p.launchRpm);
+        let torque : f64 = p.torqueAt(launching);
+        let wanted : f64 = pedal * torque * tyres.ratio * p.finalDrive * p.driveEfficiency / p.wheelRadius;
+        let force : f64 = minD(wanted, p.grip * tyres.normal * p.driveShare);
+        if (reversing) {
+            return 0.0 - force;
+        }
+        return force;
+    }
+
+    // The braking force, from the pedal and the handbrake, held to what the tyres can grip.
+    static fn brakeForce(p : VehicleParams, input : VehicleInput, tyres : VehicleTraction) : f64 {
+        let mut asked : f64 = clampD(input.brake, 0.0, 1.0) * p.brakeForce;
+        if (input.handbrake) {
+            asked = asked + VEH_HANDBRAKE_BRAKE * p.brakeForce;
+        }
+        return minD(asked, p.grip * tyres.normal);
+    }
+
+    // The pull of the slope under the car on the car, along it and sideways: down the hill, from the difference
+    // of the ground heights under the front and rear wheels and under the right and left ones.
+    static fn slopePull(p : VehicleParams, load : VehicleLoad) : VehicleSlope {
+        if (!load.touching()) {
+            return VehicleSlope {};
+        }
+
+        let rise : f64 = ((load.frontGround - load.rearGround) * VEH_PAIR_MEAN) / p.wheelBase;
+        let lean : f64 = ((load.rightGround - load.leftGround) * VEH_PAIR_MEAN) / (2.0 * p.halfTrack);
+        return VehicleSlope {
+            along: 0.0 - p.mass * PARAMS_GRAVITY * rise,
+            side: 0.0 - p.mass * PARAMS_GRAVITY * lean,
+        };
+    }
+
+    // The forces along the car for a substep: engine drive, brakes, drag, rolling resistance and the slope, and
+    // the forward speed they leave.
+    static fn thrust(
+        p : VehicleParams,
+        slice : VehicleSlice,
+        load : VehicleLoad,
+        gears : VehicleGear
+    ) : VehicleThrust {
+        let s : VehicleState = slice.state;
+        let input : VehicleInput = slice.input;
+        let h : f64 = slice.h;
+        let onGround : bool = load.touching();
+
+        let tyres : VehicleTraction = VehicleModel::traction(p, s, gears.gear, load.contacts);
+        let slope : VehicleSlope = VehicleModel::slopePull(p, load);
+
+        let wrongWay : bool = input.reverse && s.vf > VEH_REVERSE_FORWARD;
+        let backLimit : bool = gears.gear < 0 && s.vf <= 0.0 - p.reverseMax;
+        let engaged : bool = gears.shiftLeft <= 0.0 && tyres.wheelRpm < p.redlineRpm;
+        let mut drive : f64 = 0.0;
+        if (onGround && engaged && !wrongWay && !backLimit) {
+            let pedal : f64 = clampD(input.throttle, 0.0, 1.0);
+            drive = VehicleModel::driveForce(p, pedal, tyres, gears.gear < 0);
+        }
+
+        let brake : f64 = VehicleModel::brakeForce(p, input, tyres);
+        let drag : f64 = p.dragForce(absD(s.vf));
+        let rolling : f64 = p.rollingForce() * (VEH_WHEEL_SHARE * (load.contacts as f64));
+
+        let pushed : f64 = s.vf + ((drive + slope.along) / p.mass + s.yawRate * s.vl) * h;
+        let slowing : f64 = (brake + drag + rolling) / p.mass * h;
+
+        // The retarding forces bring the car to rest and no further.
+        let slowed : f64 = pushed - signD(pushed) * minD(absD(pushed), slowing);
+        return VehicleThrust {
+            drive: drive,
+            brake: brake,
+            pushed: pushed,
+            vf: slowed,
+            normal: tyres.normal,
+            slopeSide: slope.side,
+            wheelRpm: tyres.wheelRpm,
+        };
+    }
+
+    // The sideways speed after a substep. The tyres pull sideways slip out at a rate capped by the grip left after
+    // the longitudinal force (the friction circle); asked for more, they give way.
+    static fn sideways(
+        p : VehicleParams,
+        slice : VehicleSlice,
+        thrust : VehicleThrust,
+        onGround : bool
+    ) : VehicleSlip {
+        let s : VehicleState = slice.state;
+        let h : f64 = slice.h;
+
+        let mut sideGrip : f64 = p.grip * thrust.normal;
+        if (slice.input.handbrake) {
+            sideGrip = sideGrip * p.handbrakeGrip;
+        }
+        let usedGrip : f64 = minD(absD(thrust.drive) + thrust.brake, p.grip * thrust.normal);
+        let sideForceMax : f64 = sqrtD(maxD(sideGrip * sideGrip - usedGrip * usedGrip, 0.0));
+        let wantedDv : f64 = 0.0 - s.vl * p.lateralStiffness * h;
+        let maxDv : f64 = sideForceMax / p.mass * h;
+
+        let mut tireDv : f64 = 0.0;
+        let mut sliding : bool = false;
+        if (onGround) {
+            tireDv = clampD(wantedDv, 0.0 - maxDv, maxDv);
+            let asked : f64 = absD(wantedDv);
+            sliding = asked > maxDv * VEH_SLIDE_MARGIN && asked > 0.0;
+        }
+
+        let vl : f64 = s.vl + tireDv + thrust.slopeSide / p.mass * h - s.yawRate * s.vf * h;
+        return VehicleSlip { vl: vl, tireDv: tireDv, sliding: sliding };
+    }
+
+    // The wheel angle and the yaw rate after a substep: the angle follows the wheel at a limited rate and shrinks
+    // with speed; the yaw rate follows the bicycle model, held below what the tyres can corner at.
+    static fn turning(
+        p : VehicleParams,
+        slice : VehicleSlice,
+        thrust : VehicleThrust,
+        onGround : bool
+    ) : VehicleTurn {
+        let s : VehicleState = slice.state;
+        let h : f64 = slice.h;
+
+        let steerInput : f64 = clampD(slice.input.steer, -1.0, 1.0);
+        let speedRatio : f64 = absD(s.vf) / p.steerSpeedRef;
+        let wanted : f64 = steerInput * p.maxSteer / (1.0 + speedRatio * speedRatio);
+        let maxChange : f64 = p.steerRate * h;
+        let angle : f64 = s.steerAngle + clampD(wanted - s.steerAngle, 0.0 - maxChange, maxChange);
+
+        if (!onGround) {
+            return VehicleTurn { angle: angle, yawRate: s.yawRate };
+        }
+
+        let vf : f64 = thrust.vf;
+        let bicycle : f64 = vf * (sinD(angle) / cosD(angle)) / p.wheelBase;
+        let gripAccel : f64 = p.grip * thrust.normal / p.mass * VEH_GRIP_USE;
+        let cornering : f64 = gripAccel / maxD(absD(vf), VEH_YAW_MIN_SPEED);
+        let target : f64 = clampD(bicycle, 0.0 - cornering, cornering);
+        let response : f64 = minD(1.0, p.yawResponse * h);
+        return VehicleTurn { angle: angle, yawRate: s.yawRate + (target - s.yawRate) * response };
+    }
+
+    // The body's vertical speed and tilt rates after a substep: heave, pitch and roll from the springs plus the
+    // weight the tyre forces shift.
+    static fn heaving(
+        p : VehicleParams,
+        slice : VehicleSlice,
+        load : VehicleLoad,
+        thrust : VehicleThrust,
+        slip : VehicleSlip
+    ) : VehicleHeave {
+        let s : VehicleState = slice.state;
+        let h : f64 = slice.h;
+        let share : f64 = (load.contacts as f64) * VEH_WHEEL_SHARE;
+
+        let tireFx : f64 = thrust.drive - signD(thrust.pushed) * thrust.brake;
+        let tireFy : f64 = slip.tireDv / h * p.mass;
+        let pitchInertia : f64 = p.mass * p.pitchRadius * p.pitchRadius;
+        let rollInertia : f64 = p.mass * p.rollRadius * p.rollRadius;
+
+        let heaveAcc : f64 = load.springForce / p.mass - PARAMS_GRAVITY;
+        let pitchAcc : f64 = (load.pitchMoment + tireFx * p.cgHeight * share) / pitchInertia;
+        let rollAcc : f64 = (load.rollMoment + tireFy * p.cgHeight * share) / rollInertia;
+        return VehicleHeave {
+            vy: s.vy + heaveAcc * h,
+            pitchRate: s.pitchRate + pitchAcc * h,
+            rollRate: s.rollRate + rollAcc * h,
+        };
+    }
+
+    // A tilt angle held within the limit; a tilt that hit the limit also loses its rate.
+    static fn limitTilt(angle : f64, rate : f64) : VehicleTilt {
+        if (absD(angle) > VEH_TILT_MAX) {
+            return VehicleTilt { angle: clampD(angle, 0.0 - VEH_TILT_MAX, VEH_TILT_MAX), rate: 0.0 };
+        }
+        return VehicleTilt { angle: angle, rate: rate };
+    }
+
+    // The lowest height of the body's origin that keeps every wheel mount `minGap` above the ground, for the
+    // position and tilt of `at`.
+    static fn lowestBody(p : VehicleParams, ground : GroundHeight, at : VehicleState) : f64 {
+        let heading : VehicleHeading = VehicleHeading::turned(at.yaw);
+
+        let mut needed : f64 = 0.0 - VEH_HUGE;
+        for (i of 0..VEH_WHEELS) {
+            let wheel : VehicleWheel = VehicleModel::wheel(p, i);
+            let spot : DVec2 = VehicleModel::wheelSpot(at.x, at.z, heading, wheel);
+            let clear : f64 = ground.heightAt(spot.x, spot.y) + p.minGap;
+            needed = maxD(needed, clear - at.pitch * wheel.ahead - at.roll * wheel.side);
+        }
+        return needed;
+    }
+
+    // One slice of the step: the car `slice.h` seconds later.
+    static fn substep(p : VehicleParams, slice : VehicleSlice, ground : GroundHeight) : VehicleState {
+        let s : VehicleState = slice.state;
+        let h : f64 = slice.h;
+
+        let heading : VehicleHeading = VehicleHeading::turned(s.yaw);
+        let motion : VehicleMotion = VehicleMotion {
+            heading: heading,
+            worldVx: s.vf * heading.cosYaw - s.vl * heading.sinYaw,
+            worldVz: s.vf * heading.sinYaw + s.vl * heading.cosYaw,
+        };
+
+        let load : VehicleLoad = VehicleModel::loads(p, slice, ground, motion);
+        let onGround : bool = load.touching();
+        let gears : VehicleGear = VehicleModel::gearbox(p, slice);
+        let thrust : VehicleThrust = VehicleModel::thrust(p, slice, load, gears);
+        let slip : VehicleSlip = VehicleModel::sideways(p, slice, thrust, onGround);
+        let turn : VehicleTurn = VehicleModel::turning(p, slice, thrust, onGround);
+        let heave : VehicleHeave = VehicleModel::heaving(p, slice, load, thrust, slip);
+
+        // Move along the new heading, and tilt the body, which stops tilting beyond the limit.
+        let nextYaw : f64 = s.yaw + turn.yawRate * h;
+        let after : VehicleHeading = VehicleHeading::turned(nextYaw);
+        let pitchAngle : f64 = s.pitch + heave.pitchRate * h;
+        let rollAngle : f64 = s.roll + heave.rollRate * h;
+        let pitch : VehicleTilt = VehicleModel::limitTilt(pitchAngle, heave.pitchRate);
+        let roll : VehicleTilt = VehicleModel::limitTilt(rollAngle, heave.rollRate);
+        let mut next : VehicleState = VehicleState {
+            x: s.x + (thrust.vf * after.cosYaw - slip.vl * after.sinYaw) * h,
+            y: s.y + heave.vy * h,
+            z: s.z + (thrust.vf * after.sinYaw + slip.vl * after.cosYaw) * h,
+            yaw: nextYaw,
+            vf: thrust.vf,
+            vl: slip.vl,
+            vy: heave.vy,
+            yawRate: turn.yawRate,
+            pitch: pitch.angle,
+            roll: roll.angle,
+            pitchRate: pitch.rate,
+            rollRate: roll.rate,
+            steerAngle: turn.angle,
+            gear: gears.gear,
+            shiftLeft: gears.shiftLeft,
+            rpm: maxD(thrust.wheelRpm, p.idleRpm),
+            slip: absD(slip.vl) / maxD(absD(thrust.vf), VEH_SLIP_FLOOR),
+            sliding: slip.sliding,
+            wheelsDown: load.contacts,
+        };
+
+        // The ground is solid: no mount ends the step closer than minGap, whatever happened above.
+        let lowest : f64 = VehicleModel::lowestBody(p, ground, next);
+        if (next.y < lowest) {
+            next.y = lowest;
+            if (next.vy < 0.0) {
+                next.vy = 0.0;
+            }
+        }
+        return next;
+    }
+}

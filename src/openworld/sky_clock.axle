@@ -1,0 +1,150 @@
+// sky_clock — the time of day, as a sun that moves and the numbers a sky needs.
+//
+// The clock counts whole nanoseconds of game time inside a day (so it never drifts) and turns the time of day
+// into plain data: the direction to the sun and moon, how much daylight there is, and a cheap tint for the
+// sun's light. The convention is the lighting library's: time of day runs over [0, 1), 0.25 is sunrise, 0.5
+// noon, 0.75 sunset, 0 midnight; the sun's direction is (cos a, sin a, tilt) normalised with
+// a = (t - 0.25) * 2 pi. `LightSky::atDayTime(clock.timeOfDay(), clock.tilt())` therefore builds the exact
+// atmosphere (Chapman optical depth and all) for the same moment; the tint here is only for things that do
+// not want the full model — fog colour, a UI clock, a quick ambient.
+//
+// Nothing here reads a wall clock: the game says how much time passed.
+
+use crate::core::math::dvec3::DVec3;
+use crate::core::math::scalar::{clampD, lerpD, maxI64, smoothstepD, TAU_D};
+use crate::core::math::trig::{cosD, sinD};
+use crate::core::time::clock::{NANOS_PER_SECOND, secondsToNanos};
+
+// The sun is at its lowest at midnight and highest at noon; 0.25 is sunrise.
+const SKY_SUNRISE : f64 = 0.25;
+
+// Daylight ramps in as the sun clears the horizon; the light is warm near it and white high up.
+const SKY_DAWN_FROM : f64 = -0.12;
+const SKY_DAWN_TO : f64 = 0.3;
+const SKY_WARM_FROM : f64 = 0.0;
+const SKY_WARM_TO : f64 = 0.45;
+const SKY_GREEN_NIGHT : f64 = 0.45;
+const SKY_GREEN_DAY : f64 = 0.97;
+const SKY_BLUE_NIGHT : f64 = 0.2;
+const SKY_BLUE_DAY : f64 = 0.9;
+
+/** The sky at one moment, as data. */
+pub struct SkyState {
+    /** Time of day in [0, 1). */
+    pub timeOfDay : f64;
+
+    /** Unit vector towards the sun. */
+    pub sun : DVec3;
+
+    /** Unit vector towards the moon (opposite the sun). */
+    pub moon : DVec3;
+
+    /** 0 at night to 1 in full day, rising smoothly as the sun climbs through the horizon. */
+    pub daylight : f64;
+
+    /** Linear red of the sun's light, 0 to 1, already scaled by daylight. */
+    pub sunRed : f64;
+
+    /** Linear green of the sun's light. */
+    pub sunGreen : f64;
+
+    /** Linear blue of the sun's light. */
+    pub sunBlue : f64;
+
+    /** True while the sun is above the horizon. */
+    pub isDay : bool;
+}
+
+/** A day that advances with game time. */
+pub class SkyClock {
+    dayNanos : i64;
+    nanos    : i64 = 0;
+    days     : i64 = 0;
+    slant    : f64 = 0.0;
+
+    /**
+     * A clock whose day lasts `daySeconds` of game time (at least one second), starting at `startTimeOfDay` in
+     * [0, 1), with the sun's path tilted by `tilt` out of the east-west plane.
+     */
+    constructor(daySeconds : f64, startTimeOfDay : f64, tilt : f64) {
+        self.dayNanos = maxI64(secondsToNanos(daySeconds), NANOS_PER_SECOND);
+        self.slant = tilt;
+        self.nanos = SkyClock::nanosOf(startTimeOfDay, self.dayNanos);
+    }
+
+    // The nanoseconds into a day of `dayNanos` at time of day `t`, which is wrapped into [0, 1) first.
+    static fn nanosOf(t : f64, dayNanos : i64) : i64 {
+        let mut wrapped : f64 = t - ((t as i64) as f64);
+        if (wrapped < 0.0) {
+            wrapped = wrapped + 1.0;
+        }
+        let nanos : i64 = (wrapped * (dayNanos as f64)) as i64;
+        if (nanos >= dayNanos) {
+            return 0;
+        }
+        return nanos;
+    }
+
+    /** Lets `dtNanos` of game time pass. */
+    pub fn advance(mut self, dtNanos : i64) : void {
+        if (dtNanos <= 0) {
+            return;
+        }
+        self.nanos = self.nanos + dtNanos;
+        while (self.nanos >= self.dayNanos) {
+            self.nanos = self.nanos - self.dayNanos;
+            self.days = self.days + 1;
+        }
+    }
+
+    /** Sets the time of day directly (wrapped into [0, 1)). */
+    pub fn setTimeOfDay(mut self, t : f64) : void {
+        self.nanos = SkyClock::nanosOf(t, self.dayNanos);
+    }
+
+    /** The time of day in [0, 1). */
+    pub fn timeOfDay(self) : f64 {
+        return (self.nanos as f64) / (self.dayNanos as f64);
+    }
+
+    /** The tilt of the sun's path, as `LightSky::atDayTime` takes it. */
+    pub fn tilt(self) : f64 {
+        return self.slant;
+    }
+
+    /** How many whole days have passed since the clock was made. */
+    pub fn dayCount(self) : i64 {
+        return self.days;
+    }
+
+    /** The length of a day in nanoseconds. */
+    pub fn dayLength(self) : i64 {
+        return self.dayNanos;
+    }
+
+    /** The sky now. */
+    pub fn state(self) : SkyState {
+        return SkyClock::at(self.timeOfDay(), self.slant);
+    }
+
+    /** The sky at time of day `t` (in [0, 1)) with sun path tilt `tilt`: a pure function. */
+    pub static fn at(t : f64, tilt : f64) : SkyState {
+        let angle : f64 = (t - SKY_SUNRISE) * TAU_D;
+        let sun : DVec3 = DVec3::make(cosD(angle), sinD(angle), tilt).normalized();
+        let elevation : f64 = sun.y;
+        let daylight : f64 = smoothstepD(SKY_DAWN_FROM, SKY_DAWN_TO, elevation);
+        let warm : f64 = smoothstepD(SKY_WARM_FROM, SKY_WARM_TO, elevation);
+        let green : f64 = lerpD(SKY_GREEN_NIGHT, SKY_GREEN_DAY, warm);
+        let blue : f64 = lerpD(SKY_BLUE_NIGHT, SKY_BLUE_DAY, warm);
+        return SkyState {
+            timeOfDay: t,
+            sun: sun,
+            moon: sun.negated(),
+            daylight: daylight,
+            sunRed: daylight,
+            sunGreen: green * daylight,
+            sunBlue: blue * daylight,
+            isDay: elevation > 0.0,
+        };
+    }
+}

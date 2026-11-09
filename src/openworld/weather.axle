@@ -1,0 +1,354 @@
+// weather — a small weather machine: spells of one kind of weather, melting into the next.
+//
+// Weather is one of five kinds. It stays for a spell (a random time between a minimum and a maximum), then
+// picks what comes next from a weight table and blends into it over a transition, after which the new weather
+// is current and a new spell starts. The numbers a renderer or a sim wants — cloud cover, rain, fog thickness,
+// wind, and how much of the sun gets through — are plain data, interpolated during a transition. All choices
+// come from an explicit `Pcg32` and all time is whole nanoseconds, so two games given the same seed and the
+// same time steps have had the same weather, and a save needs only the seed and the elapsed time (or the
+// fields below).
+
+use crate::core::math::scalar::{lerpD, maxI64};
+use crate::core::rng::pcg32::Pcg32;
+use crate::core::time::clock::secondsToNanos;
+
+// The five kinds, in code order.
+const WEATHER_KINDS : i32 = 5;
+
+// How likely one weather is to follow another: a weight on a small scale, so a table reads as words.
+const WEATHER_NEVER : i32 = 0;
+const WEATHER_RARELY : i32 = 1;
+const WEATHER_SELDOM : i32 = 2;
+const WEATHER_SOMETIMES : i32 = 3;
+const WEATHER_OFTEN : i32 = 4;
+const WEATHER_USUALLY : i32 = 5;
+const WEATHER_ALMOST_ALWAYS : i32 = 6;
+
+// The random stream weather draws from, kept apart from other systems' streams of the same seed.
+const WEATHER_STREAM : u64 = 91;
+
+/** What one kind of weather looks like, in the units `WeatherState` reports. */
+pub struct WeatherProfile {
+    /** Sky covered by cloud, 0 to 1. */
+    pub cloud : f64 = 0.0;
+
+    /** Rain intensity, 0 to 1. */
+    pub rain : f64 = 0.0;
+
+    /** Fog thickness, 0 to 1. */
+    pub fog : f64 = 0.0;
+
+    /** Wind speed in metres per second. */
+    pub wind : f64 = 0.0;
+
+    /** Fraction of sunlight reaching the ground, 0 to 1. */
+    pub sunlight : f64 = 1.0;
+}
+
+/** The kinds of weather. */
+pub enum WeatherKind : i8 {
+    /** Open sky. */
+    Clear = 0,
+
+    /** Broken or full cloud, dry. */
+    Cloudy = 1,
+
+    /** Steady rain. */
+    Rain = 2,
+
+    /** Heavy rain, wind and darkness. */
+    Storm = 3,
+
+    /** Low cloud on the ground. */
+    Fog = 4,
+
+    /** The kind with code `n`; anything else answers Clear. */
+    pub static fn fromCode(n : i32) : WeatherKind {
+        return match n {
+            1 => WeatherKind::Cloudy,
+            2 => WeatherKind::Rain,
+            3 => WeatherKind::Storm,
+            4 => WeatherKind::Fog,
+            _ => WeatherKind::Clear,
+        };
+    }
+
+    /** The number standing for this kind. */
+    pub fn code(self) : i32 {
+        return self as i32;
+    }
+
+    /** The numbers of this kind of weather, one row of the table. */
+    pub fn profile(self) : WeatherProfile {
+        return match self {
+            WeatherKind::Clear => WeatherProfile {
+                cloud: 0.1,
+                rain: 0.0,
+                fog: 0.0,
+                wind: 3.0,
+                sunlight: 1.0,
+            },
+            WeatherKind::Cloudy => WeatherProfile {
+                cloud: 0.7,
+                rain: 0.0,
+                fog: 0.1,
+                wind: 6.0,
+                sunlight: 0.55,
+            },
+            WeatherKind::Rain => WeatherProfile {
+                cloud: 0.9,
+                rain: 0.5,
+                fog: 0.25,
+                wind: 9.0,
+                sunlight: 0.3,
+            },
+            WeatherKind::Storm => WeatherProfile {
+                cloud: 1.0,
+                rain: 1.0,
+                fog: 0.35,
+                wind: 22.0,
+                sunlight: 0.12,
+            },
+            WeatherKind::Fog => WeatherProfile { cloud: 0.5, rain: 0.0, fog: 1.0, wind: 1.0, sunlight: 0.4 },
+        };
+    }
+
+    /** Sky covered by cloud, 0 to 1. */
+    pub fn cloud(self) : f64 {
+        return self.profile().cloud;
+    }
+
+    /** Rain intensity, 0 to 1. */
+    pub fn rain(self) : f64 {
+        return self.profile().rain;
+    }
+
+    /** Fog thickness, 0 to 1. */
+    pub fn fog(self) : f64 {
+        return self.profile().fog;
+    }
+
+    /** Wind speed in metres per second. */
+    pub fn wind(self) : f64 {
+        return self.profile().wind;
+    }
+
+    /** The fraction of the sun's light that reaches the ground, 0 to 1. */
+    pub fn sunlight(self) : f64 {
+        return self.profile().sunlight;
+    }
+
+    /** How likely weather `other` is to follow this one, as a weight (0: never). */
+    pub fn weightTo(self, other : WeatherKind) : i32 {
+        let row : i32 = self as i32;
+        let col : i32 = other as i32;
+        if (row == col) {
+            return 0;
+        }
+        // Rows are the kind we leave, columns the kind we go to.
+        return match row {
+            0 => weatherFromClear(col),
+            1 => weatherFromCloudy(col),
+            2 => weatherFromRain(col),
+            3 => weatherFromStorm(col),
+            _ => weatherFromFog(col),
+        };
+    }
+}
+
+// From clear sky: back to cloud most often, rain now and then, never a storm.
+fn weatherFromClear(col : i32) : i32 {
+    return match col {
+        1 => WEATHER_ALMOST_ALWAYS,
+        2 => WEATHER_RARELY,
+        3 => WEATHER_NEVER,
+        _ => WEATHER_SELDOM,
+    };
+}
+
+// From cloud: clear, rain or fog; a storm is rare.
+fn weatherFromCloudy(col : i32) : i32 {
+    return match col {
+        0 => WEATHER_USUALLY,
+        2 => WEATHER_OFTEN,
+        3 => WEATHER_RARELY,
+        _ => WEATHER_SELDOM,
+    };
+}
+
+// From rain: back to cloud or up to a storm.
+fn weatherFromRain(col : i32) : i32 {
+    return match col {
+        0 => WEATHER_RARELY,
+        1 => WEATHER_USUALLY,
+        3 => WEATHER_SOMETIMES,
+        _ => WEATHER_RARELY,
+    };
+}
+
+// From storm: back down to cloud or rain, never straight to clear.
+fn weatherFromStorm(col : i32) : i32 {
+    return match col {
+        0 => WEATHER_NEVER,
+        1 => WEATHER_SOMETIMES,
+        2 => WEATHER_ALMOST_ALWAYS,
+        _ => WEATHER_NEVER,
+    };
+}
+
+// From fog: clear is as likely as cloud.
+fn weatherFromFog(col : i32) : i32 {
+    return match col {
+        0 => WEATHER_ALMOST_ALWAYS,
+        1 => WEATHER_SOMETIMES,
+        2 => WEATHER_RARELY,
+        _ => WEATHER_NEVER,
+    };
+}
+
+/** The weather at one moment. */
+pub struct WeatherState {
+    /** The kind we are in (or leaving, during a transition). */
+    pub kind : WeatherKind;
+
+    /** The kind we are heading for (the same as `kind` outside a transition). */
+    pub next : WeatherKind;
+
+    /** How far the transition has gone, 0 to 1 (0 outside a transition). */
+    pub blend : f64;
+
+    /** Cloud cover, 0 to 1. */
+    pub cloud : f64;
+
+    /** Rain intensity, 0 to 1. */
+    pub rain : f64;
+
+    /** Fog thickness, 0 to 1. */
+    pub fog : f64;
+
+    /** Wind speed in metres per second. */
+    pub wind : f64;
+
+    /** Fraction of sunlight reaching the ground, 0 to 1; multiply the sun's intensity by it. */
+    pub sunlight : f64;
+}
+
+/** Weather that changes over game time. */
+pub class Weather {
+    rng        : Pcg32;
+    current    : WeatherKind = WeatherKind::Clear;
+    heading    : WeatherKind = WeatherKind::Clear;
+    spellLeft  : i64 = 0;
+    transLeft  : i64 = 0;
+    transTotal : i64 = 1;
+    minSpell   : i64 = 1;
+    maxSpell   : i64 = 1;
+    changes    : i32 = 0;
+
+    /**
+     * Weather that starts clear, lasts between `minSpellSeconds` and `maxSpellSeconds` per spell and takes
+     * `transitionSeconds` to change, all random choices drawn from `seed`.
+     */
+    constructor(seed : u64, minSpellSeconds : f64, maxSpellSeconds : f64, transitionSeconds : f64) {
+        self.rng = new Pcg32(seed, WEATHER_STREAM);
+        self.minSpell = maxI64(secondsToNanos(minSpellSeconds), 1);
+        self.maxSpell = maxI64(secondsToNanos(maxSpellSeconds), self.minSpell);
+        self.transTotal = maxI64(secondsToNanos(transitionSeconds), 1);
+        self.spellLeft = self.drawSpell();
+    }
+
+    // A spell length between the limits.
+    fn drawSpell(mut self) : i64 {
+        let span : i64 = self.maxSpell - self.minSpell;
+        if (span <= 0) {
+            return self.minSpell;
+        }
+        return self.minSpell + (self.rng.nextF64() * (span as f64)) as i64;
+    }
+
+    // The next kind, drawn by weight from the current one.
+    fn drawNext(mut self) : WeatherKind {
+        let mut total : i32 = 0;
+        for (k of 0..WEATHER_KINDS) {
+            total = total + self.current.weightTo(WeatherKind::fromCode(k));
+        }
+        if (total <= 0) {
+            return self.current;
+        }
+        let mut pick : i32 = self.rng.nextBelow(total as u32) as i32;
+        for (k of 0..WEATHER_KINDS) {
+            let w : i32 = self.current.weightTo(WeatherKind::fromCode(k));
+            if (pick < w) {
+                return WeatherKind::fromCode(k);
+            }
+            pick = pick - w;
+        }
+        return self.current;
+    }
+
+    /** Lets `dtNanos` of game time pass. */
+    pub fn advance(mut self, dtNanos : i64) : void {
+        let mut left : i64 = dtNanos;
+        while (left > 0) {
+            if (self.transLeft > 0) {
+                left = self.advanceTransition(left);
+            } else {
+                left = self.advanceSpell(left);
+            }
+        }
+    }
+
+    // Spends up to `left` nanoseconds of the running transition; the new weather becomes current when it ends.
+    // Answers what is left over.
+    fn advanceTransition(mut self, left : i64) : i64 {
+        if (left < self.transLeft) {
+            self.transLeft = self.transLeft - left;
+            return 0;
+        }
+        let rest : i64 = left - self.transLeft;
+        self.transLeft = 0;
+        self.current = self.heading;
+        self.spellLeft = self.drawSpell();
+        self.changes = self.changes + 1;
+        return rest;
+    }
+
+    // Spends up to `left` nanoseconds of the running spell; a transition to the next kind starts when it ends.
+    // Answers what is left over.
+    fn advanceSpell(mut self, left : i64) : i64 {
+        if (left < self.spellLeft) {
+            self.spellLeft = self.spellLeft - left;
+            return 0;
+        }
+        let rest : i64 = left - self.spellLeft;
+        self.spellLeft = 0;
+        self.heading = self.drawNext();
+        self.transLeft = self.transTotal;
+        return rest;
+    }
+
+    /** How many transitions have finished. */
+    pub fn changeCount(self) : i32 {
+        return self.changes;
+    }
+
+    /** The weather now. */
+    pub fn state(self) : WeatherState {
+        let mut t : f64 = 0.0;
+        if (self.transLeft > 0) {
+            t = 1.0 - (self.transLeft as f64) / (self.transTotal as f64);
+        }
+        let a : WeatherProfile = self.current.profile();
+        let b : WeatherProfile = self.heading.profile();
+        return WeatherState {
+            kind: self.current,
+            next: self.heading,
+            blend: t,
+            cloud: lerpD(a.cloud, b.cloud, t),
+            rain: lerpD(a.rain, b.rain, t),
+            fog: lerpD(a.fog, b.fog, t),
+            wind: lerpD(a.wind, b.wind, t),
+            sunlight: lerpD(a.sunlight, b.sunlight, t),
+        };
+    }
+}

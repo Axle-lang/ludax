@@ -1,0 +1,320 @@
+// mission_save — the play state of missions as bytes, and back.
+//
+// Layout: the tag `LXMS`, a version, the fingerprint of the definitions (8 bytes), the number of missions and
+// of objectives, then for every mission its status, open stage and two clocks (nanoseconds, 8 bytes each),
+// for every objective its count and done flag, the flags that are set (as word ids of the definitions), the
+// rewards paid so far (word id and 8-byte total) and a CRC-32 of everything before it. All numbers are
+// big-endian.
+//
+// Loading is all or nothing. Everything is read and checked — tag, version, checksum, that the fingerprint is
+// the board's own (so a save from other definitions is refused, not misapplied), that counts match and that
+// every status, stage and progress is possible — before the first field of the board is touched. Events waiting
+// in the queue and unread notes are not saved: `update` first. Flags and rewards that no definition mentions
+// are not saved either, since they cannot change anything.
+
+use crate::core::collections::vec::Vec;
+use crate::data::bytes::{ByteBuf, Crc32};
+use crate::openworld::mission_board::{MISSION_FAILED, MISSION_LOCKED, MissionBoard};
+use crate::openworld::mission_book::{BookObjective, MissionBook};
+use crate::openworld::mission_raw::{MissionRaw, ObjectiveRaw};
+
+// The bytes of the file begin with this tag, and the buffer starts with room for a small save.
+const SAVE_TAG : string = "LXMS";
+const SAVE_START_ROOM : i32 = 256;
+
+// Where the fields of one mission record sit: status and stage words, then the two 8-byte clocks.
+const SAVE_M_STAGE : i32 = 4;
+const SAVE_M_ELAPSED : i32 = 8;
+const SAVE_M_IN_STAGE : i32 = 16;
+
+// A big-endian 64-bit value is two 32-bit words.
+const SAVE_WORD_BYTES : i32 = 4;
+
+// The format: tag, version, definitions fingerprint, then the two counts.
+const SAVE_VERSION : i32 = 1;
+const SAVE_TAG_BYTES : i32 = 4;
+const SAVE_AT_VERSION : i32 = 4;
+const SAVE_AT_FINGERPRINT : i32 = 8;
+const SAVE_AT_MISSIONS : i32 = 16;
+const SAVE_AT_OBJECTIVES : i32 = 20;
+const SAVE_AT_BODY : i32 = 24;
+const SAVE_COUNT_WORDS : i32 = 8;
+const SAVE_CRC_BYTES : i32 = 4;
+
+// A count word (the flags and the paid rewards each begin with one).
+const SAVE_COUNT_WORD : i32 = 4;
+
+// One mission record, one objective record, one flag word and one paid-reward record.
+const SAVE_MISSION : i32 = 24;
+const SAVE_OBJECTIVE : i32 = 8;
+const SAVE_FLAG : i32 = 4;
+const SAVE_PAID : i32 = 12;
+
+// A 64-bit value is two big-endian words.
+const SAVE_HALF : i32 = 32;
+const SAVE_LOW_MASK : i64 = 4294967295;
+
+// What the end of a save holds, read and checked: the flags that are set and the rewards paid, or the problem.
+struct SaveTail {
+    problem     : string;
+    flags       : Vec<i32>;
+    paidWords   : Vec<i32>;
+    paidAmounts : Vec<i64>;
+}
+
+/** The save format of `MissionBoard`. */
+pub class MissionSave {
+    static fn put64(out : ByteBuf, v : i64) : void {
+        out.pushBe32((v >>> SAVE_HALF) as i32);
+        out.pushBe32(v as i32);
+    }
+
+    static fn get64(b : ByteBuf, at : i32) : i64 {
+        return ((b.be32(at) as i64) << SAVE_HALF) | ((b.be32(at + SAVE_WORD_BYTES) as i64) & SAVE_LOW_MASK);
+    }
+
+    // A flag as the word the format stores.
+    static fn bit(on : bool) : i32 {
+        if (on) {
+            return 1;
+        }
+        return 0;
+    }
+
+    /** The bytes of `board`'s play state. */
+    pub static fn save(board : MissionBoard) : ByteBuf {
+        let book : MissionBook = board.definitions();
+        let out : ByteBuf = new ByteBuf(SAVE_START_ROOM);
+        out.pushText(SAVE_TAG);
+        out.pushBe32(SAVE_VERSION);
+        MissionSave::put64(out, board.fingerprintValue());
+        out.pushBe32(book.missionCount());
+        out.pushBe32(book.totalObjectives());
+
+        MissionSave::writeProgress(board, out);
+        MissionSave::writeFlags(board, out);
+        MissionSave::writePaid(board, out);
+        out.pushBe32(new Crc32().sum(out, 0, out.len()));
+        return out;
+    }
+
+    // The mission records, then the objective records.
+    static fn writeProgress(board : MissionBoard, out : ByteBuf) : void {
+        let book : MissionBook = board.definitions();
+        for (m of 0..book.missionCount()) {
+            let r : MissionRaw = board.rawMission(m);
+            out.pushBe32(r.status);
+            out.pushBe32(r.stage);
+            MissionSave::put64(out, r.elapsed);
+            MissionSave::put64(out, r.inStage);
+        }
+        for (o of 0..book.totalObjectives()) {
+            let r : ObjectiveRaw = board.rawObjective(o);
+            out.pushBe32(r.count);
+            out.pushBe32(MissionSave::bit(r.done));
+        }
+    }
+
+    // The flags that are set: their count, then each as a word id.
+    static fn writeFlags(board : MissionBoard, out : ByteBuf) : void {
+        let known : i32 = board.knownWords();
+        let mut flagCount : i32 = 0;
+        for (w of 0..known) {
+            if (board.isFlagWord(w)) {
+                flagCount = flagCount + 1;
+            }
+        }
+        out.pushBe32(flagCount);
+        for (w of 0..known) {
+            if (board.isFlagWord(w)) {
+                out.pushBe32(w);
+            }
+        }
+    }
+
+    // The rewards paid so far: their count, then each as a word id and an 8-byte total.
+    static fn writePaid(board : MissionBoard, out : ByteBuf) : void {
+        let known : i32 = board.knownWords();
+        let mut paidCount : i32 = 0;
+        for (w of 0..known) {
+            if (board.paidWord(w) >= 0) {
+                paidCount = paidCount + 1;
+            }
+        }
+        out.pushBe32(paidCount);
+        for (w of 0..known) {
+            if (board.paidWord(w) >= 0) {
+                out.pushBe32(w);
+                MissionSave::put64(out, board.paidWord(w));
+            }
+        }
+    }
+
+    // The checks that need no definitions walk: tag, version, checksum, fingerprint, counts and size. "" when fine.
+    static fn checkEnvelope(board : MissionBoard, b : ByteBuf) : string {
+        let tooShort : bool = b.len() < SAVE_AT_BODY + SAVE_CRC_BYTES;
+        if (tooShort || !b.tagAt(0, SAVE_TAG)) {
+            return "not a mission save (wrong tag or too short)";
+        }
+        if (b.be32(SAVE_AT_VERSION) != SAVE_VERSION) {
+            return "unsupported mission save version ${b.be32(SAVE_AT_VERSION)}";
+        }
+        let body : i32 = b.len() - SAVE_CRC_BYTES;
+        if (new Crc32().sum(b, 0, body) != b.be32(body)) {
+            return "the mission save is damaged (checksum differs)";
+        }
+        if (MissionSave::get64(b, SAVE_AT_FINGERPRINT) != board.fingerprintValue()) {
+            return "the mission save belongs to different mission definitions";
+        }
+        let book : MissionBook = board.definitions();
+        let missions : i32 = book.missionCount();
+        let objectives : i32 = book.totalObjectives();
+        if (b.be32(SAVE_AT_MISSIONS) != missions || b.be32(SAVE_AT_OBJECTIVES) != objectives) {
+            return "the mission save has a different number of missions or objectives";
+        }
+        let records : i32 = missions * SAVE_MISSION + objectives * SAVE_OBJECTIVE;
+        if (body < SAVE_AT_BODY + records + SAVE_COUNT_WORDS) {
+            return "the mission save is too short";
+        }
+        return "";
+    }
+
+    // Reads and checks the mission records into `into`; "" when every one is possible.
+    static fn readMissions(book : MissionBook, b : ByteBuf, into : Vec<MissionRaw>) : string {
+        let mut at : i32 = SAVE_AT_BODY;
+        for (m of 0..book.missionCount()) {
+            let r : MissionRaw = MissionRaw {
+                status: b.be32(at),
+                stage: b.be32(at + SAVE_M_STAGE),
+                elapsed: MissionSave::get64(b, at + SAVE_M_ELAPSED),
+                inStage: MissionSave::get64(b, at + SAVE_M_IN_STAGE),
+            };
+            at = at + SAVE_MISSION;
+            if (r.status < MISSION_LOCKED || r.status > MISSION_FAILED) {
+                return "mission ${m} has an impossible status";
+            }
+            if (r.stage < 0 || r.stage >= book.stageCount(m)) {
+                return "mission ${m} has an impossible stage";
+            }
+            if (r.elapsed < 0 || r.inStage < 0) {
+                return "mission ${m} has a negative clock";
+            }
+            into.push(r);
+        }
+        return "";
+    }
+
+    // Reads and checks the objective records starting at byte `from` into `into`; "" when every one is possible.
+    static fn readObjectives(book : MissionBook, b : ByteBuf, from : i32, into : Vec<ObjectiveRaw>) : string {
+        let mut at : i32 = from;
+        for (o of 0..book.totalObjectives()) {
+            let count : i32 = b.be32(at);
+            let done : i32 = b.be32(at + SAVE_COUNT_WORD);
+            at = at + SAVE_OBJECTIVE;
+
+            let countFits : bool = count >= 0 && count <= book.objectiveAt(o).target;
+            let doneIsBit : bool = done == 0 || done == 1;
+            if (!countFits || !doneIsBit) {
+                return "objective ${o} has impossible progress";
+            }
+            into.push(ObjectiveRaw { count: count, done: done == 1 });
+        }
+        return "";
+    }
+
+    // Reads and checks the flag list and the paid-reward list that end the save, from byte `from`.
+    static fn readTail(b : ByteBuf, from : i32, body : i32, known : i32) : SaveTail {
+        let mut tail : SaveTail = SaveTail {
+            problem: "",
+            flags: new Vec<i32>(),
+            paidWords: new Vec<i32>(),
+            paidAmounts: new Vec<i64>(),
+        };
+        let mut at : i32 = from;
+
+        let flagCount : i32 = b.be32(at);
+        at = at + SAVE_COUNT_WORD;
+        if (flagCount < 0 || flagCount > known || at + flagCount * SAVE_FLAG + SAVE_COUNT_WORD > body) {
+            tail.problem = "the mission save has an impossible flag list";
+            return tail;
+        }
+        for (i of 0..flagCount) {
+            let w : i32 = b.be32(at);
+            at = at + SAVE_FLAG;
+            if (w < 0 || w >= known) {
+                tail.problem = "the mission save names an unknown flag";
+                return tail;
+            }
+            tail.flags.push(w);
+        }
+
+        let paidCount : i32 = b.be32(at);
+        at = at + SAVE_COUNT_WORD;
+        if (paidCount < 0 || paidCount > known || at + paidCount * SAVE_PAID != body) {
+            tail.problem = "the mission save has an impossible reward list";
+            return tail;
+        }
+        for (i of 0..paidCount) {
+            let w : i32 = b.be32(at);
+            if (w < 0 || w >= known) {
+                tail.problem = "the mission save names an unknown reward";
+                return tail;
+            }
+            let amount : i64 = MissionSave::get64(b, at + SAVE_WORD_BYTES);
+            if (amount < 0) {
+                tail.problem = "the mission save has a negative reward";
+                return tail;
+            }
+            tail.paidWords.push(w);
+            tail.paidAmounts.push(amount);
+            at = at + SAVE_PAID;
+        }
+        return tail;
+    }
+
+    /**
+     * Restores `board` from `b`. Answers "" on success, else what was wrong; on any problem the board is
+     * unchanged.
+     */
+    pub static fn load(board : MissionBoard, b : ByteBuf) : string {
+        let envelope : string = MissionSave::checkEnvelope(board, b);
+        if (envelope.byteLength > 0) {
+            return envelope;
+        }
+
+        // Everything is read and checked into these before the board is touched.
+        let book : MissionBook = board.definitions();
+        let raws : Vec<MissionRaw> = new Vec<MissionRaw>();
+        let problem : string = MissionSave::readMissions(book, b, raws);
+        if (problem.byteLength > 0) {
+            return problem;
+        }
+        let progress : Vec<ObjectiveRaw> = new Vec<ObjectiveRaw>();
+        let objectivesAt : i32 = SAVE_AT_BODY + book.missionCount() * SAVE_MISSION;
+        let badObjective : string = MissionSave::readObjectives(book, b, objectivesAt, progress);
+        if (badObjective.byteLength > 0) {
+            return badObjective;
+        }
+        let tailAt : i32 = objectivesAt + book.totalObjectives() * SAVE_OBJECTIVE;
+        let bodyEnd : i32 = b.len() - SAVE_CRC_BYTES;
+        let tail : SaveTail = MissionSave::readTail(b, tailAt, bodyEnd, board.knownWords());
+        if (tail.problem.byteLength > 0) {
+            return tail.problem;
+        }
+
+        board.clearLoose();
+        for (m of 0..book.missionCount()) {
+            board.setRawMission(m, raws.get(m));
+        }
+        for (o of 0..book.totalObjectives()) {
+            board.setRawObjective(o, progress.get(o));
+        }
+        for (i of 0..tail.flags.len()) {
+            board.setFlagWord(tail.flags.get(i));
+        }
+        for (i of 0..tail.paidWords.len()) {
+            board.setPaidWord(tail.paidWords.get(i), tail.paidAmounts.get(i));
+        }
+        return "";
+    }
+}
