@@ -1,0 +1,496 @@
+// audio_engine — the software mixer: voices, buses, listener and a soft-limited stereo output, with no device attached.
+//
+// `AudioEngine::render(out, frames)` adds up every live voice into `frames` stereo frames of `out` (interleaved
+// left, right), applies the master gain and a soft limiter that cannot exceed 1, and advances the engine's own
+// frame counter. Time exists only as that counter: the same calls in the same order give the same bytes on every
+// run and machine. A device callback, a test or an offline bounce drive it identically. Voices are a fixed pool;
+// when it is full the lowest-priority (then oldest) voice is stolen, or the new sound is refused if it would be
+// the least important. Buses are a tree of gain groups (mute, group level) below the master.
+
+use crate::core::math::scalar::{abs, clamp, min, minI};
+use crate::core::math::vec3::Vec3;
+use crate::data::audio::clip::AudioClip;
+use crate::sim::audio::audio_spatial::{AudioListener, AudioEmitter, AudioSpatial, AudioSpatialResult};
+use crate::sim::audio::audio_voice::{AudioVoice, AudioPlay, AudioBlock};
+use crate::sim::audio::music_track::MusicTrack;
+
+/** The master bus: everything ends here. */
+pub const AUDIO_BUS_MASTER : i32 = 0;
+
+/** Sound effects. */
+pub const AUDIO_BUS_SFX : i32 = 1;
+
+/** Music. */
+pub const AUDIO_BUS_MUSIC : i32 = 2;
+
+/** Ambience: wind, rooms, crowds. */
+pub const AUDIO_BUS_AMBIENT : i32 = 3;
+
+/** Interface sounds. */
+pub const AUDIO_BUS_UI : i32 = 4;
+
+// Frames mixed between two updates of spatial parameters and gain ramps.
+const ENGINE_BLOCK : i32 = 128;
+const ENGINE_MAX_BUSES : i32 = 32;
+const ENGINE_MAX_CLIPS : i32 = 256;
+
+// A handle is `serial << ENGINE_SLOT_BITS | slot`: the slot names the voice, the serial tells a sound from the
+// next one to use the same slot. So there are at most 2^ENGINE_SLOT_BITS - 1 voices, and the serial wraps at 23
+// bits to keep the handle a positive i32.
+const ENGINE_SLOT_BITS : i32 = 8;
+const ENGINE_MAX_VOICES : i32 = 255;
+const ENGINE_SLOT_MASK : i32 = 255;
+const ENGINE_SERIAL_MASK : i32 = 8388607;
+
+// The failure value of every lookup of a slot, handle or clip: refused, unknown or none.
+const ENGINE_NONE : i32 = -1;
+
+// The lowest sample rate an engine accepts: below it speech is already unintelligible and the maths degrades.
+const ENGINE_MIN_RATE : i32 = 8000;
+
+// The buses that exist from the start: master, sfx, music, ambient, ui.
+const ENGINE_BUILTIN_BUSES : i32 = 5;
+
+// Music outranks every sound effect when voices are stolen.
+const ENGINE_MUSIC_PRIORITY : i32 = 1000;
+
+// A stereo clip played flat is lifted by the square root of two, so that it is as loud as a centred mono sound
+// (which the pan law attenuates by 3 dB).
+const ENGINE_STEREO_LIFT : f32 = 1.4142135;
+
+// The soft limiter first clamps its input to this, so the arithmetic after it stays finite.
+const ENGINE_LIMIT_INPUT : f32 = 1000000.0;
+
+// Level where the limiter's curve starts to bend; below it the signal passes untouched.
+const ENGINE_KNEE : f32 = 0.8;
+
+// The low-pass coefficient of a fully distant sound (about a 1 kHz cutoff at 44.1 kHz).
+const ENGINE_FAR_COEFFICIENT : f32 = 0.125;
+
+/** The mixer. */
+pub class AudioEngine {
+    rate        : i32 = 44100;
+    voiceCount  : i32 = 16;
+    voices      : AudioVoice[];
+    clips       : AudioClip[];
+    clipCount   : i32 = 0;
+    busParent   : i32[];
+    busGain     : f32[];
+    busMuted    : i32[];
+    busCount    : i32 = 0;
+    scene       : AudioListener;
+    master      : f32 = 1.0;
+    rendered    : i64 = 0;
+    startCount  : i64 = 0;
+    serialCount : i32 = 0;
+    stolen      : i32 = 0;
+    refused     : i32 = 0;
+    musicVoice  : i32 = ENGINE_NONE;
+
+    /** An engine producing `sampleRate` frames per second with at most `maxVoices` sounds at once (1..255). */
+    constructor(sampleRate : i32, maxVoices : i32) {
+        self.rate = sampleRate;
+        if (sampleRate < ENGINE_MIN_RATE) {
+            self.rate = ENGINE_MIN_RATE;
+        }
+        self.voiceCount = maxVoices;
+        if (maxVoices < 1) {
+            self.voiceCount = 1;
+        }
+        if (maxVoices > ENGINE_MAX_VOICES) {
+            self.voiceCount = ENGINE_MAX_VOICES;
+        }
+        let mut pool : AudioVoice[] = new AudioVoice[self.voiceCount as i64];
+        for (i of 0..self.voiceCount) {
+            pool[i as i64] = new AudioVoice();
+        }
+        self.voices = pool;
+        self.clips = new AudioClip[ENGINE_MAX_CLIPS as i64];
+        let mut parent : i32[] = new i32[ENGINE_MAX_BUSES as i64];
+        let mut gains : f32[] = new f32[ENGINE_MAX_BUSES as i64];
+        let mut muted : i32[] = new i32[ENGINE_MAX_BUSES as i64];
+        for (i of 0..ENGINE_MAX_BUSES) {
+            parent[i as i64] = 0;
+            gains[i as i64] = 1.0;
+            muted[i as i64] = 0;
+        }
+        self.busParent = parent;
+        self.busGain = gains;
+        self.busMuted = muted;
+        self.busCount = ENGINE_BUILTIN_BUSES;
+        self.scene = AudioListener {};
+    }
+
+    /** Frames per second of the output. */
+    pub fn sampleRate(self) : i32 {
+        return self.rate;
+    }
+
+    /** Engine time in seconds: frames rendered so far over the rate. */
+    pub fn time(self) : f64 {
+        return self.rendered as f64 / self.rate as f64;
+    }
+
+    /** Frames rendered so far. */
+    pub fn framesRendered(self) : i64 {
+        return self.rendered;
+    }
+
+    // ---- clips -------------------------------------------------------------------------------------------
+
+    /** Hands a clip to the engine (it takes ownership) and returns its id, or -1 when the table is full. */
+    pub fn addClip(mut self, own clip : AudioClip) : i32 {
+        if (self.clipCount >= ENGINE_MAX_CLIPS) {
+            return ENGINE_NONE;
+        }
+        let id : i32 = self.clipCount;
+        self.clips[id as i64] = clip;
+        self.clipCount = self.clipCount + 1;
+        return id;
+    }
+
+    /** The clip with id `id` (clip 0 for an unknown id, so callers never hold a hole). */
+    pub fn clipOf(self, id : i32) : AudioClip {
+        if (id < 0 || id >= self.clipCount) {
+            return self.clips[0];
+        }
+        return self.clips[id as i64];
+    }
+
+    // ---- buses -------------------------------------------------------------------------------------------
+
+    /** A new bus under `parent`; returns its id, or -1 when the tree is full or `parent` is unknown. */
+    pub fn addBus(mut self, parent : i32) : i32 {
+        let treeFull : bool = self.busCount >= ENGINE_MAX_BUSES;
+        let unknownParent : bool = parent < 0 || parent >= self.busCount;
+        if (treeFull || unknownParent) {
+            return ENGINE_NONE;
+        }
+        let id : i32 = self.busCount;
+        self.busParent[id as i64] = parent;
+        self.busCount = self.busCount + 1;
+        return id;
+    }
+
+    /** Sets the group gain of a bus (the master's gain too). */
+    pub fn setBusGain(mut self, bus : i32, gain : f32) : void {
+        if (bus == AUDIO_BUS_MASTER) {
+            self.master = gain;
+        } else if (bus > 0 && bus < self.busCount) {
+            self.busGain[bus as i64] = gain;
+        }
+    }
+
+    /** The group gain of a bus. */
+    pub fn busGainOf(self, bus : i32) : f32 {
+        if (bus == AUDIO_BUS_MASTER) {
+            return self.master;
+        }
+        if (bus > 0 && bus < self.busCount) {
+            return self.busGain[bus as i64];
+        }
+        return 0.0;
+    }
+
+    /** Mutes or unmutes a bus and everything below it. */
+    pub fn setBusMuted(mut self, bus : i32, on : bool) : void {
+        if (bus >= 0 && bus < self.busCount) {
+            self.busMuted[bus as i64] = 0;
+            if (on) {
+                self.busMuted[bus as i64] = 1;
+            }
+        }
+    }
+
+    // The gain of every bus from `bus` up to (not including) the master; 0 if any is muted.
+    fn busChain(self, bus : i32) : f32 {
+        let mut b : i32 = bus;
+        let mut g : f32 = 1.0;
+        let mut guard : i32 = 0;
+        while (b > 0 && b < self.busCount && guard < ENGINE_MAX_BUSES) {
+            if (self.busMuted[b as i64] != 0) {
+                return 0.0;
+            }
+            g = g * self.busGain[b as i64];
+            b = self.busParent[b as i64];
+            guard = guard + 1;
+        }
+        if (self.busMuted[0] != 0) {
+            return 0.0;
+        }
+        return g;
+    }
+
+    // ---- listener ----------------------------------------------------------------------------------------
+
+    /** Places the listener. */
+    pub fn setListener(mut self, listener : AudioListener) : void {
+        self.scene = listener;
+    }
+
+    /** The current listener. */
+    pub fn listener(self) : AudioListener {
+        return self.scene;
+    }
+
+    // ---- voices ------------------------------------------------------------------------------------------
+
+    // The slot a handle names while it is still the same sound, else ENGINE_NONE.
+    fn slotOf(self, handle : i32) : i32 {
+        if (handle <= 0) {
+            return ENGINE_NONE;
+        }
+        let slot : i32 = handle & ENGINE_SLOT_MASK;
+        if (slot >= self.voiceCount) {
+            return ENGINE_NONE;
+        }
+        let v : AudioVoice = self.voices[slot as i64];
+        if (!v.isLive() || v.serialNumber() != (handle >> ENGINE_SLOT_BITS)) {
+            return ENGINE_NONE;
+        }
+        return slot;
+    }
+
+    // The slot to use for a sound of `priority`: a free one, else the stolen victim, else ENGINE_NONE.
+    fn claimSlot(mut self, priority : i32) : i32 {
+        let mut victim : i32 = ENGINE_NONE;
+        for (i of 0..self.voiceCount) {
+            let v : AudioVoice = self.voices[i as i64];
+            if (!v.isLive()) {
+                return i;
+            }
+            if (victim == ENGINE_NONE) {
+                victim = i;
+                continue;
+            }
+
+            let w : AudioVoice = self.voices[victim as i64];
+            let lessImportant : bool = v.priorityOf() < w.priorityOf();
+            let olderOfEqual : bool = v.priorityOf() == w.priorityOf() && v.startOrder() < w.startOrder();
+            if (lessImportant || olderOfEqual) {
+                victim = i;
+            }
+        }
+        if (victim == ENGINE_NONE) {
+            return ENGINE_NONE;
+        }
+
+        let loser : AudioVoice = self.voices[victim as i64];
+        if (loser.priorityOf() > priority) {
+            self.refused = self.refused + 1;
+            return ENGINE_NONE;
+        }
+        loser.kill();
+        self.stolen = self.stolen + 1;
+        return victim;
+    }
+
+    /**
+     * Starts a sound. Returns a handle (positive), or -1 when refused: unknown clip, or no voice free and none
+     * less important.
+     */
+    pub fn play(mut self, request : AudioPlay) : i32 {
+        if (request.clip < 0 || request.clip >= self.clipCount) {
+            return ENGINE_NONE;
+        }
+        let slot : i32 = self.claimSlot(request.priority);
+        if (slot == ENGINE_NONE) {
+            return ENGINE_NONE;
+        }
+
+        self.serialCount = (self.serialCount + 1) & ENGINE_SERIAL_MASK;
+        if (self.serialCount == 0) {
+            self.serialCount = 1;
+        }
+        self.startCount = self.startCount + 1;
+        let v : AudioVoice = self.voices[slot as i64];
+        v.begin(request, self.clips[request.clip as i64], self.serialCount, self.startCount, self.rate);
+        return (self.serialCount << ENGINE_SLOT_BITS) | slot;
+    }
+
+    /** Stops a sound, fading out over `fadeSeconds` (0 stops at once). */
+    pub fn stop(mut self, handle : i32, fadeSeconds : f32) : void {
+        let slot : i32 = self.slotOf(handle);
+        if (slot >= 0) {
+            self.voices[slot as i64].fadeOut((fadeSeconds * self.rate as f32) as i64);
+        }
+    }
+
+    /** Pauses or resumes a sound; a paused sound keeps its voice. */
+    pub fn pause(mut self, handle : i32, on : bool) : void {
+        let slot : i32 = self.slotOf(handle);
+        if (slot >= 0) {
+            self.voices[slot as i64].setPaused(on);
+        }
+    }
+
+    /** Changes the gain of a playing sound. */
+    pub fn setGain(mut self, handle : i32, gain : f32) : void {
+        let slot : i32 = self.slotOf(handle);
+        if (slot >= 0) {
+            self.voices[slot as i64].setGain(gain);
+        }
+    }
+
+    /** Changes the pitch ratio of a playing sound. */
+    pub fn setPitch(mut self, handle : i32, pitch : f32) : void {
+        let slot : i32 = self.slotOf(handle);
+        if (slot >= 0) {
+            self.voices[slot as i64].setPitch(pitch);
+        }
+    }
+
+    /** Moves a playing 3D sound. */
+    pub fn setEmitter(mut self, handle : i32, emitter : AudioEmitter) : void {
+        let slot : i32 = self.slotOf(handle);
+        if (slot >= 0) {
+            self.voices[slot as i64].setEmitter(emitter);
+        }
+    }
+
+    /** True while the handle names a sound that has not ended. */
+    pub fn isPlaying(self, handle : i32) : bool {
+        return self.slotOf(handle) >= 0;
+    }
+
+    /** How many voices are in use. */
+    pub fn activeVoices(self) : i32 {
+        let mut n : i32 = 0;
+        for (i of 0..self.voiceCount) {
+            if (self.voices[i as i64].isLive()) {
+                n = n + 1;
+            }
+        }
+        return n;
+    }
+
+    /** How many sounds were cut off to make room for a more important one. */
+    pub fn stolenCount(self) : i32 {
+        return self.stolen;
+    }
+
+    /** How many sounds were refused because every voice was more important. */
+    pub fn refusedCount(self) : i32 {
+        return self.refused;
+    }
+
+    // ---- music -------------------------------------------------------------------------------------------
+
+    /**
+     * Plays `track` on the music bus, looping between its loop points. Music already playing fades out over
+     * `crossfadeSeconds` while the new track fades in, both on an equal-power curve. Returns the new handle.
+     */
+    pub fn playMusic(mut self, track : MusicTrack, crossfadeSeconds : f32) : i32 {
+        if (self.musicVoice > 0) {
+            self.stop(self.musicVoice, crossfadeSeconds);
+        }
+        let mut p : AudioPlay = AudioPlay::forClip(track.clip);
+        p.bus = AUDIO_BUS_MUSIC;
+        p.gain = track.gain;
+        p.looping = true;
+        p.loopStart = track.loopStart;
+        p.loopEnd = track.loopEnd;
+        p.priority = ENGINE_MUSIC_PRIORITY;
+        p.fadeIn = crossfadeSeconds;
+        p.equalPower = true;
+        self.musicVoice = self.play(p);
+        return self.musicVoice;
+    }
+
+    /** Fades the current music out over `fadeSeconds`. */
+    pub fn stopMusic(mut self, fadeSeconds : f32) : void {
+        if (self.musicVoice > 0) {
+            self.stop(self.musicVoice, fadeSeconds);
+        }
+        self.musicVoice = ENGINE_NONE;
+    }
+
+    // ---- rendering ---------------------------------------------------------------------------------------
+
+    /**
+     * The soft limiter: identity up to the knee, then a smooth bend that approaches but never exceeds 1.
+     * It is odd, continuous, and has a continuous slope at the knee.
+     */
+    pub static fn softLimit(x : f32) : f32 {
+        let a : f32 = clamp(x, -ENGINE_LIMIT_INPUT, ENGINE_LIMIT_INPUT);
+        let m : f32 = abs(a);
+        if (m <= ENGINE_KNEE) {
+            return a;
+        }
+
+        // Past the knee the magnitude bends towards 1 along t / (1 + t); the sign is put back at the end.
+        let room : f32 = (1.0 as f32) - ENGINE_KNEE;
+        let t : f32 = (m - ENGINE_KNEE) / room;
+        let y : f32 = min(ENGINE_KNEE + room * (t / ((1.0 as f32) + t)), 1.0);
+        if (a < 0.0) {
+            return -y;
+        }
+        return y;
+    }
+
+    // Mixes one block of at most ENGINE_BLOCK frames of every voice into `out` at frame `at`.
+    fn mixBlock(mut self, out : f32[], at : i32, n : i32) : void {
+        for (i of 0..self.voiceCount) {
+            let v : AudioVoice = self.voices[i as i64];
+            if (!v.isLive() || v.isPaused()) {
+                continue;
+            }
+            let clip : AudioClip = self.clips[v.clipIdOf() as i64];
+            let block : AudioBlock = self.blockFor(v, clip, at, n);
+            v.mix(clip, out, block);
+        }
+    }
+
+    // How voice `v` playing `clip` sounds in this block: bus and distance gain, pan, Doppler and damping.
+    fn blockFor(self, v : AudioVoice, clip : AudioClip, at : i32, n : i32) : AudioBlock {
+        let mut base : f32 = v.gainOf() * self.busChain(v.busOf());
+        let mut ratio : f32 = 1.0;
+        let mut damp : f32 = 1.0;
+        let mut pan : f32 = v.panOf();
+        if (v.isSpatial()) {
+            let s : AudioSpatialResult = AudioSpatial::solve(self.scene, v.emitterOf());
+            base = base * s.gain;
+            pan = s.pan;
+            ratio = s.doppler;
+            damp = (1.0 as f32) - s.damping * ((1.0 as f32) - ENGINE_FAR_COEFFICIENT);
+        } else if (clip.channels == 2) {
+            base = base * ENGINE_STEREO_LIFT;
+        }
+
+        let g : Vec3 = AudioSpatial::panGains(pan);
+        let step : f64 = (v.pitchOf() * ratio) as f64 * clip.rate as f64 / self.rate as f64;
+        return AudioBlock { at: at, frames: n, left: base * g.x, right: base * g.y, step: step, damp: damp };
+    }
+
+    /**
+     * Renders `frames` stereo frames (interleaved left, right) into `out`, which must hold `2 * frames` floats,
+     * replacing its contents. Engine state advances by `frames`.
+     */
+    pub fn render(mut self, out : f32[], frames : i32) : void {
+        for (i of 0..frames * 2) {
+            out[i as i64] = 0.0;
+        }
+        let mut done : i32 = 0;
+        while (done < frames) {
+            let n : i32 = minI(frames - done, ENGINE_BLOCK);
+            self.mixBlock(out, done, n);
+            done = done + n;
+        }
+        let master : f32 = self.master;
+        for (i of 0..frames * 2) {
+            out[i as i64] = AudioEngine::softLimit(out[i as i64] * master);
+        }
+        self.rendered = self.rendered + frames as i64;
+    }
+
+    /** Renders `frames` frames into a new stereo clip at the engine's rate. */
+    pub fn renderClip(mut self, frames : i32) : AudioClip {
+        let buf : f32[] = new f32[(frames * 2 + 2) as i64];
+        self.render(buf, frames);
+        let mut clip : AudioClip = new AudioClip(self.rate, 2, frames);
+        for (i of 0..frames * 2) {
+            clip.samples[i as i64] = buf[i as i64];
+        }
+        return clip;
+    }
+}

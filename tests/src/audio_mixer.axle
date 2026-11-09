@@ -1,0 +1,376 @@
+// audio_mixer — the software mixer's shared output: limiter, stealing, controls, buses, music and determinism.
+//
+// Each of these has a check that the effect exists and one that it changes only what it should. The mixer is
+// deterministic by contract, so determinism is checked on a whole scene through a WAV hash rather than on a
+// single voice.
+
+use ludax::AUDIO_BUS_MASTER;
+use ludax::AUDIO_BUS_MUSIC;
+use ludax::AUDIO_BUS_SFX;
+use ludax::AudioAttenuation;
+use ludax::AudioClip;
+use ludax::AudioEngine;
+use ludax::AudioListener;
+use ludax::AudioPlay;
+use ludax::Checks;
+use ludax::MusicTrack;
+use ludax::Vec3;
+use ludax::WavCodec;
+use ludax::WavFile;
+use ludax::absD;
+
+use crate::audio_support::{
+    AUD_TOL, AUD_TOL_LOOSE, AUD_TOL_PEAK, AUD_RATE, AUD_CENTRE, AUD_EQUAL_POWER, audioTDc,
+    audioTRender, audioTHash, audioTScene
+};
+
+/** The audio mixer checks. */
+pub class AudioMixerSuite {
+    static fn limiter(c : Checks) : void {
+        c.near("limiter passes small signals", AudioEngine::softLimit(0.5) as f64, 0.5, 0.0);
+        c.near(
+            "the soft limiter is odd: a negative input mirrors the positive one",
+            AudioEngine::softLimit(-0.5) as f64,
+            -0.5,
+            0.0
+        );
+        c.near(
+            "limiter bends above the knee: 0.9 -> 0.8 + 0.2 * (0.5/1.5)",
+            AudioEngine::softLimit(0.9) as f64,
+            0.8 + 0.2 * (0.5 / 1.5),
+            AUD_TOL
+        );
+        c.that(
+            "limiter output never exceeds 1 for huge input",
+            AudioEngine::softLimit(1000000.0) <= 1.0 && AudioEngine::softLimit(-1000000.0) >= -1.0
+        );
+        let mut mono : bool = true;
+        let mut prev : f32 = 0.0;
+        for (i of 0..400) {
+            let y : f32 = AudioEngine::softLimit((i as f32) * (0.05 as f32));
+            if (y < prev || y > 1.0) {
+                mono = false;
+            }
+            prev = y;
+        }
+        c.that("limiter is monotonic and bounded on 0..20", mono);
+
+        // Ten full-scale sounds on top of each other.
+        let e : AudioEngine = new AudioEngine(AUD_RATE, 16);
+        let id : i32 = e.addClip(audioTDc(2000, 1.0));
+        let neg : i32 = e.addClip(audioTDc(2000, -1.0));
+        for (i of 0..10) {
+            let mut p : AudioPlay = AudioPlay::forClip(id);
+            p.pan = ((i - 5) as f32) / (5.0 as f32);
+            p.gain = 3.0;
+            e.play(p);
+        }
+        let mut q : AudioPlay = AudioPlay::forClip(neg);
+        q.gain = 40.0;
+        q.pan = 1.0;
+        e.play(q);
+        let buf : f32[] = audioTRender(e, 2000);
+        let mut peak : f32 = 0.0;
+        let mut ok : bool = true;
+        for (i of 0..4000) {
+            let v : f32 = buf[i as i64];
+            let a : f32 = v * v;
+            if (a > peak) {
+                peak = a;
+            }
+            if (v > 1.0 || v < -1.0) {
+                ok = false;
+            }
+        }
+        c.that("overloaded master stays within +-1 (peak^2 ${peak})", ok);
+        c.that("overloaded master is loud, not silent", peak > 0.5);
+    }
+
+    static fn stealing(c : Checks) : void {
+        let e : AudioEngine = new AudioEngine(AUD_RATE, 2);
+        let id : i32 = e.addClip(audioTDc(100000, 0.1));
+        let mut lo : AudioPlay = AudioPlay::forClip(id);
+        lo.priority = 1;
+        let mut hi : AudioPlay = AudioPlay::forClip(id);
+        hi.priority = 5;
+        let mut mid : AudioPlay = AudioPlay::forClip(id);
+        mid.priority = 3;
+        let a : i32 = e.play(hi);
+        let b : i32 = e.play(lo);
+        c.sameInt("two voices are in use", e.activeVoices(), 2);
+        let d : i32 = e.play(mid);
+        c.that(
+            "the lowest priority voice was stolen",
+            d > 0 && !e.isPlaying(b) && e.isPlaying(a) && e.isPlaying(d)
+        );
+        c.sameInt("stealing a voice from a full engine is counted once", e.stolenCount(), 1);
+        c.sameInt("a stale handle is not a voice", e.activeVoices(), 2);
+        let mut weak : AudioPlay = AudioPlay::forClip(id);
+        weak.priority = 0;
+        c.sameInt("a sound less important than every voice is refused", e.play(weak), -1);
+        c.sameInt("the refusal is counted", e.refusedCount(), 1);
+        c.that("a refusal stole nothing", e.isPlaying(a) && e.isPlaying(d));
+
+        // Equal priority: the oldest goes.
+        let e2 : AudioEngine = new AudioEngine(AUD_RATE, 3);
+        let cid : i32 = e2.addClip(audioTDc(100000, 0.1));
+        let mut p : AudioPlay = AudioPlay::forClip(cid);
+        p.priority = 2;
+        let h1 : i32 = e2.play(p);
+        let h2 : i32 = e2.play(p);
+        let h3 : i32 = e2.play(p);
+        let h4 : i32 = e2.play(p);
+        c.that(
+            "equal priority: the oldest voice is stolen",
+            !e2.isPlaying(h1) && e2.isPlaying(h2) && e2.isPlaying(h3) && e2.isPlaying(h4)
+        );
+        let h5 : i32 = e2.play(p);
+        c.that(
+            "then the next oldest",
+            !e2.isPlaying(h2) && e2.isPlaying(h3) && e2.isPlaying(h4) && e2.isPlaying(h5)
+        );
+
+        // A finished voice frees its slot without any stealing.
+        let e3 : AudioEngine = new AudioEngine(AUD_RATE, 1);
+        let sid : i32 = e3.addClip(audioTDc(100, 0.1));
+        e3.play(AudioPlay::forClip(sid));
+        audioTRender(e3, 200);
+        c.sameInt("a finished sound leaves the pool", e3.activeVoices(), 0);
+        c.that(
+            "so a new sound needs no steal",
+            e3.play(AudioPlay::forClip(sid)) > 0 && e3.stolenCount() == 0
+        );
+    }
+
+    static fn controls(c : Checks) : void {
+        let e : AudioEngine = new AudioEngine(AUD_RATE, 8);
+        let id : i32 = e.addClip(audioTDc(100000, 1.0));
+        // Fade in: linear over 1000 frames, so halfway is half.
+        let mut p : AudioPlay = AudioPlay::forClip(id);
+        p.fadeIn = 0.125;
+        p.gain = 0.1;
+        let h : i32 = e.play(p);
+        let buf : f32[] = audioTRender(e, 2000);
+        c.near("fade in starts silent", buf[0] as f64, 0.0, 0.0000001);
+        c.near(
+            "fade in is half way at half time",
+            buf[1000] as f64,
+            0.5 * 0.1 * AUD_CENTRE,
+            0.0002
+        );
+        c.near("fade in reaches full level", buf[3000] as f64, 0.1 * AUD_CENTRE, AUD_TOL);
+
+        // Fade out.
+        e.stop(h, 0.0625);
+        let fb : f32[] = audioTRender(e, 1000);
+        c.that("fade-out ends the voice", !e.isPlaying(h));
+        c.near("fade out starts at full level", fb[0] as f64, 0.1 * AUD_CENTRE, 0.0002);
+        c.near("fade out half way", fb[500] as f64, 0.5 * 0.1 * AUD_CENTRE, 0.0003);
+        c.near("fade out is silent after its end", fb[1200] as f64, 0.0, 0.0);
+
+        // Pause holds the position.
+        let mut r : AudioClip = new AudioClip(AUD_RATE, 1, 100);
+        for (i of 0..100) {
+            r.samples[i as i64] = ((i + 1) as f32) / (128.0 as f32);
+        }
+        let rid : i32 = e.addClip(r);
+        let rh : i32 = e.play(AudioPlay::forClip(rid));
+        audioTRender(e, 10);
+        e.pause(rh, true);
+        let pb : f32[] = audioTRender(e, 20);
+        c.near("a paused voice is silent", pb[10] as f64, 0.0, 0.0);
+        c.that("a paused voice keeps its slot", e.isPlaying(rh));
+        e.pause(rh, false);
+        let rb : f32[] = audioTRender(e, 5);
+        c.near(
+            "resuming continues at frame 10",
+            rb[0] as f64,
+            11.0 / 128.0 * AUD_CENTRE,
+            AUD_TOL_LOOSE
+        );
+
+        // Stopping with no fade ends the sound at once.
+        e.stop(rh, 0.0);
+        c.that("stop(0) frees the voice immediately", !e.isPlaying(rh));
+        c.near(
+            "engine time follows the frames rendered",
+            e.time(),
+            (2000.0 + 1000.0 + 10.0 + 20.0 + 5.0) / 8000.0,
+            0.0000001
+        );
+    }
+
+    static fn buses(c : Checks) : void {
+        let e : AudioEngine = new AudioEngine(AUD_RATE, 8);
+        let id : i32 = e.addClip(audioTDc(100000, 0.4));
+        let mut p : AudioPlay = AudioPlay::forClip(id);
+        p.bus = AUDIO_BUS_SFX;
+        let h0 : i32 = e.play(p);
+        let full : f64 = audioTRender(e, 10)[5] as f64;
+        c.near(
+            "a sfx voice at unity bus gain renders at its level times the centre gain",
+            full,
+            0.4 * AUD_CENTRE,
+            AUD_TOL
+        );
+        e.setBusGain(AUDIO_BUS_SFX, 0.5);
+        let half : f64 = audioTRender(e, 300)[598] as f64;
+        c.near("sfx bus gain 0.5 halves the level", half, 0.2 * AUD_CENTRE, AUD_TOL);
+        let sub : i32 = e.addBus(AUDIO_BUS_SFX);
+        e.setBusGain(sub, 0.5);
+        let mut q : AudioPlay = AudioPlay::forClip(id);
+        q.bus = sub;
+        e.stop(h0, 0.0);
+        let hs : i32 = e.play(q);
+        c.that("a child bus got an id", sub > 4 && hs > 0);
+        let quarter : f64 = audioTRender(e, 600)[1198] as f64;
+        c.near(
+            "child bus multiplies with its parent: 0.5 * 0.5",
+            quarter,
+            0.4 * AUD_CENTRE * 0.25,
+            0.00002
+        );
+        e.setBusMuted(AUDIO_BUS_SFX, true);
+        let silent : f32[] = audioTRender(e, 200);
+        c.near("muting a bus mutes its children too", silent[300] as f64, 0.0, 0.0);
+        e.setBusMuted(AUDIO_BUS_SFX, false);
+        e.setBusGain(AUDIO_BUS_MASTER, 0.5);
+        e.setBusGain(AUDIO_BUS_SFX, 1.0);
+        e.setBusGain(sub, 1.0);
+        let m : f32[] = audioTRender(e, 600);
+        c.near("master gain scales everything", m[1000] as f64, 0.5 * (0.4 * AUD_CENTRE), 0.0002);
+        c.sameInt("an unknown parent is refused", e.addBus(99), -1);
+        c.that("the music bus has id 2", AUDIO_BUS_MUSIC == 2);
+    }
+
+    static fn spatialMixing(c : Checks) : void {
+        // Distance attenuation and panning reach the output.
+        let e : AudioEngine = new AudioEngine(AUD_RATE, 4);
+        let id : i32 = e.addClip(audioTDc(100000, 0.8));
+        let mut p : AudioPlay = AudioPlay::forClip(id);
+        p.spatial = true;
+        p.emitter.position = Vec3 { x: 4.0, y: 0.0, z: 0.0 };
+        p.emitter.minDistance = 1.0;
+        p.emitter.maxDistance = 100.0;
+        e.play(p);
+        let buf : f32[] = audioTRender(e, 600);
+        // d = 4: inverse gain 1/4; fully right.
+        c.near(
+            "right emitter: right channel = 0.8 * 1/4 (damping aside)",
+            buf[2 * 599 + 1] as f64,
+            0.8 * 0.25,
+            0.01
+        );
+        c.near("right emitter: left channel is silent", buf[2 * 599] as f64, 0.0, AUD_TOL_PEAK);
+
+        // Distance low-pass: an alternating +1/-1 signal (Nyquist) is nearly removed at max distance.
+        let mut alt : AudioClip = new AudioClip(AUD_RATE, 1, 4000);
+        for (i of 0..4000) {
+            alt.samples[i as i64] = (i % 2) as f32 * (2.0 as f32) - (1.0 as f32);
+        }
+        let mut peaks : f64 = 0.0;
+        let mut peakn : f64 = 0.0;
+        for (mode of 0..2) {
+            let en : AudioEngine = new AudioEngine(AUD_RATE, 2);
+            let aid : i32 = en.addClip(alt.copy());
+            let mut ap : AudioPlay = AudioPlay::forClip(aid);
+            ap.spatial = true;
+            ap.emitter.model = AudioAttenuation::None;
+            ap.emitter.position = Vec3 { x: 0.0, y: 0.0, z: -1.0 };
+            if (mode == 1) {
+                ap.emitter.position = Vec3 { x: 0.0, y: 0.0, z: -50.0 };
+            }
+            en.play(ap);
+            let ab : f32[] = audioTRender(en, 2000);
+            let mut m : f64 = 0.0;
+            for (i of 1000..2000) {
+                let v : f64 = absD(ab[(i * 2) as i64] as f64);
+                if (v > m) {
+                    m = v;
+                }
+            }
+            if (mode == 0) {
+                peakn = m;
+            } else {
+                peaks = m;
+            }
+        }
+        c.near("near sound keeps its high frequencies", peakn, AUD_CENTRE, 0.001);
+        c.that(
+            "far sound loses them (${peaks} vs ${peakn})",
+            peaks < peakn * 0.2
+        );
+    }
+
+    static fn music(c : Checks) : void {
+        let e : AudioEngine = new AudioEngine(AUD_RATE, 4);
+        let a : i32 = e.addClip(audioTDc(4000, 0.2));
+        let b : i32 = e.addClip(audioTDc(4000, 0.4));
+        let ha : i32 = e.playMusic(MusicTrack::forClip(a), 0.0);
+        let buf : f32[] = audioTRender(e, 500);
+        c.near("music plays at its level", buf[600] as f64, 0.2 * AUD_CENTRE, AUD_TOL_LOOSE);
+        c.that("music loops past the end of its clip", e.isPlaying(ha));
+        audioTRender(e, 8000);
+        c.that("music still plays after two clip lengths", e.isPlaying(ha));
+
+        // Crossfade over 1000 frames.
+        let hb : i32 = e.playMusic(MusicTrack::forClip(b), 0.125);
+        let cf : f32[] = audioTRender(e, 1200);
+        c.near("crossfade start: still the old track", cf[0] as f64, 0.2 * AUD_CENTRE, 0.0002);
+        c.near(
+            "crossfade midpoint: equal-power mix of both",
+            cf[1000] as f64,
+            (0.2 * AUD_EQUAL_POWER + 0.4 * AUD_EQUAL_POWER) * AUD_CENTRE,
+            0.001
+        );
+        c.near(
+            "crossfade end: only the new track",
+            cf[2 * 1100] as f64,
+            0.4 * AUD_CENTRE,
+            AUD_TOL_LOOSE
+        );
+        c.that("the old track was released", !e.isPlaying(ha));
+        c.that("the new track plays", e.isPlaying(hb));
+        let mut smooth : bool = true;
+        for (i of 1..1000) {
+            let d : f64 = absD(cf[(i * 2) as i64] as f64 - cf[((i - 1) * 2) as i64] as f64);
+            if (d > 0.002) {
+                smooth = false;
+            }
+        }
+        c.that("no jump anywhere in the crossfade", smooth);
+        e.stopMusic(0.0);
+        c.that("stopMusic with no fade ends it", !e.isPlaying(hb));
+    }
+
+    static fn determinism(c : Checks) : void {
+        let h1 : i64 = audioTHash(audioTScene(), 3000);
+        let h2 : i64 = audioTHash(audioTScene(), 3000);
+        c.that("rendering the same scene twice gives identical bytes", h1 == h2);
+        let other : AudioEngine = audioTScene();
+        other.setListener(AudioListener { position: Vec3 { x: 1.0, y: 0.0, z: 0.0 } });
+        c.that("a different listener gives different bytes", audioTHash(other, 3000) != h1);
+
+        // The offline path survives a WAV round trip.
+        let e2 : AudioEngine = audioTScene();
+        let clip : AudioClip = e2.renderClip(1000);
+        let f : WavFile = WavCodec::encodeFloat(clip);
+        let back : AudioClip = WavCodec::decode(f.bytes, f.size).clip();
+        c.sameInt("rendered clip is stereo", back.channels, 2);
+        c.that(
+            "float WAV of the render is bit exact",
+            back.samples[777] == clip.samples[777] && back.samples[1999] == clip.samples[1999]
+        );
+    }
+
+    /** Runs every check of the suite. */
+    pub static fn run(c : Checks) : void {
+        AudioMixerSuite::limiter(c);
+        AudioMixerSuite::stealing(c);
+        AudioMixerSuite::controls(c);
+        AudioMixerSuite::buses(c);
+        AudioMixerSuite::spatialMixing(c);
+        AudioMixerSuite::music(c);
+        AudioMixerSuite::determinism(c);
+    }
+}

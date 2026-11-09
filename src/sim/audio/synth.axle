@@ -1,0 +1,283 @@
+// synth — oscillators, an ADSR envelope and one-pole filters: the parts a sound is built from in code.
+//
+// Games that make their clips from these need no audio assets at all. Everything is a pure function of its
+// arguments or a small state machine stepped one sample at a time, with noise drawn from an explicit `Pcg32`, so a
+// synthesised clip is the same on every machine and every run. Phases are in turns (0..1), not radians.
+
+use crate::core::math::scalar::{clamp, TAU};
+use crate::core::math::trig::sin;
+use crate::core::rng::pcg32::Pcg32;
+
+// The most a delay or comb may feed back: 1 would ring forever, so it stops short.
+const SYNTH_FEEDBACK_MAX : f32 = 0.99;
+
+// Freeverb's tuning: the comb and all-pass lengths in frames at 44100 Hz (chosen so the echoes do not line up),
+// scaled to the sample rate in use.
+const SYNTH_REVERB_RATE : f64 = 44100.0;
+const SYNTH_COMB_A : f64 = 1116.0;
+const SYNTH_COMB_B : f64 = 1188.0;
+const SYNTH_COMB_C : f64 = 1277.0;
+const SYNTH_COMB_D : f64 = 1356.0;
+const SYNTH_ALLPASS_A : f64 = 556.0;
+const SYNTH_ALLPASS_B : f64 = 441.0;
+
+// Freeverb's gains: the input is attenuated so four combs cannot clip; `room` 0..1 maps to a comb feedback of
+// ROOM_BASE..ROOM_BASE+ROOM_SPAN (a longer tail without ringing forever); damping stops short of fully closed.
+const SYNTH_REVERB_INPUT : f32 = 0.15;
+const SYNTH_ROOM_BASE : f32 = 0.7;
+const SYNTH_ROOM_SPAN : f32 = 0.28;
+const SYNTH_DAMPING_MAX : f32 = 0.95;
+
+// The all-pass diffusers' feedback.
+const SYNTH_ALLPASS_FEEDBACK : f32 = 0.5;
+
+/** The basic waveshapes. */
+pub enum SynthWave : i8 {
+    /** sin(2 pi phase). */
+    Sine = 0,
+    /** +1 for the first half of the cycle, -1 for the second. */
+    Square = 1,
+    /** Rises from -1 to 1 over the cycle, then jumps back. */
+    Saw = 2,
+    /** 0 at phase 0, 1 at a quarter, -1 at three quarters. */
+    Triangle = 3,
+    /** White noise in -1..1; ignores the phase. */
+    Noise = 4,
+
+    /** The value at `phase` (turns; any real number, only the fractional part matters). Noise draws from `rng`. */
+    pub fn sample(self, phase : f32, rng : Pcg32) : f32 {
+        let mut p : f32 = phase - ((phase as i64) as f32);
+        if (p < 0.0) {
+            p = p + (1.0 as f32);
+        }
+        return match self {
+            SynthWave::Sine => sin(TAU * p),
+            SynthWave::Square => SynthShape::square(p),
+            SynthWave::Saw => p * (2.0 as f32) - (1.0 as f32),
+            SynthWave::Triangle => SynthShape::triangle(p),
+            SynthWave::Noise => rng.rangeF32(-(1.0 as f32), 1.0 as f32),
+        };
+    }
+}
+
+// The two waveshapes that need a branch, and the delay line that echoes and reverbs are built on.
+class SynthShape {
+    // A silent delay line of `lineSize(frames)` frames.
+    pub(crate) static fn silentLine(frames : i32) : f32[] {
+        let size : i32 = SynthShape::lineSize(frames);
+        let mut buf : f32[] = new f32[size as i64];
+        for (i of 0..size) {
+            buf[i as i64] = 0.0;
+        }
+        return buf;
+    }
+
+    // The length of a delay line asked for `frames`: never less than one, so the wrap-around has a modulus.
+    pub(crate) static fn lineSize(frames : i32) : i32 {
+        if (frames < 1) {
+            return 1;
+        }
+        return frames;
+    }
+
+    pub(crate) static fn square(p : f32) : f32 {
+        if (p < 0.5) {
+            return 1.0;
+        }
+        return -1.0;
+    }
+
+    pub(crate) static fn triangle(p : f32) : f32 {
+        if (p < 0.25) {
+            return p * (4.0 as f32);
+        }
+        if (p < 0.75) {
+            return (2.0 as f32) - p * (4.0 as f32);
+        }
+        return p * (4.0 as f32) - (4.0 as f32);
+    }
+}
+
+/**
+ * Attack-decay-sustain-release envelope, piecewise linear: 0 to 1 over `attack`, 1 down to `sustain` over
+ * `decay`, held at `sustain` while the note is held, then down to 0 over `release` from wherever it was.
+ */
+pub struct SynthAdsr {
+    /** Seconds to rise from 0 to 1. */
+    pub attack : f32 = 0.01;
+
+    /** Seconds to fall from 1 to the sustain level. */
+    pub decay : f32 = 0.1;
+
+    /** Level held while the note is down, 0..1. */
+    pub sustain : f32 = 0.7;
+
+    /** Seconds to fall to 0 after the note is released. */
+    pub release : f32 = 0.2;
+
+    /** An envelope from its four parameters. */
+    pub static fn make(attack : f32, decay : f32, sustain : f32, release : f32) : SynthAdsr {
+        return SynthAdsr { attack: attack, decay: decay, sustain: sustain, release: release };
+    }
+
+    // The level while held, at `t` seconds after the note began.
+    fn held(self, t : f32) : f32 {
+        if (t < 0.0) {
+            return 0.0;
+        }
+        if (t < self.attack) {
+            return t / self.attack;
+        }
+        if (t < self.attack + self.decay) {
+            return (1.0 as f32) - ((1.0 as f32) - self.sustain) * (t - self.attack) / self.decay;
+        }
+        return self.sustain;
+    }
+
+    /** The level `t` seconds after the note began, for a note released at `gate` seconds. */
+    pub fn level(self, t : f32, gate : f32) : f32 {
+        if (t <= gate) {
+            return self.held(t);
+        }
+        if (self.release <= 0.0 || t >= gate + self.release) {
+            return 0.0;
+        }
+        return self.held(gate) * ((1.0 as f32) - (t - gate) / self.release);
+    }
+
+    /** Total sounding time of a note held for `gate` seconds. */
+    pub fn length(self, gate : f32) : f32 {
+        return gate + self.release;
+    }
+}
+
+/** A first-order filter, low-pass or high-pass, with unity gain at DC (low-pass) or zero (high-pass). */
+pub class SynthFilter {
+    coefficient : f32 = 1.0;
+    high        : bool = false;
+    state       : f32 = 0.0;
+
+    /** A low-pass (or a high-pass when `highPass`) with its -3 dB point near `cutoffHz` at `rate`. */
+    constructor(cutoffHz : f32, rate : i32, highPass : bool) {
+        let w : f32 = TAU * cutoffHz / (rate as f32);
+        self.coefficient = w / ((1.0 as f32) + w);
+        self.high = highPass;
+    }
+
+    /** Filters one sample. */
+    pub fn process(mut self, x : f32) : f32 {
+        self.state = self.state + self.coefficient * (x - self.state);
+        if (self.high) {
+            return x - self.state;
+        }
+        return self.state;
+    }
+
+    /** Forgets the past. */
+    pub fn reset(mut self) : void {
+        self.state = 0.0;
+    }
+}
+
+/** An echo: the input plus a delayed copy that feeds back into the line. */
+pub class SynthDelay {
+    line     : f32[];
+    size     : i32 = 1;
+    at       : i32 = 0;
+    feedback : f32 = 0.0;
+    level    : f32 = 0.5;
+
+    /** A delay of `frames` samples with feedback 0..1 and a wet level. */
+    constructor(frames : i32, feedback : f32, wet : f32) {
+        self.size = SynthShape::lineSize(frames);
+        self.line = SynthShape::silentLine(frames);
+        self.feedback = clamp(feedback, 0.0, SYNTH_FEEDBACK_MAX);
+        self.level = wet;
+    }
+
+    /** Dry input plus the wet echo. */
+    pub fn process(mut self, x : f32) : f32 {
+        let echo : f32 = self.line[self.at as i64];
+        self.line[self.at as i64] = x + echo * self.feedback;
+        self.at = (self.at + 1) % self.size;
+        return x + echo * self.level;
+    }
+}
+
+// One damped feedback comb of the Schroeder/Freeverb reverb.
+class SynthComb {
+    line  : f32[];
+    size  : i32 = 1;
+    at    : i32 = 0;
+    store : f32 = 0.0;
+
+    constructor(frames : i32) {
+        self.size = SynthShape::lineSize(frames);
+        self.line = SynthShape::silentLine(frames);
+    }
+
+    pub(crate) fn process(mut self, x : f32, feedback : f32, damp : f32) : f32 {
+        let y : f32 = self.line[self.at as i64];
+        self.store = y * ((1.0 as f32) - damp) + self.store * damp;
+        self.line[self.at as i64] = x + self.store * feedback;
+        self.at = (self.at + 1) % self.size;
+        return y;
+    }
+}
+
+// One all-pass diffuser.
+class SynthAllpass {
+    line : f32[];
+    size : i32 = 1;
+    at   : i32 = 0;
+
+    constructor(frames : i32) {
+        self.size = SynthShape::lineSize(frames);
+        self.line = SynthShape::silentLine(frames);
+    }
+
+    pub(crate) fn process(mut self, x : f32) : f32 {
+        let held : f32 = self.line[self.at as i64];
+        self.line[self.at as i64] = x + held * SYNTH_ALLPASS_FEEDBACK;
+        self.at = (self.at + 1) % self.size;
+        return held - x;
+    }
+}
+
+/** A Schroeder reverb: four parallel damped combs into two series all-passes. */
+pub class SynthReverb {
+    combA   : SynthComb;
+    combB   : SynthComb;
+    combC   : SynthComb;
+    combD   : SynthComb;
+    passA   : SynthAllpass;
+    passB   : SynthAllpass;
+    room    : f32 = 0.8;
+    damping : f32 = 0.3;
+    wet     : f32 = 0.3;
+
+    /** A reverb at sample rate `rate`; `room` 0..1 sets the tail length, `damping` 0..1 darkens it, `wet` mixes it in. */
+    constructor(rate : i32, room : f32, damping : f32, wet : f32) {
+        let k : f64 = rate as f64 / SYNTH_REVERB_RATE;
+        self.combA = new SynthComb((SYNTH_COMB_A * k) as i32);
+        self.combB = new SynthComb((SYNTH_COMB_B * k) as i32);
+        self.combC = new SynthComb((SYNTH_COMB_C * k) as i32);
+        self.combD = new SynthComb((SYNTH_COMB_D * k) as i32);
+        self.passA = new SynthAllpass((SYNTH_ALLPASS_A * k) as i32);
+        self.passB = new SynthAllpass((SYNTH_ALLPASS_B * k) as i32);
+        self.room = SYNTH_ROOM_BASE + clamp(room, 0.0, 1.0) * SYNTH_ROOM_SPAN;
+        self.damping = clamp(damping, 0.0, SYNTH_DAMPING_MAX);
+        self.wet = wet;
+    }
+
+    /** Dry input plus the reverberated signal. */
+    pub fn process(mut self, x : f32) : f32 {
+        let scaled : f32 = x * SYNTH_REVERB_INPUT;
+        let mut sum : f32 = self.combA.process(scaled, self.room, self.damping);
+        sum = sum + self.combB.process(scaled, self.room, self.damping);
+        sum = sum + self.combC.process(scaled, self.room, self.damping);
+        sum = sum + self.combD.process(scaled, self.room, self.damping);
+        let diffuse : f32 = self.passB.process(self.passA.process(sum));
+        return x + diffuse * self.wet;
+    }
+}

@@ -1,0 +1,441 @@
+// audio_voice — one sound being played: a position in a clip and everything that shapes it.
+//
+// A voice walks through a clip at a step per output frame (pitch times the ratio of sample rates times Doppler),
+// reading between frames by linear or Catmull-Rom cubic interpolation. It loops inside loop points, fades in and
+// out, and for a 3D sound runs a one-pole low-pass whose cutoff the engine sets from distance. Gains are ramped
+// across each block so a moving emitter does not click. A voice never touches a device or a clock: `mix` adds
+// `n` frames of itself into a stereo buffer and says whether it is still going.
+
+use crate::core::math::scalar::{maxD, maxI};
+use crate::core::math::trig::sin;
+use crate::core::math::vec3::Vec3;
+use crate::data::audio::clip::AudioClip;
+use crate::sim::audio::audio_spatial::{AudioEmitter, AudioAttenuation};
+
+// What `fold` answers for an index past the end of the clip: no frame, so the sample reads as silence.
+const VOICE_SILENCE : i32 = -1;
+
+// A quarter turn in radians: an equal-power fade is sin(fraction * quarter turn), 0 up to 1.
+const VOICE_QUARTER_TURN : f32 = 1.5707964;
+
+// A loop shorter than this many frames cannot repeat, so the voice plays once instead.
+const VOICE_MIN_LOOP : f64 = 1.0;
+
+/** How a voice reads between two stored frames. */
+pub enum AudioInterpolation : i8 {
+    /** Straight line between neighbours: cheap, slightly dull at high pitch. */
+    Linear = 0,
+    /** Catmull-Rom through four neighbours: smoother when pitch-shifting. */
+    Cubic = 1,
+}
+
+/** Everything that describes a sound to play; start from `AudioPlay::forClip(clip)` and change what you need. */
+pub struct AudioPlay {
+    /** Clip id from `AudioEngine::addClip`. */
+    pub clip : i32 = 0;
+
+    /** Bus the voice plays on (`AUDIO_BUS_SFX` ...); 1 is `AUDIO_BUS_SFX`, written out because a struct default must be a literal. */
+    pub bus : i32 = 1;
+
+    /** Linear gain. */
+    pub gain : f32 = 1.0;
+
+    /** Playback speed ratio; 2 is an octave up and half the duration. */
+    pub pitch : f32 = 1.0;
+
+    /** Repeat between the loop points instead of ending. */
+    pub looping : bool = false;
+
+    /** First frame of the loop region. */
+    pub loopStart : i32 = 0;
+
+    /** Frame where the loop jumps back; 0 or less means the end of the clip. */
+    pub loopEnd : i32 = 0;
+
+    /** Higher survives voice stealing longer. */
+    pub priority : i32 = 0;
+
+    /** Left-right position -1..1 for a non-3D sound. */
+    pub pan : f32 = 0.0;
+
+    /** Treat `emitter` as a place in the world. */
+    pub spatial : bool = false;
+
+    /** Seconds over which the sound fades in from silence. */
+    pub fadeIn : f32 = 0.0;
+
+    /** Fade with an equal-power curve (for crossfades) instead of a straight line. */
+    pub equalPower : bool = false;
+
+    /** How to read between frames. */
+    pub interp : AudioInterpolation = AudioInterpolation::Linear;
+
+    /** Frame to start from. */
+    pub startFrame : i32 = 0;
+
+    /** The world placement, used when `spatial` is true. */
+    pub emitter : AudioEmitter = AudioEmitter {
+        position: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+        velocity: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+        minDistance: 1.0,
+        maxDistance: 50.0,
+        rolloff: 1.0,
+        model: AudioAttenuation::Inverse,
+        doppler: 1.0,
+    };
+
+    /** A plain one-shot of clip `clip` on the sfx bus. */
+    pub static fn forClip(clip : i32) : AudioPlay {
+        let mut p : AudioPlay = AudioPlay {};
+        p.clip = clip;
+        return p;
+    }
+}
+
+/** One block of output a voice is mixed into: where it goes, how loud and how fast the clip advances. */
+pub(crate) struct AudioBlock {
+    /** The first output frame of the block. */
+    pub(crate) at : i32;
+
+    /** How many frames the block holds. */
+    pub(crate) frames : i32;
+
+    /** The final left gain, ramped from the previous block's. */
+    pub(crate) left : f32;
+
+    /** The final right gain, ramped from the previous block's. */
+    pub(crate) right : f32;
+
+    /** Clip frames advanced per output frame. */
+    pub(crate) step : f64;
+
+    /** The one-pole low-pass coefficient (1 = no filtering). */
+    pub(crate) damp : f32;
+}
+
+/** The state of one playing sound; owned and driven by the engine. */
+pub(crate) class AudioVoice {
+    live        : bool = false;
+    paused      : bool = false;
+    serial      : i32 = 0;
+    order       : i64 = 0;
+    clipId      : i32 = 0;
+    busId       : i32 = 1;
+    gain        : f32 = 1.0;
+    pitch       : f32 = 1.0;
+    looping     : bool = false;
+    loopStart   : f64 = 0.0;
+    loopEnd     : f64 = 0.0;
+    priority    : i32 = 0;
+    pan         : f32 = 0.0;
+    spatial     : bool = false;
+    emitter     : AudioEmitter;
+    fadeInLen   : i64 = 0;
+    equalPower  : bool = false;
+    cubic       : bool = false;
+    position    : f64 = 0.0;
+    age         : i64 = 0;
+    fadeOutLen  : i64 = 0;
+    fadeOutLeft : i64 = 0;
+    lowState    : f32 = 0.0;
+    lastLeft    : f32 = 0.0;
+    lastRight   : f32 = 0.0;
+    primed      : bool = false;
+
+    constructor() {
+        self.emitter = AudioPlay::forClip(0).emitter;
+    }
+
+    /** True while the voice occupies its slot. */
+    pub(crate) fn isLive(self) : bool {
+        return self.live;
+    }
+
+    pub(crate) fn isPaused(self) : bool {
+        return self.paused;
+    }
+
+    pub(crate) fn serialNumber(self) : i32 {
+        return self.serial;
+    }
+
+    pub(crate) fn startOrder(self) : i64 {
+        return self.order;
+    }
+
+    pub(crate) fn priorityOf(self) : i32 {
+        return self.priority;
+    }
+
+    pub(crate) fn clipIdOf(self) : i32 {
+        return self.clipId;
+    }
+
+    pub(crate) fn busOf(self) : i32 {
+        return self.busId;
+    }
+
+    pub(crate) fn gainOf(self) : f32 {
+        return self.gain;
+    }
+
+    pub(crate) fn isSpatial(self) : bool {
+        return self.spatial;
+    }
+
+    pub(crate) fn isLooping(self) : bool {
+        return self.looping;
+    }
+
+    pub(crate) fn panOf(self) : f32 {
+        return self.pan;
+    }
+
+    pub(crate) fn pitchOf(self) : f32 {
+        return self.pitch;
+    }
+
+    pub(crate) fn positionFrames(self) : f64 {
+        return self.position;
+    }
+
+    pub(crate) fn emitterOf(self) : AudioEmitter {
+        return self.emitter;
+    }
+
+    pub(crate) fn fadingOut(self) : bool {
+        return self.fadeOutLen > 0;
+    }
+
+    /** Takes the slot for a new sound. `order` ranks age (smaller is older); `rate` is the engine's frame rate. */
+    pub(crate) fn begin(
+        mut self,
+        request : AudioPlay,
+        clip : AudioClip,
+        serial : i32,
+        order : i64,
+        rate : i32
+    ) : void {
+        self.live = true;
+        self.paused = false;
+        self.serial = serial;
+        self.order = order;
+        self.clipId = request.clip;
+        self.busId = request.bus;
+        self.gain = request.gain;
+        self.pitch = request.pitch;
+        self.looping = request.looping;
+        self.loopStart = request.loopStart as f64;
+        self.loopEnd = request.loopEnd as f64;
+        if (request.loopEnd <= 0 || request.loopEnd > clip.frames) {
+            self.loopEnd = clip.frames as f64;
+        }
+        self.loopStart = maxD(self.loopStart, 0.0);
+        if (self.loopEnd - self.loopStart < VOICE_MIN_LOOP) {
+            self.looping = false;
+        }
+        self.priority = request.priority;
+        self.pan = request.pan;
+        self.spatial = request.spatial;
+        self.emitter = request.emitter;
+        self.fadeInLen = (request.fadeIn * rate as f32) as i64;
+        self.equalPower = request.equalPower;
+        self.cubic = request.interp == AudioInterpolation::Cubic;
+        self.position = request.startFrame as f64;
+        self.age = 0;
+        self.fadeOutLen = 0;
+        self.fadeOutLeft = 0;
+        self.lowState = 0.0;
+        self.primed = false;
+    }
+
+    /** Frees the slot at once. */
+    pub(crate) fn kill(mut self) : void {
+        self.live = false;
+    }
+
+    pub(crate) fn setPaused(mut self, on : bool) : void {
+        self.paused = on;
+    }
+
+    pub(crate) fn setGain(mut self, gain : f32) : void {
+        self.gain = gain;
+    }
+
+    pub(crate) fn setPitch(mut self, p : f32) : void {
+        self.pitch = p;
+    }
+
+    pub(crate) fn setEmitter(mut self, emitter : AudioEmitter) : void {
+        self.emitter = emitter;
+    }
+
+    /** Starts fading out over `frames` frames; the voice frees itself at the end. 0 stops it at once. */
+    pub(crate) fn fadeOut(mut self, frames : i64) : void {
+        if (frames <= 0) {
+            self.live = false;
+            return;
+        }
+        if (self.fadeOutLen > 0) {
+            return;
+        }
+        self.fadeOutLen = frames;
+        self.fadeOutLeft = frames;
+    }
+
+    // The frame to read for index `i`, folding indices past the loop end back into the loop; VOICE_SILENCE means silence.
+    fn fold(self, i : i32, frames : i32) : i32 {
+        let mut k : i32 = i;
+        if (self.looping) {
+            let le : i32 = self.loopEnd as i32;
+            let ls : i32 = self.loopStart as i32;
+            if (k >= le) {
+                k = ls + (k - ls) % (le - ls);
+            }
+        }
+        k = maxI(k, 0);
+        if (k >= frames) {
+            return VOICE_SILENCE;
+        }
+        return k;
+    }
+
+    // One channel of the clip at fractional position `i0 + t`.
+    fn read(self, clip : AudioClip, ch : i32, i0 : i32, t : f32) : f32 {
+        let frames : i32 = clip.frames;
+        let ia : i32 = self.fold(i0, frames);
+        let ib : i32 = self.fold(i0 + 1, frames);
+        let p1 : f32 = AudioVoice::sampleAt(clip, ia, ch, 0.0);
+        let p2 : f32 = AudioVoice::sampleAt(clip, ib, ch, 0.0);
+        if (!self.cubic) {
+            return p1 + (p2 - p1) * t;
+        }
+
+        // Beyond the clip the outer neighbours repeat the inner ones, so the curve flattens at the ends.
+        let iz : i32 = self.fold(i0 - 1, frames);
+        let id : i32 = self.fold(i0 + 2, frames);
+        let p0 : f32 = AudioVoice::sampleAt(clip, iz, ch, p1);
+        let p3 : f32 = AudioVoice::sampleAt(clip, id, ch, p2);
+        return AudioVoice::catmullRom(p0, p1, p2, p3, t);
+    }
+
+    // Frame `i` of channel `ch`, or `fallback` for VOICE_SILENCE.
+    static fn sampleAt(clip : AudioClip, i : i32, ch : i32, fallback : f32) : f32 {
+        if (i == VOICE_SILENCE) {
+            return fallback;
+        }
+        return clip.samples[(i * clip.channels + ch) as i64];
+    }
+
+    // The Catmull-Rom spline through p1 (at t = 0) and p2 (at t = 1), with p0 and p3 shaping the tangents.
+    static fn catmullRom(p0 : f32, p1 : f32, p2 : f32, p3 : f32, t : f32) : f32 {
+        let half : f32 = 0.5;
+        let a : f32 = p2 - p0;
+        let b : f32 = p0 * (2.0 as f32) - p1 * (5.0 as f32) + p2 * (4.0 as f32) - p3;
+        let d : f32 = (p1 - p2) * (3.0 as f32) + p3 - p0;
+        return p1 + half * t * (a + t * (b + t * d));
+    }
+
+    // The fade-in and fade-out level of the voice at its current age.
+    fn envelope(self) : f32 {
+        let mut env : f32 = 1.0;
+        if (self.fadeInLen > 0 && self.age < self.fadeInLen) {
+            env = (self.age as f32) / (self.fadeInLen as f32);
+            if (self.equalPower) {
+                env = sin(env * VOICE_QUARTER_TURN);
+            }
+        }
+        if (self.fadeOutLen > 0) {
+            let f : f32 = (self.fadeOutLeft as f32) / (self.fadeOutLen as f32);
+            if (self.equalPower) {
+                env = env * sin(f * VOICE_QUARTER_TURN);
+            } else {
+                env = env * f;
+            }
+        }
+        return env;
+    }
+
+    // Moves one output frame on; false when a fade-out has just run out.
+    fn advance(mut self, step : f64) : bool {
+        self.position = self.position + step;
+        if (self.looping && self.position >= self.loopEnd) {
+            self.position = self.position - (self.loopEnd - self.loopStart);
+        }
+        self.age = self.age + 1;
+        if (self.fadeOutLen > 0) {
+            self.fadeOutLeft = self.fadeOutLeft - 1;
+            return self.fadeOutLeft > 0;
+        }
+        return true;
+    }
+
+    // Adds one stereo frame (`left`, `right`) to `out` at frame `index`.
+    static fn addFrame(out : f32[], index : i32, left : f32, right : f32) : void {
+        out[(index * 2) as i64] = out[(index * 2) as i64] + left;
+        out[(index * 2 + 1) as i64] = out[(index * 2 + 1) as i64] + right;
+    }
+
+    /**
+     * Adds the `block.frames` frames of this voice to the stereo buffer `out` from frame `block.at`: the gains
+     * ramp from the previous block's values, and the clip advances `block.step` frames per output frame.
+     * Returns false once the voice is over.
+     */
+    pub(crate) fn mix(mut self, clip : AudioClip, out : f32[], block : AudioBlock) : bool {
+        if (!self.primed) {
+            self.lastLeft = block.left;
+            self.lastRight = block.right;
+            self.primed = true;
+        }
+        let n : i32 = block.frames;
+        let c : i32 = clip.channels;
+        let stereoPath : bool = c == 2 && !self.spatial;
+        let inv : f32 = (1.0 as f32) / (c as f32);
+
+        // The gains ramp linearly from last block's values to this block's.
+        let leftStep : f32 = (block.left - self.lastLeft) / (n as f32);
+        let rightStep : f32 = (block.right - self.lastRight) / (n as f32);
+        let mut leftGain : f32 = self.lastLeft;
+        let mut rightGain : f32 = self.lastRight;
+        let mut alive : bool = true;
+        for (k of 0..n) {
+            if (!self.looping && self.position >= clip.frames as f64) {
+                alive = false;
+                break;
+            }
+            let i0 : i32 = self.position as i32;
+            let t : f32 = (self.position - i0 as f64) as f32;
+            let env : f32 = self.envelope();
+            leftGain = leftGain + leftStep;
+            rightGain = rightGain + rightStep;
+
+            if (stereoPath) {
+                let l : f32 = self.read(clip, 0, i0, t);
+                let r : f32 = self.read(clip, 1, i0, t);
+                AudioVoice::addFrame(out, block.at + k, l * leftGain * env, r * rightGain * env);
+            } else {
+                let mut s : f32 = 0.0;
+                for (ch of 0..c) {
+                    s = s + self.read(clip, ch, i0, t);
+                }
+                s = s * inv;
+                if (self.spatial) {
+                    self.lowState = self.lowState + block.damp * (s - self.lowState);
+                    s = self.lowState;
+                }
+                AudioVoice::addFrame(out, block.at + k, s * leftGain * env, s * rightGain * env);
+            }
+
+            if (!self.advance(block.step)) {
+                alive = false;
+                break;
+            }
+        }
+        self.lastLeft = block.left;
+        self.lastRight = block.right;
+        if (!alive) {
+            self.live = false;
+        }
+        return alive;
+    }
+}
