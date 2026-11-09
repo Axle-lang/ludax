@@ -1,0 +1,164 @@
+// fluid_emit — where the columns give water to the air: breaking crests and surfaces thrown up.
+//
+// The other half of the coupling (see `fluid_coupling`): water leaves the columns and becomes particles.
+// A heightfield cannot overturn, jet or foam, so the standard way to fake what it cannot hold is to take
+// the water out of the columns exactly where the real surface would have left them, and let the particles
+// carry it. Two places (the vent, which feeds the air from a conduit rather than from the columns, is
+// `fluid_vent`):
+//
+//   breaking  a column that `fluid_surface` says is breaking sheds a share of its water per second as spray,
+//             forward along the flow and up by the energy of the wave: the crest spray of a breaking wave,
+//             the spit of a rapid.
+//   throw     a column whose surface rises faster than `throwSpeed` is a mound jumping off a piston or a
+//             vent: it throws the excess as liquid particles at the speed it was rising.
+//
+// Every emission removes from the column exactly the volume of the particles it makes, so the ledger
+// (`emitted`) and the columns always agree, and a column is never emptied (a share of its depth at most).
+// All of it runs serially in column order with the population's random numbers, so it is repeatable.
+
+use crate::core::math::dvec2::DVec2;
+use crate::core::math::dvec3::DVec3;
+use crate::core::math::scalar::{maxD, minD, minI};
+use crate::sim::fluid::fluid_field::FluidField;
+use crate::sim::fluid::fluid_foam::FluidFoam;
+use crate::sim::fluid::fluid_particle::{FluidParticleKind, fluidParticleVolume};
+use crate::sim::fluid::fluid_particle_params::FluidBreakingParams;
+use crate::sim::fluid::fluid_pool::FluidPopulation;
+use crate::sim::fluid::fluid_sample::FluidSample;
+use crate::sim::fluid::fluid_spawn::FluidSpawn;
+use crate::sim::fluid::fluid_surface::{FLUID_WET_DEPTH, FluidSurface};
+use crate::sim::fluid::fluid_tick::FluidTick;
+
+/** The most drops a breaking column sheds in one tick. */
+const FLUID_BREAK_DROPS : i32 = 40;
+
+/** The most liquid particles a thrown-up column makes in one tick. */
+const FLUID_THROW_PARTICLES : i32 = 64;
+
+/** The largest share of a column's water one emission may take. */
+const FLUID_EMIT_SHARE : f64 = 0.25;
+
+/** The larger share a throw may take, since a mound is mostly what is thrown. */
+const FLUID_THROW_SHARE : f64 = 0.35;
+
+/** The breaking measure below which a column sheds nothing. */
+const FLUID_BREAK_FLOOR : f64 = 0.01;
+
+/** The column-to-particle phase of a tick, as static functions. */
+pub(crate) class FluidEmit {
+    /** Sheds spray from breaking columns and throws liquid from columns rising fast, after a tick. */
+    pub(crate) static fn fromColumns(
+        pop : Shared<FluidPopulation>,
+        field : Shared<FluidField>,
+        run : FluidTick,
+        flow : FluidSurface,
+        foam : FluidFoam
+    ) : void {
+        let br : FluidBreakingParams = pop.params.breaking;
+        let dt : f64 = field.rules.dt;
+        for (c of 0..field.width * field.depth) {
+            if (field.water[c as i64] <= FLUID_WET_DEPTH) {
+                continue;
+            }
+            if (flow.breaking[c as i64] > FLUID_BREAK_FLOOR && pop.params.spray.capacity > 0) {
+                FluidEmit::shed(pop, field, run, flow, c, br, dt);
+            }
+            if (flow.rise[c as i64] > br.throwSpeed && pop.params.liquid.capacity > 0) {
+                FluidEmit::throwUp(pop, field, run, flow, foam, c, br, dt);
+            }
+        }
+    }
+
+    // A point inside column `c` at the surface, `lift` above it.
+    static fn columnPoint(
+        pop : Shared<FluidPopulation>,
+        field : Shared<FluidField>,
+        c : i32,
+        lift : f64
+    ) : DVec3 {
+        let x : f64 = ((c % field.width) as f64) + 0.5 + (pop.rng.nextF64() - 0.5) * 0.9;
+        let z : f64 = ((c / field.width) as f64) + 0.5 + (pop.rng.nextF64() - 0.5) * 0.9;
+        return DVec3::make(x, FluidSample::surface(field, x, z) + lift, z);
+    }
+
+    // Spray off the crest of a breaking column: forward with the flow, up with the energy of the wave.
+    static fn shed(
+        pop : Shared<FluidPopulation>,
+        field : Shared<FluidField>,
+        run : FluidTick,
+        flow : FluidSurface,
+        c : i32,
+        br : FluidBreakingParams,
+        dt : f64
+    ) : void {
+        let i : i64 = c as i64;
+        let depth : f64 = field.water[i];
+        let b : f64 = flow.breaking[i];
+        let budget : f64 = minD(br.spray * depth * b * dt, FLUID_EMIT_SHARE * depth);
+        let mean : f64 = fluidParticleVolume(
+            FluidParticleKind::Spray,
+            0.5 * (pop.params.spray.radiusMin + pop.params.spray.radiusMax)
+        );
+        let count : i32 = minI(FLUID_BREAK_DROPS, (budget / mean + pop.rng.nextF64()) as i32);
+        let wave : f64 = (pop.gravity * depth).sqrt();
+        let scale : f64 = maxD(flow.speed[i], wave);
+
+        for (k of 0..count) {
+            let radius : f64 = FluidSpawn::sprayRadius(pop);
+            let volume : f64 = fluidParticleVolume(FluidParticleKind::Spray, radius);
+            if (volume > FLUID_EMIT_SHARE * field.water[i]) {
+                break;
+            }
+
+            let dir : DVec2 = pop.direction();
+            let side : f64 = 0.25 * scale * pop.rng.nextF64();
+            let up : f64 = (0.5 + pop.rng.nextF64()) * (1.2 * wave * b + 0.4 * flow.speed[i]) + 0.3;
+            let velocity : DVec3 = DVec3::make(flow.u[i] + dir.x * side, up, flow.w[i] + dir.y * side);
+            let at : DVec3 = FluidEmit::columnPoint(pop, field, c, radius + 0.01);
+            if (!FluidSpawn::spray(pop, at, velocity, radius)) {
+                break;
+            }
+            field.water[i] = field.water[i] - volume;
+            pop.emitted = pop.emitted + volume;
+            run.wakeNow(c);
+        }
+    }
+
+    // Liquid thrown off a column whose surface is rising faster than `throwSpeed`.
+    static fn throwUp(
+        pop : Shared<FluidPopulation>,
+        field : Shared<FluidField>,
+        run : FluidTick,
+        flow : FluidSurface,
+        foam : FluidFoam,
+        c : i32,
+        br : FluidBreakingParams,
+        dt : f64
+    ) : void {
+        let i : i64 = c as i64;
+        let rise : f64 = flow.rise[i];
+        let chunk : f64 = pop.liquidVolume();
+        let want : f64 = minD((rise - br.throwSpeed) * dt * 0.5, FLUID_THROW_SHARE * field.water[i]);
+        let count : i32 = minI(FLUID_THROW_PARTICLES, (want / chunk + pop.rng.nextF64()) as i32);
+
+        for (k of 0..count) {
+            if (chunk > FLUID_THROW_SHARE * field.water[i]) {
+                break;
+            }
+            let dir : DVec2 = pop.direction();
+            let side : f64 = 0.2 * rise * pop.rng.nextF64();
+            let up : f64 = rise * (0.9 + 0.2 * pop.rng.nextF64());
+            let velocity : DVec3 = DVec3::make(flow.u[i] + dir.x * side, up, flow.w[i] + dir.y * side);
+            let at : DVec3 = FluidEmit::columnPoint(pop, field, c, pop.params.liquid.radius + 0.01);
+            if (!FluidSpawn::liquid(pop, at, velocity)) {
+                break;
+            }
+            field.water[i] = field.water[i] - chunk;
+            pop.emitted = pop.emitted + chunk;
+            run.wakeNow(c);
+            if (pop.params.foam.enabled) {
+                foam.stir(c, 0.8);
+            }
+        }
+    }
+}

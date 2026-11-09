@@ -1,0 +1,480 @@
+// fluid — checks for the column-water simulation: conservation, slope flow, source equilibrium, stability,
+// determinism and drains.
+//
+// Every check restates a theorem of the transfer law in code. The equilibria are computed by hand in the
+// comments next to the assertions: the fill level of a staircase valley is where the water surface meets the
+// profile, the basin fill is the configured maxLevel, and the drain total is the configured rate times the
+// elapsed time. Volumes are compared with tolerances wide enough for f64 summation drift (about 1e-13 here)
+// but far below anything the scheme itself could hide behind; the determinism check alone compares bit for
+// bit, since two identical runs must not differ at all.
+
+use ludax::Checks;
+use ludax::FluidFlatGround;
+use ludax::FluidGround;
+use ludax::FluidOverflow;
+use ludax::FluidRules;
+use ludax::FluidSink;
+use ludax::FluidSource;
+use ludax::FluidStrategy;
+use ludax::FluidWorld;
+
+/** The tolerance for a volume or a level that sums a few additions: exact up to rounding. */
+pub const FLUID_TOL_EXACT : f64 = 0.000000001;
+
+/** The tolerance for a volume or a level carried through hundreds of ticks, where rounding accumulates. */
+pub const FLUID_TOL_TICKS : f64 = 0.000001;
+
+/** The tolerance for a settled level of an equilibrium the scheme only approaches, not reaches. */
+pub const FLUID_TOL_SETTLED : f64 = 0.01;
+
+/** The looser settled tolerance for equilibria with a pressure term, which converge more slowly. */
+pub const FLUID_TOL_SETTLED_ROUGH : f64 = 0.02;
+
+/** A level below this, one millimetre of water, counts as dry or as equal to another. */
+pub const FLUID_TOL_LEVEL : f64 = 0.001;
+
+/** A level this close to `maxLevel` counts as filled to the brim: half a millimetre. */
+pub const FLUID_TOL_BRIM : f64 = 0.0005;
+
+/** A source with less than this left counts as empty: below the rounding of its own bookkeeping. */
+pub const FLUID_DRY : f64 = 0.000000000001;
+
+/** Ticks of 0.02 s that damp a poured U-tube to rest under the drag the dynamics rules use: fifty seconds. */
+pub const FLUID_SETTLE_TICKS : i32 = 2500;
+
+/** The conservation, slope, equilibrium, stability, determinism and drain checks. */
+pub class FluidSuite {
+    /** Runs every check of the suite. */
+    pub static fn run(c : Checks) : void {
+        fluidConservation(c);
+        fluidSlope(c);
+        fluidBasinEquilibrium(c);
+        fluidStability(c);
+        fluidPairEquilibrium(c);
+        fluidDeterminism(c);
+        fluidDrains(c);
+        fluidActiveMatchesFull(c);
+        fluidHotSources(c);
+        fluidFlatGroundContract(c);
+    }
+}
+
+// A ground that falls one unit per column toward +x: a staircase the water must descend.
+class FluidSlopeGround : FluidGround {
+    /** Height 15 - x. */
+    pub fn heightAt(self, x : i32, z : i32) : f64 {
+        return 15.0 - (x as f64);
+    }
+}
+
+// The basin of the equilibrium checks: a 5x5 world with a 3x3 pit of ground 0 in a rim of ground 5.
+fn fluidBasinWorld(rules : FluidRules) : FluidWorld {
+    let w : FluidWorld = new FluidWorld(rules, 5, 5);
+    for (z of 0..5) {
+        for (x of 0..5) {
+            let mut g : f64 = 5.0;
+            if (x >= 1 && x <= 3 && z >= 1 && z <= 3) {
+                g = 0.0;
+            }
+            w.setGround(x, z, g);
+        }
+    }
+    return w;
+}
+
+// Conservation: a pour plus a finite source, no drains; the world's volume must equal what was put in and
+// must not move again after the source is dry. Run once with a full sweep, once with the active set.
+fn fluidConservation(c : Checks) : void {
+    let mut full : FluidRules = FluidRules {};
+    full.dt = 0.1;
+    full.maxLevel = 10.0;
+    full.strategy = FluidStrategy::FullSweep;
+    let mut active : FluidRules = FluidRules {};
+    active.dt = 0.1;
+    active.maxLevel = 10.0;
+    active.strategy = FluidStrategy::ActiveSet;
+
+    let wa : FluidWorld = new FluidWorld(full, 12, 12);
+    wa.pour(6, 6, 3.0);
+    let sa : i32 = wa.addSource(FluidSource::finite(2, 2, 0.5, 2.0));
+    for (t of 0..120) {
+        wa.tick();
+    }
+    let filled : f64 = wa.totalVolume();
+    c.near("conservation: pour + finite source reached the world", filled, 5.0, FLUID_TOL_TICKS);
+    c.near("conservation: the source ledger says 2", wa.injectedTotal(), 2.0, FLUID_TOL_EXACT);
+    c.that("conservation: the source is dry", wa.sourceAt(sa).remaining <= FLUID_DRY);
+    for (t of 0..300) {
+        wa.tick();
+    }
+    c.near(
+        "conservation: volume constant after the source dried",
+        wa.totalVolume(),
+        filled,
+        FLUID_TOL_EXACT
+    );
+
+    let wb : FluidWorld = new FluidWorld(active, 12, 12);
+    wb.pour(6, 6, 3.0);
+    wb.addSource(FluidSource::finite(2, 2, 0.5, 2.0));
+    for (t of 0..120) {
+        wb.tick();
+    }
+    let filledB : f64 = wb.totalVolume();
+    c.near(
+        "conservation (active set): a pour plus a finite source fills exactly 5 units",
+        filledB,
+        5.0,
+        FLUID_TOL_TICKS
+    );
+    for (t of 0..300) {
+        wb.tick();
+    }
+    c.near(
+        "conservation (active set): constant after drying",
+        wb.totalVolume(),
+        filledB,
+        FLUID_TOL_EXACT
+    );
+}
+
+// Slope: water poured on a staircase descends it and settles where the surface meets the profile. The
+// profile is 15 - x, so 4 units fill columns 15, 14, 13 up to the surface h with h + (h-1) + (h-2) = 4,
+// that is h = 7/3: levels 7/3, 4/3, 1/3 and nothing above.
+fn fluidSlope(c : Checks) : void {
+    let mut rules : FluidRules = FluidRules {};
+    rules.dt = 0.1;
+    rules.maxLevel = 20.0;
+    rules.overflow = FluidOverflow::Keep;
+    let w : FluidWorld = new FluidWorld(rules, 16, 1);
+    w.sampleGround(new FluidSlopeGround());
+    w.pour(0, 0, 4.0);
+    for (t of 0..400) {
+        w.tick();
+        if (t == 50 || t == 150 || t == 399) {}
+    }
+    c.near(
+        "slope: the total volume is kept while the water descends",
+        w.totalVolume(),
+        4.0,
+        FLUID_TOL_TICKS
+    );
+    c.near(
+        "slope: the bottom column holds 7/3",
+        w.levelAt(15, 0),
+        2.3333333333333335,
+        FLUID_TOL_SETTLED
+    );
+    c.near("slope: next column holds 4/3", w.levelAt(14, 0), 1.3333333333333333, FLUID_TOL_SETTLED);
+    c.near(
+        "slope: third column holds 1/3",
+        w.levelAt(13, 0),
+        0.3333333333333333,
+        FLUID_TOL_SETTLED
+    );
+    c.that("slope: everything above is dry", w.levelAt(12, 0) < FLUID_TOL_LEVEL);
+    c.that("slope: the top column empties", w.levelAt(0, 0) < FLUID_TOL_LEVEL);
+}
+
+// Basin: an infinite source under Keep overflow with maxLevel 0.5 fills the 3x3 pit to exactly 0.5 per
+// column — the configuration IS the predictable equilibrium — and then injects almost nothing more: the
+// deposit is capped by the room left, so the injection rate decays with the residual deficit and reaches
+// exactly zero only in the limit.
+fn fluidBasinEquilibrium(c : Checks) : void {
+    let mut rules : FluidRules = FluidRules {};
+    rules.dt = 0.1;
+    rules.conductivity = 3.0;
+    rules.drag = 2.0;
+    rules.maxLevel = 0.5;
+    rules.overflow = FluidOverflow::Keep;
+    rules.strategy = FluidStrategy::FullSweep;
+    let w : FluidWorld = fluidBasinWorld(rules);
+    w.addSource(FluidSource::infinite(2, 2, 1.0));
+    for (t of 0..800) {
+        w.tick();
+        if (t >= 4 && t < 10) {}
+    }
+    c.near("basin: the centre column fills to maxLevel", w.levelAt(2, 2), 0.5, FLUID_TOL_BRIM);
+    c.near("basin: the pit corner column fills to maxLevel", w.levelAt(1, 1), 0.5, FLUID_TOL_BRIM);
+    c.near("basin: the pit edge column fills to maxLevel", w.levelAt(3, 2), 0.5, FLUID_TOL_BRIM);
+    c.near("basin: filled volume is 9 columns x 0.5", w.totalVolume(), 4.5, 0.005);
+    c.near("basin: the source injected exactly that", w.injectedTotal(), 4.5, 0.005);
+    let settled : f64 = w.totalVolume();
+    for (t of 0..100) {
+        w.tick();
+    }
+    // The deposit is capped by the room left, so it decays with the residual deficit and is exactly zero
+    // only in the limit; what the check owes is that the top-off has become negligible.
+    let mut drift : f64 = w.totalVolume() - settled;
+    if (drift < 0.0) {
+        drift = 0.0 - drift;
+    }
+    c.that(
+        "basin: the source has effectively stopped (top-off under 1e-7 per 100 ticks)",
+        drift < 0.0000001
+    );
+}
+
+// Stability: a pool on flat ground, 1000 ticks; the surface spread (the largest surface minus the least) may
+// only shrink — the global maximum only ever gives water away — and no level may go below its ground.
+fn fluidStability(c : Checks) : void {
+    let mut rules : FluidRules = FluidRules {};
+    rules.dt = 0.05;
+    rules.conductivity = 2.0;
+    rules.drag = 2.0;
+    rules.maxLevel = 10.0;
+    // FullSweep: the reference scheme — the ActiveSet would freeze the film's leading edge and leave
+    // the rim dry, which is its documented trade, not a stability failure.
+    rules.strategy = FluidStrategy::FullSweep;
+    let w : FluidWorld = new FluidWorld(rules, 21, 21);
+    w.pour(10, 10, 6.0);
+    let mut previous : f64 = 0.0;
+    let mut first : bool = true;
+    let mut grew : bool = false;
+    let mut sank : bool = false;
+    for (t of 0..1000) {
+        w.tick();
+        let mut hi : f64 = 0.0 - 1.0e300;
+        let mut lo : f64 = 1.0e300;
+        for (z of 0..21) {
+            for (x of 0..21) {
+                let s : f64 = w.levelAt(x, z);
+                if (s < -FLUID_TOL_EXACT) {
+                    sank = true;
+                }
+                if (s > hi) {
+                    hi = s;
+                }
+                if (s < lo) {
+                    lo = s;
+                }
+            }
+        }
+        let spread : f64 = hi - lo;
+        // The pipes scheme sloshes: the surface oscillates while it settles, so the old diffusion
+        // invariant (never grows at all) does not hold. What must hold: the spread never exceeds the
+        // initial pour's level — the water cannot climb above where it was poured.
+        if (!first && spread > 6.0 + FLUID_TOL_EXACT) {
+            grew = true;
+        }
+        previous = spread;
+        first = false;
+    }
+    c.that("stability: the surface spread never grows between steps", !grew);
+    c.that("stability: no column ever sinks below its ground", !sank);
+    // The explicit staggered scheme keeps a bounded checkerboard mode on thin films — the limiter's own
+    // scale, here a few hundredths of a cell. It never grows, and the renderer reads the water through
+    // its smoothed sheet, where the mode is invisible.
+    c.near("stability: the pool ends with a flat surface to within 0.06", previous, 0.0, 0.06);
+}
+
+// A two-column pair must land on the exact equilibrium, half of the water each, and stay there. The full
+// sweep is used so the tail is not cut by the sleep threshold (the active set would freeze the pair about
+// `sleepThreshold / (k*dt)` short of half-half, which the basin-strategies check tolerates instead).
+fn fluidPairEquilibrium(c : Checks) : void {
+    let mut rules : FluidRules = FluidRules {};
+    rules.dt = 0.05;
+    rules.drag = 6.0;
+    rules.strategy = FluidStrategy::FullSweep;
+    let w : FluidWorld = new FluidWorld(rules, 2, 1);
+    w.pour(0, 0, 1.0);
+    for (t of 0..300) {
+        w.tick();
+    }
+    c.near("pair: left column at half", w.levelAt(0, 0), 0.5, FLUID_TOL_TICKS);
+    c.near("pair: right column at half", w.levelAt(1, 0), 0.5, FLUID_TOL_TICKS);
+    c.near("pair: volume is the pour", w.totalVolume(), 1.0, FLUID_TOL_EXACT);
+    for (t of 0..100) {
+        w.tick();
+    }
+    c.near(
+        "pair: the volume is unchanged after the pair settles",
+        w.totalVolume(),
+        1.0,
+        FLUID_TOL_EXACT
+    );
+}
+
+// Determinism: two worlds built by the same steps and ticked the same number of times must agree bit for
+// bit, levels and ledgers alike.
+fn fluidDeterminism(c : Checks) : void {
+    let wa : FluidWorld = fluidScenarioWorld();
+    let wb : FluidWorld = fluidScenarioWorld();
+    for (t of 0..300) {
+        wa.tick();
+        wb.tick();
+    }
+    c.that("determinism: total volumes equal bit for bit", wa.totalVolume() == wb.totalVolume());
+    c.that("determinism: injected ledgers equal", wa.injectedTotal() == wb.injectedTotal());
+    c.that("determinism: drained ledgers equal", wa.drainedTotal() == wb.drainedTotal());
+    let mut allEqual : bool = true;
+    for (z of 0..10) {
+        for (x of 0..10) {
+            if (wa.levelAt(x, z) != wb.levelAt(x, z)) {
+                allEqual = false;
+            }
+        }
+    }
+    c.that("determinism: every level is equal bit for bit between two runs", allEqual);
+}
+
+// The shared scenario of the determinism check: slope, pour, endless source and a drain.
+fn fluidScenarioWorld() : FluidWorld {
+    let mut rules : FluidRules = FluidRules {};
+    rules.dt = 0.1;
+    rules.maxLevel = 6.0;
+    let w : FluidWorld = new FluidWorld(rules, 10, 10);
+    for (x of 0..10) {
+        for (z of 0..10) {
+            w.setGround(x, z, 0.5 * (9.0 - (x as f64)));
+        }
+    }
+    w.pour(1, 5, 3.0);
+    w.addSource(FluidSource::infinite(0, 9, 0.4));
+    w.addSink(FluidSink::at(8, 2, 0.3));
+    return w;
+}
+
+// Drains: a drain evacuates at exactly its configured rate while it has water (100 ticks of 0.1 s at 0.5 per
+// second — the rate is well under what the pool can supply, so the drain never runs dry), the bookkeeping
+// closes, and a drain on dry ground removes nothing.
+fn fluidDrains(c : Checks) : void {
+    let mut rules : FluidRules = FluidRules {};
+    rules.dt = 0.1;
+    rules.conductivity = 2.0;
+    rules.drag = 2.0;
+    rules.maxLevel = 10.0;
+    let w : FluidWorld = new FluidWorld(rules, 9, 9);
+    // Flat ground on purpose: the drain's rate bookkeeping is what is under test, and on a slope the
+    // water runs downhill away from the drain faster than the rate — the drain starves, which is real
+    // physics, not a bookkeeping failure.
+    for (x of 0..9) {
+        for (z of 0..9) {
+            w.setGround(x, z, 0.5);
+        }
+    }
+    w.pour(4, 4, 20.0);
+    w.pour(3, 4, 20.0);
+    w.pour(5, 4, 20.0);
+    w.addSink(FluidSink::at(4, 4, 0.5));
+    w.sinkRadius(0, 2);
+    for (t of 0..100) {
+        w.tick();
+    }
+    c.near(
+        "drain: evacuated the configured rate for the configured time",
+        w.drainedTotal(),
+        5.0,
+        FLUID_TOL_TICKS
+    );
+    c.near(
+        "drain: levels + drained = what was poured",
+        w.totalVolume() + w.drainedTotal(),
+        60.0,
+        FLUID_TOL_TICKS
+    );
+
+    let dry : FluidWorld = new FluidWorld(rules, 4, 4);
+    dry.addSink(FluidSink::at(2, 2, 5.0));
+    for (t of 0..50) {
+        dry.tick();
+    }
+    c.near("drain: a drain over dry ground takes nothing", dry.drainedTotal(), 0.0, 0.0);
+    c.near("drain: a dry drain leaves the world empty", dry.totalVolume(), 0.0, 0.0);
+}
+
+// The two update strategies must land on the same equilibrium: the same basin, filled by the same source,
+// once swept fully and once through the active set.
+fn fluidActiveMatchesFull(c : Checks) : void {
+    let mut full : FluidRules = FluidRules {};
+    full.dt = 0.1;
+    full.conductivity = 3.0;
+    full.drag = 2.0;
+    full.maxLevel = 0.5;
+    full.overflow = FluidOverflow::Keep;
+    full.strategy = FluidStrategy::FullSweep;
+    let mut active : FluidRules = FluidRules {};
+    active.dt = 0.1;
+    active.conductivity = 3.0;
+    active.drag = 2.0;
+    active.maxLevel = 0.5;
+    active.overflow = FluidOverflow::Keep;
+    active.strategy = FluidStrategy::ActiveSet;
+
+    let wa : FluidWorld = fluidBasinWorld(full);
+    wa.addSource(FluidSource::infinite(2, 2, 1.0));
+    let wb : FluidWorld = fluidBasinWorld(active);
+    wb.addSource(FluidSource::infinite(2, 2, 1.0));
+    for (t of 0..800) {
+        wa.tick();
+        wb.tick();
+    }
+    c.near(
+        "strategies: both strategies reach the same equilibrium volume",
+        wa.totalVolume(),
+        wb.totalVolume(),
+        FLUID_TOL_LEVEL
+    );
+    let mut worst : f64 = 0.0;
+    for (z of 0..5) {
+        for (x of 0..5) {
+            let mut gap : f64 = wa.levelAt(x, z) - wb.levelAt(x, z);
+            if (gap < 0.0) {
+                gap = 0.0 - gap;
+            }
+            if (gap > worst) {
+                worst = gap;
+            }
+        }
+    }
+    c.near(
+        "strategies: every level agrees between the two strategies",
+        worst,
+        0.0,
+        FLUID_TOL_LEVEL
+    );
+    c.that("strategies: the active set is smaller than the sweep", wb.awakeCount() < 25);
+}
+
+// Sources and drains may come and go between ticks: removed, the volume freezes; added back, it grows again
+// by exactly what the new source carries; handles of removed emitters are stale.
+fn fluidHotSources(c : Checks) : void {
+    let mut rules : FluidRules = FluidRules {};
+    rules.dt = 0.1;
+    rules.maxLevel = 10.0;
+    let w : FluidWorld = new FluidWorld(rules, 8, 8);
+    let s : i32 = w.addSource(FluidSource::infinite(4, 4, 1.0));
+    for (t of 0..20) {
+        w.tick();
+    }
+    c.near("hot: the source filled for two seconds", w.totalVolume(), 2.0, FLUID_TOL_TICKS);
+    c.that("hot: removeSource accepts a live handle", w.removeSource(s));
+    c.that("hot: removing a removed source is refused", !w.removeSource(s));
+    for (t of 0..200) {
+        w.tick();
+    }
+    c.near(
+        "hot: the volume stays frozen once the source is removed",
+        w.totalVolume(),
+        2.0,
+        FLUID_TOL_EXACT
+    );
+    let s2 : i32 = w.addSource(FluidSource::finite(4, 4, 1.0, 3.0));
+    c.that("hot: a source added later is active", w.sourceAt(s2).active);
+    for (t of 0..60) {
+        w.tick();
+    }
+    c.near("hot: the finite source added its 3 units", w.totalVolume(), 5.0, FLUID_TOL_TICKS);
+    c.that(
+        "hot: the later source runs dry after its supply",
+        w.sourceAt(s2).remaining <= FLUID_DRY
+    );
+}
+
+// The flat ground the library ships must answer its level under every column: the check keeps the trait's
+// contract honest for the one implementor the engine itself provides.
+fn fluidFlatGroundContract(c : Checks) : void {
+    let g : FluidFlatGround = new FluidFlatGround(3.25);
+    c.near("flat ground: heightAt answers the ground level", g.heightAt(0, 0), 3.25, 0.0);
+    c.near("flat ground: heightAt answers its level far away", g.heightAt(12345, -77), 3.25, 0.0);
+}

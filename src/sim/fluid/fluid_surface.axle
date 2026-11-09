@@ -1,0 +1,254 @@
+// fluid_surface — what the surface of the columns is doing: its velocity, its steepness, and where it breaks.
+//
+// This is the analysis the foam and the breaking-wave emission both read, kept apart from both so each can be
+// switched off alone. It owns no water and changes none: from the fields of a `FluidField` and the velocities
+// of the frontiers it derives, per column, the velocity of the surface (the average of the two frontiers
+// either side), the speed, the slope of the free surface, its curvature, the convergence of the flow, how
+// fast the surface is rising, and one number in 0..1 that says how hard the column is breaking.
+//
+// A column breaks in one of two ways, both standard stand-ins for physics a heightfield cannot hold. A
+// steep crest (slope past `FluidBreakingParams.steepness`, on a column that stands above its neighbours)
+// breaks the way an ocean wave does; a flow faster than the wave speed `sqrt(g h)` (a Froude number past
+// `FluidBreakingParams.froude`) breaks the way a hydraulic jump or a rapid does. Slopes are taken between wet
+// columns only: the bed's own slope under a thin film is not a wave, and a shoreline is not a cliff. Gravity
+// enters through the wave speed, so the same water on a moon breaks at a different speed.
+//
+// Everything is a plain serial sweep over the grid in column order, so it is deterministic by construction.
+
+use crate::core::math::dvec2::DVec2;
+use crate::core::math::scalar::{maxD, minD, saturateD};
+use crate::sim::fluid::fluid_field::FluidField;
+use crate::sim::fluid::fluid_particle_params::FluidBreakingParams;
+use crate::sim::fluid::fluid_sample::{FluidSample, FluidStencil};
+use crate::sim::fluid::fluid_tick::FluidTick;
+
+/** The depth, in cell units, below which a column counts as dry for analysis. */
+pub(crate) const FLUID_WET_DEPTH : f64 = 0.005;
+
+/** The depth below which a Froude number is not trusted (a film is not a flow). */
+const FLUID_FROUDE_DEPTH : f64 = 0.03;
+
+/** The speed, in cells per second, of a shoreline front that makes full foam. */
+const FLUID_SHORE_SPEED : f64 = 1.5;
+
+/** Bump of a crest over its neighbours that counts as a full crest: this plus the depth times its share. */
+const FLUID_CREST_BASE : f64 = 0.02;
+
+/** The share of the depth added to the crest scale. */
+const FLUID_CREST_DEPTH : f64 = 0.05;
+
+/** The per-column readings of the surface, refreshed by `update`. */
+pub(crate) class FluidSurface {
+    width               : i32;
+    depth               : i32;
+    pub(crate) u        : f64[];
+    pub(crate) w        : f64[];
+    pub(crate) speed    : f64[];
+    pub(crate) froude   : f64[];
+    pub(crate) converge : f64[];
+    pub(crate) breaking : f64[];
+    pub(crate) shore    : f64[];
+    pub(crate) rise     : f64[];
+    surface             : f64[];
+    primed              : bool = false;
+
+    /** Readings for a grid of `width` x `depth` columns, all zero. */
+    constructor(width : i32, depth : i32) {
+        self.width = width;
+        self.depth = depth;
+        let n : i64 = (width * depth) as i64;
+        self.u = new f64[n];
+        self.w = new f64[n];
+        self.speed = new f64[n];
+        self.froude = new f64[n];
+        self.converge = new f64[n];
+        self.breaking = new f64[n];
+        self.shore = new f64[n];
+        self.rise = new f64[n];
+        self.surface = new f64[n];
+        for (i of 0..n) {
+            self.u[i] = 0.0;
+            self.w[i] = 0.0;
+            self.speed[i] = 0.0;
+            self.froude[i] = 0.0;
+            self.converge[i] = 0.0;
+            self.breaking[i] = 0.0;
+            self.shore[i] = 0.0;
+            self.rise[i] = 0.0;
+            self.surface[i] = 0.0;
+        }
+    }
+
+    /** The horizontal velocity of the water surface in column `c` (x, then z): the mean of the frontiers
+     * either side, zero in a dry column. */
+    pub(crate) static fn columnVelocity(field : Shared<FluidField>, run : FluidTick, c : i32) : DVec2 {
+        if (field.water[c as i64] <= FLUID_WET_DEPTH) {
+            return DVec2::zero();
+        }
+
+        let x : i32 = c % field.width;
+        let z : i32 = c / field.width;
+        let mut ux : f64 = 0.0;
+        if (x > 0) {
+            ux = ux + run.velocity[run.eastFrontier(x - 1, z) as i64];
+        }
+        if (x + 1 < field.width) {
+            ux = ux + run.velocity[run.eastFrontier(x, z) as i64];
+        }
+
+        let mut uz : f64 = 0.0;
+        if (z > 0) {
+            uz = uz + run.velocity[run.southFrontier(x, z - 1) as i64];
+        }
+        if (z + 1 < field.depth) {
+            uz = uz + run.velocity[run.southFrontier(x, z) as i64];
+        }
+        return DVec2::make(ux * 0.5, uz * 0.5);
+    }
+
+    /** The surface velocity at (x, z), blended from the four columns around it. */
+    pub(crate) static fn velocityAt(field : Shared<FluidField>, run : FluidTick, x : f64, z : f64) : DVec2 {
+        let s : FluidStencil = FluidSample::stencil(field, x, z);
+        let a : DVec2 = FluidSurface::columnVelocity(field, run, s.c00);
+        let b : DVec2 = FluidSurface::columnVelocity(field, run, s.c10);
+        let c : DVec2 = FluidSurface::columnVelocity(field, run, s.c01);
+        let d : DVec2 = FluidSurface::columnVelocity(field, run, s.c11);
+        return a.lerp(b, s.tx).lerp(c.lerp(d, s.tx), s.tz);
+    }
+
+    // The surface height of neighbour `n` of a column whose centre is `centre`; a missing or dry neighbour answers
+    // `centre`, so it adds no slope.
+    fn neighbourSurface(self, field : Shared<FluidField>, n : i32, centre : f64) : f64 {
+        if (n < 0 || field.water[n as i64] <= FLUID_WET_DEPTH) {
+            return centre;
+        }
+        return field.surface(n);
+    }
+
+    // How many of two neighbours are real wet columns, at least one (a divisor for a one-sided difference).
+    fn spans(self, field : Shared<FluidField>, a : i32, b : i32) : f64 {
+        let mut count : i32 = 0;
+        if (a >= 0 && field.water[a as i64] > FLUID_WET_DEPTH) {
+            count = count + 1;
+        }
+        if (b >= 0 && field.water[b as i64] > FLUID_WET_DEPTH) {
+            count = count + 1;
+        }
+        if (count == 0) {
+            return 1.0;
+        }
+        return count as f64;
+    }
+
+    /** Refreshes every reading from the field and the frontiers; `dt` is the tick, `gravity` the wave
+     * speed's. */
+    pub(crate) fn update(
+        mut self,
+        field : Shared<FluidField>,
+        run : FluidTick,
+        breaking : FluidBreakingParams,
+        gravity : f64,
+        dt : f64
+    ) : void {
+        let count : i32 = field.width * field.depth;
+        for (c of 0..count) {
+            let i : i64 = c as i64;
+            let v : DVec2 = FluidSurface::columnVelocity(field, run, c);
+            let now : f64 = field.surface(c);
+            self.u[i] = v.x;
+            self.w[i] = v.y;
+            self.speed[i] = v.length();
+            self.rise[i] = 0.0;
+            if (self.primed) {
+                self.rise[i] = (now - self.surface[i]) / dt;
+            }
+            self.surface[i] = now;
+        }
+        self.primed = true;
+
+        for (z of 0..field.depth) {
+            for (x of 0..field.width) {
+                self.analyse(field, x, z, breaking, gravity);
+            }
+        }
+    }
+
+    // Fills the slope, curvature, convergence, Froude and breaking readings of one column.
+    fn analyse(
+        mut self,
+        field : Shared<FluidField>,
+        x : i32,
+        z : i32,
+        breaking : FluidBreakingParams,
+        gravity : f64
+    ) : void {
+        let c : i32 = field.column(x, z);
+        let i : i64 = c as i64;
+        let d : f64 = field.water[i];
+        self.froude[i] = 0.0;
+        self.converge[i] = 0.0;
+        self.breaking[i] = 0.0;
+        self.shore[i] = 0.0;
+        if (d <= FLUID_WET_DEPTH) {
+            return;
+        }
+
+        let west : i32 = field.neighbour(c, 0);
+        let east : i32 = field.neighbour(c, 1);
+        let north : i32 = field.neighbour(c, 2);
+        let south : i32 = field.neighbour(c, 3);
+        let centre : f64 = field.surface(c);
+        let sw : f64 = self.neighbourSurface(field, west, centre);
+        let se : f64 = self.neighbourSurface(field, east, centre);
+        let sn : f64 = self.neighbourSurface(field, north, centre);
+        let ss : f64 = self.neighbourSurface(field, south, centre);
+        let gx : f64 = (se - sw) / self.spans(field, west, east);
+        let gz : f64 = (ss - sn) / self.spans(field, north, south);
+        let steep : f64 = (gx * gx + gz * gz).sqrt();
+
+        let bump : f64 = centre - 0.25 * (sw + se + sn + ss);
+        let crest : f64 = saturateD(bump / (FLUID_CREST_BASE + FLUID_CREST_DEPTH * d));
+        let raw : f64 = self.speed[i] / (gravity * maxD(d, 0.05)).sqrt();
+        self.froude[i] = raw;
+
+        let mut front : f64 = 0.0;
+        if (d > FLUID_FROUDE_DEPTH) {
+            front = saturateD(raw / breaking.froude - 1.0);
+        }
+        let steepFront : f64 = saturateD(steep / breaking.steepness - 1.0) * (0.3 + 0.7 * crest);
+        self.breaking[i] = maxD(front, steepFront);
+
+        let du : f64 = self.edge(self.u, x + 1, z, field) - self.edge(self.u, x - 1, z, field);
+        let dw : f64 = self.edge(self.w, x, z + 1, field) - self.edge(self.w, x, z - 1, field);
+        self.converge[i] = maxD(0.0 - 0.5 * (du + dw), 0.0);
+
+        let nextToDry : bool = FluidSurface::isDry(field, west) || FluidSurface::isDry(field, east)
+            || FluidSurface::isDry(field, north)
+            || FluidSurface::isDry(field, south);
+        if (nextToDry) {
+            self.shore[i] = saturateD(self.speed[i] / FLUID_SHORE_SPEED);
+        }
+    }
+
+    // A neighbour column that exists and has no water.
+    static fn isDry(field : Shared<FluidField>, n : i32) : bool {
+        return n >= 0 && field.water[n as i64] <= FLUID_WET_DEPTH;
+    }
+
+    // A reading at (x, z), zero outside the grid (a wall carries no flow).
+    fn edge(self, values : f64[], x : i32, z : i32, field : Shared<FluidField>) : f64 {
+        if (!field.inBounds(x, z)) {
+            return 0.0;
+        }
+        return values[field.column(x, z) as i64];
+    }
+
+    /** The turbulence a column's readings call for, 0..1: the energy of the flow against the wave speed,
+     * plus breaking, run-up and convergence. */
+    pub(crate) fn turbulenceTarget(self, c : i32) : f64 {
+        let i : i64 = c as i64;
+        let energy : f64 = minD(self.froude[i] * self.froude[i], 1.0) * 0.6;
+        return saturateD(energy + 0.8 * self.breaking[i] + 0.5 * self.shore[i]
+            + 0.3 * saturateD(self.converge[i]));
+    }
+}

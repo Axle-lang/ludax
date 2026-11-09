@@ -1,0 +1,155 @@
+// fluid_sample — reading the column fields between column centres.
+//
+// The heightfield stores one number per column, and a column (i, j) spans [i, i+1) x [j, j+1), so its number
+// belongs to the centre (i + 0.5, j + 0.5). A renderer and the particle solver both want the field anywhere:
+// bilinear interpolation between the four centres around a point, clamped at the grid's edge so a point
+// outside reads the nearest column. Bilinear is the cheapest reading that is continuous, and continuity is
+// what a particle resting on the bed or a ray marching the surface needs; the gradient it implies is constant
+// inside each square of centres, which is what `slope` returns.
+//
+// Everything here is a pure function of the arrays; nothing allocates and nothing is stored.
+
+use crate::core::math::dvec2::DVec2;
+use crate::sim::fluid::fluid_field::FluidField;
+
+/** The four columns around a point and the weights that blend them: the bilinear stencil. */
+pub(crate) struct FluidStencil {
+    /** The column at the low corner of x and z. */
+    pub(crate) c00 : i32 = 0;
+
+    /** The column one step in x from `c00`. */
+    pub(crate) c10 : i32 = 0;
+
+    /** The column one step in z from `c00`. */
+    pub(crate) c01 : i32 = 0;
+
+    /** The column one step in both. */
+    pub(crate) c11 : i32 = 0;
+
+    /** Blend along x, 0..1. */
+    pub(crate) tx : f64 = 0.0;
+
+    /** Blend along z, 0..1. */
+    pub(crate) tz : f64 = 0.0;
+}
+
+/** The bed under a point: its height and the unit normal pointing up out of it. */
+pub(crate) struct FluidContact {
+    /** Height of the bed. */
+    pub(crate) height : f64 = 0.0;
+
+    /** Normal, x component. */
+    pub(crate) nx : f64 = 0.0;
+
+    /** Normal, y component (always positive). */
+    pub(crate) ny : f64 = 1.0;
+
+    /** Normal, z component. */
+    pub(crate) nz : f64 = 0.0;
+}
+
+/** Interpolated readings of a field, as static functions over a `FluidField`. */
+pub(crate) class FluidSample {
+    /** The largest integer not above `v` (`as i32` truncates toward zero, which is wrong below 0). */
+    pub(crate) static fn floor(v : f64) : i32 {
+        let i : i32 = v as i32;
+        if ((i as f64) > v) {
+            return i - 1;
+        }
+        return i;
+    }
+
+    /** The stencil of the point (x, z), clamped to the grid. */
+    pub(crate) static fn stencil(field : Shared<FluidField>, x : f64, z : f64) : FluidStencil {
+        let fx : f64 = x - 0.5;
+        let fz : f64 = z - 0.5;
+        let ix : i32 = FluidSample::floor(fx);
+        let iz : i32 = FluidSample::floor(fz);
+        let x0 : i32 = FluidSample::clamp(ix, field.width);
+        let z0 : i32 = FluidSample::clamp(iz, field.depth);
+        let x1 : i32 = FluidSample::clamp(ix + 1, field.width);
+        let z1 : i32 = FluidSample::clamp(iz + 1, field.depth);
+        return FluidStencil {
+            c00: z0 * field.width + x0,
+            c10: z0 * field.width + x1,
+            c01: z1 * field.width + x0,
+            c11: z1 * field.width + x1,
+            tx: FluidSample::fraction(fx - (ix as f64)),
+            tz: FluidSample::fraction(fz - (iz as f64)),
+        };
+    }
+
+    // An index kept inside 0..count.
+    static fn clamp(i : i32, count : i32) : i32 {
+        if (i < 0) {
+            return 0;
+        }
+        if (i >= count) {
+            return count - 1;
+        }
+        return i;
+    }
+
+    // A blend weight kept inside 0..1, so a point beyond the grid's edge reads the edge column.
+    static fn fraction(t : f64) : f64 {
+        if (t < 0.0) {
+            return 0.0;
+        }
+        if (t > 1.0) {
+            return 1.0;
+        }
+        return t;
+    }
+
+    /** The bilinear blend of `values` (one per column) over a stencil. */
+    pub(crate) static fn blend(values : f64[], s : FluidStencil) : f64 {
+        let a : f64 = values[s.c00 as i64] * (1.0 - s.tx) + values[s.c10 as i64] * s.tx;
+        let b : f64 = values[s.c01 as i64] * (1.0 - s.tx) + values[s.c11 as i64] * s.tx;
+        return a * (1.0 - s.tz) + b * s.tz;
+    }
+
+    /** The bilinear blend of an f32 field. */
+    pub(crate) static fn blendF32(values : f32[], s : FluidStencil) : f64 {
+        let a : f64 = (values[s.c00 as i64] as f64) * (1.0 - s.tx) + (values[s.c10 as i64] as f64) * s.tx;
+        let b : f64 = (values[s.c01 as i64] as f64) * (1.0 - s.tx) + (values[s.c11 as i64] as f64) * s.tx;
+        return a * (1.0 - s.tz) + b * s.tz;
+    }
+
+    /** The bed height at (x, z). */
+    pub(crate) static fn bed(field : Shared<FluidField>, x : f64, z : f64) : f64 {
+        return FluidSample::blend(field.ground, FluidSample::stencil(field, x, z));
+    }
+
+    /** The water depth at (x, z). */
+    pub(crate) static fn depth(field : Shared<FluidField>, x : f64, z : f64) : f64 {
+        return FluidSample::blend(field.water, FluidSample::stencil(field, x, z));
+    }
+
+    /** The surface height at (x, z): bed plus depth, each interpolated. */
+    pub(crate) static fn surface(field : Shared<FluidField>, x : f64, z : f64) : f64 {
+        let s : FluidStencil = FluidSample::stencil(field, x, z);
+        return FluidSample::blend(field.ground, s) + FluidSample::blend(field.water, s);
+    }
+
+    /** The gradient of a field's bilinear surface at the stencil: change per cell along x (first) and z. */
+    pub(crate) static fn slope(values : f64[], s : FluidStencil) : DVec2 {
+        let dx0 : f64 = values[s.c10 as i64] - values[s.c00 as i64];
+        let dx1 : f64 = values[s.c11 as i64] - values[s.c01 as i64];
+        let dz0 : f64 = values[s.c01 as i64] - values[s.c00 as i64];
+        let dz1 : f64 = values[s.c11 as i64] - values[s.c10 as i64];
+        return DVec2::make(dx0 * (1.0 - s.tz) + dx1 * s.tz, dz0 * (1.0 - s.tx) + dz1 * s.tx);
+    }
+
+    /** The bed at (x, z) with its normal from the slope of the bilinear surface. */
+    pub(crate) static fn contact(field : Shared<FluidField>, x : f64, z : f64) : FluidContact {
+        let s : FluidStencil = FluidSample::stencil(field, x, z);
+        let g : DVec2 = FluidSample::slope(field.ground, s);
+        let inv : f64 = 1.0 / (1.0 + g.x * g.x + g.y * g.y).sqrt();
+        return FluidContact {
+            height: FluidSample::blend(field.ground, s),
+            nx: 0.0 - g.x * inv,
+            ny: inv,
+            nz: 0.0 - g.y * inv,
+        };
+    }
+}

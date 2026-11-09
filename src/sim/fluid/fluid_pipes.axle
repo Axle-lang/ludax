@@ -1,0 +1,300 @@
+// fluid_pipes — the transfer law: how water crosses the frontier between two columns.
+//
+// The model is the linearised shallow-water system on a staggered grid, written as virtual pipes. A frontier
+// carries a velocity u, the momentum of the water crossing it. Each tick:
+//
+//   1. u gains the pressure push, `conductivity * gravity * (head_a - head_b) * dt`, and loses to bed drag,
+//      `u / (1 + drag * dt)` (implicit, so any drag is stable);
+//   2. u is smoothed toward its neighbours' by viscosity — frontiers share momentum, which is what makes
+//      honey differ from water and what damps the thin-film checkerboard an explicit scheme would keep;
+//   3. the volume moved is `u * depth * dt`, where depth is the water above the sill (the higher of the two
+//      grounds) on the upwind side, so water cannot cross a wall it does not reach and a wave's speed is
+//      the physical `sqrt(gravity * depth)`;
+//   4. the transfer is limited so no column gives more than it holds (and, in `Keep` mode, takes more than
+//      its room), the velocity is scaled by what was actually paid, and the water moves.
+//
+// Why these limits. The wave equation this scheme discretises is stable while `gravity * depth * dt^2` stays
+// under a bound, so the pressure push is capped by `FLUID_STABILITY / (depth * dt^2)`: in water too deep for
+// the time step a wave travels slower than physics says instead of blowing up, and in shallow water the cap
+// is never reached. Velocity is capped at `FLUID_COURANT` cells per tick, so a donor loses at most half of
+// what lies above the sill to one frontier, and the per-column scaling settles the rest. Every transfer
+// subtracts from one column exactly what it adds to the other: volume is conserved to rounding.
+//
+// Two passes over a snapshot, and why. Every velocity is computed from the same levels before any water
+// moves, so the scan order cannot bias the flow (an x-then-z sweep that applied each transfer at once would
+// push eastward harder than westward). The availability scaling is settled first and the room scaling is
+// computed from the inflows that remain after it: a dry column on higher ground can ask with a big head it
+// cannot pay, and that phantom request must not throttle the inflows that are real.
+
+use crate::core::collections::vec::Vec;
+use crate::core::math::scalar::{absD, maxD, minD};
+use crate::sim::fluid::fluid_field::{FLUID_DIRECTIONS, FluidField};
+use crate::sim::fluid::fluid_rules::{FluidFlow, FluidOverflow, FluidRules, FluidStrategy};
+use crate::sim::fluid::fluid_tick::FluidTick;
+
+/** The largest `gravity * depth * dt^2` a frontier is allowed to feel; the explicit wave scheme is stable
+ * below 2, and a quarter keeps a wide margin for the four frontiers a column shares. */
+const FLUID_STABILITY : f64 = 0.25;
+
+/** The most a flow may travel in one tick, in cells; half keeps a donor from giving all of its depth to one
+ * frontier. */
+const FLUID_COURANT : f64 = 0.5;
+
+/** The largest fraction of the neighbours' velocity difference viscosity may close in one tick; an explicit
+ * diffusion over four neighbours is stable up to a quarter. */
+const FLUID_VISCOUS_SHARE : f64 = 0.2;
+
+/** The share of a `Keep` receiver's free room that one frontier may fill in a tick; half, because a column
+ * has several frontiers that can fill the same room. */
+const FLUID_ROOM_SHARE : f64 = 0.5;
+
+/** Velocities and head differences under this count as zero, so a settled frontier goes idle. */
+const FLUID_IDLE : f64 = 0.000000000001;
+
+/** The phases of the transfer law, as static functions over a field and the tick's bookkeeping. */
+pub(crate) class FluidPipes {
+    /** Phase one: the pressure push and drag of every live frontier, from the snapshot of the levels. */
+    pub(crate) static fn accelerate(field : Shared<FluidField>, run : FluidTick) : void {
+        if (field.rules.strategy == FluidStrategy::FullSweep) {
+            for (c of 0..(run.width * run.depth)) {
+                run.touch(c);
+            }
+            for (id of 0..run.frontierCount) {
+                run.stamp(id);
+                FluidPipes::accelerateFrontier(field, run, id);
+            }
+            return;
+        }
+
+        for (k of 0..run.awakeColumns.len()) {
+            FluidPipes::visitAround(field, run, run.awakeColumns.get(k));
+        }
+    }
+
+    // The four frontiers around one awake column, in a fixed order; each is computed at most once per tick.
+    static fn visitAround(field : Shared<FluidField>, run : FluidTick, c : i32) : void {
+        let x : i32 = c % run.width;
+        let z : i32 = c / run.width;
+        if (x + 1 < run.width) {
+            FluidPipes::visit(field, run, run.eastFrontier(x, z));
+        }
+        if (x > 0) {
+            FluidPipes::visit(field, run, run.eastFrontier(x - 1, z));
+        }
+        if (z + 1 < run.depth) {
+            FluidPipes::visit(field, run, run.southFrontier(x, z));
+        }
+        if (z > 0) {
+            FluidPipes::visit(field, run, run.southFrontier(x, z - 1));
+        }
+    }
+
+    static fn visit(field : Shared<FluidField>, run : FluidTick, id : i32) : void {
+        if (!run.stamp(id)) {
+            return;
+        }
+        FluidPipes::accelerateFrontier(field, run, id);
+    }
+
+    // The water a column can push over a sill: what its head lifts above it, never more than it holds.
+    static fn depthOver(field : Shared<FluidField>, c : i32, sill : f64) : f64 {
+        let lifted : f64 = field.head(c) - sill;
+        return minD(maxD(lifted, 0.0), field.water[c as i64]);
+    }
+
+    // One frontier's velocity: pressure push, then drag. A frontier nothing can cross, or one at rest with
+    // equal heads, is idle: its momentum is dropped and it neither joins the live list nor wakes anything.
+    static fn accelerateFrontier(field : Shared<FluidField>, run : FluidTick, id : i32) : void {
+        let a : i32 = run.firstColumn(id);
+        let b : i32 = run.secondColumn(id);
+        let rules : FluidRules = field.rules;
+        let sill : f64 = maxD(field.ground[a as i64], field.ground[b as i64]);
+        let depthA : f64 = FluidPipes::depthOver(field, a, sill);
+        let depthB : f64 = FluidPipes::depthOver(field, b, sill);
+        let depth : f64 = maxD(depthA, depthB);
+        if (depth <= 0.0) {
+            run.velocity[id as i64] = 0.0;
+            return;
+        }
+
+        let dt : f64 = rules.dt;
+        let drive : f64 = field.head(a) - field.head(b);
+        let ceiling : f64 = FLUID_STABILITY / (depth * dt * dt);
+        let pull : f64 = minD(rules.conductivity * rules.gravity, ceiling);
+
+        let pushed : f64 = run.velocity[id as i64] + pull * drive * dt;
+        let u : f64 = pushed / (1.0 + rules.drag * dt);
+        let atRest : bool = absD(u) < FLUID_IDLE && absD(drive) < FLUID_IDLE;
+        if (atRest) {
+            run.velocity[id as i64] = 0.0;
+            return;
+        }
+
+        run.velocity[id as i64] = u;
+        run.liveFrontiers.push(id);
+        run.touch(a);
+        run.touch(b);
+    }
+
+    /** Phase two: live frontiers share momentum with the four neighbours of their own orientation. */
+    pub(crate) static fn diffuse(field : Shared<FluidField>, run : FluidTick) : void {
+        let share : f64 = minD(field.rules.viscosity * field.rules.dt, FLUID_VISCOUS_SHARE);
+        if (share <= 0.0) {
+            return;
+        }
+
+        for (k of 0..run.liveFrontiers.len()) {
+            let id : i32 = run.liveFrontiers.get(k);
+            let mine : f64 = run.velocity[id as i64];
+            let mut gap : f64 = 0.0;
+            for (direction of 0..FLUID_DIRECTIONS) {
+                let n : i32 = run.neighbourFrontier(id, direction);
+                if (n < 0) {
+                    continue;
+                }
+                gap = gap + run.velocity[n as i64] - mine;
+            }
+            run.viscousDelta[id as i64] = share * gap;
+        }
+
+        for (k of 0..run.liveFrontiers.len()) {
+            let id : i32 = run.liveFrontiers.get(k);
+            run.velocity[id as i64] = run.velocity[id as i64] + run.viscousDelta[id as i64];
+        }
+    }
+
+    /**
+     * Phase three: the volume every live frontier wants to move, limited by what its donor lifts and, in `Keep`
+     * mode, by half the room of its receiver.
+     */
+    pub(crate) static fn limitFluxes(field : Shared<FluidField>, run : FluidTick) : void {
+        let dt : f64 = field.rules.dt;
+        let keep : bool = field.rules.overflow == FluidOverflow::Keep;
+        for (k of 0..run.liveFrontiers.len()) {
+            let id : i32 = run.liveFrontiers.get(k);
+            let u : f64 = run.velocity[id as i64];
+            run.flux[id as i64] = 0.0;
+            if (u == 0.0) {
+                continue;
+            }
+
+            let mut donor : i32 = run.firstColumn(id);
+            let mut recv : i32 = run.secondColumn(id);
+            let mut dir : f64 = 1.0;
+            if (u < 0.0) {
+                donor = recv;
+                recv = run.firstColumn(id);
+                dir = -1.0;
+            }
+
+            let sill : f64 = maxD(field.ground[donor as i64], field.ground[recv as i64]);
+            let depth : f64 = FluidPipes::depthOver(field, donor, sill);
+            if (depth <= 0.0) {
+                run.velocity[id as i64] = 0.0;
+                continue;
+            }
+
+            let mut volume : f64 = minD(absD(u) * dt, FLUID_COURANT) * depth;
+            if (keep) {
+                let room : f64 = maxD(field.rules.maxLevel - field.water[recv as i64], 0.0);
+                volume = minD(volume, room * FLUID_ROOM_SHARE);
+            }
+
+            run.velocity[id as i64] = dir * volume / (depth * dt);
+            run.flux[id as i64] = dir * volume;
+        }
+    }
+
+    // The column scale factors: no column gives more than it holds, and in Keep mode none takes more than
+    // its room. The room scale is computed from the inflows AFTER the donors' availability scaling.
+    static fn computeScales(field : Shared<FluidField>, run : FluidTick) : void {
+        for (k of 0..run.liveFrontiers.len()) {
+            let id : i32 = run.liveFrontiers.get(k);
+            let f : f64 = run.flux[id as i64];
+            let donor : i32 = FluidPipes::donorOf(run, id, f);
+            run.outflow[donor as i64] = run.outflow[donor as i64] + absD(f);
+        }
+
+        for (k of 0..run.touchedColumns.len()) {
+            let c : i32 = run.touchedColumns.get(k);
+            let held : f64 = field.water[c as i64];
+            let out : f64 = run.outflow[c as i64];
+            run.outScale[c as i64] = FluidPipes::fit(held, out);
+        }
+
+        for (k of 0..run.liveFrontiers.len()) {
+            let id : i32 = run.liveFrontiers.get(k);
+            let f : f64 = run.flux[id as i64];
+            if (f == 0.0) {
+                continue;
+            }
+            let donor : i32 = FluidPipes::donorOf(run, id, f);
+            let recv : i32 = run.firstColumn(id) + run.secondColumn(id) - donor;
+            let paid : f64 = absD(f) * run.outScale[donor as i64];
+            run.inflow[recv as i64] = run.inflow[recv as i64] + paid;
+        }
+
+        let keep : bool = field.rules.overflow == FluidOverflow::Keep;
+        for (k of 0..run.touchedColumns.len()) {
+            let c : i32 = run.touchedColumns.get(k);
+            run.inScale[c as i64] = 1.0;
+            if (keep) {
+                let room : f64 = maxD(field.rules.maxLevel - field.water[c as i64], 0.0);
+                run.inScale[c as i64] = FluidPipes::fit(room, run.inflow[c as i64]);
+            }
+        }
+    }
+
+    // The factor that makes `wanted` fit in `capacity`: 1 when it already does, else their ratio.
+    static fn fit(capacity : f64, wanted : f64) : f64 {
+        if (wanted <= capacity) {
+            return 1.0;
+        }
+        if (wanted <= 0.0) {
+            return 0.0;
+        }
+        return capacity / wanted;
+    }
+
+    // The column that loses water through frontier `id` when its flux is `f`.
+    static fn donorOf(run : FluidTick, id : i32, f : f64) : i32 {
+        if (f < 0.0) {
+            return run.secondColumn(id);
+        }
+        return run.firstColumn(id);
+    }
+
+    /**
+     * Phase four: apply every scaled transfer, scale each frontier's velocity by what it actually paid, and
+     * record the flows. Each transfer subtracts the number it adds, so the world's volume is conserved.
+     */
+    pub(crate) static fn apply(field : Shared<FluidField>, run : FluidTick, flows : Vec<FluidFlow>) : void {
+        FluidPipes::computeScales(field, run);
+        let wake : f64 = field.rules.sleepThreshold;
+        for (k of 0..run.liveFrontiers.len()) {
+            let id : i32 = run.liveFrontiers.get(k);
+            let f : f64 = run.flux[id as i64];
+            if (f == 0.0) {
+                continue;
+            }
+
+            let donor : i32 = FluidPipes::donorOf(run, id, f);
+            let recv : i32 = run.firstColumn(id) + run.secondColumn(id) - donor;
+            let scale : f64 = run.outScale[donor as i64] * run.inScale[recv as i64];
+            let delta : f64 = absD(f) * scale;
+            run.velocity[id as i64] = run.velocity[id as i64] * scale;
+            if (delta <= 0.0) {
+                continue;
+            }
+
+            field.water[donor as i64] = field.water[donor as i64] - delta;
+            field.water[recv as i64] = field.water[recv as i64] + delta;
+            flows.push(run.flowBetween(donor, recv, delta));
+
+            if (delta > wake) {
+                run.wakeNext(donor);
+                run.wakeNext(recv);
+            }
+        }
+    }
+}

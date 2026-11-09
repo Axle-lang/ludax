@@ -1,0 +1,632 @@
+// fluid_dynamics — checks for what moves in the column-water simulation: pressure, waves, viscosity, loads,
+// impacts and spray.
+//
+// `fluid` holds the equilibrium and bookkeeping theorems; this suite holds the ones about motion. Each check
+// states its expected number as arithmetic in the comment beside it: a U-tube under a piston settles where
+// the heads match, so the loaded arm is lower by the load; a ripple on depth h travels at sqrt(g h), so the
+// pulse peak sits that far from the splash after a given time, and four times the gravity doubles the
+// distance; an impact adds exactly the object's volume, whether it is in the columns or still flying as
+// spray. Tolerances are wide where the scheme is intentionally approximate (a wave front smears over a few
+// cells) and tight where it is exact (volume, symmetry, bit-for-bit repeats).
+
+use ludax::Checks;
+use ludax::FluidImpact;
+use ludax::FluidOverflow;
+use ludax::FluidRules;
+use ludax::FluidSink;
+use ludax::FluidSource;
+use ludax::FluidSplash;
+use ludax::FluidStrategy;
+use ludax::FluidWorld;
+
+use crate::fluid::{
+    FLUID_DRY, FLUID_SETTLE_TICKS, FLUID_TOL_EXACT, FLUID_TOL_SETTLED, FLUID_TOL_SETTLED_ROUGH
+};
+
+/** The pressure, load, wave, viscosity, impact and spray checks of the fluid. */
+pub class FluidDynamicsSuite {
+    /** Runs every check of the suite. */
+    pub static fn run(c : Checks) : void {
+        fluidDynCommunicatingVessels(c);
+        fluidDynPiston(c);
+        fluidDynPressureMode(c);
+        fluidDynWaveSpeed(c);
+        fluidDynSloshing(c);
+        fluidDynViscosity(c);
+        fluidDynWalls(c);
+        fluidDynEmitterBlocks(c);
+        fluidDynImpactVolume(c);
+        fluidDynImpactShock(c);
+        fluidDynConservationUnderStress(c);
+        fluidDynDeterminism(c);
+        fluidDynSleeping(c);
+        fluidDynExtremes(c);
+    }
+}
+
+/** The tick of the dynamics checks, in seconds: short enough that a wave crosses a cell in several ticks. */
+const FLUID_DYN_DT : f64 = 0.02;
+
+// Rules for the checks: a short step, water's gravity, and the sweep that never sleeps.
+fn fluidDynRules() : FluidRules {
+    let mut r : FluidRules = FluidRules {};
+    r.dt = FLUID_DYN_DT;
+    r.drag = 1.5;
+    r.maxLevel = 100.0;
+    r.strategy = FluidStrategy::FullSweep;
+    return r;
+}
+
+// A U-tube on a 7 x 2 grid: arms at (1, 0) and (5, 0), the channel along z = 1 from x = 1 to 5, everything
+// else a wall of height 10. Seven water cells, so a pour of 7 rests at level 1 everywhere.
+fn fluidDynUTube(rules : FluidRules) : FluidWorld {
+    let w : FluidWorld = new FluidWorld(rules, 7, 2);
+    for (z of 0..2) {
+        for (x of 0..7) {
+            let arm : bool = z == 0 && (x == 1 || x == 5);
+            let channel : bool = z == 1 && x >= 1 && x <= 5;
+            if (!arm && !channel) {
+                w.setGround(x, z, 10.0);
+            }
+        }
+    }
+    return w;
+}
+
+fn fluidDynRun(w : FluidWorld, ticks : i32) : void {
+    for (t of 0..ticks) {
+        w.tick();
+    }
+}
+
+// Communicating vessels: water poured into one arm of a U-tube rises to the same level in every part of it,
+// 7 units over 7 cells = 1, and a raised floor in one arm lowers its water by exactly the floor.
+fn fluidDynCommunicatingVessels(c : Checks) : void {
+    let w : FluidWorld = fluidDynUTube(fluidDynRules());
+    w.pour(1, 0, 7.0);
+    fluidDynRun(w, FLUID_SETTLE_TICKS);
+    c.near("vessels: the poured arm levelled to 1", w.levelAt(1, 0), 1.0, FLUID_TOL_SETTLED);
+    c.near("vessels: the far arm rose to 1", w.levelAt(5, 0), 1.0, FLUID_TOL_SETTLED);
+    c.near("vessels: the channel holds 1", w.levelAt(3, 1), 1.0, FLUID_TOL_SETTLED);
+    c.near("vessels: volume conserved", w.totalVolume(), 7.0, FLUID_TOL_EXACT);
+    c.near("vessels: the walls stayed dry", w.levelAt(0, 0) + w.levelAt(6, 1), 0.0, 0.0);
+
+    // A floor of 0.5 under the far arm: the surface h is shared, so the far arm holds h - 0.5.
+    // Cells: 6 at depth h plus the arm at h - 0.5 sum to 7, so 7 h = 7.5 and h = 15/14.
+    let raised : FluidWorld = fluidDynUTube(fluidDynRules());
+    raised.setGround(5, 0, 0.5);
+    raised.pour(1, 0, 7.0);
+    fluidDynRun(raised, FLUID_SETTLE_TICKS);
+    let surface : f64 = 15.0 / 14.0;
+    c.near(
+        "vessels: the shared surface is 15/14",
+        raised.levelAt(3, 1),
+        surface,
+        FLUID_TOL_SETTLED
+    );
+    c.near(
+        "vessels: the raised arm holds the surface less its floor",
+        raised.levelAt(5, 0),
+        surface - 0.5,
+        FLUID_TOL_SETTLED
+    );
+}
+
+// A piston: a head of 0.5 laid on one arm holds that arm 0.5 lower than the rest. With 7 units over 7 cells,
+// the loaded arm holds a, the other six hold a + 0.5, and a + 6 (a + 0.5) = 7 gives a = 4/7. Releasing the
+// piston returns every cell to 1, and a pressure in pascals is the same head over density times gravity.
+fn fluidDynPiston(c : Checks) : void {
+    let w : FluidWorld = fluidDynUTube(fluidDynRules());
+    w.pour(1, 0, 7.0);
+    fluidDynRun(w, 1500);
+    w.setLoad(1, 0, 0.5);
+    fluidDynRun(w, FLUID_SETTLE_TICKS);
+    c.near("piston: the loaded arm drops to 4/7", w.levelAt(1, 0), 4.0 / 7.0, FLUID_TOL_SETTLED);
+    c.near(
+        "piston: the far arm is pushed up to 15/14",
+        w.levelAt(5, 0),
+        15.0 / 14.0,
+        FLUID_TOL_SETTLED
+    );
+    c.near("piston: the heads match", w.headAt(1, 0), w.headAt(5, 0), FLUID_TOL_SETTLED);
+    c.near("piston: volume conserved", w.totalVolume(), 7.0, FLUID_TOL_EXACT);
+
+    w.setLoad(1, 0, 0.0);
+    fluidDynRun(w, FLUID_SETTLE_TICKS);
+    c.near("piston: released, the arm returns to 1", w.levelAt(1, 0), 1.0, FLUID_TOL_SETTLED);
+
+    let pascals : FluidWorld = fluidDynUTube(fluidDynRules());
+    pascals.pour(1, 0, 7.0);
+    let rules : FluidRules = pascals.settings();
+    pascals.setLoadPressure(1, 0, 0.5 * rules.density * rules.gravity);
+    c.near(
+        "piston: 0.5 head is a pressure of 0.5 rho g",
+        pascals.loadAt(1, 0),
+        0.5,
+        FLUID_TOL_EXACT
+    );
+
+    // A piston pushes water out before it reaches equilibrium: the pressure wave covers the four cells to the far
+    // arm at about 3 cells a second, so three seconds after it lands the arm is already higher than it was.
+    let fresh : FluidWorld = fluidDynUTube(fluidDynRules());
+    fresh.pour(1, 0, 1.0);
+    fresh.pour(5, 0, 1.0);
+    fresh.pour(2, 1, 1.0);
+    fresh.pour(3, 1, 1.0);
+    fresh.pour(4, 1, 1.0);
+    fresh.pour(1, 1, 1.0);
+    fresh.pour(5, 1, 1.0);
+    fresh.setLoad(1, 0, 1.0);
+    fluidDynRun(fresh, 150);
+    c.that(
+        "piston: the far arm rises within three seconds, before equilibrium",
+        fresh.levelAt(5, 0) > 1.01
+    );
+}
+
+// Pressure overflow: a column may hold more than maxLevel, and the excess is compressed water that pushes.
+// With stiffness 4 a column of 2 over a brim of 1 has head 2 + 4 = 6. The settled world has equal heads
+// everywhere, and the compressed side holds more than the brim.
+fn fluidDynPressureMode(c : Checks) : void {
+    let mut r : FluidRules = fluidDynRules();
+    r.overflow = FluidOverflow::Pressure;
+    r.maxLevel = 1.0;
+    r.pressureStiffness = 4.0;
+    let w : FluidWorld = new FluidWorld(r, 2, 1);
+    w.setGround(1, 0, 1.0);
+    w.pour(0, 0, 2.0);
+    c.near(
+        "pressure: head of 2 over a brim of 1 at stiffness 4",
+        w.headAt(0, 0),
+        6.0,
+        FLUID_TOL_EXACT
+    );
+
+    fluidDynRun(w, 4000);
+    c.near(
+        "pressure: heads equal at rest",
+        w.headAt(0, 0),
+        w.headAt(1, 0),
+        FLUID_TOL_SETTLED_ROUGH
+    );
+    c.near("pressure: nothing lost", w.totalVolume(), 2.0, FLUID_TOL_EXACT);
+    c.near(
+        "pressure: the compressed column holds 7/6",
+        w.levelAt(0, 0),
+        7.0 / 6.0,
+        FLUID_TOL_SETTLED_ROUGH
+    );
+    c.near(
+        "pressure: the raised column holds 5/6",
+        w.levelAt(1, 0),
+        5.0 / 6.0,
+        FLUID_TOL_SETTLED_ROUGH
+    );
+}
+
+// Index of the highest level among columns x0..x1 of row 0.
+fn fluidDynPeak(w : FluidWorld, x0 : i32, x1 : i32) : i32 {
+    let mut best : i32 = x0;
+    for (x of x0..x1 + 1) {
+        if (w.levelAt(x, 0) > w.levelAt(best, 0)) {
+            best = x;
+        }
+    }
+    return best;
+}
+
+/** Columns of the wave channel: odd, so the bump has a centre and the two pulses a mirror. */
+const FLUID_DYN_CHANNEL : i32 = 81;
+
+/** The column of the bump, the middle of the channel. */
+const FLUID_DYN_BUMP : i32 = 40;
+
+/** Columns each side of the bump that the mirror check compares, short of where a pulse could reach the wall. */
+const FLUID_DYN_MIRROR_SPAN : i32 = 30;
+
+/** Ticks of the wave checks: two seconds at the dynamics tick. */
+const FLUID_DYN_WAVE_TICKS : i32 = 100;
+
+// A flat 1D channel of depth 1 with a bump of 0.1 on top of the middle column, under `rules`.
+fn fluidDynChannel(rules : FluidRules) : FluidWorld {
+    let w : FluidWorld = new FluidWorld(rules, FLUID_DYN_CHANNEL, 1);
+    for (x of 0..FLUID_DYN_CHANNEL) {
+        w.pour(x, 0, 1.0);
+    }
+    w.pour(FLUID_DYN_BUMP, 0, 0.1);
+    return w;
+}
+
+// A flat 1D channel of depth 1 with a small bump at x = 40 and no drag: the bump splits in two pulses that
+// travel at c = sqrt(g h). After 2 s at g = 9.81 each peak is c * 2 = 6.26 cells away; at 4 g they are twice as
+// far. The channel is symmetric, so the two pulses mirror each other exactly: the scan order has no bias.
+fn fluidDynWaveSpeed(c : Checks) : void {
+    let mut r : FluidRules = fluidDynRules();
+    r.drag = 0.0;
+    let w : FluidWorld = fluidDynChannel(r);
+    fluidDynRun(w, FLUID_DYN_WAVE_TICKS);
+    let right : i32 = fluidDynPeak(w, FLUID_DYN_BUMP + 1, FLUID_DYN_CHANNEL - 1);
+    let reach : f64 = (right - FLUID_DYN_BUMP) as f64;
+    c.near("waves: the pulse peak is c t = 6.26 cells out", reach, 6.26, 1.5);
+    let mut mirror : f64 = 0.0;
+    for (k of 1..FLUID_DYN_MIRROR_SPAN) {
+        let gap : f64 = w.levelAt(FLUID_DYN_BUMP + k, 0) - w.levelAt(FLUID_DYN_BUMP - k, 0);
+        if (gap > mirror) {
+            mirror = gap;
+        }
+        if (0.0 - gap > mirror) {
+            mirror = 0.0 - gap;
+        }
+    }
+    c.near("waves: the two pulses are mirror images", mirror, 0.0, FLUID_TOL_EXACT);
+    c.near("waves: the volume is the water poured", w.totalVolume(), 81.1, FLUID_TOL_EXACT);
+
+    let mut heavy : FluidRules = r;
+    heavy.gravity = 4.0 * 9.81;
+    let h : FluidWorld = fluidDynChannel(heavy);
+    fluidDynRun(h, FLUID_DYN_WAVE_TICKS);
+    let heavyPeak : i32 = fluidDynPeak(h, FLUID_DYN_BUMP + 1, FLUID_DYN_CHANNEL - 1);
+    let farther : f64 = (heavyPeak - FLUID_DYN_BUMP) as f64;
+    c.near("waves: four times the gravity doubles the reach", farther, 12.5, 2.0);
+    c.that("waves: and the pulse is farther than at 1 g", farther > reach + 3.0);
+}
+
+// Sloshing: with no drag two columns exchange water back and forth and the level overshoots the mean; a
+// heavily damped pair settles without crossing it.
+fn fluidDynSloshing(c : Checks) : void {
+    let mut free : FluidRules = fluidDynRules();
+    free.drag = 0.0;
+    let a : FluidWorld = new FluidWorld(free, 2, 1);
+    a.pour(0, 0, 1.0);
+    let mut lowest : f64 = 1.0;
+    for (t of 0..120) {
+        a.tick();
+        if (a.levelAt(0, 0) < lowest) {
+            lowest = a.levelAt(0, 0);
+        }
+    }
+    c.that("sloshing: an undamped pair overshoots the mean", lowest < 0.4);
+
+    let mut damped : FluidRules = fluidDynRules();
+    damped.drag = 20.0;
+    let b : FluidWorld = new FluidWorld(damped, 2, 1);
+    b.pour(0, 0, 1.0);
+    let mut floor : f64 = 1.0;
+    for (t of 0..400) {
+        b.tick();
+        if (b.levelAt(0, 0) < floor) {
+            floor = b.levelAt(0, 0);
+        }
+    }
+    c.that("sloshing: a heavily damped pair never crosses the mean", floor > 0.49);
+}
+
+// Viscosity: the same pulse in a viscous fluid is lower and broader than in an ideal one, and volume is the
+// same either way.
+fn fluidDynViscosity(c : Checks) : void {
+    let mut ideal : FluidRules = fluidDynRules();
+    ideal.drag = 0.0;
+    let mut thick : FluidRules = ideal;
+    thick.viscosity = 5.0;
+
+    let a : FluidWorld = new FluidWorld(ideal, 41, 5);
+    let b : FluidWorld = new FluidWorld(thick, 41, 5);
+    for (z of 0..5) {
+        for (x of 0..41) {
+            a.pour(x, z, 1.0);
+            b.pour(x, z, 1.0);
+        }
+    }
+    a.pour(20, 2, 0.5);
+    b.pour(20, 2, 0.5);
+    fluidDynRun(a, 60);
+    fluidDynRun(b, 60);
+
+    let mut peakA : f64 = 0.0;
+    let mut peakB : f64 = 0.0;
+    for (z of 0..5) {
+        for (x of 0..41) {
+            if (x > 22 && a.levelAt(x, z) > peakA) {
+                peakA = a.levelAt(x, z);
+            }
+            if (x > 22 && b.levelAt(x, z) > peakB) {
+                peakB = b.levelAt(x, z);
+            }
+        }
+    }
+    c.that("viscosity: the viscous pulse is lower", peakB < peakA);
+    c.near("viscosity: the volume is the same", b.totalVolume(), a.totalVolume(), FLUID_TOL_EXACT);
+}
+
+// Walls: water does not climb a wall it does not reach, and a deeper pool than the wall spills over it.
+fn fluidDynWalls(c : Checks) : void {
+    let w : FluidWorld = new FluidWorld(fluidDynRules(), 2, 1);
+    w.setGround(1, 0, 5.0);
+    w.pour(0, 0, 1.0);
+    fluidDynRun(w, 500);
+    c.near("walls: a wall higher than the water stays dry", w.levelAt(1, 0), 0.0, 0.0);
+    c.near("walls: and the water stays", w.levelAt(0, 0), 1.0, 0.0);
+
+    let over : FluidWorld = new FluidWorld(fluidDynRules(), 2, 1);
+    over.setGround(1, 0, 1.0);
+    over.pour(0, 0, 3.0);
+    fluidDynRun(over, 3000);
+    // Surface s over both: s = 3 + 0 shared as (s) + (s - 1) = 3, so s = 2.
+    c.near(
+        "walls: water over a wall levels out on both sides",
+        over.levelAt(0, 0),
+        2.0,
+        FLUID_TOL_SETTLED_ROUGH
+    );
+    c.near(
+        "walls: the far side holds one less than the surface",
+        over.levelAt(1, 0),
+        1.0,
+        FLUID_TOL_SETTLED_ROUGH
+    );
+}
+
+// Sources and drains work over a block: an even share into, and out of, every column of it.
+fn fluidDynEmitterBlocks(c : Checks) : void {
+    let mut r : FluidRules = fluidDynRules();
+    r.overflow = FluidOverflow::Keep;
+    let w : FluidWorld = new FluidWorld(r, 3, 3);
+    let id : i32 = w.addSource(FluidSource::infinite(1, 1, 9.0));
+    w.sourceRadius(id, 1);
+    w.tick();
+    let share : f64 = 9.0 * r.dt / 9.0;
+    c.near("blocks: the source spread its water evenly", w.levelAt(0, 0), share, FLUID_TOL_EXACT);
+    c.near("blocks: the centre got the same", w.levelAt(1, 1), share, FLUID_TOL_EXACT);
+    c.near(
+        "blocks: the ledger says the whole rate",
+        w.injectedTotal(),
+        9.0 * r.dt,
+        FLUID_TOL_EXACT
+    );
+
+    let d : FluidWorld = new FluidWorld(r, 5, 5);
+    for (z of 0..5) {
+        for (x of 0..5) {
+            d.pour(x, z, 1.0);
+        }
+    }
+    let sink : i32 = d.addSink(FluidSink::at(2, 2, 4.5));
+    d.sinkRadius(sink, 1);
+    d.tick();
+    c.near("blocks: the drain took 0.09 in total", d.drainedTotal(), 4.5 * r.dt, FLUID_TOL_EXACT);
+    c.near(
+        "blocks: and the same from the corner",
+        d.levelAt(1, 1),
+        d.levelAt(3, 3),
+        FLUID_TOL_EXACT
+    );
+    c.near("blocks: and from the centre", d.levelAt(2, 2), d.levelAt(1, 1), FLUID_TOL_EXACT);
+}
+
+// An object entering a pool: the columns plus the spray hold exactly the pool plus the object, at the
+// instant of the hit and after every drop has landed. A slow object throws nothing; a fast one throws
+// more as it goes faster.
+fn fluidDynImpactVolume(c : Checks) : void {
+    let w : FluidWorld = fluidDynPool();
+    let before : f64 = w.totalVolume();
+    let hit : FluidImpact = FluidImpact { x: 10, z: 10, radius: 1, volume: 0.9, speed: 8.0 };
+    w.impact(hit);
+    c.near(
+        "impact: columns plus spray hold the pool plus the object",
+        w.totalVolume() + w.airborneVolume(),
+        before + 0.9,
+        FLUID_TOL_EXACT
+    );
+    c.that("impact: a fast hit throws spray", w.particleCount() > 0);
+    c.that("impact: the spray is a share of the object, not more", w.airborneVolume() <= 0.4 * 0.9);
+
+    fluidDynRun(w, 600);
+    c.near("impact: every drop landed", w.airborneVolume(), 0.0, 0.0);
+    c.near(
+        "impact: and the pool holds the object's volume",
+        w.totalVolume(),
+        before + 0.9,
+        FLUID_TOL_EXACT
+    );
+
+    let slow : FluidWorld = fluidDynPool();
+    slow.impact(FluidImpact { x: 10, z: 10, radius: 1, volume: 0.9, speed: 1.0 });
+    c.that("impact: a slow object throws no spray", slow.particleCount() == 0);
+
+    let fast : FluidWorld = fluidDynPool();
+    let faster : FluidWorld = fluidDynPool();
+    fast.impact(FluidImpact { x: 10, z: 10, radius: 1, volume: 0.9, speed: 4.0 });
+    faster.impact(FluidImpact { x: 10, z: 10, radius: 1, volume: 0.9, speed: 12.0 });
+    c.that("impact: more speed throws more", faster.airborneVolume() > fast.airborneVolume());
+
+    let mut gentle : FluidSplash = FluidSplash {};
+    gentle.fraction = 0.0;
+    let calm : FluidWorld = fluidDynPool();
+    calm.setSplash(gentle);
+    calm.impact(FluidImpact { x: 10, z: 10, radius: 1, volume: 0.9, speed: 12.0 });
+    c.that("impact: a splash fraction of zero throws nothing", calm.particleCount() == 0);
+
+    let off : FluidWorld = fluidDynPool();
+    off.impact(FluidImpact { x: -5, z: 3, radius: 1, volume: 0.9, speed: 12.0 });
+    c.near("impact: outside the grid does nothing", off.totalVolume(), before, 0.0);
+}
+
+// A calm square pool: 21 x 21 columns, level 1, over flat ground, sweeping every column.
+fn fluidDynPool() : FluidWorld {
+    let w : FluidWorld = new FluidWorld(fluidDynRules(), 21, 21);
+    for (z of 0..21) {
+        for (x of 0..21) {
+            w.pour(x, z, 1.0);
+        }
+    }
+    return w;
+}
+
+// The shock of an impact: the ring wave leaves the footprint symmetrically, and a hit that shoves reaches
+// farther in the same time than a displacement alone.
+fn fluidDynImpactShock(c : Checks) : void {
+    let w : FluidWorld = fluidDynPool();
+    w.impact(FluidImpact { x: 10, z: 10, radius: 0, volume: 0.5, speed: 1.0 });
+    fluidDynRun(w, 10);
+    let east : f64 = w.levelAt(13, 10);
+    c.that("shock: the ring wave reaches three columns out", east > 1.0 + 0.00001);
+    c.near("shock: west mirrors east", w.levelAt(7, 10), east, FLUID_TOL_EXACT);
+    c.near("shock: north mirrors east", w.levelAt(10, 7), east, FLUID_TOL_EXACT);
+    c.near("shock: south mirrors east", w.levelAt(10, 13), east, FLUID_TOL_EXACT);
+
+    let mut still : FluidSplash = FluidSplash {};
+    still.kick = 0.0;
+    let a : FluidWorld = fluidDynPool();
+    a.setSplash(still);
+    let b : FluidWorld = fluidDynPool();
+    a.impact(FluidImpact { x: 10, z: 10, radius: 0, volume: 0.5, speed: 1.0 });
+    b.impact(FluidImpact { x: 10, z: 10, radius: 0, volume: 0.5, speed: 1.0 });
+    fluidDynRun(a, 6);
+    fluidDynRun(b, 6);
+    c.that(
+        "shock: the shoved water gets farther than the displaced alone",
+        b.levelAt(12, 10) > a.levelAt(12, 10)
+    );
+}
+
+// Volume bookkeeping under everything at once: sources, drains, loads switching, pours and impacts, for both
+// strategies. The columns, the spray and the ledgers always close, and no level goes below zero.
+fn fluidDynConservationUnderStress(c : Checks) : void {
+    fluidDynStress(c, FluidStrategy::FullSweep, "full sweep");
+    fluidDynStress(c, FluidStrategy::ActiveSet, "active set");
+}
+
+fn fluidDynStress(c : Checks, strategy : FluidStrategy, name : string) : void {
+    let mut r : FluidRules = fluidDynRules();
+    r.strategy = strategy;
+    r.viscosity = 0.5;
+    r.maxLevel = 3.0;
+    let w : FluidWorld = new FluidWorld(r, 16, 16);
+    for (z of 0..16) {
+        for (x of 0..16) {
+            w.setGround(x, z, 0.1 * ((x + z) as f64));
+        }
+    }
+    w.addSource(FluidSource::infinite(2, 2, 1.5));
+    w.addSink(FluidSink::at(13, 13, 0.7));
+
+    let mut dropped : f64 = 0.0;
+    let mut lowest : f64 = 0.0;
+    for (t of 0..600) {
+        if (t % 40 == 0) {
+            w.impact(FluidImpact { x: 5 + (t / 40) % 6, z: 6, radius: 1, volume: 0.3, speed: 6.0 });
+            dropped = dropped + 0.3;
+        }
+        if (t % 70 == 0) {
+            w.pour(8, 8, 2.0);
+            dropped = dropped + 2.0;
+        }
+        if (t == 200) {
+            w.setLoad(4, 4, 1.0);
+        }
+        if (t == 400) {
+            w.setLoad(4, 4, 0.0);
+        }
+        w.tick();
+        for (z of 0..16) {
+            for (x of 0..16) {
+                if (w.levelAt(x, z) < lowest) {
+                    lowest = w.levelAt(x, z);
+                }
+            }
+        }
+    }
+    let held : f64 = w.totalVolume() + w.airborneVolume();
+    let expected : f64 = dropped + w.injectedTotal() - w.drainedTotal();
+    c.near("stress ${name}: the ledgers close", held, expected, 0.00000001);
+    c.that("stress ${name}: no negative water", lowest >= -FLUID_DRY);
+}
+
+// Determinism: two worlds given the same history, impacts, loads and spray included, agree bit for bit.
+fn fluidDynDeterminism(c : Checks) : void {
+    let a : FluidWorld = fluidDynPool();
+    let b : FluidWorld = fluidDynPool();
+    for (t of 0..200) {
+        if (t == 5 || t == 60) {
+            a.impact(FluidImpact { x: 8, z: 12, radius: 1, volume: 0.6, speed: 9.0 });
+            b.impact(FluidImpact { x: 8, z: 12, radius: 1, volume: 0.6, speed: 9.0 });
+        }
+        if (t == 20) {
+            a.setLoad(3, 3, 0.7);
+            b.setLoad(3, 3, 0.7);
+        }
+        a.tick();
+        b.tick();
+    }
+    let mut same : bool = true;
+    for (z of 0..21) {
+        for (x of 0..21) {
+            if (a.levelAt(x, z) != b.levelAt(x, z)) {
+                same = false;
+            }
+        }
+    }
+    c.that("determinism: levels equal bit for bit after impacts and loads", same);
+    c.that("determinism: the spray in flight is the same", a.particleCount() == b.particleCount());
+    c.that("determinism: and carries the same volume", a.airborneVolume() == b.airborneVolume());
+}
+
+// Sleeping: a settled active-set world visits nothing, and a load wakes the columns it touches.
+fn fluidDynSleeping(c : Checks) : void {
+    let mut r : FluidRules = fluidDynRules();
+    r.strategy = FluidStrategy::ActiveSet;
+    let w : FluidWorld = new FluidWorld(r, 6, 1);
+    w.pour(0, 0, 3.0);
+    fluidDynRun(w, 3000);
+    c.near(
+        "sleeping: the settled world is flat",
+        w.levelAt(5, 0),
+        w.levelAt(0, 0),
+        FLUID_TOL_SETTLED
+    );
+    c.that("sleeping: and nothing is awake", w.awakeCount() == 0);
+
+    w.setLoad(0, 0, 0.5);
+    c.that("sleeping: a load wakes its column", w.isAwake(0, 0));
+    fluidDynRun(w, 3000);
+    c.that("sleeping: the loaded column ended lower", w.levelAt(0, 0) < w.levelAt(5, 0) - 0.1);
+}
+
+// Extremes: a 1 x 1 world, a very deep pool with a long step, and a world with no gravity must all tick without
+// producing a non-finite or negative level.
+fn fluidDynExtremes(c : Checks) : void {
+    let tiny : FluidWorld = new FluidWorld(fluidDynRules(), 1, 1);
+    tiny.pour(0, 0, 2.0);
+    tiny.impact(FluidImpact { x: 0, z: 0, radius: 2, volume: 0.1, speed: 9.0 });
+    fluidDynRun(tiny, 300);
+    c.near(
+        "extremes: a one-column world keeps its water",
+        tiny.totalVolume() + tiny.airborneVolume(),
+        2.1,
+        FLUID_TOL_EXACT
+    );
+
+    let mut deep : FluidRules = fluidDynRules();
+    deep.dt = 0.1;
+    let d : FluidWorld = new FluidWorld(deep, 8, 8);
+    d.pour(3, 3, 60.0);
+    let mut lowest : f64 = 0.0;
+    let mut highest : f64 = 0.0;
+    for (t of 0..400) {
+        d.tick();
+        for (z of 0..8) {
+            for (x of 0..8) {
+                if (d.levelAt(x, z) < lowest) {
+                    lowest = d.levelAt(x, z);
+                }
+                if (d.levelAt(x, z) > highest) {
+                    highest = d.levelAt(x, z);
+                }
+            }
+        }
+    }
+    c.that("extremes: deep water with a long step stays non-negative", lowest >= -FLUID_DRY);
+    c.that("extremes: and never exceeds what was poured", highest <= 60.000000001);
+    c.near("extremes: and keeps its volume", d.totalVolume(), 60.0, FLUID_TOL_EXACT);
+    c.near("extremes: the deep pool settles flat", d.levelAt(0, 0), 60.0 / 64.0, 0.05);
+}

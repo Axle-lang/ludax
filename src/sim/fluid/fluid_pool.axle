@@ -1,0 +1,251 @@
+// fluid_pool — the storage of one population of particles, and the population the layer is made of.
+//
+// A `FluidPool` is structure-of-arrays: one `f64` array per quantity, so the solver's loops stream through
+// memory and a parallel kernel writes only the slots of its own index range. Positions are `f64` ("f64 for
+// positions in the world"). The pool never grows past its capacity and refuses an `add` at the limit; it
+// grows its arrays by doubling only up to that limit, so a tick allocates only when a population reaches a new
+// high (or never, with `reserve`).
+//
+// Removal is never done mid-loop. A kernel writes a `fate` for each particle (stay, land, break); a serial
+// phase in index order acts on every fate (the coupling deposits water, spawns drops) and
+// then `compact` squeezes the survivors together preserving their order. So the order of particles is a
+// function of the history alone, and the same for any number of threads.
+//
+// `FluidPopulation` bundles the two pools with the ledger counters, the serial random generator and the
+// tick number: the one object the solver, the coupling and the emission all take, so none of them has to
+// import another.
+
+use crate::core::math::dvec2::DVec2;
+use crate::core::math::dvec3::DVec3;
+use crate::core::rng::pcg32::Pcg32;
+use crate::sim::fluid::fluid_noise::FluidNoise;
+use crate::sim::fluid::fluid_particle::{FluidLedger, FluidParticle, FluidParticleKind, fluidParticleVolume};
+use crate::sim::fluid::fluid_particle_params::FluidParticleParams;
+
+/** The particle is still flying. */
+pub(crate) const FLUID_FATE_STAY : i32 = 0;
+
+/** The particle reached the surface or the bed and is to be merged into the columns. */
+pub(crate) const FLUID_FATE_LAND : i32 = 1;
+
+/** The (liquid) particle is to shatter into spray. */
+pub(crate) const FLUID_FATE_BREAK : i32 = 2;
+
+/** Slots a pool starts with when it does not reserve its capacity. */
+const FLUID_POOL_START : i32 = 256;
+
+/** The `Pcg32` stream of the serial phases, fixed so a world's scatter is repeatable. */
+const FLUID_POPULATION_STREAM : u64 = 77;
+
+/** One population of particles in structure-of-arrays form. */
+pub(crate) class FluidPool {
+    pub(crate) kind   : FluidParticleKind;
+    pub(crate) px     : f64[];
+    pub(crate) py     : f64[];
+    pub(crate) pz     : f64[];
+    pub(crate) vx     : f64[];
+    pub(crate) vy     : f64[];
+    pub(crate) vz     : f64[];
+    pub(crate) radius : f64[];
+
+    /** Seconds since birth. */
+    pub(crate) age : f64[];
+
+    /** What the last kernel decided for the particle; `FLUID_FATE_*`. */
+    pub(crate) fate : i32[];
+
+    /** How many particles are alive. */
+    pub(crate) used : i32 = 0;
+
+    /** The most particles the pool will ever hold. */
+    pub(crate) limit : i32;
+
+    /** How many slots are allocated now (at most `limit`). */
+    pub(crate) room : i32;
+
+    /** An empty pool of `kind` that holds at most `limit` particles; `reserve` allocates them all now. */
+    constructor(kind : FluidParticleKind, limit : i32, reserve : bool) {
+        self.kind = kind;
+        self.limit = limit;
+        let mut start : i32 = FLUID_POOL_START;
+        if (reserve || start > limit) {
+            start = limit;
+        }
+        self.room = start;
+        let n : i64 = (start + 1) as i64;
+        self.px = new f64[n];
+        self.py = new f64[n];
+        self.pz = new f64[n];
+        self.vx = new f64[n];
+        self.vy = new f64[n];
+        self.vz = new f64[n];
+        self.radius = new f64[n];
+        self.age = new f64[n];
+        self.fate = new i32[n];
+    }
+
+    /** Adds a particle at `at` with `velocity` and `radius`; false when the pool is at its limit. */
+    pub(crate) fn add(mut self, at : DVec3, velocity : DVec3, radius : f64) : bool {
+        if (self.used >= self.limit) {
+            return false;
+        }
+        if (self.used >= self.room) {
+            self.grow();
+        }
+
+        let i : i64 = self.used as i64;
+        self.px[i] = at.x;
+        self.py[i] = at.y;
+        self.pz[i] = at.z;
+        self.vx[i] = velocity.x;
+        self.vy[i] = velocity.y;
+        self.vz[i] = velocity.z;
+        self.radius[i] = radius;
+        self.age[i] = 0.0;
+        self.fate[i] = FLUID_FATE_STAY;
+        self.used = self.used + 1;
+        return true;
+    }
+
+    // Doubles the arrays (up to the limit), keeping the particles.
+    fn grow(mut self) : void {
+        let mut room : i32 = self.room * 2;
+        if (room < 1) {
+            room = 1;
+        }
+        if (room > self.limit) {
+            room = self.limit;
+        }
+
+        let used : i32 = self.used;
+        self.px = FluidPool::widen(self.px, used, room);
+        self.py = FluidPool::widen(self.py, used, room);
+        self.pz = FluidPool::widen(self.pz, used, room);
+        self.vx = FluidPool::widen(self.vx, used, room);
+        self.vy = FluidPool::widen(self.vy, used, room);
+        self.vz = FluidPool::widen(self.vz, used, room);
+        self.radius = FluidPool::widen(self.radius, used, room);
+        self.age = FluidPool::widen(self.age, used, room);
+
+        let mut fates : i32[] = new i32[(room + 1) as i64];
+        for (i of 0..used) {
+            fates[i as i64] = self.fate[i as i64];
+        }
+        self.fate = fates;
+        self.room = room;
+    }
+
+    // A copy of the first `used` entries in an array of `room` slots.
+    static fn widen(old : f64[], used : i32, room : i32) : f64[] {
+        let mut bigger : f64[] = new f64[(room + 1) as i64];
+        for (i of 0..used) {
+            bigger[i as i64] = old[i as i64];
+        }
+        return bigger;
+    }
+
+    /** Removes every particle whose fate is not `FLUID_FATE_STAY`, keeping the order of the rest. */
+    pub(crate) fn compact(mut self) : void {
+        let mut out : i32 = 0;
+        for (i of 0..self.used) {
+            let from : i64 = i as i64;
+            if (self.fate[from] != FLUID_FATE_STAY) {
+                continue;
+            }
+            if (out != i) {
+                let to : i64 = out as i64;
+                self.px[to] = self.px[from];
+                self.py[to] = self.py[from];
+                self.pz[to] = self.pz[from];
+                self.vx[to] = self.vx[from];
+                self.vy[to] = self.vy[from];
+                self.vz[to] = self.vz[from];
+                self.radius[to] = self.radius[from];
+                self.age[to] = self.age[from];
+            }
+            out = out + 1;
+        }
+        for (i of 0..out) {
+            self.fate[i as i64] = FLUID_FATE_STAY;
+        }
+        self.used = out;
+    }
+
+    /** The volume the pool's particles carry: the sum of their radii's volumes, in index order. */
+    pub(crate) fn volume(self) : f64 {
+        let mut sum : f64 = 0.0;
+        for (i of 0..self.used) {
+            sum = sum + fluidParticleVolume(self.kind, self.radius[i as i64]);
+        }
+        return sum;
+    }
+
+    /** Particle `k` as the public record; `k` must be inside `0..used`. */
+    pub(crate) fn at(self, k : i32) : FluidParticle {
+        let i : i64 = k as i64;
+        return FluidParticle {
+            position: DVec3::make(self.px[i], self.py[i], self.pz[i]),
+            velocity: DVec3::make(self.vx[i], self.vy[i], self.vz[i]),
+            radius: self.radius[i],
+            kind: self.kind,
+            age: self.age[i],
+        };
+    }
+}
+
+/** The two pools, the running ledger and the serial random generator: what the layer's phases share. */
+pub(crate) class FluidPopulation {
+    pub(crate) params  : FluidParticleParams;
+    pub(crate) liquid  : FluidPool;
+    pub(crate) spray   : FluidPool;
+    pub(crate) rng     : Pcg32;
+    pub(crate) emitted : f64 = 0.0;
+    pub(crate) landed  : f64 = 0.0;
+    pub(crate) tick    : i64 = 0;
+    draws              : i64 = 0;
+    pub(crate) gravity : f64;
+
+    /** An empty population under `params` (already `checked`) in a world of the given `gravity`. */
+    constructor(params : FluidParticleParams, gravity : f64) {
+        self.gravity = gravity;
+        self.params = params;
+        self.liquid = new FluidPool(FluidParticleKind::Liquid, params.liquid.capacity, params.reserve);
+        self.spray = new FluidPool(FluidParticleKind::Spray, params.spray.capacity, params.reserve);
+        self.rng = new Pcg32(params.seed, FLUID_POPULATION_STREAM);
+    }
+
+    /** A random horizontal unit vector (x, then z) for the serial phases: stateless hashing keyed by the
+     * tick and a running draw counter, so it is a function of the history. */
+    pub(crate) fn direction(mut self) : DVec2 {
+        self.draws = self.draws + 1;
+        return FluidNoise::disk(self.params.seed as i64, self.tick, self.draws);
+    }
+
+    /** The volume the liquid particles of a given radius carry. */
+    pub(crate) fn liquidVolume(self) : f64 {
+        return fluidParticleVolume(FluidParticleKind::Liquid, self.params.liquid.radius);
+    }
+
+    /** How many particles are alive, all kinds. */
+    pub(crate) fn count(self) : i32 {
+        return self.liquid.used + self.spray.used;
+    }
+
+    /** Particle `k`: liquid first, then spray. */
+    pub(crate) fn at(self, k : i32) : FluidParticle {
+        if (k < self.liquid.used) {
+            return self.liquid.at(k);
+        }
+        return self.spray.at(k - self.liquid.used);
+    }
+
+    /** The ledger as it stands, the pools summed in index order. */
+    pub(crate) fn ledger(self) : FluidLedger {
+        return FluidLedger {
+            liquid: self.liquid.volume(),
+            spray: self.spray.volume(),
+            emitted: self.emitted,
+            landed: self.landed,
+        };
+    }
+}

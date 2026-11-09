@@ -1,0 +1,108 @@
+// fluid_particles — the particle layer of a world: its populations, its solvers, and the order they run in.
+//
+// This is the module boundary the rest of the engine sees. It owns the two populations (liquid, spray)
+// as a `FluidPopulation`, the liquid solver, the spray stepper and the runner that executes
+// their stages on the job pool, and it knows how to step them one tick against a bed (`FluidField`, read for
+// collisions and landing). It does not own the heightfield's dynamics, the foam, or the sources: a world
+// wires those to it, and the only code in the engine that moves water between the two is `fluid_coupling`
+// (particles to columns) and `fluid_emit` (columns to particles).
+//
+// One `step` is, in this order: liquid prediction, the spatial sort, neighbour lists, `iterations` rounds of
+// multipliers, deltas and displacement, velocities, viscosity and cohesion, fates; the spray
+// flown; then the coupling acts on the fates serially and compacts the pools. A population whose capacity is
+// 0 is skipped outright, and a world with no particles alive costs a tick counter.
+//
+// Reconfiguring (`reconfigure`) is allowed between ticks: it pours everything airborne back into the columns
+// first, so changing capacities never loses water, then rebuilds the populations and solvers under the new
+// parameters and keeps the ledger totals running.
+
+use crate::sim::fluid::fluid_coupling::FluidCoupling;
+use crate::sim::fluid::fluid_field::FluidField;
+use crate::sim::fluid::fluid_foam::FluidFoam;
+use crate::sim::fluid::fluid_particle::fluidParticleVolume;
+use crate::sim::fluid::fluid_particle_params::FluidParticleParams;
+use crate::sim::fluid::fluid_pool::{FluidPool, FluidPopulation};
+use crate::sim::fluid::fluid_runner::{FluidRunner, FluidStage};
+use crate::sim::fluid::fluid_tick::FluidTick;
+
+/** The particle layer of one world. */
+pub(crate) class FluidParticles {
+    pub(crate) pop : Shared<FluidPopulation>;
+    runner         : FluidRunner;
+    field          : Shared<FluidField>;
+
+    /** A layer under `params` (already `checked`) over `field`, falling under `gravity`. */
+    constructor(params : FluidParticleParams, own field : Shared<FluidField>, gravity : f64) {
+        self.field = field;
+        self.pop = share new FluidPopulation(params, gravity);
+        self.runner = new FluidRunner(self.pop, field, gravity, field.rules.dt, params.threads);
+    }
+
+    /** Pours every airborne particle back into the columns, replaces the layer by one under `params`, and
+     * keeps the ledger totals. Call between ticks. */
+    pub(crate) fn reconfigure(mut self, params : FluidParticleParams, gravity : f64, run : FluidTick) : void {
+        self.drain(run);
+        self.runner.close();
+
+        let mut fresh : Shared<FluidPopulation> = share new FluidPopulation(params, gravity);
+        fresh.emitted = self.pop.emitted;
+        fresh.landed = self.pop.landed;
+        fresh.tick = self.pop.tick;
+        self.pop = fresh;
+        self.runner = new FluidRunner(self.pop, self.field, gravity, self.field.rules.dt, params.threads);
+    }
+
+    // Pours the volume of every liquid and spray particle into the column under it, at no speed.
+    fn drain(mut self, run : FluidTick) : void {
+        self.drainPool(self.pop.liquid, run);
+        self.drainPool(self.pop.spray, run);
+    }
+
+    fn drainPool(mut self, pool : FluidPool, run : FluidTick) : void {
+        for (i of 0..pool.used) {
+            let volume : f64 = fluidParticleVolume(pool.kind, pool.radius[i as i64]);
+            let c : i32 = FluidCoupling::columnOf(self.field, pool.px[i as i64], pool.pz[i as i64]);
+            FluidCoupling::deposit(self.field, run, c, volume, 0.0, 0.0);
+            self.pop.landed = self.pop.landed + volume;
+        }
+    }
+
+    /** Stops the worker threads; the layer must not step afterwards. */
+    pub(crate) fn close(mut self) : void {
+        self.runner.close();
+    }
+
+    /** Advances the layer one tick against the current columns, landing what arrives (into `run`'s
+     * bookkeeping) and marking `foam`. */
+    pub(crate) fn step(mut self, run : FluidTick, foam : FluidFoam) : void {
+        self.pop.tick = self.pop.tick + 1;
+        if (self.pop.count() == 0) {
+            return;
+        }
+
+        let params : FluidParticleParams = self.pop.params;
+        let n : i32 = self.pop.liquid.used;
+        self.runner.prepare(
+            self.pop.tick,
+            params.seed as i64,
+            params.spray.capacity > 0,
+            self.pop.liquid.room
+        );
+        if (n > 0) {
+            self.runner.run(FluidStage::Predict, n);
+            self.runner.sortLiquid(n);
+            self.runner.run(FluidStage::Neighbours, n);
+            for (round of 0..params.liquid.iterations) {
+                self.runner.run(FluidStage::Multipliers, n);
+                self.runner.run(FluidStage::Deltas, n);
+                self.runner.run(FluidStage::Displace, n);
+            }
+            self.runner.run(FluidStage::Settle, n);
+            self.runner.run(FluidStage::Soften, n);
+            self.runner.run(FluidStage::Commit, n);
+            self.runner.run(FluidStage::Decide, n);
+        }
+        self.runner.run(FluidStage::Spray, self.pop.spray.used);
+        FluidCoupling::settle(self.pop, self.field, run, foam);
+    }
+}

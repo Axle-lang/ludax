@@ -1,0 +1,219 @@
+// fluid_emitters — where water enters and leaves the world outside the pipes: sources, drains and spills.
+//
+// Sources and drains are the only things that change the world's volume (a pour is a one-off edit), and each
+// reports the volume it moved so the world can keep an exact ledger: `totalVolume + drained - injected` is
+// invariant, and a test holds the engine to it. Both work on a block of columns, not a point: a real spring
+// feeds an area and a real intake draws from one, and a strong point source builds a hydraulic cone that no
+// pool has. The block's share is even, so the surface stays a plateau the size of the intake.
+//
+// A spill is the escape valve of `Spill` overflow. A column holding more than `maxLevel` hands the surplus to
+// its lowest neighbour at once — water past the brim does not hop one cell a tick, it finds its level now,
+// the way a pressure source filling one cell really does — never past the donor's own capped surface, so a
+// full basin climbs its rim and nothing is created or destroyed. The pass repeats until nothing above the
+// brim can move, because a spill may itself overfill the next column.
+
+use crate::core::collections::vec::Vec;
+use crate::core::math::scalar::{maxD, minD};
+use crate::sim::fluid::fluid_field::{FLUID_DIRECTIONS, FluidBlock, FluidField};
+use crate::sim::fluid::fluid_rules::{FluidFlow, FluidOverflow, FluidSink, FluidSource};
+use crate::sim::fluid::fluid_tick::FluidTick;
+
+/** The most cascade passes a spill makes in one tick; a basin that needs more settles over the next tick. */
+const FLUID_SPILL_PASSES : i32 = 64;
+
+/** The emitter and spill phases of a tick, as static functions over a field and the tick's bookkeeping. */
+pub(crate) class FluidEmitters {
+    /** Sources deposit what their columns can take and returns the volume deposited. In `Keep` mode a full
+     * column refuses water and the surplus stays in the reservoir; elsewhere everything is taken. */
+    pub(crate) static fn applySources(
+        field : Shared<FluidField>,
+        run : FluidTick,
+        sources : Vec<FluidSource>
+    ) : f64 {
+        let mut total : f64 = 0.0;
+        for (k of 0..sources.len()) {
+            let s : FluidSource = sources.get(k);
+            let spent : bool = !s.infinite && s.remaining <= 0.0;
+            if (!s.active || spent) {
+                continue;
+            }
+            if (!field.inBounds(s.x, s.z)) {
+                continue;
+            }
+
+            let mut offered : f64 = s.rate * field.rules.dt;
+            if (!s.infinite) {
+                offered = minD(offered, s.remaining);
+            }
+
+            let block : FluidBlock = field.block(s.x, s.z, s.radius);
+            let given : f64 = FluidEmitters::deposit(field, run, block, offered);
+            if (given <= 0.0) {
+                continue;
+            }
+
+            total = total + given;
+            if (!s.infinite) {
+                let mut left : FluidSource = s;
+                left.remaining = s.remaining - given;
+                sources.set(k, left);
+            }
+        }
+        return total;
+    }
+
+    // Spreads `offered` evenly over the block and answers what the columns took.
+    static fn deposit(field : Shared<FluidField>, run : FluidTick, block : FluidBlock, offered : f64) : f64 {
+        let share : f64 = offered / (block.count() as f64);
+        let keep : bool = field.rules.overflow == FluidOverflow::Keep;
+        let mut total : f64 = 0.0;
+        for (z of block.z0..block.z1 + 1) {
+            for (x of block.x0..block.x1 + 1) {
+                let c : i32 = field.column(x, z);
+                let mut amount : f64 = share;
+                if (keep) {
+                    amount = minD(share, maxD(field.rules.maxLevel - field.water[c as i64], 0.0));
+                }
+                if (amount <= 0.0) {
+                    continue;
+                }
+
+                field.water[c as i64] = field.water[c as i64] + amount;
+                total = total + amount;
+                run.touch(c);
+                run.wakeNext(c);
+            }
+        }
+        return total;
+    }
+
+    /**
+     * Drains evacuate at most their configured rate, and nothing once their columns are dry. Returns the volume
+     * evacuated.
+     */
+    pub(crate) static fn applySinks(
+        field : Shared<FluidField>,
+        run : FluidTick,
+        sinks : Vec<FluidSink>
+    ) : f64 {
+        let mut total : f64 = 0.0;
+        for (k of 0..sinks.len()) {
+            let s : FluidSink = sinks.get(k);
+            if (!s.active || !field.inBounds(s.x, s.z)) {
+                continue;
+            }
+            let want : f64 = s.maxRate * field.rules.dt;
+            let block : FluidBlock = field.block(s.x, s.z, s.radius);
+            total = total + FluidEmitters::draw(field, run, block, want);
+        }
+        return total;
+    }
+
+    // Draws `want` from the block: an even share from every wet column first, then what the dry-ish columns
+    // could not give from the wetter ones in scan order. Answers what was drawn.
+    static fn draw(field : Shared<FluidField>, run : FluidTick, block : FluidBlock, want : f64) : f64 {
+        let share : f64 = want / (block.count() as f64);
+        let mut drawn : f64 = 0.0;
+        for (z of block.z0..block.z1 + 1) {
+            for (x of block.x0..block.x1 + 1) {
+                let c : i32 = field.column(x, z);
+                drawn = drawn + FluidEmitters::take(field, run, c, share);
+            }
+        }
+
+        for (z of block.z0..block.z1 + 1) {
+            for (x of block.x0..block.x1 + 1) {
+                if (drawn >= want) {
+                    return drawn;
+                }
+                let c : i32 = field.column(x, z);
+                drawn = drawn + FluidEmitters::take(field, run, c, want - drawn);
+            }
+        }
+        return drawn;
+    }
+
+    // Removes up to `amount` from column `c` and answers what it gave.
+    static fn take(field : Shared<FluidField>, run : FluidTick, c : i32, amount : f64) : f64 {
+        let given : f64 = minD(amount, field.water[c as i64]);
+        if (given <= 0.0) {
+            return 0.0;
+        }
+        field.water[c as i64] = field.water[c as i64] - given;
+        run.wakeNext(c);
+        return given;
+    }
+
+    // Moves column `c`'s surplus to its lowest neighbour, no further than the donor's capped surface.
+    static fn spillFrom(field : Shared<FluidField>, run : FluidTick, flows : Vec<FluidFlow>, c : i32) : f64 {
+        let n : i32 = FluidEmitters::lowestNeighbour(field, c);
+        if (n < 0) {
+            return 0.0;
+        }
+
+        let brim : f64 = field.rules.maxLevel;
+        let capped : f64 = field.ground[c as i64] + brim;
+        let room : f64 = capped - field.surface(n);
+        if (room <= 0.0) {
+            return 0.0;
+        }
+
+        let portion : f64 = minD(field.water[c as i64] - brim, room);
+        field.water[c as i64] = field.water[c as i64] - portion;
+        field.water[n as i64] = field.water[n as i64] + portion;
+        flows.push(run.flowBetween(c, n, portion));
+
+        // The receiver joins the touched list so the next pass can spill it on if it now stands over the brim.
+        run.touch(n);
+        if (portion > field.rules.sleepThreshold) {
+            run.wakeNext(c);
+            run.wakeNext(n);
+        }
+        return portion;
+    }
+
+    // The neighbour with the least surface, first minimal in a fixed west, east, north, south order; -1 for
+    // a grid of one column.
+    static fn lowestNeighbour(field : Shared<FluidField>, c : i32) : i32 {
+        let mut best : i32 = -1;
+        let mut bestSurface : f64 = 0.0;
+        for (direction of 0..FLUID_DIRECTIONS) {
+            let n : i32 = field.neighbour(c, direction);
+            if (n < 0) {
+                continue;
+            }
+            let s : f64 = field.surface(n);
+            if (best < 0 || s < bestSurface) {
+                best = n;
+                bestSurface = s;
+            }
+        }
+        return best;
+    }
+
+    /** `Spill` overflow only: every column above `maxLevel` hands its surplus to its lowest neighbour. */
+    pub(crate) static fn applySpill(
+        field : Shared<FluidField>,
+        run : FluidTick,
+        flows : Vec<FluidFlow>
+    ) : void {
+        if (field.rules.overflow != FluidOverflow::Spill) {
+            return;
+        }
+
+        let brim : f64 = field.rules.maxLevel;
+        for (pass of 0..FLUID_SPILL_PASSES) {
+            let mut moved : f64 = 0.0;
+            for (k of 0..run.touchedColumns.len()) {
+                let c : i32 = run.touchedColumns.get(k);
+                if (field.water[c as i64] <= brim) {
+                    continue;
+                }
+                moved = moved + FluidEmitters::spillFrom(field, run, flows, c);
+            }
+            if (moved <= field.rules.sleepThreshold) {
+                return;
+            }
+        }
+    }
+}

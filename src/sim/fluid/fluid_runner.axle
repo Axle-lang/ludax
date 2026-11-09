@@ -1,0 +1,173 @@
+// fluid_runner — the stages of the particle solver as parallel loops, bit-identical for any thread count.
+//
+// A stage is one data-parallel loop over a population (predict every liquid particle, list every particle's
+// neighbours, fly every drop). `FluidKernel` is the single kernel a `JobPool` is bound to (a pool serves one
+// kernel for life), a dispatcher that picks the stage to run from its `stage` field; `FluidRunner` sets the
+// stage and runs it over `count` items, on the pool when the world asked for threads and on the calling
+// thread otherwise.
+//
+// The determinism contract is the job library's (`core/jobs/kernel`): a loop is cut into chunks of a fixed
+// grain by item index alone, a stage writes only the slots of its own items and reads what no other item of
+// the same stage writes, and the stages that need a whole-population view (the spatial sort, the compaction)
+// run on one thread between loops. So the bytes a stage produces do not depend on who ran which chunk.
+// The Jacobi structure of the density solver (read all old positions, write all new deltas, then apply) is
+// what makes that true for the physics too.
+
+use crate::core::jobs::kernel::{RangeKernel, runSerial};
+use crate::core::jobs::pool::JobPool;
+use crate::sim::fluid::fluid_aloft::FluidAloft;
+use crate::sim::fluid::fluid_field::FluidField;
+use crate::sim::fluid::fluid_liquid::FluidLiquid;
+use crate::sim::fluid::fluid_particle_params::FluidParticleParams;
+use crate::sim::fluid::fluid_pool::FluidPopulation;
+
+/** How many particles a chunk of a stage covers; fixed, so the cut never depends on the thread count. */
+const FLUID_GRAIN : i32 = 512;
+
+/** One stage of the solver; the kernel runs the stage it is set to. */
+pub(crate) enum FluidStage : i8 {
+    /** Liquid: gravity, predicted positions, bed contact. */
+    Predict = 0,
+
+    /** Liquid: neighbour lists from the sorted grid. */
+    Neighbours = 1,
+
+    /** Liquid: densities and constraint multipliers. */
+    Multipliers = 2,
+
+    /** Liquid: position changes from the multipliers. */
+    Deltas = 3,
+
+    /** Liquid: apply the changes and keep out of the bed. */
+    Displace = 4,
+
+    /** Liquid: velocities from the position change. */
+    Settle = 5,
+
+    /** Liquid: viscosity and cohesion into scratch. */
+    Soften = 6,
+
+    /** Liquid: commit the softened velocities. */
+    Commit = 7,
+
+    /** Liquid: decide fates. */
+    Decide = 8,
+
+    /** Spray: ballistic flight and fates. */
+    Spray = 9,
+}
+
+/** The dispatcher a `JobPool` runs: it owns the solvers and shares the population and the bed. */
+pub(crate) class FluidKernel : RangeKernel {
+    pop                : Shared<FluidPopulation>;
+    field              : Shared<FluidField>;
+    pub(crate) liquid  : FluidLiquid;
+    pub(crate) aloft   : FluidAloft;
+    pub(crate) stage   : FluidStage = FluidStage::Predict;
+    pub(crate) sprayOn : bool = true;
+
+    /** A kernel over a population and a bed, with the solvers the population's parameters call for. */
+    constructor(own pop : Shared<FluidPopulation>, own field : Shared<FluidField>, gravity : f64, dt : f64) {
+        self.pop = pop;
+        self.field = field;
+        let params : FluidParticleParams = pop.params;
+        self.liquid = new FluidLiquid(params.liquid, gravity, dt);
+        self.aloft = new FluidAloft(params.spray, gravity, dt);
+    }
+
+    /** Runs the current stage over the items `begin` up to `end`. */
+    pub fn runRange(mut self, begin : i32, end : i32) : void {
+        match self.stage {
+            FluidStage::Predict => {
+                self.liquid.predict(self.pop.liquid, self.field, begin, end);
+            },
+            FluidStage::Neighbours => {
+                self.liquid.neighbours(self.pop.liquid, self.field, begin, end);
+            },
+            FluidStage::Multipliers => {
+                self.liquid.multipliers(self.pop.liquid, self.field, begin, end);
+            },
+            FluidStage::Deltas => {
+                self.liquid.deltas(self.pop.liquid, self.field, begin, end);
+            },
+            FluidStage::Displace => {
+                self.liquid.displace(self.pop.liquid, self.field, begin, end);
+            },
+            FluidStage::Settle => {
+                self.liquid.settle(self.pop.liquid, self.field, begin, end);
+            },
+            FluidStage::Soften => {
+                self.liquid.soften(self.pop.liquid, self.field, begin, end);
+            },
+            FluidStage::Commit => {
+                self.liquid.commit(self.pop.liquid, self.field, begin, end);
+            },
+            FluidStage::Decide => {
+                self.liquid.decide(self.pop.liquid, self.field, begin, end, self.sprayOn);
+            },
+            FluidStage::Spray => {
+                self.aloft.flySpray(self.pop.spray, self.field, begin, end);
+            },
+        }
+    }
+}
+
+/** Runs the kernel's stages, on worker threads or on the caller. */
+pub(crate) class FluidRunner {
+    kernel   : FluidKernel;
+    pool     : JobPool;
+    threaded : bool;
+
+    /** A runner over a population and a bed; `threads` above 1 starts that many workers, otherwise stages
+     * run serially on the caller. */
+    constructor(
+        own pop : Shared<FluidPopulation>,
+        own field : Shared<FluidField>,
+        gravity : f64,
+        dt : f64,
+        threads : i32
+    ) {
+        self.kernel = new FluidKernel(pop, field, gravity, dt);
+        self.threaded = threads > 1;
+        let mut workers : i32 = threads;
+        if (workers < 1) {
+            workers = 1;
+        }
+        self.pool = new JobPool(workers, self.kernel);
+        if (!self.threaded) {
+            self.pool.shutdown();
+        }
+    }
+
+    /** Sets the per-tick inputs of the stages: the tick number and seed the noise is keyed by, and whether
+     * loose liquid may shatter. */
+    pub(crate) fn prepare(mut self, tick : i64, seed : i64, sprayOn : bool, room : i32) : void {
+        self.kernel.sprayOn = sprayOn;
+        self.kernel.aloft.tick = tick;
+        self.kernel.aloft.seed = seed;
+        self.kernel.liquid.fitScratch(room);
+    }
+
+    /** The liquid solver, for sorting between stages. */
+    pub(crate) fn sortLiquid(mut self, count : i32) : void {
+        self.kernel.liquid.sort(count);
+    }
+
+    /** Runs `stage` over `count` items and returns when every one is done. */
+    pub(crate) fn run(mut self, stage : FluidStage, count : i32) : void {
+        if (count <= 0) {
+            return;
+        }
+        self.kernel.stage = stage;
+        if (self.threaded) {
+            self.pool.run(count, FLUID_GRAIN);
+            return;
+        }
+        runSerial(self.kernel, count, FLUID_GRAIN);
+    }
+
+    /** Stops the workers; safe to call twice. A serial runner has none. */
+    pub(crate) fn close(mut self) : void {
+        self.pool.shutdown();
+    }
+}

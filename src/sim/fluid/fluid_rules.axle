@@ -1,0 +1,196 @@
+// fluid_rules — the vocabulary a game uses to configure and observe a `FluidWorld`.
+//
+// Everything here is plain data a game builds, changes and reads; `FluidWorld` copies what it needs and
+// never surprises the caller with a mutated rule. Units are cell units: a column holds `level` units of
+// water above its ground, the cell footprint is 1 x 1, so one unit of level is one unit of volume and the
+// whole simulation is a bookkeeping of that single unit. The engine knows nothing about Ludax voxels; a game
+// maps its own terrain into `ground` heights and maps the levels back however it likes.
+//
+// A rule whose zero would be nonsense (a zero time step, a zero density) means "use the default": a game
+// that spells only some fields of a `FluidRules` literal gets a world that ticks, not a division by zero.
+// Rules whose zero is meaningful (no viscosity, no drag) keep that meaning.
+
+use crate::core::math::scalar::maxD;
+
+/** What a column does with water offered past `FluidRules.maxLevel`. */
+pub enum FluidOverflow : i8 {
+    /** The surplus stays in the reservoir: inflow stops once the column is full and nothing is destroyed. */
+    Keep = 0,
+
+    /** The surplus is force-transferred to the lowest neighbour, so a full basin spills over its rim. */
+    Spill = 1,
+
+    /** The column may hold more; the excess is compressed water whose pressure head grows with it
+     * (`FluidRules.pressureStiffness`), so a sealed or overfed volume pushes outward and upward. */
+    Pressure = 2,
+}
+
+/** Which columns a tick visits. */
+pub enum FluidStrategy : i8 {
+    /** Every column is visited every tick: simplest, best for small worlds and for debugging. */
+    FullSweep = 0,
+
+    /** Only columns in motion (and their frontiers) are visited; a settled world costs nothing per tick. */
+    ActiveSet = 1,
+}
+
+/** The tunable numbers of a `FluidWorld`. Copy the defaults and change what the game needs. */
+pub struct FluidRules {
+    /** The fixed length of one tick in seconds; never changes after construction, so runs are repeatable.
+     * Zero or less selects 0.05. */
+    pub dt : f64 = 0.05;
+
+    /** How freely water passes the ground between two columns, a multiplier on the pressure that drives a
+     * frontier: 1 is open water, below 1 a porous bed, 0 a sealed wall. Negative is 0. */
+    pub conductivity : f64 = 1.0;
+
+    /** Gravitational acceleration, cells per second squared: 9.81 on Earth, 1.62 on the Moon. It sets the
+     * speed of a wave, `sqrt(gravity * depth)`, and the pace at which a head difference accelerates a flow.
+     * Zero or less selects 9.81. */
+    pub gravity : f64 = 9.81;
+
+    /** Bed drag per second: how fast moving water loses speed to the ground. 2.0 settles a splash in about a
+     * second, 0.2 lets it ring. */
+    pub drag : f64 = 2.0;
+
+    /** Viscosity in cells squared per second: how fast neighbouring flows share momentum. Zero is an ideal
+     * fluid; honey is a few units. Beyond `0.2 / dt` it saturates, which is the stability bound. */
+    pub viscosity : f64 = 0.0;
+
+    /** Mass per cell volume, in kilograms per cubic metre: only needed to turn a pressure in pascals into a
+     * head (`FluidWorld.setLoadPressure`). Zero or less selects 1000, water. */
+    pub density : f64 = 1000.0;
+
+    /** The greatest water level a column is meant to hold, in cell units. What a column past this does with
+     * extra water is `overflow`. Zero or less selects 1. */
+    pub maxLevel : f64 = 1.0;
+
+    /** What a column does with water offered past `maxLevel` (see `FluidOverflow`). */
+    pub overflow : FluidOverflow = FluidOverflow::Spill;
+
+    /** Head, in cell units, added per unit of water held above `maxLevel` when `overflow` is `Pressure`:
+     * the inverse compressibility. Large is stiff (nearly incompressible), small is spongy. Zero or less
+     * selects 8. */
+    pub pressureStiffness : f64 = 8.0;
+
+    /** Which columns each tick visits (see `FluidStrategy`). */
+    pub strategy : FluidStrategy = FluidStrategy::ActiveSet;
+
+    /** A frontier that moved less than this (cell units, per tick) stops waking its columns, and a column
+     * nothing wakes falls asleep. Zero disables sleeping (with `ActiveSet` the world then never sleeps). */
+    pub sleepThreshold : f64 = 0.000001;
+
+    /** Water soaking into the ground, in cell units of depth per second from every wet column: 0 (the default)
+     * keeps every drop on the surface for ever, a small value (0.0005) lets puddles dry in minutes. What soaks
+     * is booked in `FluidWorld.soakedTotal`, so the ledger still closes. Negative is 0. */
+    pub infiltration : f64 = 0.0;
+
+    /** The same rules with every nonsensical value replaced as the field docs promise. */
+    pub fn checked(self) : FluidRules {
+        // The field defaults above are the replacements; struct defaults cannot name a constant.
+        let defaults : FluidRules = FluidRules {};
+        return FluidRules {
+            dt: fluidPositiveOr(self.dt, defaults.dt),
+            conductivity: maxD(self.conductivity, 0.0),
+            gravity: fluidPositiveOr(self.gravity, defaults.gravity),
+            drag: maxD(self.drag, 0.0),
+            viscosity: maxD(self.viscosity, 0.0),
+            density: fluidPositiveOr(self.density, defaults.density),
+            maxLevel: fluidPositiveOr(self.maxLevel, defaults.maxLevel),
+            overflow: self.overflow,
+            pressureStiffness: fluidPositiveOr(self.pressureStiffness, defaults.pressureStiffness),
+            strategy: self.strategy,
+            sleepThreshold: maxD(self.sleepThreshold, 0.0),
+            infiltration: maxD(self.infiltration, 0.0),
+        };
+    }
+}
+
+// A rule whose zero would be nonsense: the value itself when positive, else its documented default.
+fn fluidPositiveOr(value : f64, fallback : f64) : f64 {
+    if (value <= 0.0) {
+        return fallback;
+    }
+    return value;
+}
+
+/** A water emitter the game places on a column. Build one with ``FluidSource::finite` or `infinite`. */
+pub struct FluidSource {
+    /** Column x the source sits on. */
+    pub x : i32 = 0;
+
+    /** Column z the source sits on. */
+    pub z : i32 = 0;
+
+    /** Volume per second offered to the column while the source has water left. */
+    pub rate : f64 = 1.0;
+
+    /** Intake radius in cells: 0 pours into the source's column alone, 1 spreads over its 3x3 block.
+     * A real spring feeds an area, not a point — the radius keeps a strong source from building a
+     * hydraulic cone on flat ground. */
+    pub radius : i32 = 0;
+
+    /** Volume left for a finite source; ignored when `infinite`. */
+    pub remaining : f64 = 0.0;
+
+    /** False once the source is removed or exhausted; the handle stays valid. */
+    pub active : bool = true;
+
+    /** True for a source that never runs out. */
+    pub infinite : bool = false;
+
+    /** A finite source of `volume` at (`x`, `z`) emitting `rate` per second until dry. */
+    pub static fn finite(x : i32, z : i32, rate : f64, volume : f64) : FluidSource {
+        return FluidSource { x: x, z: z, rate: rate, remaining: volume, infinite: false };
+    }
+
+    /** An endless source of `rate` per second at (`x`, `z`). */
+    pub static fn infinite(x : i32, z : i32, rate : f64) : FluidSource {
+        return FluidSource { x: x, z: z, rate: rate, infinite: true };
+    }
+}
+
+/** A drain the game places on a column: it removes at most `maxRate` per second, and nothing when dry. */
+pub struct FluidSink {
+    /** Column x the drain sits on. */
+    pub x : i32 = 0;
+
+    /** Column z the drain sits on. */
+    pub z : i32 = 0;
+
+    /** Volume per second the drain evacuates at most. */
+    pub maxRate : f64 = 1.0;
+
+    /** Intake radius in cells: 0 draws from the drain's column alone, 1 over its 3x3 block. A strong
+     * drain over a point would dig a hole in the surface — a real intake draws from an area. */
+    pub radius : i32 = 0;
+
+    /** False once the drain is removed; the handle stays valid. */
+    pub active : bool = true;
+
+    /** A drain of `maxRate` per second at (`x`, `z`). */
+    pub static fn at(x : i32, z : i32, maxRate : f64) : FluidSink {
+        return FluidSink { x: x, z: z, maxRate: maxRate };
+    }
+}
+
+/**
+ * One frontier that carried water during a tick: from column (`x0`, `z0`) to (`x1`, `z1`), `volume` cell
+ * units this tick. Read-only data for rendering, sound and achievements; the list is rebuilt every tick.
+ */
+pub struct FluidFlow {
+    /** x of the donor column (the one that lost water). */
+    pub x0 : i32 = 0;
+
+    /** z of the donor column. */
+    pub z0 : i32 = 0;
+
+    /** x of the receiving column. */
+    pub x1 : i32 = 0;
+
+    /** z of the receiving column. */
+    pub z1 : i32 = 0;
+
+    /** Volume that crossed this tick, in cell units. */
+    pub volume : f64 = 0.0;
+}

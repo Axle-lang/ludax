@@ -1,0 +1,282 @@
+// fluid_particle_params — every number that shapes the particle layer, one struct per module.
+//
+// The layer is built of modules that can be used, tuned and switched off one by one: the liquid (a true
+// fluid of particles), the spray (ballistic drops), the breaking-wave and throw emission of the columns, and the
+// foam and turbulence fields. Each has its own params struct with documented defaults, and `FluidParticleParams`
+// only gathers them (plus the thread count, the seed and gravity), so a game changes `params.spray.drag` without
+// knowing what the liquid solver is. A population is switched off by a
+// capacity of 0, the emission and the foam by `enabled: false`; the heightfield itself is a separate module of
+// the world (`FluidWorld.setHeightfieldEnabled`). Capacities are the only memory the layer takes and a full
+// pool refuses newcomers, so a tick allocates only when a population reaches a new high (`reserve` allocates
+// everything up front).
+//
+// Gravity is not copied here: `gravity` 0 means "the world's `FluidRules.gravity`", so the columns, the wave
+// speed `sqrt(g h)`, the liquid and the spray all fall at one number; a game sets it here only to
+// let the particles differ from the columns.
+//
+// Units are the world's: lengths in cells, times in seconds, speeds in cells per second. The defaults treat a
+// cell as about a metre, so a liquid radius of 0.1 is a ten-centimetre parcel of water and a spray drop of
+// 0.02 a two-centimetre one; scale them with the cell if the cell of a game is not a metre. A parameter whose
+// zero would be nonsense means "use the default"; `checked()` applies that and the world only holds a checked
+// copy.
+
+use crate::core::math::scalar::{maxD, minD};
+
+/** The liquid population: particles that behave as one body of water (pressure, viscosity, cohesion). */
+pub struct FluidLiquidParams {
+    /** The most liquid particles alive at once; 0 switches the population off (jets then throw spray). */
+    pub capacity : i32 = 30000;
+
+    /** Radius of a liquid particle: the lattice spacing is twice it, so it is the resolution of the fluid.
+     * Zero or less selects 0.1. */
+    pub radius : f64 = 0.1;
+
+    /** Kernel support in cells; four radii gives about 30 neighbours in the bulk. Zero or less selects four
+     * times `radius`. */
+    pub smoothing : f64 = 0.0;
+
+    /** Density of the liquid in kilograms per cubic metre, for the Weber number of breakup. */
+    pub restDensity : f64 = 1000.0;
+
+    /** Density iterations per step (Jacobi, so the order of particles never matters): more is stiffer and
+     * costs linearly. At least 1; 3 suits a splash, 6 a pool that must not compress. */
+    pub iterations : i32 = 3;
+
+    /** Share of the relative velocity between neighbours averaged away per step (XSPH viscosity): 0 is
+     * inviscid, 0.1 water, 0.5 syrup, 1 a rigid lump. */
+    pub viscosity : f64 = 0.08;
+
+    /** Pull between neighbouring particles, in cells per second squared at the surface: a surface-tension
+     * like force that holds a drop round and a jet together until it thins. */
+    pub cohesion : f64 = 6.0;
+
+    /** Surface tension in newtons per metre, for the Weber number (0.072 is water in air). */
+    pub surfaceTension : f64 = 0.072;
+
+    /** The Weber number past which a loose particle shatters into spray (about 12 in the literature). */
+    pub breakupWeber : f64 = 12.0;
+
+    /** A particle with this many neighbours or fewer has left the core and may break up. */
+    pub looseNeighbours : i32 = 3;
+
+    /** Particles slower than this, in cells per second, never shatter: air cannot shear them however loose
+     * they are. */
+    pub breakupSpeed : f64 = 3.0;
+
+    /** The most spray drops one liquid particle shatters into. */
+    pub breakupDrops : i32 = 6;
+
+    /** Bounce off the bed, 0 dead to 1 elastic. */
+    pub restitution : f64 = 0.25;
+
+    /** A particle on the bed slower than this, in cells per second, settles into the columns as depth. */
+    pub settleSpeed : f64 = 1.0;
+}
+
+/** The spray population: small drops in ballistic flight with quadratic air drag. */
+pub struct FluidSprayParams {
+    /** The most drops alive at once; 0 switches spray off (breakup and splashes then keep their water in the
+     * columns). */
+    pub capacity : i32 = 200000;
+
+    /** Smallest radius a drop is born with. Zero or less selects 0.012. */
+    pub radiusMin : f64 = 0.012;
+
+    /** Largest radius a drop is born with (at most the liquid radius). Zero or less selects 0.04. */
+    pub radiusMax : f64 = 0.04;
+
+    /** Drag coefficient of a drop (0.47 is a sphere). */
+    pub drag : f64 = 0.47;
+
+    /** Density of air relative to water, which sets how hard drag brakes a drop. */
+    pub airDensity : f64 = 0.0012;
+
+    /** Landing speed in cells per second above which a drop splashes: part of it rebounds as smaller drops.
+     * Zero or less selects 4. */
+    pub splashSpeed : f64 = 4.0;
+}
+
+/** Where the columns throw water into the air: breaking crests and surfaces thrown up. */
+pub struct FluidBreakingParams {
+    /** True lets the columns emit spray and liquid on their own (breaking crests, mounds thrown up). Off by
+     * default: it takes water out of the columns, so a world that wants the plain heightfield, and every
+     * world written before the particle layer, keeps all its water in them. Jets and impacts work either way. */
+    pub enabled : bool = false;
+
+    /** Surface slope (rise over run) past which a crest breaks; waves break near 0.8, the default is lower
+     * since a grid blunts crests. Zero or less selects 0.55. */
+    pub steepness : f64 = 0.55;
+
+    /** Flow speed as a multiple of the wave speed `sqrt(g h)` past which a front breaks. Zero or less
+     * selects 1.1. */
+    pub froude : f64 = 1.1;
+
+    /** Share per second of the water of a fully breaking column that is thrown off as spray. */
+    pub spray : f64 = 0.25;
+
+    /** Rise speed of the surface in cells per second past which a column throws water up as liquid, as a
+     * mound jumps off a piston or a vent. Zero or less selects 3. */
+    pub throwSpeed : f64 = 3.0;
+}
+
+/** The foam and turbulence fields of the columns. */
+pub struct FluidFoamParams {
+    /** False leaves both fields at zero and skips their update. */
+    pub enabled : bool = true;
+
+    /** Foam made per second at full convergence, breaking or shoreline run-up, as coverage (0..1). */
+    pub generation : f64 = 2.0;
+
+    /** Seconds for foam to halve. Zero or less selects 4. */
+    pub halfLife : f64 = 4.0;
+
+    /** Foam diffusion in cells squared per second. */
+    pub diffusion : f64 = 0.2;
+
+    /** Foam laid on its column by a landing drop at the splash speed, as coverage. */
+    pub landing : f64 = 0.5;
+
+    /** Seconds for turbulence to halve. Zero or less selects 1.5. */
+    pub turbulenceHalfLife : f64 = 1.5;
+}
+
+/** The tunable numbers of the particle layer: one struct per module and the settings they share. */
+pub struct FluidParticleParams {
+    /** Worker threads of the particle solver; 1 runs on the calling thread. The state is bit-identical for
+     * any count. Zero or less selects 1. */
+    pub threads : i32 = 1;
+
+    /** Seed of the random numbers of the layer; two worlds with the same seed and inputs stay identical. */
+    pub seed : u64 = 20240607;
+
+    /** True allocates every pool at its capacity at once instead of on first need. */
+    pub reserve : bool = false;
+
+    /** Gravity of the particles in cells per second squared; zero or less follows `FluidRules.gravity`. */
+    pub gravity : f64 = 0.0;
+
+    /** The liquid module. */
+    pub liquid : FluidLiquidParams;
+
+    /** The spray module. */
+    pub spray : FluidSprayParams;
+
+    /** The breaking and throwing emission of the columns. */
+    pub breaking : FluidBreakingParams;
+
+    /** The foam and turbulence fields. */
+    pub foam : FluidFoamParams;
+
+    /** The defaults of every module (a struct literal cannot nest the defaults of its members). */
+    pub static fn standard() : FluidParticleParams {
+        return FluidParticleParams {
+            liquid: FluidLiquidParams {},
+            spray: FluidSprayParams {},
+            breaking: FluidBreakingParams {},
+            foam: FluidFoamParams {},
+        };
+    }
+
+    /**
+     * The parameters of a large geyser (see `FluidVent.geyser`): quarter-cell liquid parcels so that tens of
+     * thousands of them make a tall dense column, big drops, and crest breaking on so the water falling back
+     * splashes and foams.
+     */
+    pub static fn geyser() : FluidParticleParams {
+        let mut p : FluidParticleParams = FluidParticleParams::standard();
+        p.liquid.capacity = 40000;
+        p.liquid.radius = 0.25;
+        p.liquid.cohesion = 10.0;
+        p.liquid.breakupDrops = 24;
+        p.spray.radiusMin = 0.03;
+        p.spray.radiusMax = 0.12;
+        p.spray.capacity = 250000;
+        p.breaking.enabled = true;
+        return p;
+    }
+
+    /** The same parameters with every nonsensical value replaced as the field docs promise. */
+    pub fn checked(self) : FluidParticleParams {
+        let liquid : FluidLiquidParams = fluidCheckLiquid(self.liquid);
+        let spray : FluidSprayParams = fluidCheckSpray(self.spray, liquid.radius);
+        let breaking : FluidBreakingParams = fluidCheckBreaking(self.breaking);
+        let foam : FluidFoamParams = fluidCheckFoam(self.foam);
+        return FluidParticleParams {
+            threads: fluidAtLeast(self.threads, 1),
+            seed: self.seed,
+            reserve: self.reserve,
+            gravity: maxD(self.gravity, 0.0),
+            liquid: liquid,
+            spray: spray,
+            breaking: breaking,
+            foam: foam,
+        };
+    }
+}
+
+fn fluidCheckLiquid(l : FluidLiquidParams) : FluidLiquidParams {
+    let radius : f64 = fluidOr(l.radius, 0.1);
+    let mut p : FluidLiquidParams = l;
+    p.capacity = fluidAtLeast(l.capacity, 0);
+    p.radius = radius;
+    p.smoothing = fluidOr(l.smoothing, 4.0 * radius);
+    p.restDensity = fluidOr(l.restDensity, 1000.0);
+    p.iterations = fluidAtLeast(l.iterations, 1);
+    p.viscosity = minD(maxD(l.viscosity, 0.0), 1.0);
+    p.cohesion = maxD(l.cohesion, 0.0);
+    p.surfaceTension = fluidOr(l.surfaceTension, 0.072);
+    p.breakupWeber = fluidOr(l.breakupWeber, 12.0);
+    p.looseNeighbours = fluidAtLeast(l.looseNeighbours, 0);
+    p.breakupSpeed = maxD(l.breakupSpeed, 0.0);
+    p.breakupDrops = fluidAtLeast(l.breakupDrops, 1);
+    p.restitution = minD(maxD(l.restitution, 0.0), 1.0);
+    p.settleSpeed = maxD(l.settleSpeed, 0.0);
+    return p;
+}
+
+fn fluidCheckSpray(s : FluidSprayParams, liquidRadius : f64) : FluidSprayParams {
+    let top : f64 = minD(fluidOr(s.radiusMax, 0.04), liquidRadius);
+    let mut p : FluidSprayParams = s;
+    p.capacity = fluidAtLeast(s.capacity, 0);
+    p.radiusMax = top;
+    p.radiusMin = minD(fluidOr(s.radiusMin, 0.012), top);
+    p.drag = maxD(s.drag, 0.0);
+    p.airDensity = maxD(s.airDensity, 0.0);
+    p.splashSpeed = fluidOr(s.splashSpeed, 4.0);
+    return p;
+}
+
+fn fluidCheckBreaking(b : FluidBreakingParams) : FluidBreakingParams {
+    let mut p : FluidBreakingParams = b;
+    p.steepness = fluidOr(b.steepness, 0.55);
+    p.froude = fluidOr(b.froude, 1.1);
+    p.spray = maxD(b.spray, 0.0);
+    p.throwSpeed = fluidOr(b.throwSpeed, 3.0);
+    return p;
+}
+
+fn fluidCheckFoam(f : FluidFoamParams) : FluidFoamParams {
+    let mut p : FluidFoamParams = f;
+    p.generation = maxD(f.generation, 0.0);
+    p.halfLife = fluidOr(f.halfLife, 4.0);
+    p.diffusion = maxD(f.diffusion, 0.0);
+    p.landing = maxD(f.landing, 0.0);
+    p.turbulenceHalfLife = fluidOr(f.turbulenceHalfLife, 1.5);
+    return p;
+}
+
+// A parameter whose zero would be nonsense: the value when positive, else its default.
+fn fluidOr(value : f64, fallback : f64) : f64 {
+    if (value <= 0.0) {
+        return fallback;
+    }
+    return value;
+}
+
+// An integer parameter with a floor.
+fn fluidAtLeast(value : i32, floor : i32) : i32 {
+    if (value < floor) {
+        return floor;
+    }
+    return value;
+}

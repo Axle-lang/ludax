@@ -1,0 +1,629 @@
+// fluid_liquid — the liquid particles as a true fluid: position-based fluids on a spatial hash.
+//
+// Why position-based fluids (Macklin and Mueller, 2013) and not SPH proper or FLIP. Weakly compressible SPH
+// needs a time step bounded by the speed of sound (`c * dt < 0.4 h`), and a geyser throws water at 30 cells
+// per second on a world that ticks at 20 Hz: SPH would need a dozen substeps or a soft, spongy fluid. FLIP
+// needs a background grid of the whole volume and a transfer each step, which fights a world of columns.
+// Position-based fluids treat incompressibility as a constraint on positions, solved by a few Jacobi
+// iterations: unconditionally stable at any speed, one parameter (the iteration count) trades stiffness for
+// cost, and a Jacobi sweep reads the old positions only, so every particle's update is independent of the
+// order and of the thread that computes it. That last property is what makes the state bit-identical for one
+// worker or many.
+//
+// Per tick, on the predicted positions `q = x + v dt` (gravity already in `v`): find neighbours through the
+// spatial hash; then `iterations` times compute each particle's constraint multiplier lambda (only
+// compression counts, `C = max(rho / rho0 - 1, 0)`: a free surface does not pull, so drops and splashes are
+// stable without the tensile-instability correction) and the position change it implies, and apply it with a
+// collision against the bed; derive the velocity from the position change; blend it with the neighbours'
+// (XSPH viscosity); and add a cohesive pull toward the neighbours, which is the surface tension that holds a
+// drop round. A wall term adds the density the missing half-space of fluid would have, so the layer resting
+// on the bed is not under-dense.
+//
+// Gravity is a parameter (`FluidLiquid.gravity`, the world's by default), and so is the viscosity
+// (`FluidLiquidParams.viscosity`); both are read here and nowhere hard-coded.
+//
+// The merge into the columns, the breakup into spray and everything else that touches the heightfield is the
+// coupling's job (`fluid_coupling`); this file only decides each particle's fate and writes it.
+
+use crate::sim::fluid::fluid_field::FluidField;
+use crate::sim::fluid::fluid_grid::FluidGrid;
+use crate::sim::fluid::fluid_particle::{FluidParticleKind, fluidParticleVolume};
+use crate::sim::fluid::fluid_particle_params::FluidLiquidParams;
+use crate::sim::fluid::fluid_pool::{FLUID_FATE_BREAK, FLUID_FATE_LAND, FLUID_FATE_STAY, FluidPool};
+use crate::sim::fluid::fluid_sample::{FluidContact, FluidSample};
+
+/** The most neighbours stored per particle; denser particles keep the first ones found, deterministically. */
+const FLUID_NEIGHBOURS : i32 = 48;
+
+/** The speed limit of a liquid particle, in cells per second: a guard against a blown-up configuration. */
+const FLUID_LIQUID_VMAX : f64 = 150.0;
+
+/** Largest position change of one iteration, in smoothing lengths, so a deep overlap cannot explode. */
+const FLUID_STEP_CAP : f64 = 0.25;
+
+/** Share of the rest stiffness added to the constraint's denominator (the relaxation of the paper). */
+const FLUID_RELAX : f64 = 0.1;
+
+/** Samples of the wall-density table between distance 0 and the smoothing length. */
+const FLUID_WALL_SAMPLES : i32 = 32;
+
+/** Contact speed, in cells per second, below which a bounce is not worth making (it would only jitter). */
+const FLUID_BOUNCE_FLOOR : f64 = 0.5;
+
+/** The share of tangential speed a particle keeps per step while it slides on the bed. */
+const FLUID_BED_FRICTION : f64 = 0.97;
+
+/** The liquid solver: state, scratch and the stages a kernel runs over index ranges. */
+pub(crate) class FluidLiquid {
+    pub(crate) grid : FluidGrid;
+    p               : FluidLiquidParams;
+    gravity         : f64;
+    dt              : f64;
+    h               : f64;
+    h2              : f64;
+    volume          : f64;
+    poly6           : f64;
+    spiky           : f64;
+    rest            : f64;
+    relax           : f64;
+    cohesionNorm    : f64;
+    wall            : f64[];
+    room            : i32;
+    qx              : f64[];
+    qy              : f64[];
+    qz              : f64[];
+    lam             : f64[];
+    rho             : f64[];
+    dx              : f64[];
+    dy              : f64[];
+    dz              : f64[];
+    tx              : f64[];
+    ty              : f64[];
+    tz              : f64[];
+    bounce          : f64[];
+    neighbourCount  : i32[];
+    neighbour       : i32[];
+
+    /** A solver stepping `dt` seconds under `gravity`, with the module's `params`; the pool and the bed it
+     * works on are handed to every stage, so one solver can serve any pool. */
+    constructor(params : FluidLiquidParams, gravity : f64, dt : f64) {
+        self.p = params;
+        self.gravity = gravity;
+        self.dt = dt;
+        self.h = params.smoothing;
+        self.h2 = params.smoothing * params.smoothing;
+        self.volume = fluidParticleVolume(FluidParticleKind::Liquid, params.radius);
+        let h : f64 = params.smoothing;
+        let h3 : f64 = h * h * h;
+        self.poly6 = 315.0 / (64.0 * 3.14159265358979 * h3 * h3 * h3);
+        self.spiky = 0.0 - 45.0 / (3.14159265358979 * h3 * h3);
+        self.rest = 1.0;
+        self.relax = 0.0;
+        self.cohesionNorm = 1.0;
+        self.wall = new f64[(FLUID_WALL_SAMPLES + 1) as i64];
+        self.room = 0;
+        self.qx = new f64[1];
+        self.qy = new f64[1];
+        self.qz = new f64[1];
+        self.lam = new f64[1];
+        self.rho = new f64[1];
+        self.dx = new f64[1];
+        self.dy = new f64[1];
+        self.dz = new f64[1];
+        self.tx = new f64[1];
+        self.ty = new f64[1];
+        self.tz = new f64[1];
+        self.bounce = new f64[1];
+        self.neighbourCount = new i32[1];
+        self.neighbour = new i32[1];
+        self.grid = new FluidGrid(h, 1);
+        if (params.capacity > 0) {
+            self.calibrate();
+        }
+    }
+
+    /** The density, relative to rest, a lattice-packed particle has: the constraint's target. */
+    pub(crate) fn restDensity(self) : f64 {
+        return self.rest;
+    }
+
+    // Measures the rest state on a cubic lattice of spacing twice the radius: the density a particle in the
+    // bulk has, the stiffness of the constraint there and the weight of the cohesion, then tabulates the wall.
+    fn calibrate(mut self) : void {
+        let s : f64 = 2.0 * self.p.radius;
+        let mut sumW : f64 = self.poly6 * self.h2 * self.h2 * self.h2;
+        let mut coh : f64 = 0.0;
+        for (a of 0..9) {
+            for (b of 0..9) {
+                for (c of 0..9) {
+                    let i : f64 = (a - 4) as f64;
+                    let j : f64 = (b - 4) as f64;
+                    let k : f64 = (c - 4) as f64;
+                    let r2 : f64 = s * s * (i * i + j * j + k * k);
+                    if (r2 <= 0.0 || r2 >= self.h2) {
+                        continue;
+                    }
+                    let d : f64 = self.h2 - r2;
+                    sumW = sumW + self.poly6 * d * d * d;
+                    let u : f64 = 1.0 - r2.sqrt() / self.h;
+                    coh = coh + u * u;
+                }
+            }
+        }
+        self.rest = self.volume * sumW;
+        self.cohesionNorm = coh;
+
+        let mut grad2 : f64 = 0.0;
+        for (a of 0..9) {
+            for (b of 0..9) {
+                for (c of 0..9) {
+                    let i : f64 = (a - 4) as f64;
+                    let j : f64 = (b - 4) as f64;
+                    let k : f64 = (c - 4) as f64;
+                    let r2 : f64 = s * s * (i * i + j * j + k * k);
+                    if (r2 <= 0.0 || r2 >= self.h2) {
+                        continue;
+                    }
+                    let g : f64 = self.volume / self.rest * self.spiky * (self.h - r2.sqrt())
+                        * (self.h - r2.sqrt());
+                    grad2 = grad2 + g * g;
+                }
+            }
+        }
+        self.relax = FLUID_RELAX * grad2;
+        self.tabulateWall();
+    }
+
+    // The density a half-space of rest fluid adds at distance d from its face, by midpoint quadrature of the
+    // kernel over the half-space, for d from 0 to h.
+    fn tabulateWall(mut self) : void {
+        let cells : i32 = 12;
+        let step : f64 = self.h / (cells as f64);
+        for (n of 0..FLUID_WALL_SAMPLES + 1) {
+            let d : f64 = self.h * (n as f64) / (FLUID_WALL_SAMPLES as f64);
+            let mut sum : f64 = 0.0;
+            for (ix of 0..2 * cells) {
+                for (iy of 0..2 * cells) {
+                    for (iz of 0..cells) {
+                        let x : f64 = (((ix - cells) as f64) + 0.5) * step;
+                        let y : f64 = (((iy - cells) as f64) + 0.5) * step;
+                        let z : f64 = d + ((iz as f64) + 0.5) * step;
+                        let r2 : f64 = x * x + y * y + z * z;
+                        if (r2 >= self.h2) {
+                            continue;
+                        }
+                        let w : f64 = self.h2 - r2;
+                        sum = sum + self.poly6 * w * w * w;
+                    }
+                }
+            }
+            self.wall[n as i64] = sum * step * step * step;
+        }
+    }
+
+    // The density added by the bed at height `d` above it (along its normal).
+    fn wallDensity(self, d : f64) : f64 {
+        if (d >= self.h) {
+            return 0.0;
+        }
+        let mut t : f64 = d / self.h * (FLUID_WALL_SAMPLES as f64);
+        if (t < 0.0) {
+            t = 0.0;
+        }
+        let i : i32 = t as i32;
+        let f : f64 = t - (i as f64);
+        let a : f64 = self.wall[i as i64];
+        let b : f64 = self.wall[(i + 1) as i64];
+        return a + (b - a) * f;
+    }
+
+    /** Resizes the scratch arrays to `room` particles; call before a step when the pool may have grown. */
+    pub(crate) fn fitScratch(mut self, room : i32) : void {
+        if (room <= self.room) {
+            return;
+        }
+        self.room = room;
+        let n : i64 = (room + 1) as i64;
+        self.qx = new f64[n];
+        self.qy = new f64[n];
+        self.qz = new f64[n];
+        self.lam = new f64[n];
+        self.rho = new f64[n];
+        self.dx = new f64[n];
+        self.dy = new f64[n];
+        self.dz = new f64[n];
+        self.tx = new f64[n];
+        self.ty = new f64[n];
+        self.tz = new f64[n];
+        self.bounce = new f64[n];
+        self.neighbourCount = new i32[n];
+        self.neighbour = new i32[(room as i64) * (FLUID_NEIGHBOURS as i64) + 1];
+        self.grid.ensure(room);
+    }
+
+    /** Builds the spatial hash over the predicted positions; run on one thread between `predict` and
+     * `neighbours`. */
+    pub(crate) fn sort(mut self, count : i32) : void {
+        self.grid.build(self.qx, self.qy, self.qz, count);
+    }
+
+    // ---- stages, each over the particles begin..end ----
+
+    /** Applies gravity, predicts the positions and resolves contact with the bed. */
+    pub(crate) fn predict(
+        mut self,
+        pool : FluidPool,
+        field : Shared<FluidField>,
+        begin : i32,
+        end : i32
+    ) : void {
+        for (n of begin..end) {
+            let i : i64 = n as i64;
+            let r : f64 = pool.radius[i];
+            pool.vy[i] = pool.vy[i] - self.gravity * self.dt;
+            let mut x : f64 = pool.px[i] + pool.vx[i] * self.dt;
+            let mut y : f64 = pool.py[i] + pool.vy[i] * self.dt;
+            let mut z : f64 = pool.pz[i] + pool.vz[i] * self.dt;
+            self.bounce[i] = 0.0;
+
+            let c : FluidContact = FluidSample::contact(field, x, z);
+            let pen : f64 = c.height + r - y;
+            if (pen > 0.0) {
+                let vn : f64 = pool.vx[i] * c.nx + pool.vy[i] * c.ny + pool.vz[i] * c.nz;
+                if (vn < 0.0 && 0.0 - vn > FLUID_BOUNCE_FLOOR + self.p.settleSpeed) {
+                    self.bounce[i] = (0.0 - vn) * self.p.restitution;
+                }
+                x = x + c.nx * pen * c.ny;
+                y = y + c.ny * pen * c.ny;
+                z = z + c.nz * pen * c.ny;
+            }
+            self.qx[i] = x;
+            self.qy[i] = y;
+            self.qz[i] = z;
+        }
+    }
+
+    /** Lists, for each particle, the others within the smoothing length (at most `FLUID_NEIGHBOURS`). */
+    pub(crate) fn neighbours(
+        mut self,
+        pool : FluidPool,
+        field : Shared<FluidField>,
+        begin : i32,
+        end : i32
+    ) : void {
+        for (n of begin..end) {
+            let i : i64 = n as i64;
+            let x : f64 = self.qx[i];
+            let y : f64 = self.qy[i];
+            let z : f64 = self.qz[i];
+            let cx : i32 = self.grid.cube(x);
+            let cy : i32 = self.grid.cube(y);
+            let cz : i32 = self.grid.cube(z);
+            let base : i64 = i * (FLUID_NEIGHBOURS as i64);
+            let mut found : i32 = 0;
+
+            for (oz of 0..3) {
+                for (oy of 0..3) {
+                    for (ox of 0..3) {
+                        let bucket : i32 = FluidGrid::bucket(cx + ox - 1, cy + oy - 1, cz + oz - 1);
+                        let last : i32 = self.grid.starts[(bucket + 1) as i64];
+                        let mut t : i32 = self.grid.starts[bucket as i64];
+                        while (t < last) {
+                            let j : i32 = self.grid.order[t as i64];
+                            t = t + 1;
+                            if (j == n || found >= FLUID_NEIGHBOURS) {
+                                continue;
+                            }
+                            let ax : f64 = self.qx[j as i64] - x;
+                            let ay : f64 = self.qy[j as i64] - y;
+                            let az : f64 = self.qz[j as i64] - z;
+                            if (ax * ax + ay * ay + az * az < self.h2) {
+                                self.neighbour[base + (found as i64)] = j;
+                                found = found + 1;
+                            }
+                        }
+                    }
+                }
+            }
+            self.neighbourCount[i] = found;
+        }
+    }
+
+    /** Computes each particle's density and constraint multiplier from the current predicted positions. */
+    pub(crate) fn multipliers(
+        mut self,
+        pool : FluidPool,
+        field : Shared<FluidField>,
+        begin : i32,
+        end : i32
+    ) : void {
+        let k : f64 = self.volume / self.rest;
+        for (n of begin..end) {
+            let i : i64 = n as i64;
+            let base : i64 = i * (FLUID_NEIGHBOURS as i64);
+            let count : i32 = self.neighbourCount[i];
+            let mut density : f64 = self.volume * self.poly6 * self.h2 * self.h2 * self.h2;
+            let mut gx : f64 = 0.0;
+            let mut gy : f64 = 0.0;
+            let mut gz : f64 = 0.0;
+            let mut sum2 : f64 = 0.0;
+
+            for (m of 0..count) {
+                let j : i64 = self.neighbour[base + (m as i64)] as i64;
+                let ax : f64 = self.qx[i] - self.qx[j];
+                let ay : f64 = self.qy[i] - self.qy[j];
+                let az : f64 = self.qz[i] - self.qz[j];
+                let r2 : f64 = ax * ax + ay * ay + az * az;
+                if (r2 >= self.h2) {
+                    continue;
+                }
+                let w : f64 = self.h2 - r2;
+                density = density + self.volume * self.poly6 * w * w * w;
+                let r : f64 = r2.sqrt();
+                if (r < 0.000000001) {
+                    continue;
+                }
+                let g : f64 = k * self.spiky * (self.h - r) * (self.h - r) / r;
+                gx = gx + g * ax;
+                gy = gy + g * ay;
+                gz = gz + g * az;
+                sum2 = sum2 + g * g * r2;
+            }
+
+            let c : FluidContact = FluidSample::contact(field, self.qx[i], self.qz[i]);
+            density = density + self.wallDensity((self.qy[i] - c.height) * c.ny);
+            self.rho[i] = density;
+
+            let compression : f64 = density / self.rest - 1.0;
+            if (compression <= 0.0) {
+                self.lam[i] = 0.0;
+                continue;
+            }
+            self.lam[i] = 0.0 - compression / (sum2 + gx * gx + gy * gy + gz * gz + self.relax);
+        }
+    }
+
+    /** Computes the position change each particle's constraints ask for, into the delta arrays. */
+    pub(crate) fn deltas(
+        mut self,
+        pool : FluidPool,
+        field : Shared<FluidField>,
+        begin : i32,
+        end : i32
+    ) : void {
+        let k : f64 = self.volume / self.rest;
+        let cap : f64 = FLUID_STEP_CAP * self.h;
+        for (n of begin..end) {
+            let i : i64 = n as i64;
+            let base : i64 = i * (FLUID_NEIGHBOURS as i64);
+            let count : i32 = self.neighbourCount[i];
+            let mut sx : f64 = 0.0;
+            let mut sy : f64 = 0.0;
+            let mut sz : f64 = 0.0;
+
+            for (m of 0..count) {
+                let j : i64 = self.neighbour[base + (m as i64)] as i64;
+                let ax : f64 = self.qx[i] - self.qx[j];
+                let ay : f64 = self.qy[i] - self.qy[j];
+                let az : f64 = self.qz[i] - self.qz[j];
+                let r2 : f64 = ax * ax + ay * ay + az * az;
+                if (r2 >= self.h2) {
+                    continue;
+                }
+                let r : f64 = r2.sqrt();
+                if (r < 0.000000001) {
+                    continue;
+                }
+                let g : f64 = k * (self.lam[i] + self.lam[j]) * self.spiky * (self.h - r) * (self.h - r) / r;
+                sx = sx + g * ax;
+                sy = sy + g * ay;
+                sz = sz + g * az;
+            }
+
+            let len2 : f64 = sx * sx + sy * sy + sz * sz;
+            if (len2 > cap * cap) {
+                let scale : f64 = cap / len2.sqrt();
+                sx = sx * scale;
+                sy = sy * scale;
+                sz = sz * scale;
+            }
+            self.dx[i] = sx;
+            self.dy[i] = sy;
+            self.dz[i] = sz;
+        }
+    }
+
+    /** Moves each predicted position by its delta and keeps it out of the bed. */
+    pub(crate) fn displace(
+        mut self,
+        pool : FluidPool,
+        field : Shared<FluidField>,
+        begin : i32,
+        end : i32
+    ) : void {
+        for (n of begin..end) {
+            let i : i64 = n as i64;
+            let x : f64 = self.qx[i] + self.dx[i];
+            let mut y : f64 = self.qy[i] + self.dy[i];
+            let z : f64 = self.qz[i] + self.dz[i];
+            let c : FluidContact = FluidSample::contact(field, x, z);
+            let pen : f64 = c.height + pool.radius[i] - y;
+            self.qx[i] = x;
+            self.qz[i] = z;
+            if (pen > 0.0) {
+                self.qx[i] = x + c.nx * pen * c.ny;
+                self.qz[i] = z + c.nz * pen * c.ny;
+                y = y + c.ny * pen * c.ny;
+            }
+            self.qy[i] = y;
+        }
+    }
+
+    /** Derives the velocity from the position change, adds the bounce, and commits the positions. */
+    pub(crate) fn settle(
+        mut self,
+        pool : FluidPool,
+        field : Shared<FluidField>,
+        begin : i32,
+        end : i32
+    ) : void {
+        let inv : f64 = 1.0 / self.dt;
+        for (n of begin..end) {
+            let i : i64 = n as i64;
+            let mut vx : f64 = (self.qx[i] - pool.px[i]) * inv;
+            let mut vy : f64 = (self.qy[i] - pool.py[i]) * inv;
+            let mut vz : f64 = (self.qz[i] - pool.pz[i]) * inv;
+            pool.px[i] = self.qx[i];
+            pool.py[i] = self.qy[i];
+            pool.pz[i] = self.qz[i];
+
+            let c : FluidContact = FluidSample::contact(field, pool.px[i], pool.pz[i]);
+            let touching : bool = pool.py[i] - pool.radius[i] - c.height < 0.25 * pool.radius[i];
+            if (touching) {
+                let vn : f64 = vx * c.nx + vy * c.ny + vz * c.nz;
+                if (vn < 0.0) {
+                    vx = vx - vn * c.nx;
+                    vy = vy - vn * c.ny;
+                    vz = vz - vn * c.nz;
+                }
+                vx = vx * FLUID_BED_FRICTION;
+                vz = vz * FLUID_BED_FRICTION;
+                vx = vx + c.nx * self.bounce[i];
+                vy = vy + c.ny * self.bounce[i];
+                vz = vz + c.nz * self.bounce[i];
+            }
+
+            let speed2 : f64 = vx * vx + vy * vy + vz * vz;
+            if (speed2 > FLUID_LIQUID_VMAX * FLUID_LIQUID_VMAX) {
+                let scale : f64 = FLUID_LIQUID_VMAX / speed2.sqrt();
+                vx = vx * scale;
+                vy = vy * scale;
+                vz = vz * scale;
+            }
+            pool.vx[i] = vx;
+            pool.vy[i] = vy;
+            pool.vz[i] = vz;
+        }
+    }
+
+    /** Blends each velocity with its neighbours' (XSPH viscosity) and adds the cohesive pull, into scratch. */
+    pub(crate) fn soften(
+        mut self,
+        pool : FluidPool,
+        field : Shared<FluidField>,
+        begin : i32,
+        end : i32
+    ) : void {
+        let pull : f64 = self.p.cohesion * self.dt / self.cohesionNorm;
+        for (n of begin..end) {
+            let i : i64 = n as i64;
+            let base : i64 = i * (FLUID_NEIGHBOURS as i64);
+            let count : i32 = self.neighbourCount[i];
+            let mut wsum : f64 = 0.0;
+            let mut mx : f64 = 0.0;
+            let mut my : f64 = 0.0;
+            let mut mz : f64 = 0.0;
+            let mut cx : f64 = 0.0;
+            let mut cy : f64 = 0.0;
+            let mut cz : f64 = 0.0;
+
+            for (m of 0..count) {
+                let j : i64 = self.neighbour[base + (m as i64)] as i64;
+                let ax : f64 = pool.px[j] - pool.px[i];
+                let ay : f64 = pool.py[j] - pool.py[i];
+                let az : f64 = pool.pz[j] - pool.pz[i];
+                let r2 : f64 = ax * ax + ay * ay + az * az;
+                if (r2 >= self.h2) {
+                    continue;
+                }
+                let w : f64 = self.h2 - r2;
+                let weight : f64 = w * w * w;
+                wsum = wsum + weight;
+                mx = mx + weight * (pool.vx[j] - pool.vx[i]);
+                my = my + weight * (pool.vy[j] - pool.vy[i]);
+                mz = mz + weight * (pool.vz[j] - pool.vz[i]);
+
+                let r : f64 = r2.sqrt();
+                if (r < 0.000000001) {
+                    continue;
+                }
+                let u : f64 = 1.0 - r / self.h;
+                let a : f64 = u * u / r;
+                cx = cx + a * ax;
+                cy = cy + a * ay;
+                cz = cz + a * az;
+            }
+
+            let mut blend : f64 = 0.0;
+            if (wsum > 0.0) {
+                blend = self.p.viscosity / (wsum + self.h2 * self.h2 * self.h2);
+            }
+            self.tx[i] = pool.vx[i] + blend * mx + pull * cx;
+            self.ty[i] = pool.vy[i] + blend * my + pull * cy;
+            self.tz[i] = pool.vz[i] + blend * mz + pull * cz;
+        }
+    }
+
+    /** Commits the softened velocities. */
+    pub(crate) fn commit(
+        mut self,
+        pool : FluidPool,
+        field : Shared<FluidField>,
+        begin : i32,
+        end : i32
+    ) : void {
+        for (n of begin..end) {
+            let i : i64 = n as i64;
+            pool.vx[i] = self.tx[i];
+            pool.vy[i] = self.ty[i];
+            pool.vz[i] = self.tz[i];
+        }
+    }
+
+    /** Decides each particle's fate: merge into the columns, shatter into spray, or keep flying. */
+    pub(crate) fn decide(
+        mut self,
+        pool : FluidPool,
+        field : Shared<FluidField>,
+        begin : i32,
+        end : i32,
+        sprayOn : bool
+    ) : void {
+        for (n of begin..end) {
+            let i : i64 = n as i64;
+            pool.age[i] = pool.age[i] + self.dt;
+            pool.fate[i] = FLUID_FATE_STAY;
+
+            let r : f64 = pool.radius[i];
+            let x : f64 = pool.px[i];
+            let z : f64 = pool.pz[i];
+            let bed : f64 = FluidSample::bed(field, x, z);
+            let surface : f64 = FluidSample::surface(field, x, z);
+            let speed2 : f64 = pool.vx[i] * pool.vx[i] + pool.vy[i] * pool.vy[i] + pool.vz[i] * pool.vz[i];
+
+            let inWater : bool = surface - bed > 0.002 && pool.py[i] - r <= surface && pool.vy[i] <= 0.0;
+            let slow : bool = speed2 <= self.p.settleSpeed * self.p.settleSpeed;
+            let onBed : bool = self.p.settleSpeed > 0.0 && pool.py[i] - r - bed < 0.25 * r && slow;
+            if (inWater || onBed) {
+                pool.fate[i] = FLUID_FATE_LAND;
+                continue;
+            }
+
+            let loose : bool = self.neighbourCount[i] <= self.p.looseNeighbours;
+            let fast : bool = speed2 > self.p.breakupSpeed * self.p.breakupSpeed;
+            if (sprayOn && loose && fast && self.weber(speed2, r) > self.p.breakupWeber) {
+                pool.fate[i] = FLUID_FATE_BREAK;
+            }
+        }
+    }
+
+    // The Weber number of a drop of radius r moving at the given speed through air: inertia over surface tension.
+    fn weber(self, speed2 : f64, r : f64) : f64 {
+        return self.p.restDensity * speed2 * 2.0 * r / self.p.surfaceTension;
+    }
+
+    /** The relative density of particle `k` as of the last step (1 is rest); for tests and diagnostics. */
+    pub(crate) fn densityAt(self, k : i32) : f64 {
+        return self.rho[k as i64] / self.rest;
+    }
+}

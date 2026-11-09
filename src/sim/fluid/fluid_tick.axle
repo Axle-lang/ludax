@@ -1,0 +1,268 @@
+// fluid_tick — the bookkeeping one tick of the pipe model runs on: who is awake, what was touched, how the
+// frontiers are numbered.
+//
+// A tick is a fixed sequence of phases (`fluid_world` lists them); this file owns the state they share and
+// none of the physics. The world is a grid of columns joined by frontiers: the one between (x, z) and
+// (x + 1, z) is an "east" frontier, the one between (x, z) and (x, z + 1) a "south" one, and the numbering is
+// all east frontiers row by row, then all south ones, so a frontier id is an array index and its two
+// columns are arithmetic, not a lookup. Each frontier carries a persistent velocity: the momentum of the
+// water crossing it, which is what lets a pool slosh instead of creeping.
+//
+// Sleeping. With the `ActiveSet` strategy only columns woken by the previous tick (plus sources, drains,
+// pours, ground edits and kicks) are visited, and a frontier is computed when either of its columns is awake.
+// A settled world costs one list walk per tick. The trade the game accepts: a frontier whose per-tick
+// transfer falls under `sleepThreshold` stops waking its columns, which freezes a surface gap of a few
+// `sleepThreshold` across it — sub-threshold water is left unpriced rather than simulated. `FullSweep` visits
+// everything and never sleeps a column.
+//
+// Nothing here allocates after construction and nothing reads a clock; lists are filled in a fixed order, so
+// two worlds fed the same inputs stay bit-for-bit identical.
+
+use crate::core::collections::vec::Vec;
+use crate::sim::fluid::fluid_field::{FLUID_EAST, FLUID_NORTH, FLUID_SOUTH, FLUID_WEST};
+use crate::sim::fluid::fluid_rules::FluidFlow;
+
+/** The shared machinery of one tick: wake and touch bookkeeping, per-frontier state, per-column scales. */
+pub(crate) class FluidTick {
+    pub(crate) width          : i32;
+    pub(crate) depth          : i32;
+    pub(crate) eastCount      : i32;
+    pub(crate) frontierCount  : i32;
+    pub(crate) tickNumber     : i64 = 1;
+    awakeGen                  : i64[];
+    touchCol                  : i64[];
+    touchStamp                : i64[];
+    pub(crate) awakeColumns   : Vec<i32>;
+    nextList                  : Vec<i32>;
+    pub(crate) touchedColumns : Vec<i32>;
+    pub(crate) liveFrontiers  : Vec<i32>;
+    previousLive              : Vec<i32>;
+
+    /** Persistent velocity of each frontier, cells per second, positive from its first column to its second. */
+    pub(crate) velocity : f64[];
+
+    /** Scratch: the viscous change of each live frontier, applied after every one has been computed. */
+    pub(crate) viscousDelta : f64[];
+
+    /** The volume each live frontier moves this tick, signed like `velocity`. */
+    pub(crate) flux     : f64[];
+    pub(crate) outflow  : f64[];
+    pub(crate) inflow   : f64[];
+    pub(crate) outScale : f64[];
+    pub(crate) inScale  : f64[];
+
+    /** Machinery for a grid of `width` x `depth` columns. */
+    constructor(width : i32, depth : i32) {
+        self.width = width;
+        self.depth = depth;
+        let n : i64 = (width * depth) as i64;
+        self.awakeGen = new i64[n];
+        self.touchCol = new i64[n];
+        self.outflow = new f64[n];
+        self.inflow = new f64[n];
+        self.outScale = new f64[n];
+        self.inScale = new f64[n];
+        for (i of 0..n) {
+            self.awakeGen[i] = 0;
+            self.touchCol[i] = 0;
+            self.outflow[i] = 0.0;
+            self.inflow[i] = 0.0;
+            self.outScale[i] = 1.0;
+            self.inScale[i] = 1.0;
+        }
+
+        self.eastCount = (width - 1) * depth;
+        let total : i32 = self.eastCount + width * (depth - 1);
+        self.frontierCount = total;
+        let m : i64 = (total + 1) as i64;
+        self.velocity = new f64[m];
+        self.viscousDelta = new f64[m];
+        self.flux = new f64[m];
+        self.touchStamp = new i64[m];
+        for (i of 0..m) {
+            self.velocity[i] = 0.0;
+            self.viscousDelta[i] = 0.0;
+            self.flux[i] = 0.0;
+            self.touchStamp[i] = 0;
+        }
+
+        self.awakeColumns = new Vec<i32>();
+        self.nextList = new Vec<i32>();
+        self.touchedColumns = new Vec<i32>();
+        self.liveFrontiers = new Vec<i32>();
+        self.previousLive = new Vec<i32>();
+    }
+
+    // ---- frontier geometry ----
+
+    /** The first column of frontier `id`: the west one of an east frontier, the north one of a south one. */
+    pub(crate) fn firstColumn(self, id : i32) : i32 {
+        if (id >= self.eastCount) {
+            return id - self.eastCount;
+        }
+        let z : i32 = id / (self.width - 1);
+        return id + z;
+    }
+
+    /** The second column of frontier `id`: one column east of the first, or one row south of it. */
+    pub(crate) fn secondColumn(self, id : i32) : i32 {
+        if (id >= self.eastCount) {
+            return id - self.eastCount + self.width;
+        }
+        return self.firstColumn(id) + 1;
+    }
+
+    /** The id of the frontier between (x, z) and (x + 1, z); the caller keeps x + 1 inside the grid. */
+    pub(crate) fn eastFrontier(self, x : i32, z : i32) : i32 {
+        return z * (self.width - 1) + x;
+    }
+
+    /** The id of the frontier between (x, z) and (x, z + 1); the caller keeps z + 1 inside the grid. */
+    pub(crate) fn southFrontier(self, x : i32, z : i32) : i32 {
+        return self.eastCount + z * self.width + x;
+    }
+
+    /**
+     * The id of the frontier of the same orientation as `id` one step away in `direction` (a `FLUID_WEST` …
+     * `FLUID_SOUTH`), or -1 at the edge of the grid.
+     */
+    pub(crate) fn neighbourFrontier(self, id : i32, direction : i32) : i32 {
+        let a : i32 = self.firstColumn(id);
+        let x : i32 = a % self.width;
+        let z : i32 = a / self.width;
+        let south : bool = id >= self.eastCount;
+        let mut nx : i32 = x;
+        let mut nz : i32 = z;
+        if (direction == FLUID_WEST) {
+            nx = x - 1;
+        }
+        if (direction == FLUID_EAST) {
+            nx = x + 1;
+        }
+        if (direction == FLUID_NORTH) {
+            nz = z - 1;
+        }
+        if (direction == FLUID_SOUTH) {
+            nz = z + 1;
+        }
+
+        let outside : bool = nx < 0 || nz < 0 || nx >= self.width || nz >= self.depth;
+        if (outside) {
+            return -1;
+        }
+        if (south) {
+            if (nz + 1 >= self.depth) {
+                return -1;
+            }
+            return self.southFrontier(nx, nz);
+        }
+        if (nx + 1 >= self.width) {
+            return -1;
+        }
+        return self.eastFrontier(nx, nz);
+    }
+
+    /** The record of `volume` crossing from column `donor` to column `recv`, for the tick's flow list. */
+    pub(crate) fn flowBetween(self, donor : i32, recv : i32, volume : f64) : FluidFlow {
+        return FluidFlow {
+            x0: donor % self.width,
+            z0: donor / self.width,
+            x1: recv % self.width,
+            z1: recv / self.width,
+            volume: volume,
+        };
+    }
+
+    // ---- visit bookkeeping ----
+
+    /** Marks a column to be visited by the tick in progress (or the next one, when called between ticks). */
+    pub(crate) fn wakeNow(mut self, c : i32) : void {
+        if (self.awakeGen[c as i64] == self.tickNumber) {
+            return;
+        }
+        self.awakeGen[c as i64] = self.tickNumber;
+        self.awakeColumns.push(c);
+    }
+
+    /** Marks a column to be visited by the tick after this one. */
+    pub(crate) fn wakeNext(mut self, c : i32) : void {
+        let next : i64 = self.tickNumber + 1;
+        if (self.awakeGen[c as i64] == next) {
+            return;
+        }
+        self.awakeGen[c as i64] = next;
+        self.nextList.push(c);
+    }
+
+    /** Whether the next tick visits the column. */
+    pub(crate) fn isAwake(self, c : i32) : bool {
+        return self.awakeGen[c as i64] == self.tickNumber;
+    }
+
+    /** How many columns the next tick visits. */
+    pub(crate) fn awakeCount(self) : i32 {
+        return self.awakeColumns.len();
+    }
+
+    /** Drops the per-tick lists so the phases start from nothing; called once, before the phases. */
+    pub(crate) fn beginTick(mut self) : void {
+        self.touchedColumns.clear();
+        self.liveFrontiers.clear();
+        self.nextList.clear();
+    }
+
+    /** Commits the columns woken during the tick as the visitors of the next one. */
+    pub(crate) fn endTick(mut self) : void {
+        self.awakeColumns.clear();
+        for (k of 0..self.nextList.len()) {
+            self.awakeColumns.push(self.nextList.get(k));
+        }
+        self.tickNumber = self.tickNumber + 1;
+    }
+
+    /** Marks a column as touched this tick and resets its flux accumulators. */
+    pub(crate) fn touch(mut self, c : i32) : void {
+        if (self.touchCol[c as i64] == self.tickNumber) {
+            return;
+        }
+        self.touchCol[c as i64] = self.tickNumber;
+        self.outflow[c as i64] = 0.0;
+        self.inflow[c as i64] = 0.0;
+        self.touchedColumns.push(c);
+    }
+
+    /** Marks a frontier as computed this tick; true on the first touch. */
+    pub(crate) fn stamp(mut self, id : i32) : bool {
+        if (self.touchStamp[id as i64] == self.tickNumber) {
+            return false;
+        }
+        self.touchStamp[id as i64] = self.tickNumber;
+        return true;
+    }
+
+    /**
+     * Zeroes the velocity of every frontier that was live last tick and not visited this one: a sleeping
+     * frontier must not keep its momentum while nobody watches it. Then this tick's live frontiers become
+     * the next tick's candidates, so the cost follows the live frontiers, not the grid.
+     */
+    pub(crate) fn quiesce(mut self) : void {
+        for (k of 0..self.previousLive.len()) {
+            let id : i32 = self.previousLive.get(k);
+            if (self.touchStamp[id as i64] != self.tickNumber) {
+                self.velocity[id as i64] = 0.0;
+            }
+        }
+        self.previousLive.clear();
+        for (k of 0..self.liveFrontiers.len()) {
+            self.previousLive.push(self.liveFrontiers.get(k));
+        }
+    }
+
+    /** Adds `speed` to the velocity of frontier `id` and wakes both its columns, so the kick is not lost. */
+    pub(crate) fn kick(mut self, id : i32, speed : f64) : void {
+        self.velocity[id as i64] = self.velocity[id as i64] + speed;
+        self.previousLive.push(id);
+        self.wakeNow(self.firstColumn(id));
+        self.wakeNow(self.secondColumn(id));
+    }
+}

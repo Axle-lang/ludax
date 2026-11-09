@@ -1,0 +1,78 @@
+// fluid_aloft — spray in ballistic flight.
+//
+// Spray is the water that left the liquid core as small drops. Each drop is a body under gravity and a
+// quadratic air drag, `a = -(3/8) Cd (rho_air / rho_water) |v| v / r`: the smaller the drop the harder it is
+// braked, so a fine spray hangs and drifts while a big drop flies far, which is what makes a plume look like
+// one. The drag is applied implicitly (`v / (1 + k |v| dt)`), so it never reverses a velocity however large
+// the step. A drop ends one way, decided here and acted on by the coupling: it reaches the surface or the bed
+// and lands. Nothing evaporates.
+//
+// Drops are independent (no neighbours are consulted), so a kernel can run any slice of the population on any
+// thread; the result does not depend on the thread count.
+
+use crate::sim::fluid::fluid_field::FluidField;
+use crate::sim::fluid::fluid_particle_params::FluidSprayParams;
+use crate::sim::fluid::fluid_pool::{FLUID_FATE_LAND, FLUID_FATE_STAY, FluidPool};
+use crate::sim::fluid::fluid_sample::FluidSample;
+
+/** The longest a drop may stay in the air whatever happens, a guard against drops that never land. */
+const FLUID_SPRAY_MAX_AGE : f64 = 60.0;
+
+/** Three eighths: the shape factor of the drag of a sphere, `a = (3/8) Cd (rho_air / rho_water) / r |v| v`. */
+const FLUID_DRAG_SHAPE : f64 = 0.375;
+
+/** The stepping of the spray pool. */
+pub(crate) class FluidAloft {
+    sprayParams     : FluidSprayParams;
+    gravity         : f64;
+    dt              : f64;
+    pub(crate) tick : i64 = 0;
+    pub(crate) seed : i64 = 0;
+
+    /** The stepper of spray under `gravity`, `dt` seconds a step; the pool and the bed are handed to each stage. */
+    constructor(sprayParams : FluidSprayParams, gravity : f64, dt : f64) {
+        self.sprayParams = sprayParams;
+        self.gravity = gravity;
+        self.dt = dt;
+    }
+
+    /** Flies the drops `begin..end` one step and decides who lands. */
+    pub(crate) fn flySpray(
+        mut self,
+        pool : FluidPool,
+        field : Shared<FluidField>,
+        begin : i32,
+        end : i32
+    ) : void {
+        let drag : f64 = FLUID_DRAG_SHAPE * self.sprayParams.drag * self.sprayParams.airDensity;
+        for (n of begin..end) {
+            let i : i64 = n as i64;
+            let r : f64 = pool.radius[i];
+            let mut vx : f64 = pool.vx[i];
+            let mut vy : f64 = pool.vy[i] - self.gravity * self.dt;
+            let mut vz : f64 = pool.vz[i];
+
+            let speed : f64 = (vx * vx + vy * vy + vz * vz).sqrt();
+            let brake : f64 = 1.0 / (1.0 + drag / r * speed * self.dt);
+            vx = vx * brake;
+            vy = vy * brake;
+            vz = vz * brake;
+            pool.vx[i] = vx;
+            pool.vy[i] = vy;
+            pool.vz[i] = vz;
+            pool.px[i] = pool.px[i] + vx * self.dt;
+            pool.py[i] = pool.py[i] + vy * self.dt;
+            pool.pz[i] = pool.pz[i] + vz * self.dt;
+            pool.age[i] = pool.age[i] + self.dt;
+
+            pool.fate[i] = FLUID_FATE_STAY;
+            let surface : f64 = FluidSample::surface(field, pool.px[i], pool.pz[i]);
+            let bed : f64 = FluidSample::bed(field, pool.px[i], pool.pz[i]);
+            if ((pool.py[i] <= surface && vy <= 0.0) || pool.py[i] <= bed) {
+                pool.fate[i] = FLUID_FATE_LAND;
+            } else if (pool.age[i] > FLUID_SPRAY_MAX_AGE) {
+                pool.fate[i] = FLUID_FATE_LAND;
+            }
+        }
+    }
+}

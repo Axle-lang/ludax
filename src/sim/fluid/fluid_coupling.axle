@@ -1,0 +1,282 @@
+// fluid_coupling — where particles give their water back to the columns: landing, splash and breakup.
+//
+// This file and `fluid_emit` are the only places that touch both a particle pool and the columns; the
+// solvers (`fluid_liquid`, `fluid_aloft`) read the bed and write fates, nothing more, and the heightfield
+// knows nothing of particles. This one handles the particle-to-column direction, `fluid_emit` the other.
+//
+// After the solvers have written their fates, `settle` walks every pool in index order and acts:
+//
+//   land      the volume of the particle is poured into the column under it and its horizontal momentum
+//             kicks the frontiers of that column (a share equal to the particle's share of the water there),
+//             so a drop lands as a ring ripple and a jet landing drives a current; the foam field is marked.
+//   splash    a drop landing faster than the splash speed does not give everything back: part of it rebounds
+//             as smaller drops thrown up and outward (a crown); the rest lands.
+//   break     a loose liquid particle whose Weber number is past the threshold shatters into spray drops
+//             that exactly share its volume.
+//
+// Every volume that moves is accounted: what leaves the air either lands (`landed`) or becomes other airborne
+// particles (counted by the pools). Nothing evaporates. A spawn that finds its pool full keeps
+// its volume with the particle that failed to split, which then lands. The pools are compacted last.
+
+use crate::core::math::dvec2::DVec2;
+use crate::core::math::dvec3::DVec3;
+use crate::core::math::scalar::{maxD, minD, minI};
+use crate::sim::fluid::fluid_field::FluidField;
+use crate::sim::fluid::fluid_foam::FluidFoam;
+use crate::sim::fluid::fluid_noise::FluidNoise;
+use crate::sim::fluid::fluid_particle::{FluidParticleKind, fluidParticleVolume};
+use crate::sim::fluid::fluid_particle_params::{FluidFoamParams, FluidSprayParams};
+use crate::sim::fluid::fluid_pool::{FLUID_FATE_BREAK, FLUID_FATE_LAND, FluidPool, FluidPopulation};
+use crate::sim::fluid::fluid_sample::FluidSample;
+use crate::sim::fluid::fluid_spawn::FluidSpawn;
+use crate::sim::fluid::fluid_tick::FluidTick;
+
+/** The share of a drop's volume a splash may send back up at most. */
+const FLUID_SPLASH_SHARE : f64 = 0.5;
+
+/** Splash share per unit of landing speed over the splash speed. */
+const FLUID_SPLASH_GAIN : f64 = 0.12;
+
+/** The most drops a single splash makes. */
+const FLUID_SPLASH_DROPS : i32 = 4;
+
+/** Share of its own momentum water takes from a landing particle, at most (the rest is lost to the splash). */
+const FLUID_LANDING_KICK : f64 = 0.5;
+
+/** The volume under which a leftover is poured back without ceremony. */
+const FLUID_CRUMB : f64 = 0.000000000000001;
+
+/** Four thirds of pi, the volume of a unit sphere, for turning a volume back into a radius. */
+const FLUID_COUPLING_SPHERE : f64 = 4.18879020478639;
+
+/** The particle-to-column phase of a tick, as static functions. */
+pub(crate) class FluidCoupling {
+    /** The column under (x, z), clamped to the grid so a particle past the edge lands on the edge. */
+    pub(crate) static fn columnOf(field : Shared<FluidField>, x : f64, z : f64) : i32 {
+        let mut cx : i32 = FluidSample::floor(x);
+        let mut cz : i32 = FluidSample::floor(z);
+        if (cx < 0) {
+            cx = 0;
+        }
+        if (cz < 0) {
+            cz = 0;
+        }
+        if (cx >= field.width) {
+            cx = field.width - 1;
+        }
+        if (cz >= field.depth) {
+            cz = field.depth - 1;
+        }
+        return cz * field.width + cx;
+    }
+
+    /** Pours `volume` into column `c` and shares `(vx, vz)` with the water there through the frontiers. */
+    pub(crate) static fn deposit(
+        field : Shared<FluidField>,
+        run : FluidTick,
+        c : i32,
+        volume : f64,
+        vx : f64,
+        vz : f64
+    ) : void {
+        if (volume <= 0.0) {
+            return;
+        }
+        field.water[c as i64] = field.water[c as i64] + volume;
+        run.wakeNow(c);
+
+        let x : i32 = c % field.width;
+        let z : i32 = c / field.width;
+        let share : f64 = FLUID_LANDING_KICK * volume / field.water[c as i64];
+        if (vx > 0.0 && x + 1 < field.width) {
+            run.kick(run.eastFrontier(x, z), vx * share);
+        }
+        if (vx < 0.0 && x > 0) {
+            run.kick(run.eastFrontier(x - 1, z), vx * share);
+        }
+        if (vz > 0.0 && z + 1 < field.depth) {
+            run.kick(run.southFrontier(x, z), vz * share);
+        }
+        if (vz < 0.0 && z > 0) {
+            run.kick(run.southFrontier(x, z - 1), vz * share);
+        }
+    }
+
+    /** Acts on every fate the solvers wrote, in index order, then compacts the pools. */
+    pub(crate) static fn settle(
+        pop : Shared<FluidPopulation>,
+        field : Shared<FluidField>,
+        run : FluidTick,
+        foam : FluidFoam
+    ) : void {
+        let liquid : FluidPool = pop.liquid;
+        for (i of 0..liquid.used) {
+            let fate : i32 = liquid.fate[i as i64];
+            if (fate == FLUID_FATE_LAND) {
+                let v : f64 = fluidParticleVolume(FluidParticleKind::Liquid, liquid.radius[i as i64]);
+                FluidCoupling::land(
+                    pop,
+                    field,
+                    run,
+                    foam,
+                    FluidCoupling::position(liquid, i),
+                    FluidCoupling::velocity(liquid, i),
+                    v
+                );
+            }
+            if (fate == FLUID_FATE_BREAK) {
+                FluidCoupling::breakUp(pop, field, run, foam, i);
+            }
+        }
+
+        let spray : FluidPool = pop.spray;
+        let sprayCount : i32 = spray.used;
+        for (i of 0..sprayCount) {
+            let fate : i32 = spray.fate[i as i64];
+            let v : f64 = fluidParticleVolume(FluidParticleKind::Spray, spray.radius[i as i64]);
+            if (fate == FLUID_FATE_LAND) {
+                FluidCoupling::land(
+                    pop,
+                    field,
+                    run,
+                    foam,
+                    FluidCoupling::position(spray, i),
+                    FluidCoupling::velocity(spray, i),
+                    v
+                );
+            }
+        }
+
+        pop.liquid.compact();
+        pop.spray.compact();
+    }
+
+    static fn position(pool : FluidPool, i : i32) : DVec3 {
+        return DVec3::make(pool.px[i as i64], pool.py[i as i64], pool.pz[i as i64]);
+    }
+
+    static fn velocity(pool : FluidPool, i : i32) : DVec3 {
+        return DVec3::make(pool.vx[i as i64], pool.vy[i as i64], pool.vz[i as i64]);
+    }
+
+    // A particle of `volume` arrives at `at` with velocity `v`: splash, then the rest lands.
+    static fn land(
+        pop : Shared<FluidPopulation>,
+        field : Shared<FluidField>,
+        run : FluidTick,
+        foam : FluidFoam,
+        at : DVec3,
+        v : DVec3,
+        volume : f64
+    ) : void {
+        let spray : FluidSprayParams = pop.params.spray;
+        let c : i32 = FluidCoupling::columnOf(field, at.x, at.z);
+        let speed : f64 = v.length();
+        let mut keep : f64 = volume;
+        if (speed > spray.splashSpeed) {
+            keep = keep - FluidCoupling::splash(pop, field, at, v, volume);
+        }
+
+        FluidCoupling::deposit(field, run, c, keep, v.x, v.z);
+        pop.landed = pop.landed + keep;
+
+        let f : FluidFoamParams = pop.params.foam;
+        if (f.enabled) {
+            let force : f64 = minD(speed / spray.splashSpeed, 1.0);
+            let size : f64 = minD(volume / pop.liquidVolume(), 1.0);
+            foam.add(c, f.landing * force * size);
+            foam.stir(c, force * 0.5);
+        }
+    }
+
+    // Throws part of a landing drop back up as a crown of smaller drops; answers the volume it took.
+    static fn splash(
+        pop : Shared<FluidPopulation>,
+        field : Shared<FluidField>,
+        at : DVec3,
+        v : DVec3,
+        volume : f64
+    ) : f64 {
+        let s : FluidSprayParams = pop.params.spray;
+        if (s.capacity <= 0) {
+            return 0.0;
+        }
+
+        let ratio : f64 = v.length() / s.splashSpeed;
+        let count : i32 = minI(1 + (ratio as i32), FLUID_SPLASH_DROPS);
+        let share : f64 = minD(FLUID_SPLASH_SHARE, FLUID_SPLASH_GAIN * ratio);
+        let each : f64 = share * volume / (count as f64);
+        let radius : f64 = FluidNoise::cbrt(each / FLUID_COUPLING_SPHERE);
+        if (radius < s.radiusMin) {
+            return 0.0;
+        }
+
+        let speed : f64 = v.length();
+        let lift : f64 = maxD(0.0 - v.y, 0.5 * speed);
+        let top : f64 = FluidSample::surface(field, at.x, at.z) + radius * 1.1;
+        let mut taken : f64 = 0.0;
+        for (k of 0..count) {
+            let dir : DVec2 = pop.direction();
+            let out : f64 = (0.25 + 0.35 * pop.rng.nextF64()) * speed;
+            let up : f64 = (0.25 + 0.35 * pop.rng.nextF64()) * lift;
+            let velocity : DVec3 = DVec3::make(v.x * 0.4 + dir.x * out, up, v.z * 0.4 + dir.y * out);
+            let from : DVec3 = DVec3::make(at.x, maxD(at.y, top), at.z);
+            if (!FluidSpawn::spray(pop, from, velocity, radius)) {
+                break;
+            }
+            taken = taken + fluidParticleVolume(FluidParticleKind::Spray, radius);
+        }
+        return taken;
+    }
+
+    // Shatters liquid particle `i` into spray that shares its volume exactly; whatever cannot be made, or is
+    // too small to be a drop, is poured back where the particle was.
+    static fn breakUp(
+        pop : Shared<FluidPopulation>,
+        field : Shared<FluidField>,
+        run : FluidTick,
+        foam : FluidFoam,
+        i : i32
+    ) : void {
+        let liquid : FluidPool = pop.liquid;
+        let s : FluidSprayParams = pop.params.spray;
+        let at : DVec3 = FluidCoupling::position(liquid, i);
+        let v : DVec3 = FluidCoupling::velocity(liquid, i);
+        let volume : f64 = fluidParticleVolume(FluidParticleKind::Liquid, liquid.radius[i as i64]);
+        let biggest : f64 = fluidParticleVolume(FluidParticleKind::Spray, s.radiusMax);
+        let count : i32 = minI(1 + ((volume / biggest) as i32), pop.params.liquid.breakupDrops);
+        let mean : f64 = FluidNoise::cbrt(volume / (count as f64) / FLUID_COUPLING_SPHERE);
+        let least : f64 = 0.5 * fluidParticleVolume(FluidParticleKind::Spray, s.radiusMin);
+        let speed : f64 = v.length();
+
+        let mut remaining : f64 = volume;
+        for (k of 0..count) {
+            if (remaining <= least) {
+                break;
+            }
+            let mut radius : f64 = mean * (0.6 + 0.7 * pop.rng.nextF64());
+            if (k == count - 1) {
+                radius = FluidNoise::cbrt(remaining / FLUID_COUPLING_SPHERE);
+            }
+            radius = minD(radius, FluidNoise::cbrt(remaining / FLUID_COUPLING_SPHERE));
+
+            let dir : DVec2 = pop.direction();
+            let out : f64 = 0.2 * speed * pop.rng.nextF64();
+            let velocity : DVec3 = DVec3::make(
+                v.x * 0.9 + dir.x * out,
+                v.y * 0.9 + 0.1 * out,
+                v.z * 0.9 + dir.y * out
+            );
+            if (!FluidSpawn::spray(pop, at, velocity, radius)) {
+                break;
+            }
+            remaining = remaining - fluidParticleVolume(FluidParticleKind::Spray, radius);
+        }
+
+        if (remaining > FLUID_CRUMB) {
+            let c : i32 = FluidCoupling::columnOf(field, at.x, at.z);
+            FluidCoupling::deposit(field, run, c, remaining, v.x, v.z);
+            pop.landed = pop.landed + remaining;
+        }
+    }
+}

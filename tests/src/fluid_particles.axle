@@ -1,0 +1,576 @@
+// fluid_particles — checks for the particle layer of the fluid: the volume ledger, the liquid solver, spray,
+// gravity and viscosity as parameters, and the determinism of it all across thread counts.
+//
+// Each check states a physical or accounting fact and the engine is held to it: the ledger
+// `totalVolume + liquid + spray = poured + injected - drained` closes to rounding under jets,
+// impacts, crest breaking, and landing; a settled column of liquid sits at rest density; a
+// falling sphere keeps its centre of mass on the free-fall parabola (internal forces conserve momentum);
+// a drop falls in `sqrt(2h/g)` and a jet rises `v^2/2g` whatever `g` is; and a thread count changes how fast
+// the state is computed, never what it is (compared bit for bit, not within a tolerance).
+
+use ludax::Checks;
+use ludax::DVec3;
+use ludax::FluidImpact;
+use ludax::FluidLedger;
+use ludax::FluidLiquidParams;
+use ludax::FluidParticle;
+use ludax::FluidParticleKind;
+use ludax::FluidParticleParams;
+use ludax::FluidRules;
+use ludax::FluidSprayParams;
+use ludax::FluidVent;
+use ludax::FluidWorld;
+
+/** The tolerance of volume closures: rounding of a few hundred thousand additions. */
+pub const FPART_TOL_LEDGER : f64 = 0.000000001;
+
+/** The suite of ledger, liquid, spray, gravity and viscosity checks of the particle layer. */
+pub class FluidParticlesSuite {
+    /** Runs every check of the suite. */
+    pub static fn run(c : Checks) : void {
+        fpLedgerJets(c);
+        fpLedgerImpactAndBreaking(c);
+        fpLedgerLanding(c);
+        fpHydrostatic(c);
+        fpFallingSphere(c);
+        fpGravityDrop(c);
+        fpGravityJetHeight(c);
+        fpGravityLiquid(c);
+        fpViscosityLiquid(c);
+        fpViscosityHeightfield(c);
+    }
+}
+
+// Rules with a short step, so a fall time is resolved to a few milliseconds.
+fn fpRules(dt : f64, gravity : f64) : FluidRules {
+    return FluidRules { dt: dt, gravity: gravity, drag: 2.0 };
+}
+
+// A flat world of `size` x `size` columns holding `level` of water everywhere.
+fn fpPool(size : i32, level : f64, rules : FluidRules) : FluidWorld {
+    let w : FluidWorld = new FluidWorld(rules, size, size);
+    for (z of 0..size) {
+        for (x of 0..size) {
+            w.pour(x, z, level);
+        }
+    }
+    return w;
+}
+
+// The ledger error of a world against what was poured into it at the start.
+fn fpLedgerError(w : FluidWorld, poured : f64) : f64 {
+    let l : FluidLedger = w.particleLedger();
+    let held : f64 = w.totalVolume() + l.liquid + l.spray;
+    let put : f64 = poured + w.injectedTotal() - w.drainedTotal();
+    let diff : f64 = held - put;
+    if (diff < 0.0) {
+        return 0.0 - diff;
+    }
+    return diff;
+}
+
+// A small fountain: a conduit of 0.8 cells at 15 cells per second, with a dome feed.
+fn fpFountain() : FluidVent {
+    let mut v : FluidVent = FluidVent::geyser(12.5, 12.5);
+    v.radius = 0.8;
+    v.speed = 15.0;
+    v.domeRate = 4.0;
+    return v;
+}
+
+// Parameters with coarser liquid parcels, so a small vent is a few thousand particles.
+fn fpCoarse() : FluidParticleParams {
+    let mut p : FluidParticleParams = FluidParticleParams::standard();
+    p.liquid.radius = 0.2;
+    return p;
+}
+
+// A jet turns its rate into particles; through landing, splash and breakup
+// every drop of it stays on the ledger, tick after tick.
+fn fpLedgerJets(c : Checks) : void {
+    let w : FluidWorld = fpPool(24, 0.5, fpRules(0.05, 9.81));
+    let poured : f64 = w.totalVolume();
+    w.setParticleParams(fpCoarse());
+    w.addVent(fpFountain());
+
+    let mut worst : f64 = 0.0;
+    let mut mostLiquid : i32 = 0;
+    for (t of 0..400) {
+        w.tick();
+        let e : f64 = fpLedgerError(w, poured);
+        if (e > worst) {
+            worst = e;
+        }
+        let mut liquid : i32 = 0;
+        for (k of 0..w.particleCount()) {
+            let p : FluidParticle = w.particleAt(k);
+            if (p.kind == FluidParticleKind::Liquid) {
+                liquid = liquid + 1;
+            }
+        }
+        if (liquid > mostLiquid) {
+            mostLiquid = liquid;
+        }
+    }
+
+    let l : FluidLedger = w.particleLedger();
+    println("  measured jet: ledger error ${worst}, at most ${mostLiquid} liquid alive, emitted ${l.emitted}, landed ${l.landed}");
+    c.that("jet: the ledger closes at every tick", worst < FPART_TOL_LEDGER);
+    c.that("jet: it threw liquid", mostLiquid > 50);
+    c.that("jet: water came back", l.landed > 0.0);
+}
+
+// An impact and the columns' own emission (crests breaking, mounds thrown up) keep the ledger too.
+fn fpLedgerImpactAndBreaking(c : Checks) : void {
+    let mut p : FluidParticleParams = FluidParticleParams::standard();
+    p.breaking.enabled = true;
+    let w : FluidWorld = fpPool(24, 1.0, fpRules(0.05, 9.81));
+    w.setParticleParams(p);
+    let poured : f64 = w.totalVolume();
+
+    w.impact(FluidImpact { x: 12, z: 12, radius: 1, volume: 1.5, speed: 14.0 });
+    let mut worst : f64 = fpLedgerError(w, poured + 1.5);
+    for (t of 0..300) {
+        w.tick();
+        let e : f64 = fpLedgerError(w, poured + 1.5);
+        if (e > worst) {
+            worst = e;
+        }
+    }
+    let l : FluidLedger = w.particleLedger();
+    println("  measured impact with breaking: ledger error ${worst}, emitted ${l.emitted}, landed ${l.landed}");
+    c.that("impact: the ledger closes while it splashes", worst < FPART_TOL_LEDGER);
+    c.that("impact: the splash left the columns", l.emitted > 0.0);
+}
+
+// Spray thrown up lands again: its volume is in the air while it flies and in the columns after.
+fn fpLedgerLanding(c : Checks) : void {
+    let w : FluidWorld = new FluidWorld(fpRules(0.02, 9.81), 8, 8);
+    let mut s : FluidSprayParams = FluidSprayParams {};
+    s.drag = 0.0;
+    let mut p : FluidParticleParams = FluidParticleParams::standard();
+    p.spray = s;
+    w.setParticleParams(p);
+
+    let radius : f64 = 0.03;
+    let thrown : bool = w.throwSpray(
+        DVec3::make(4.5, 0.2, 4.5),
+        DVec3::make(0.0, 3.0, 0.0),
+        radius
+    );
+    let volume : f64 = w.injectedTotal();
+    c.that("landing: the drop was thrown", thrown && w.particleCount() == 1);
+    c.near("landing: it flies as spray volume", w.airborneVolume(), volume, FPART_TOL_LEDGER);
+    c.near("landing: the columns hold none of it yet", w.totalVolume(), 0.0, FPART_TOL_LEDGER);
+
+    for (t of 0..400) {
+        w.tick();
+    }
+    c.that("landing: the drop is gone", w.particleCount() == 0);
+    c.near("landing: its volume is in the columns", w.totalVolume(), volume, FPART_TOL_LEDGER);
+    c.near(
+        "landing: and the ledger booked the return",
+        w.particleLedger().landed,
+        volume,
+        FPART_TOL_LEDGER
+    );
+    c.that("landing: right under the drop", w.levelAt(4, 4) > 0.0);
+}
+
+// ---- liquid ----
+
+// A lattice of liquid particles `nx` x `ny` x `nz` at `spacing` from the corner `at`, all moving at `v`.
+fn fpBlock(
+    w : FluidWorld,
+    at : DVec3,
+    nx : i32,
+    ny : i32,
+    nz : i32,
+    spacing : f64,
+    v : DVec3
+) : i32 {
+    let mut made : i32 = 0;
+    for (k of 0..nz) {
+        for (j of 0..ny) {
+            for (i of 0..nx) {
+                let p : DVec3 = DVec3::make(
+                    at.x + (i as f64) * spacing,
+                    at.y + (j as f64) * spacing,
+                    at.z + (k as f64) * spacing
+                );
+                if (w.throwLiquid(p, v)) {
+                    made = made + 1;
+                }
+            }
+        }
+    }
+    return made;
+}
+
+// The liquid particles' mean position and velocity.
+fn fpMean(w : FluidWorld, velocity : bool) : DVec3 {
+    let mut sum : DVec3 = DVec3::zero();
+    let mut n : i32 = 0;
+    for (k of 0..w.particleCount()) {
+        let p : FluidParticle = w.particleAt(k);
+        if (p.kind != FluidParticleKind::Liquid) {
+            continue;
+        }
+        if (velocity) {
+            sum = sum.plus(p.velocity);
+        } else {
+            sum = sum.plus(p.position);
+        }
+        n = n + 1;
+    }
+    if (n == 0) {
+        return DVec3::zero();
+    }
+    return sum.scale(1.0 / (n as f64));
+}
+
+// The liquid particles' kinetic energy per unit mass.
+fn fpKinetic(w : FluidWorld) : f64 {
+    let mut sum : f64 = 0.0;
+    for (k of 0..w.particleCount()) {
+        let p : FluidParticle = w.particleAt(k);
+        if (p.kind == FluidParticleKind::Liquid) {
+            sum = sum + 0.5 * p.velocity.lengthSquared();
+        }
+    }
+    return sum;
+}
+
+// A basin: a floor at 0 over columns 1..size-2, walls of height 6 around it.
+fn fpBasin(size : i32, rules : FluidRules) : FluidWorld {
+    let w : FluidWorld = new FluidWorld(rules, size, size);
+    for (z of 0..size) {
+        for (x of 0..size) {
+            if (x == 0 || z == 0 || x == size - 1 || z == size - 1) {
+                w.setGround(x, z, 6.0);
+            }
+        }
+    }
+    return w;
+}
+
+// Liquid params that keep particles as particles: no merging into the columns by settling, no shattering.
+fn fpLiquidOnly(settle : f64, viscosity : f64) : FluidParticleParams {
+    let mut l : FluidLiquidParams = FluidLiquidParams {};
+    l.settleSpeed = settle;
+    l.viscosity = viscosity;
+    l.breakupSpeed = 1000000.0;
+    let mut p : FluidParticleParams = FluidParticleParams::standard();
+    p.liquid = l;
+    return p;
+}
+
+// The relative density of liquid particle `k` by brute force: the kernel sum over the others.
+fn fpDensity(w : FluidWorld, k : i32, h : f64, rest : f64) : f64 {
+    let me : FluidParticle = w.particleAt(k);
+    let r : f64 = me.radius;
+    let volume : f64 = 8.0 * r * r * r;
+    let poly6 : f64 = 315.0 / (64.0 * 3.14159265358979 * h * h * h * h * h * h * h * h * h);
+    let mut sum : f64 = poly6 * h * h * h * h * h * h;
+    for (j of 0..w.particleCount()) {
+        if (j == k) {
+            continue;
+        }
+        let o : FluidParticle = w.particleAt(j);
+        let d2 : f64 = o.position.distanceSquared(me.position);
+        if (d2 >= h * h) {
+            continue;
+        }
+        let t : f64 = h * h - d2;
+        sum = sum + poly6 * t * t * t;
+    }
+    return volume * sum / rest;
+}
+
+// A column of liquid in a basin settles to rest density, and fills it to the height its volume says.
+fn fpHydrostatic(c : Checks) : void {
+    let w : FluidWorld = fpBasin(8, fpRules(0.02, 9.81));
+    w.setParticleParams(fpLiquidOnly(0.0, 0.08));
+
+    // 24 x 24 particles over the 5 x 5 flat floor (spacing 0.2 leaves a wall gap), 10 layers.
+    let made : i32 = fpBlock(w, DVec3::make(1.6, 0.12, 1.6), 24, 10, 24, 0.2, DVec3::zero());
+    let volume : f64 = w.injectedTotal();
+    for (t of 0..150) {
+        w.tick();
+    }
+
+    let alive : i32 = w.particleCount();
+    let mut top : f64 = 0.0;
+    let mut sum : f64 = 0.0;
+    let mut counted : i32 = 0;
+    let mut worst : f64 = 0.0;
+    for (k of 0..alive) {
+        let p : FluidParticle = w.particleAt(k);
+        if (p.position.y > top) {
+            top = p.position.y;
+        }
+        let rho : f64 = fpDensity(w, k, 0.4, fpRestOf(w));
+        if (p.position.y > 0.35 && p.position.y < 0.9) {
+            sum = sum + rho;
+            counted = counted + 1;
+        }
+        if (rho > worst) {
+            worst = rho;
+        }
+    }
+    let mut mean : f64 = 0.0;
+    if (counted > 0) {
+        mean = sum / (counted as f64);
+    }
+    println("  measured hydrostatic: ${made} particles, ${alive} alive, bulk density ${mean} of rest, densest ${worst}, top ${top}");
+    c.that("hydrostatic: every particle stays a particle", alive == made);
+    c.near("hydrostatic: the bulk sits at rest density", mean, 1.0, 0.15);
+    c.that("hydrostatic: nothing is compressed past 40 percent", worst < 1.4);
+    c.that("hydrostatic: the pile is no taller than its start", top < 2.2);
+    c.that("hydrostatic: and still fills its basin to about the volume's height", top > 1.5);
+    c.near(
+        "hydrostatic: the ledger holds the particles",
+        w.airborneVolume(),
+        volume,
+        FPART_TOL_LEDGER
+    );
+}
+
+// Rest relative density of the default lattice as the solver calibrates it, recomputed here from the
+// definition so the test does not trust the solver's own number.
+fn fpRestOf(w : FluidWorld) : f64 {
+    let p : FluidParticleParams = w.particleParams();
+    let s : f64 = 2.0 * p.liquid.radius;
+    let h : f64 = p.liquid.smoothing;
+    let volume : f64 = s * s * s;
+    let poly6 : f64 = 315.0 / (64.0 * 3.14159265358979 * h * h * h * h * h * h * h * h * h);
+    let mut sum : f64 = poly6 * h * h * h * h * h * h;
+    for (a of 0..9) {
+        for (b of 0..9) {
+            for (e of 0..9) {
+                let i : f64 = (a - 4) as f64;
+                let j : f64 = (b - 4) as f64;
+                let k : f64 = (e - 4) as f64;
+                let r2 : f64 = s * s * (i * i + j * j + k * k);
+                if (r2 <= 0.0 || r2 >= h * h) {
+                    continue;
+                }
+                let t : f64 = h * h - r2;
+                sum = sum + poly6 * t * t * t;
+            }
+        }
+    }
+    return volume * sum;
+}
+
+// A sphere of liquid falling onto the ground: in free fall its centre of mass follows the parabola
+// (the internal forces cannot move it), it stays together, and what it does on impact keeps the
+// horizontal momentum at zero.
+fn fpFallingSphere(c : Checks) : void {
+    let w : FluidWorld = new FluidWorld(fpRules(0.01, 9.81), 16, 16);
+    w.setParticleParams(fpLiquidOnly(0.0, 0.08));
+
+    let mut count : i32 = 0;
+    let spacing : f64 = 0.2;
+    for (k of -6..7) {
+        for (j of -6..7) {
+            for (i of -6..7) {
+                let off : DVec3 = DVec3::make(
+                    (i as f64) * spacing,
+                    (j as f64) * spacing,
+                    (k as f64) * spacing
+                );
+                if (off.length() > 1.1) {
+                    continue;
+                }
+                if (w.throwLiquid(DVec3::make(8.0, 5.0, 8.0).plus(off), DVec3::zero())) {
+                    count = count + 1;
+                }
+            }
+        }
+    }
+
+    let start : DVec3 = fpMean(w, false);
+    for (t of 0..40) {
+        w.tick();
+    }
+    let seconds : f64 = 0.4;
+    let fell : f64 = start.y - fpMean(w, false).y;
+    let drift : f64 = fpMean(w, true).x;
+    let mut widest : f64 = 0.0;
+    let centre : DVec3 = fpMean(w, false);
+    for (k of 0..w.particleCount()) {
+        let d : f64 = w.particleAt(k).position.distance(centre);
+        if (d > widest) {
+            widest = d;
+        }
+    }
+    println("  measured sphere: ${count} particles, fell ${fell} in ${seconds} s (parabola ${0.5 * 9.81 * seconds * seconds}), widest ${widest}");
+    c.near(
+        "sphere: the centre of mass falls as g t^2 / 2",
+        fell,
+        0.5 * 9.81 * seconds * seconds,
+        0.03
+    );
+    c.near("sphere: with no sideways drift", drift, 0.0, 0.001);
+    c.that("sphere: and holds together", widest < 1.5);
+
+    let mut upward : f64 = 0.0;
+    let mut sideways : DVec3 = DVec3::zero();
+    for (t of 0..160) {
+        w.tick();
+        for (k of 0..w.particleCount()) {
+            let p : FluidParticle = w.particleAt(k);
+            if (p.kind == FluidParticleKind::Liquid && p.velocity.y > upward) {
+                upward = p.velocity.y;
+            }
+        }
+        sideways = fpMean(w, true);
+    }
+    println("  measured sphere impact: fastest upward ${upward}, mean velocity (${sideways.x}, ${sideways.y}, ${sideways.z})");
+    c.near("sphere: after impact the horizontal momentum is still zero (x)", sideways.x, 0.0, 0.05);
+    c.near("sphere: after impact the horizontal momentum is still zero (z)", sideways.z, 0.0, 0.05);
+    c.that("sphere: the crown rebounds upward", upward > 1.0);
+}
+
+// ---- gravity ----
+
+// A spray drop without drag, released at rest from `height`: the seconds until it is gone from the air.
+fn fpFallSeconds(gravity : f64, height : f64) : f64 {
+    let rules : FluidRules = fpRules(0.005, gravity);
+    let w : FluidWorld = new FluidWorld(rules, 4, 4);
+    let mut s : FluidSprayParams = FluidSprayParams {};
+    s.drag = 0.0;
+    let mut p : FluidParticleParams = FluidParticleParams::standard();
+    p.spray = s;
+    w.setParticleParams(p);
+    w.throwSpray(DVec3::make(2.0, height, 2.0), DVec3::zero(), 0.03);
+
+    let mut ticks : i32 = 0;
+    while (w.particleLedger().landed <= 0.0 && ticks < 4000) {
+        w.tick();
+        ticks = ticks + 1;
+    }
+    return (ticks as f64) * 0.005;
+}
+
+// The fall time of a drop is sqrt(2h/g): four times the gravity halves it.
+fn fpGravityDrop(c : Checks) : void {
+    let slow : f64 = fpFallSeconds(9.81, 5.0);
+    let fast : f64 = fpFallSeconds(4.0 * 9.81, 5.0);
+    println("  measured fall of 5 cells: ${slow} s at g, ${fast} s at 4g (sqrt(2h/g) = ${(2.0 * 5.0 / 9.81).sqrt()})");
+    c.near("gravity: a drop falls 5 cells in sqrt(2h/g)", slow, (2.0 * 5.0 / 9.81).sqrt(), 0.02);
+    c.near("gravity: at four times g it takes half as long", slow / fast, 2.0, 0.05);
+}
+
+// The highest point of a drop thrown straight up at `speed`, drag off.
+fn fpApex(gravity : f64, speed : f64) : f64 {
+    let w : FluidWorld = new FluidWorld(fpRules(0.005, gravity), 4, 4);
+    let mut s : FluidSprayParams = FluidSprayParams {};
+    s.drag = 0.0;
+    let mut p : FluidParticleParams = FluidParticleParams::standard();
+    p.spray = s;
+    w.setParticleParams(p);
+    w.throwSpray(DVec3::make(2.0, 0.5, 2.0), DVec3::make(0.0, speed, 0.0), 0.03);
+
+    let mut top : f64 = 0.0;
+    for (t of 0..3000) {
+        if (w.particleLedger().landed > 0.0) {
+            break;
+        }
+        w.tick();
+        if (w.particleCount() > 0 && w.particleAt(0).position.y > top) {
+            top = w.particleAt(0).position.y;
+        }
+    }
+    return top - 0.5;
+}
+
+// The height a jet reaches is v^2 / 2g: twice the gravity halves it.
+fn fpGravityJetHeight(c : Checks) : void {
+    let low : f64 = fpApex(9.81, 12.0);
+    let high : f64 = fpApex(2.0 * 9.81, 12.0);
+    println("  measured jet height at 12 cells/s: ${low} at g (v^2/2g = ${144.0 / (2.0 * 9.81)}), ${high} at 2g");
+    c.near("gravity: a jet rises v^2 / 2g", low, 144.0 / (2.0 * 9.81), 0.1);
+    c.near("gravity: twice the gravity, half the height", low / high, 2.0, 0.05);
+}
+
+// The liquid particles fall at the world's gravity too: the centre of a free block follows g t^2 / 2.
+fn fpFallOf(gravity : f64) : f64 {
+    let w : FluidWorld = new FluidWorld(fpRules(0.01, gravity), 12, 12);
+    w.setParticleParams(fpLiquidOnly(0.0, 0.08));
+    fpBlock(w, DVec3::make(5.0, 40.0, 5.0), 4, 4, 4, 0.2, DVec3::zero());
+    let start : f64 = fpMean(w, false).y;
+    for (t of 0..50) {
+        w.tick();
+    }
+    return start - fpMean(w, false).y;
+}
+
+fn fpGravityLiquid(c : Checks) : void {
+    let at1 : f64 = fpFallOf(9.81);
+    let at2 : f64 = fpFallOf(3.0 * 9.81);
+    println("  measured liquid block fall in 0.5 s: ${at1} at g, ${at2} at 3g");
+    c.near("gravity: liquid falls g t^2 / 2", at1, 0.5 * 9.81 * 0.25, 0.05);
+    c.near("gravity: and three times as far at 3g", at2 / at1, 3.0, 0.05);
+}
+
+// ---- viscosity ----
+
+// The kinetic energy of the motion of a free block of liquid relative to its own centre after a shear: its
+// upper half sliding one way and its lower half the other, high above the ground, for a given viscosity.
+fn fpShearEnergy(viscosity : f64) : f64 {
+    let w : FluidWorld = new FluidWorld(fpRules(0.01, 9.81), 16, 16);
+    w.setParticleParams(fpLiquidOnly(0.0, viscosity));
+    fpBlock(w, DVec3::make(6.0, 60.0, 6.0), 8, 4, 8, 0.2, DVec3::make(3.0, 0.0, 0.0));
+    fpBlock(w, DVec3::make(6.0, 59.2, 6.0), 8, 4, 8, 0.2, DVec3::make(-3.0, 0.0, 0.0));
+    for (t of 0..30) {
+        w.tick();
+    }
+    let mean : DVec3 = fpMean(w, true);
+    let mut sum : f64 = 0.0;
+    for (k of 0..w.particleCount()) {
+        let p : FluidParticle = w.particleAt(k);
+        if (p.kind == FluidParticleKind::Liquid) {
+            sum = sum + 0.5 * p.velocity.minus(mean).lengthSquared();
+        }
+    }
+    return sum;
+}
+
+// Viscosity is a parameter of the liquid: a sheared viscous block loses its internal motion faster.
+fn fpViscosityLiquid(c : Checks) : void {
+    let thin : f64 = fpShearEnergy(0.0);
+    let thick : f64 = fpShearEnergy(0.9);
+    println("  measured shear energy after 0.3 s: ${thin} thin, ${thick} viscous");
+    c.that(
+        "viscosity: a viscous liquid loses its internal motion faster than a thin one",
+        thick < 0.5 * thin
+    );
+}
+
+// The deviation of a settled pool's surface from flat, after a bump of water is let go.
+fn fpRipple(viscosity : f64) : f64 {
+    let rules : FluidRules = FluidRules { dt: 0.05, drag: 0.1, viscosity: viscosity };
+    let w : FluidWorld = fpPool(21, 1.0, rules);
+    w.pour(10, 10, 4.0);
+    for (t of 0..60) {
+        w.tick();
+    }
+    let mut sum : f64 = 0.0;
+    for (z of 0..21) {
+        for (x of 0..21) {
+            let d : f64 = w.levelAt(x, z) - w.totalVolume() / 441.0;
+            sum = sum + d * d;
+        }
+    }
+    return sum;
+}
+
+// The heightfield keeps its own viscosity: it damps a ripple faster too.
+fn fpViscosityHeightfield(c : Checks) : void {
+    let thin : f64 = fpRipple(0.0);
+    let thick : f64 = fpRipple(3.0);
+    println("  measured ripple energy after 3 s: ${thin} thin, ${thick} viscous");
+    c.that("viscosity: the heightfield's viscosity damps a ripple faster", thick < 0.5 * thin);
+}

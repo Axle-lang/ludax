@@ -1,0 +1,706 @@
+// fluid_particles_world — checks for the particle layer at the scale of a scene: the geyser, the flood it
+// makes, breaking waves, foam, the modules that switch off one by one, and determinism across threads.
+//
+// The geyser checks hold the default vent to numbers a viewer can see (a column more than twenty conduit
+// radii tall, a flow that is `power * pi * r^2 * v` volume per second); the flood check holds the world to the
+// story of an eruption (water landing outside the pool spreads over many cells, wets more ground at the peak
+// than before, and runs back downhill afterwards); the module checks switch each population, the
+// heightfield and the foam off alone and see that the rest still works; and the thread checks compare two
+// worlds that differ only in their worker count bit for bit.
+
+use ludax::Checks;
+use ludax::DVec3;
+use ludax::FluidImpact;
+use ludax::FluidLedger;
+use ludax::FluidParticle;
+use ludax::FluidParticleKind;
+use ludax::FluidParticleParams;
+use ludax::FluidRules;
+use ludax::FluidVent;
+use ludax::FluidWorld;
+use ludax::nanosToMillis;
+use ludax::nowNanos;
+
+/** The tolerance of the geyser's flow against its formula: lattice edges and the start-up of a column. */
+pub const FWORLD_TOL_FLOW : f64 = 0.1;
+
+/** Seconds in one world tick of these checks. */
+const FWORLD_DT : f64 = 0.05;
+
+/** The suite of scene-scale checks of the particle layer. */
+pub class FluidWorldSuite {
+    /** Runs every check of the suite. */
+    pub static fn run(c : Checks) : void {
+        fwGeyser(c);
+        fwFlood(c);
+        fwFilm(c);
+        fwSoak(c);
+        fwBreaking(c);
+        fwFoam(c);
+        fwModules(c);
+        fwShore(c);
+        fwThreads(c);
+        fwCapacity(c);
+        fwPerformance(c);
+    }
+}
+
+// A flat pool world of size x size columns, `level` deep, with the given particle parameters.
+fn fwPool(size : i32, level : f64, params : FluidParticleParams) : FluidWorld {
+    let w : FluidWorld = new FluidWorld(FluidRules { dt: FWORLD_DT }, size, size);
+    for (z of 0..size) {
+        for (x of 0..size) {
+            w.pour(x, z, level);
+        }
+    }
+    w.setParticleParams(params);
+    return w;
+}
+
+// How many particles of `kind` are alive.
+fn fwCount(w : FluidWorld, kind : FluidParticleKind) : i32 {
+    let mut n : i32 = 0;
+    for (k of 0..w.particleCount()) {
+        if (w.particleAt(k).kind == kind) {
+            n = n + 1;
+        }
+    }
+    return n;
+}
+
+// The default geyser: how tall its column gets, and the flow it throws.
+fn fwGeyser(c : Checks) : void {
+    let mut params : FluidParticleParams = FluidParticleParams::geyser();
+    params.threads = 4;
+    let w : FluidWorld = fwPool(64, 1.5, params);
+    let mut vent : FluidVent = FluidVent::geyser(32.5, 32.5);
+    vent.domeTime = 0.0;
+    vent.burstTime = 0.0;
+    vent.sustainTime = 0.0;
+    vent.decayTime = 0.0;
+    vent.restTime = 0.0;
+    vent.domeRate = 0.0;
+    w.addVent(vent);
+
+    let mut top : f64 = 0.0;
+    let mut mostLiquid : i32 = 0;
+    let mut mostSpray : i32 = 0;
+    let mut emittedAt20 : f64 = 0.0;
+    let ticks : i32 = 200;
+    let started : i64 = nowNanos();
+    for (t of 0..ticks) {
+        w.tick();
+        if (t == 20) {
+            emittedAt20 = w.particleLedger().emitted;
+        }
+        let mut liquid : i32 = 0;
+        let mut spray : i32 = 0;
+        for (k of 0..w.particleCount()) {
+            let p : FluidParticle = w.particleAt(k);
+            if (p.position.y > top) {
+                top = p.position.y;
+            }
+            if (p.kind == FluidParticleKind::Liquid) {
+                liquid = liquid + 1;
+            } else {
+                spray = spray + 1;
+            }
+        }
+        mostLiquid = if_max(mostLiquid, liquid);
+        mostSpray = if_max(mostSpray, spray);
+    }
+    let ms : f64 = nanosToMillis(nowNanos() - started);
+
+    let seconds : f64 = ((ticks - 20) as f64) * FWORLD_DT;
+    let flow : f64 = (w.particleLedger().emitted - emittedAt20) / seconds;
+    let formula : f64 = vent.flow();
+    let height : f64 = top - 1.5;
+    println("  measured geyser: column ${height} cells (v^2/2g = ${vent.speed * vent.speed / (2.0 * 9.81)}), flow ${flow} per s (formula ${formula}), at most ${mostLiquid} liquid, ${mostSpray} spray; ${ms / (ticks as f64)} ms per tick");
+    c.that("geyser: the column is over twenty conduit radii tall", height > 20.0 * vent.radius);
+    c.near(
+        "geyser: it reaches v^2 / 2g (to a tenth)",
+        height,
+        vent.speed * vent.speed / (2.0 * 9.81),
+        0.1 * vent.speed * vent.speed / (2.0 * 9.81)
+    );
+    c.near(
+        "geyser: the water leaving the vent per second is power * pi r^2 v",
+        flow / formula,
+        1.0,
+        FWORLD_TOL_FLOW
+    );
+    c.that("geyser: the liquid core holds thousands of particles", mostLiquid > 3000);
+    c.that("geyser: spray breaks off it", mostSpray > 1000);
+    w.close();
+}
+
+// A larger of two counts (a free function so the loops above stay short).
+fn if_max(a : i32, b : i32) : i32 {
+    if (b > a) {
+        return b;
+    }
+    return a;
+}
+
+// An eruption over a basin in a bowl-shaped apron with a hollow in it: the fallen water must persist, as
+// sheets that run and puddles that stay, and every drop of it must be on the ledger.
+fn fwFlood(c : Checks) : void {
+    let size : i32 = 80;
+    let rim : f64 = 7.0;
+    let mut params : FluidParticleParams = FluidParticleParams::geyser();
+    params.liquid.radius = 0.2;
+    params.liquid.capacity = 20000;
+    params.spray.capacity = 60000;
+    params.threads = 4;
+    let w : FluidWorld = new FluidWorld(FluidRules { dt: FWORLD_DT, drag: 1.0 }, size, size);
+    for (z of 0..size) {
+        for (x of 0..size) {
+            let dx : f64 = (x as f64) + 0.5 - 40.0;
+            let dz : f64 = (z as f64) + 0.5 - 40.0;
+            let d : f64 = (dx * dx + dz * dz).sqrt();
+            let hx : f64 = (x as f64) + 0.5 - 52.5;
+            let hz : f64 = (z as f64) + 0.5 - 40.5;
+            let hollow : f64 = 1.0 - (hx * hx + hz * hz).sqrt() / 2.5;
+            if (d < rim) {
+                w.setGround(x, z, -2.0);
+                w.pour(x, z, 1.0);
+            } else if (hollow > 0.0) {
+                w.setGround(x, z, 0.06 * (d - rim) - 0.5 * hollow);
+            } else {
+                w.setGround(x, z, 0.06 * (d - rim));
+            }
+        }
+    }
+    w.setParticleParams(params);
+    let poured : f64 = w.totalVolume();
+
+    let mut vent : FluidVent = FluidVent::geyser(40.5, 40.5);
+    vent.radius = 1.2;
+    vent.speed = 18.0;
+    vent.domeRate = 25.0;
+    vent.domeTime = 1.5;
+    vent.burstTime = 2.0;
+    vent.sustainTime = 2.0;
+    vent.decayTime = 2.0;
+    vent.restTime = 100.0;
+    vent.repeat = false;
+    w.addVent(vent);
+
+    let before : i32 = fwWetOutside(w, rim);
+    let area0 : i32 = fwWetArea(w);
+    let mut peakOutside : i32 = 0;
+    let mut peakArea : i32 = 0;
+    let mut peakAt : i32 = 0;
+    let mut poolAtEnd : f64 = 0.0;
+    let mut outsideAtEnd : f64 = 0.0;
+    let mut puddleLeast : f64 = 100.0;
+    let mut series : string = "";
+    let ticks : i32 = 1400;
+    for (t of 0..ticks) {
+        w.tick();
+        if (t == 300) {
+            poolAtEnd = fwPoolVolume(w, rim);
+            outsideAtEnd = w.totalVolume() - poolAtEnd;
+        }
+        let n : i32 = fwWetOutside(w, rim);
+        if (n > peakOutside) {
+            peakOutside = n;
+        }
+        let a : i32 = fwWetArea(w);
+        if (a > peakArea) {
+            peakArea = a;
+            peakAt = t;
+        }
+        if (t >= 400 && w.levelAt(52, 40) < puddleLeast) {
+            puddleLeast = w.levelAt(52, 40);
+        }
+        if (t % 200 == 199) {
+            series = "${series} ${a}";
+        }
+    }
+    let pool : f64 = fwPoolVolume(w, rim);
+    let outsideVolume : f64 = w.totalVolume() - pool;
+    let endArea : i32 = fwWetArea(w);
+    let l : FluidLedger = w.particleLedger();
+    let kept : f64 = w.totalVolume() + w.airborneVolume() + w.soakedTotal();
+    let put : f64 = poured + w.injectedTotal();
+    println("  measured flood: wet cells outside ${before} -> peak ${peakOutside}, wet area ${area0} -> peak ${peakArea} (tick ${peakAt}) -> ${endArea} after 70 s; every 10 s:${series}");
+    println("  measured flood: outside volume ${outsideAtEnd} -> ${outsideVolume}, pool ${poolAtEnd} -> ${pool}, hollow puddle depth at least ${puddleLeast} from 20 s to 70 s, ledger ${kept} of ${put}, emitted ${l.emitted}, landed ${l.landed}");
+    c.that("flood: nothing is wet outside the pool before", before == 0);
+    c.that("flood: the fallen water spread over more than 150 cells", peakOutside > 150);
+    c.that("flood: the wet area at the peak is larger than before", peakArea > area0 + 100);
+    c.that(
+        "flood: the water outside runs back downhill afterwards",
+        outsideVolume < 0.85 * outsideAtEnd
+    );
+    c.that("flood: and the pool volume recovers", pool > poolAtEnd);
+    c.near(
+        "flood: ground plus pool hold everything that was emitted, less the declared ledger items",
+        kept,
+        put,
+        FPART_FLOOD_TOL
+    );
+    c.that(
+        "flood: 60 s after the eruption the wet area is still over a fifth of the peak",
+        (endArea as f64) > 0.2 * (peakArea as f64)
+    );
+    c.that("flood: a puddle in a hollow stays", puddleLeast > 0.05);
+    w.close();
+}
+
+/** The tolerance of the flood ledger: rounding of a few hundred thousand deposits. */
+pub const FPART_FLOOD_TOL : f64 = 0.000000001;
+
+// The volume of water in the basin (distance to the centre under `rim`).
+fn fwPoolVolume(w : FluidWorld, rim : f64) : f64 {
+    let mut sum : f64 = 0.0;
+    for (z of 0..w.depth()) {
+        for (x of 0..w.width()) {
+            let dx : f64 = (x as f64) + 0.5 - 40.0;
+            let dz : f64 = (z as f64) + 0.5 - 40.0;
+            if ((dx * dx + dz * dz).sqrt() < rim) {
+                sum = sum + w.levelAt(x, z);
+            }
+        }
+    }
+    return sum;
+}
+
+// How many columns outside the basin hold water.
+fn fwWetOutside(w : FluidWorld, rim : f64) : i32 {
+    let mut n : i32 = 0;
+    for (z of 0..w.depth()) {
+        for (x of 0..w.width()) {
+            let dx : f64 = (x as f64) + 0.5 - 40.0;
+            let dz : f64 = (z as f64) + 0.5 - 40.0;
+            if ((dx * dx + dz * dz).sqrt() >= rim && w.levelAt(x, z) > 0.005) {
+                n = n + 1;
+            }
+        }
+    }
+    return n;
+}
+
+// How many columns of the whole world hold water.
+fn fwWetArea(w : FluidWorld) : i32 {
+    let mut n : i32 = 0;
+    for (z of 0..w.depth()) {
+        for (x of 0..w.width()) {
+            if (w.levelAt(x, z) > 0.005) {
+                n = n + 1;
+            }
+        }
+    }
+    return n;
+}
+
+// A dam: `high` water in the columns x < 30, `low` beyond, in a strip of 60 x 3.
+fn fwDam(high : f64, low : f64, params : FluidParticleParams) : FluidWorld {
+    let w : FluidWorld = new FluidWorld(FluidRules { dt: FWORLD_DT, drag: 0.3 }, 60, 3);
+    for (z of 0..3) {
+        for (x of 0..60) {
+            if (x < 30) {
+                w.pour(x, z, high);
+            } else {
+                w.pour(x, z, low);
+            }
+        }
+    }
+    w.setParticleParams(params);
+    return w;
+}
+
+// The emitted volume of a dam run under the given parameters.
+fn fwDamEmitted(high : f64, low : f64, params : FluidParticleParams) : f64 {
+    let w : FluidWorld = fwDam(high, low, params);
+    for (t of 0..40) {
+        w.tick();
+    }
+    return w.particleLedger().emitted;
+}
+
+// A crest sheds spray only when it passes the breaking criterion.
+fn fwBreaking(c : Checks) : void {
+    let mut on : FluidParticleParams = FluidParticleParams::standard();
+    on.breaking.enabled = true;
+    on.breaking.steepness = 0.3;
+    let mut strict : FluidParticleParams = on;
+    strict.breaking.steepness = 50.0;
+    strict.breaking.froude = 50.0;
+    strict.breaking.throwSpeed = 500.0;
+
+    let steep : f64 = fwDamEmitted(2.0, 0.3, on);
+    let held : f64 = fwDamEmitted(2.0, 0.3, strict);
+    let off : f64 = fwDamEmitted(2.0, 0.3, FluidParticleParams::standard());
+    let gentle : f64 = fwDamEmitted(1.03, 1.0, on);
+    println("  measured breaking: dam emits ${steep}, with a high threshold ${held}, switched off ${off}, a gentle step ${gentle}");
+    c.that("breaking: a steep crest sheds spray", steep > 0.0);
+    c.near("breaking: below the threshold nothing is shed", held, 0.0, 0.0);
+    c.near("breaking: switched off nothing is shed", off, 0.0, 0.0);
+    c.near("breaking: a gentle step does not break", gentle, 0.0, 0.0);
+}
+
+// The largest foam coverage along the strip of a dam run, and whether foam is on or off.
+fn fwDamFoam(params : FluidParticleParams, ticks : i32) : f64 {
+    let w : FluidWorld = fwDam(2.0, 0.3, params);
+    let mut peak : f64 = 0.0;
+    for (t of 0..ticks) {
+        w.tick();
+        for (x of 20..50) {
+            let f : f64 = w.foamAt((x as f64) + 0.5, 1.5) as f64;
+            if (f > peak) {
+                peak = f;
+            }
+        }
+    }
+    return peak;
+}
+
+// Foam appears where the flow converges and a front runs, decays, and is a module that switches off.
+fn fwFoam(c : Checks) : void {
+    let on : f64 = fwDamFoam(FluidParticleParams::standard(), 30);
+    let mut p : FluidParticleParams = FluidParticleParams::standard();
+    p.foam.enabled = false;
+    let off : f64 = fwDamFoam(p, 30);
+    println("  measured foam: bore of a dam ${on}, foam module off ${off}");
+    c.that("foam: a bore makes whitewater", on > 0.05);
+    c.near("foam: with the module off there is none", off, 0.0, 0.0);
+
+    let mut q : FluidParticleParams = FluidParticleParams::standard();
+    q.foam.generation = 0.0;
+    q.foam.halfLife = 1.0;
+    let w : FluidWorld = fwPool(12, 1.0, q);
+    for (k of 0..40) {
+        w.throwSpray(DVec3::make(6.5, 1.6, 6.5), DVec3::make(0.0, -10.0, 0.0), 0.06);
+    }
+    for (t of 0..8) {
+        w.tick();
+    }
+    let early : f64 = w.foamAt(6.5, 6.5) as f64;
+    let stirred : f64 = w.turbulenceAt(6.5, 6.5) as f64;
+    for (t of 0..80) {
+        w.tick();
+    }
+    let late : f64 = w.foamAt(6.5, 6.5) as f64;
+    println("  measured foam decay: landing foam ${early}, turbulence ${stirred}, after 4 s (half-life 1 s) ${late}");
+    c.that("foam: landing drops lay foam", early > 0.1);
+    c.that("foam: and stir the water", stirred > 0.05);
+    c.that("foam: it decays with its half-life", late < 0.2 * early);
+}
+
+// Each module can be switched off alone, and the others go on working.
+fn fwModules(c : Checks) : void {
+    // No liquid: the vent throws nothing and the ledger stays empty.
+    let mut noLiquid : FluidParticleParams = FluidParticleParams::standard();
+    noLiquid.liquid.capacity = 0;
+    let a : FluidWorld = fwPool(16, 1.0, noLiquid);
+    a.addVent(FluidVent { x: 8.5, z: 8.5, radius: 1.0, speed: 10.0 });
+    for (t of 0..30) {
+        a.tick();
+    }
+    c.that(
+        "modules: with no liquid the vent throws no liquid",
+        fwCount(a, FluidParticleKind::Liquid) == 0
+    );
+    c.near("modules: and emits nothing", a.particleLedger().emitted, 0.0, 0.0);
+
+    // No heightfield: columns hold water but do not flow; particles still fall into them.
+    let b : FluidWorld = new FluidWorld(FluidRules { dt: FWORLD_DT }, 8, 8);
+    b.setHeightfieldEnabled(false);
+    b.pour(4, 4, 3.0);
+    b.throwSpray(DVec3::make(2.5, 2.0, 2.5), DVec3::zero(), 0.04);
+    for (t of 0..60) {
+        b.tick();
+    }
+    c.near(
+        "modules: without the heightfield a poured column does not flow",
+        b.levelAt(4, 4),
+        3.0,
+        0.0
+    );
+    c.that("modules: and a drop still lands in its column", b.levelAt(2, 2) > 0.0);
+
+    // No particles at all: the plain heightfield behaves as it always did.
+    let mut none : FluidParticleParams = FluidParticleParams::standard();
+    none.liquid.capacity = 0;
+    none.spray.capacity = 0;
+    let d : FluidWorld = fwDam(2.0, 0.3, none);
+    let before : f64 = d.totalVolume();
+    for (t of 0..100) {
+        d.tick();
+    }
+    c.near("modules: the heightfield alone keeps its volume", d.totalVolume(), before, 0.000000001);
+    c.that("modules: and flows", d.levelAt(40, 1) > 0.31);
+    c.that("modules: with no particles at all", d.particleCount() == 0);
+
+    // Reconfiguring pours the airborne water back.
+    let e : FluidWorld = new FluidWorld(FluidRules { dt: FWORLD_DT }, 8, 8);
+    e.throwSpray(DVec3::make(3.5, 5.0, 3.5), DVec3::zero(), 0.05);
+    let volume : f64 = e.injectedTotal();
+    e.setParticleParams(none);
+    c.near("modules: reconfiguring lands what was airborne", e.totalVolume(), volume, 0.000000001);
+    c.that("modules: and leaves no particle", e.particleCount() == 0);
+}
+
+// A beach: water run up a slope stays non-negative and conserved, and whitens its front.
+fn fwShore(c : Checks) : void {
+    let w : FluidWorld = new FluidWorld(FluidRules { dt: FWORLD_DT, drag: 0.5 }, 60, 3);
+    for (z of 0..3) {
+        for (x of 0..60) {
+            w.setGround(x, z, 0.05 * (x as f64));
+            if (x < 6) {
+                w.pour(x, z, 2.0);
+            }
+        }
+    }
+    let before : f64 = w.totalVolume();
+    let mut lowest : f64 = 0.0;
+    let mut front : i32 = 0;
+    let mut farthest : i32 = 0;
+    let mut foam : f64 = 0.0;
+    for (t of 0..400) {
+        w.tick();
+        let mut edge : i32 = 0;
+        for (x of 0..60) {
+            let level : f64 = w.levelAt(x, 1);
+            if (level < lowest) {
+                lowest = level;
+            }
+            if (level > 0.005) {
+                edge = x;
+            }
+        }
+        front = edge;
+        if (edge > farthest) {
+            farthest = edge;
+        }
+        let f : f64 = w.foamAt((edge as f64) + 0.5, 1.5) as f64;
+        if (f > foam) {
+            foam = f;
+        }
+    }
+    println("  measured shore: front reached column ${farthest}, ended at ${front}, foam at the front ${foam}");
+    c.that("shore: no column goes below dry", lowest >= -0.000000000001);
+    c.near("shore: the volume is kept", w.totalVolume(), before, 0.000000001);
+    c.that("shore: the water ran up the beach", farthest > 12);
+    c.that("shore: and whitened its front", foam > 0.05);
+}
+
+// Two worlds that differ only in their thread count, run in lockstep: every particle equal, every tick.
+fn fwSameState(a : FluidWorld, b : FluidWorld) : bool {
+    if (a.particleCount() != b.particleCount()) {
+        return false;
+    }
+    for (k of 0..a.particleCount()) {
+        let p : FluidParticle = a.particleAt(k);
+        let q : FluidParticle = b.particleAt(k);
+        let same : bool = p.position.x == q.position.x && p.position.y == q.position.y
+            && p.position.z == q.position.z
+            && p.velocity.x == q.velocity.x
+            && p.velocity.y == q.velocity.y
+            && p.velocity.z == q.velocity.z
+            && p.radius == q.radius
+            && p.age == q.age;
+        if (!same) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// A busy scene for the determinism checks: a vent, an impact, breaking waves.
+fn fwBusy(threads : i32) : FluidWorld {
+    let mut p : FluidParticleParams = FluidParticleParams::standard();
+    p.threads = threads;
+    p.liquid.radius = 0.2;
+    p.breaking.enabled = true;
+    let w : FluidWorld = fwPool(32, 1.0, p);
+    let vent : FluidVent = FluidVent {
+        x: 16.5,
+        z: 16.5,
+        radius: 1.0,
+        speed: 12.0,
+        domeRate: 4.0,
+    };
+    w.addVent(vent);
+    w.impact(FluidImpact { x: 8, z: 8, radius: 1, volume: 1.5, speed: 14.0 });
+    return w;
+}
+
+// One thread or four, and a run twice over, give the same bits.
+fn fwThreads(c : Checks) : void {
+    let one : FluidWorld = fwBusy(1);
+    let four : FluidWorld = fwBusy(4);
+    let again : FluidWorld = fwBusy(1);
+    let mut lockstep : bool = true;
+    let mut repeat : bool = true;
+    let mut most : i32 = 0;
+    for (t of 0..80) {
+        one.tick();
+        four.tick();
+        again.tick();
+        if (!fwSameState(one, four)) {
+            lockstep = false;
+        }
+        if (!fwSameState(one, again)) {
+            repeat = false;
+        }
+        most = if_max(most, one.particleCount());
+    }
+    let la : FluidLedger = one.particleLedger();
+    let lb : FluidLedger = four.particleLedger();
+    let sameFoam : bool = one.foamAt(16.5, 16.5) == four.foamAt(16.5, 16.5);
+    println("  measured threads: ${most} particles at most, 1 vs 4 workers identical every tick: ${lockstep}");
+    c.that("threads: the scene is not trivial", most > 500);
+    c.that("threads: 1 and 4 workers give the same particles at every tick", lockstep);
+    c.that(
+        "threads: and the same ledger",
+        la.liquid == lb.liquid && la.spray == lb.spray
+    );
+    c.that("threads: and the same foam", sameFoam);
+    c.that("determinism: a second run gives the same particles", repeat);
+    one.close();
+    four.close();
+    again.close();
+}
+
+// Tiny capacities: no population ever holds more than its limit, and the water is still accounted.
+fn fwCapacity(c : Checks) : void {
+    let mut p : FluidParticleParams = FluidParticleParams::standard();
+    p.liquid.capacity = 40;
+    p.spray.capacity = 60;
+    p.liquid.radius = 0.2;
+    p.breaking.enabled = true;
+    let w : FluidWorld = fwPool(24, 1.0, p);
+    let poured : f64 = w.totalVolume();
+    w.addVent(FluidVent { x: 12.5, z: 12.5, radius: 1.0, speed: 12.0, domeRate: 4.0 });
+    w.impact(FluidImpact { x: 6, z: 6, radius: 1, volume: 1.5, speed: 14.0 });
+
+    let mut ok : bool = true;
+    let mut worst : f64 = 0.0;
+    for (t of 0..150) {
+        w.tick();
+        if (fwCount(w, FluidParticleKind::Liquid) > 40
+            || fwCount(w, FluidParticleKind::Spray) > 60) {
+            ok = false;
+        }
+        let l : FluidLedger = w.particleLedger();
+        let err : f64 = w.totalVolume() + l.liquid + l.spray - (poured + w.injectedTotal() + 1.5);
+        if (err > worst) {
+            worst = err;
+        }
+        if (0.0 - err > worst) {
+            worst = 0.0 - err;
+        }
+    }
+    println("  measured capacity: ledger error ${worst} with 40 liquid and 60 spray at most");
+    c.that("capacity: no population exceeds its limit", ok);
+    c.that("capacity: and the ledger still closes", worst < 0.000000001);
+}
+
+// The cost of a large scene: 20k liquid and 100k spray particles, ticked a few times.
+fn fwPerformance(c : Checks) : void {
+    let mut p : FluidParticleParams = FluidParticleParams::standard();
+    p.threads = 4;
+    p.liquid.capacity = 20000;
+    p.liquid.radius = 0.2;
+    p.spray.capacity = 100000;
+    let w : FluidWorld = new FluidWorld(FluidRules { dt: FWORLD_DT }, 64, 64);
+    w.setParticleParams(p);
+
+    let mut liquid : i32 = 0;
+    for (k of 0..27) {
+        for (j of 0..27) {
+            for (i of 0..27) {
+                let at : DVec3 = DVec3::make(
+                    26.0 + (i as f64) * 0.4,
+                    40.0 + (j as f64) * 0.4,
+                    26.0 + (k as f64) * 0.4
+                );
+                if (w.throwLiquid(at, DVec3::make(0.0, 1.0, 0.0))) {
+                    liquid = liquid + 1;
+                }
+            }
+        }
+    }
+    let mut seed : i64 = 12345;
+    for (n of 0..100000) {
+        seed = (seed * 6364136223846793005 + 1442695040888963407) & 9223372036854775807;
+        let a : f64 = ((seed >>> 16) % 1000) as f64 / 1000.0;
+        let b : f64 = ((seed >>> 32) % 1000) as f64 / 1000.0;
+        let d : f64 = ((seed >>> 44) % 1000) as f64 / 1000.0;
+        let at : DVec3 = DVec3::make(a * 60.0 + 2.0, 20.0 + b * 40.0, d * 60.0 + 2.0);
+        w.throwSpray(at, DVec3::make(a - 0.5, 4.0 * (b - 0.5), d - 0.5), 0.03);
+    }
+
+    let started : i64 = nowNanos();
+    let ticks : i32 = 20;
+    for (t of 0..ticks) {
+        w.tick();
+    }
+    let ms : f64 = nanosToMillis(nowNanos() - started);
+    let count : i32 = w.particleCount();
+    let perTick : f64 = ms / (ticks as f64);
+    let rate : f64 = (count as f64) * (ticks as f64) / (ms / 1000.0);
+    println("  measured performance: ${liquid} liquid, ${fwCount(w, FluidParticleKind::Spray)} spray at the end: ${perTick} ms per tick, ${rate} particle updates per second (4 workers)");
+    c.that("performance: a scene of 120k particles ticks in under 2 s", perTick < 2000.0);
+    w.close();
+}
+
+// A thin film (a millimetre deep) on a rough slope: no column goes negative, no volume leaks, and when the
+// water has found its places the world goes quiet and costs nothing.
+fn fwFilm(c : Checks) : void {
+    let w : FluidWorld = new FluidWorld(FluidRules { dt: FWORLD_DT, drag: 1.0 }, 32, 32);
+    for (z of 0..32) {
+        for (x of 0..32) {
+            let bump : f64 = 0.02 * (((x * 7 + z * 13) % 5) as f64);
+            w.setGround(x, z, 0.03 * (x as f64) + bump);
+            w.pour(x, z, 0.001);
+        }
+    }
+    let before : f64 = w.totalVolume();
+    let mut lowest : f64 = 0.0;
+    for (t of 0..1200) {
+        w.tick();
+        if (t % 50 == 0) {
+            for (z of 0..32) {
+                for (x of 0..32) {
+                    if (w.levelAt(x, z) < lowest) {
+                        lowest = w.levelAt(x, z);
+                    }
+                }
+            }
+        }
+    }
+    println("  measured film: lowest level ${lowest}, volume ${w.totalVolume()} of ${before}, awake columns after 60 s: ${w.awakeCount()}");
+    c.that("film: no column goes negative", lowest >= -0.000000000001);
+    c.near("film: no volume leaks", w.totalVolume(), before, 0.000000001);
+    c.that("film: and the calm world is cheap", w.awakeCount() < 100);
+}
+
+// Infiltration is an explicit, small term: with it a puddle dries and the ledger books the soaked water;
+// without it the puddle stays for ever.
+fn fwSoak(c : Checks) : void {
+    let dry : FluidWorld = new FluidWorld(
+        FluidRules { dt: FWORLD_DT, infiltration: 0.002 },
+        8,
+        8
+    );
+    let wet : FluidWorld = new FluidWorld(FluidRules { dt: FWORLD_DT }, 8, 8);
+    dry.pour(4, 4, 0.5);
+    wet.pour(4, 4, 0.5);
+    for (t of 0..1200) {
+        dry.tick();
+        wet.tick();
+    }
+    println("  measured soak: after 60 s ${dry.totalVolume()} left of 0.5 with infiltration, ${wet.totalVolume()} without, soaked ${dry.soakedTotal()}");
+    c.near(
+        "soak: the soaked water is on the ledger",
+        dry.totalVolume() + dry.soakedTotal(),
+        0.5,
+        0.000000001
+    );
+    c.that("soak: a small infiltration dries the puddle", dry.totalVolume() < 0.05);
+    c.near("soak: with none the puddle stays", wet.totalVolume(), 0.5, 0.000000001);
+    c.near("soak: and soaks nothing", wet.soakedTotal(), 0.0, 0.0);
+}

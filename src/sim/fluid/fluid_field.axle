@@ -1,0 +1,151 @@
+// fluid_field — the state of a column world: ground, water, external load, and the head they make.
+//
+// The field is the one place that knows what "pressure" means here. Water in a column at rest has the
+// hydrostatic head of its surface, `ground + water`; two more terms add to it. A `load` is a head pushed onto
+// the column from outside — a piston, a lid, a floating hull — so a piston on one arm of a U-tube raises the
+// other arm until the heads match. And in `Pressure` overflow a column holding more than `maxLevel` is
+// compressed: its excess adds `pressureStiffness` of head per unit, which is how a sealed volume pushes back.
+// Flow between two columns is driven by the difference of these heads and by nothing else, so every
+// equilibrium of the world is a state of equal head, whatever produced it.
+//
+// Levels are f64 on purpose: conservation here is exact cancellation (every transfer subtracts from one
+// column the number it adds to the other), and f32 would lose it to rounding within a few thousand transfers.
+// The phases that advance the field live in `fluid_pipes`, `fluid_emitters` and `fluid_splash`; the world
+// that a game holds is `fluid_world`.
+
+use crate::core::math::scalar::maxD;
+use crate::sim::fluid::fluid_rules::{FluidOverflow, FluidRules};
+
+/** The four neighbours of a column, in the fixed order every phase visits them in. */
+pub(crate) const FLUID_WEST : i32 = 0;
+pub(crate) const FLUID_EAST : i32 = 1;
+pub(crate) const FLUID_NORTH : i32 = 2;
+pub(crate) const FLUID_SOUTH : i32 = 3;
+
+/** How many neighbours a column has; direction loops run `0..FLUID_DIRECTIONS`. */
+pub(crate) const FLUID_DIRECTIONS : i32 = 4;
+
+/** A square of columns clipped to the grid: the footprint of a spring, a drain or an impact. */
+pub(crate) struct FluidBlock {
+    /** First column x. */
+    pub(crate) x0 : i32 = 0;
+
+    /** First column z. */
+    pub(crate) z0 : i32 = 0;
+
+    /** Last column x, inclusive. */
+    pub(crate) x1 : i32 = 0;
+
+    /** Last column z, inclusive. */
+    pub(crate) z1 : i32 = 0;
+
+    /** How many columns the block holds; 0 when it lies wholly outside the grid. */
+    pub(crate) fn count(self) : i32 {
+        if (self.x1 < self.x0 || self.z1 < self.z0) {
+            return 0;
+        }
+        return (self.x1 - self.x0 + 1) * (self.z1 - self.z0 + 1);
+    }
+}
+
+/** The arrays and rules every phase of a tick reads and writes. */
+pub(crate) class FluidField {
+    pub(crate) width  : i32;
+    pub(crate) depth  : i32;
+    pub(crate) ground : f64[];
+    pub(crate) water  : f64[];
+    pub(crate) load   : f64[];
+    pub(crate) rules  : FluidRules;
+
+    /** A dry, flat, unloaded field of `width` x `depth` columns under `rules` (already `checked`). */
+    constructor(rules : FluidRules, width : i32, depth : i32) {
+        self.width = width;
+        self.depth = depth;
+        self.rules = rules;
+        let n : i64 = (width * depth) as i64;
+        self.ground = new f64[n];
+        self.water = new f64[n];
+        self.load = new f64[n];
+        for (i of 0..n) {
+            self.ground[i] = 0.0;
+            self.water[i] = 0.0;
+            self.load[i] = 0.0;
+        }
+    }
+
+    /** Whether column (x, z) is inside the grid. */
+    pub(crate) fn inBounds(self, x : i32, z : i32) : bool {
+        return x >= 0 && z >= 0 && x < self.width && z < self.depth;
+    }
+
+    /** The index of column (x, z), which must be inside the grid. */
+    pub(crate) fn column(self, x : i32, z : i32) : i32 {
+        return z * self.width + x;
+    }
+
+    /** The column next to `c` in `direction` (a `FLUID_WEST` … `FLUID_SOUTH`), or -1 at the grid's edge. */
+    pub(crate) fn neighbour(self, c : i32, direction : i32) : i32 {
+        let x : i32 = c % self.width;
+        let z : i32 = c / self.width;
+        if (direction == FLUID_WEST && x > 0) {
+            return c - 1;
+        }
+        if (direction == FLUID_EAST && x + 1 < self.width) {
+            return c + 1;
+        }
+        if (direction == FLUID_NORTH && z > 0) {
+            return c - self.width;
+        }
+        if (direction == FLUID_SOUTH && z + 1 < self.depth) {
+            return c + self.width;
+        }
+        return -1;
+    }
+
+    /** The square of columns within `radius` of (x, z), clipped to the grid. */
+    pub(crate) fn block(self, x : i32, z : i32, radius : i32) : FluidBlock {
+        let mut block : FluidBlock = FluidBlock {
+            x0: x - radius,
+            z0: z - radius,
+            x1: x + radius,
+            z1: z + radius,
+        };
+        if (block.x0 < 0) {
+            block.x0 = 0;
+        }
+        if (block.z0 < 0) {
+            block.z0 = 0;
+        }
+        if (block.x1 >= self.width) {
+            block.x1 = self.width - 1;
+        }
+        if (block.z1 >= self.depth) {
+            block.z1 = self.depth - 1;
+        }
+        return block;
+    }
+
+    /** The surface height of a column: ground plus water. */
+    pub(crate) fn surface(self, c : i32) : f64 {
+        return self.ground[c as i64] + self.water[c as i64];
+    }
+
+    /** The head a column pushes with: surface, external load and, under `Pressure`, compression. */
+    pub(crate) fn head(self, c : i32) : f64 {
+        let base : f64 = self.surface(c) + self.load[c as i64];
+        if (self.rules.overflow != FluidOverflow::Pressure) {
+            return base;
+        }
+        let excess : f64 = maxD(self.water[c as i64] - self.rules.maxLevel, 0.0);
+        return base + self.rules.pressureStiffness * excess;
+    }
+
+    /** The sum of every column's water, in column order. */
+    pub(crate) fn totalWater(self) : f64 {
+        let mut sum : f64 = 0.0;
+        for (i of 0..(self.width * self.depth)) {
+            sum = sum + self.water[i as i64];
+        }
+        return sum;
+    }
+}

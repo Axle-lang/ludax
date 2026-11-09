@@ -1,0 +1,106 @@
+// fluid_grid — the spatial hash that finds a particle's neighbours, built by counting sort.
+//
+// Space is cut into cubes of the kernel support, and a cube's address is its integer coordinates wrapped
+// into a fixed block of 64 x 64 x 32 buckets (`FLUID_GRID_BUCKETS`). Wrapping means two far-apart cubes can
+// share a bucket, which only costs a few extra distance tests, and it means the grid is a flat array whatever
+// the size of the world. The wrap dimensions are all at least 3, so the 27 cubes around any cube land in 27
+// different buckets: a query never visits a particle twice.
+//
+// The build is a counting sort run on the calling thread: count the particles of each bucket, prefix-sum the
+// counts, scatter the particle indices in index order. Its result is a function of the positions alone —
+// the bucket order is arithmetic, and inside a bucket particles keep index order — so the neighbour lists
+// derived from it, and the physics derived from those, are identical for any number of threads. A hash map
+// would iterate in an order that depends on its history; this cannot.
+
+use crate::sim::fluid::fluid_sample::FluidSample;
+
+/** Wrap of the cube coordinate x, a power of two of at least 4. */
+const FLUID_GRID_XS : i32 = 64;
+
+/** Wrap of the cube coordinate z. */
+const FLUID_GRID_ZS : i32 = 64;
+
+/** Wrap of the cube coordinate y. */
+const FLUID_GRID_YS : i32 = 32;
+
+/** How many buckets the grid has. */
+pub(crate) const FLUID_GRID_BUCKETS : i32 = 131072;
+
+/** A counting-sorted spatial hash of particle positions. */
+pub(crate) class FluidGrid {
+    /** First sorted slot of each bucket; one more than the buckets, so a bucket ends where the next starts. */
+    pub(crate) starts : i32[];
+
+    /** Particle indices sorted by bucket, index order inside a bucket. */
+    pub(crate) order : i32[];
+    keys             : i32[];
+    room             : i32;
+    inverse          : f64;
+    sized            : bool;
+
+    /** A grid for cubes of side `cell` that can hold `room` particles. */
+    constructor(cell : f64, room : i32) {
+        self.inverse = 1.0 / cell;
+        self.room = room;
+        self.starts = new i32[1];
+        self.sized = false;
+        self.order = new i32[(room + 1) as i64];
+        self.keys = new i32[(room + 1) as i64];
+    }
+
+    /** Makes room for `room` particles (never shrinks). */
+    pub(crate) fn ensure(mut self, room : i32) : void {
+        if (!self.sized) {
+            self.sized = true;
+            self.starts = new i32[(FLUID_GRID_BUCKETS + 1) as i64];
+        }
+        if (room <= self.room) {
+            return;
+        }
+        self.room = room;
+        self.order = new i32[(room + 1) as i64];
+        self.keys = new i32[(room + 1) as i64];
+    }
+
+    /** The bucket of the cube with integer coordinates (ix, iy, iz). */
+    pub(crate) static fn bucket(ix : i32, iy : i32, iz : i32) : i32 {
+        return (ix & (FLUID_GRID_XS - 1)) | ((iz & (FLUID_GRID_ZS - 1)) << 6)
+            | ((iy & (FLUID_GRID_YS - 1)) << 12);
+    }
+
+    /** The cube coordinate of a position along one axis. */
+    pub(crate) fn cube(self, v : f64) : i32 {
+        return FluidSample::floor(v * self.inverse);
+    }
+
+    /** Sorts the first `count` particles at (px, py, pz) into buckets. */
+    pub(crate) fn build(mut self, px : f64[], py : f64[], pz : f64[], count : i32) : void {
+        for (b of 0..FLUID_GRID_BUCKETS + 1) {
+            self.starts[b as i64] = 0;
+        }
+
+        for (i of 0..count) {
+            let k : i64 = i as i64;
+            let key : i32 = FluidGrid::bucket(self.cube(px[k]), self.cube(py[k]), self.cube(pz[k]));
+            self.keys[k] = key;
+            self.starts[(key + 1) as i64] = self.starts[(key + 1) as i64] + 1;
+        }
+        for (b of 0..FLUID_GRID_BUCKETS) {
+            self.starts[(b + 1) as i64] = self.starts[(b + 1) as i64] + self.starts[b as i64];
+        }
+
+        // Scatter, advancing a bucket's start; afterwards each start has moved to its bucket's end, which is
+        // the next bucket's start, so shift them back by one bucket.
+        for (i of 0..count) {
+            let key : i64 = self.keys[i as i64] as i64;
+            self.order[self.starts[key] as i64] = i;
+            self.starts[key] = self.starts[key] + 1;
+        }
+        let mut b : i32 = FLUID_GRID_BUCKETS;
+        while (b > 0) {
+            self.starts[b as i64] = self.starts[(b - 1) as i64];
+            b = b - 1;
+        }
+        self.starts[0] = 0;
+    }
+}

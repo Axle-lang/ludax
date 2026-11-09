@@ -1,0 +1,239 @@
+// fluid_impact — an object hitting the water: displacement, an outward shock, and spray.
+//
+// An impact is described by the object (where, how big, how fast) and turned into three effects that each
+// say something true. Displacement: the object's volume now occupies the footprint, so the water there
+// rises by exactly that volume — the pipes carry the bump away as a ring wave at the physical speed.
+// Momentum: the water around the footprint is shoved outward, harder when the object is large next to the
+// water it lands in (`volume / (volume + footprint * depth)`: a pebble in a lake barely shoves, a boulder in
+// a puddle sends it flying) and in proportion to its speed. Spray: above a threshold speed a share of the
+// object's volume, growing with the energy past the threshold, is thrown up as liquid particles (see `fluid_liquid`),
+// never more than half of what the footprint held, and taken out of the columns so volume stays accounted:
+// `totalVolume + airborne` after equals before plus the object's volume.
+//
+// The numbers a designer tunes live in `FluidSplash`, so one world can have a gentle pond and a violent
+// one. Randomness for the drops' scatter is a `Pcg32` seeded from the world's seed, never a clock.
+
+use crate::core::math::dvec3::DVec3;
+use crate::core::math::scalar::{maxD, minD, minI};
+use crate::core::rng::pcg32::Pcg32;
+use crate::sim::fluid::fluid_field::{FluidBlock, FluidField};
+use crate::sim::fluid::fluid_pool::FluidPopulation;
+use crate::sim::fluid::fluid_sample::FluidSample;
+use crate::sim::fluid::fluid_spawn::FluidSpawn;
+use crate::sim::fluid::fluid_tick::FluidTick;
+
+/** The most liquid particles a single impact throws. */
+const FLUID_IMPACT_PARTICLES_MAX : i32 = 600;
+
+/** The `Pcg32` stream selector of the spray, fixed so the scatter is repeatable. */
+const FLUID_IMPACT_STREAM : u64 = 54;
+
+/** The most of the water under an impact that spray may take; the rest stays to be displaced. */
+const FLUID_IMPACT_SPRAY_CAP : f64 = 0.5;
+
+/** The least share of full lift a drop gets; a random share of the remainder is added on top. */
+const FLUID_IMPACT_LIFT_FLOOR : f64 = 0.5;
+
+/** How hard an impact splashes. Copy the defaults and change what the water needs. */
+pub struct FluidSplash {
+    /** The impact speed, in cells per second, below which nothing is thrown up; an object slower than this
+     * only displaces and pushes. */
+    pub speedThreshold : f64 = 2.0;
+
+    /** The share of the object's volume thrown as spray at very high speed. The share grows from zero at the
+     * threshold toward this as `1 - (threshold / speed)^2`. */
+    pub fraction : f64 = 0.4;
+
+    /** How fast spray leaves upward, as a multiple of the impact speed. */
+    pub lift : f64 = 0.5;
+
+    /** How fast spray leaves sideways at most, as a multiple of the impact speed. */
+    pub spread : f64 = 0.3;
+
+    /** Unused since the spray became particles: the size of what an impact throws is the liquid radius of
+     * `FluidParticleParams` (kept so existing games compile). */
+    pub dropletVolume : f64 = 0.02;
+
+    /** How hard the outward shock is, as a multiple of the impact speed: 0 leaves only the displacement,
+     * 1 sends the shoved water out as fast as the object came in. */
+    pub kick : f64 = 0.6;
+}
+
+/** An object entering the water through the column (`x`, `z`). */
+pub struct FluidImpact {
+    /** Column x the object strikes. */
+    pub x : i32 = 0;
+
+    /** Column z the object strikes. */
+    pub z : i32 = 0;
+
+    /** Half-width of the object's footprint in columns: 0 is one column, 1 is 3 x 3. */
+    pub radius : i32 = 0;
+
+    /** The object's volume, in cell units, that ends up displacing water. */
+    pub volume : f64 = 0.0;
+
+    /** The speed of the fall at the surface, in cells per second. */
+    pub speed : f64 = 0.0;
+}
+
+/** The impact machinery of a world: the splash numbers and the scatter generator, and the phase that applies
+ * an impact to a field, a tick's bookkeeping and the drop pool. */
+pub(crate) class FluidImpacts {
+    rng               : Pcg32;
+    pub(crate) splash : FluidSplash;
+
+    /** The machinery of a world; `seed` seeds the scatter of the spray. */
+    constructor(seed : u64) {
+        self.rng = new Pcg32(seed, FLUID_IMPACT_STREAM);
+        self.splash = FluidSplash {};
+    }
+
+    /** Applies one impact to the world between ticks; an impact outside the grid, or of no volume, does
+     * nothing. */
+    pub(crate) fn apply(
+        mut self,
+        field : Shared<FluidField>,
+        run : FluidTick,
+        pop : Shared<FluidPopulation>,
+        hit : FluidImpact
+    ) : void {
+        if (!field.inBounds(hit.x, hit.z) || hit.volume <= 0.0) {
+            return;
+        }
+
+        let block : FluidBlock = field.block(hit.x, hit.z, hit.radius);
+        let held : f64 = FluidImpacts::heldIn(field, block);
+
+        // The object's share of the water-and-object mass sets how much of its speed the water takes.
+        let share : f64 = hit.volume / (hit.volume + held);
+        let shove : f64 = self.splash.kick * hit.speed * share;
+
+        self.spray(field, pop, hit, block, held);
+        FluidImpacts::displace(field, block, hit.volume / (block.count() as f64));
+        FluidImpacts::push(field, run, block, shove);
+        FluidImpacts::wake(field, run, block);
+    }
+
+    // The water the block holds.
+    static fn heldIn(field : Shared<FluidField>, block : FluidBlock) : f64 {
+        let mut sum : f64 = 0.0;
+        for (z of block.z0..block.z1 + 1) {
+            for (x of block.x0..block.x1 + 1) {
+                sum = sum + field.water[field.column(x, z) as i64];
+            }
+        }
+        return sum;
+    }
+
+    // Raises every column of the block by `share`.
+    static fn displace(field : Shared<FluidField>, block : FluidBlock, share : f64) : void {
+        for (z of block.z0..block.z1 + 1) {
+            for (x of block.x0..block.x1 + 1) {
+                let c : i64 = field.column(x, z) as i64;
+                field.water[c] = field.water[c] + share;
+            }
+        }
+    }
+
+    // Scales the water of every column of the block.
+    static fn thin(field : Shared<FluidField>, block : FluidBlock, keep : f64) : void {
+        for (z of block.z0..block.z1 + 1) {
+            for (x of block.x0..block.x1 + 1) {
+                let c : i64 = field.column(x, z) as i64;
+                field.water[c] = field.water[c] * keep;
+            }
+        }
+    }
+
+    // Wakes the block, whose levels just changed under the pipes' feet.
+    static fn wake(field : Shared<FluidField>, run : FluidTick, block : FluidBlock) : void {
+        for (z of block.z0..block.z1 + 1) {
+            for (x of block.x0..block.x1 + 1) {
+                run.wakeNow(field.column(x, z));
+            }
+        }
+    }
+
+    // Shoves the water just outside the block away from it, along every frontier of its rim.
+    static fn push(field : Shared<FluidField>, run : FluidTick, block : FluidBlock, speed : f64) : void {
+        if (speed <= 0.0) {
+            return;
+        }
+        for (z of block.z0..block.z1 + 1) {
+            if (block.x0 > 0) {
+                run.kick(run.eastFrontier(block.x0 - 1, z), 0.0 - speed);
+            }
+            if (block.x1 + 1 < field.width) {
+                run.kick(run.eastFrontier(block.x1, z), speed);
+            }
+        }
+        for (x of block.x0..block.x1 + 1) {
+            if (block.z0 > 0) {
+                run.kick(run.southFrontier(x, block.z0 - 1), 0.0 - speed);
+            }
+            if (block.z1 + 1 < field.depth) {
+                run.kick(run.southFrontier(x, block.z1), speed);
+            }
+        }
+    }
+
+    // Throws the spray of an impact: liquid particles flying up and out of the footprint, which break into
+    // spray on their own where they have left the core. The columns lose exactly the volume the particles
+    // carry; a pool that is full or off throws less, never more.
+    fn spray(
+        mut self,
+        field : Shared<FluidField>,
+        pop : Shared<FluidPopulation>,
+        hit : FluidImpact,
+        block : FluidBlock,
+        held : f64
+    ) : void {
+        let s : FluidSplash = self.splash;
+        if (hit.speed <= s.speedThreshold || held <= 0.0 || pop.params.liquid.capacity <= 0) {
+            return;
+        }
+
+        let ratio : f64 = s.speedThreshold / hit.speed;
+        let wanted : f64 = s.fraction * hit.volume * (1.0 - ratio * ratio);
+        let volume : f64 = minD(wanted, held * FLUID_IMPACT_SPRAY_CAP);
+        let chunk : f64 = pop.liquidVolume();
+        let n : i32 = minI((volume / chunk) as i32, FLUID_IMPACT_PARTICLES_MAX);
+        let mut thrown : i32 = 0;
+        for (i of 0..n) {
+            if (!self.throwOne(field, pop, hit)) {
+                break;
+            }
+            thrown = thrown + 1;
+        }
+        if (thrown > 0) {
+            let taken : f64 = (thrown as f64) * chunk;
+            FluidImpacts::thin(field, block, 1.0 - taken / held);
+            pop.emitted = pop.emitted + taken;
+        }
+    }
+
+    // One liquid particle from a random spot over the footprint, flying up and a little sideways; false when
+    // the pool is full.
+    fn throwOne(
+        mut self,
+        field : Shared<FluidField>,
+        pop : Shared<FluidPopulation>,
+        hit : FluidImpact
+    ) : bool {
+        let s : FluidSplash = self.splash;
+        let width : f64 = (2 * hit.radius + 1) as f64;
+        let jitterX : f64 = self.rng.nextF64() - 0.5;
+        let jitterZ : f64 = self.rng.nextF64() - 0.5;
+        let x : f64 = (hit.x as f64) + 0.5 + jitterX * width;
+        let z : f64 = (hit.z as f64) + 0.5 + jitterZ * width;
+        let at : DVec3 = DVec3::make(x, FluidSample::surface(field, x, z) + pop.params.liquid.radius, z);
+
+        let side : f64 = s.spread * hit.speed;
+        let vx : f64 = (self.rng.nextF64() * 2.0 - 1.0) * side;
+        let vz : f64 = (self.rng.nextF64() * 2.0 - 1.0) * side;
+        let lift : f64 = FLUID_IMPACT_LIFT_FLOOR + (1.0 - FLUID_IMPACT_LIFT_FLOOR) * self.rng.nextF64();
+        let velocity : DVec3 = DVec3::make(vx, s.lift * hit.speed * lift, vz);
+        return FluidSpawn::liquid(pop, at, velocity);
+    }
+}

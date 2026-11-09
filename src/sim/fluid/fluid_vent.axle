@@ -1,0 +1,363 @@
+// fluid_vent — a vent: a conduit that throws a powerful column of water out of the pool, after
+// a dome of water has been pushed up under it.
+//
+// A geyser is not a faster fountain. Water leaves a conduit several cells wide at a speed that sets the
+// height (`speed^2 / 2g`, true at any gravity), as a dense column: the particles are laid on a lattice as wide
+// as the conduit, one slab every two radii of travel, so the liquid core is a packed body the density solver
+// holds together (cohesion and incompressibility), not a scatter of drops. Spray is not emitted at all: it
+// breaks off the core by the Weber rule of the liquid solver, where the column thins and its particles
+// become loose, so the base is a dense white column and the top a fan of drops, as in the photographs.
+//
+// The flow is a physical quantity: `eruptionPower * pi * radius^2 * speed` cell units of volume per second.
+// `eruptionPower` is the share of the conduit that is filled with water: 1 is a solid column, 0.3 a column
+// with the lattice thinned at random to 30 percent (a rougher, more broken jet), 0 is the vent at rest. The
+// number of liquid particles that leave per second follows: flow over the volume of a particle. There is no
+// steam: the vent throws water only.
+//
+// The dome is the other half: `domeRate` pours volume into the columns around the vent, weighted toward its
+// centre, so the heightfield bulges before the column leaves, and keeps feeding the base while it plays.
+// The heightfield carries that bulge outward as a wave; its surface velocity and foam are read by the renderer.
+//
+// A vent places its water from nowhere (its supply is the conduit, not the pool), and counts what it emits
+// as injected, so the ledger holds: `totalVolume + airborne = poured + injected - drained`.
+// The slab lattice is laid with the population's serial random numbers, in vent order, so a run is repeatable.
+
+use crate::core::collections::vec::Vec;
+use crate::core::math::dvec2::DVec2;
+use crate::core::math::dvec3::DVec3;
+use crate::core::math::scalar::{maxD, minD};
+use crate::sim::fluid::fluid_coupling::FluidCoupling;
+use crate::sim::fluid::fluid_field::FluidField;
+use crate::sim::fluid::fluid_particle::{FluidParticleKind, fluidParticleVolume};
+use crate::sim::fluid::fluid_pool::FluidPopulation;
+use crate::sim::fluid::fluid_sample::FluidSample;
+use crate::sim::fluid::fluid_spawn::FluidSpawn;
+use crate::sim::fluid::fluid_tick::FluidTick;
+
+/** Pi, for the area of the conduit. */
+const FLUID_VENT_PI : f64 = 3.14159265358979;
+
+/** Share of a lattice spacing a particle is jittered by, so slabs do not stack in perfect columns. */
+const FLUID_VENT_JITTER : f64 = 0.1;
+
+/** The most slabs a vent lays in one tick, a guard against a runaway speed. */
+const FLUID_VENT_SLABS : i32 = 64;
+
+/** What the timeline of a vent calls for at an instant: shares of full power and of the dome feed. */
+pub struct FluidVentShape {
+    /** Share of the eruption power, 0..1. */
+    pub power : f64 = 0.0;
+
+    /** Share of the dome feed, 0..1. */
+    pub dome : f64 = 0.0;
+}
+
+/** A vent: where it is, how wide, how fast, how full, and what it does to the pool around it. */
+pub struct FluidVent {
+    /** Column coordinate x of the centre of the conduit (columns span [i, i+1)). */
+    pub x : f64 = 0.0;
+
+    /** Column coordinate z of the centre of the conduit. */
+    pub z : f64 = 0.0;
+
+    /** Radius of the conduit in cells; the column is twice as wide at its base. Several cells for a geyser. */
+    pub radius : f64 = 2.0;
+
+    /** Exit speed in cells per second: the jet rises `speed^2 / 2g`, at any gravity (30 gives 46 cells on
+     * Earth, 280 on the Moon). */
+    pub speed : f64 = 30.0;
+
+    /** The share of the conduit filled with water, 0..1: the flow is `eruptionPower * pi * radius^2 * speed`
+     * cell units of volume per second. 1 is a solid, dense column; lower thins it to a broken jet; 0 is the
+     * vent at rest. */
+    pub eruptionPower : f64 = 1.0;
+
+    /** How fast the column fans out, as a tangent: the water at the rim of the conduit leaves this far off
+     * the axis (0.06 is a tight column, 0.3 a fan). */
+    pub spread : f64 = 0.06;
+
+    /** Volume per second poured into the columns around the vent (the dome, and the base's feed); 0 for none. */
+    pub domeRate : f64 = 0.0;
+
+    /** Radius in cells over which the dome is poured; zero or less selects three conduit radii. */
+    pub domeRadius : f64 = 0.0;
+
+    /** Seconds of dome before the burst: the vent only feeds the pool, which swells. The timeline fields below
+     * all being 0 (the default) means no timeline: the vent holds `eruptionPower` and `domeRate` constantly. */
+    pub domeTime : f64 = 0.0;
+
+    /** Seconds of burst: the power rises to full in a third of a second and holds, the violent opening. */
+    pub burstTime : f64 = 0.0;
+
+    /** Seconds of the sustained phase, at `sustainPower` of full. */
+    pub sustainTime : f64 = 0.0;
+
+    /** Seconds over which the power decays linearly to nothing. */
+    pub decayTime : f64 = 0.0;
+
+    /** Seconds of quiet after the decay before the next cycle starts (if `repeat`). */
+    pub restTime : f64 = 0.0;
+
+    /** Power of the sustained phase as a share of full, 0..1. */
+    pub sustainPower : f64 = 0.5;
+
+    /** How deep the pulse train dips, 0..1: the power swings between full and `1 - pulseDepth` of itself, a
+     * triangle wave of period `pulsePeriod`, through the burst and the sustained phase. */
+    pub pulseDepth : f64 = 0.0;
+
+    /** Seconds between pulses of the train. Zero or less selects 0.4. */
+    pub pulsePeriod : f64 = 0.4;
+
+    /** True restarts the timeline after the rest; false erupts once. */
+    pub repeat : bool = true;
+
+    /** False silences the vent entirely. */
+    pub active : bool = true;
+
+    /** Seconds the timeline has run (state). */
+    pub(crate) clock : f64 = 0.0;
+
+    /** Distance the column has travelled since the last slab left (state of the lattice). */
+    pub(crate) travel : f64 = 0.0;
+
+    /** The vent of a large geyser at column coordinates (x, z): a conduit 2 cells in radius, 30 cells per
+     * second (a 46 cell column), and an eruption that plays as a dynamic event: 3 s of dome,
+     * a 4 s burst, 6 s sustained at half power, a 5 s decay, then 10 s of rest, with a pulse train through
+     * the active phases. */
+    pub static fn geyser(x : f64, z : f64) : FluidVent {
+        return FluidVent {
+            x: x,
+            z: z,
+            domeRate: 30.0,
+            domeTime: 3.0,
+            burstTime: 4.0,
+            sustainTime: 6.0,
+            decayTime: 5.0,
+            restTime: 10.0,
+            pulseDepth: 0.3,
+        };
+    }
+
+    /** Whether the vent plays a timeline. */
+    pub fn hasTimeline(self) : bool {
+        return self.domeTime + self.burstTime + self.sustainTime + self.decayTime + self.restTime > 0.0;
+    }
+
+    /** The shares of full power and of the dome feed the timeline calls for now (both 1 without one). */
+    pub fn shape(self) : FluidVentShape {
+        if (!self.hasTimeline()) {
+            return FluidVentShape { power: 1.0, dome: 1.0 };
+        }
+        let total : f64 = self.domeTime + self.burstTime + self.sustainTime + self.decayTime + self.restTime;
+        let mut t : f64 = self.clock;
+        if (self.repeat) {
+            t = t - ((t / total) as i32 as f64) * total;
+        } else if (t >= total) {
+            return FluidVentShape { power: 0.0, dome: 0.0 };
+        }
+
+        if (t < self.domeTime) {
+            return FluidVentShape { power: 0.0, dome: 0.4 + 0.6 * t / self.domeTime };
+        }
+        t = t - self.domeTime;
+        if (t < self.burstTime) {
+            let ramp : f64 = minD(1.0, 3.0 * t / maxD(self.burstTime, 0.000001));
+            return FluidVentShape { power: ramp * self.pulse(t), dome: 0.5 };
+        }
+        t = t - self.burstTime;
+        if (t < self.sustainTime) {
+            return FluidVentShape { power: self.sustainPower * self.pulse(t + self.burstTime), dome: 0.3 };
+        }
+        t = t - self.sustainTime;
+        if (t < self.decayTime) {
+            let left : f64 = 1.0 - t / self.decayTime;
+            return FluidVentShape { power: self.sustainPower * left, dome: 0.15 * left };
+        }
+        return FluidVentShape { power: 0.0, dome: 0.0 };
+    }
+
+    // The pulse train at time t into the active phase: 1 at the crest of a pulse, `1 - pulseDepth` in the dip.
+    fn pulse(self, t : f64) : f64 {
+        let mut period : f64 = self.pulsePeriod;
+        if (period <= 0.0) {
+            period = 0.4;
+        }
+        let x : f64 = t / period;
+        let phase : f64 = x - (x as i32 as f64);
+        let tri : f64 = 2.0 * phase - 1.0;
+        let mut wave : f64 = tri;
+        if (tri < 0.0) {
+            wave = 0.0 - tri;
+        }
+        return 1.0 - self.pulseDepth * wave;
+    }
+
+    /** The flow this vent throws, in cell units of volume per second, at its current power. */
+    pub fn flow(self) : f64 {
+        let power : f64 = minD(maxD(self.eruptionPower, 0.0), 1.0);
+        return power * FLUID_VENT_PI * self.radius * self.radius * self.speed;
+    }
+}
+
+/** What a vent phase made in a tick and the state it leaves in the vent. */
+pub(crate) struct FluidVentStep {
+    /** Volume made, to count as injected. */
+    pub(crate) given : f64 = 0.0;
+
+    /** The distance travelled since the last slab. */
+    pub(crate) travel : f64 = 0.0;
+}
+
+/** The vent phase of a tick, as static functions. */
+pub(crate) class FluidVents {
+    /** Runs every vent for one tick and answers the volume they put into the world (what to count as
+     * injected). */
+    pub(crate) static fn apply(
+        pop : Shared<FluidPopulation>,
+        field : Shared<FluidField>,
+        run : FluidTick,
+        vents : Vec<FluidVent>
+    ) : f64 {
+        let mut total : f64 = 0.0;
+        for (k of 0..vents.len()) {
+            let v : FluidVent = vents.get(k);
+            if (!v.active) {
+                continue;
+            }
+
+            let shape : FluidVentShape = v.shape();
+            let mut now : FluidVent = v;
+            now.eruptionPower = v.eruptionPower * shape.power;
+            now.domeRate = v.domeRate * shape.dome;
+
+            let mut left : FluidVent = v;
+            let column : FluidVentStep = FluidVents::column(pop, field, now);
+            left.travel = column.travel;
+            left.clock = v.clock + field.rules.dt;
+            total = total + FluidVents::dome(field, run, now) + column.given;
+            vents.set(k, left);
+        }
+        return total;
+    }
+
+    // Pours the dome: `domeRate` over the columns around the vent, weighted by (1 - d / radius)^2.
+    static fn dome(field : Shared<FluidField>, run : FluidTick, v : FluidVent) : f64 {
+        if (v.domeRate <= 0.0) {
+            return 0.0;
+        }
+        let mut reach : f64 = v.domeRadius;
+        if (reach <= 0.0) {
+            reach = 3.0 * v.radius;
+        }
+
+        let x0 : i32 = FluidSample::floor(v.x - reach);
+        let x1 : i32 = FluidSample::floor(v.x + reach);
+        let z0 : i32 = FluidSample::floor(v.z - reach);
+        let z1 : i32 = FluidSample::floor(v.z + reach);
+        let mut sum : f64 = 0.0;
+        for (z of z0..z1 + 1) {
+            for (x of x0..x1 + 1) {
+                sum = sum + FluidVents::weight(field, v, x, z, reach);
+            }
+        }
+        if (sum <= 0.0) {
+            return 0.0;
+        }
+
+        let volume : f64 = v.domeRate * field.rules.dt;
+        let mut given : f64 = 0.0;
+        for (z of z0..z1 + 1) {
+            for (x of x0..x1 + 1) {
+                let part : f64 = volume * FluidVents::weight(field, v, x, z, reach) / sum;
+                if (part <= 0.0) {
+                    continue;
+                }
+                FluidCoupling::deposit(field, run, field.column(x, z), part, 0.0, 0.0);
+                given = given + part;
+            }
+        }
+        return given;
+    }
+
+    // The dome's weight of column (x, z): zero outside the grid or the reach.
+    static fn weight(field : Shared<FluidField>, v : FluidVent, x : i32, z : i32, reach : f64) : f64 {
+        if (!field.inBounds(x, z)) {
+            return 0.0;
+        }
+        let dx : f64 = (x as f64) + 0.5 - v.x;
+        let dz : f64 = (z as f64) + 0.5 - v.z;
+        let t : f64 = 1.0 - (dx * dx + dz * dz).sqrt() / reach;
+        if (t <= 0.0) {
+            return 0.0;
+        }
+        return t * t;
+    }
+
+    // Lays the slabs of the column that left this tick; answers the volume of the particles made.
+    static fn column(
+        pop : Shared<FluidPopulation>,
+        field : Shared<FluidField>,
+        v : FluidVent
+    ) : FluidVentStep {
+        let mut vent : FluidVent = v;
+        let power : f64 = minD(maxD(v.eruptionPower, 0.0), 1.0);
+        if (power <= 0.0 || pop.params.liquid.capacity <= 0 || v.speed <= 0.0) {
+            return FluidVentStep { given: 0.0, travel: 0.0 };
+        }
+
+        let spacing : f64 = 2.0 * pop.params.liquid.radius;
+        vent.travel = v.travel + v.speed * field.rules.dt;
+        let mut slabs : i32 = 0;
+        let mut given : f64 = 0.0;
+        while (vent.travel >= spacing && slabs < FLUID_VENT_SLABS) {
+            vent.travel = vent.travel - spacing;
+            given = given + FluidVents::slab(pop, field, vent, power);
+            slabs = slabs + 1;
+        }
+        return FluidVentStep { given: given, travel: vent.travel };
+    }
+
+    // One slab of the lattice, `vent.travel` ahead of the conduit's mouth; answers its volume.
+    static fn slab(
+        pop : Shared<FluidPopulation>,
+        field : Shared<FluidField>,
+        vent : FluidVent,
+        power : f64
+    ) : f64 {
+        let r : f64 = pop.params.liquid.radius;
+        let s : f64 = 2.0 * r;
+        let reach : i32 = ((vent.radius / s) as i32) + 1;
+        let base : f64 = FluidSample::surface(field, vent.x, vent.z);
+        let ahead : f64 = vent.travel;
+        let aged : f64 = ahead / vent.speed;
+        let climb : f64 = vent.speed - pop.gravity * aged;
+        let mut given : f64 = 0.0;
+        let chunk : f64 = fluidParticleVolume(FluidParticleKind::Liquid, r);
+
+        for (j of 0..2 * reach + 1) {
+            for (i of 0..2 * reach + 1) {
+                let px : f64 = ((i - reach) as f64) * s;
+                let pz : f64 = ((j - reach) as f64) * s;
+                if (px * px + pz * pz > vent.radius * vent.radius) {
+                    continue;
+                }
+                if (power < 1.0 && pop.rng.nextF64() > power) {
+                    continue;
+                }
+
+                let jx : f64 = (pop.rng.nextF64() - 0.5) * FLUID_VENT_JITTER * s;
+                let jz : f64 = (pop.rng.nextF64() - 0.5) * FLUID_VENT_JITTER * s;
+                let at : DVec3 = DVec3::make(vent.x + px + jx, base + ahead + r, vent.z + pz + jz);
+                let fan : f64 = vent.spread * vent.speed / vent.radius;
+                let along : f64 = 1.0 + 0.03 * (pop.rng.nextF64() - 0.5);
+                let velocity : DVec3 = DVec3::make(px * fan, climb * along, pz * fan);
+                if (!FluidSpawn::liquid(pop, at, velocity)) {
+                    return given;
+                }
+                pop.emitted = pop.emitted + chunk;
+                given = given + chunk;
+            }
+        }
+        return given;
+    }
+}

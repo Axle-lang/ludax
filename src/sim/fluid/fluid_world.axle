@@ -1,0 +1,597 @@
+// fluid_world — FluidWorld, the column-water simulation a game drives.
+//
+// The world is a grid of columns: column (x, z) holds `level` cell units of water above a ground height the
+// game supplies. It owns no terrain and imports nothing from the voxel or openworld modules — a game pours
+// its own world in as ground heights (baked once from a `FluidGround` with `sampleGround`, or cell by cell
+// with `setGround`) and reads the levels back. One `tick()` advances `rules.dt` seconds through a fixed phase
+// order — drops land, sources deposit, pipes accelerate, share momentum and transfer, drains evacuate,
+// spills settle — and nothing else moves time, so the same inputs give the same levels on every run, bit for
+// bit. Sources and drains may be added and removed between ticks at will; a game that moves terrain calls
+// `setGround` again.
+//
+// What the world can be pushed with, beyond water: a `load` (a head laid on a column, for a piston, a lid or
+// a floating hull), a `pour` (a one-off edit) and an `impact` (an object entering the water, which displaces,
+// shoves and throws spray). Each is plain data in, and each wakes what it touches.
+//
+// Units are cell units: the footprint of a column is 1 x 1, so one unit of level is one unit of volume and
+// `totalVolume` is their plain sum. Flow between columns never changes it; only sources, drains, pours and
+// impacts do, and spray in flight is counted by `airborneVolume`. So `totalVolume + airborneVolume` equals
+// what the game put in, plus `injectedTotal`, minus `drainedTotal` — the invariant the tests hold the engine to.
+
+use crate::core::collections::vec::Vec;
+use crate::core::math::dvec2::DVec2;
+use crate::core::math::dvec3::DVec3;
+use crate::core::math::scalar::{maxD, minD};
+use crate::sim::fluid::fluid_emit::FluidEmit;
+use crate::sim::fluid::fluid_emitters::FluidEmitters;
+use crate::sim::fluid::fluid_field::FluidField;
+use crate::sim::fluid::fluid_foam::FluidFoam;
+use crate::sim::fluid::fluid_ground::FluidGround;
+use crate::sim::fluid::fluid_impact::{FluidImpact, FluidImpacts, FluidSplash};
+use crate::sim::fluid::fluid_particle::{FluidLedger, FluidParticle, FluidParticleKind, fluidParticleVolume};
+use crate::sim::fluid::fluid_particle_params::FluidParticleParams;
+use crate::sim::fluid::fluid_particles::FluidParticles;
+use crate::sim::fluid::fluid_pipes::FluidPipes;
+use crate::sim::fluid::fluid_rules::{FluidFlow, FluidRules, FluidSink, FluidSource, FluidStrategy};
+use crate::sim::fluid::fluid_sample::FluidSample;
+use crate::sim::fluid::fluid_spawn::FluidSpawn;
+use crate::sim::fluid::fluid_surface::FluidSurface;
+use crate::sim::fluid::fluid_tick::FluidTick;
+use crate::sim::fluid::fluid_vent::{FluidVent, FluidVents};
+
+/** The seed of the spray's scatter; a world's randomness is explicit, and this is it. */
+const FLUID_SPRAY_SEED : u64 = 20240607;
+
+/** A column-water world: sources, drains, ground, levels and one `tick()` that advances them. */
+pub class FluidWorld {
+    field       : Shared<FluidField>;
+    sources     : Vec<FluidSource>;
+    sinks       : Vec<FluidSink>;
+    flows       : Vec<FluidFlow>;
+    vents       : Vec<FluidVent>;
+    run         : FluidTick;
+    particles   : FluidParticles;
+    surface     : FluidSurface;
+    foam        : FluidFoam;
+    heightfield : bool = true;
+    impacts     : FluidImpacts;
+    injected    : f64 = 0.0;
+    drained     : f64 = 0.0;
+    soaked      : f64 = 0.0;
+    ticksDone   : i64 = 0;
+
+    /** A world of `width` x `depth` dry columns over a flat ground at 0, governed by `rules`. Degenerate
+     * sizes become 1 and nonsensical rules fall back to the documented defaults (`FluidRules.checked`), so
+     * a world always ticks. */
+    constructor(rules : FluidRules, width : i32, depth : i32) {
+        let mut w : i32 = width;
+        if (w < 1) {
+            w = 1;
+        }
+        let mut d : i32 = depth;
+        if (d < 1) {
+            d = 1;
+        }
+
+        self.field = share new FluidField(rules.checked(), w, d);
+        self.run = new FluidTick(w, d);
+        self.particles = new FluidParticles(
+            FluidParticleParams::standard().checked(),
+            self.field,
+            self.field.rules.gravity
+        );
+        self.surface = new FluidSurface(w, d);
+        self.foam = new FluidFoam(w, d);
+        self.impacts = new FluidImpacts(FLUID_SPRAY_SEED);
+        self.sources = new Vec<FluidSource>();
+        self.sinks = new Vec<FluidSink>();
+        self.flows = new Vec<FluidFlow>();
+        self.vents = new Vec<FluidVent>();
+    }
+
+    // ---- shape and ground ----
+
+    /** How many columns across (x) the world is. */
+    pub fn width(self) : i32 {
+        return self.field.width;
+    }
+
+    /** How many columns deep (z) the world is. */
+    pub fn depth(self) : i32 {
+        return self.field.depth;
+    }
+
+    /** The rules in force. The world may have replaced a nonsensical value at construction. */
+    pub fn settings(self) : FluidRules {
+        return self.field.rules;
+    }
+
+    /** Sets the ground height of one column; the column wakes, since the flow around it can change. */
+    pub fn setGround(mut self, x : i32, z : i32, height : f64) : void {
+        if (!self.field.inBounds(x, z)) {
+            return;
+        }
+        let c : i32 = self.field.column(x, z);
+        self.field.ground[c as i64] = height;
+        self.run.wakeNow(c);
+    }
+
+    /**
+     * Bakes a whole ground at once by sampling `g` at every column, replacing what was there. For a ground
+     * that changes later, call this again or move single columns with `setGround`.
+     */
+    pub fn sampleGround(mut self, ground : FluidGround) : void {
+        for (z of 0..self.field.depth) {
+            for (x of 0..self.field.width) {
+                self.setGround(x, z, ground.heightAt(x, z));
+            }
+        }
+    }
+
+    /** The ground height of a column; 0 outside the grid. */
+    pub fn groundAt(self, x : i32, z : i32) : f64 {
+        if (!self.field.inBounds(x, z)) {
+            return 0.0;
+        }
+        return self.field.ground[self.field.column(x, z) as i64];
+    }
+
+    // ---- water in and out ----
+
+    /** The water level of a column, in cell units above its ground; 0 outside the grid. */
+    pub fn levelAt(self, x : i32, z : i32) : f64 {
+        if (!self.field.inBounds(x, z)) {
+            return 0.0;
+        }
+        return self.field.water[self.field.column(x, z) as i64];
+    }
+
+    /**
+     * Pours `volume` cell units onto a column at once (rain, a splash, an initial condition). A negative volume
+     * lifts water out, never below an empty column.
+     */
+    pub fn pour(mut self, x : i32, z : i32, volume : f64) : void {
+        if (!self.field.inBounds(x, z)) {
+            return;
+        }
+        let c : i32 = self.field.column(x, z);
+        self.field.water[c as i64] = maxD(self.field.water[c as i64] + volume, 0.0);
+        self.run.wakeNow(c);
+    }
+
+    /** Adds a source and returns its handle; sources may be added and removed between ticks at will. */
+    pub fn addSource(mut self, source : FluidSource) : i32 {
+        let id : i32 = self.sources.len();
+        self.sources.push(source);
+        if (self.field.inBounds(source.x, source.z) && source.active) {
+            self.run.wakeNow(self.field.column(source.x, source.z));
+        }
+        return id;
+    }
+
+    /** Removes a source; false when the handle is stale (an exhausted source is not stale, just quiet). */
+    pub fn removeSource(mut self, id : i32) : bool {
+        if (!self.sources.has(id)) {
+            return false;
+        }
+        let mut s : FluidSource = self.sources.get(id);
+        if (!s.active) {
+            return false;
+        }
+        s.active = false;
+        self.sources.set(id, s);
+        return true;
+    }
+
+    /** A copy of the source `id` (`active` false for a stale or removed handle). */
+    pub fn sourceAt(self, id : i32) : FluidSource {
+        if (!self.sources.has(id)) {
+            return FluidSource { active: false };
+        }
+        return self.sources.get(id);
+    }
+
+    /** Sets the intake radius of source `id` in cells: 0 pours on its column alone, 1 spreads over the
+     * 3x3 block around it. A strong spring wants a wide intake, or it builds a hydraulic cone. */
+    pub fn sourceRadius(mut self, id : i32, r : i32) : void {
+        if (!self.sources.has(id)) {
+            return;
+        }
+        let mut s : FluidSource = self.sources.get(id);
+        s.radius = r;
+        self.sources.set(id, s);
+    }
+
+    /** Adds a drain and returns its handle; drains may be added and removed between ticks at will. */
+    pub fn addSink(mut self, sink : FluidSink) : i32 {
+        let id : i32 = self.sinks.len();
+        self.sinks.push(sink);
+        if (self.field.inBounds(sink.x, sink.z) && sink.active) {
+            self.run.wakeNow(self.field.column(sink.x, sink.z));
+        }
+        return id;
+    }
+
+    /** Removes a drain; false when the handle is stale. */
+    pub fn removeSink(mut self, id : i32) : bool {
+        if (!self.sinks.has(id)) {
+            return false;
+        }
+        let mut s : FluidSink = self.sinks.get(id);
+        if (!s.active) {
+            return false;
+        }
+        s.active = false;
+        self.sinks.set(id, s);
+        return true;
+    }
+
+    /** A copy of the drain `id` (`active` false for a stale or removed handle). */
+    pub fn sinkAt(self, id : i32) : FluidSink {
+        if (!self.sinks.has(id)) {
+            return FluidSink { active: false };
+        }
+        return self.sinks.get(id);
+    }
+
+    /** Sets the intake radius of sink `id` in cells, the drain's mirror of `sourceRadius`. */
+    pub fn sinkRadius(mut self, id : i32, r : i32) : void {
+        if (!self.sinks.has(id)) {
+            return;
+        }
+        let mut s : FluidSink = self.sinks.get(id);
+        s.radius = r;
+        self.sinks.set(id, s);
+    }
+
+    // ---- vents ----
+
+    /** Adds a vent (a geyser's conduit and dome, see `FluidVent`) and returns its handle. */
+    pub fn addVent(mut self, vent : FluidVent) : i32 {
+        let id : i32 = self.vents.len();
+        self.vents.push(vent);
+        return id;
+    }
+
+    /** A copy of the vent `id` (`active` false for a stale handle). */
+    pub fn ventAt(self, id : i32) : FluidVent {
+        if (!self.vents.has(id)) {
+            return FluidVent { active: false };
+        }
+        return self.vents.get(id);
+    }
+
+    /** Sets the eruption power of vent `id` (0..1, see `FluidVent.eruptionPower`); a game ramps it to start
+     * and end an eruption. False for a stale handle. */
+    pub fn setVentPower(mut self, id : i32, power : f64) : bool {
+        if (!self.vents.has(id)) {
+            return false;
+        }
+        let mut v : FluidVent = self.vents.get(id);
+        v.eruptionPower = power;
+        self.vents.set(id, v);
+        return true;
+    }
+
+    /** Sets the dome feed of vent `id` in volume per second (see `FluidVent.domeRate`). False for a stale
+     * handle. */
+    pub fn setVentDome(mut self, id : i32, rate : f64) : bool {
+        if (!self.vents.has(id)) {
+            return false;
+        }
+        let mut v : FluidVent = self.vents.get(id);
+        v.domeRate = rate;
+        self.vents.set(id, v);
+        return true;
+    }
+
+    /** Silences or restarts vent `id`. False for a stale handle. */
+    pub fn setVentActive(mut self, id : i32, active : bool) : bool {
+        if (!self.vents.has(id)) {
+            return false;
+        }
+        let mut v : FluidVent = self.vents.get(id);
+        v.active = active;
+        self.vents.set(id, v);
+        return true;
+    }
+
+    // ---- loads and impacts ----
+
+    /**
+     * Lays an external `head` on a column, in cell units of water: a piston, a lid or a hull pressing on it.
+     * The water under it is pushed toward columns of lower head until the heads match, so a load of 1 on one
+     * arm of a U-tube holds the other arm one unit higher. Zero removes it.
+     */
+    pub fn setLoad(mut self, x : i32, z : i32, head : f64) : void {
+        if (!self.field.inBounds(x, z)) {
+            return;
+        }
+        let c : i32 = self.field.column(x, z);
+        self.field.load[c as i64] = head;
+        self.run.wakeNow(c);
+    }
+
+    /**
+     * Lays an external pressure, in pascals, on a column: the head of that pressure on this world's water
+     * (`pressure / (density * gravity)`).
+     */
+    pub fn setLoadPressure(mut self, x : i32, z : i32, pressure : f64) : void {
+        let rules : FluidRules = self.field.rules;
+        self.setLoad(x, z, pressure / (rules.density * rules.gravity));
+    }
+
+    /** The load laid on a column, as a head; 0 outside the grid. */
+    pub fn loadAt(self, x : i32, z : i32) : f64 {
+        if (!self.field.inBounds(x, z)) {
+            return 0.0;
+        }
+        return self.field.load[self.field.column(x, z) as i64];
+    }
+
+    /** The head a column pushes with: surface plus load plus compression. Water flows toward lower head. */
+    pub fn headAt(self, x : i32, z : i32) : f64 {
+        if (!self.field.inBounds(x, z)) {
+            return 0.0;
+        }
+        return self.field.head(self.field.column(x, z));
+    }
+
+    /**
+     * Drops an object into the water between ticks: its volume displaces water, the water around is shoved
+     * outward, and past the splash speed spray is thrown up (see `FluidImpact`).
+     */
+    pub fn impact(mut self, hit : FluidImpact) : void {
+        self.impacts.apply(self.field, self.run, self.particles.pop, hit);
+    }
+
+    /**
+     * Throws one liquid particle into the air from `at` with `velocity`; its volume is new water, counted in
+     * `injectedTotal`. False when the liquid pool is full or switched off (nothing is injected then).
+     */
+    pub fn throwLiquid(mut self, at : DVec3, velocity : DVec3) : bool {
+        let made : bool = FluidSpawn::liquid(self.particles.pop, at, velocity);
+        if (made) {
+            self.injected = self.injected + self.particles.pop.liquidVolume();
+        }
+        return made;
+    }
+
+    /**
+     * Throws one spray drop of `radius` into the air; its volume is new water, counted in `injectedTotal`.
+     * False when the spray pool is full or switched off.
+     */
+    pub fn throwSpray(mut self, at : DVec3, velocity : DVec3, radius : f64) : bool {
+        let made : bool = FluidSpawn::spray(self.particles.pop, at, velocity, radius);
+        if (made) {
+            self.injected = self.injected + fluidParticleVolume(FluidParticleKind::Spray, radius);
+        }
+        return made;
+    }
+
+    /** Sets how hard impacts splash. */
+    pub fn setSplash(mut self, splash : FluidSplash) : void {
+        self.impacts.splash = splash;
+    }
+
+    // ---- the particle layer, the foam and the surface readings ----
+
+    /**
+     * Replaces the parameters of the particle layer, module by module (liquid, spray, breaking, foam).
+     * Between ticks only: everything airborne is poured back into the columns first, so changing capacities
+     * loses no water. A capacity of 0 switches that population off.
+     */
+    pub fn setParticleParams(mut self, params : FluidParticleParams) : void {
+        let checked : FluidParticleParams = params.checked();
+        let mut gravity : f64 = self.field.rules.gravity;
+        if (checked.gravity > 0.0) {
+            gravity = checked.gravity;
+        }
+        self.particles.reconfigure(checked, gravity, self.run);
+    }
+
+    /** The particle parameters in force (already `checked`). */
+    pub fn particleParams(self) : FluidParticleParams {
+        return self.particles.pop.params;
+    }
+
+    /** How many particles of every kind are alive. */
+    pub fn particleCount(self) : i32 {
+        return self.particles.pop.count();
+    }
+
+    /** The `k`-th particle, liquid first, then spray; `k` must be inside `0..particleCount()`. */
+    pub fn particleAt(self, k : i32) : FluidParticle {
+        return self.particles.pop.at(k);
+    }
+
+    /** The volume bookkeeping of the particle layer; see `FluidLedger`. */
+    pub fn particleLedger(self) : FluidLedger {
+        return self.particles.pop.ledger();
+    }
+
+    /** The volume in the air as liquid or spray: `particleLedger().airborne()`. It returns to the columns
+     * when the particles land. */
+    pub fn airborneVolume(self) : f64 {
+        return self.particles.pop.ledger().airborne();
+    }
+
+    /** Switches the heightfield's own dynamics (pipes, drains, spills) on or off. Off, the columns only hold
+     * water: particles still fall into them and sources still pour, but nothing flows. A game that wants
+     * particles over a fixed bed turns it off; one that wants the plain column model sets all the particle
+     * capacities to 0. */
+    pub fn setHeightfieldEnabled(mut self, enabled : bool) : void {
+        self.heightfield = enabled;
+    }
+
+    /** Stops the particle solver's worker threads (a world with `threads` above 1 must be closed). */
+    pub fn close(mut self) : void {
+        self.particles.close();
+    }
+
+    /** Whitewater coverage at (x, z), 0..1, interpolated between column centres. */
+    pub fn foamAt(self, x : f64, z : f64) : f32 {
+        return self.foam.foamAt(self.field, x, z) as f32;
+    }
+
+    /** Turbulence at (x, z), 0..1: a kinetic-energy-like measure for capillary detail. */
+    pub fn turbulenceAt(self, x : f64, z : f64) : f32 {
+        return self.foam.turbulenceAt(self.field, x, z) as f32;
+    }
+
+    /** The horizontal velocity of the water surface at (x, z) in cells per second (x, then z). */
+    pub fn surfaceVelocityAt(self, x : f64, z : f64) : DVec2 {
+        return FluidSurface::velocityAt(self.field, self.run, x, z);
+    }
+
+    /** The height of the water surface at (x, z): bed plus depth, each interpolated. */
+    pub fn surfaceHeightAt(self, x : f64, z : f64) : f64 {
+        return FluidSample::surface(self.field, x, z);
+    }
+
+    /** The height of the bed at (x, z), interpolated between column centres. */
+    pub fn bedHeightAt(self, x : f64, z : f64) : f64 {
+        return FluidSample::bed(self.field, x, z);
+    }
+
+    /** The water depth at (x, z), interpolated between column centres. */
+    pub fn depthAt(self, x : f64, z : f64) : f64 {
+        return FluidSample::depth(self.field, x, z);
+    }
+
+    // ---- stepping and readings ----
+
+    /** Advances the world by one fixed step of `rules.dt` seconds. */
+    pub fn tick(mut self) : void {
+        self.flows.clear();
+        self.run.beginTick();
+        self.particles.step(self.run, self.foam);
+        self.injected = self.injected
+            + FluidVents::apply(self.particles.pop, self.field, self.run, self.vents);
+        self.injected = self.injected + FluidEmitters::applySources(self.field, self.run, self.sources);
+
+        if (self.heightfield) {
+            self.flowColumns();
+        }
+        self.run.endTick();
+        self.ticksDone = self.ticksDone + 1;
+        self.readSurface();
+    }
+
+    // The heightfield's own phases: pipes accelerate, share momentum and transfer, drains evacuate, spills
+    // settle.
+    fn flowColumns(mut self) : void {
+        FluidPipes::accelerate(self.field, self.run);
+        self.run.quiesce();
+        FluidPipes::diffuse(self.field, self.run);
+        FluidPipes::limitFluxes(self.field, self.run);
+        FluidPipes::apply(self.field, self.run, self.flows);
+
+        self.drained = self.drained + FluidEmitters::applySinks(self.field, self.run, self.sinks);
+        FluidEmitters::applySpill(self.field, self.run, self.flows);
+        self.soak();
+    }
+
+    // The infiltration term: every wet column loses `infiltration * dt` of depth into the ground, never more
+    // than it holds, and stays awake while it still has water to lose. Off (the default) it costs nothing.
+    fn soak(mut self) : void {
+        let rate : f64 = self.field.rules.infiltration * self.field.rules.dt;
+        if (rate <= 0.0) {
+            return;
+        }
+        for (c of 0..self.field.width * self.field.depth) {
+            let held : f64 = self.field.water[c as i64];
+            if (held <= 0.0) {
+                continue;
+            }
+            let take : f64 = minD(held, rate);
+            self.field.water[c as i64] = held - take;
+            self.soaked = self.soaked + take;
+            if (held > take) {
+                self.run.wakeNext(c);
+            }
+        }
+    }
+
+    // After the columns have moved: read the surface, let breaking crests and rising mounds throw water into
+    // the air, and update the foam. Skipped while nothing moves and nothing is foamy, so a settled world
+    // stays free.
+    fn readSurface(mut self) : void {
+        let params : FluidParticleParams = self.particles.pop.params;
+        if (!params.foam.enabled && !params.breaking.enabled) {
+            return;
+        }
+        let busy : bool = self.run.awakeCount() > 0 || self.foam.active || self.particles.pop.count() > 0;
+        if (!busy) {
+            return;
+        }
+
+        self.surface.update(
+            self.field,
+            self.run,
+            params.breaking,
+            self.particles.pop.gravity,
+            self.field.rules.dt
+        );
+        if (params.breaking.enabled) {
+            FluidEmit::fromColumns(self.particles.pop, self.field, self.run, self.surface, self.foam);
+        }
+        if (params.foam.enabled) {
+            self.foam.update(self.field, self.surface, params.foam, self.field.rules.dt);
+        }
+    }
+
+    /** How many ticks have run. */
+    pub fn tickCount(self) : i64 {
+        return self.ticksDone;
+    }
+
+    /** The water in the columns, in cell units: the sum of every column's level, in column order. Spray in
+     * flight is not in it; see `airborneVolume`. */
+    pub fn totalVolume(self) : f64 {
+        return self.field.totalWater();
+    }
+
+    /** Total volume sources have deposited since the world was built. */
+    pub fn injectedTotal(self) : f64 {
+        return self.injected;
+    }
+
+    /** Total volume drains have evacuated since the world was built. */
+    pub fn drainedTotal(self) : f64 {
+        return self.drained;
+    }
+
+    /** Total volume that soaked into the ground (`FluidRules.infiltration`) since the world was built; with
+     * drains it is the only water the world loses. */
+    pub fn soakedTotal(self) : f64 {
+        return self.soaked;
+    }
+
+    /** How many frontiers carried water in the last tick (read-only data for rendering and sound). */
+    pub fn flowCount(self) : i32 {
+        return self.flows.len();
+    }
+
+    /** The `k`-th flow of the last tick, in the order it was applied; `k` must be inside `0..flowCount()`. */
+    pub fn flowAt(self, k : i32) : FluidFlow {
+        return self.flows.get(k);
+    }
+
+    /** How many columns the next tick visits; a settled `ActiveSet` world tends to 0, a `FullSweep` one is
+     * always every column. */
+    pub fn awakeCount(self) : i32 {
+        if (self.field.rules.strategy == FluidStrategy::FullSweep) {
+            return self.field.width * self.field.depth;
+        }
+        return self.run.awakeCount();
+    }
+
+    /** Whether a column is awake (visited by the next tick); a perf probe, not a game mechanic. */
+    pub fn isAwake(self, x : i32, z : i32) : bool {
+        if (!self.field.inBounds(x, z)) {
+            return false;
+        }
+        return self.run.isAwake(self.field.column(x, z));
+    }
+}

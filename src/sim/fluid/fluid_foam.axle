@@ -1,0 +1,166 @@
+// fluid_foam — whitewater coverage and turbulence, two fields over the columns that a renderer reads.
+//
+// Foam is the part of the surface that is aerated: white where the flow converges (water squeezed together
+// piles up and folds under), where a crest breaks, where a front runs up a beach, and where a drop falls
+// back in. It is a coverage in 0..1 per column that the engine advects with the surface velocity, diffuses a
+// little and lets decay with a half-life, so a wake streams downstream and fades instead of blinking out.
+// Turbulence is a companion in 0..1, a kinetic-energy-like measure of how disturbed the water is: it rises
+// at once to what the flow calls for and decays more slowly, and a renderer uses it to add capillary detail
+// (fine ripples) where the water is rough and keep it glassy where it is not.
+//
+// The module reads the analysis of `fluid_surface` and the landings the coupling reports (`add`); it changes
+// no water and no particle, and a world that switches it off (`FluidFoamParams.enabled`) never allocates
+// or reads it. The fields are `f32`: they are pictures, not bookkeeping. Dry columns lose foam faster, since
+// a stain left on a beach should not outlive the water that made it.
+//
+// A sweep per tick over the grid in column order; advection is semi-Lagrangian (stable at any speed).
+
+use crate::core::math::scalar::minD;
+use crate::sim::fluid::fluid_field::FluidField;
+use crate::sim::fluid::fluid_noise::FluidNoise;
+use crate::sim::fluid::fluid_particle_params::FluidFoamParams;
+use crate::sim::fluid::fluid_sample::{FluidSample, FluidStencil};
+use crate::sim::fluid::fluid_surface::{FLUID_WET_DEPTH, FluidSurface};
+
+/** The most a tick's diffusion may mix a column with its neighbours' mean, for stability. */
+const FLUID_FOAM_MIX_MAX : f64 = 0.2;
+
+/** How many times faster foam fades on a dry column. */
+const FLUID_FOAM_DRY_FADE : i32 = 4;
+
+/** Foam or turbulence below this counts as nothing, so a faded field lets the sweep be skipped. */
+const FLUID_FOAM_QUIET : f64 = 0.0001;
+
+/** The foam and turbulence fields of a world. */
+pub(crate) class FluidFoam {
+    width             : i32;
+    depth             : i32;
+    foam              : f32[];
+    turbulence        : f32[];
+    scratch           : f32[];
+    pub(crate) active : bool = false;
+
+    /** Fields for a grid of `width` x `depth` columns, both empty. */
+    constructor(width : i32, depth : i32) {
+        self.width = width;
+        self.depth = depth;
+        let n : i64 = (width * depth) as i64;
+        self.foam = new f32[n];
+        self.turbulence = new f32[n];
+        self.scratch = new f32[n];
+        for (i of 0..n) {
+            self.foam[i] = 0.0 as f32;
+            self.turbulence[i] = 0.0 as f32;
+            self.scratch[i] = 0.0 as f32;
+        }
+    }
+
+    /** Lays `amount` of coverage on column `c` (a landing drop, an impact); the next `update` clamps it. */
+    pub(crate) fn add(mut self, c : i32, amount : f64) : void {
+        let i : i64 = c as i64;
+        self.foam[i] = (minD((self.foam[i] as f64) + amount, 1.0)) as f32;
+        self.active = true;
+    }
+
+    /** Raises the turbulence of column `c` to at least `level`. */
+    pub(crate) fn stir(mut self, c : i32, level : f64) : void {
+        let i : i64 = c as i64;
+        if ((self.turbulence[i] as f64) < level) {
+            self.turbulence[i] = minD(level, 1.0) as f32;
+        }
+        self.active = true;
+    }
+
+    /** Foam coverage at (x, z), blended between column centres. */
+    pub(crate) fn foamAt(self, field : Shared<FluidField>, x : f64, z : f64) : f64 {
+        return FluidSample::blendF32(self.foam, FluidSample::stencil(field, x, z));
+    }
+
+    /** Turbulence at (x, z), blended between column centres. */
+    pub(crate) fn turbulenceAt(self, field : Shared<FluidField>, x : f64, z : f64) : f64 {
+        return FluidSample::blendF32(self.turbulence, FluidSample::stencil(field, x, z));
+    }
+
+    /** Foam coverage of column `c` itself. */
+    pub(crate) fn foamOf(self, c : i32) : f64 {
+        return self.foam[c as i64] as f64;
+    }
+
+    /** Advances both fields one tick of `dt` seconds under the readings of `flow`. */
+    pub(crate) fn update(
+        mut self,
+        field : Shared<FluidField>,
+        flow : FluidSurface,
+        p : FluidFoamParams,
+        dt : f64
+    ) : void {
+        self.advect(field, flow, dt);
+        self.diffuse(field, p.diffusion * dt);
+
+        let fade : f64 = FluidNoise::decay(dt, p.halfLife);
+        let dryFade : f64 = FluidNoise::decay(dt * (FLUID_FOAM_DRY_FADE as f64), p.halfLife);
+        let calm : f64 = FluidNoise::decay(dt, p.turbulenceHalfLife);
+        let mut peak : f64 = 0.0;
+        for (c of 0..self.width * self.depth) {
+            let i : i64 = c as i64;
+            let mut keep : f64 = fade;
+            if (field.water[i] <= FLUID_WET_DEPTH) {
+                keep = dryFade;
+            }
+            let made : f64 = p.generation * dt
+                * (0.7 * minD(flow.converge[i], 1.0) + flow.breaking[i] + 0.6 * flow.shore[i]);
+            let foam : f64 = minD((self.scratch[i] as f64) * keep + made, 1.0);
+            self.foam[i] = foam as f32;
+
+            let target : f64 = flow.turbulenceTarget(c);
+            let held : f64 = (self.turbulence[i] as f64) * calm;
+            let turbulence : f64 = held;
+            if (target > held) {
+                self.turbulence[i] = target as f32;
+            } else {
+                self.turbulence[i] = turbulence as f32;
+            }
+            peak = peak + foam + (self.turbulence[i] as f64);
+        }
+        self.active = peak > FLUID_FOAM_QUIET;
+    }
+
+    // Carries the foam along the surface velocity into `scratch`: each column takes what was upstream of it.
+    fn advect(mut self, field : Shared<FluidField>, flow : FluidSurface, dt : f64) : void {
+        for (z of 0..self.depth) {
+            for (x of 0..self.width) {
+                let c : i32 = z * self.width + x;
+                let i : i64 = c as i64;
+                let fromX : f64 = (x as f64) + 0.5 - flow.u[i] * dt;
+                let fromZ : f64 = (z as f64) + 0.5 - flow.w[i] * dt;
+                let s : FluidStencil = FluidSample::stencil(field, fromX, fromZ);
+                self.scratch[i] = FluidSample::blendF32(self.foam, s) as f32;
+            }
+        }
+    }
+
+    // Mixes each column of `scratch` toward its neighbours' mean by `mix`, back into `foam` as the source of
+    // the next step (`scratch` is rewritten from `foam` so the sweep reads old values only).
+    fn diffuse(mut self, field : Shared<FluidField>, mix : f64) : void {
+        let k : f64 = minD(mix, FLUID_FOAM_MIX_MAX);
+        for (c of 0..self.width * self.depth) {
+            self.foam[c as i64] = self.scratch[c as i64];
+        }
+        if (k <= 0.0) {
+            return;
+        }
+        for (c of 0..self.width * self.depth) {
+            let here : f64 = self.foam[c as i64] as f64;
+            let mut sum : f64 = 0.0;
+            for (d of 0..4) {
+                let n : i32 = field.neighbour(c, d);
+                if (n < 0) {
+                    sum = sum + here;
+                } else {
+                    sum = sum + (self.foam[n as i64] as f64);
+                }
+            }
+            self.scratch[c as i64] = (here + k * (0.25 * sum - here)) as f32;
+        }
+    }
+}
