@@ -1,0 +1,576 @@
+// asset_db — the asset database: every file a game uses, by logical path, with an id, a kind and a version.
+//
+// An asset is a file of the virtual file system. Registering a path gives it an `AssetId` computed from the
+// path alone (a hash, so ids are stable across runs and machines), and two paths that would share an id are
+// an error at registration rather than a silent mix-up. Loading reads the file through the `Vfs` the database
+// owns and turns the bytes into a value by kind: an `Image`, a `JsonDoc`, a `ModelAsset`, or the bytes
+// themselves.
+//
+// An asset can list the assets it needs (`dependsOn`); `loadWithDependencies` loads those first, in an order
+// that never loads a thing before what it needs, and refuses a cycle before it loads anything. Hot reload is
+// an explicit call: `reload(path)` reads the file again, compares a hash of its bytes with the last load,
+// and only when they differ replaces the value and raises the asset's `version`, so a system can compare a
+// remembered version against `version(id)` to know that its copy is stale. Nothing reads a clock or watches
+// the disk; the caller decides when to look.
+//
+// The database owns its `Vfs` (mount sources through `files()`), because Axle lets a class be stored in one
+// place only. A failed call answers the none id or false and leaves the reason in `error()`; the value an
+// asset already had is kept when a reload fails.
+
+use crate::core::collections::map::Map;
+use crate::core::collections::vec::Vec;
+use crate::core::id::hash::{hashFnv1a64, hashFnv1a64Bytes};
+use crate::core::id::string_id::{StringId, StringInterner};
+use crate::data::assets::asset_kind::{AssetId, AssetKind};
+use crate::data::bytes::ByteBuf;
+use crate::data::image::image::Image;
+use crate::data::image::png::PngCodec;
+use crate::data::json::json_doc::JsonDoc;
+use crate::data::json::json_parse::JsonParser;
+use crate::data::model::bbmodel_import::BbModelImporter;
+use crate::data::model::gltf_import::GltfImporter;
+use crate::data::model::model_asset::ModelAsset;
+use crate::data::slots::DataSlots;
+use crate::data::vfs::vfs::Vfs;
+use crate::data::vfs::vfs_path::VfsPath;
+
+// An id keeps the low 31 bits of the hash's two halves folded together, so it is never negative and never
+// collides with the none id.
+const ASSET_ID_MASK : i64 = 2147483647;
+const ASSET_ID_FOLD : i32 = 32;
+
+// What a lookup answers when there is nothing: no asset at a path or id, no value slot yet, no next edge.
+const ASSET_NO_INDEX : i32 = -1;
+
+// The extension that selects the Blockbench importer; every other model is read as glTF.
+const ASSET_BBMODEL_EXTENSION : string = ".bbmodel";
+
+// The starting room of a buffer answered for an asset that is not a loaded blob.
+const ASSET_EMPTY_ROOM : i32 = 16;
+
+// Room for the bytes a blob owns beyond the file's own length, so copying into it does not reallocate.
+const ASSET_BLOB_SLACK : i32 = 16;
+
+// The states of an asset in the dependency walk.
+const ASSET_UNVISITED : i32 = 0;
+const ASSET_ON_PATH : i32 = 1;
+const ASSET_DONE : i32 = 2;
+
+/** The asset database over one virtual file system. */
+pub class AssetDb {
+    vfs      : Vfs;
+    names    : StringInterner;
+    byId     : Map<i32, i32>;
+    idOf     : Vec<i32>;
+    kinds    : Vec<i32>;
+    slots    : Vec<i32>;
+    versions : Vec<i32>;
+    hashes   : Vec<i64>;
+    depHead  : Vec<i32>;
+    depTail  : Vec<i32>;
+    edgeTo   : Vec<i32>;
+    edgeNext : Vec<i32>;
+    images   : DataSlots<Image>;
+    docs     : DataSlots<JsonDoc>;
+    blobs    : DataSlots<ByteBuf>;
+    models   : DataSlots<ModelAsset>;
+    err      : string;
+    loads    : i32 = 0;
+    mark     : Vec<i32>;
+    order    : Vec<i32>;
+    trail    : Vec<i32>;
+
+    /** A database that loads from `files`; it takes ownership of the file system (reach it with `files()`). */
+    constructor(own files : Vfs) {
+        self.vfs = files;
+        self.names = new StringInterner();
+        self.byId = new Map<i32, i32>();
+        self.idOf = new Vec<i32>();
+        self.kinds = new Vec<i32>();
+        self.slots = new Vec<i32>();
+        self.versions = new Vec<i32>();
+        self.hashes = new Vec<i64>();
+        self.depHead = new Vec<i32>();
+        self.depTail = new Vec<i32>();
+        self.edgeTo = new Vec<i32>();
+        self.edgeNext = new Vec<i32>();
+        self.images = new DataSlots<Image>();
+        self.docs = new DataSlots<JsonDoc>();
+        self.blobs = new DataSlots<ByteBuf>();
+        self.models = new DataSlots<ModelAsset>();
+        self.mark = new Vec<i32>();
+        self.order = new Vec<i32>();
+        self.trail = new Vec<i32>();
+        self.err = "";
+    }
+
+    /** How many times an asset's value has been installed (first loads and changed reloads); a counter for tests and tools. */
+    pub fn installCount(self) : i32 {
+        return self.loads;
+    }
+
+    /** The file system assets are read from, to mount sources and write files into. */
+    pub fn files(self) : Vfs {
+        return self.vfs;
+    }
+
+    /** Why the last call failed, or an empty string after a call that worked. */
+    pub fn error(self) : string {
+        return self.err;
+    }
+
+    /** How many assets are registered. */
+    pub fn count(self) : i32 {
+        return self.idOf.len();
+    }
+
+    /** The id a path has (or would have): a hash of the normalised path, 31 bits. */
+    pub static fn idFor(path : string) : AssetId {
+        let h : i64 = hashFnv1a64(VfsPath::normalize(path));
+        let folded : i64 = (h ^ (h >>> ASSET_ID_FOLD)) & ASSET_ID_MASK;
+        return AssetId { raw: folded as i32 };
+    }
+
+    fn fail(mut self, why : string) : AssetId {
+        self.err = why;
+        return AssetId::none();
+    }
+
+    // ---- registration ----
+
+    /** Registers `path` as an asset of the kind its extension implies; the id of an already registered path is returned as is. */
+    pub fn register(mut self, path : string) : AssetId {
+        return self.registerAs(path, AssetKind::fromExtension(VfsPath::extension(path)));
+    }
+
+    /** Registers `path` as an asset of `kind`. None (see `error`) for a path that escapes the root, is empty, or whose id belongs to another path. */
+    pub fn registerAs(mut self, path : string, kind : AssetKind) : AssetId {
+        if (VfsPath::escapes(path)) {
+            return self.fail("the asset path climbs above the root: ${path}");
+        }
+        let clean : string = VfsPath::normalize(path);
+        if (clean.byteLength == 0) {
+            return self.fail("an asset needs a path");
+        }
+
+        let known : StringId = self.names.find(clean);
+        if (!known.isNone()) {
+            self.err = "";
+            return AssetId { raw: self.idOf.get(known.raw) };
+        }
+
+        let id : AssetId = AssetDb::idFor(clean);
+        let clash : i32 = self.byId.getOr(id.raw, ASSET_NO_INDEX);
+        if (clash >= 0) {
+            let other : string = self.names.name(StringId { raw: clash });
+            return self.fail("asset id collision: ${clean} and ${other} both hash to ${id.raw}");
+        }
+
+        let index : StringId = self.names.intern(clean);
+        self.byId.put(id.raw, index.raw);
+        self.idOf.push(id.raw);
+        self.kinds.push(kind.code());
+        self.slots.push(ASSET_NO_INDEX);
+        self.versions.push(0);
+        self.hashes.push(0);
+        self.depHead.push(ASSET_NO_INDEX);
+        self.depTail.push(ASSET_NO_INDEX);
+        self.err = "";
+        return id;
+    }
+
+    /** The id of the registered asset at `path`, or none. */
+    pub fn find(self, path : string) : AssetId {
+        let at : i32 = self.indexOfPath(path);
+        if (at < 0) {
+            return AssetId::none();
+        }
+        return AssetId { raw: self.idOf.get(at) };
+    }
+
+    fn indexOfPath(self, path : string) : i32 {
+        if (VfsPath::escapes(path)) {
+            return ASSET_NO_INDEX;
+        }
+        let known : StringId = self.names.find(VfsPath::normalize(path));
+        return known.raw;
+    }
+
+    fn indexOfId(self, id : AssetId) : i32 {
+        return self.byId.getOr(id.raw, ASSET_NO_INDEX);
+    }
+
+    /** The logical path of the asset `id` (borrowed; copy to keep); "" for an unknown id. */
+    pub fn pathOf(self, id : AssetId) : string {
+        let at : i32 = self.indexOfId(id);
+        if (at < 0) {
+            return "";
+        }
+        return self.names.name(StringId { raw: at });
+    }
+
+    /** The kind of the asset `id`; Bytes for an unknown id. */
+    pub fn kindOf(self, id : AssetId) : AssetKind {
+        let at : i32 = self.indexOfId(id);
+        if (at < 0) {
+            return AssetKind::Bytes;
+        }
+        return AssetKind::fromCode(self.kinds.get(at));
+    }
+
+    /** How many times the asset's content has been loaded with a change: 0 before the first load, 1 after it, +1 for each reload that found new bytes. */
+    pub fn version(self, id : AssetId) : i32 {
+        let at : i32 = self.indexOfId(id);
+        if (at < 0) {
+            return 0;
+        }
+        return self.versions.get(at);
+    }
+
+    /** True when the asset's value is loaded. */
+    pub fn isLoaded(self, id : AssetId) : bool {
+        return self.version(id) > 0;
+    }
+
+    // ---- dependencies ----
+
+    /** Records that the asset at `path` needs the asset at `needs` (both are registered if they are not yet). False when one cannot be registered. */
+    pub fn dependsOn(mut self, path : string, needs : string) : bool {
+        let a : AssetId = self.register(path);
+        let b : AssetId = self.register(needs);
+        if (a.isNone() || b.isNone()) {
+            return false;
+        }
+
+        let from : i32 = self.indexOfId(a);
+        let to : i32 = self.indexOfId(b);
+        let mut e : i32 = self.depHead.get(from);
+        while (e >= 0) {
+            if (self.edgeTo.get(e) == to) {
+                return true;
+            }
+            e = self.edgeNext.get(e);
+        }
+
+        let edge : i32 = self.edgeTo.len();
+        self.edgeTo.push(to);
+        self.edgeNext.push(ASSET_NO_INDEX);
+        if (self.depTail.get(from) < 0) {
+            self.depHead.set(from, edge);
+        } else {
+            self.edgeNext.set(self.depTail.get(from), edge);
+        }
+        self.depTail.set(from, edge);
+        return true;
+    }
+
+    /** How many assets the asset `id` needs directly. */
+    pub fn dependencyCount(self, id : AssetId) : i32 {
+        let at : i32 = self.indexOfId(id);
+        if (at < 0) {
+            return 0;
+        }
+
+        let mut n : i32 = 0;
+        let mut e : i32 = self.depHead.get(at);
+        while (e >= 0) {
+            n = n + 1;
+            e = self.edgeNext.get(e);
+        }
+        return n;
+    }
+
+    /** The `i`-th asset `id` needs directly (in the order they were declared), or none. */
+    pub fn dependencyAt(self, id : AssetId, i : i32) : AssetId {
+        let at : i32 = self.indexOfId(id);
+        if (at < 0 || i < 0) {
+            return AssetId::none();
+        }
+
+        let mut e : i32 = self.depHead.get(at);
+        let mut k : i32 = 0;
+        while (e >= 0) {
+            if (k == i) {
+                return AssetId { raw: self.idOf.get(self.edgeTo.get(e)) };
+            }
+            k = k + 1;
+            e = self.edgeNext.get(e);
+        }
+        return AssetId::none();
+    }
+
+    // Depth-first post-order: every asset lands in `order` after everything it needs. `mark` holds the visit
+    // state, and `trail` is the current path, for the message of a cycle.
+    fn visit(mut self, index : i32) : bool {
+        let state : i32 = self.mark.get(index);
+        if (state == ASSET_DONE) {
+            return true;
+        }
+        if (state == ASSET_ON_PATH) {
+            return self.failCycle(index);
+        }
+
+        self.mark.set(index, ASSET_ON_PATH);
+        self.trail.push(index);
+        let mut e : i32 = self.depHead.get(index);
+        while (e >= 0) {
+            if (!self.visit(self.edgeTo.get(e))) {
+                return false;
+            }
+            e = self.edgeNext.get(e);
+        }
+        self.trail.pop();
+        self.mark.set(index, ASSET_DONE);
+        self.order.push(index);
+        return true;
+    }
+
+    // Names the cycle that closes on asset `index`, starting at its earlier appearance on the trail.
+    fn failCycle(mut self, index : i32) : bool {
+        let mut start : i32 = 0;
+        for (k of 0..self.trail.len()) {
+            if (self.trail.get(k) == index) {
+                start = k;
+            }
+        }
+
+        let mut chain : string = "";
+        for (k of start..self.trail.len()) {
+            let name : string = self.names.name(StringId { raw: self.trail.get(k) });
+            chain = "${chain}${name} -> ";
+        }
+        let closing : string = self.names.name(StringId { raw: index });
+        self.err = "dependency cycle: ${chain}${closing}";
+        return false;
+    }
+
+    // ---- loading ----
+
+    /** Loads the asset at `path` (registering it first) if it is not loaded; its dependencies are not touched. None on failure (see `error`). */
+    pub fn load(mut self, path : string) : AssetId {
+        let id : AssetId = self.register(path);
+        if (id.isNone()) {
+            return id;
+        }
+
+        let at : i32 = self.indexOfId(id);
+        if (self.versions.get(at) > 0) {
+            return id;
+        }
+        if (!self.fetch(at, false)) {
+            return AssetId::none();
+        }
+        return id;
+    }
+
+    /**
+     * Loads the asset at `path` and everything it needs, each after what it needs. A dependency cycle is an
+     * error found before anything is loaded. None on failure (see `error`); assets loaded before the failure stay loaded.
+     */
+    pub fn loadWithDependencies(mut self, path : string) : AssetId {
+        let id : AssetId = self.register(path);
+        if (id.isNone()) {
+            return id;
+        }
+
+        let root : i32 = self.indexOfId(id);
+        self.mark.clear();
+        for (i of 0..self.idOf.len()) {
+            self.mark.push(ASSET_UNVISITED);
+        }
+        self.order.clear();
+        self.trail.clear();
+        if (!self.visit(root)) {
+            return AssetId::none();
+        }
+
+        for (k of 0..self.order.len()) {
+            let index : i32 = self.order.get(k);
+            if (self.versions.get(index) == 0 && !self.fetch(index, false)) {
+                return AssetId::none();
+            }
+        }
+        self.err = "";
+        return id;
+    }
+
+    /**
+     * Reads the file of the asset at `path` again. When its bytes differ from the last load the value is
+     * replaced, the version goes up and true is returned; when they are the same, or the file cannot be read or
+     * understood (see `error`), nothing changes and false is returned. An asset that was never loaded is loaded.
+     */
+    pub fn reload(mut self, path : string) : bool {
+        let id : AssetId = self.register(path);
+        if (id.isNone()) {
+            return false;
+        }
+        return self.fetch(self.indexOfId(id), true);
+    }
+
+    /** Reloads every loaded asset in registration order; returns how many changed. */
+    pub fn reloadAll(mut self) : i32 {
+        let mut changed : i32 = 0;
+        for (index of 0..self.idOf.len()) {
+            if (self.versions.get(index) == 0) {
+                continue;
+            }
+            if (self.fetch(index, true)) {
+                changed = changed + 1;
+            }
+        }
+        return changed;
+    }
+
+    // Reads and installs asset `index`; with `onlyIfChanged` an unchanged file is left alone (false).
+    fn fetch(mut self, index : i32, onlyIfChanged : bool) : bool {
+        let path : string = self.names.name(StringId { raw: index });
+        try {
+            let bytes : ByteBuf = self.vfs.read(path);
+            let hash : i64 = hashFnv1a64Bytes(bytes.raw(), bytes.len());
+            if (onlyIfChanged && self.versions.get(index) > 0 && self.hashes.get(index) == hash) {
+                self.err = "";
+                return false;
+            }
+            return self.install(index, bytes, hash);
+        } catch e : IOException {
+            self.err = e.message;
+            return false;
+        }
+    }
+
+    // A model from the bytes of a file, by its extension: Blockbench for `.bbmodel`, glTF for the rest.
+    static fn readModel(bytes : ByteBuf, vfs : Vfs, path : string) : ModelAsset {
+        let base : string = VfsPath::parent(path);
+        if (VfsPath::extension(path) == ASSET_BBMODEL_EXTENSION) {
+            return BbModelImporter::fromBytes(bytes, vfs, base);
+        }
+        return GltfImporter::fromBytes(bytes, vfs, base);
+    }
+
+    // Turns the bytes into the value of asset `index`, by its kind, and records the load.
+    fn install(mut self, index : i32, bytes : ByteBuf, hash : i64) : bool {
+        let path : string = self.names.name(StringId { raw: index });
+        let kind : AssetKind = AssetKind::fromCode(self.kinds.get(index));
+        let slot : i32 = self.slots.get(index);
+
+        let installed : bool = match kind {
+            AssetKind::Image => self.installImage(index, slot, bytes, path),
+            AssetKind::Json => self.installJson(index, slot, bytes, path),
+            AssetKind::Model => self.installModel(index, slot, bytes, path),
+            AssetKind::Bytes => self.installBytes(index, slot, bytes),
+        };
+        if (!installed) {
+            return false;
+        }
+
+        self.hashes.set(index, hash);
+        self.versions.set(index, self.versions.get(index) + 1);
+        self.loads = self.loads + 1;
+        self.err = "";
+        return true;
+    }
+
+    // The value slots: a first load takes a new slot, a reload replaces what the slot holds.
+    fn installImage(mut self, index : i32, slot : i32, bytes : ByteBuf, path : string) : bool {
+        let codec : PngCodec = new PngCodec();
+        let img : Image = codec.decode(bytes);
+        if (img.isEmpty()) {
+            self.err = "${path}: ${codec.error()}";
+            return false;
+        }
+        if (slot < 0) {
+            self.slots.set(index, self.images.push(img));
+        } else {
+            self.images.set(slot, img);
+        }
+        return true;
+    }
+
+    fn installJson(mut self, index : i32, slot : i32, bytes : ByteBuf, path : string) : bool {
+        let doc : JsonDoc = JsonParser::parseBytes(bytes);
+        if (!doc.ok()) {
+            self.err = "${path}: ${doc.error()}";
+            return false;
+        }
+        if (slot < 0) {
+            self.slots.set(index, self.docs.push(doc));
+        } else {
+            self.docs.set(slot, doc);
+        }
+        return true;
+    }
+
+    fn installModel(mut self, index : i32, slot : i32, bytes : ByteBuf, path : string) : bool {
+        let model : ModelAsset = AssetDb::readModel(bytes, self.vfs, path);
+        if (!model.ok()) {
+            self.err = "${path}: ${model.error()}";
+            return false;
+        }
+        if (slot < 0) {
+            self.slots.set(index, self.models.push(model));
+        } else {
+            self.models.set(slot, model);
+        }
+        return true;
+    }
+
+    fn installBytes(mut self, index : i32, slot : i32, bytes : ByteBuf) : bool {
+        let copy : ByteBuf = new ByteBuf(bytes.len() + ASSET_BLOB_SLACK);
+        copy.pushRange(bytes, 0, bytes.len());
+        if (slot < 0) {
+            self.slots.set(index, self.blobs.push(copy));
+        } else {
+            self.blobs.set(slot, copy);
+        }
+        return true;
+    }
+
+    // ---- values ----
+
+    // The slot of a loaded asset of the wanted kind, or -1.
+    fn slotOf(self, id : AssetId, kind : AssetKind) : i32 {
+        let at : i32 = self.indexOfId(id);
+        if (at < 0 || self.kinds.get(at) != kind.code() || self.versions.get(at) == 0) {
+            return ASSET_NO_INDEX;
+        }
+        return self.slots.get(at);
+    }
+
+    /** The picture of the image asset `id`; the empty image when it is not a loaded image. */
+    pub fn image(self, id : AssetId) : Image {
+        let s : i32 = self.slotOf(id, AssetKind::Image);
+        if (s < 0) {
+            return new Image(0, 0);
+        }
+        return self.images.get(s);
+    }
+
+    /** The document of the JSON asset `id`; an empty document (no root) when it is not a loaded JSON asset. */
+    pub fn json(self, id : AssetId) : JsonDoc {
+        let s : i32 = self.slotOf(id, AssetKind::Json);
+        if (s < 0) {
+            return new JsonDoc();
+        }
+        return self.docs.get(s);
+    }
+
+    /** The model of the model asset `id`; an empty model with an error when it is not a loaded model asset. */
+    pub fn model(self, id : AssetId) : ModelAsset {
+        let s : i32 = self.slotOf(id, AssetKind::Model);
+        if (s < 0) {
+            let none : ModelAsset = new ModelAsset();
+            none.fail("not a loaded model asset");
+            return none;
+        }
+        return self.models.get(s);
+    }
+
+    /** The bytes of the bytes asset `id`; an empty buffer when it is not a loaded bytes asset. */
+    pub fn bytes(self, id : AssetId) : ByteBuf {
+        let s : i32 = self.slotOf(id, AssetKind::Bytes);
+        if (s < 0) {
+            return new ByteBuf(ASSET_EMPTY_ROOM);
+        }
+        return self.blobs.get(s);
+    }
+}

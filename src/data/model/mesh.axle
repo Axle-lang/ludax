@@ -1,0 +1,402 @@
+// mesh — triangle geometry as flat arrays, the form importers produce and renderers consume.
+//
+// A mesh is a set of vertices and a list of triangles over them. Each channel is a flat run of numbers in
+// vertex order: positions (3 per vertex), normals (3), texture coordinates (2, `v` down like image rows),
+// tangents (4: xyz and a handedness sign in w) and, for skinned meshes, four joint indices and four weights per
+// vertex. Only positions are required; a channel that is present has exactly one entry per vertex, and
+// `check` says whether that and the indices hold. Triangles wind counter-clockwise seen from the front, in a
+// right-handed world with +Y up, the convention of `Mat4`.
+//
+// The flat arrays are `Vec`s of numbers, so uploading to a GPU buffer is a straight copy.
+
+use crate::core::collections::vec::Vec;
+use crate::core::math::geom::Aabb;
+use crate::core::math::vec2::Vec2;
+use crate::core::math::vec3::Vec3;
+use crate::core::math::vec4::Vec4;
+
+// Numbers per vertex in each channel.
+const MESH_POSITION_STRIDE : i32 = 3;
+const MESH_NORMAL_STRIDE : i32 = 3;
+const MESH_UV_STRIDE : i32 = 2;
+const MESH_TANGENT_STRIDE : i32 = 4;
+const MESH_SKIN_JOINTS : i32 = 4;
+
+// Indices per triangle.
+const MESH_TRIANGLE_INDICES : i32 = 3;
+
+// Below this the triangle has no usable tangent frame in uv space.
+const MESH_UV_EPSILON : f32 = 0.0000000001;
+
+/** The three vertex indices of one triangle of the index list. */
+struct MeshTriangle {
+    a : i32;
+    b : i32;
+    c : i32;
+
+    // True when all three indices name a vertex of a mesh with `n` of them.
+    fn isValid(self, n : i32) : bool {
+        return self.a >= 0 && self.b >= 0 && self.c >= 0 && self.a < n && self.b < n && self.c < n;
+    }
+}
+
+/** The tangent and bitangent directions of one triangle, from how its texture coordinates run over its edges. */
+struct MeshFrame {
+    tangent   : Vec3;
+    bitangent : Vec3;
+    usable    : bool;
+}
+
+/** Indexed triangle geometry. */
+pub class Mesh {
+    positions : Vec<f32>;
+    normals   : Vec<f32>;
+    uvs       : Vec<f32>;
+    tangents  : Vec<f32>;
+    indices   : Vec<i32>;
+    joints    : Vec<i32>;
+    weights   : Vec<f32>;
+
+    /** An empty mesh. */
+    constructor() {
+        self.positions = new Vec<f32>();
+        self.normals = new Vec<f32>();
+        self.uvs = new Vec<f32>();
+        self.tangents = new Vec<f32>();
+        self.indices = new Vec<i32>();
+        self.joints = new Vec<i32>();
+        self.weights = new Vec<f32>();
+    }
+
+    /** How many vertices. */
+    pub fn vertexCount(self) : i32 {
+        return self.positions.len() / MESH_POSITION_STRIDE;
+    }
+
+    /** How many indices (three per triangle). */
+    pub fn indexCount(self) : i32 {
+        return self.indices.len();
+    }
+
+    /** How many triangles. */
+    pub fn triangleCount(self) : i32 {
+        return self.indices.len() / MESH_TRIANGLE_INDICES;
+    }
+
+    /** True when every vertex has a normal. */
+    pub fn hasNormals(self) : bool {
+        return self.positions.len() > 0 && self.normals.len() == self.positions.len();
+    }
+
+    /** True when every vertex has texture coordinates. */
+    pub fn hasUvs(self) : bool {
+        let n : i32 = self.vertexCount();
+        return n > 0 && self.uvs.len() == n * MESH_UV_STRIDE;
+    }
+
+    /** True when every vertex has a tangent. */
+    pub fn hasTangents(self) : bool {
+        let n : i32 = self.vertexCount();
+        return n > 0 && self.tangents.len() == n * MESH_TANGENT_STRIDE;
+    }
+
+    /** True when every vertex has four joints and four weights. */
+    pub fn hasSkin(self) : bool {
+        let n : i32 = self.vertexCount();
+        return n > 0 && self.joints.len() == n * MESH_SKIN_JOINTS && self.weights.len() == self.joints.len();
+    }
+
+    // ---- reading ----
+
+    /** The position of vertex `i`. */
+    pub fn position(self, i : i32) : Vec3 {
+        let o : i32 = i * MESH_POSITION_STRIDE;
+        return Vec3 { x: self.positions.get(o), y: self.positions.get(o + 1), z: self.positions.get(o + 2) };
+    }
+
+    /** The normal of vertex `i` (the zero vector when the mesh has none). */
+    pub fn normal(self, i : i32) : Vec3 {
+        if (!self.hasNormals()) {
+            return Vec3::zero();
+        }
+        let o : i32 = i * MESH_NORMAL_STRIDE;
+        return Vec3 { x: self.normals.get(o), y: self.normals.get(o + 1), z: self.normals.get(o + 2) };
+    }
+
+    /** The texture coordinates of vertex `i` (zero when the mesh has none). */
+    pub fn uv(self, i : i32) : Vec2 {
+        if (!self.hasUvs()) {
+            return Vec2::zero();
+        }
+        return Vec2 {
+            x: self.uvs.get(i * MESH_UV_STRIDE),
+            y: self.uvs.get(i * MESH_UV_STRIDE + 1),
+        };
+    }
+
+    /** The tangent of vertex `i`: xyz the direction of increasing `u`, w the handedness sign (zero when the mesh has none). */
+    pub fn tangent(self, i : i32) : Vec4 {
+        if (!self.hasTangents()) {
+            return Vec4::zero();
+        }
+        return Vec4 {
+            x: self.tangents.get(i * MESH_TANGENT_STRIDE),
+            y: self.tangents.get(i * MESH_TANGENT_STRIDE + 1),
+            z: self.tangents.get(i * MESH_TANGENT_STRIDE + 2),
+            w: self.tangents.get(i * MESH_TANGENT_STRIDE + 3),
+        };
+    }
+
+    /** The vertex index at position `i` of the index list. */
+    pub fn index(self, i : i32) : i32 {
+        return self.indices.get(i);
+    }
+
+    /** Joint number `k` (0 to 3) of vertex `i`; 0 when the mesh has no skin. */
+    pub fn joint(self, i : i32, k : i32) : i32 {
+        if (!self.hasSkin()) {
+            return 0;
+        }
+        return self.joints.get(i * MESH_SKIN_JOINTS + k);
+    }
+
+    /** Weight number `k` (0 to 3) of vertex `i`; 0 when the mesh has no skin. */
+    pub fn weight(self, i : i32, k : i32) : f32 {
+        if (!self.hasSkin()) {
+            return 0.0;
+        }
+        return self.weights.get(i * MESH_SKIN_JOINTS + k);
+    }
+
+    /** The smallest box around all vertices (the empty box for an empty mesh). */
+    pub fn bounds(self) : Aabb {
+        let mut out : Aabb = Aabb::empty();
+        for (i of 0..self.vertexCount()) {
+            out = out.expandedToPoint(self.position(i));
+        }
+        return out;
+    }
+
+    // Triangle `t` of the index list.
+    fn triangle(self, t : i32) : MeshTriangle {
+        let at : i32 = t * MESH_TRIANGLE_INDICES;
+        return MeshTriangle {
+            a: self.indices.get(at),
+            b: self.indices.get(at + 1),
+            c: self.indices.get(at + 2),
+        };
+    }
+
+    // A zeroed accumulator with a three-component slot per vertex (one spare, since arrays cannot be empty).
+    static fn accumulator(vertexCount : i32) : f32[] {
+        let size : i32 = vertexCount * MESH_POSITION_STRIDE;
+        let mut acc : f32[] = new f32[(size + 1) as i64];
+        for (i of 0..size) {
+            acc[i] = 0.0;
+        }
+        return acc;
+    }
+
+    // Vertex `i` of an accumulated three-component array.
+    fn sliceVec3(self, values : f32[], i : i32) : Vec3 {
+        let o : i32 = i * MESH_POSITION_STRIDE;
+        return Vec3 { x: values[o], y: values[o + 1], z: values[o + 2] };
+    }
+
+    // ---- building ----
+
+    /** Appends a vertex with position, normal and texture coordinates; returns its index. Use it for every vertex of a mesh or for none of them. */
+    pub fn addVertex(mut self, p : Vec3, n : Vec3, uv : Vec2) : i32 {
+        let at : i32 = self.vertexCount();
+        self.addPosition(p);
+        self.addNormal(n);
+        self.addUv(uv);
+        return at;
+    }
+
+    /** Appends a position only; returns the vertex index. The other channels are filled by `addNormal` and friends, one per vertex. */
+    pub fn addPosition(mut self, p : Vec3) : i32 {
+        let at : i32 = self.vertexCount();
+        self.positions.push(p.x);
+        self.positions.push(p.y);
+        self.positions.push(p.z);
+        return at;
+    }
+
+    /** Appends a normal (the next vertex's). */
+    pub fn addNormal(mut self, n : Vec3) : void {
+        self.normals.push(n.x);
+        self.normals.push(n.y);
+        self.normals.push(n.z);
+    }
+
+    /** Appends texture coordinates. */
+    pub fn addUv(mut self, uv : Vec2) : void {
+        self.uvs.push(uv.x);
+        self.uvs.push(uv.y);
+    }
+
+    /** Appends a tangent. */
+    pub fn addTangent(mut self, t : Vec4) : void {
+        self.tangents.push(t.x);
+        self.tangents.push(t.y);
+        self.tangents.push(t.z);
+        self.tangents.push(t.w);
+    }
+
+    /** Appends the four joints and four weights of the next vertex. */
+    pub fn addSkin(mut self, j0 : i32, j1 : i32, j2 : i32, j3 : i32, w : Vec4) : void {
+        self.joints.push(j0);
+        self.joints.push(j1);
+        self.joints.push(j2);
+        self.joints.push(j3);
+        self.weights.push(w.x);
+        self.weights.push(w.y);
+        self.weights.push(w.z);
+        self.weights.push(w.w);
+    }
+
+    /** Appends a triangle of three vertex indices. */
+    pub fn addTriangle(mut self, a : i32, b : i32, c : i32) : void {
+        self.indices.push(a);
+        self.indices.push(b);
+        self.indices.push(c);
+    }
+
+    // ---- derived data ----
+
+    /** Replaces the normals by smooth ones: each vertex gets the area-weighted mean of the faces that use it (up when it has none). */
+    pub fn computeNormals(mut self) : void {
+        let n : i32 = self.vertexCount();
+        let acc : f32[] = Mesh::accumulator(n);
+        for (t of 0..self.triangleCount()) {
+            let tri : MeshTriangle = self.triangle(t);
+            if (!tri.isValid(n)) {
+                continue;
+            }
+
+            // The cross product of two edges has the face's area as its length, which is the weight.
+            let pa : Vec3 = self.position(tri.a);
+            let face : Vec3 = self.position(tri.b).minus(pa).cross(self.position(tri.c).minus(pa));
+            self.addTo(acc, tri.a, face);
+            self.addTo(acc, tri.b, face);
+            self.addTo(acc, tri.c, face);
+        }
+
+        self.normals.clear();
+        for (i of 0..n) {
+            let sum : Vec3 = self.sliceVec3(acc, i);
+            self.addNormal(sum.normalizedOr(Vec3::unitY()));
+        }
+    }
+
+    fn addTo(self, acc : f32[], v : i32, d : Vec3) : void {
+        acc[v * MESH_POSITION_STRIDE] = acc[v * MESH_POSITION_STRIDE] + d.x;
+        acc[v * MESH_POSITION_STRIDE + 1] = acc[v * MESH_POSITION_STRIDE + 1] + d.y;
+        acc[v * MESH_POSITION_STRIDE + 2] = acc[v * MESH_POSITION_STRIDE + 2] + d.z;
+    }
+
+    /** Replaces the tangents by ones derived from the texture coordinates; needs normals and texture coordinates (does nothing without them). */
+    pub fn computeTangents(mut self) : void {
+        if (!self.hasNormals() || !self.hasUvs()) {
+            return;
+        }
+        let n : i32 = self.vertexCount();
+        let tanAcc : f32[] = Mesh::accumulator(n);
+        let bitAcc : f32[] = Mesh::accumulator(n);
+        for (t of 0..self.triangleCount()) {
+            let tri : MeshTriangle = self.triangle(t);
+            if (!tri.isValid(n)) {
+                continue;
+            }
+
+            let frame : MeshFrame = self.uvFrame(tri);
+            if (!frame.usable) {
+                continue;
+            }
+            self.addTo(tanAcc, tri.a, frame.tangent);
+            self.addTo(tanAcc, tri.b, frame.tangent);
+            self.addTo(tanAcc, tri.c, frame.tangent);
+            self.addTo(bitAcc, tri.a, frame.bitangent);
+            self.addTo(bitAcc, tri.b, frame.bitangent);
+            self.addTo(bitAcc, tri.c, frame.bitangent);
+        }
+
+        self.tangents.clear();
+        for (i of 0..n) {
+            let normal : Vec3 = self.normal(i);
+            let tv : Vec3 = self.sliceVec3(tanAcc, i);
+            let bv : Vec3 = self.sliceVec3(bitAcc, i);
+            self.addTangent(Mesh::orthogonalTangent(normal, tv, bv));
+        }
+    }
+
+    // The tangent and bitangent of a triangle: its edges expressed in uv space, inverted. A triangle whose uv
+    // area is too small has no frame (`usable` false, and nothing is divided).
+    fn uvFrame(self, tri : MeshTriangle) : MeshFrame {
+        let pa : Vec3 = self.position(tri.a);
+        let e1 : Vec3 = self.position(tri.b).minus(pa);
+        let e2 : Vec3 = self.position(tri.c).minus(pa);
+        let ua : Vec2 = self.uv(tri.a);
+        let d1 : Vec2 = Vec2 { x: self.uv(tri.b).x - ua.x, y: self.uv(tri.b).y - ua.y };
+        let d2 : Vec2 = Vec2 { x: self.uv(tri.c).x - ua.x, y: self.uv(tri.c).y - ua.y };
+
+        let det : f32 = d1.x * d2.y - d2.x * d1.y;
+        let mut absDet : f32 = det;
+        if (absDet < 0.0) {
+            absDet = -absDet;
+        }
+        if (absDet < MESH_UV_EPSILON) {
+            return MeshFrame { tangent: Vec3::zero(), bitangent: Vec3::zero(), usable: false };
+        }
+
+        let k : f32 = (1.0 as f32) / det;
+        return MeshFrame {
+            tangent: e1.scale(d2.y).minus(e2.scale(d1.y)).scale(k),
+            bitangent: e2.scale(d1.x).minus(e1.scale(d2.x)).scale(k),
+            usable: true,
+        };
+    }
+
+    // The accumulated tangent made perpendicular to the normal, with the handedness sign in w; a vertex whose
+    // tangent came to nothing gets any perpendicular.
+    static fn orthogonalTangent(normal : Vec3, tv : Vec3, bv : Vec3) : Vec4 {
+        let ortho : Vec3 = tv.minus(normal.scale(normal.dot(tv)));
+        let u : Vec3 = ortho.normalizedOr(normal.anyPerpendicular());
+        let mut sign : f32 = 1.0;
+        if (normal.cross(u).dot(bv) < 0.0) {
+            sign = -1.0;
+        }
+        return Vec4 { x: u.x, y: u.y, z: u.z, w: sign };
+    }
+
+    /** An empty string when the mesh is consistent, else what is wrong: a channel with the wrong length, an index list that is not whole triangles, or an index past the last vertex. */
+    pub fn check(self) : string {
+        let n : i32 = self.vertexCount();
+        if (self.positions.len() % MESH_POSITION_STRIDE != 0) {
+            return "the position array is not a whole number of vertices";
+        }
+        if (self.normals.len() != 0 && self.normals.len() != n * MESH_NORMAL_STRIDE) {
+            return "the normal count differs from the vertex count";
+        }
+        if (self.uvs.len() != 0 && self.uvs.len() != n * MESH_UV_STRIDE) {
+            return "the texture coordinate count differs from the vertex count";
+        }
+        if (self.tangents.len() != 0 && self.tangents.len() != n * MESH_TANGENT_STRIDE) {
+            return "the tangent count differs from the vertex count";
+        }
+        if (self.joints.len() != 0
+            && (self.joints.len() != n * MESH_SKIN_JOINTS || self.weights.len() != n * MESH_SKIN_JOINTS)) {
+            return "the joint or weight count differs from the vertex count";
+        }
+        if (self.indices.len() % MESH_TRIANGLE_INDICES != 0) {
+            return "the index count is not a multiple of three";
+        }
+        for (i of 0..self.indices.len()) {
+            if (self.indices.get(i) < 0 || self.indices.get(i) >= n) {
+                return "an index points past the last vertex";
+            }
+        }
+        return "";
+    }
+}

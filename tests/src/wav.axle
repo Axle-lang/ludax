@@ -1,0 +1,423 @@
+// wav — the WAVE codec and the AudioClip helpers: exact header bytes, round trips, odd chunks, damaged input.
+//
+// The encoder is checked byte by byte against the RIFF layout, because a file that plays is not the same as a
+// file another tool reads back the same way. Decode is checked for exactness where the sample grid allows it
+// (16-bit multiples of 1/32768, every f32) and within one LSB where quantising loses a step; every damaged
+// file must come back as an error, never a partial clip.
+
+use ludax::{Checks, Pcg32, AudioClip, WavCodec, WavFile, WavResult};
+
+fn wavTU16(b : i8[], at : i32, v : i32) : void {
+    b[at as i64] = (v & 255) as i8;
+    b[(at + 1) as i64] = ((v >> 8) & 255) as i8;
+}
+
+fn wavTU32(b : i8[], at : i32, v : i32) : void {
+    wavTU16(b, at, v & 65535);
+    wavTU16(b, at + 2, (v >>> 16) & 65535);
+}
+
+fn wavTTag(b : i8[], at : i32, s : string) : void {
+    for (i of 0..4) {
+        b[(at + i) as i64] = s.charAt(i) as i8;
+    }
+}
+
+fn wavTByte(f : WavFile, at : i32) : i32 {
+    return (f.bytes[at as i64] as i32) & 255;
+}
+
+// A zeroed buffer of `n` bytes.
+fn wavTBuf(n : i32) : i8[] {
+    let mut b : i8[] = new i8[n as i64];
+    for (i of 0..n) {
+        b[i as i64] = 0 as i8;
+    }
+    return b;
+}
+
+// A RIFF/WAVE shell with a plain 16-byte fmt chunk; the caller fills in data at offset 36.
+fn wavTShell(total : i32, code : i32, channels : i32, rate : i32, bits : i32) : i8[] {
+    let b : i8[] = wavTBuf(total);
+    wavTTag(b, 0, "RIFF");
+    wavTU32(b, 4, total - 8);
+    wavTTag(b, 8, "WAVE");
+    wavTTag(b, 12, "fmt ");
+    wavTU32(b, 16, 16);
+    wavTU16(b, 20, code);
+    wavTU16(b, 22, channels);
+    wavTU32(b, 24, rate);
+    wavTU32(b, 28, rate * channels * (bits / 8));
+    wavTU16(b, 32, channels * (bits / 8));
+    wavTU16(b, 34, bits);
+    return b;
+}
+
+fn wavTRandomClip(rate : i32, channels : i32, frames : i32, seed : u64) : AudioClip {
+    let g : Pcg32 = new Pcg32(seed, 1);
+    let mut clip : AudioClip = new AudioClip(rate, channels, frames);
+    for (i of 0..frames * channels) {
+        clip.samples[i as i64] = g.rangeF32(0.0 - (1.0 as f32), 1.0 as f32);
+    }
+    return clip;
+}
+
+/** The wav checks, one static function per topic. */
+pub class WavSuite {
+    static fn headers(c : Checks) : void {
+        let clip : AudioClip = new AudioClip(8000, 1, 3);
+        clip.set(0, 0, 0.5);
+        clip.set(1, 0, -0.5);
+        clip.set(2, 0, 1.0);
+        let f : WavFile = WavCodec::encode16(clip);
+        c.sameInt("pcm16 file size is 44 + data", f.size, 50);
+        c.that(
+            "pcm16 starts with RIFF",
+            wavTByte(f, 0) == 82 && wavTByte(f, 1) == 73 && wavTByte(f, 2) == 70
+                && wavTByte(f, 3) == 70
+        );
+        c.sameInt("pcm16 RIFF size is file - 8", wavTByte(f, 4), 42);
+        c.that(
+            "pcm16 WAVE and fmt tags",
+            wavTByte(f, 8) == 87 && wavTByte(f, 12) == 102 && wavTByte(f, 15) == 32
+        );
+        c.sameInt("pcm16: the fmt chunk size is 16", wavTByte(f, 16), 16);
+        c.sameInt("pcm16 format code 1", wavTByte(f, 20), 1);
+        c.sameInt("pcm16: the channel count is 1", wavTByte(f, 22), 1);
+        c.sameInt("pcm16 rate low byte (8000 = 0x1F40)", wavTByte(f, 24), 64);
+        c.sameInt("pcm16 rate high byte", wavTByte(f, 25), 31);
+        c.sameInt("pcm16 byte rate low byte (16000 = 0x3E80)", wavTByte(f, 28), 128);
+        c.sameInt("pcm16 byte rate high byte", wavTByte(f, 29), 62);
+        c.sameInt("pcm16: block align is 2 bytes for mono 16-bit", wavTByte(f, 32), 2);
+        c.sameInt("pcm16: bits per sample is 16", wavTByte(f, 34), 16);
+        c.that(
+            "pcm16 data tag",
+            wavTByte(f, 36) == 100 && wavTByte(f, 37) == 97 && wavTByte(f, 39) == 97
+        );
+        c.sameInt("pcm16: the data chunk size is 6 bytes", wavTByte(f, 40), 6);
+        // 0.5 = 0x4000, -0.5 = 0xC000, 1.0 clamps to 0x7FFF; little endian.
+        c.that(
+            "pcm16 sample bytes",
+            wavTByte(f, 44) == 0 && wavTByte(f, 45) == 64 && wavTByte(f, 46) == 0
+                && wavTByte(f, 47) == 192
+                && wavTByte(f, 48) == 255
+                && wavTByte(f, 49) == 127
+        );
+
+        let one : AudioClip = new AudioClip(44100, 1, 1);
+        one.set(0, 0, 1.0);
+        let g : WavFile = WavCodec::encodeFloat(one);
+        c.sameInt("float file size (58 header + 4)", g.size, 62);
+        c.sameInt("float format code 3", wavTByte(g, 20), 3);
+        c.sameInt("float fmt chunk size 18", wavTByte(g, 16), 18);
+        c.that(
+            "float has a fact chunk",
+            wavTByte(g, 38) == 102 && wavTByte(g, 39) == 97 && wavTByte(g, 40) == 99
+        );
+        c.sameInt("float: the data chunk size is 4 bytes", wavTByte(g, 54), 4);
+        c.that(
+            "1.0f is 00 00 80 3F",
+            wavTByte(g, 58) == 0 && wavTByte(g, 59) == 0 && wavTByte(g, 60) == 128
+                && wavTByte(g, 61) == 63
+        );
+
+        let six : WavFile = WavCodec::encode16(new AudioClip(48000, 6, 2));
+        c.sameInt(
+            "multichannel uses the extensible code",
+            wavTByte(six, 20) + wavTByte(six, 21) * 256,
+            65534
+        );
+        c.sameInt("extensible: the fmt chunk size is 40", wavTByte(six, 16), 40);
+    }
+
+    static fn roundTrips(c : Checks) : void {
+        // 16 bit: samples that are multiples of 1/32768 come back bit for bit.
+        let mut clip : AudioClip = new AudioClip(22050, 2, 2000);
+        let g : Pcg32 = new Pcg32(5, 5);
+        for (i of 0..4000) {
+            let q : i32 = g.range(-32768, 32768);
+            clip.samples[i as i64] = (q as f32) / (32768.0 as f32);
+        }
+        let f : WavFile = WavCodec::encode16(clip);
+        let r : WavResult = WavCodec::decode(f.bytes, f.size);
+        c.that("16-bit: an encoded file decodes without error", r.isOk());
+        let back : AudioClip = r.clip();
+        c.sameInt("16-bit: the sample rate survives a round trip", back.rate, 22050);
+        c.sameInt("16-bit: the channel count survives a round trip", back.channels, 2);
+        c.sameInt("16-bit: the frame count survives a round trip", back.frames, 2000);
+        let mut exact : bool = true;
+        for (i of 0..4000) {
+            if (back.samples[i as i64] != clip.samples[i as i64]) {
+                exact = false;
+            }
+        }
+        c.that("16-bit round trip is exact", exact);
+
+        // float: every f32 comes back exactly, including tiny, subnormal and negative ones.
+        let fl : AudioClip = wavTRandomClip(48000, 3, 500, 9);
+        fl.set(0, 0, 0.00000000000000000000000000000001);
+        fl.set(1, 0, -0.0000000000000000000000000000000000000000001);
+        fl.set(2, 0, 3000.5);
+        fl.set(3, 0, 0.0);
+        let ff : WavFile = WavCodec::encodeFloat(fl);
+        let fr : WavResult = WavCodec::decode(ff.bytes, ff.size);
+        c.that("float file with 3 channels decodes", fr.isOk());
+        let fb : AudioClip = fr.clip();
+        let mut same : bool = fb.frames == 500 && fb.channels == 3;
+        for (i of 0..1500) {
+            if (fb.samples[i as i64] != fl.samples[i as i64]) {
+                same = false;
+            }
+        }
+        c.that("float round trip is exact", same);
+
+        // 6 channels at 16 bit go through the extensible header.
+        let mut six : AudioClip = new AudioClip(48000, 6, 10);
+        for (i of 0..60) {
+            six.samples[i as i64] = ((i - 30) as f32) / (32768.0 as f32);
+        }
+        let sf : WavFile = WavCodec::encode16(six);
+        let sr : WavResult = WavCodec::decode(sf.bytes, sf.size);
+        c.that("extensible 6-channel file decodes", sr.isOk());
+        c.sameInt("extensible: the decoded clip has six channels", sr.clip().channels, 6);
+        c.near(
+            "extensible: sample 59 decodes to 29/32768",
+            sr.clip().samples[59] as f64,
+            29.0 / 32768.0,
+            0.0
+        );
+    }
+
+    static fn otherDepths(c : Checks) : void {
+        // 24 bit: three samples, built by hand: 0x7FFFFF, 0x800000, 0x123456.
+        let mut full : i8[] = wavTShell(44 + 9, 1, 1, 8000, 24);
+        wavTTag(full, 36, "data");
+        wavTU32(full, 40, 9);
+        full[44] = 255 as i8;
+        full[45] = 255 as i8;
+        full[46] = 127 as i8;
+        full[47] = 0 as i8;
+        full[48] = 0 as i8;
+        full[49] = 128 as i8;
+        full[50] = 86 as i8;
+        full[51] = 52 as i8;
+        full[52] = 18 as i8;
+        wavTU32(full, 4, 44 + 9 - 8);
+        let r : WavResult = WavCodec::decode(full, 44 + 9);
+        c.that("24-bit: a hand-built file decodes without error", r.isOk());
+        let a : AudioClip = r.clip();
+        c.sameInt("24-bit: the decoded clip has three frames", a.frames, 3);
+        c.near("24-bit max within 1 LSB", a.get(0, 0) as f64, 1.0, 1.0 / 8388608.0);
+        c.near("24-bit min is -1", a.get(1, 0) as f64, -1.0, 0.0);
+        c.near(
+            "24-bit: 0x123456 decodes to its fraction of full scale within one LSB",
+            a.get(2, 0) as f64,
+            1193046.0 / 8388608.0,
+            1.0 / 8388608.0
+        );
+
+        // 24-bit values that came from 16-bit land within 1 LSB of the original after re-quantising.
+        let q : AudioClip = wavTRandomClip(8000, 1, 100, 3);
+        let bits24 : i32 = 100 * 3;
+        let mut enc : i8[] = wavTShell(44 + bits24, 1, 1, 8000, 24);
+        wavTTag(enc, 36, "data");
+        wavTU32(enc, 40, bits24);
+        for (i of 0..100) {
+            let mut v : i32 = ((q.samples[i as i64] as f64) * 8388608.0) as i32;
+            if (v > 8388607) {
+                v = 8388607;
+            }
+            enc[(44 + i * 3) as i64] = (v & 255) as i8;
+            enc[(45 + i * 3) as i64] = ((v >> 8) & 255) as i8;
+            enc[(46 + i * 3) as i64] = ((v >> 16) & 255) as i8;
+        }
+        let r24 : WavResult = WavCodec::decode(enc, 44 + bits24);
+        let mut worst : f64 = 0.0;
+        for (i of 0..100) {
+            let d : f64 = (r24.clip().samples[i as i64] - q.samples[i as i64]) as f64;
+            let mut ad : f64 = d;
+            if (d < 0.0) {
+                ad = 0.0 - d;
+            }
+            if (ad > worst) {
+                worst = ad;
+            }
+        }
+        c.that("24-bit round trip within 1 LSB", r24.isOk() && worst <= 1.0 / 8388608.0);
+
+        // 8 bit is unsigned with 128 at silence.
+        let mut e : i8[] = wavTShell(44 + 3, 1, 1, 8000, 8);
+        wavTTag(e, 36, "data");
+        wavTU32(e, 40, 3);
+        e[44] = 128 as i8;
+        e[45] = 255 as i8;
+        e[46] = 0 as i8;
+        let r8 : WavResult = WavCodec::decode(e, 44 + 3);
+        c.that("8-bit: a hand-built file decodes without error", r8.isOk());
+        c.near("8-bit 128 is silence", r8.clip().get(0, 0) as f64, 0.0, 0.0);
+        c.near(
+            "8-bit: byte 255 decodes to 127/128",
+            r8.clip().get(1, 0) as f64,
+            127.0 / 128.0,
+            0.0
+        );
+        c.near("8-bit 0 is -1", r8.clip().get(2, 0) as f64, -1.0, 0.0);
+
+        // 32-bit integer.
+        let w : i8[] = wavTShell(44 + 8, 1, 1, 8000, 32);
+        wavTTag(w, 36, "data");
+        wavTU32(w, 40, 8);
+        wavTU32(w, 44, 1073741824);
+        wavTU32(w, 48, -2147483648);
+        let r32 : WavResult = WavCodec::decode(w, 52);
+        c.near("32-bit: half of full scale decodes to 0.5", r32.clip().get(0, 0) as f64, 0.5, 0.0);
+        c.near("32-bit: the minimum value decodes to -1", r32.clip().get(1, 0) as f64, -1.0, 0.0);
+    }
+
+    static fn oddChunks(c : Checks) : void {
+        // fmt, then a LIST chunk of odd size 5 (+1 pad), the data chunk of odd size 3 (+1 pad), then a trailing chunk.
+        let total : i32 = 12 + 24 + (8 + 5 + 1) + (8 + 3 + 1) + (8 + 4);
+        let mut b : i8[] = wavTBuf(total);
+        wavTTag(b, 0, "RIFF");
+        wavTU32(b, 4, total - 8);
+        wavTTag(b, 8, "WAVE");
+        wavTTag(b, 12, "fmt ");
+        wavTU32(b, 16, 16);
+        wavTU16(b, 20, 1);
+        wavTU16(b, 22, 1);
+        wavTU32(b, 24, 8000);
+        wavTU32(b, 28, 8000);
+        wavTU16(b, 32, 1);
+        wavTU16(b, 34, 8);
+        wavTTag(b, 36, "LIST");
+        wavTU32(b, 40, 5);
+        // 5 bytes of junk and a pad byte
+        wavTTag(b, 50, "data");
+        wavTU32(b, 54, 3);
+        b[58] = 255 as i8;
+        b[59] = 128 as i8;
+        b[60] = 0 as i8;
+        wavTTag(b, 62, "cue ");
+        wavTU32(b, 66, 4);
+        let r : WavResult = WavCodec::decode(b, total);
+        c.that("a file with LIST and odd padding decodes: ${r.error()}", r.isOk());
+        c.sameInt("odd data chunk frame count", r.clip().frames, 3);
+        c.near("sample after the skipped chunk", r.clip().get(0, 0) as f64, 127.0 / 128.0, 0.0);
+        c.near("last sample before the pad", r.clip().get(2, 0) as f64, -1.0, 0.0);
+    }
+
+    static fn damaged(c : Checks) : void {
+        let clip : AudioClip = wavTRandomClip(8000, 2, 100, 4);
+        let f : WavFile = WavCodec::encode16(clip);
+        c.that("an intact file decodes", WavCodec::decode(f.bytes, f.size).isOk());
+
+        let cut : WavResult = WavCodec::decode(f.bytes, f.size - 10);
+        c.that("a truncated file fails", !cut.isOk());
+        c.that("the truncation message is not empty", cut.error().byteLength > 0);
+        c.that("a header cut to 20 bytes fails", !WavCodec::decode(f.bytes, 20).isOk());
+        c.that("an empty input fails", !WavCodec::decode(f.bytes, 0).isOk());
+        c.that("wav: an 11-byte input fails to decode", !WavCodec::decode(f.bytes, 11).isOk());
+
+        // The data chunk claims more than the file holds, while the RIFF size agrees with the file.
+        let lie : WavFile = WavCodec::encode16(clip);
+        wavTU32(lie.bytes, 40, 100000);
+        c.that("a lying data size fails", !WavCodec::decode(lie.bytes, lie.size).isOk());
+        wavTU32(lie.bytes, 40, -1);
+        c.that("a data size of 0xFFFFFFFF fails", !WavCodec::decode(lie.bytes, lie.size).isOk());
+
+        let lie2 : WavFile = WavCodec::encode16(clip);
+        wavTU32(lie2.bytes, 4, 1000000);
+        c.that("a lying RIFF size fails", !WavCodec::decode(lie2.bytes, lie2.size).isOk());
+
+        let lie3 : WavFile = WavCodec::encode16(clip);
+        wavTU32(lie3.bytes, 16, 1000000);
+        c.that("a lying fmt size fails", !WavCodec::decode(lie3.bytes, lie3.size).isOk());
+
+        let mut nf : WavFile = WavCodec::encode16(clip);
+        nf.bytes[8] = 88 as i8;
+        c.that("a wrong form type fails", !WavCodec::decode(nf.bytes, nf.size).isOk());
+
+        let bad : WavFile = WavCodec::encode16(clip);
+        wavTU16(bad.bytes, 34, 12);
+        c.that("12-bit samples are refused", !WavCodec::decode(bad.bytes, bad.size).isOk());
+        let zc : WavFile = WavCodec::encode16(clip);
+        wavTU16(zc.bytes, 22, 0);
+        c.that("zero channels are refused", !WavCodec::decode(zc.bytes, zc.size).isOk());
+        let al : WavFile = WavCodec::encode16(clip);
+        wavTU16(al.bytes, 32, 3);
+        c.that("a wrong block alignment is refused", !WavCodec::decode(al.bytes, al.size).isOk());
+        let fm : WavFile = WavCodec::encode16(clip);
+        wavTU16(fm.bytes, 20, 85);
+        c.that("a compressed format code is refused", !WavCodec::decode(fm.bytes, fm.size).isOk());
+        let sr : WavFile = WavCodec::encode16(clip);
+        wavTU32(sr.bytes, 24, 0);
+        c.that("sample rate 0 is refused", !WavCodec::decode(sr.bytes, sr.size).isOk());
+
+        // fmt missing: rename it to a chunk nobody knows.
+        let mut nofmt : WavFile = WavCodec::encode16(clip);
+        nofmt.bytes[12] = 120 as i8;
+        c.that("a file without fmt fails", !WavCodec::decode(nofmt.bytes, nofmt.size).isOk());
+        let mut nodata : WavFile = WavCodec::encode16(clip);
+        nodata.bytes[36] = 120 as i8;
+        c.that("a file without data fails", !WavCodec::decode(nodata.bytes, nodata.size).isOk());
+    }
+
+    static fn helpers(c : Checks) : void {
+        let st : AudioClip = new AudioClip(1000, 2, 4);
+        for (i of 0..4) {
+            st.set(i, 0, 1.0);
+            st.set(i, 1, -0.5);
+        }
+        let mono : AudioClip = st.mixdownMono();
+        c.sameInt("mono mixdown has one channel", mono.channels, 1);
+        c.near("mono mixdown averages the channels", mono.get(2, 0) as f64, 0.25, 0.0);
+
+        let ramp : AudioClip = new AudioClip(1000, 1, 5);
+        for (i of 0..5) {
+            ramp.set(i, 0, (i as f32) / 4.0);
+        }
+        let up : AudioClip = ramp.resampled(2000);
+        c.sameInt("resampling to double the rate doubles the length", up.frames, 10);
+        c.near("resample keeps frame 0", up.get(0, 0) as f64, 0.0, 0.0);
+        c.near(
+            "wav: resampling interpolates linearly between neighbouring samples",
+            up.get(1, 0) as f64,
+            0.125,
+            0.000001
+        );
+        c.near("resample of a ramp stays on the ramp", up.get(5, 0) as f64, 0.625, 0.000001);
+        c.sameInt("resample keeps the new rate", up.rate, 2000);
+        c.sameInt("resampling to half the rate halves the length", ramp.resampled(500).frames, 3);
+
+        c.near("wav: gained(2.0) doubles a sample", ramp.gained(2.0).get(4, 0) as f64, 2.0, 0.0);
+        c.near("normalise sets the peak", ramp.normalised(0.5).peak() as f64, 0.5, 0.000001);
+        c.near(
+            "normalising silence leaves it silent",
+            new AudioClip(8000, 1, 10).normalised(1.0).peak() as f64,
+            0.0,
+            0.0
+        );
+
+        let part : AudioClip = ramp.slice(1, 3);
+        c.sameInt("wav: a slice of three frames has length 3", part.frames, 3);
+        c.near(
+            "wav: the first sample of a slice is the source sample at the slice start",
+            part.get(0, 0) as f64,
+            0.25,
+            0.0
+        );
+        c.sameInt("slice is clipped to the clip", ramp.slice(3, 100).frames, 2);
+        c.sameInt("slice past the end is empty", ramp.slice(9, 3).frames, 0);
+        c.near("the source is untouched by the helpers", ramp.get(4, 0) as f64, 1.0, 0.0);
+    }
+
+    /** Runs every wav check. */
+    pub static fn run(c : Checks) : void {
+        WavSuite::headers(c);
+        WavSuite::roundTrips(c);
+        WavSuite::otherDepths(c);
+        WavSuite::oddChunks(c);
+        WavSuite::damaged(c);
+        WavSuite::helpers(c);
+    }
+}

@@ -1,0 +1,393 @@
+// model_anim — skins and animation clips as plain data, for the animation system of the sim layer to consume.
+//
+// An importer fills these; nothing here drives a skeleton. A `ModelChannel` is one animated property of one
+// node: key times and key values, plus how to blend between keys. It can answer "what is the value at time t"
+// so a player does not have to repeat the interpolation rules of glTF: linear (spherical for rotations), step
+// (hold the earlier key), and cubic spline (Hermite with the in- and out-tangents stored beside each key). A
+// time before the first key gives the first value, after the last the last. A `ModelClip` is a named set of
+// channels; a `ModelSkin` lists the joint nodes and the matrices that bring a vertex from model space to each
+// joint's space in the bind pose.
+
+use crate::core::collections::vec::Vec;
+use crate::core::math::mat4::Mat4;
+use crate::core::math::quat::Quat;
+use crate::core::math::vec3::Vec3;
+use crate::data::slots::DataSlots;
+use crate::data::text::DataText;
+
+// Within one CubicSpline key the values are stored as in-tangent, value, out-tangent.
+const MODEL_BLOCK_IN : i32 = 0;
+const MODEL_BLOCK_VALUE : i32 = 1;
+const MODEL_BLOCK_OUT : i32 = 2;
+const MODEL_CUBIC_BLOCKS : i32 = 3;
+
+// Numbers in one value of a channel: a rotation is a quaternion, translation and scale are vectors.
+const MODEL_QUAT_WIDTH : i32 = 4;
+const MODEL_VEC3_WIDTH : i32 = 3;
+
+// Numbers in a Mat4, the stride of one inverse bind matrix.
+const MODEL_MAT4_COMPONENTS : i32 = 16;
+
+/** Which property of a node a channel animates. */
+pub enum ModelPath : i8 {
+    Translation = 0,
+    Rotation = 1,
+    Scale = 2,
+
+    /** The path with code `n`; unknown codes answer Translation. */
+    pub static fn fromCode(n : i32) : ModelPath {
+        return match n {
+            1 => ModelPath::Rotation,
+            2 => ModelPath::Scale,
+            _ => ModelPath::Translation,
+        };
+    }
+
+    /** How many numbers one value has: 3 for translation and scale, 4 for a rotation. */
+    pub fn width(self) : i32 {
+        return match self {
+            ModelPath::Rotation => MODEL_QUAT_WIDTH,
+            _ => MODEL_VEC3_WIDTH,
+        };
+    }
+}
+
+/** How a channel blends between two keys. */
+pub enum ModelInterp : i8 {
+    Linear = 0,
+    Step = 1,
+    CubicSpline = 2,
+
+    /** The interpolation with code `n`; unknown codes answer Linear. */
+    pub static fn fromCode(n : i32) : ModelInterp {
+        return match n {
+            1 => ModelInterp::Step,
+            2 => ModelInterp::CubicSpline,
+            _ => ModelInterp::Linear,
+        };
+    }
+}
+
+/** The keys of one animated property of one node. */
+pub class ModelChannel {
+    /** The index of the animated node in the model's node list. */
+    pub node : i32;
+
+    /** The property. */
+    pub path : ModelPath;
+
+    /** The blending rule. */
+    pub interp : ModelInterp;
+
+    /** Key times in seconds, not decreasing. */
+    pub times : Vec<f32>;
+
+    /** Key values, `path.width()` numbers per key (xyzw for rotations); for CubicSpline three per key: in-tangent, value, out-tangent. */
+    pub values : Vec<f32>;
+
+    /** An empty channel on `node`. */
+    constructor(node : i32, path : ModelPath, interp : ModelInterp) {
+        self.node = node;
+        self.path = path;
+        self.interp = interp;
+        self.times = new Vec<f32>();
+        self.values = new Vec<f32>();
+    }
+
+    /** How many keys. */
+    pub fn keyCount(self) : i32 {
+        return self.times.len();
+    }
+
+    /** The time of the last key (0 with no keys). */
+    pub fn duration(self) : f32 {
+        if (self.times.isEmpty()) {
+            return 0.0;
+        }
+        return self.times.last();
+    }
+
+    // The stride of one key in `values`.
+    fn stride(self) : i32 {
+        if (self.interp == ModelInterp::CubicSpline) {
+            return self.path.width() * MODEL_CUBIC_BLOCKS;
+        }
+        return self.path.width();
+    }
+
+    // Component `c` of the value (or tangent block `block`: 0 in, 1 value, 2 out) of key `k`.
+    fn at(self, k : i32, block : i32, c : i32) : f32 {
+        let w : i32 = self.path.width();
+        let mut base : i32 = k * self.stride() + c;
+        if (self.interp == ModelInterp::CubicSpline) {
+            base = base + block * w;
+        }
+        return self.values.get(base);
+    }
+
+    // Value block of key `k` as a vector.
+    fn vec3Key(self, k : i32, block : i32) : Vec3 {
+        return Vec3 {
+            x: self.at(k, block, 0),
+            y: self.at(k, block, 1),
+            z: self.at(k, block, 2),
+        };
+    }
+
+    // Value block of key `k` as a normalised rotation.
+    fn quatKey(self, k : i32, block : i32) : Quat {
+        return Quat {
+            x: self.at(k, block, 0),
+            y: self.at(k, block, 1),
+            z: self.at(k, block, 2),
+            w: self.at(k, block, 3),
+        }.normalized();
+    }
+
+    /** True when `times` and `values` agree in length (and the times do not go backwards). */
+    pub fn isConsistent(self) : bool {
+        if (self.values.len() != self.times.len() * self.stride()) {
+            return false;
+        }
+        for (k of 1..self.times.len()) {
+            if (self.times.get(k) < self.times.get(k - 1)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // The key at the start of the segment containing `t`, or -1 when `t` is outside the keys (the caller then
+    // takes an end key).
+    fn segment(self, t : f32) : i32 {
+        let n : i32 = self.times.len();
+        if (n < 2 || t <= self.times.get(0) || t >= self.times.get(n - 1)) {
+            return -1;
+        }
+        let mut lo : i32 = 0;
+        let mut hi : i32 = n - 1;
+        while (hi - lo > 1) {
+            let mid : i32 = (lo + hi) / 2;
+            if (self.times.get(mid) <= t) {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        return lo;
+    }
+
+    // The key that applies when `t` is outside the range: the last for a later time, else the first.
+    fn endKey(self, t : f32) : i32 {
+        let n : i32 = self.times.len();
+        if (n > 1 && t >= self.times.get(n - 1)) {
+            return n - 1;
+        }
+        return 0;
+    }
+
+    // The blend factor of `t` within segment `k`.
+    fn factor(self, k : i32, t : f32) : f32 {
+        let span : f32 = self.times.get(k + 1) - self.times.get(k);
+        if (span <= 0.0) {
+            return 0.0;
+        }
+        return (t - self.times.get(k)) / span;
+    }
+
+    // Cubic Hermite blend of component `c` between keys `k` and `k + 1`, glTF's formula.
+    fn hermite(self, k : i32, c : i32, s : f32) : f32 {
+        let dt : f32 = self.times.get(k + 1) - self.times.get(k);
+        let s2 : f32 = s * s;
+        let s3 : f32 = s2 * s;
+        let v0 : f32 = self.at(k, MODEL_BLOCK_VALUE, c);
+        let b0 : f32 = self.at(k, MODEL_BLOCK_OUT, c);
+        let a1 : f32 = self.at(k + 1, MODEL_BLOCK_IN, c);
+        let v1 : f32 = self.at(k + 1, MODEL_BLOCK_VALUE, c);
+        return ((2.0 as f32) * s3 - (3.0 as f32) * s2 + (1.0 as f32)) * v0
+            + (s3 - (2.0 as f32) * s2 + s) * dt * b0
+            + ((3.0 as f32) * s2 - (2.0 as f32) * s3) * v1
+            + (s3 - s2) * dt * a1;
+    }
+
+    /** The value of a translation or scale channel at time `t`; the zero vector with no keys (use `sampleScale` for scale to get ones). */
+    pub fn sampleVec3(self, t : f32) : Vec3 {
+        if (self.times.isEmpty()) {
+            return Vec3::zero();
+        }
+
+        let k : i32 = self.segment(t);
+        if (k < 0) {
+            return self.vec3Key(self.endKey(t), MODEL_BLOCK_VALUE);
+        }
+        if (self.interp == ModelInterp::Step) {
+            return self.vec3Key(k, MODEL_BLOCK_VALUE);
+        }
+
+        let s : f32 = self.factor(k, t);
+        if (self.interp == ModelInterp::CubicSpline) {
+            return Vec3 {
+                x: self.hermite(k, 0, s),
+                y: self.hermite(k, 1, s),
+                z: self.hermite(k, 2, s),
+            };
+        }
+        let a : Vec3 = self.vec3Key(k, MODEL_BLOCK_VALUE);
+        let b : Vec3 = self.vec3Key(k + 1, MODEL_BLOCK_VALUE);
+        return a.lerp(b, s);
+    }
+
+    /** The value of a scale channel at time `t`; ones with no keys. */
+    pub fn sampleScale(self, t : f32) : Vec3 {
+        if (self.times.isEmpty()) {
+            return Vec3::splat(1.0);
+        }
+        return self.sampleVec3(t);
+    }
+
+    /** The value of a rotation channel at time `t`, normalised; the identity with no keys. */
+    pub fn sampleQuat(self, t : f32) : Quat {
+        if (self.times.isEmpty()) {
+            return Quat::identity();
+        }
+
+        let k : i32 = self.segment(t);
+        if (k < 0) {
+            return self.quatKey(self.endKey(t), MODEL_BLOCK_VALUE);
+        }
+        if (self.interp == ModelInterp::Step) {
+            return self.quatKey(k, MODEL_BLOCK_VALUE);
+        }
+
+        let s : f32 = self.factor(k, t);
+        if (self.interp == ModelInterp::CubicSpline) {
+            return Quat {
+                x: self.hermite(k, 0, s),
+                y: self.hermite(k, 1, s),
+                z: self.hermite(k, 2, s),
+                w: self.hermite(k, 3, s),
+            }.normalized();
+        }
+        let a : Quat = self.quatKey(k, MODEL_BLOCK_VALUE);
+        let b : Quat = self.quatKey(k + 1, MODEL_BLOCK_VALUE);
+        return a.slerp(b, s);
+    }
+}
+
+/** A named animation: a set of channels that play together. */
+pub class ModelClip {
+    /** The clip's name ("" when the file gave none). */
+    pub name : string;
+    channels : DataSlots<ModelChannel>;
+
+    /** An empty clip. */
+    constructor(name : string) {
+        self.name = DataText::copy(name);
+        self.channels = new DataSlots<ModelChannel>();
+    }
+
+    /** Adds a channel (the clip takes it over). */
+    pub fn addChannel(mut self, own ch : ModelChannel) : void {
+        self.channels.push(ch);
+    }
+
+    /** How many channels. */
+    pub fn channelCount(self) : i32 {
+        return self.channels.len();
+    }
+
+    /** Channel `i`. */
+    pub fn channel(self, i : i32) : ModelChannel {
+        return self.channels.get(i);
+    }
+
+    /** The time of the last key of any channel: how long the clip runs. */
+    pub fn duration(self) : f32 {
+        let mut d : f32 = 0.0;
+        for (i of 0..self.channels.len()) {
+            let e : f32 = self.channels.get(i).duration();
+            if (e > d) {
+                d = e;
+            }
+        }
+        return d;
+    }
+}
+
+/** The joints of a skinned mesh and the matrices of the bind pose. */
+pub class ModelSkin {
+    /** The skin's name. */
+    pub name : string;
+
+    /** The model node index of each joint, in the order vertices refer to them. */
+    pub joints : Vec<i32>;
+
+    /** The inverse bind matrices, 16 numbers per joint in column-major order (as the file stores them). */
+    pub inverseBind : Vec<f32>;
+
+    /** The node that is the root of the skeleton, or -1. */
+    pub skeleton : i32 = -1;
+
+    /** An empty skin. */
+    constructor(name : string) {
+        self.name = DataText::copy(name);
+        self.joints = new Vec<i32>();
+        self.inverseBind = new Vec<f32>();
+    }
+
+    /** How many joints. */
+    pub fn jointCount(self) : i32 {
+        return self.joints.len();
+    }
+
+    /** Appends one inverse bind matrix (the next joint's), in the column-major order the file stores. */
+    pub fn addInverseBind(mut self, m : Mat4) : void {
+        self.inverseBind.push(m.m00);
+        self.inverseBind.push(m.m10);
+        self.inverseBind.push(m.m20);
+        self.inverseBind.push(m.m30);
+        self.inverseBind.push(m.m01);
+        self.inverseBind.push(m.m11);
+        self.inverseBind.push(m.m21);
+        self.inverseBind.push(m.m31);
+        self.inverseBind.push(m.m02);
+        self.inverseBind.push(m.m12);
+        self.inverseBind.push(m.m22);
+        self.inverseBind.push(m.m32);
+        self.inverseBind.push(m.m03);
+        self.inverseBind.push(m.m13);
+        self.inverseBind.push(m.m23);
+        self.inverseBind.push(m.m33);
+    }
+
+    /** The `Mat4` whose 16 column-major numbers start at `offset` of `numbers`; aborts when they run past the end. */
+    pub(crate) static fn matrixAt(numbers : Vec<f32>, offset : i32) : Mat4 {
+        let o : i32 = offset;
+        return Mat4 {
+            m00: numbers.get(o),
+            m10: numbers.get(o + 1),
+            m20: numbers.get(o + 2),
+            m30: numbers.get(o + 3),
+            m01: numbers.get(o + 4),
+            m11: numbers.get(o + 5),
+            m21: numbers.get(o + 6),
+            m31: numbers.get(o + 7),
+            m02: numbers.get(o + 8),
+            m12: numbers.get(o + 9),
+            m22: numbers.get(o + 10),
+            m32: numbers.get(o + 11),
+            m03: numbers.get(o + 12),
+            m13: numbers.get(o + 13),
+            m23: numbers.get(o + 14),
+            m33: numbers.get(o + 15),
+        };
+    }
+
+    /** The inverse bind matrix of joint `i` as a `Mat4` (the identity when the skin has none for it). */
+    pub fn inverseBindMatrix(self, i : i32) : Mat4 {
+        if (i < 0 || (i + 1) * MODEL_MAT4_COMPONENTS > self.inverseBind.len()) {
+            return Mat4::identity();
+        }
+        return ModelSkin::matrixAt(self.inverseBind, i * MODEL_MAT4_COMPONENTS);
+    }
+}

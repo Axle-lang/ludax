@@ -1,0 +1,474 @@
+// gltf_import — glTF 2.0 (`.gltf` and `.glb`) to a `ModelAsset`.
+//
+// What is read: meshes with triangle, strip and fan primitives (positions, normals, first texture
+// coordinates, tangents, joints and weights; normals are computed when the file has none), materials
+// (base colour factor and texture, metallic, roughness, emissive), PNG pictures, the node tree with
+// translation/rotation/scale or a matrix, skins and animations (see `gltf_scene`). What is not: sparse
+// accessors, morph targets, cameras and lights, JPEG pictures (the texture slot is kept, empty, with a
+// warning), and extensions. Everything is bounds-checked; a malformed file gives a model with `ok()` false.
+//
+// Buffers and pictures named by a relative URI are read through the `Vfs` from the directory of the model,
+// so the same call works on a disk, in an archive and in memory. `ModelAsset::externalFiles` lists them.
+
+use crate::core::math::vec2::Vec2;
+use crate::core::math::vec3::Vec3;
+use crate::core::math::vec4::Vec4;
+use crate::data::bytes::ByteBuf;
+use crate::data::image::image::Image;
+use crate::data::image::png::PngCodec;
+use crate::data::json::json_doc::{JsonDoc, JsonValue};
+use crate::data::model::base64::Base64;
+use crate::data::model::gltf_file::{GltfAccessor, GltfFile};
+use crate::data::model::gltf_scene::GltfScene;
+use crate::data::model::mesh::Mesh;
+use crate::data::model::model_asset::{ModelAsset, ModelMaterial, ModelMesh};
+use crate::data::text::DataText;
+use crate::data::vfs::vfs::Vfs;
+use crate::data::vfs::vfs_path::VfsPath;
+
+// Primitive modes we can turn into triangles; points and lines are skipped with a warning.
+const GLTF_MODE_TRIANGLES : i32 = 4;
+const GLTF_MODE_STRIP : i32 = 5;
+const GLTF_MODE_FAN : i32 = 6;
+
+// The ASCII code of '2': the major version every glTF 2 file starts with.
+const GLTF_VERSION_2 : i32 = 50;
+
+// Components per element of the attributes of a primitive: positions and normals are VEC3, texture coordinates
+// VEC2, tangents and the four joints and weights VEC4; indices are scalars.
+const GLTF_POSITION_COMPS : i32 = 3;
+const GLTF_NORMAL_COMPS : i32 = 3;
+const GLTF_UV_COMPS : i32 = 2;
+const GLTF_TANGENT_COMPS : i32 = 4;
+const GLTF_SKIN_COMPS : i32 = 4;
+const GLTF_INDEX_COMPS : i32 = 1;
+
+// Indices per triangle.
+const GLTF_TRIANGLE_INDICES : i32 = 3;
+
+// A colour factor is RGBA, four numbers.
+const GLTF_COLOR_COMPS : i32 = 4;
+const GLTF_VEC3_COMPS : i32 = 3;
+
+/** The vertex order a primitive draws in: one index per corner, whether it came from the file or was counted. */
+struct GltfIndices {
+    order : i32[];
+    total : i32;
+}
+
+/** Reads glTF models. */
+pub class GltfImporter {
+    /** Imports the `.gltf` or `.glb` file at `path` of `vfs`; buffers and pictures are looked up beside it. */
+    pub static fn load(vfs : Vfs, path : string) : ModelAsset {
+        try {
+            let bytes : ByteBuf = vfs.read(path);
+            return GltfImporter::fromBytes(bytes, vfs, VfsPath::parent(VfsPath::normalize(path)));
+        } catch e : IOException {
+            let failed : ModelAsset = new ModelAsset();
+            failed.fail(e.message);
+            return failed;
+        }
+    }
+
+    /** Imports a model from the bytes of a `.gltf` or `.glb`; relative URIs are resolved in `baseDir` of `vfs`. */
+    pub static fn fromBytes(bytes : ByteBuf, vfs : Vfs, baseDir : string) : ModelAsset {
+        let model : ModelAsset = new ModelAsset();
+        let gf : GltfFile = GltfFile::open(bytes);
+        if (gf.ok()) {
+            GltfImporter::convert(gf, model, vfs, baseDir);
+        }
+        if (!gf.ok()) {
+            model.fail(gf.error());
+        }
+        return model;
+    }
+
+    // Runs the stages in order; each stops at the first failure, recorded in `gf`.
+    static fn convert(gf : GltfFile, model : ModelAsset, vfs : Vfs, baseDir : string) : void {
+        let asset : JsonValue = gf.json().field(gf.root(), "asset");
+        let version : string = gf.stringOr(asset, "version", "");
+        if (version.byteLength < 1 || version.byteAt(0) != GLTF_VERSION_2) {
+            gf.fail("not a glTF 2 file (asset.version is \"${version}\")");
+            return;
+        }
+        model.name = DataText::copy(gf.stringOr(asset, "generator", ""));
+        if (!gf.loadBuffers(vfs, baseDir, model)) {
+            return;
+        }
+        if (!GltfImporter::images(gf, model, vfs, baseDir)) {
+            return;
+        }
+        if (!GltfImporter::materials(gf, model)) {
+            return;
+        }
+        if (!GltfImporter::meshes(gf, model)) {
+            return;
+        }
+        if (!GltfScene::nodes(gf, model)) {
+            return;
+        }
+        if (!GltfScene::skins(gf, model)) {
+            return;
+        }
+        if (!GltfScene::scenes(gf, model)) {
+            return;
+        }
+        GltfScene::animations(gf, model);
+    }
+
+    // ---- pictures ----
+
+    static fn images(gf : GltfFile, model : ModelAsset, vfs : Vfs, baseDir : string) : bool {
+        let n : i32 = gf.count("images");
+        for (i of 0..n) {
+            let ji : JsonValue = gf.item("images", i);
+            let uri : string = gf.stringOr(ji, "uri", "");
+            let data : ByteBuf = new ByteBuf(16);
+            let mut have : bool = false;
+            let payload : i32 = Base64::dataUriStart(uri);
+            if (uri.byteLength > 0) {
+                if (payload >= 0) {
+                    have = Base64::decodeFrom(uri, payload, data);
+                } else if (!VfsPath::escapes(baseDir + "/" + uri)) {
+                    let path : string = VfsPath::join(baseDir, uri);
+                    try {
+                        let read : ByteBuf = vfs.read(path);
+                        data.pushRange(read, 0, read.len());
+                        model.noteFile(path);
+                        have = true;
+                    } catch e : IOException {
+                        have = false;
+                    }
+                }
+            } else if (gf.json().has(ji, "bufferView")) {
+                let view : ByteBuf = gf.viewBytes(gf.intOr(ji, "bufferView", -1));
+                if (!gf.ok()) {
+                    return false;
+                }
+                data.pushRange(view, 0, view.len());
+                have = true;
+            }
+            let codec : PngCodec = new PngCodec();
+            let mut img : Image = new Image(0, 0);
+            if (have) {
+                img = codec.decode(data);
+            }
+            if (img.isEmpty()) {
+                model.warn("image ${i} could not be decoded (only PNG is supported)");
+            }
+            model.addTexture(img);
+        }
+        return true;
+    }
+
+    // ---- materials ----
+
+    static fn materials(gf : GltfFile, model : ModelAsset) : bool {
+        let doc : JsonDoc = gf.json();
+        let n : i32 = gf.count("materials");
+        for (i of 0..n) {
+            let jm : JsonValue = gf.item("materials", i);
+            let mut mat : ModelMaterial = new ModelMaterial(gf.stringOr(jm, "name", ""));
+            let pbr : JsonValue = doc.field(jm, "pbrMetallicRoughness");
+
+            let white : Vec4 = Vec4 { x: 1.0, y: 1.0, z: 1.0, w: 1.0 };
+            mat.baseColor = GltfImporter::vec4Field(doc, pbr, "baseColorFactor", white);
+            mat.metallic = gf.numberOr(pbr, "metallicFactor", 1.0) as f32;
+            mat.roughness = gf.numberOr(pbr, "roughnessFactor", 1.0) as f32;
+            mat.emissive = GltfImporter::vec3Field(doc, jm, "emissiveFactor", Vec3::zero());
+
+            let tex : JsonValue = doc.field(pbr, "baseColorTexture");
+            if (!tex.isNone()) {
+                let ti : i32 = gf.intOr(tex, "index", -1);
+                if (ti < 0 || ti >= gf.count("textures")) {
+                    gf.fail("material ${i} names a texture that does not exist");
+                    return false;
+                }
+                let source : i32 = gf.intOr(gf.item("textures", ti), "source", -1);
+                if (source < 0 || source >= model.textureCount()) {
+                    gf.fail("texture ${ti} names a picture that does not exist");
+                    return false;
+                }
+                mat.baseColorTexture = source;
+            }
+            model.addMaterial(mat);
+        }
+        return true;
+    }
+
+    // The four numbers of array field `key`, or `fallback` when it is absent or the wrong size.
+    static fn vec4Field(doc : JsonDoc, v : JsonValue, key : string, fallback : Vec4) : Vec4 {
+        let a : JsonValue = doc.field(v, key);
+        if (doc.childCount(a) != GLTF_COLOR_COMPS) {
+            return fallback;
+        }
+        let x : JsonValue = doc.firstChild(a);
+        let y : JsonValue = doc.nextSibling(x);
+        let z : JsonValue = doc.nextSibling(y);
+        let w : JsonValue = doc.nextSibling(z);
+        return Vec4 {
+            x: doc.numberOr(x, fallback.x as f64) as f32,
+            y: doc.numberOr(y, fallback.y as f64) as f32,
+            z: doc.numberOr(z, fallback.z as f64) as f32,
+            w: doc.numberOr(w, fallback.w as f64) as f32,
+        };
+    }
+
+    // The three numbers of array field `key`, or `fallback` when it is absent or the wrong size.
+    static fn vec3Field(doc : JsonDoc, v : JsonValue, key : string, fallback : Vec3) : Vec3 {
+        let a : JsonValue = doc.field(v, key);
+        if (doc.childCount(a) != GLTF_VEC3_COMPS) {
+            return fallback;
+        }
+        let x : JsonValue = doc.firstChild(a);
+        let y : JsonValue = doc.nextSibling(x);
+        let z : JsonValue = doc.nextSibling(y);
+        return Vec3 {
+            x: doc.numberOr(x, fallback.x as f64) as f32,
+            y: doc.numberOr(y, fallback.y as f64) as f32,
+            z: doc.numberOr(z, fallback.z as f64) as f32,
+        };
+    }
+
+    // ---- meshes ----
+
+    static fn meshes(gf : GltfFile, model : ModelAsset) : bool {
+        let n : i32 = gf.count("meshes");
+        for (i of 0..n) {
+            let jm : JsonValue = gf.item("meshes", i);
+            let mesh : ModelMesh = new ModelMesh(gf.stringOr(jm, "name", ""));
+            let mut prim : JsonValue = gf.json().firstChild(gf.json().field(jm, "primitives"));
+            let mut pi : i32 = 0;
+            while (!prim.isNone()) {
+                let part : Mesh = GltfImporter::primitive(gf, model, prim, i, pi);
+                if (!gf.ok()) {
+                    return false;
+                }
+                if (part.vertexCount() > 0) {
+                    let material : i32 = gf.intOr(prim, "material", -1);
+                    if (material >= model.materialCount() || material < -1) {
+                        gf.fail("mesh ${i} names a material that does not exist");
+                        return false;
+                    }
+                    mesh.addPrimitive(part, material);
+                }
+                prim = gf.json().nextSibling(prim);
+                pi = pi + 1;
+            }
+            model.addMesh(mesh);
+        }
+        return true;
+    }
+
+    // One primitive as a `Mesh`; an empty mesh (with a warning) for a mode that is not triangles.
+    static fn primitive(
+        gf : GltfFile,
+        model : ModelAsset,
+        prim : JsonValue,
+        meshIndex : i32,
+        primIndex : i32
+    ) : Mesh {
+        let out : Mesh = new Mesh();
+        let tag : string = "mesh ${meshIndex} primitive ${primIndex}";
+        let mode : i32 = gf.intOr(prim, "mode", GLTF_MODE_TRIANGLES);
+        if (mode < GLTF_MODE_TRIANGLES || mode > GLTF_MODE_FAN) {
+            model.warn("${tag}: a point or line primitive was skipped");
+            return out;
+        }
+
+        let attrs : JsonValue = gf.json().field(prim, "attributes");
+        let n : i32 = GltfImporter::readVertices(gf, attrs, out, tag);
+        if (!gf.ok()) {
+            return out;
+        }
+        let indices : GltfIndices = GltfImporter::readIndices(gf, prim, n, tag);
+        if (!gf.ok()) {
+            return out;
+        }
+        if (!GltfImporter::addTriangles(gf, out, indices, mode, tag)) {
+            return out;
+        }
+
+        if (!out.hasNormals()) {
+            out.computeNormals();
+        }
+        let problem : string = out.check();
+        if (problem.byteLength > 0) {
+            gf.fail("${tag}: ${problem}");
+        }
+        return out;
+    }
+
+    // Reads the vertex channels of a primitive into `out`: positions first (they fix the vertex count, which is
+    // returned), then whichever of normals, texture coordinates, tangents and skin the file has. A failure is
+    // recorded in `gf`.
+    static fn readVertices(gf : GltfFile, attrs : JsonValue, out : Mesh, tag : string) : i32 {
+        if (!gf.json().has(attrs, "POSITION")) {
+            gf.fail("${tag} has no POSITION attribute");
+            return 0;
+        }
+        let pos : GltfAccessor = gf.readAccessor(gf.intOr(attrs, "POSITION", -1));
+        if (!gf.ok()) {
+            return 0;
+        }
+        if (pos.componentCount() != GLTF_POSITION_COMPS) {
+            gf.fail("${tag}: POSITION must be a VEC3");
+            return 0;
+        }
+        let n : i32 = pos.count();
+        for (v of 0..n) {
+            out.addPosition(pos.vec3(v));
+        }
+
+        if (gf.json().has(attrs, "NORMAL")) {
+            let nrm : GltfAccessor = GltfImporter::attribute(gf, attrs, "NORMAL", GLTF_NORMAL_COMPS, n, tag);
+            if (!gf.ok()) {
+                return n;
+            }
+            for (v of 0..n) {
+                out.addNormal(nrm.vec3(v));
+            }
+        }
+        if (gf.json().has(attrs, "TEXCOORD_0")) {
+            let uv : GltfAccessor = GltfImporter::attribute(gf, attrs, "TEXCOORD_0", GLTF_UV_COMPS, n, tag);
+            if (!gf.ok()) {
+                return n;
+            }
+            for (v of 0..n) {
+                out.addUv(uv.vec2(v));
+            }
+        }
+        if (gf.json().has(attrs, "TANGENT")) {
+            let tan : GltfAccessor = GltfImporter::attribute(
+                gf,
+                attrs,
+                "TANGENT",
+                GLTF_TANGENT_COMPS,
+                n,
+                tag
+            );
+            if (!gf.ok()) {
+                return n;
+            }
+            for (v of 0..n) {
+                out.addTangent(tan.vec4(v));
+            }
+        }
+        if (gf.json().has(attrs, "JOINTS_0") && gf.json().has(attrs, "WEIGHTS_0")) {
+            GltfImporter::readSkin(gf, attrs, out, n, tag);
+        }
+        return n;
+    }
+
+    // The accessor of attribute `key`, which must have `componentCount` components and one element per vertex (`n`).
+    static fn attribute(
+        gf : GltfFile,
+        attrs : JsonValue,
+        key : string,
+        componentCount : i32,
+        n : i32,
+        tag : string
+    ) : GltfAccessor {
+        let acc : GltfAccessor = gf.readAccessor(gf.intOr(attrs, key, -1));
+        if (gf.ok() && (acc.componentCount() != componentCount || acc.count() != n)) {
+            gf.fail("${tag}: ${key} does not match POSITION");
+        }
+        return acc;
+    }
+
+    // The four joints and weights of every vertex.
+    static fn readSkin(gf : GltfFile, attrs : JsonValue, out : Mesh, n : i32, tag : string) : void {
+        let joints : GltfAccessor = gf.readAccessor(gf.intOr(attrs, "JOINTS_0", -1));
+        if (!gf.ok()) {
+            return;
+        }
+        let weights : GltfAccessor = gf.readAccessor(gf.intOr(attrs, "WEIGHTS_0", -1));
+        if (!gf.ok()) {
+            return;
+        }
+        let jointsFit : bool = joints.componentCount() == GLTF_SKIN_COMPS && joints.count() == n;
+        let weightsFit : bool = weights.componentCount() == GLTF_SKIN_COMPS && weights.count() == n;
+        if (!jointsFit || !weightsFit) {
+            gf.fail("${tag}: JOINTS_0 or WEIGHTS_0 does not match POSITION");
+            return;
+        }
+
+        for (v of 0..n) {
+            let w : Vec4 = weights.vec4(v);
+            out.addSkin(joints.intAt(v, 0), joints.intAt(v, 1), joints.intAt(v, 2), joints.intAt(v, 3), w);
+        }
+    }
+
+    // The index list of a primitive: the accessor's, or 0, 1, 2, ... when the primitive is not indexed. Every
+    // index must name one of the `n` vertices.
+    static fn readIndices(gf : GltfFile, prim : JsonValue, n : i32, tag : string) : GltfIndices {
+        if (!gf.json().has(prim, "indices")) {
+            let mut order : i32[] = new i32[(n + 1) as i64];
+            for (k of 0..n) {
+                order[k] = k;
+            }
+            return GltfIndices { order: order, total: n };
+        }
+
+        let nothing : i32[] = new i32[1];
+        let none : GltfIndices = GltfIndices { order: nothing, total: 0 };
+        let ix : GltfAccessor = gf.readAccessor(gf.intOr(prim, "indices", -1));
+        if (!gf.ok()) {
+            return none;
+        }
+        if (ix.componentCount() != GLTF_INDEX_COMPS) {
+            gf.fail("${tag}: indices must be scalars");
+            return none;
+        }
+
+        let total : i32 = ix.count();
+        let mut order : i32[] = new i32[(total + 1) as i64];
+        for (k of 0..total) {
+            let at : i32 = ix.intAt(k, 0);
+            if (at < 0 || at >= n) {
+                gf.fail("${tag}: an index points past the last vertex");
+                return none;
+            }
+            order[k] = at;
+        }
+        return GltfIndices { order: order, total: total };
+    }
+
+    // Turns the index list into triangles: every three indices, or the triangles of a strip or a fan. False
+    // (recorded in `gf`) when a triangle list is not a whole number of triangles.
+    static fn addTriangles(
+        gf : GltfFile,
+        out : Mesh,
+        indices : GltfIndices,
+        mode : i32,
+        tag : string
+    ) : bool {
+        let order : i32[] = indices.order;
+        let total : i32 = indices.total;
+        if (mode == GLTF_MODE_TRIANGLES) {
+            if (total % GLTF_TRIANGLE_INDICES != 0) {
+                gf.fail("${tag}: the index count is not a multiple of three");
+                return false;
+            }
+            let mut t : i32 = 0;
+            while (t < total) {
+                out.addTriangle(order[t], order[t + 1], order[t + 2]);
+                t = t + GLTF_TRIANGLE_INDICES;
+            }
+        } else if (mode == GLTF_MODE_STRIP) {
+            // Every second triangle of a strip is flipped so that all of them keep the same winding.
+            for (t of 0..(total - 2)) {
+                if (t % 2 == 0) {
+                    out.addTriangle(order[t], order[t + 1], order[t + 2]);
+                } else {
+                    out.addTriangle(order[t + 1], order[t], order[t + 2]);
+                }
+            }
+        } else {
+            for (t of 1..(total - 1)) {
+                out.addTriangle(order[0], order[t], order[t + 1]);
+            }
+        }
+        return true;
+    }
+}

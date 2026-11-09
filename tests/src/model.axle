@@ -1,0 +1,335 @@
+// model — checks for meshes, base64 and float bits.
+//
+// The float coding is verified against bit patterns written out by hand (taken from an IEEE 754 reference), and
+// base64 against known vectors. The glTF importer builds on both and is checked in `model_gltf`. Meshes are
+// checked for the geometry they promise: volume, outward normals and winding.
+
+use ludax::Aabb;
+use ludax::Base64;
+use ludax::ByteBuf;
+use ludax::Checks;
+use ludax::DataText;
+use ludax::Ieee;
+use ludax::Mesh;
+use ludax::MeshShapes;
+use ludax::Vec3;
+use ludax::Vec4;
+
+use crate::model_support::{MDL_TOL_COARSE};
+
+/** The model checks. */
+pub class ModelSuite {
+    /** Runs every check of the suite. */
+    pub static fn run(c : Checks) : void {
+        mdlIeeeChecks(c);
+        mdlBase64Checks(c);
+        mdlMeshChecks(c);
+        mdlShapeChecks(c);
+    }
+}
+
+// ---- float bits ----
+
+fn mdlIeeeChecks(c : Checks) : void {
+    c.sameInt("ieee: bitsOf 1.0 is 0x3F800000", Ieee::bitsOf(1.0), 1065353216);
+    c.sameInt("ieee: bitsOf -2.0 is 0xC0000000", Ieee::bitsOf(-2.0), -1073741824);
+    c.sameInt("ieee: bitsOf 0.1 is its single-precision pattern", Ieee::bitsOf(0.1), 1036831949);
+    c.sameInt(
+        "ieee: bitsOf 123.456 is its single-precision pattern",
+        Ieee::bitsOf(123.456),
+        1123477881
+    );
+    c.sameInt(
+        "ieee: bitsOf the largest float is 0x7F7FFFFF",
+        Ieee::bitsOf(3.4028234663852886e38),
+        2139095039
+    );
+    c.sameInt("ieee: bitsOf the smallest denormal is 1", Ieee::bitsOf(1.0e-45), 1);
+    c.sameInt("ieee: bitsOf zero is 0", Ieee::bitsOf(0.0), 0);
+    c.near("ieee: toF32 of 0x3F800000 is 1.0", Ieee::toF32(1065353216) as f64, 1.0, 0.0);
+    c.near("ieee: toF32 of 0xC0000000 is -2.0", Ieee::toF32(-1073741824) as f64, -2.0, 0.0);
+    c.near(
+        "ieee: from 0x3DCCCCCD is the float nearest 0.1",
+        Ieee::toF32(1036831949) as f64,
+        (0.1 as f32) as f64,
+        0.0
+    );
+    c.near(
+        "ieee: from the largest float",
+        Ieee::toF32(2139095039) as f64,
+        3.4028234663852886e38,
+        0.0
+    );
+    c.that(
+        "ieee: from a denormal is positive and tiny",
+        Ieee::toF32(1) > 0.0 && Ieee::toF32(1) < 0.000000000000000000000000000000000000001
+    );
+    c.that(
+        "ieee: infinity and NaN are flagged",
+        !Ieee::isFinite(2139095040) && !Ieee::isFinite(2143289344) && !Ieee::isFinite(-8388608)
+            && Ieee::isFinite(1065353216)
+            && Ieee::isFinite(0)
+    );
+    let mut ok : bool = true;
+    let mut x : f32 = 0.0001;
+    for (i of 0..400) {
+        x = x * (1.07 as f32);
+        if (Ieee::toF32(Ieee::bitsOf(x)) != x || Ieee::toF32(Ieee::bitsOf(-x)) != -x) {
+            ok = false;
+        }
+    }
+    c.that("ieee: bits round trip across many magnitudes", ok);
+}
+
+// ---- base64 ----
+
+fn mdlB64(text : string) : string {
+    let out : ByteBuf = new ByteBuf(16);
+    if (!Base64::decode(text, out)) {
+        return "<invalid>";
+    }
+    return DataText::fromBytes(out, 0, out.len());
+}
+
+fn mdlBase64Checks(c : Checks) : void {
+    c.that(
+        "base64: RFC 4648 vectors encode",
+        Base64::encode(DataText::toBytes("")) == ""
+            && Base64::encode(DataText::toBytes("f")) == "Zg=="
+            && Base64::encode(DataText::toBytes("fo")) == "Zm8="
+            && Base64::encode(DataText::toBytes("foo")) == "Zm9v"
+            && Base64::encode(DataText::toBytes("foob")) == "Zm9vYg=="
+            && Base64::encode(DataText::toBytes("fooba")) == "Zm9vYmE="
+            && Base64::encode(DataText::toBytes("foobar")) == "Zm9vYmFy"
+    );
+    c.that(
+        "base64: RFC 4648 vectors decode",
+        mdlB64("") == "" && mdlB64("Zg==") == "f" && mdlB64("Zm8=") == "fo"
+            && mdlB64("Zm9v") == "foo"
+            && mdlB64("Zm9vYg==") == "foob"
+            && mdlB64("Zm9vYmE=") == "fooba"
+            && mdlB64("Zm9vYmFy") == "foobar"
+    );
+    c.that(
+        "base64: padding may be left off and still decodes",
+        mdlB64("Zg") == "f" && mdlB64("Zm9vYg") == "foob"
+    );
+    c.that(
+        "base64: white space is skipped",
+        mdlB64("Zm9v\nYmFy") == "foobar" && mdlB64(" Zm 9v\r\n") == "foo"
+    );
+    c.that(
+        "base64: the URL-safe alphabet decodes the same as the standard one",
+        mdlB64("-_-_") == mdlB64("+/+/")
+    );
+    c.that(
+        "base64: a bad character is refused",
+        mdlB64("Zm9v!") == "<invalid>" && mdlB64("Zm9é") == "<invalid>"
+    );
+    c.that(
+        "base64: a length that cannot occur is refused",
+        mdlB64("Z") == "<invalid>" && mdlB64("Zm9vY") == "<invalid>"
+    );
+    c.that(
+        "base64: wrong padding is refused",
+        mdlB64("Zg=") == "<invalid>" && mdlB64("Zg===") == "<invalid>"
+            && mdlB64("=Zm9") == "<invalid>"
+            && mdlB64("Zg==Zg==") == "<invalid>"
+    );
+    let all : ByteBuf = new ByteBuf(16);
+    for (i of 0..256) {
+        all.push(i);
+    }
+    let back : ByteBuf = new ByteBuf(16);
+    c.that(
+        "base64: all byte values round trip",
+        Base64::decode(Base64::encode(all), back) && back.len() == 256 && back.get(0) == 0
+            && back.get(255) == 255
+            && back.get(128) == 128
+    );
+    c.sameInt(
+        "base64: a data URI payload starts after the marker",
+        Base64::dataUriStart("data:application/octet-stream;base64,AAAA"),
+        37
+    );
+    c.sameInt("base64: a plain file URI is not a data URI", Base64::dataUriStart("model.bin"), -1);
+    c.sameInt(
+        "base64: a data URI without base64 is not read",
+        Base64::dataUriStart("data:text/plain,hello"),
+        -1
+    );
+    c.sameInt(
+        "base64: an input shorter than a data URI prefix is not a data URI",
+        Base64::dataUriStart("data"),
+        -1
+    );
+}
+
+// ---- meshes ----
+
+// Six times the signed volume of a closed mesh (the divergence theorem over its triangles).
+fn mdlVolume(m : Mesh) : f64 {
+    let mut sum : f64 = 0.0;
+    for (t of 0..m.triangleCount()) {
+        let a : Vec3 = m.position(m.index(t * 3));
+        let b : Vec3 = m.position(m.index(t * 3 + 1));
+        let d : Vec3 = m.position(m.index(t * 3 + 2));
+        sum = sum + (a.dot(b.cross(d)) as f64);
+    }
+    return sum / 6.0;
+}
+
+// True when every vertex normal points away from the origin and has unit length.
+fn mdlOutward(m : Mesh) : bool {
+    for (v of 0..m.vertexCount()) {
+        let n : Vec3 = m.normal(v);
+        let l : f32 = n.length();
+        if (l < 0.999 || l > 1.001 || n.dot(m.position(v)) <= 0.0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// True when each triangle's winding agrees with the normal stored at its first vertex.
+fn mdlWinding(m : Mesh) : bool {
+    for (t of 0..m.triangleCount()) {
+        let a : i32 = m.index(t * 3);
+        let p0 : Vec3 = m.position(a);
+        let face : Vec3 = m
+            .position(m.index(t * 3 + 1))
+            .minus(p0)
+            .cross(m.position(m.index(t * 3 + 2)).minus(p0));
+        if (face.lengthSquared() > 0.0000001 && face.dot(m.normal(a)) <= 0.0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn mdlMeshChecks(c : Checks) : void {
+    let m : Mesh = new Mesh();
+    c.that(
+        "mesh: an empty mesh is consistent and has an empty box",
+        m.check() == "" && m.vertexCount() == 0 && m.triangleCount() == 0 && !m.hasNormals()
+            && !m.hasUvs()
+            && !m.hasSkin()
+            && m.bounds().isEmpty()
+    );
+    m.addPosition(Vec3 { x: 0.0, y: 0.0, z: 0.0 });
+    m.addPosition(Vec3 { x: 2.0, y: 0.0, z: 0.0 });
+    m.addPosition(Vec3 { x: 0.0, y: 3.0, z: 0.0 });
+    m.addTriangle(0, 1, 2);
+    c.that(
+        "mesh: positions only is consistent",
+        m.check() == "" && m.vertexCount() == 3 && m.triangleCount() == 1 && m.indexCount() == 3
+    );
+    m.computeNormals();
+    c.that(
+        "mesh: computed normal of a counter-clockwise triangle in XY is +Z",
+        m.hasNormals() && m.normal(0).z == 1.0 && m.normal(1).z == 1.0 && m.normal(2).x == 0.0
+    );
+    let bnd : Aabb = m.bounds();
+    c.that(
+        "mesh: bounds",
+        bnd.min.x == 0.0 && bnd.max.x == 2.0 && bnd.max.y == 3.0 && bnd.min.z == 0.0
+    );
+    m.addTriangle(0, 1, 7);
+    c.that(
+        "mesh: check names an index past the last vertex",
+        m.check() == "an index points past the last vertex"
+    );
+    let broken : Mesh = new Mesh();
+    broken.addPosition(Vec3::zero());
+    broken.addNormal(Vec3::unitY());
+    broken.addNormal(Vec3::unitY());
+    c.that(
+        "mesh: check names a normal count mismatch",
+        broken.check() == "the normal count differs from the vertex count"
+    );
+    let partial : Mesh = new Mesh();
+    c.that(
+        "mesh: reading a missing channel answers zeros",
+        partial.uv(0).x == 0.0 && partial.tangent(0).w == 0.0 && partial.joint(0, 0) == 0
+            && partial.weight(0, 0) == 0.0
+    );
+}
+
+fn mdlShapeChecks(c : Checks) : void {
+    let b : Mesh = MeshShapes::box(2.0, 4.0, 6.0);
+    c.that(
+        "shapes: a box has 24 vertices and 12 triangles",
+        b.vertexCount() == 24 && b.triangleCount() == 12 && b.check() == ""
+    );
+    c.that(
+        "shapes: a box has normals, uvs and tangents",
+        b.hasNormals() && b.hasUvs() && b.hasTangents()
+    );
+    let bb : Aabb = b.bounds();
+    c.that(
+        "shapes: the box bounds are its half sizes",
+        bb.min.x == -1.0 && bb.max.x == 1.0 && bb.min.y == -2.0 && bb.max.y == 2.0
+            && bb.min.z == -3.0
+            && bb.max.z == 3.0
+    );
+    c.near("shapes: the box volume from its triangles", mdlVolume(b), 48.0, MDL_TOL_COARSE);
+    c.that("shapes: the box is wound counter-clockwise from outside", mdlWinding(b));
+    c.that("shapes: box normals point outward", mdlOutward(b));
+    let mut tangentsOk : bool = true;
+    for (v of 0..b.vertexCount()) {
+        let t : Vec4 = b.tangent(v);
+        let n : Vec3 = b.normal(v);
+        let tv : Vec3 = Vec3 { x: t.x, y: t.y, z: t.z };
+        if (tv.length() < 0.999 || tv.length() > 1.001 || tv.dot(n) > 0.001 || tv.dot(n) < -0.001
+            || (t.w != 1.0 && t.w != -1.0)) {
+            tangentsOk = false;
+        }
+    }
+    c.that("shapes: box tangents are unit, perpendicular to the normal, with a sign", tangentsOk);
+    let u : Mesh = MeshShapes::box(1.0, 1.0, 1.0);
+    let uv : Vec3 = Vec3 { x: u.uv(1).x, y: u.uv(1).y, z: 0.0 };
+    c.that("shapes: box texture coordinates span 0 to 1", uv.x == 1.0 && uv.y == 1.0);
+    let s : Mesh = MeshShapes::sphere(2.0, 32, 16);
+    c.sameInt("shapes: a sphere has 33 x 17 vertices", s.vertexCount(), 33 * 17);
+    c.that("shapes: a sphere passes the mesh consistency check", s.check() == "");
+    c.that("shapes: sphere normals point outward", mdlOutward(s));
+    c.that("shapes: the sphere is wound counter-clockwise from outside", mdlWinding(s));
+    let vol : f64 = mdlVolume(s);
+    let exact : f64 = 4.0 / 3.0 * 3.141592653589793 * 8.0;
+    c.that(
+        "shapes: the sphere volume is close to 4/3 pi r^3 and a little less",
+        vol < exact && vol > exact * 0.97
+    );
+    let sb : Aabb = s.bounds();
+    c.near("shapes: sphere reaches the radius at the poles", sb.max.y as f64, 2.0, MDL_TOL_COARSE);
+    c.near(
+        "shapes: the sphere bounds reach the radius of 2 at the equator",
+        sb.max.x as f64,
+        2.0,
+        MDL_TOL_COARSE
+    );
+    c.that(
+        "shapes: a sphere with silly arguments is still a mesh",
+        MeshShapes::sphere(1.0, 0, 0).check() == ""
+            && MeshShapes::sphere(1.0, 0, 0).triangleCount() > 0
+    );
+    let p : Mesh = MeshShapes::plane(4.0, 2.0, 2, 1);
+    c.that(
+        "shapes: a plane 2 x 1 has 6 vertices and 4 triangles",
+        p.vertexCount() == 6 && p.triangleCount() == 4 && p.check() == ""
+    );
+    c.that(
+        "shapes: plane faces +Y, wound counter-clockwise seen from above",
+        p.normal(0).y == 1.0 && mdlWinding(p)
+    );
+    let pb : Aabb = p.bounds();
+    c.that(
+        "shapes: plane bounds",
+        pb.min.x == -2.0 && pb.max.x == 2.0 && pb.min.z == -1.0 && pb.max.z == 1.0
+            && pb.max.y == 0.0
+    );
+    c.that(
+        "shapes: a degenerate plane request is clamped",
+        MeshShapes::plane(1.0, 1.0, 0, -3).triangleCount() == 2
+    );
+}

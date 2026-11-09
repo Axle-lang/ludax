@@ -1,0 +1,193 @@
+// clip — decoded audio: interleaved f32 frames at a sample rate.
+//
+// An `AudioClip` is what every audio importer produces and the mixer consumes: `frames` frames of `channels`
+// samples each, interleaved (frame 0 channel 0, frame 0 channel 1, ...), as `f32` nominally in -1..1. The
+// operations here (mix to mono, resample, gain, normalise, slice) all return a new clip and leave the source
+// alone, so a loaded asset can be shared and derived from freely. Nothing reads a clock or a device.
+//
+// A read or write outside the clip is a failure value: `get` answers 0 and `set` does nothing. The constructor
+// raises a rate or channel count below 1 and a frame count below 0 to the nearest legal value, so every clip
+// can divide by its rate and channels without a guard.
+
+use crate::core::math::scalar::minI;
+
+/** A block of audio: `frames` frames of `channels` interleaved `f32` samples at `rate` frames per second. */
+pub class AudioClip {
+    /** Frames per second. */
+    pub rate : i32 = 44100;
+
+    /** Samples per frame. */
+    pub channels : i32 = 1;
+
+    /** How many frames the clip holds. */
+    pub frames : i32 = 0;
+
+    /** The samples, `frames * channels` of them, interleaved. */
+    pub samples : f32[];
+
+    /** A silent clip. `channels` and `rate` are raised to 1 when smaller; `frames` to 0. */
+    constructor(rate : i32, channels : i32, frames : i32) {
+        self.rate = rate;
+        if (rate < 1) {
+            self.rate = 1;
+        }
+        self.channels = channels;
+        if (channels < 1) {
+            self.channels = 1;
+        }
+        self.frames = frames;
+        if (frames < 0) {
+            self.frames = 0;
+        }
+
+        let total : i32 = self.sampleCount();
+        let mut buf : f32[] = new f32[(total + 1) as i64];
+        for (i of 0..total + 1) {
+            buf[i as i64] = 0.0;
+        }
+        self.samples = buf;
+    }
+
+    // How many samples the clip holds.
+    fn sampleCount(self) : i32 {
+        return self.frames * self.channels;
+    }
+
+    // The position of one sample in `samples`.
+    fn sampleIndex(self, frame : i32, channel : i32) : i32 {
+        return frame * self.channels + channel;
+    }
+
+    /** The sample of `channel` in `frame`; 0 outside the clip. */
+    pub fn get(self, frame : i32, channel : i32) : f32 {
+        if (frame < 0 || frame >= self.frames || channel < 0 || channel >= self.channels) {
+            return 0.0;
+        }
+        return self.samples[self.sampleIndex(frame, channel) as i64];
+    }
+
+    /** Sets the sample of `channel` in `frame`; ignored outside the clip. */
+    pub fn set(mut self, frame : i32, channel : i32, v : f32) : void {
+        if (frame < 0 || frame >= self.frames || channel < 0 || channel >= self.channels) {
+            return;
+        }
+        self.samples[self.sampleIndex(frame, channel) as i64] = v;
+    }
+
+    /** Length in seconds. */
+    pub fn duration(self) : f32 {
+        return self.frames as f32 / self.rate as f32;
+    }
+
+    /** The largest absolute sample value; 0 for an empty clip. */
+    pub fn peak(self) : f32 {
+        let mut p : f32 = 0.0;
+        let total : i32 = self.sampleCount();
+        for (i of 0..total) {
+            let v : f32 = self.samples[i as i64];
+            let mut a : f32 = v;
+            if (v < 0.0) {
+                a = (0.0 as f32) - v;
+            }
+            if (a > p) {
+                p = a;
+            }
+        }
+        return p;
+    }
+
+    /** An independent copy. */
+    pub fn copy(self) : AudioClip {
+        let mut out : AudioClip = new AudioClip(self.rate, self.channels, self.frames);
+        let total : i32 = self.sampleCount();
+        for (i of 0..total) {
+            out.samples[i as i64] = self.samples[i as i64];
+        }
+        return out;
+    }
+
+    /** The average of all channels, as a mono clip. */
+    pub fn mixdownMono(self) : AudioClip {
+        let mut out : AudioClip = new AudioClip(self.rate, 1, self.frames);
+        let inv : f32 = (1.0 as f32) / (self.channels as f32);
+        for (f of 0..self.frames) {
+            let mut sum : f32 = 0.0;
+            for (c of 0..self.channels) {
+                sum = sum + self.samples[self.sampleIndex(f, c) as i64];
+            }
+            out.samples[f as i64] = sum * inv;
+        }
+        return out;
+    }
+
+    /**
+     * The clip at another sample rate, by linear interpolation between neighbouring frames. The length scales
+     * with the rate (rounded to the nearest frame); the first and last frames keep their values.
+     */
+    pub fn resampled(self, newRate : i32) : AudioClip {
+        let mut target : i32 = newRate;
+        if (newRate < 1) {
+            target = 1;
+        }
+        let count : i32 = ((self.frames as f64 * target as f64 / self.rate as f64) + 0.5) as i32;
+        let mut out : AudioClip = new AudioClip(target, self.channels, count);
+        if (self.frames == 0) {
+            return out;
+        }
+
+        let step : f64 = self.rate as f64 / target as f64;
+        for (f of 0..count) {
+            let pos : f64 = f as f64 * step;
+            let last : i32 = self.frames - 1;
+            let i0 : i32 = minI(pos as i32, last);
+            let i1 : i32 = minI(i0 + 1, last);
+            let t : f32 = (pos - i0 as f64) as f32;
+            for (c of 0..self.channels) {
+                let a : f32 = self.samples[self.sampleIndex(i0, c) as i64];
+                let b : f32 = self.samples[self.sampleIndex(i1, c) as i64];
+                out.samples[self.sampleIndex(f, c) as i64] = a + (b - a) * t;
+            }
+        }
+        return out;
+    }
+
+    /** Every sample multiplied by `k`. */
+    pub fn gained(self, k : f32) : AudioClip {
+        let mut out : AudioClip = new AudioClip(self.rate, self.channels, self.frames);
+        let total : i32 = self.sampleCount();
+        for (i of 0..total) {
+            out.samples[i as i64] = self.samples[i as i64] * k;
+        }
+        return out;
+    }
+
+    /** Scaled so that the largest sample has magnitude `target`; a silent clip is returned unchanged. */
+    pub fn normalised(self, target : f32) : AudioClip {
+        let p : f32 = self.peak();
+        if (p <= 0.0) {
+            return self.copy();
+        }
+        return self.gained(target / p);
+    }
+
+    /** `count` frames starting at `start`, clipped to the clip (so the result may be shorter, never longer). */
+    pub fn slice(self, start : i32, count : i32) : AudioClip {
+        let mut from : i32 = start;
+        if (start < 0) {
+            from = 0;
+        }
+        let mut n : i32 = count;
+        if (from + n > self.frames) {
+            n = self.frames - from;
+        }
+        if (n < 0) {
+            n = 0;
+        }
+
+        let mut out : AudioClip = new AudioClip(self.rate, self.channels, n);
+        for (i of 0..n * self.channels) {
+            out.samples[i as i64] = self.samples[(from * self.channels + i) as i64];
+        }
+        return out;
+    }
+}

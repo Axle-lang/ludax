@@ -1,0 +1,351 @@
+// model_gltf_files — checks for glTF containers, external files and damaged input.
+//
+// A binary container, a buffer loaded through the virtual file system and each kind of damage a file can have
+// (a count that runs past its buffer, an index past the last vertex, a loop in the node tree, a cut-short
+// container) must give a model or an error, never an abort.
+
+use ludax::ByteBuf;
+use ludax::Checks;
+use ludax::DataText;
+use ludax::GltfImporter;
+use ludax::ModelAsset;
+use ludax::Vfs;
+
+use crate::model_support::{mdlDoc, mdlFails, mdlJson, mdlTriBuffer, mdlTriRest, mdlUri};
+
+/** The glTF container and damage checks. */
+pub class ModelGltfFilesSuite {
+    /** Runs every check of the suite. */
+    pub static fn run(c : Checks) : void {
+        mdlGlbChecks(c);
+        mdlVfsChecks(c);
+        mdlGltfDamage(c);
+    }
+}
+
+fn mdlGlb(json : string, bin : ByteBuf) : ByteBuf {
+    let j : ByteBuf = DataText::toBytes(json);
+    while (j.len() % 4 != 0) {
+        j.push(32);
+    }
+    let bn : ByteBuf = new ByteBuf(16);
+    bn.pushRange(bin, 0, bin.len());
+    while (bn.len() % 4 != 0) {
+        bn.push(0);
+    }
+    let out : ByteBuf = new ByteBuf(64);
+    out.pushText("glTF");
+    out.pushLe32(2);
+    out.pushLe32(12 + 8 + j.len() + 8 + bn.len());
+    out.pushLe32(j.len());
+    out.pushLe32(0x4E4F534A);
+    out.pushRange(j, 0, j.len());
+    out.pushLe32(bn.len());
+    out.pushLe32(0x004E4942);
+    out.pushRange(bn, 0, bn.len());
+    return out;
+}
+
+fn mdlGlbChecks(c : Checks) : void {
+    let bin : ByteBuf = mdlTriBuffer();
+    let json : string = mdlJson("{'asset':{'version':'2.0'},'buffers':[{'byteLength':36}],"
+        + mdlTriRest(",'translation':[4,5,6]")
+        + "}");
+    let glb : ByteBuf = mdlGlb(json, bin);
+    let vfs : Vfs = new Vfs();
+    let m : ModelAsset = GltfImporter::fromBytes(glb, vfs, "");
+    c.that("glb: a binary glTF imports (${m.error()})", m.ok() && m.meshCount() == 1);
+    c.that(
+        "glb: its buffer is the binary chunk",
+        m.mesh(0).primitive(0).position(1).x == 1.0 && m.mesh(0).primitive(0).position(2).y == 1.0
+            && m.node(0).local.translation.z == 6.0
+    );
+    // A GLB whose JSON chunk is padded and whose binary chunk is longer than the buffer it declares is fine.
+    c.that(
+        "glb: the declared buffer may be shorter than the chunk",
+        GltfImporter::fromBytes(mdlGlb(json, mdlPadded(bin)), vfs, "").ok()
+    );
+    // Cut at every length: always an error, never an abort.
+    let mut allRefused : bool = true;
+    for (len of 0..glb.len()) {
+        let cut : ByteBuf = new ByteBuf(16);
+        cut.pushRange(glb, 0, len);
+        if (GltfImporter::fromBytes(cut, vfs, "").ok()) {
+            allRefused = false;
+        }
+    }
+    c.that("glb: a file cut at any length is refused", allRefused);
+    let flipped : ByteBuf = new ByteBuf(16);
+    flipped.pushRange(glb, 0, glb.len());
+    flipped.set(4, 3);
+    c.that(
+        "glb: a container of another version is refused",
+        !GltfImporter::fromBytes(flipped, vfs, "").ok()
+    );
+    let lie : ByteBuf = new ByteBuf(16);
+    lie.pushRange(glb, 0, glb.len());
+    lie.set(12, 255);
+    lie.set(13, 255);
+    c.that(
+        "glb: a chunk longer than the file is refused",
+        !GltfImporter::fromBytes(lie, vfs, "").ok()
+    );
+    // No binary chunk, but a buffer without a uri.
+    let jb : ByteBuf = DataText::toBytes(json);
+    while (jb.len() % 4 != 0) {
+        jb.push(32);
+    }
+    let noBin : ByteBuf = new ByteBuf(64);
+    noBin.pushText("glTF");
+    noBin.pushLe32(2);
+    noBin.pushLe32(20 + jb.len());
+    noBin.pushLe32(jb.len());
+    noBin.pushLe32(0x4E4F534A);
+    noBin.pushRange(jb, 0, jb.len());
+    c.that(
+        "glb: a buffer with no uri and no binary chunk is refused",
+        !GltfImporter::fromBytes(noBin, vfs, "").ok()
+    );
+}
+
+fn mdlPadded(b : ByteBuf) : ByteBuf {
+    let out : ByteBuf = new ByteBuf(16);
+    out.pushRange(b, 0, b.len());
+    for (i of 0..16) {
+        out.push(7);
+    }
+    return out;
+}
+
+// ---- files through the Vfs ----
+
+fn mdlVfsChecks(c : Checks) : void {
+    let vfs : Vfs = new Vfs();
+    vfs.addMemory("");
+    let json : string = mdlJson("{'asset':{'version':'2.0'},'buffers':[{'byteLength':36,'uri':'my%20tri.bin'}],"
+        + mdlTriRest("")
+        + "}");
+    try {
+        vfs.write("models/my tri.bin", mdlTriBuffer());
+        vfs.writeText("models/tri.gltf", json);
+    } catch e : IOException {
+        c.that("model: setup writes", false);
+    }
+    let m : ModelAsset = GltfImporter::load(vfs, "models/tri.gltf");
+    c.that(
+        "gltf: an external buffer is read through the Vfs (${m.error()})",
+        m.ok() && m.mesh(0).primitive(0).position(1).x == 1.0
+    );
+    c.that(
+        "gltf: the external file is recorded in the import",
+        m.externalFiles() == "models/my tri.bin\n"
+    );
+    c.that(
+        "gltf: loading a file that does not exist fails",
+        !GltfImporter::load(vfs, "models/none.gltf").ok()
+    );
+    let missing : Vfs = new Vfs();
+    missing.addMemory("");
+    try {
+        missing.writeText("tri.gltf", json);
+    } catch e : IOException {
+        c.that("model: setup writes", false);
+    }
+    c.that(
+        "gltf: a missing external buffer is an error",
+        !GltfImporter::load(missing, "tri.gltf").ok()
+            && GltfImporter::load(missing, "tri.gltf").error().byteLength > 0
+    );
+    let escape : string = mdlJson("{'asset':{'version':'2.0'},'buffers':[{'byteLength':36,'uri':'../secret.bin'}],"
+        + mdlTriRest("")
+        + "}");
+    c.that(
+        "gltf: a buffer outside the root is refused",
+        !GltfImporter::fromBytes(DataText::toBytes(escape), vfs, "models").ok()
+    );
+}
+
+// ---- damaged glTF ----
+
+/** The one buffer view and the one position accessor of a sound triangle; the checks break one field at a time. */
+const MDL_TRI_VIEW : string = "'buffer':0,'byteLength':36";
+const MDL_TRI_ACCESSOR : string = "'componentType':5126,'count':3,'type':'VEC3'";
+
+/** A mesh with one primitive that reads its positions from accessor 0. */
+const MDL_POSITION_MESH : string = "'meshes':[{'primitives':[{'attributes':{'POSITION':0}}]}]";
+
+// A document whose view 0 holds `view` and whose accessor 0 holds `accessor`, both over the triangle buffer.
+fn mdlBadAccessor(c : Checks, name : string, view : string, accessor : string) : void {
+    let views : string = "'bufferViews':[{${view}}]";
+    let accessors : string = "'accessors':[{'bufferView':0,${accessor}}]";
+    mdlFails(c, name, mdlDoc(mdlTriBuffer(), "${views},${accessors},${MDL_POSITION_MESH}"));
+}
+
+// The faults of the buffers, views and accessors that positions are read through.
+fn mdlDamagedBuffers(c : Checks) : void {
+    let tri : ByteBuf = mdlTriBuffer();
+    let good : string = mdlTriRest("");
+    let base64 : string = "data:application/octet-stream;base64,@@@@";
+    let triUri : string = mdlUri(tri);
+    let header : string = "'asset':{'version':'2.0'}";
+
+    mdlFails(c, "text that is not JSON", "this is not a model");
+    mdlFails(c, "the empty file", "");
+    mdlFails(c, "JSON that is not an object", "[1,2]");
+    mdlFails(c, "a missing asset version", mdlJson("{'buffers':[]}"));
+    mdlFails(c, "glTF version 1", mdlJson("{'asset':{'version':'1.0'}}"));
+    mdlFails(
+        c,
+        "invalid base64 in a buffer",
+        mdlJson("{${header},'buffers':[{'byteLength':36,'uri':'${base64}'}]}")
+    );
+    mdlFails(
+        c,
+        "a buffer shorter than its byteLength",
+        mdlJson("{${header},'buffers':[{'byteLength':400,'uri':'${triUri}'}],${good}}")
+    );
+    mdlFails(
+        c,
+        "a buffer with no byteLength",
+        mdlJson("{${header},'buffers':[{'uri':'${triUri}'}],${good}}")
+    );
+
+    let past : string = "'buffer':0,'byteOffset':20,'byteLength':36";
+    let missing : string = "'buffer':3,'byteLength':36";
+    let strided : string = "'buffer':0,'byteLength':36,'byteStride':4";
+    mdlBadAccessor(c, "a buffer view past the end of its buffer", past, MDL_TRI_ACCESSOR);
+    mdlBadAccessor(c, "a buffer view of a buffer that is not there", missing, MDL_TRI_ACCESSOR);
+    mdlBadAccessor(c, "a stride smaller than an element", strided, MDL_TRI_ACCESSOR);
+
+    let count4 : string = "'componentType':5126,'count':4,'type':'VEC3'";
+    let huge : string = "'componentType':5126,'count':2000000000,'type':'VEC3'";
+    let negative : string = "'componentType':5126,'count':-1,'type':'VEC3'";
+    let overflow : string = "'byteOffset':2147483647,${MDL_TRI_ACCESSOR}";
+    mdlBadAccessor(c, "an accessor that reads past its view", MDL_TRI_VIEW, count4);
+    mdlBadAccessor(c, "an accessor with a huge count", MDL_TRI_VIEW, huge);
+    mdlBadAccessor(c, "an accessor with a negative count", MDL_TRI_VIEW, negative);
+    mdlBadAccessor(c, "an offset that overflows", MDL_TRI_VIEW, overflow);
+
+    let badComponent : string = "'componentType':1234,'count':3,'type':'VEC3'";
+    let badType : string = "'componentType':5126,'count':3,'type':'VEC5'";
+    let sparse : string = "${MDL_TRI_ACCESSOR},'sparse':{'count':1}";
+    let vec2 : string = "'componentType':5126,'count':3,'type':'VEC2'";
+    mdlBadAccessor(c, "an unknown component type", MDL_TRI_VIEW, badComponent);
+    mdlBadAccessor(c, "an unknown accessor type", MDL_TRI_VIEW, badType);
+    mdlBadAccessor(c, "a sparse accessor", MDL_TRI_VIEW, sparse);
+    mdlBadAccessor(c, "positions that are not VEC3", MDL_TRI_VIEW, vec2);
+
+    let noView : string = "'accessors':[{${MDL_TRI_ACCESSOR}}],${MDL_POSITION_MESH}";
+    mdlFails(c, "an accessor with no buffer view", mdlDoc(tri, noView));
+    mdlFails(
+        c,
+        "a position accessor that does not exist",
+        mdlDoc(tri, "'meshes':[{'primitives':[{'attributes':{'POSITION':9}}]}]")
+    );
+    mdlFails(
+        c,
+        "a primitive without POSITION",
+        mdlDoc(tri, "'meshes':[{'primitives':[{'attributes':{}}]}]")
+    );
+}
+
+// Float positions that are not numbers, and indices that point nowhere.
+fn mdlDamagedValues(c : Checks) : void {
+    let good : string = mdlTriRest("");
+
+    let nan : ByteBuf = new ByteBuf(64);
+    nan.pushLe32(2143289344);
+    for (i of 0..8) {
+        nan.pushLe32(0);
+    }
+    mdlFails(c, "a NaN in a float accessor", mdlDoc(nan, good));
+
+    let inf : ByteBuf = new ByteBuf(64);
+    inf.pushLe32(2139095040);
+    for (i of 0..8) {
+        inf.pushLe32(0);
+    }
+    mdlFails(c, "an infinity in a float accessor", mdlDoc(inf, good));
+
+    // Three 16-bit indices after the triangle: 0, 1 and 9, the last one past the end.
+    let ib : ByteBuf = mdlTriBuffer();
+    ib.push(0);
+    ib.push(0);
+    ib.push(1);
+    ib.push(0);
+    ib.push(9);
+    ib.push(0);
+    let views : string = "'bufferViews':[{${MDL_TRI_VIEW}},{'buffer':0,'byteOffset':36,'byteLength':6}]";
+    let positions : string = "{'bufferView':0,${MDL_TRI_ACCESSOR}}";
+    let primitive : string = "'meshes':[{'primitives':[{'attributes':{'POSITION':0},'indices':1}]}]";
+    let indices3 : string = "{'bufferView':1,'componentType':5123,'count':3,'type':'SCALAR'}";
+    let indicesVec : string = "{'bufferView':1,'componentType':5123,'count':1,'type':'VEC3'}";
+    mdlFails(
+        c,
+        "an index past the last vertex",
+        mdlDoc(ib, "${views},'accessors':[${positions},${indices3}],${primitive}")
+    );
+    mdlFails(
+        c,
+        "indices that are not scalars",
+        mdlDoc(ib, "${views},'accessors':[${positions},${indicesVec}],${primitive}")
+    );
+
+    let tri : ByteBuf = mdlTriBuffer();
+    let normals : string = "{'bufferView':0,'componentType':5126,'count':2,'type':'VEC3'}";
+    let normalMesh : string = "'meshes':[{'primitives':[{'attributes':{'POSITION':0,'NORMAL':1}}]}]";
+    let oneView : string = "'bufferViews':[{${MDL_TRI_VIEW}}]";
+    mdlFails(
+        c,
+        "a normal count that differs from the positions",
+        mdlDoc(tri, "${oneView},'accessors':[${positions},${normals}],${normalMesh}")
+    );
+}
+
+// References that point at materials, textures and nodes that are not there, and loops in the node tree.
+fn mdlDamagedReferences(c : Checks) : void {
+    let tri : ByteBuf = mdlTriBuffer();
+    let good : string = mdlTriRest("");
+
+    let texture : string = "'materials':[{'pbrMetallicRoughness':{'baseColorTexture':{'index':4}}}]";
+    mdlFails(c, "a material with a texture that does not exist", mdlDoc(tri, "${good},${texture}"));
+
+    let material : string = "'meshes':[{'primitives':[{'attributes':{'POSITION':0},'material':2}]}]";
+    let views : string = "'bufferViews':[{${MDL_TRI_VIEW}}]";
+    let accessors : string = "'accessors':[{'bufferView':0,${MDL_TRI_ACCESSOR}}]";
+    mdlFails(
+        c,
+        "a primitive with a material that does not exist",
+        mdlDoc(tri, "${views},${accessors},${material}")
+    );
+
+    mdlFails(c, "a node with a mesh that does not exist", mdlDoc(tri, "'nodes':[{'mesh':3}]"));
+    mdlFails(c, "a child that does not exist", mdlDoc(tri, "'nodes':[{'children':[5]}]"));
+    mdlFails(c, "a node that is its own child", mdlDoc(tri, "'nodes':[{'children':[0]}]"));
+    mdlFails(
+        c,
+        "a loop in the node tree",
+        mdlDoc(tri, "'nodes':[{'children':[1]},{'children':[2]},{'children':[0]}]")
+    );
+    mdlFails(
+        c,
+        "a node with two parents",
+        mdlDoc(tri, "'nodes':[{'children':[2]},{'children':[2]},{}]")
+    );
+    mdlFails(
+        c,
+        "a scene with a node that does not exist",
+        mdlDoc(tri, "'nodes':[{}],'scenes':[{'nodes':[7]}]")
+    );
+    mdlFails(
+        c,
+        "a default scene that does not exist",
+        mdlDoc(tri, "'nodes':[{}],'scenes':[{'nodes':[0]}],'scene':3")
+    );
+}
+
+fn mdlGltfDamage(c : Checks) : void {
+    mdlDamagedBuffers(c);
+    mdlDamagedValues(c);
+    mdlDamagedReferences(c);
+}
