@@ -1,0 +1,174 @@
+// frustum — the six planes of a camera, for culling.
+//
+// Built from a view-projection matrix (Gribb-Hartmann: each plane is a sum or difference of rows of the
+// matrix), so it works for any projection `mat4` makes: perspective or orthographic, ordinary or reversed
+// depth, finite or infinite far plane. The clip volume is Vulkan's, `-w <= x, y <= w` and `0 <= z <= w`.
+
+use crate::core::math::geom::{Aabb, Plane, Sphere};
+use crate::core::math::mat4::Mat4;
+use crate::core::math::vec3::Vec3;
+
+/** How a shape stands against a volume. */
+pub enum Containment : i8 {
+    /** Entirely outside. */
+    Outside,
+
+    /** Partly inside, partly outside. */
+    Intersecting,
+
+    /** Entirely inside. */
+    Inside,
+}
+
+// Where a shape stands against one plane: entirely behind it, straddling it, or entirely in front of it.
+// Ordered so that the smaller value is the stricter verdict.
+enum PlaneSide : i8 {
+    Behind = 0,
+    Straddling = 1,
+    InFront = 2,
+}
+
+/** The volume a camera sees, as six inward-facing planes. */
+pub struct Frustum {
+    /** Plane of the left edge of the view. */
+    pub left : Plane = Plane {};
+
+    /** Plane of the right edge of the view. */
+    pub right : Plane = Plane {};
+
+    /** Plane of the bottom edge of the view. */
+    pub bottom : Plane = Plane {};
+
+    /** Plane of the top edge of the view. */
+    pub top : Plane = Plane {};
+
+    /** Plane where clip depth is 0: the near plane, or the far plane under reversed depth. */
+    pub depth0 : Plane = Plane {};
+
+    /** Plane where clip depth equals w (1 after division): the far plane, or the near plane when reversed. */
+    pub depth1 : Plane = Plane {};
+
+    /**
+     * The frustum of a view-projection matrix. A plane the projection does not have (the far plane of an
+     * infinite projection) comes out as one that every point is in front of.
+     */
+    pub static fn fromViewProjection(vp : Mat4) : Frustum {
+        return Frustum {
+            left: Frustum::plane(vp.m30 + vp.m00, vp.m31 + vp.m01, vp.m32 + vp.m02, vp.m33 + vp.m03),
+            right: Frustum::plane(vp.m30 - vp.m00, vp.m31 - vp.m01, vp.m32 - vp.m02, vp.m33 - vp.m03),
+            bottom: Frustum::plane(vp.m30 + vp.m10, vp.m31 + vp.m11, vp.m32 + vp.m12, vp.m33 + vp.m13),
+            top: Frustum::plane(vp.m30 - vp.m10, vp.m31 - vp.m11, vp.m32 - vp.m12, vp.m33 - vp.m13),
+            depth0: Frustum::plane(vp.m20, vp.m21, vp.m22, vp.m23),
+            depth1: Frustum::plane(vp.m30 - vp.m20, vp.m31 - vp.m21, vp.m32 - vp.m22, vp.m33 - vp.m23),
+        };
+    }
+
+    // A plane from a row combination of the matrix, normalised.
+    static fn plane(a : f32, b : f32, c : f32, d : f32) : Plane {
+        return Plane::fromEquation(a, b, c, d);
+    }
+
+    /** Whether the point lies inside or on the frustum. */
+    pub fn containsPoint(self, p : Vec3) : bool {
+        let sides : bool = Frustum::onInnerSide(self.left, p) && Frustum::onInnerSide(self.right, p);
+        let slabs : bool = Frustum::onInnerSide(self.bottom, p) && Frustum::onInnerSide(self.top, p);
+        let depth : bool = Frustum::onInnerSide(self.depth0, p) && Frustum::onInnerSide(self.depth1, p);
+        return sides && slabs && depth;
+    }
+
+    // Whether the point is on the inside of the plane, the boundary included.
+    static fn onInnerSide(plane : Plane, p : Vec3) : bool {
+        return plane.signedDistance(p) >= 0.0;
+    }
+
+    /**
+     * How a ball stands against the frustum. Conservative at the corners: a ball just outside an edge can
+     * read `Intersecting`, but a ball that is partly visible never reads `Outside`.
+     */
+    pub fn testSphere(self, s : Sphere) : Containment {
+        let mut verdict : PlaneSide = Frustum::sphereSide(self.left, s);
+        verdict = Frustum::stricter(verdict, Frustum::sphereSide(self.right, s));
+        verdict = Frustum::stricter(verdict, Frustum::sphereSide(self.bottom, s));
+        verdict = Frustum::stricter(verdict, Frustum::sphereSide(self.top, s));
+        verdict = Frustum::stricter(verdict, Frustum::sphereSide(self.depth0, s));
+        verdict = Frustum::stricter(verdict, Frustum::sphereSide(self.depth1, s));
+
+        return Frustum::containment(verdict);
+    }
+
+    /** How a box stands against the frustum; conservative in the same way as `testSphere`. */
+    pub fn testAabb(self, b : Aabb) : Containment {
+        let mut verdict : PlaneSide = Frustum::boxSide(self.left, b);
+        verdict = Frustum::stricter(verdict, Frustum::boxSide(self.right, b));
+        verdict = Frustum::stricter(verdict, Frustum::boxSide(self.bottom, b));
+        verdict = Frustum::stricter(verdict, Frustum::boxSide(self.top, b));
+        verdict = Frustum::stricter(verdict, Frustum::boxSide(self.depth0, b));
+        verdict = Frustum::stricter(verdict, Frustum::boxSide(self.depth1, b));
+
+        return Frustum::containment(verdict);
+    }
+
+    /** Whether any part of the ball may be seen. */
+    pub fn intersectsSphere(self, s : Sphere) : bool {
+        return self.testSphere(s) != Containment::Outside;
+    }
+
+    /** Whether any part of the box may be seen. */
+    pub fn intersectsAabb(self, b : Aabb) : bool {
+        return self.testAabb(b) != Containment::Outside;
+    }
+
+    // Where a ball stands against one plane.
+    static fn sphereSide(p : Plane, s : Sphere) : PlaneSide {
+        let dist : f32 = p.signedDistance(s.center);
+        if (dist < -s.radius) {
+            return PlaneSide::Behind;
+        }
+        if (dist < s.radius) {
+            return PlaneSide::Straddling;
+        }
+        return PlaneSide::InFront;
+    }
+
+    // Where a box stands against one plane, by its corners nearest and farthest along the normal.
+    static fn boxSide(p : Plane, b : Aabb) : PlaneSide {
+        if (p.signedDistance(Frustum::cornerAlong(b, p.normal, true)) < 0.0) {
+            return PlaneSide::Behind;
+        }
+        if (p.signedDistance(Frustum::cornerAlong(b, p.normal, false)) < 0.0) {
+            return PlaneSide::Straddling;
+        }
+        return PlaneSide::InFront;
+    }
+
+    // The corner of the box farthest along `n` (or, with `farthest` false, the nearest).
+    static fn cornerAlong(b : Aabb, n : Vec3, farthest : bool) : Vec3 {
+        let mut c : Vec3 = b.min;
+        if ((n.x >= 0.0) == farthest) {
+            c.x = b.max.x;
+        }
+        if ((n.y >= 0.0) == farthest) {
+            c.y = b.max.y;
+        }
+        if ((n.z >= 0.0) == farthest) {
+            c.z = b.max.z;
+        }
+        return c;
+    }
+
+    // The stricter of two verdicts: one plane that excludes the shape excludes it from the frustum.
+    static fn stricter(a : PlaneSide, b : PlaneSide) : PlaneSide {
+        if ((b as i32) < (a as i32)) {
+            return b;
+        }
+        return a;
+    }
+
+    static fn containment(verdict : PlaneSide) : Containment {
+        return match verdict {
+            PlaneSide::Behind => Containment::Outside,
+            PlaneSide::Straddling => Containment::Intersecting,
+            PlaneSide::InFront => Containment::Inside,
+        };
+    }
+}

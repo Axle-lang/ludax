@@ -1,0 +1,292 @@
+// trig — deterministic sin, cos, tan, atan2, acos and sqrt.
+//
+// The C library's `sin` and `cos` are allowed to differ between platforms and versions, which would make a
+// replay or a lock-step simulation drift. These are plain polynomials evaluated in a fixed order from
+// IEEE-754 additions, multiplications and divisions, which every target rounds identically, so the same
+// input gives the same bits on every machine. `sqrt` is the hardware square root, which IEEE-754 also fixes.
+//
+// The kernels are the minimax polynomials of the FreeBSD msun library (Sun's fdlibm). The f32 functions
+// widen to f64, evaluate, and round once, so they are correct to within a rounding of the f32 result.
+//
+// Accuracy, measured against the C library by `tests/src/math_trig.axle`:
+//
+//   * sin, cos, atan, atan2, asin, acos in f64: within 1e-15 absolute (measured worst: 4.5e-16, a few ulp)
+//     for |x| up to 1e3 in the sweep and by construction up to 1e6; tan within 1e-13 relative away from
+//     the poles.
+//     Beyond 1e6 the argument is wrapped by whole turns first and the error grows with |x|.
+//   * the f32 versions: within 1.3e-7 absolute, i.e. one f32 rounding of the result near pi.
+//
+// Nothing here divides by zero or returns NaN for a finite input: Axle traps on a float division by zero, so
+// every quotient is guarded and the edge cases answer a defined value (documented per function).
+
+use crate::core::math::scalar::{PI_D, HALF_PI_D, HUGE_D, absD, wrapAngleD};
+
+// Cody-Waite split of pi/2 into pieces whose products with an integer below 2^20 are exact.
+const TRIG_PIO2_1 : f64 = 1.57079632673412561417;
+const TRIG_PIO2_2 : f64 = 6.07710050630396597660e-11;
+const TRIG_PIO2_3 : f64 = 2.02226624871116645580e-21;
+const TRIG_INV_PIO2 : f64 = 0.63661977236758134308;
+
+// Breakpoints of the msun atan argument reduction: below the first the polynomial is used directly; each
+// later interval is shifted onto [0, 7/16] around the angle atan(0.5), atan(1), atan(1.5) or pi/2.
+const TRIG_ATAN_DIRECT_BELOW : f64 = 0.4375;
+const TRIG_ATAN_HALF_BELOW : f64 = 0.6875;
+const TRIG_ATAN_ONE_BELOW : f64 = 1.1875;
+const TRIG_ATAN_ONE_HALF_BELOW : f64 = 2.4375;
+
+// Beyond this the reduction below loses its digits; the argument is first wrapped by whole turns.
+const TRIG_REDUCE_LIMIT : f64 = 1000000.0;
+
+/** The square root; zero for a negative or not-a-number input instead of NaN. */
+pub fn sqrt(x : f32) : f32 {
+    if (!(x > 0.0)) {
+        return 0.0;
+    }
+    return x.sqrt();
+}
+
+/** The square root (f64); zero for a negative or not-a-number input instead of NaN. */
+pub fn sqrtD(x : f64) : f64 {
+    if (!(x > 0.0)) {
+        return 0.0;
+    }
+    return x.sqrt();
+}
+
+// sin(r) for |r| <= pi/4.
+fn trigSinKernel(r : f64) : f64 {
+    let z : f64 = r * r;
+    let poly : f64 = -0.166666666666666324348
+        + z
+            * (0.00833333333332248946124
+                + z
+                    * (-0.000198412698298579493134
+                        + z
+                            * (0.00000275573137070700676789
+                                + z
+                                    * (-0.0000000250507602534068634195
+                                        + z * 0.000000000158969099521155010221))));
+    return r + r * z * poly;
+}
+
+// cos(r) for |r| <= pi/4.
+fn trigCosKernel(r : f64) : f64 {
+    let z : f64 = r * r;
+    let poly : f64 = 0.0416666666666666019037
+        + z
+            * (-0.00138888888888741095749
+                + z
+                    * (0.0000248015872894767294178
+                        + z
+                            * (-0.000000275573143513906633035
+                                + z
+                                    * (0.00000000208757232129817482790
+                                        + z * -0.0000000000113596475577881948265))));
+    return 1.0 - 0.5 * z + z * z * poly;
+}
+
+// An angle as a count of quarter turns (mod 4) and the remainder in [-pi/4, pi/4].
+struct TrigReduced {
+    quadrant  : i8 = 0;
+    remainder : f64 = 0.0;
+}
+
+fn trigReduce(x : f64) : TrigReduced {
+    let mut v : f64 = x;
+    if (v > TRIG_REDUCE_LIMIT || v < -TRIG_REDUCE_LIMIT) {
+        v = wrapAngleD(v);
+    }
+    let quarters : i64 = (v * TRIG_INV_PIO2).round();
+    let n : f64 = quarters as f64;
+    let r : f64 = ((v - n * TRIG_PIO2_1) - n * TRIG_PIO2_2) - n * TRIG_PIO2_3;
+    // The quadrant is `quarters mod 4`, so it always fits a signed byte.
+    return TrigReduced { quadrant: (quarters & 3) as i8, remainder: r };
+}
+
+/** The sine of an angle in radians (f64). Zero for an infinite or not-a-number input. */
+pub fn sinD(x : f64) : f64 {
+    if (!x.isFinite()) {
+        return 0.0;
+    }
+    let red : TrigReduced = trigReduce(x);
+    return match red.quadrant {
+        0 => trigSinKernel(red.remainder),
+        1 => trigCosKernel(red.remainder),
+        2 => 0.0 - trigSinKernel(red.remainder),
+        _ => 0.0 - trigCosKernel(red.remainder),
+    };
+}
+
+/** The cosine of an angle in radians (f64). One for an infinite or not-a-number input. */
+pub fn cosD(x : f64) : f64 {
+    if (!x.isFinite()) {
+        return 1.0;
+    }
+    let red : TrigReduced = trigReduce(x);
+    return match red.quadrant {
+        0 => trigCosKernel(red.remainder),
+        1 => 0.0 - trigSinKernel(red.remainder),
+        2 => 0.0 - trigCosKernel(red.remainder),
+        _ => trigSinKernel(red.remainder),
+    };
+}
+
+/**
+ * The tangent of an angle in radians (f64). Where the cosine is exactly zero the answer is plus or minus
+ * `HUGE_D` rather than infinity; pi/2 in floating point is not exactly pi/2, so this rarely happens.
+ */
+pub fn tanD(x : f64) : f64 {
+    let c : f64 = cosD(x);
+    let s : f64 = sinD(x);
+    if (c == 0.0) {
+        if (s < 0.0) {
+            return -HUGE_D;
+        }
+        return HUGE_D;
+    }
+    return s / c;
+}
+
+// atan of a non-negative number, by the msun argument reduction to [0, 7/16] and an odd polynomial.
+fn trigAtanPositive(x : f64) : f64 {
+    let mut a : f64 = x;
+    let mut hi : f64 = 0.0;
+    let mut lo : f64 = 0.0;
+    let mut reduced : bool = true;
+    if (x < TRIG_ATAN_DIRECT_BELOW) {
+        reduced = false;
+    } else if (x < TRIG_ATAN_ONE_BELOW) {
+        if (x < TRIG_ATAN_HALF_BELOW) {
+            a = (2.0 * x - 1.0) / (2.0 + x);
+            hi = 0.463647609000806093515;
+            lo = 0.0000000000000000226987774529616870924;
+        } else {
+            a = (x - 1.0) / (x + 1.0);
+            hi = 0.785398163397448278999;
+            lo = 0.0000000000000000306161699786838301793;
+        }
+    } else if (x < TRIG_ATAN_ONE_HALF_BELOW) {
+        a = (x - 1.5) / (1.0 + 1.5 * x);
+        hi = 0.982793723247329054082;
+        lo = 0.0000000000000000139033110312309984516;
+    } else {
+        a = -1.0 / x;
+        hi = 1.57079632679489655800;
+        lo = 0.0000000000000000061232339957367660359;
+    }
+    let z : f64 = a * a;
+    let w : f64 = z * z;
+    let odd : f64 = z
+        * (0.333333333333329318027
+            + w
+                * (0.142857142725034663711
+                    + w
+                        * (0.0909088713343650656196
+                            + w
+                                * (0.0666107313738753120669
+                                    + w * (0.0497687799461593236017 + w * 0.0162858201153657823623)))));
+    let even : f64 = w
+        * (-0.199999999998764832476
+            + w
+                * (-0.111111104054623557880
+                    + w
+                        * (-0.0769187620504482999495
+                            + w * (-0.0583357013379057348645 + w * -0.0365315727442169155270))));
+    if (!reduced) {
+        return a - a * (odd + even);
+    }
+    return hi - ((a * (odd + even) - lo) - a);
+}
+
+/** The angle whose tangent is `x`, in `-PI/2..PI/2` radians (f64). */
+pub fn atanD(x : f64) : f64 {
+    if (x != x) {
+        return 0.0;
+    }
+    if (x < 0.0) {
+        return 0.0 - trigAtanPositive(0.0 - x);
+    }
+    return trigAtanPositive(x);
+}
+
+/**
+ * The angle of the point `(x, y)` from the +X axis, in `-PI..PI` radians (f64), counter-clockwise; the usual
+ * `atan2`. The origin answers 0.
+ */
+pub fn atan2D(y : f64, x : f64) : f64 {
+    if (x == 0.0 && y == 0.0) {
+        return 0.0;
+    }
+    if (absD(x) >= absD(y)) {
+        let a : f64 = atanD(y / x);
+        if (x < 0.0) {
+            if (y >= 0.0) {
+                return a + PI_D;
+            }
+            return a - PI_D;
+        }
+        return a;
+    }
+    let a : f64 = atanD(x / y);
+    if (y > 0.0) {
+        return HALF_PI_D - a;
+    }
+    return 0.0 - HALF_PI_D - a;
+}
+
+/** The angle in `0..PI` whose cosine is `x` (f64); `x` outside `-1..1` is clamped to it. */
+pub fn acosD(x : f64) : f64 {
+    if (x >= 1.0) {
+        return 0.0;
+    }
+    if (x <= -1.0) {
+        return PI_D;
+    }
+    return atan2D(sqrtD((1.0 - x) * (1.0 + x)), x);
+}
+
+/** The angle in `-PI/2..PI/2` whose sine is `x` (f64); `x` outside `-1..1` is clamped to it. */
+pub fn asinD(x : f64) : f64 {
+    if (x >= 1.0) {
+        return HALF_PI_D;
+    }
+    if (x <= -1.0) {
+        return 0.0 - HALF_PI_D;
+    }
+    return atan2D(x, sqrtD((1.0 - x) * (1.0 + x)));
+}
+
+/** The sine of an angle in radians. */
+pub fn sin(x : f32) : f32 {
+    return sinD(x as f64) as f32;
+}
+
+/** The cosine of an angle in radians. */
+pub fn cos(x : f32) : f32 {
+    return cosD(x as f64) as f32;
+}
+
+/** The tangent of an angle in radians; see `tanD` for the pole. */
+pub fn tan(x : f32) : f32 {
+    return tanD(x as f64) as f32;
+}
+
+/** The angle whose tangent is `x`, in `-PI/2..PI/2` radians. */
+pub fn atan(x : f32) : f32 {
+    return atanD(x as f64) as f32;
+}
+
+/** The angle of the point `(x, y)` from the +X axis, in `-PI..PI` radians; the origin answers 0. */
+pub fn atan2(y : f32, x : f32) : f32 {
+    return atan2D(y as f64, x as f64) as f32;
+}
+
+/** The angle in `0..PI` whose cosine is `x`; `x` outside `-1..1` is clamped to it. */
+pub fn acos(x : f32) : f32 {
+    return acosD(x as f64) as f32;
+}
+
+/** The angle in `-PI/2..PI/2` whose sine is `x`; `x` outside `-1..1` is clamped to it. */
+pub fn asin(x : f32) : f32 {
+    return asinD(x as f64) as f32;
+}

@@ -1,0 +1,241 @@
+// geom — the shapes of space queries: box, sphere, ray and plane.
+//
+// Plain value types with the questions that need only the shape itself (containment, distance, growing a
+// box). Questions between two shapes live in `intersect`; the six planes of a camera in `frustum`.
+
+use crate::core::math::mat4::Mat4;
+use crate::core::math::scalar::HUGE;
+use crate::core::math::vec3::Vec3;
+
+// A box has eight corners, numbered by the bits of `corner`: bit 0 picks x, bit 1 y, bit 2 z.
+const G_CORNERS : i32 = 8;
+
+// Below this squared length a normal has no direction.
+const G_TINY : f32 = 0.00000000000000000001;
+
+/** An axis-aligned box given by its smallest and largest corners. */
+pub struct Aabb {
+    /** The corner with the smallest coordinates. */
+    pub min : Vec3 = Vec3 { x: 0.0, y: 0.0, z: 0.0 };
+
+    /** The corner with the largest coordinates. */
+    pub max : Vec3 = Vec3 { x: 0.0, y: 0.0, z: 0.0 };
+
+    /** A box from its two corners (`min` must not exceed `max` on any axis, or the box is empty). */
+    pub static fn make(lo : Vec3, hi : Vec3) : Aabb {
+        return Aabb { min: lo, max: hi };
+    }
+
+    /** A box around `center`, reaching `halfSize` in each direction along the axes. */
+    pub static fn fromCenterHalfSize(center : Vec3, halfSize : Vec3) : Aabb {
+        return Aabb { min: center.minus(halfSize), max: center.plus(halfSize) };
+    }
+
+    /** The box that contains nothing: growing it by a point gives exactly that point. */
+    pub static fn empty() : Aabb {
+        return Aabb { min: Vec3::splat(HUGE), max: Vec3::splat(-HUGE) };
+    }
+
+    /** Whether the box contains no point at all. */
+    pub fn isEmpty(self) : bool {
+        return self.min.x > self.max.x || self.min.y > self.max.y || self.min.z > self.max.z;
+    }
+
+    /** The middle of the box. */
+    pub fn center(self) : Vec3 {
+        return self.min.plus(self.max).scale(0.5);
+    }
+
+    /** Half the box's size along each axis. */
+    pub fn halfSize(self) : Vec3 {
+        return self.max.minus(self.min).scale(0.5);
+    }
+
+    /** The size along each axis. */
+    pub fn size(self) : Vec3 {
+        return self.max.minus(self.min);
+    }
+
+    /** The enclosed volume; zero for an empty box. */
+    pub fn volume(self) : f32 {
+        if (self.isEmpty()) {
+            return 0.0;
+        }
+        let s : Vec3 = self.size();
+        return s.x * s.y * s.z;
+    }
+
+    /** The area of the six faces; zero for an empty box. */
+    pub fn surfaceArea(self) : f32 {
+        if (self.isEmpty()) {
+            return 0.0;
+        }
+        let s : Vec3 = self.size();
+        return (2.0 as f32) * (s.x * s.y + s.y * s.z + s.z * s.x);
+    }
+
+    /** One of the eight corners; bit 0 of `index` picks max x, bit 1 max y, bit 2 max z. */
+    pub fn corner(self, index : i32) : Vec3 {
+        let mut c : Vec3 = self.min;
+        if ((index & 1) != 0) {
+            c.x = self.max.x;
+        }
+        if ((index & 2) != 0) {
+            c.y = self.max.y;
+        }
+        if ((index & 4) != 0) {
+            c.z = self.max.z;
+        }
+        return c;
+    }
+
+    /** The smallest box holding this one and the point `p`. */
+    pub fn expandedToPoint(self, p : Vec3) : Aabb {
+        return Aabb { min: self.min.componentMin(p), max: self.max.componentMax(p) };
+    }
+
+    /** The smallest box holding both boxes; an empty box adds nothing. */
+    pub fn merged(self, o : Aabb) : Aabb {
+        return Aabb { min: self.min.componentMin(o.min), max: self.max.componentMax(o.max) };
+    }
+
+    /** The box grown by `amount` on every side (shrunk when negative). */
+    pub fn inflated(self, amount : f32) : Aabb {
+        return Aabb { min: self.min.minus(Vec3::splat(amount)), max: self.max.plus(Vec3::splat(amount)) };
+    }
+
+    /** Whether the point lies inside or on the box. */
+    pub fn contains(self, p : Vec3) : bool {
+        let inX : bool = p.x >= self.min.x && p.x <= self.max.x;
+        let inY : bool = p.y >= self.min.y && p.y <= self.max.y;
+        let inZ : bool = p.z >= self.min.z && p.z <= self.max.z;
+        return inX && inY && inZ;
+    }
+
+    /** Whether `o` lies entirely inside this box. */
+    pub fn containsBox(self, o : Aabb) : bool {
+        return !o.isEmpty() && self.contains(o.min) && self.contains(o.max);
+    }
+
+    /** The point of the box nearest to `p`: `p` itself when inside. */
+    pub fn closestPoint(self, p : Vec3) : Vec3 {
+        return p.componentMax(self.min).componentMin(self.max);
+    }
+
+    /** The smallest axis-aligned box around this box after the affine matrix `m` has moved it. */
+    pub fn transformed(self, m : Mat4) : Aabb {
+        let mut result : Aabb = Aabb::empty();
+        let mut i : i32 = 0;
+        while (i < G_CORNERS) {
+            result = result.expandedToPoint(m.transformPoint(self.corner(i)));
+            i = i + 1;
+        }
+        return result;
+    }
+}
+
+/** A ball: a centre and a radius. */
+pub struct Sphere {
+    /** The middle of the ball. */
+    pub center : Vec3 = Vec3 { x: 0.0, y: 0.0, z: 0.0 };
+
+    /** The distance from the middle to the surface. */
+    pub radius : f32 = 0.0;
+
+    /** A ball from its centre and radius. */
+    pub static fn make(center : Vec3, radius : f32) : Sphere {
+        return Sphere { center: center, radius: radius };
+    }
+
+    /** A ball around the box, centred on it: it holds the box, though it is not the smallest such ball. */
+    pub static fn enclosing(bounds : Aabb) : Sphere {
+        return Sphere { center: bounds.center(), radius: bounds.halfSize().length() };
+    }
+
+    /** Whether the point lies inside or on the ball. */
+    pub fn contains(self, p : Vec3) : bool {
+        return self.center.distanceSquared(p) <= self.radius * self.radius;
+    }
+
+    /** The smallest axis-aligned box around the ball. */
+    pub fn bounds(self) : Aabb {
+        return Aabb::fromCenterHalfSize(self.center, Vec3::splat(self.radius));
+    }
+}
+
+/** A half-line: an origin and the direction it runs in. */
+pub struct Ray {
+    /** Where the ray starts. */
+    pub origin : Vec3 = Vec3 { x: 0.0, y: 0.0, z: 0.0 };
+
+    /** Which way it runs. Distances along the ray are in units of this vector's length. */
+    pub direction : Vec3 = Vec3 { x: 0.0, y: 0.0, z: -1.0 };
+
+    /** A ray from its origin and direction; the direction is kept as given. */
+    pub static fn make(origin : Vec3, direction : Vec3) : Ray {
+        return Ray { origin: origin, direction: direction };
+    }
+
+    /** The ray from `from` through `to`, with a unit direction. */
+    pub static fn between(from : Vec3, to : Vec3) : Ray {
+        return Ray { origin: from, direction: to.minus(from).normalized() };
+    }
+
+    /** The point `t` along the ray. */
+    pub fn at(self, t : f32) : Vec3 {
+        return self.origin.plus(self.direction.scale(t));
+    }
+}
+
+/** An infinite flat surface: the points `p` with `normal . p + d = 0`. */
+pub struct Plane {
+    /** The direction the plane faces; unit length once `normalized`. */
+    pub normal : Vec3 = Vec3 { x: 0.0, y: 1.0, z: 0.0 };
+
+    /** The signed distance from the origin along the normal, negated: `-normal . pointOnPlane`. */
+    pub d : f32 = 0.0;
+
+    /** A plane from its equation `a x + b y + c z + d = 0`, normalised. */
+    pub static fn fromEquation(a : f32, b : f32, c : f32, d : f32) : Plane {
+        return Plane { normal: Vec3 { x: a, y: b, z: c }, d: d }.normalized();
+    }
+
+    /** The plane through `point` that faces along `normal` (which is normalised here). */
+    pub static fn fromPointNormal(point : Vec3, normal : Vec3) : Plane {
+        let n : Vec3 = normal.normalized();
+        return Plane { normal: n, d: -n.dot(point) };
+    }
+
+    /** The plane through the triangle `a`, `b`, `c`, facing the side where they run counter-clockwise. */
+    pub static fn fromTriangle(a : Vec3, b : Vec3, c : Vec3) : Plane {
+        return Plane::fromPointNormal(a, b.minus(a).cross(c.minus(a)));
+    }
+
+    /**
+     * The same plane with a unit normal. A zero normal cannot be normalised: it becomes the plane in front of
+     * which every point lies.
+     */
+    pub fn normalized(self) : Plane {
+        let lenSq : f32 = self.normal.lengthSquared();
+        if (!(lenSq > G_TINY)) {
+            return Plane { normal: Vec3::zero(), d: 1.0 };
+        }
+        let k : f32 = (1.0 as f32) / lenSq.sqrt();
+        return Plane { normal: self.normal.scale(k), d: self.d * k };
+    }
+
+    /** How far `p` is in front of the plane (negative: behind), in units of the normal's length. */
+    pub fn signedDistance(self, p : Vec3) : f32 {
+        return self.normal.dot(p) + self.d;
+    }
+
+    /** The point of the plane nearest to `p`; assumes a unit normal. */
+    pub fn closestPoint(self, p : Vec3) : Vec3 {
+        return p.minus(self.normal.scale(self.signedDistance(p)));
+    }
+
+    /** The same plane facing the other way. */
+    pub fn flipped(self) : Plane {
+        return Plane { normal: self.normal.negated(), d: -self.d };
+    }
+}

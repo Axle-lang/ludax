@@ -1,0 +1,533 @@
+// dmat4 — a 4x4 f64 matrix: model, view and projection transforms.
+// Generated from mat4.axle by tools/gen_math_f64.sh: edit the original, not this file.
+//
+// Sixteen named fields rather than an array, because Axle 0.18.3 miscompiles writes through fixed arrays and
+// because `m21` cannot be mistaken for `m12` the way index arithmetic can. A struct is a value: copying is
+// assignment and a matrix costs no allocation.
+//
+// Conventions, stated once because everything downstream depends on them:
+//
+//   * `mRC` is row R, column C. Storage in memory for the GPU is column-major (see `toColumnMajor`), which is
+//     what GLSL and Vulkan expect, so the same matrix goes to the shader without a transpose.
+//   * Column vectors: a point is transformed as `v' = M * v`, so composition reads right to left:
+//     `projection.mul(view).mul(model)` applies the model first.
+//   * Right-handed world, +Y up; the camera looks down -Z in view space.
+//   * Projections target Vulkan clip space: depth runs 0 (near) to 1 (far), and +Y points DOWN in normalised
+//     device coordinates, so no negative viewport height is needed. The `Reversed` variants map near to 1 and
+//     far to 0, which spends float precision where a perspective projection needs it; use them with a
+//     greater-or-equal depth test and a depth buffer cleared to 0.
+//
+// Constructors that divide check their inputs and answer the identity for nonsense (a zero aspect ratio,
+// equal planes): float division by zero traps in Axle, and a degenerate camera should not abort a frame.
+
+use crate::core::math::dmat3::DMat3;
+use crate::core::math::dvec3::DVec3;
+use crate::core::math::dvec4::DVec4;
+use crate::core::math::scalar::{absD, approxEqWithinD};
+use crate::core::math::trig::{sinD, cosD, tanD};
+
+// Below this a determinant is treated as zero: the matrix has no inverse.
+const D_M4_TINY : f64 = 0.000000000000000000000000000001;
+
+// The largest field of view a perspective accepts, just under a half turn.
+const D_M4_MAX_FOV : f64 = 3.14;
+
+/** A 4x4 transform. Defaults to the identity. */
+pub struct DMat4 {
+    /** Row 0, column 0. */
+    pub m00 : f64 = 1.0;
+
+    /** Row 0, column 1. */
+    pub m01 : f64 = 0.0;
+
+    /** Row 0, column 2. */
+    pub m02 : f64 = 0.0;
+
+    /** Row 0, column 3. */
+    pub m03 : f64 = 0.0;
+
+    /** Row 1, column 0. */
+    pub m10 : f64 = 0.0;
+
+    /** Row 1, column 1. */
+    pub m11 : f64 = 1.0;
+
+    /** Row 1, column 2. */
+    pub m12 : f64 = 0.0;
+
+    /** Row 1, column 3. */
+    pub m13 : f64 = 0.0;
+
+    /** Row 2, column 0. */
+    pub m20 : f64 = 0.0;
+
+    /** Row 2, column 1. */
+    pub m21 : f64 = 0.0;
+
+    /** Row 2, column 2. */
+    pub m22 : f64 = 1.0;
+
+    /** Row 2, column 3. */
+    pub m23 : f64 = 0.0;
+
+    /** Row 3, column 0. */
+    pub m30 : f64 = 0.0;
+
+    /** Row 3, column 1. */
+    pub m31 : f64 = 0.0;
+
+    /** Row 3, column 2. */
+    pub m32 : f64 = 0.0;
+
+    /** Row 3, column 3. */
+    pub m33 : f64 = 1.0;
+
+    /** The identity: transforms nothing. */
+    pub static fn identity() : DMat4 {
+        return DMat4 {};
+    }
+
+    /** Moves points by `v`. */
+    pub static fn translation(v : DVec3) : DMat4 {
+        return DMat4 { m03: v.x, m13: v.y, m23: v.z };
+    }
+
+    /** Scales along the axes by the components of `v`. */
+    pub static fn scaling(v : DVec3) : DMat4 {
+        return DMat4 { m00: v.x, m11: v.y, m22: v.z };
+    }
+
+    /** Turns counter-clockwise about +X by `radians`, seen from +X looking at the origin. */
+    pub static fn rotationX(radians : f64) : DMat4 {
+        let s : f64 = sinD(radians);
+        let c : f64 = cosD(radians);
+        return DMat4 { m11: c, m12: -s, m21: s, m22: c };
+    }
+
+    /** Turns counter-clockwise about +Y by `radians`. */
+    pub static fn rotationY(radians : f64) : DMat4 {
+        let s : f64 = sinD(radians);
+        let c : f64 = cosD(radians);
+        return DMat4 { m00: c, m02: s, m20: -s, m22: c };
+    }
+
+    /** Turns counter-clockwise about +Z by `radians`. */
+    pub static fn rotationZ(radians : f64) : DMat4 {
+        let s : f64 = sinD(radians);
+        let c : f64 = cosD(radians);
+        return DMat4 { m00: c, m01: -s, m10: s, m11: c };
+    }
+
+    /** A rotation or other 3x3 linear map, with no translation. */
+    pub static fn fromMat3(m : DMat3) : DMat4 {
+        return DMat4 {
+            m00: m.m00,
+            m01: m.m01,
+            m02: m.m02,
+            m10: m.m10,
+            m11: m.m11,
+            m12: m.m12,
+            m20: m.m20,
+            m21: m.m21,
+            m22: m.m22,
+        };
+    }
+
+    /**
+     * A perspective projection with a vertical field of view `fovY` in radians, `aspect` = width / height,
+     * and the near and far planes as positive distances. Vulkan clip space (see the file header). Degenerate
+     * input (non-positive aspect, planes that are not `0 < near < far`, a field of view outside `0..pi`)
+     * answers the identity.
+     */
+    pub static fn perspective(fovY : f64, aspect : f64, near : f64, far : f64) : DMat4 {
+        if (!DMat4::validPerspective(fovY, aspect, near, far) || !(far > near)) {
+            return DMat4 {};
+        }
+        let f : f64 = (1.0 as f64) / tanD(fovY * (0.5 as f64));
+        let depth : f64 = (1.0 as f64) / (near - far);
+        return DMat4 {
+            m00: f / aspect,
+            m11: -f,
+            m22: far * depth,
+            m23: near * far * depth,
+            m32: -1.0,
+            m33: 0.0,
+        };
+    }
+
+    /** Like `perspective` with depth reversed: near maps to 1 and far to 0. */
+    pub static fn perspectiveReversed(fovY : f64, aspect : f64, near : f64, far : f64) : DMat4 {
+        if (!DMat4::validPerspective(fovY, aspect, near, far) || !(far > near)) {
+            return DMat4 {};
+        }
+        let f : f64 = (1.0 as f64) / tanD(fovY * (0.5 as f64));
+        let depth : f64 = (1.0 as f64) / (far - near);
+        return DMat4 {
+            m00: f / aspect,
+            m11: -f,
+            m22: near * depth,
+            m23: near * far * depth,
+            m32: -1.0,
+            m33: 0.0,
+        };
+    }
+
+    /**
+     * Reversed depth with the far plane at infinity: near maps to 1 and depth tends to 0 with distance. The
+     * usual choice for open worlds, since nothing is ever clipped at the far end.
+     */
+    pub static fn perspectiveInfiniteReversed(fovY : f64, aspect : f64, near : f64) : DMat4 {
+        if (!DMat4::validPerspective(fovY, aspect, near, near + 1.0)) {
+            return DMat4 {};
+        }
+        let f : f64 = (1.0 as f64) / tanD(fovY * (0.5 as f64));
+        return DMat4 { m00: f / aspect, m11: -f, m22: 0.0, m23: near, m32: -1.0, m33: 0.0 };
+    }
+
+    // Whether the arguments of a perspective describe a camera at all.
+    static fn validPerspective(fovY : f64, aspect : f64, near : f64, far : f64) : bool {
+        return fovY > 0.0 && fovY < D_M4_MAX_FOV && aspect > 0.0 && near > 0.0 && far > 0.0;
+    }
+
+    /**
+     * An orthographic projection of the box `left..right`, `bottom..top` (view-space y, up) and distances
+     * `near..far` in front of the camera, to Vulkan clip space. An empty box answers the identity.
+     */
+    pub static fn ortho(left : f64, right : f64, bottom : f64, top : f64, near : f64, far : f64) : DMat4 {
+        if (right == left || top == bottom || far == near) {
+            return DMat4 {};
+        }
+        let width : f64 = (1.0 as f64) / (right - left);
+        let height : f64 = (1.0 as f64) / (top - bottom);
+        let depth : f64 = (1.0 as f64) / (far - near);
+        return DMat4 {
+            m00: (2.0 as f64) * width,
+            m03: -(right + left) * width,
+            m11: (-2.0 as f64) * height,
+            m13: (top + bottom) * height,
+            m22: -depth,
+            m23: -near * depth,
+        };
+    }
+
+    /** Like `ortho` with depth reversed: near maps to 1 and far to 0. */
+    pub static fn orthoReversed(
+        left : f64,
+        right : f64,
+        bottom : f64,
+        top : f64,
+        near : f64,
+        far : f64
+    ) : DMat4 {
+        if (right == left || top == bottom || far == near) {
+            return DMat4 {};
+        }
+        let width : f64 = (1.0 as f64) / (right - left);
+        let height : f64 = (1.0 as f64) / (top - bottom);
+        let depth : f64 = (1.0 as f64) / (far - near);
+        return DMat4 {
+            m00: (2.0 as f64) * width,
+            m03: -(right + left) * width,
+            m11: (-2.0 as f64) * height,
+            m13: (top + bottom) * height,
+            m22: depth,
+            m23: far * depth,
+        };
+    }
+
+    /**
+     * The view matrix of a camera at `eye` looking at `target`, with `up` as the roughly-upward direction.
+     * If `eye == target` there is no direction and only the translation applies; if `up` is parallel to the
+     * view direction another perpendicular is picked.
+     */
+    pub static fn lookAt(eye : DVec3, target : DVec3, up : DVec3) : DMat4 {
+        let forward : DVec3 = target.minus(eye).normalized();
+        if (forward.lengthSquared() == 0.0) {
+            return DMat4::translation(eye.negated());
+        }
+        let mut side : DVec3 = forward.cross(up).normalized();
+        if (side.lengthSquared() == 0.0) {
+            side = forward.anyPerpendicular();
+        }
+        let upward : DVec3 = side.cross(forward);
+        return DMat4 {
+            m00: side.x,
+            m01: side.y,
+            m02: side.z,
+            m03: -side.dot(eye),
+            m10: upward.x,
+            m11: upward.y,
+            m12: upward.z,
+            m13: -upward.dot(eye),
+            m20: -forward.x,
+            m21: -forward.y,
+            m22: -forward.z,
+            m23: forward.dot(eye),
+        };
+    }
+
+    /** This matrix times `o`: `o` is applied first, then this one. */
+    pub fn mul(self, o : DMat4) : DMat4 {
+        return DMat4 {
+            m00: self.m00 * o.m00 + self.m01 * o.m10 + self.m02 * o.m20 + self.m03 * o.m30,
+            m01: self.m00 * o.m01 + self.m01 * o.m11 + self.m02 * o.m21 + self.m03 * o.m31,
+            m02: self.m00 * o.m02 + self.m01 * o.m12 + self.m02 * o.m22 + self.m03 * o.m32,
+            m03: self.m00 * o.m03 + self.m01 * o.m13 + self.m02 * o.m23 + self.m03 * o.m33,
+            m10: self.m10 * o.m00 + self.m11 * o.m10 + self.m12 * o.m20 + self.m13 * o.m30,
+            m11: self.m10 * o.m01 + self.m11 * o.m11 + self.m12 * o.m21 + self.m13 * o.m31,
+            m12: self.m10 * o.m02 + self.m11 * o.m12 + self.m12 * o.m22 + self.m13 * o.m32,
+            m13: self.m10 * o.m03 + self.m11 * o.m13 + self.m12 * o.m23 + self.m13 * o.m33,
+            m20: self.m20 * o.m00 + self.m21 * o.m10 + self.m22 * o.m20 + self.m23 * o.m30,
+            m21: self.m20 * o.m01 + self.m21 * o.m11 + self.m22 * o.m21 + self.m23 * o.m31,
+            m22: self.m20 * o.m02 + self.m21 * o.m12 + self.m22 * o.m22 + self.m23 * o.m32,
+            m23: self.m20 * o.m03 + self.m21 * o.m13 + self.m22 * o.m23 + self.m23 * o.m33,
+            m30: self.m30 * o.m00 + self.m31 * o.m10 + self.m32 * o.m20 + self.m33 * o.m30,
+            m31: self.m30 * o.m01 + self.m31 * o.m11 + self.m32 * o.m21 + self.m33 * o.m31,
+            m32: self.m30 * o.m02 + self.m31 * o.m12 + self.m32 * o.m22 + self.m33 * o.m32,
+            m33: self.m30 * o.m03 + self.m31 * o.m13 + self.m32 * o.m23 + self.m33 * o.m33,
+        };
+    }
+
+    /** Writes `a * b` into this matrix; `a` and `b` may be this matrix itself. */
+    pub fn setMul(mut self, a : DMat4, b : DMat4) : void {
+        let product : DMat4 = a.mul(b);
+        self.copyFrom(product);
+    }
+
+    /** Overwrites every field with those of `o`. */
+    pub fn copyFrom(mut self, o : DMat4) : void {
+        self.m00 = o.m00;
+        self.m01 = o.m01;
+        self.m02 = o.m02;
+        self.m03 = o.m03;
+        self.m10 = o.m10;
+        self.m11 = o.m11;
+        self.m12 = o.m12;
+        self.m13 = o.m13;
+        self.m20 = o.m20;
+        self.m21 = o.m21;
+        self.m22 = o.m22;
+        self.m23 = o.m23;
+        self.m30 = o.m30;
+        self.m31 = o.m31;
+        self.m32 = o.m32;
+        self.m33 = o.m33;
+    }
+
+    /** Rows and columns exchanged. */
+    pub fn transposed(self) : DMat4 {
+        return DMat4 {
+            m00: self.m00,
+            m01: self.m10,
+            m02: self.m20,
+            m03: self.m30,
+            m10: self.m01,
+            m11: self.m11,
+            m12: self.m21,
+            m13: self.m31,
+            m20: self.m02,
+            m21: self.m12,
+            m22: self.m22,
+            m23: self.m32,
+            m30: self.m03,
+            m31: self.m13,
+            m32: self.m23,
+            m33: self.m33,
+        };
+    }
+
+    /** The determinant: zero exactly when the matrix flattens space and has no inverse. */
+    pub fn determinant(self) : f64 {
+        let s0 : f64 = self.m00 * self.m11 - self.m10 * self.m01;
+        let s1 : f64 = self.m00 * self.m12 - self.m10 * self.m02;
+        let s2 : f64 = self.m00 * self.m13 - self.m10 * self.m03;
+        let s3 : f64 = self.m01 * self.m12 - self.m11 * self.m02;
+        let s4 : f64 = self.m01 * self.m13 - self.m11 * self.m03;
+        let s5 : f64 = self.m02 * self.m13 - self.m12 * self.m03;
+        let c5 : f64 = self.m22 * self.m33 - self.m32 * self.m23;
+        let c4 : f64 = self.m21 * self.m33 - self.m31 * self.m23;
+        let c3 : f64 = self.m21 * self.m32 - self.m31 * self.m22;
+        let c2 : f64 = self.m20 * self.m33 - self.m30 * self.m23;
+        let c1 : f64 = self.m20 * self.m32 - self.m30 * self.m22;
+        let c0 : f64 = self.m20 * self.m31 - self.m30 * self.m21;
+        return s0 * c5 - s1 * c4 + s2 * c3 + s3 * c2 - s4 * c1 + s5 * c0;
+    }
+
+    /** Whether `inverse` is meaningful. */
+    pub fn isInvertible(self) : bool {
+        return absD(self.determinant()) > D_M4_TINY;
+    }
+
+    /**
+     * The general inverse, by cofactors. A singular matrix has none and answers the identity; ask
+     * `isInvertible` first when that matters. For a rigid or affine transform `inverseAffine` is cheaper.
+     */
+    pub fn inverse(self) : DMat4 {
+        let s0 : f64 = self.m00 * self.m11 - self.m10 * self.m01;
+        let s1 : f64 = self.m00 * self.m12 - self.m10 * self.m02;
+        let s2 : f64 = self.m00 * self.m13 - self.m10 * self.m03;
+        let s3 : f64 = self.m01 * self.m12 - self.m11 * self.m02;
+        let s4 : f64 = self.m01 * self.m13 - self.m11 * self.m03;
+        let s5 : f64 = self.m02 * self.m13 - self.m12 * self.m03;
+        let c5 : f64 = self.m22 * self.m33 - self.m32 * self.m23;
+        let c4 : f64 = self.m21 * self.m33 - self.m31 * self.m23;
+        let c3 : f64 = self.m21 * self.m32 - self.m31 * self.m22;
+        let c2 : f64 = self.m20 * self.m33 - self.m30 * self.m23;
+        let c1 : f64 = self.m20 * self.m32 - self.m30 * self.m22;
+        let c0 : f64 = self.m20 * self.m31 - self.m30 * self.m21;
+        let det : f64 = s0 * c5 - s1 * c4 + s2 * c3 + s3 * c2 - s4 * c1 + s5 * c0;
+        if (!(absD(det) > D_M4_TINY)) {
+            return DMat4 {};
+        }
+        let k : f64 = (1.0 as f64) / det;
+        return DMat4 {
+            m00: (self.m11 * c5 - self.m12 * c4 + self.m13 * c3) * k,
+            m01: (-self.m01 * c5 + self.m02 * c4 - self.m03 * c3) * k,
+            m02: (self.m31 * s5 - self.m32 * s4 + self.m33 * s3) * k,
+            m03: (-self.m21 * s5 + self.m22 * s4 - self.m23 * s3) * k,
+            m10: (-self.m10 * c5 + self.m12 * c2 - self.m13 * c1) * k,
+            m11: (self.m00 * c5 - self.m02 * c2 + self.m03 * c1) * k,
+            m12: (-self.m30 * s5 + self.m32 * s2 - self.m33 * s1) * k,
+            m13: (self.m20 * s5 - self.m22 * s2 + self.m23 * s1) * k,
+            m20: (self.m10 * c4 - self.m11 * c2 + self.m13 * c0) * k,
+            m21: (-self.m00 * c4 + self.m01 * c2 - self.m03 * c0) * k,
+            m22: (self.m30 * s4 - self.m31 * s2 + self.m33 * s0) * k,
+            m23: (-self.m20 * s4 + self.m21 * s2 - self.m23 * s0) * k,
+            m30: (-self.m10 * c3 + self.m11 * c1 - self.m12 * c0) * k,
+            m31: (self.m00 * c3 - self.m01 * c1 + self.m02 * c0) * k,
+            m32: (-self.m30 * s3 + self.m31 * s1 - self.m32 * s0) * k,
+            m33: (self.m20 * s3 - self.m21 * s1 + self.m22 * s0) * k,
+        };
+    }
+
+    /**
+     * The inverse of an affine transform (bottom row 0 0 0 1: translation, rotation, scale, shear), from the
+     * inverse of its 3x3 part. It is only meaningful for such matrices; a projection needs `inverse`. A
+     * singular 3x3 part answers the identity.
+     */
+    pub fn inverseAffine(self) : DMat4 {
+        let linear : DMat3 = self.upper3x3();
+        if (!linear.isInvertible()) {
+            return DMat4 {};
+        }
+        let inv : DMat3 = linear.inverse();
+        let t : DVec3 = inv.transform(self.translationPart()).negated();
+        return DMat4 {
+            m00: inv.m00,
+            m01: inv.m01,
+            m02: inv.m02,
+            m03: t.x,
+            m10: inv.m10,
+            m11: inv.m11,
+            m12: inv.m12,
+            m13: t.y,
+            m20: inv.m20,
+            m21: inv.m21,
+            m22: inv.m22,
+            m23: t.z,
+        };
+    }
+
+    /** The 3x3 linear part: rotation and scale without the translation. */
+    pub fn upper3x3(self) : DMat3 {
+        return DMat3 {
+            m00: self.m00,
+            m01: self.m01,
+            m02: self.m02,
+            m10: self.m10,
+            m11: self.m11,
+            m12: self.m12,
+            m20: self.m20,
+            m21: self.m21,
+            m22: self.m22,
+        };
+    }
+
+    /** The translation: where the origin goes. */
+    pub fn translationPart(self) : DVec3 {
+        return DVec3 { x: self.m03, y: self.m13, z: self.m23 };
+    }
+
+    /** The point `p` transformed as an affine map (bottom row unused): linear part, then translation. */
+    pub fn transformPoint(self, p : DVec3) : DVec3 {
+        return DVec3 {
+            x: self.m00 * p.x + self.m01 * p.y + self.m02 * p.z + self.m03,
+            y: self.m10 * p.x + self.m11 * p.y + self.m12 * p.z + self.m13,
+            z: self.m20 * p.x + self.m21 * p.y + self.m22 * p.z + self.m23,
+        };
+    }
+
+    /** The direction `v` transformed without the translation: a normal-free offset, a velocity. */
+    pub fn transformVector(self, v : DVec3) : DVec3 {
+        return DVec3 {
+            x: self.m00 * v.x + self.m01 * v.y + self.m02 * v.z,
+            y: self.m10 * v.x + self.m11 * v.y + self.m12 * v.z,
+            z: self.m20 * v.x + self.m21 * v.y + self.m22 * v.z,
+        };
+    }
+
+    /** The full 4-component product `M * v`, for clip-space work. */
+    pub fn transformVec4(self, v : DVec4) : DVec4 {
+        return DVec4 {
+            x: self.m00 * v.x + self.m01 * v.y + self.m02 * v.z + self.m03 * v.w,
+            y: self.m10 * v.x + self.m11 * v.y + self.m12 * v.z + self.m13 * v.w,
+            z: self.m20 * v.x + self.m21 * v.y + self.m22 * v.z + self.m23 * v.w,
+            w: self.m30 * v.x + self.m31 * v.y + self.m32 * v.z + self.m33 * v.w,
+        };
+    }
+
+    /**
+     * The point `p` through a projection, divided by w: normalised device coordinates. A point on the
+     * camera's plane (w = 0) has none and answers the zero vector.
+     */
+    pub fn projectPoint(self, p : DVec3) : DVec3 {
+        let clip : DVec4 = self.transformVec4(DVec4 { x: p.x, y: p.y, z: p.z, w: 1.0 });
+        if (clip.w == 0.0) {
+            return DVec3::zero();
+        }
+        let inv : f64 = (1.0 as f64) / clip.w;
+        return DVec3 { x: clip.x * inv, y: clip.y * inv, z: clip.z * inv };
+    }
+
+    /** Whether every field differs from `o`'s by at most `tolerance`. */
+    pub fn approxEq(self, o : DMat4, tolerance : f64) : bool {
+        return approxEqWithinD(self.m00, o.m00, tolerance) && approxEqWithinD(self.m01, o.m01, tolerance)
+            && approxEqWithinD(self.m02, o.m02, tolerance)
+            && approxEqWithinD(self.m03, o.m03, tolerance)
+            && approxEqWithinD(self.m10, o.m10, tolerance)
+            && approxEqWithinD(self.m11, o.m11, tolerance)
+            && approxEqWithinD(self.m12, o.m12, tolerance)
+            && approxEqWithinD(self.m13, o.m13, tolerance)
+            && approxEqWithinD(self.m20, o.m20, tolerance)
+            && approxEqWithinD(self.m21, o.m21, tolerance)
+            && approxEqWithinD(self.m22, o.m22, tolerance)
+            && approxEqWithinD(self.m23, o.m23, tolerance)
+            && approxEqWithinD(self.m30, o.m30, tolerance)
+            && approxEqWithinD(self.m31, o.m31, tolerance)
+            && approxEqWithinD(self.m32, o.m32, tolerance)
+            && approxEqWithinD(self.m33, o.m33, tolerance);
+    }
+
+    /**
+     * Writes the 16 fields into `out` starting at `offset` in column-major order, the layout of a GLSL `mat4`
+     * and a Vulkan uniform. `out` must hold at least `offset + 16` elements.
+     */
+    pub fn toColumnMajor(self, out : f64[], offset : i64) : void {
+        out[offset + 0] = self.m00;
+        out[offset + 1] = self.m10;
+        out[offset + 2] = self.m20;
+        out[offset + 3] = self.m30;
+        out[offset + 4] = self.m01;
+        out[offset + 5] = self.m11;
+        out[offset + 6] = self.m21;
+        out[offset + 7] = self.m31;
+        out[offset + 8] = self.m02;
+        out[offset + 9] = self.m12;
+        out[offset + 10] = self.m22;
+        out[offset + 11] = self.m32;
+        out[offset + 12] = self.m03;
+        out[offset + 13] = self.m13;
+        out[offset + 14] = self.m23;
+        out[offset + 15] = self.m33;
+    }
+}
