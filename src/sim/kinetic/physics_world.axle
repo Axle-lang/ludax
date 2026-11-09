@@ -1,0 +1,724 @@
+// physics_world — PhysicsWorld, the rigid-body simulation a game talks to.
+//
+// The world owns the bodies, joints and contacts and advances them in fixed internal steps: forces become
+// velocities, the broad phase finds touching pairs, the narrow phase makes contact points, the solver finds the
+// impulses that keep bodies apart and joints together, positions advance, and resting islands go to sleep. The
+// step length is `settings.substep` and never changes, so the same inputs give the same state on every run;
+// `step(dt)` banks real time and runs as many whole steps as fit, while `advance()` runs exactly one (for
+// callers that already pace themselves with a `FixedStep`).
+
+use crate::core::collections::vec::Vec;
+use crate::core::id::entity_id::EntityId;
+use crate::core::math::dquat::DQuat;
+use crate::core::math::dvec3::DVec3;
+use crate::core::math::scalar::maxD;
+use crate::sim::kinetic::body_store::{BodyDesc, BodyStore};
+use crate::sim::kinetic::broad_phase::BroadPhase;
+use crate::sim::kinetic::contact_buffer::ContactBuffer;
+use crate::sim::kinetic::contact_set::{ContactPoint, ContactSet, Manifold};
+use crate::sim::kinetic::contact_solver::ContactSolver;
+use crate::sim::kinetic::debug_draw::{
+    DebugDraw, DEBUG_COLOR_STATIC, DEBUG_COLOR_AWAKE, DEBUG_COLOR_ASLEEP, DEBUG_COLOR_KINEMATIC,
+    DEBUG_COLOR_CONTACT, DEBUG_COLOR_JOINT
+};
+use crate::sim::kinetic::joint_set::{JOINT_BALL_SOCKET, JOINT_DISTANCE, JOINT_HINGE, Joint, JointSet};
+use crate::sim::kinetic::joint_solver::JointSolver;
+use crate::sim::kinetic::kinetic_sort::KineticSort;
+use crate::sim::kinetic::narrow::Narrow;
+use crate::sim::kinetic::physics_measure::PhysicsMeasure;
+use crate::sim::kinetic::physics_query::{PhysicsQuery, RayCastHit};
+use crate::sim::kinetic::physics_settings::PhysicsSettings;
+use crate::sim::kinetic::shape::{Placed, Shape};
+use crate::sim::kinetic::sleeper::Sleeper;
+use crate::sim::kinetic::solver_state::SolverState;
+use crate::sim::kinetic::state_hash::StateHash;
+
+// A single `step` runs at most this many internal steps, so a long frame cannot spiral into a freeze.
+const WORLD_MAX_STEPS : i32 = 64;
+
+// Collide passes per step: a pass that wakes a sleeping island is redone.
+const WORLD_COLLIDE_PASSES : i32 = 3;
+
+// Slack on the banked-time comparison, so a step is not lost to a rounding hair.
+const WORLD_TIME_SLACK : f64 = 0.000000000001;
+
+// Rotation below this many radians per step is not worth a quaternion update.
+const WORLD_MIN_TURN : f64 = 0.000000000001;
+
+// Length of the normal line drawn at each contact point in debug output.
+const WORLD_DEBUG_NORMAL : f64 = 0.25;
+
+// What a stale handle's shape reads as: a sphere of this radius, the default `Shape`.
+const WORLD_STALE_RADIUS : f64 = 0.5;
+
+/** A rigid-body physics world. */
+pub class PhysicsWorld {
+    pub(crate) cfg      : PhysicsSettings;
+    pub(crate) store    : BodyStore;
+    pub(crate) joints   : JointSet;
+    pub(crate) broad    : BroadPhase;
+    pub(crate) contacts : ContactSet;
+    state               : SolverState;
+    scratch             : ContactBuffer;
+    skip                : i64[];
+    skipCount           : i32 = 0;
+    banked              : f64 = 0.0;
+    stepsDone           : i64 = 0;
+    islands             : i32 = 0;
+
+    /** A world with the given settings. */
+    constructor(settings : PhysicsSettings) {
+        self.cfg = settings;
+        self.store = new BodyStore();
+        self.joints = new JointSet();
+        self.broad = new BroadPhase();
+        self.contacts = new ContactSet();
+        self.state = new SolverState();
+        self.scratch = new ContactBuffer();
+        self.skip = new i64[1];
+    }
+
+    /** The settings in force. */
+    pub fn settings(self) : PhysicsSettings {
+        return self.cfg;
+    }
+
+    /** Replaces the settings; takes effect from the next step. */
+    pub fn setSettings(mut self, settings : PhysicsSettings) : void {
+        self.cfg = settings;
+    }
+
+    // ---- bodies ----
+
+    /** Adds a body to the world and returns its handle. */
+    pub fn addBody(mut self, desc : BodyDesc) : EntityId {
+        return self.store.add(desc);
+    }
+
+    /** Removes a body and every joint attached to it; false when the handle is stale. */
+    pub fn removeBody(mut self, id : EntityId) : bool {
+        let i : i32 = self.store.slotOf(id);
+        if (i < 0) {
+            return false;
+        }
+        for (j of 0..self.joints.items.len()) {
+            let mut jt : Joint = self.joints.items.get(j);
+            if (jt.active && (jt.a == i || jt.b == i)) {
+                jt.active = false;
+                self.joints.items.set(j, jt);
+            }
+        }
+        return self.store.remove(id);
+    }
+
+    /** Whether the handle names a body that still exists. */
+    pub fn hasBody(self, id : EntityId) : bool {
+        return self.store.slotOf(id) >= 0;
+    }
+
+    /** How many bodies exist. */
+    pub fn bodyCount(self) : i32 {
+        return self.store.liveCount();
+    }
+
+    /** The handle of the body in slot `i`, or the none id; slots run 0 to `slotCount() - 1` in creation order. */
+    pub fn bodyAt(self, i : i32) : EntityId {
+        return self.store.handleOf(i);
+    }
+
+    /** One more than the highest body slot ever used. */
+    pub fn slotCount(self) : i32 {
+        return self.store.slotCount();
+    }
+
+    /** The position of a body's centre of mass. */
+    pub fn position(self, id : EntityId) : DVec3 {
+        let i : i32 = self.store.slotOf(id);
+        if (i < 0) {
+            return DVec3::zero();
+        }
+        return self.store.position.get(i);
+    }
+
+    /** The orientation of a body. */
+    pub fn rotation(self, id : EntityId) : DQuat {
+        let i : i32 = self.store.slotOf(id);
+        if (i < 0) {
+            return DQuat::identity();
+        }
+        return self.store.rotation.get(i);
+    }
+
+    /** A body's linear velocity. */
+    pub fn linearVelocity(self, id : EntityId) : DVec3 {
+        let i : i32 = self.store.slotOf(id);
+        if (i < 0) {
+            return DVec3::zero();
+        }
+        return self.store.linearVelocity.get(i);
+    }
+
+    /** A body's angular velocity (radians per second). */
+    pub fn angularVelocity(self, id : EntityId) : DVec3 {
+        let i : i32 = self.store.slotOf(id);
+        if (i < 0) {
+            return DVec3::zero();
+        }
+        return self.store.angularVelocity.get(i);
+    }
+
+    /** The collision shape of a body (a default sphere for a stale handle). */
+    pub fn shapeOf(self, id : EntityId) : Shape {
+        let i : i32 = self.store.slotOf(id);
+        if (i < 0) {
+            return Shape::sphere(WORLD_STALE_RADIUS);
+        }
+        return self.store.shape.get(i);
+    }
+
+    /** Whether the body is static (never moves). */
+    pub fn isStatic(self, id : EntityId) : bool {
+        let i : i32 = self.store.slotOf(id);
+        return i >= 0 && self.store.isStatic(i);
+    }
+
+    /** A body's mass; zero for static and kinematic bodies. */
+    pub fn mass(self, id : EntityId) : f64 {
+        let i : i32 = self.store.slotOf(id);
+        if (i < 0) {
+            return 0.0;
+        }
+        return self.store.mass.get(i);
+    }
+
+    /** The number the game stored with the body. */
+    pub fn userData(self, id : EntityId) : i64 {
+        let i : i32 = self.store.slotOf(id);
+        if (i < 0) {
+            return 0;
+        }
+        return self.store.userData.get(i);
+    }
+
+    /** Whether the body is asleep. */
+    pub fn isAsleep(self, id : EntityId) : bool {
+        let i : i32 = self.store.slotOf(id);
+        return i >= 0 && self.store.asleep.get(i);
+    }
+
+    /** Moves a body (a teleport: no collision on the way) and wakes it. */
+    pub fn setPosition(mut self, id : EntityId, p : DVec3) : void {
+        let i : i32 = self.store.slotOf(id);
+        if (i >= 0) {
+            self.store.position.set(i, p);
+            Sleeper::wakeIsland(self.store, i);
+        }
+    }
+
+    /** Turns a body (a teleport) and wakes it. */
+    pub fn setRotation(mut self, id : EntityId, q : DQuat) : void {
+        let i : i32 = self.store.slotOf(id);
+        if (i >= 0) {
+            self.store.rotation.set(i, q.normalized());
+            self.store.refreshInertia(i);
+            Sleeper::wakeIsland(self.store, i);
+        }
+    }
+
+    /** Sets a body's linear velocity and wakes it. A kinematic body moves with it. */
+    pub fn setLinearVelocity(mut self, id : EntityId, v : DVec3) : void {
+        let i : i32 = self.store.slotOf(id);
+        if (i >= 0) {
+            self.store.linearVelocity.set(i, v);
+            self.store.prevLinearVelocity.set(i, v);
+            Sleeper::wakeIsland(self.store, i);
+        }
+    }
+
+    /** Sets a body's angular velocity and wakes it. */
+    pub fn setAngularVelocity(mut self, id : EntityId, w : DVec3) : void {
+        let i : i32 = self.store.slotOf(id);
+        if (i >= 0) {
+            self.store.angularVelocity.set(i, w);
+            self.store.prevAngularVelocity.set(i, w);
+            Sleeper::wakeIsland(self.store, i);
+        }
+    }
+
+    /** Applies a force (newtons) at the centre of mass for the next step only, and wakes the body. */
+    pub fn applyForce(mut self, id : EntityId, f : DVec3) : void {
+        let i : i32 = self.store.slotOf(id);
+        if (i >= 0 && self.store.isDynamic(i)) {
+            self.store.force.set(i, self.store.force.get(i).plus(f));
+            Sleeper::wakeIsland(self.store, i);
+        }
+    }
+
+    /** Applies a torque for the next step only, and wakes the body. */
+    pub fn applyTorque(mut self, id : EntityId, t : DVec3) : void {
+        let i : i32 = self.store.slotOf(id);
+        if (i >= 0 && self.store.isDynamic(i)) {
+            self.store.torque.set(i, self.store.torque.get(i).plus(t));
+            Sleeper::wakeIsland(self.store, i);
+        }
+    }
+
+    /** Changes the velocity at once by an impulse (newton-seconds) applied at the world point `at`. */
+    pub fn applyImpulseAt(mut self, id : EntityId, impulse : DVec3, at : DVec3) : void {
+        let i : i32 = self.store.slotOf(id);
+        if (i >= 0 && self.store.isDynamic(i)) {
+            Sleeper::wakeIsland(self.store, i);
+
+            // The velocities the impulse produces are also the previous ones, so the step sees no jump.
+            let dv : DVec3 = impulse.scale(self.store.invMass.get(i));
+            let lin : DVec3 = self.store.linearVelocity.get(i).plus(dv);
+            self.store.linearVelocity.set(i, lin);
+            self.store.prevLinearVelocity.set(i, lin);
+
+            let torque : DVec3 = at.minus(self.store.position.get(i)).cross(impulse);
+            let dw : DVec3 = self.store.invInertiaW.get(i).transform(torque);
+            let ang : DVec3 = self.store.angularVelocity.get(i).plus(dw);
+            self.store.angularVelocity.set(i, ang);
+            self.store.prevAngularVelocity.set(i, ang);
+        }
+    }
+
+    // ---- joints ----
+
+    /** Joins two bodies at the world point `anchor` so they can turn freely about it; `none` for the world. */
+    pub fn addBallSocket(mut self, a : EntityId, b : EntityId, anchor : DVec3) : i32 {
+        let ia : i32 = self.store.slotOf(a);
+        let ib : i32 = self.store.slotOf(b);
+        let j : Joint = Joint {
+            kind: JOINT_BALL_SOCKET,
+            a: ia,
+            b: ib,
+            anchorA: self.localPoint(ia, anchor),
+            anchorB: self.localPoint(ib, anchor),
+        };
+        return self.joints.add(j);
+    }
+
+    /** Keeps the world points `anchorA` of body `a` and `anchorB` of body `b` at their present distance. */
+    pub fn addDistance(mut self, a : EntityId, b : EntityId, anchorA : DVec3, anchorB : DVec3) : i32 {
+        let ia : i32 = self.store.slotOf(a);
+        let ib : i32 = self.store.slotOf(b);
+        let j : Joint = Joint {
+            kind: JOINT_DISTANCE,
+            a: ia,
+            b: ib,
+            anchorA: self.localPoint(ia, anchorA),
+            anchorB: self.localPoint(ib, anchorB),
+            length: anchorA.distance(anchorB),
+        };
+        return self.joints.add(j);
+    }
+
+    /** Joins two bodies at `anchor` so they can only turn about `axis` (both in world coordinates). */
+    pub fn addHinge(mut self, a : EntityId, b : EntityId, anchor : DVec3, axis : DVec3) : i32 {
+        let ia : i32 = self.store.slotOf(a);
+        let ib : i32 = self.store.slotOf(b);
+        let axisDir : DVec3 = axis.normalizedOr(DVec3::unitY());
+        let refDir : DVec3 = axisDir.anyPerpendicular();
+        let j : Joint = Joint {
+            kind: JOINT_HINGE,
+            a: ia,
+            b: ib,
+            anchorA: self.localPoint(ia, anchor),
+            anchorB: self.localPoint(ib, anchor),
+            axisA: self.localDir(ia, axisDir),
+            axisB: self.localDir(ib, axisDir),
+            refA: self.localDir(ia, refDir),
+            refB: self.localDir(ib, refDir),
+        };
+        return self.joints.add(j);
+    }
+
+    /** Limits a hinge to angles between `lower` and `upper` radians, measured from its creation pose. */
+    pub fn setHingeLimits(mut self, joint : i32, lower : f64, upper : f64) : void {
+        if (self.joints.has(joint)) {
+            let mut j : Joint = self.joints.items.get(joint);
+            j.limited = true;
+            j.lower = lower;
+            j.upper = upper;
+            self.joints.items.set(joint, j);
+        }
+    }
+
+    /** Lets the bodies of a joint collide with each other (they do not by default). */
+    pub fn setJointCollide(mut self, joint : i32, collide : bool) : void {
+        if (self.joints.has(joint)) {
+            let mut j : Joint = self.joints.items.get(joint);
+            j.collide = collide;
+            self.joints.items.set(joint, j);
+        }
+    }
+
+    /** Removes a joint. */
+    pub fn removeJoint(mut self, joint : i32) : void {
+        if (self.joints.has(joint)) {
+            let mut j : Joint = self.joints.items.get(joint);
+            j.active = false;
+            self.joints.items.set(joint, j);
+        }
+    }
+
+    /** How many joint handles have been issued (removed joints keep their number). */
+    pub fn jointCount(self) : i32 {
+        return self.joints.count();
+    }
+
+    /** Whether the joint handle names a joint that still exists. */
+    pub fn hasJoint(self, joint : i32) : bool {
+        return self.joints.has(joint);
+    }
+
+    /** The current angle of a hinge in radians (0 at creation); zero for other joints. */
+    pub fn hingeAngle(self, joint : i32) : f64 {
+        if (!self.joints.has(joint)) {
+            return 0.0;
+        }
+        let j : Joint = self.joints.items.get(joint);
+        if (j.kind != JOINT_HINGE) {
+            return 0.0;
+        }
+        return JointSolver::angleOf(self.store, j);
+    }
+
+    /** The world position of the anchor of a joint on its first body. */
+    pub fn jointAnchorA(self, joint : i32) : DVec3 {
+        let j : Joint = self.joints.items.get(joint);
+        if (j.a < 0) {
+            return j.anchorA;
+        }
+        return self.store.worldPoint(j.a, j.anchorA);
+    }
+
+    /** The world position of the anchor of a joint on its second body. */
+    pub fn jointAnchorB(self, joint : i32) : DVec3 {
+        let j : Joint = self.joints.items.get(joint);
+        if (j.b < 0) {
+            return j.anchorB;
+        }
+        return self.store.worldPoint(j.b, j.anchorB);
+    }
+
+    fn localPoint(self, slot : i32, p : DVec3) : DVec3 {
+        if (slot < 0) {
+            return p;
+        }
+        return self.store.rotation.get(slot).conjugate().rotate(p.minus(self.store.position.get(slot)));
+    }
+
+    fn localDir(self, slot : i32, d : DVec3) : DVec3 {
+        if (slot < 0) {
+            return d;
+        }
+        return self.store.rotation.get(slot).conjugate().rotate(d);
+    }
+
+    // ---- stepping ----
+
+    /** Banks `dt` seconds of real time and runs as many whole internal steps as it covers (at most 64). */
+    pub fn step(mut self, dt : f64) : void {
+        if (dt > 0.0) {
+            self.banked = self.banked + dt;
+        }
+        let h : f64 = self.cfg.substep;
+        let mut guard : i32 = 0;
+        while (self.banked >= h - WORLD_TIME_SLACK && guard < WORLD_MAX_STEPS) {
+            self.advance();
+            self.banked = self.banked - h;
+            guard = guard + 1;
+        }
+        if (self.banked > h) {
+            self.banked = 0.0;
+        }
+    }
+
+    /** Runs exactly one internal step of `settings.substep` seconds. */
+    pub fn advance(mut self) : void {
+        let dt : f64 = self.cfg.substep;
+        self.integrateVelocities(dt);
+        self.skipKeys();
+        self.contacts.beginStep();
+        let mut pass : i32 = 0;
+        let mut woke : bool = true;
+        while (woke && pass < WORLD_COLLIDE_PASSES) {
+            woke = self.collide();
+            pass = pass + 1;
+        }
+        self.solve();
+        self.integratePositions(dt);
+        self.islands = Sleeper::update(self.store, self.contacts, self.joints, self.cfg, dt, self.islands);
+        self.stepsDone = self.stepsDone + 1;
+    }
+
+    // Velocity pass (joints, then contacts, so contacts have the last word) and then the position pass, on a
+    // flat copy of the body motion that is written back at the end.
+    fn solve(mut self) : void {
+        self.state.load(self.store);
+        ContactSolver::prepare(self.contacts, self.state, self.store, self.cfg);
+        JointSolver::prepare(self.joints, self.state, self.store, self.cfg);
+        ContactSolver::warmStart(self.contacts, self.state);
+        for (it of 0..self.cfg.velocityIterations) {
+            JointSolver::iterate(self.joints, self.state);
+            ContactSolver::iterate(self.contacts, self.state);
+        }
+        for (it of 0..self.cfg.positionIterations) {
+            JointSolver::iteratePosition(self.joints, self.state);
+            ContactSolver::iteratePosition(self.contacts, self.state);
+        }
+        self.state.store(self.store);
+    }
+
+    /** How many internal steps have run. */
+    pub fn steps(self) : i64 {
+        return self.stepsDone;
+    }
+
+    /** Simulated time in seconds: whole steps times the step length. */
+    pub fn time(self) : f64 {
+        return (self.stepsDone as f64) * self.cfg.substep;
+    }
+
+    fn integrateVelocities(mut self, dt : f64) : void {
+        let s : BodyStore = self.store;
+        for (i of 0..s.slotCount()) {
+            if (!s.isLive(i) || !s.isDynamic(i) || s.asleep.get(i)) {
+                continue;
+            }
+            let inv : f64 = s.invMass.get(i);
+            let acc : DVec3 = self.cfg.gravity.scale(s.gravityScale.get(i)).plus(s.force.get(i).scale(inv));
+            let spin : DVec3 = s.invInertiaW.get(i).transform(s.torque.get(i));
+            let linKeep : f64 = PhysicsWorld::damping(dt, s.linearDamping.get(i));
+            let angKeep : f64 = PhysicsWorld::damping(dt, s.angularDamping.get(i));
+            let v : DVec3 = s.linearVelocity.get(i).plus(acc.scale(dt)).scale(linKeep);
+            let w : DVec3 = s.angularVelocity.get(i).plus(spin.scale(dt)).scale(angKeep);
+            s.linearVelocity.set(i, v);
+            s.angularVelocity.set(i, w);
+            s.force.set(i, DVec3::zero());
+            s.torque.set(i, DVec3::zero());
+        }
+    }
+
+    // The factor a velocity keeps over `dt` under the damping rate `rate` (implicit, so any step is stable).
+    static fn damping(dt : f64, rate : f64) : f64 {
+        return 1.0 / (1.0 + dt * rate);
+    }
+
+    // Rebuilds the sorted list of pairs that joints forbid to collide.
+    fn skipKeys(mut self) : void {
+        let n : i32 = self.joints.items.len();
+        self.skip = new i64[(n + 1) as i64];
+        let mut m : i32 = 0;
+        for (i of 0..n) {
+            let j : Joint = self.joints.items.get(i);
+            if (j.active && !j.collide && j.a >= 0 && j.b >= 0) {
+                let mut key : i64 = KineticSort::pairKey(j.a, j.b);
+                if (j.a > j.b) {
+                    key = KineticSort::pairKey(j.b, j.a);
+                }
+                self.skip[m as i64] = key;
+                m = m + 1;
+            }
+        }
+        KineticSort::whole(self.skip, m);
+        self.skipCount = m;
+    }
+
+    // One broad + narrow pass; true when it woke a sleeping island, so the pass must be redone.
+    fn collide(mut self) : bool {
+        let s : BodyStore = self.store;
+        self.broad.update(s, self.skip, self.skipCount);
+        self.contacts.points.clear();
+        self.contacts.manifolds.clear();
+        let mut woke : bool = false;
+        for (k of 0..self.broad.pairCount()) {
+            let a : i32 = self.broad.firstOf(k);
+            let b : i32 = self.broad.secondOf(k);
+            let pa : Placed = Placed {
+                shape: s.shape.get(a),
+                pos: s.position.get(a),
+                rot: s.rotation.get(a),
+            };
+            let pb : Placed = Placed {
+                shape: s.shape.get(b),
+                pos: s.position.get(b),
+                rot: s.rotation.get(b),
+            };
+            if (!Narrow::collidePlaced(pa, pb, self.scratch)) {
+                continue;
+            }
+            if (self.wakeIfAsleep(a)) {
+                woke = true;
+            }
+            if (self.wakeIfAsleep(b)) {
+                woke = true;
+            }
+            self.addManifold(a, b);
+        }
+        return woke;
+    }
+
+    // Wakes the island of slot `i` when it sleeps; true when it did.
+    fn wakeIfAsleep(self, i : i32) : bool {
+        if (!self.store.asleep.get(i)) {
+            return false;
+        }
+        Sleeper::wakeIsland(self.store, i);
+        return true;
+    }
+
+    // Copies the scratch buffer's points into the contact list as one manifold of the pair (a, b), with the
+    // pair's mixed material: friction is the geometric mean, restitution the larger.
+    fn addManifold(mut self, a : i32, b : i32) : void {
+        let s : BodyStore = self.store;
+        let first : i32 = self.contacts.points.len();
+        let friction : f64 = (s.friction.get(a) * s.friction.get(b)).sqrt();
+        let restitution : f64 = maxD(s.restitution.get(a), s.restitution.get(b));
+        let normal : DVec3 = self.scratch.normal();
+        for (c of 0..self.scratch.count()) {
+            self.contacts.points.push(ContactPoint {
+                a: a,
+                b: b,
+                normal: normal,
+                point: self.scratch.pointAt(c),
+                depth: self.scratch.depthAt(c),
+                feature: self.scratch.idAt(c),
+                friction: friction,
+                restitution: restitution,
+            });
+        }
+        self.contacts.manifolds.push(Manifold { a: a, b: b, first: first, count: self.scratch.count() });
+    }
+
+    fn integratePositions(mut self, dt : f64) : void {
+        let s : BodyStore = self.store;
+        let st : SolverState = self.state;
+        for (i of 0..s.slotCount()) {
+            if (!s.isLive(i) || s.isStatic(i) || s.asleep.get(i)) {
+                continue;
+            }
+            // Positions advance with the mean of the velocity at the start and at the end of the step, which is
+            // exact for constant acceleration and keeps a bounce from adding the energy of half a step.
+            let v : DVec3 = s.linearVelocity
+                .get(i)
+                .plus(s.prevLinearVelocity.get(i))
+                .scale(0.5)
+                .plus(st.pseudoLin(i));
+            let w : DVec3 = s.angularVelocity
+                .get(i)
+                .plus(s.prevAngularVelocity.get(i))
+                .scale(0.5)
+                .plus(st.pseudoAng(i));
+            s.prevLinearVelocity.set(i, s.linearVelocity.get(i));
+            s.prevAngularVelocity.set(i, s.angularVelocity.get(i));
+            s.position.set(i, s.position.get(i).plus(v.scale(dt)));
+            let speed : f64 = w.length();
+            if (speed * dt > WORLD_MIN_TURN) {
+                let dq : DQuat = DQuat::fromAxisAngle(w.scale(1.0 / speed), speed * dt);
+                s.rotation.set(i, dq.mul(s.rotation.get(i)).normalized());
+                s.refreshInertia(i);
+            }
+        }
+    }
+
+    // ---- queries and debug output ----
+
+    /** The nearest body hit by the ray from `origin` along `dir` within `maxDistance`. */
+    pub fn raycast(self, origin : DVec3, dir : DVec3, maxDistance : f64) : RayCastHit {
+        return PhysicsQuery::raycast(self.store, origin, dir, maxDistance);
+    }
+
+    /** The bodies overlapping a sphere, in slot order. */
+    pub fn overlapSphere(self, centre : DVec3, radius : f64) : Vec<EntityId> {
+        return PhysicsQuery::overlapSphere(self.store, centre, radius);
+    }
+
+    /** The bodies overlapping an oriented box, in slot order. */
+    pub fn overlapBox(self, centre : DVec3, half : DVec3, rot : DQuat) : Vec<EntityId> {
+        return PhysicsQuery::overlapBox(self.store, centre, half, rot);
+    }
+
+    /**
+     * Fills `out` (emptied first) with the world as lines and points: every shape's outline coloured by its
+     * state, the last step's contact points with their normals, and the joints.
+     */
+    pub fn debugDraw(self, out : DebugDraw) : void {
+        out.clear();
+        let s : BodyStore = self.store;
+        for (i of 0..s.slotCount()) {
+            if (!s.isLive(i)) {
+                continue;
+            }
+            let color : i32 = PhysicsWorld::debugColor(s, i);
+            out.shape(s.shape.get(i), s.position.get(i), s.rotation.get(i), color);
+        }
+        for (k of 0..self.contacts.points.len()) {
+            let p : ContactPoint = self.contacts.points.get(k);
+            out.point(p.point, DEBUG_COLOR_CONTACT);
+            out.line(p.point, p.point.plus(p.normal.scale(WORLD_DEBUG_NORMAL)), DEBUG_COLOR_CONTACT);
+        }
+        for (j of 0..self.joints.items.len()) {
+            if (self.joints.has(j)) {
+                out.line(self.jointAnchorA(j), self.jointAnchorB(j), DEBUG_COLOR_JOINT);
+                out.point(self.jointAnchorA(j), DEBUG_COLOR_JOINT);
+            }
+        }
+    }
+
+    // The outline colour of the body in slot `i`, by what it is doing.
+    static fn debugColor(bodies : BodyStore, i : i32) : i32 {
+        if (bodies.isStatic(i)) {
+            return DEBUG_COLOR_STATIC;
+        }
+        if (bodies.isKinematic(i)) {
+            return DEBUG_COLOR_KINEMATIC;
+        }
+        if (bodies.asleep.get(i)) {
+            return DEBUG_COLOR_ASLEEP;
+        }
+        return DEBUG_COLOR_AWAKE;
+    }
+
+    // ---- measurements ----
+
+    /** How many contact points the last step produced. */
+    pub fn contactCount(self) : i32 {
+        return self.contacts.pointCount();
+    }
+
+    /** The contact points of the last step (read-only data for tools and tests). */
+    pub fn contactPoint(self, k : i32) : ContactPoint {
+        return self.contacts.points.get(k);
+    }
+
+    /** How many body pairs the broad phase passed to the narrow phase in the last step. */
+    pub fn pairCount(self) : i32 {
+        return self.broad.pairCount();
+    }
+
+    /** The kinetic energy of all dynamic bodies, linear plus rotational, in joules. */
+    pub fn kineticEnergy(self) : f64 {
+        return PhysicsMeasure::kineticEnergy(self.store);
+    }
+
+    /** The potential energy of all dynamic bodies in the gravity field, relative to the origin. */
+    pub fn potentialEnergy(self) : f64 {
+        return PhysicsMeasure::potentialEnergy(self.store, self.cfg.gravity);
+    }
+
+    /** The total linear momentum of all dynamic bodies. */
+    pub fn linearMomentum(self) : DVec3 {
+        return PhysicsMeasure::linearMomentum(self.store);
+    }
+
+    /**
+     * A hash of the whole simulation state (positions, orientations, velocities, sleep flags) at a resolution of
+     * a nanometre. Two runs that did the same thing have the same hash; any divergence changes it.
+     */
+    pub fn stateHash(self) : i64 {
+        return StateHash::compute(self.store);
+    }
+}

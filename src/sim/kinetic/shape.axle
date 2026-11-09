@@ -1,0 +1,207 @@
+// shape — the collision shapes of kinetic and what they weigh.
+//
+// Four convex shapes: a sphere, an oriented box, a capsule and an infinite plane. All of them are centred on
+// the body's origin (the centre of mass), so the inertia tensor is diagonal in the body frame and a body needs
+// only three numbers for it. A capsule's axis is the body's local Y axis. A plane is the exception: it lives in
+// world space (its position and rotation are ignored) and may only belong to a static body.
+//
+// A `Shape` is a plain value; the same one can serve any number of bodies.
+
+use crate::core::math::dgeom::DAabb;
+use crate::core::math::dquat::DQuat;
+use crate::core::math::dvec3::DVec3;
+use crate::core::math::scalar::{PI_D, absD, maxD};
+use crate::sim::kinetic::kinetic_geometry::{KINETIC_GEOMETRY_SMALL};
+
+// A plane has no bounds; this stands for "enormous but still finite", so box arithmetic never sees infinity.
+const SHAPE_UNBOUNDED : f64 = 1.0e30;
+
+// Moment of inertia of a solid sphere is 2/5 m r^2.
+const SHAPE_SPHERE_INERTIA : f64 = 0.4;
+
+/** A shape placed in the world: the unit the narrow phase tests in pairs. */
+pub(crate) struct Placed {
+    pub(crate) shape : Shape = Shape { kind: ShapeKind::Sphere };
+    pub(crate) pos   : DVec3 = DVec3 { x: 0.0, y: 0.0, z: 0.0 };
+    pub(crate) rot   : DQuat = DQuat { x: 0.0, y: 0.0, z: 0.0, w: 1.0 };
+}
+
+/** The kinds of collision shape. The numeric code orders the narrow phase's pair table. */
+pub enum ShapeKind : i8 {
+    Sphere = 0,
+    Cuboid = 1,
+    Capsule = 2,
+    Plane = 3,
+
+    /** The stable number of this kind. */
+    pub fn code(self) : i32 {
+        return self as i32;
+    }
+
+    /** The kind with number `n`; a plane for anything unknown. */
+    pub static fn fromCode(n : i32) : ShapeKind {
+        return match n {
+            0 => ShapeKind::Sphere,
+            1 => ShapeKind::Cuboid,
+            2 => ShapeKind::Capsule,
+            _ => ShapeKind::Plane,
+        };
+    }
+}
+
+/** A collision shape: a sphere, box, capsule or plane, described by a few numbers. */
+pub struct Shape {
+    /** Which kind of shape this is. */
+    pub kind : ShapeKind = ShapeKind::Sphere;
+
+    /** The radius of a sphere or of a capsule's caps. */
+    pub radius : f64 = 0.5;
+
+    /** A box's half extents along its local axes; a capsule's `y` is half the length of its straight part. */
+    pub half : DVec3 = DVec3 { x: 0.5, y: 0.5, z: 0.5 };
+
+    /** A plane's unit normal, pointing out of the solid. */
+    pub normal : DVec3 = DVec3 { x: 0.0, y: 1.0, z: 0.0 };
+
+    /** A plane's offset: the points `p` with `normal . p = offset` lie on it. */
+    pub offset : f64 = 0.0;
+
+    /** A sphere of radius `r`. */
+    pub static fn sphere(r : f64) : Shape {
+        return Shape { kind: ShapeKind::Sphere, radius: r };
+    }
+
+    /** A box with half extents `hx`, `hy`, `hz` (so the box is twice as large on each axis). */
+    pub static fn cuboid(hx : f64, hy : f64, hz : f64) : Shape {
+        return Shape { kind: ShapeKind::Cuboid, half: DVec3 { x: hx, y: hy, z: hz } };
+    }
+
+    /** A capsule along the local Y axis: a segment of length `2 * halfLength` swept by a sphere of radius `r`. */
+    pub static fn capsule(r : f64, halfLength : f64) : Shape {
+        return Shape { kind: ShapeKind::Capsule, radius: r, half: DVec3 { x: 0.0, y: halfLength, z: 0.0 } };
+    }
+
+    /** The half space behind the plane `normal . p = offset`; the normal is normalised here. */
+    pub static fn plane(normal : DVec3, offset : f64) : Shape {
+        let len : f64 = normal.length();
+        let mut n : DVec3 = DVec3 { x: 0.0, y: 1.0, z: 0.0 };
+        let mut d : f64 = offset;
+        if (len > KINETIC_GEOMETRY_SMALL) {
+            n = normal.scale(1.0 / len);
+            d = offset / len;
+        }
+        return Shape { kind: ShapeKind::Plane, normal: n, offset: d };
+    }
+
+    /** The volume; a plane has none, so it answers zero. */
+    pub fn volume(self) : f64 {
+        return match self.kind {
+            Sphere => self.sphereVolume(),
+            Cuboid => 8.0 * self.half.x * self.half.y * self.half.z,
+            Capsule => PI_D * self.radius * self.radius * (2.0 * self.half.y) + self.sphereVolume(),
+            _ => 0.0,
+        };
+    }
+
+    // The ball of this shape's radius: a sphere, or the two caps of a capsule together.
+    fn sphereVolume(self) : f64 {
+        return 4.0 / 3.0 * PI_D * self.radius * self.radius * self.radius;
+    }
+
+    /**
+     * The diagonal of the inertia tensor about the centre of mass, in the body frame, for a body of `mass`
+     * filling this shape uniformly. A plane answers zero.
+     */
+    pub fn inertia(self, mass : f64) : DVec3 {
+        return match self.kind {
+            Sphere => DVec3::splat(SHAPE_SPHERE_INERTIA * mass * self.radius * self.radius),
+            Cuboid => self.boxInertia(mass),
+            Capsule => self.capsuleInertia(mass),
+            _ => DVec3::zero(),
+        };
+    }
+
+    fn boxInertia(self, mass : f64) : DVec3 {
+        let x2 : f64 = 4.0 * self.half.x * self.half.x;
+        let y2 : f64 = 4.0 * self.half.y * self.half.y;
+        let z2 : f64 = 4.0 * self.half.z * self.half.z;
+        let k : f64 = mass / 12.0;
+        return DVec3 { x: k * (y2 + z2), y: k * (x2 + z2), z: k * (x2 + y2) };
+    }
+
+    // A cylinder of the straight part plus two hemispheres, the mass shared by volume; the hemispheres are
+    // moved off the centre with the parallel axis theorem (their own centre of mass is 3r/8 from the flat face).
+    fn capsuleInertia(self, mass : f64) : DVec3 {
+        let r : f64 = self.radius;
+        let h : f64 = 2.0 * self.half.y;
+        let vc : f64 = PI_D * r * r * h;
+        let vh : f64 = self.sphereVolume();
+        let total : f64 = vc + vh;
+        if (total <= 0.0) {
+            return DVec3::zero();
+        }
+        let mc : f64 = mass * vc / total;
+        let mh : f64 = mass * vh / total;
+        let iy : f64 = 0.5 * mc * r * r + SHAPE_SPHERE_INERTIA * mh * r * r;
+        let ix : f64 = mc * (3.0 * r * r + h * h) / 12.0
+            + mh * (SHAPE_SPHERE_INERTIA * r * r + 0.25 * h * h + 3.0 * h * r / 8.0);
+        return DVec3 { x: ix, y: iy, z: ix };
+    }
+
+    /** The distance from the centre to the farthest point of the shape; huge for a plane. */
+    pub fn boundingRadius(self) : f64 {
+        return match self.kind {
+            Sphere => self.radius,
+            Cuboid => self.half.length(),
+            Capsule => self.half.y + self.radius,
+            _ => SHAPE_UNBOUNDED,
+        };
+    }
+
+    /** The axis-aligned box that holds the shape placed at `pos` with orientation `rot`. A plane's is enormous. */
+    pub fn aabb(self, pos : DVec3, rot : DQuat) : DAabb {
+        return match self.kind {
+            Sphere => DAabb::fromCenterHalfSize(pos, DVec3::splat(self.radius)),
+            Cuboid => self.boxBounds(pos, rot),
+            Capsule => self.capsuleBounds(pos, rot),
+            _ => DAabb::fromCenterHalfSize(DVec3::zero(), DVec3::splat(SHAPE_UNBOUNDED)),
+        };
+    }
+
+    fn boxBounds(self, pos : DVec3, rot : DQuat) : DAabb {
+        let m = rot.toMat3();
+        let ex : f64 = absD(m.m00) * self.half.x + absD(m.m01) * self.half.y + absD(m.m02) * self.half.z;
+        let ey : f64 = absD(m.m10) * self.half.x + absD(m.m11) * self.half.y + absD(m.m12) * self.half.z;
+        let ez : f64 = absD(m.m20) * self.half.x + absD(m.m21) * self.half.y + absD(m.m22) * self.half.z;
+        return DAabb::fromCenterHalfSize(pos, DVec3 { x: ex, y: ey, z: ez });
+    }
+
+    fn capsuleBounds(self, pos : DVec3, rot : DQuat) : DAabb {
+        let axis : DVec3 = rot.rotate(DVec3 { x: 0.0, y: self.half.y, z: 0.0 });
+        let r : f64 = self.radius;
+        return DAabb::fromCenterHalfSize(pos, DVec3 {
+            x: absD(axis.x) + r,
+            y: absD(axis.y) + r,
+            z: absD(axis.z) + r,
+        });
+    }
+
+    /** The end points of a capsule's axis in the world, the lower one first. */
+    pub fn capsuleEnds(self, pos : DVec3, rot : DQuat, upper : bool) : DVec3 {
+        let axis : DVec3 = rot.rotate(DVec3 { x: 0.0, y: self.half.y, z: 0.0 });
+        if (upper) {
+            return pos.plus(axis);
+        }
+        return pos.minus(axis);
+    }
+
+    /** The largest half extent along any axis, a size to scale tolerances with. */
+    pub fn extent(self) : f64 {
+        return match self.kind {
+            Sphere => self.radius,
+            Cuboid => self.half.maxComponent(),
+            Capsule => maxD(self.radius, self.half.y + self.radius),
+            _ => 1.0,
+        };
+    }
+}

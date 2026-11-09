@@ -1,0 +1,210 @@
+// contact_buffer — the scratch space a narrow-phase test writes its contact points into.
+//
+// One shared normal (from the first shape toward the second) and a short list of points, each with a depth and
+// a feature id. The id names which vertex / edge / face produced the point, so the next step can find the same
+// point again and reuse the impulse it had (warm starting). A buffer is reused for every pair; `clear` between.
+
+use crate::core::collections::vec::Vec;
+use crate::core::math::dvec3::DVec3;
+use crate::sim::kinetic::clip_poly::ClipPoly;
+
+// A manifold keeps this many points: four spread corners hold a box up.
+const CONTACT_MAX_POINTS : i32 = 4;
+
+// Weight of "near the third point" against signed area when choosing the fourth, small enough to break ties only.
+const CONTACT_TIE_WEIGHT : f64 = 0.000001;
+
+// One stored point, read out whole.
+struct ContactPick {
+    point : DVec3 = DVec3 { x: 0.0, y: 0.0, z: 0.0 };
+    depth : f64 = 0.0;
+    id    : i32 = 0;
+}
+
+/** Contact points of one shape pair, before they are copied into the world's contact list. */
+pub class ContactBuffer {
+    normalDir : DVec3 = DVec3 { x: 0.0, y: 1.0, z: 0.0 };
+    points    : Vec<DVec3>;
+    depths    : Vec<f64>;
+    featureId : Vec<i32>;
+    clipA     : ClipPoly;
+    clipB     : ClipPoly;
+
+    /** An empty buffer. */
+    constructor() {
+        self.points = new Vec<DVec3>();
+        self.depths = new Vec<f64>();
+        self.featureId = new Vec<i32>();
+        self.clipA = new ClipPoly();
+        self.clipB = new ClipPoly();
+    }
+
+    /** A scratch polygon for face clipping; the box-box test owns both for the duration of a call. */
+    pub fn polyA(self) : ClipPoly {
+        return self.clipA;
+    }
+
+    /** The second scratch polygon. */
+    pub fn polyB(self) : ClipPoly {
+        return self.clipB;
+    }
+
+    /** Forgets all points. */
+    pub fn clear(mut self) : void {
+        self.points.clear();
+        self.depths.clear();
+        self.featureId.clear();
+    }
+
+    /** The unit contact normal, pointing from the first shape toward the second. */
+    pub fn normal(self) : DVec3 {
+        return self.normalDir;
+    }
+
+    /** Sets the contact normal. */
+    pub fn setNormal(mut self, n : DVec3) : void {
+        self.normalDir = n;
+    }
+
+    /** Adds a point with its penetration depth (positive when the shapes overlap) and feature id. */
+    pub fn add(mut self, p : DVec3, depth : f64, id : i32) : void {
+        self.points.push(p);
+        self.depths.push(depth);
+        self.featureId.push(id);
+    }
+
+    /** How many points there are. */
+    pub fn count(self) : i32 {
+        return self.points.len();
+    }
+
+    /** Point `k` in world space. */
+    pub fn pointAt(self, k : i32) : DVec3 {
+        return self.points.get(k);
+    }
+
+    /** Penetration depth of point `k`. */
+    pub fn depthAt(self, k : i32) : f64 {
+        return self.depths.get(k);
+    }
+
+    /** Feature id of point `k`. */
+    pub fn idAt(self, k : i32) : i32 {
+        return self.featureId.get(k);
+    }
+
+    /** Reverses the normal: the same contact seen from the other shape. */
+    pub fn flip(mut self) : void {
+        self.normalDir = self.normalDir.negated();
+    }
+
+    /**
+     * Keeps at most four points that cover the contact patch best: the deepest, the one farthest from it, then
+     * the two that enclose the largest area. Four well spread points hold a box up; more only cost time.
+     */
+    pub fn reduceToFour(mut self) : void {
+        if (self.points.len() <= CONTACT_MAX_POINTS) {
+            return;
+        }
+        let first : i32 = self.deepest();
+        let second : i32 = self.farthestFrom(first);
+        let third : i32 = self.largestTriangle(first, second);
+        let fourth : i32 = self.oppositeOf(first, second, third);
+
+        // Read all four before clearing: they are indices into the lists being emptied.
+        let p0 : ContactPick = self.pickAt(first);
+        let p1 : ContactPick = self.pickAt(second);
+        let p2 : ContactPick = self.pickAt(third);
+        let p3 : ContactPick = self.pickAt(fourth);
+        self.clear();
+        self.add(p0.point, p0.depth, p0.id);
+        self.add(p1.point, p1.depth, p1.id);
+        self.add(p2.point, p2.depth, p2.id);
+        self.add(p3.point, p3.depth, p3.id);
+    }
+
+    fn pickAt(self, k : i32) : ContactPick {
+        return ContactPick {
+            point: self.points.get(k),
+            depth: self.depths.get(k),
+            id: self.featureId.get(k),
+        };
+    }
+
+    // Index of the deepest point; the first of equals.
+    fn deepest(self) : i32 {
+        let mut best : i32 = 0;
+        for (k of 1..self.points.len()) {
+            if (self.depths.get(k) > self.depths.get(best)) {
+                best = k;
+            }
+        }
+        return best;
+    }
+
+    // Index of the point farthest from point `from`.
+    fn farthestFrom(self, from : i32) : i32 {
+        let origin : DVec3 = self.points.get(from);
+        let mut far : i32 = -1;
+        let mut farD : f64 = -1.0;
+        for (k of 0..self.points.len()) {
+            let d : f64 = self.points.get(k).distanceSquared(origin);
+            if (k != from && d > farD) {
+                far = k;
+                farD = d;
+            }
+        }
+        return far;
+    }
+
+    // The signed area (twice) of the triangle p0, p1, point `k`, seen along the contact normal.
+    fn signedArea(self, p0 : DVec3, p1 : DVec3, k : i32) : f64 {
+        return p1.minus(p0).cross(self.points.get(k).minus(p0)).dot(self.normalDir);
+    }
+
+    // Index of the point that makes the triangle of largest area with points `i0` and `i1`.
+    fn largestTriangle(self, i0 : i32, i1 : i32) : i32 {
+        let p0 : DVec3 = self.points.get(i0);
+        let p1 : DVec3 = self.points.get(i1);
+        let mut third : i32 = -1;
+        let mut thirdA : f64 = 0.0;
+        for (k of 0..self.points.len()) {
+            if (k == i0 || k == i1) {
+                continue;
+            }
+            let a : f64 = self.signedArea(p0, p1, k);
+            if (third < 0 || a * a > thirdA * thirdA) {
+                third = k;
+                thirdA = a;
+            }
+        }
+        return third;
+    }
+
+    // The fourth corner lies on the other side of the third's triangle: most negative signed area against the
+    // edge (p0, p1) when the third was positive, and vice versa. Nearness to the third breaks ties.
+    fn oppositeOf(self, i0 : i32, i1 : i32, i2 : i32) : i32 {
+        let p0 : DVec3 = self.points.get(i0);
+        let p1 : DVec3 = self.points.get(i1);
+        let p2 : DVec3 = self.points.get(i2);
+        let thirdIsNegative : bool = self.signedArea(p0, p1, i2) < 0.0;
+        let mut fourth : i32 = -1;
+        let mut fourthScore : f64 = 0.0;
+        for (k of 0..self.points.len()) {
+            if (k == i0 || k == i1 || k == i2) {
+                continue;
+            }
+            let a : f64 = self.signedArea(p0, p1, k);
+            let mut score : f64 = -a;
+            if (thirdIsNegative) {
+                score = a;
+            }
+            score = score + self.points.get(k).distanceSquared(p2) * CONTACT_TIE_WEIGHT;
+            if (fourth < 0 || score > fourthScore) {
+                fourth = k;
+                fourthScore = score;
+            }
+        }
+        return fourth;
+    }
+}

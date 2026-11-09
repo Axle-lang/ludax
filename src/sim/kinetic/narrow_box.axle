@@ -1,0 +1,479 @@
+// narrow_box — contact generation for oriented boxes: against spheres, capsules and each other.
+//
+// Box against box is a separating axis test over the 15 candidate axes (3 faces of each box, 9 edge pairs). The
+// axis of least overlap decides the contact: a face axis gives a face-to-face contact, made by clipping the
+// incident face of one box to the side planes of the reference face of the other and keeping the points below
+// that face (up to four); an edge axis gives one point where the two edges come closest. Face contacts are
+// preferred unless an edge axis is clearly shallower, which keeps a resting stack from flickering between the
+// two. A sphere or capsule against a box is a closest-point test in the box's own frame.
+
+use crate::core::math::dmat3::DMat3;
+use crate::core::math::dquat::DQuat;
+use crate::core::math::dvec3::DVec3;
+use crate::core::math::scalar::{absD, clampD};
+use crate::sim::kinetic::clip_poly::{ClipPlane, ClipPoly};
+use crate::sim::kinetic::contact_buffer::ContactBuffer;
+use crate::sim::kinetic::kinetic_geometry::{KineticGeometry, KINETIC_GEOMETRY_FAR, KINETIC_GEOMETRY_SMALL};
+use crate::sim::kinetic::shape::Placed;
+
+// Box B's face is chosen as the reference only when it is this much shallower than A's, so equal faces keep
+// one reference from step to step.
+const BOX_FACE_BIAS : f64 = 0.98;
+
+// An edge axis beats the best face only when it is this fraction of that depth, minus a small absolute slack:
+// edges are unstable contacts, and a face contact is wanted whenever one is nearly as good.
+const BOX_EDGE_BIAS : f64 = 0.95;
+const BOX_EDGE_SLACK : f64 = 0.0005;
+
+// Edge-pair cross products shorter than this (squared) mean the edges are parallel: that axis is a face axis.
+const BOX_PARALLEL_EPS : f64 = 0.000001;
+
+// A sphere centre closer than this (squared) to the box surface counts as touching it from inside.
+const BOX_SURFACE_EPS : f64 = 0.000000000000000001;
+
+// Feature ids. A face contact's id is `face * FACE_SPAN + code * CORNER_SPAN + corner`, where `face` odd-numbers
+// the reference axis (so the ids of one axis never meet another's) and `code` the incident face. Edge contacts
+// number from `BOX_EDGE_ID_BASE`, which falls between the ids of axis 0 (64..87) and axis 1 (192..215).
+const BOX_FACE_SPAN : i32 = 64;
+const BOX_CORNER_SPAN : i32 = 4;
+const BOX_EDGE_ID_BASE : i32 = 100;
+
+// The capsule axis is searched for its point nearest the box with golden-section steps; 40 shrink the interval
+// by 0.618^40, far below any contact tolerance.
+const BOX_GOLDEN : f64 = 0.6180339887498949;
+const BOX_GOLDEN_STEPS : i32 = 40;
+
+// The interior sample of a capsule is skipped when it lies within 0.1% of an end, where the end sample
+// already says the same.
+const BOX_END_GUARD_LOW : f64 = 0.001;
+const BOX_END_GUARD_HIGH : f64 = 0.999;
+
+// A further capsule sample becomes a contact when its normal agrees with the deepest one's within this cosine
+// and it lies at least 1% of the radius (squared: 0.0001) away from it.
+const BOX_AGREE_DOT : f64 = 0.9;
+const BOX_MIN_SPREAD : f64 = 0.0001;
+
+/** The nearest feature of a box to a sphere centre. */
+struct BoxSphereHit {
+    hit    : bool = false;
+    normal : DVec3 = DVec3 { x: 0.0, y: 1.0, z: 0.0 };
+    depth  : f64 = 0.0;
+    point  : DVec3 = DVec3 { x: 0.0, y: 0.0, z: 0.0 };
+}
+
+// A box in the world: its half extents, centre and local axes (the columns of `m`).
+struct BoxPose {
+    half : DVec3 = DVec3 { x: 0.5, y: 0.5, z: 0.5 };
+    pos  : DVec3 = DVec3 { x: 0.0, y: 0.0, z: 0.0 };
+    m    : DMat3 = DMat3 {};
+
+    // The i-th local axis of the box in the world.
+    fn axis(self, i : i32) : DVec3 {
+        return KineticGeometry::column(self.m, i);
+    }
+
+    // The half extent along local axis `i`.
+    fn halfAlong(self, i : i32) : f64 {
+        return KineticGeometry::component(self.half, i);
+    }
+
+    // How far the box reaches along the unit direction `l` from its centre.
+    fn reach(self, l : DVec3) : f64 {
+        return self.half.x * absD(self.axis(0).dot(l)) + self.half.y * absD(self.axis(1).dot(l))
+            + self.half.z * absD(self.axis(2).dot(l));
+    }
+}
+
+// Two boxes and the vector from the first centre to the second.
+struct BoxPair {
+    a : BoxPose = BoxPose {};
+    b : BoxPose = BoxPose {};
+    d : DVec3 = DVec3 { x: 0.0, y: 0.0, z: 0.0 };
+
+    // How deeply the boxes overlap when projected on the unit direction `l`; negative when `l` separates them.
+    fn depthAlong(self, l : DVec3) : f64 {
+        return self.a.reach(l) + self.b.reach(l) - absD(self.d.dot(l));
+    }
+}
+
+// The shallowest face axis of one box: its depth (negative: the boxes are apart) and local index.
+struct FaceAxis {
+    depth : f64 = 1.0e300;
+    index : i32 = -1;
+}
+
+// The shallowest edge-pair axis: depth, the local axes of the two edges and the unit direction.
+struct EdgeAxis {
+    depth  : f64 = 1.0e300;
+    i      : i32 = -1;
+    j      : i32 = -1;
+    normal : DVec3 = DVec3 { x: 0.0, y: 0.0, z: 0.0 };
+}
+
+/** Narrow-phase tests that involve boxes. */
+pub(crate) class NarrowBox {
+    /** A sphere (first) against a box (second). */
+    pub(crate) static fn sphereBox(ps : DVec3, rs : f64, box : Placed, out : ContactBuffer) : bool {
+        let h : BoxSphereHit = NarrowBox::sphereVsBox(ps, rs, box);
+        if (!h.hit) {
+            return false;
+        }
+        out.setNormal(h.normal.negated());
+        out.add(h.point, h.depth, 0);
+        return true;
+    }
+
+    // The sphere at `c` of radius `r` against the box; `normal` points from the box toward the sphere.
+    static fn sphereVsBox(c : DVec3, r : f64, box : Placed) : BoxSphereHit {
+        let h : DVec3 = box.shape.half;
+        let local : DVec3 = box.rot.conjugate().rotate(c.minus(box.pos));
+        let q : DVec3 = DVec3 {
+            x: clampD(local.x, -h.x, h.x),
+            y: clampD(local.y, -h.y, h.y),
+            z: clampD(local.z, -h.z, h.z),
+        };
+        let delta : DVec3 = local.minus(q);
+        let distSq : f64 = delta.lengthSquared();
+        let mut nLocal : DVec3 = DVec3::unitY();
+        let mut surface : DVec3 = q;
+        let mut depth : f64 = 0.0;
+        if (distSq > BOX_SURFACE_EPS) {
+            if (distSq >= r * r) {
+                return BoxSphereHit {};
+            }
+            let dist : f64 = distSq.sqrt();
+            nLocal = delta.scale(1.0 / dist);
+            depth = r - dist;
+        } else {
+            // The centre is inside: leave through the nearest face.
+            let gx : f64 = h.x - absD(local.x);
+            let gy : f64 = h.y - absD(local.y);
+            let gz : f64 = h.z - absD(local.z);
+            if (gx <= gy && gx <= gz) {
+                nLocal = DVec3 { x: KineticGeometry::sgn(local.x), y: 0.0, z: 0.0 };
+                surface = DVec3 { x: nLocal.x * h.x, y: local.y, z: local.z };
+                depth = r + gx;
+            } else if (gy <= gz) {
+                nLocal = DVec3 { x: 0.0, y: KineticGeometry::sgn(local.y), z: 0.0 };
+                surface = DVec3 { x: local.x, y: nLocal.y * h.y, z: local.z };
+                depth = r + gy;
+            } else {
+                nLocal = DVec3 { x: 0.0, y: 0.0, z: KineticGeometry::sgn(local.z) };
+                surface = DVec3 { x: local.x, y: local.y, z: nLocal.z * h.z };
+                depth = r + gz;
+            }
+        }
+        let n : DVec3 = box.rot.rotate(nLocal);
+        let onBox : DVec3 = box.pos.plus(box.rot.rotate(surface));
+        let onSphere : DVec3 = c.minus(n.scale(r));
+        return BoxSphereHit { hit: true, normal: n, depth: depth, point: onBox.plus(onSphere).scale(0.5) };
+    }
+
+    /**
+     * A capsule (first) against a box (second). The point of the capsule's axis nearest the box is found by a
+     * golden-section search (the distance to a convex box is convex along a line); that point and both end
+     * caps are each tested as a sphere, and the ones that agree on the normal become contact points.
+     */
+    pub(crate) static fn capsuleBox(cap : Placed, box : Placed, out : ContactBuffer) : bool {
+        let c0 : DVec3 = cap.shape.capsuleEnds(cap.pos, cap.rot, false);
+        let c1 : DVec3 = cap.shape.capsuleEnds(cap.pos, cap.rot, true);
+        let inv : DQuat = box.rot.conjugate();
+        let l0 : DVec3 = inv.rotate(c0.minus(box.pos));
+        let l1 : DVec3 = inv.rotate(c1.minus(box.pos));
+        let tBest : f64 = NarrowBox::nearestOnAxis(l0, l1.minus(l0), box.shape.half);
+        let r : f64 = cap.shape.radius;
+
+        // Deepest sample first: it fixes the normal the others must agree with.
+        let mut bestK : i32 = -1;
+        let mut best : BoxSphereHit = BoxSphereHit {};
+        for (k of 0..3) {
+            let at : DVec3 = c0.plus(c1.minus(c0).scale(NarrowBox::sampleT(k, tBest)));
+            let h : BoxSphereHit = NarrowBox::sphereVsBox(at, r, box);
+            let deeper : bool = bestK < 0 || h.depth > best.depth;
+            if (h.hit && deeper) {
+                best = h;
+                bestK = k;
+            }
+        }
+        if (bestK < 0) {
+            return false;
+        }
+        out.setNormal(best.normal.negated());
+        out.add(best.point, best.depth, bestK);
+
+        let interiorIsEnd : bool = tBest < BOX_END_GUARD_LOW || tBest > BOX_END_GUARD_HIGH;
+        for (k of 0..3) {
+            if (k == bestK || (k == 2 && interiorIsEnd)) {
+                continue;
+            }
+            let at : DVec3 = c0.plus(c1.minus(c0).scale(NarrowBox::sampleT(k, tBest)));
+            let h : BoxSphereHit = NarrowBox::sphereVsBox(at, r, box);
+            let agrees : bool = h.hit && h.normal.dot(best.normal) > BOX_AGREE_DOT;
+            let apart : bool = h.point.distanceSquared(best.point) > BOX_MIN_SPREAD * r * r;
+            if (agrees && apart) {
+                out.add(h.point, h.depth, k);
+            }
+        }
+        return true;
+    }
+
+    // Where on the axis (0 start, 1 end) sample `k` lies: the two ends, then the point nearest the box.
+    static fn sampleT(k : i32, tBest : f64) : f64 {
+        if (k == 0) {
+            return 0.0;
+        }
+        if (k == 1) {
+            return 1.0;
+        }
+        return tBest;
+    }
+
+    // The parameter 0..1 of the point of the segment `from + t * seg` nearest the box (in its own frame).
+    static fn nearestOnAxis(from : DVec3, seg : DVec3, half : DVec3) : f64 {
+        let mut lo : f64 = 0.0;
+        let mut hi : f64 = 1.0;
+        let g : f64 = BOX_GOLDEN;
+        let mut m1 : f64 = hi - g * (hi - lo);
+        let mut m2 : f64 = lo + g * (hi - lo);
+        let mut f1 : f64 = KineticGeometry::distSqToBox(from.plus(seg.scale(m1)), half);
+        let mut f2 : f64 = KineticGeometry::distSqToBox(from.plus(seg.scale(m2)), half);
+        for (it of 0..BOX_GOLDEN_STEPS) {
+            if (f1 <= f2) {
+                hi = m2;
+                m2 = m1;
+                f2 = f1;
+                m1 = hi - g * (hi - lo);
+                f1 = KineticGeometry::distSqToBox(from.plus(seg.scale(m1)), half);
+            } else {
+                lo = m1;
+                m1 = m2;
+                f1 = f2;
+                m2 = lo + g * (hi - lo);
+                f2 = KineticGeometry::distSqToBox(from.plus(seg.scale(m2)), half);
+            }
+        }
+        return (lo + hi) * 0.5;
+    }
+
+    /** A box (first) against a box (second). */
+    pub(crate) static fn boxBox(a : Placed, b : Placed, out : ContactBuffer) : bool {
+        let poseA : BoxPose = BoxPose { half: a.shape.half, pos: a.pos, m: a.rot.toMat3() };
+        let poseB : BoxPose = BoxPose { half: b.shape.half, pos: b.pos, m: b.rot.toMat3() };
+        let pair : BoxPair = BoxPair { a: poseA, b: poseB, d: b.pos.minus(a.pos) };
+
+        // Any separating axis ends the test; the groups are checked cheapest first.
+        let faceA : FaceAxis = NarrowBox::shallowestFace(pair, poseA);
+        if (faceA.depth < 0.0) {
+            return false;
+        }
+        let faceB : FaceAxis = NarrowBox::shallowestFace(pair, poseB);
+        if (faceB.depth < 0.0) {
+            return false;
+        }
+        let edge : EdgeAxis = NarrowBox::shallowestEdge(pair);
+        if (edge.depth < 0.0) {
+            return false;
+        }
+
+        let mut face : FaceAxis = faceA;
+        let mut referenceIsB : bool = false;
+        if (faceB.depth < faceA.depth * BOX_FACE_BIAS - KINETIC_GEOMETRY_SMALL) {
+            face = faceB;
+            referenceIsB = true;
+        }
+        let edgeWins : bool = edge.i >= 0 && edge.depth + BOX_EDGE_SLACK < face.depth * BOX_EDGE_BIAS;
+        if (edgeWins) {
+            return NarrowBox::edgeContact(pair, edge, out);
+        }
+        return NarrowBox::faceContact(pair, referenceIsB, face.index, out);
+    }
+
+    // The face axis of `box` (one of the pair) along which the boxes overlap least.
+    static fn shallowestFace(pair : BoxPair, box : BoxPose) : FaceAxis {
+        let mut best : FaceAxis = FaceAxis { depth: KINETIC_GEOMETRY_FAR };
+        for (i of 0..3) {
+            let depth : f64 = pair.depthAlong(box.axis(i));
+            if (depth < 0.0) {
+                return FaceAxis { depth: depth, index: i };
+            }
+            if (depth < best.depth) {
+                best = FaceAxis { depth: depth, index: i };
+            }
+        }
+        return best;
+    }
+
+    // The edge-pair axis along which the boxes overlap least; the first separating one is returned as is.
+    static fn shallowestEdge(pair : BoxPair) : EdgeAxis {
+        let mut best : EdgeAxis = EdgeAxis { depth: KINETIC_GEOMETRY_FAR };
+        for (i of 0..3) {
+            for (j of 0..3) {
+                let c : DVec3 = pair.a.axis(i).cross(pair.b.axis(j));
+                let len2 : f64 = c.lengthSquared();
+                if (len2 < BOX_PARALLEL_EPS) {
+                    continue;
+                }
+                let l : DVec3 = c.scale(1.0 / len2.sqrt());
+                let depth : f64 = pair.depthAlong(l);
+                if (depth < 0.0) {
+                    return EdgeAxis { depth: depth, i: i, j: j, normal: l };
+                }
+                if (depth < best.depth) {
+                    best = EdgeAxis { depth: depth, i: i, j: j, normal: l };
+                }
+            }
+        }
+        return best;
+    }
+
+    // One point where the two edges of the shallowest edge axis come closest.
+    static fn edgeContact(pair : BoxPair, axis : EdgeAxis, out : ContactBuffer) : bool {
+        let a : BoxPose = pair.a;
+        let b : BoxPose = pair.b;
+        let mut n : DVec3 = axis.normal;
+        if (n.dot(pair.d) < 0.0) {
+            n = n.negated();
+        }
+
+        // The edge of each box that lies deepest in the other's direction.
+        let mut ptA : DVec3 = a.pos;
+        let mut ptB : DVec3 = b.pos;
+        for (k of 0..3) {
+            if (k != axis.i) {
+                let ax : DVec3 = a.axis(k);
+                ptA = ptA.plus(ax.scale(KineticGeometry::sgn(ax.dot(n)) * a.halfAlong(k)));
+            }
+            if (k != axis.j) {
+                let bx : DVec3 = b.axis(k);
+                ptB = ptB.plus(bx.scale(-KineticGeometry::sgn(bx.dot(n)) * b.halfAlong(k)));
+            }
+        }
+
+        // The nearest points of the two infinite edge lines, clamped to the edges' lengths.
+        let u : DVec3 = a.axis(axis.i);
+        let v : DVec3 = b.axis(axis.j);
+        let w : DVec3 = ptA.minus(ptB);
+        let cosine : f64 = u.dot(v);
+        let du : f64 = u.dot(w);
+        let ev : f64 = v.dot(w);
+        let denom : f64 = 1.0 - cosine * cosine;
+        let mut s : f64 = 0.0;
+        let mut t : f64 = 0.0;
+        if (denom > KINETIC_GEOMETRY_SMALL) {
+            t = (ev - cosine * du) / denom;
+            s = t * cosine - du;
+        }
+        let halfU : f64 = a.halfAlong(axis.i);
+        let halfV : f64 = b.halfAlong(axis.j);
+        s = clampD(s, -halfU, halfU);
+        t = clampD(t, -halfV, halfV);
+        let p1 : DVec3 = ptA.plus(u.scale(s));
+        let p2 : DVec3 = ptB.plus(v.scale(t));
+        out.setNormal(n);
+        out.add(p1.plus(p2).scale(0.5), axis.depth, BOX_EDGE_ID_BASE + axis.i * 3 + axis.j);
+        return true;
+    }
+
+    // The face-to-face contact for reference axis `k`: the incident face clipped to it, as up to four points.
+    static fn faceContact(pair : BoxPair, referenceIsB : bool, k : i32, out : ContactBuffer) : bool {
+        let mut ref : BoxPose = pair.a;
+        let mut inc : BoxPose = pair.b;
+        if (referenceIsB) {
+            ref = pair.b;
+            inc = pair.a;
+        }
+
+        // Outward normal of the reference face: toward the other box.
+        let refAxis : DVec3 = ref.axis(k);
+        let mut nref : DVec3 = refAxis;
+        if (refAxis.dot(inc.pos.minus(ref.pos)) < 0.0) {
+            nref = refAxis.negated();
+        }
+        let refCenter : DVec3 = ref.pos.plus(nref.scale(ref.halfAlong(k)));
+
+        let polyA : ClipPoly = out.polyA();
+        let polyB : ClipPoly = out.polyB();
+        NarrowBox::incidentFace(polyA, inc, nref, k);
+        NarrowBox::clipToSides(polyA, polyB, ref, k);
+
+        let mut n : DVec3 = nref;
+        if (referenceIsB) {
+            n = nref.negated();
+        }
+        out.setNormal(n);
+
+        // Points below the reference face are contacts, halfway between the two faces.
+        for (q of 0..polyA.count()) {
+            let x : DVec3 = polyA.pts.get(q);
+            let dist : f64 = x.minus(refCenter).dot(nref);
+            if (dist <= 0.0) {
+                out.add(x.minus(nref.scale(dist * 0.5)), -dist, polyA.ids.get(q));
+            }
+        }
+        if (out.count() == 0) {
+            return false;
+        }
+        out.reduceToFour();
+        return true;
+    }
+
+    // Fills `poly` with the face of `inc` that points most squarely at the reference face (normal `nref`),
+    // each corner carrying a feature id from the reference axis `k`, the incident face and the corner number.
+    static fn incidentFace(poly : ClipPoly, inc : BoxPose, nref : DVec3, k : i32) : void {
+        let mut m : i32 = 0;
+        let mut mDot : f64 = 0.0;
+        for (c of 0..3) {
+            let dt : f64 = inc.axis(c).dot(nref);
+            if (absD(dt) > absD(mDot) || c == 0) {
+                m = c;
+                mDot = dt;
+            }
+        }
+        let incAxis : DVec3 = inc.axis(m);
+        let mut ninc : DVec3 = incAxis;
+        let mut sideCode : i32 = 1;
+        if (mDot > 0.0) {
+            ninc = incAxis.negated();
+            sideCode = 0;
+        }
+        let m1 : i32 = (m + 1) % 3;
+        let m2 : i32 = (m + 2) % 3;
+        let centre : DVec3 = inc.pos.plus(ninc.scale(inc.halfAlong(m)));
+        let u : DVec3 = inc.axis(m1).scale(inc.halfAlong(m1));
+        let v : DVec3 = inc.axis(m2).scale(inc.halfAlong(m2));
+        let faceCode : i32 = (m * 2 + sideCode) * BOX_CORNER_SPAN;
+        let base : i32 = (k * 2 + 1) * BOX_FACE_SPAN + faceCode;
+        poly.clear();
+        poly.push(centre.plus(u).plus(v), base);
+        poly.push(centre.minus(u).plus(v), base + 1);
+        poly.push(centre.minus(u).minus(v), base + 2);
+        poly.push(centre.plus(u).minus(v), base + 3);
+    }
+
+    // Cuts `polyA` to the four side planes of the reference face (the slab between the face's two other axes),
+    // alternating with `polyB` as scratch; the result is left in `polyA`.
+    static fn clipToSides(polyA : ClipPoly, polyB : ClipPoly, ref : BoxPose, k : i32) : void {
+        let k1 : i32 = (k + 1) % 3;
+        let k2 : i32 = (k + 2) % 3;
+        let s1 : DVec3 = ref.axis(k1);
+        let s2 : DVec3 = ref.axis(k2);
+        let plane1 : ClipPlane = ClipPlane { origin: ref.pos, normal: s1, offset: ref.halfAlong(k1), id: 0 };
+        let plane2 : ClipPlane = ClipPlane {
+            origin: ref.pos,
+            normal: s1.negated(),
+            offset: ref.halfAlong(k1),
+            id: 1,
+        };
+        let plane3 : ClipPlane = ClipPlane { origin: ref.pos, normal: s2, offset: ref.halfAlong(k2), id: 2 };
+        let plane4 : ClipPlane = ClipPlane {
+            origin: ref.pos,
+            normal: s2.negated(),
+            offset: ref.halfAlong(k2),
+            id: 3,
+        };
+        polyB.clipFrom(polyA, plane1);
+        polyA.clipFrom(polyB, plane2);
+        polyB.clipFrom(polyA, plane3);
+        polyA.clipFrom(polyB, plane4);
+    }
+}

@@ -1,0 +1,280 @@
+// physics_query — questions about the world that do not change it: ray casts and overlap tests.
+//
+// A ray cast tests the ray against every body's shape (after a cheap box test) and keeps the nearest hit; ties go
+// to the lower body slot, so the answer does not depend on anything but the scene. Overlap tests build a
+// temporary shape and run the same narrow phase the simulation uses, so "overlaps" means exactly "would
+// collide". There is no acceleration structure behind either: they are linear in the number of bodies.
+
+use crate::core::collections::vec::Vec;
+use crate::core::id::entity_id::EntityId;
+use crate::core::math::dgeom::{DAabb, DRay};
+use crate::core::math::dquat::DQuat;
+use crate::core::math::dvec3::DVec3;
+use crate::core::math::scalar::{absD, clampD};
+use crate::sim::kinetic::body_store::BodyStore;
+use crate::sim::kinetic::contact_buffer::ContactBuffer;
+use crate::sim::kinetic::kinetic_geometry::{KineticGeometry, KINETIC_GEOMETRY_FAR, KINETIC_GEOMETRY_TINY};
+use crate::sim::kinetic::narrow::Narrow;
+use crate::sim::kinetic::shape::{Placed, Shape, ShapeKind};
+
+// A normalised direction has squared length 1 and a zero direction has 0; anything under half of one is zero.
+const QUERY_MIN_DIR_SQ : f64 = 0.5;
+
+/** The result of a ray cast. */
+pub struct RayCastHit {
+    /** Whether anything was hit. */
+    pub hit : bool = false;
+
+    /** The body that was hit. */
+    pub body : EntityId = EntityId { index: -1, generation: 0 };
+
+    /** Where the ray met the body. */
+    pub point : DVec3 = DVec3 { x: 0.0, y: 0.0, z: 0.0 };
+
+    /** The surface normal there, pointing against the ray. */
+    pub normal : DVec3 = DVec3 { x: 0.0, y: 1.0, z: 0.0 };
+
+    /** The distance from the ray's origin. */
+    pub distance : f64 = 0.0;
+}
+
+// A ray against one shape: the entry distance and the surface normal there.
+struct ShapeRay {
+    hit    : bool = false;
+    t      : f64 = 0.0;
+    normal : DVec3 = DVec3 { x: 0.0, y: 1.0, z: 0.0 };
+}
+
+/** Ray casts and overlap queries over a body store. */
+pub class PhysicsQuery {
+    /** Casts a ray; `dir` need not be unit length. Only hits within `maxDistance` count. */
+    pub static fn raycast(bodies : BodyStore, origin : DVec3, dir : DVec3, maxDistance : f64) : RayCastHit {
+        let d : DVec3 = dir.normalized();
+        let mut best : RayCastHit = RayCastHit {};
+        if (d.lengthSquared() < QUERY_MIN_DIR_SQ) {
+            return best;
+        }
+        let ray : DRay = DRay::make(origin, d);
+        let mut bestT : f64 = maxDistance;
+        for (i of 0..bodies.slotCount()) {
+            if (!bodies.isLive(i)) {
+                continue;
+            }
+            let body : Placed = Placed {
+                shape: bodies.shape.get(i),
+                pos: bodies.position.get(i),
+                rot: bodies.rotation.get(i),
+            };
+            let r : ShapeRay = PhysicsQuery::rayShape(body, ray);
+            let closer : bool = !best.hit || r.t < best.distance;
+            if (r.hit && r.t <= bestT && closer) {
+                bestT = r.t;
+                best = RayCastHit {
+                    hit: true,
+                    body: bodies.handleOf(i),
+                    point: origin.plus(d.scale(r.t)),
+                    normal: r.normal,
+                    distance: r.t,
+                };
+            }
+        }
+        return best;
+    }
+
+    // Dispatch by shape kind.
+    static fn rayShape(body : Placed, ray : DRay) : ShapeRay {
+        let sh : Shape = body.shape;
+        let rot : DQuat = body.rot;
+        if (sh.kind == ShapeKind::Plane) {
+            return PhysicsQuery::rayPlane(sh, ray.origin, ray.direction);
+        }
+
+        // The shape tests run in the body's own frame.
+        let inv : DQuat = rot.conjugate();
+        let lo : DVec3 = inv.rotate(ray.origin.minus(body.pos));
+        let ld : DVec3 = inv.rotate(ray.direction);
+        let mut r : ShapeRay = match sh.kind {
+            ShapeKind::Sphere => PhysicsQuery::raySphere(DVec3::zero(), sh.radius, lo, ld),
+            ShapeKind::Cuboid => PhysicsQuery::rayBox(sh.half, lo, ld),
+            ShapeKind::Capsule => PhysicsQuery::rayCapsule(sh, lo, ld),
+            ShapeKind::Plane => ShapeRay {},
+        };
+        if (r.hit) {
+            r.normal = rot.rotate(r.normal);
+        }
+        return r;
+    }
+
+    // A plane is the half space behind it: a ray starting inside answers 0, one coming from the front hits the
+    // plane, and one running parallel to it misses.
+    static fn rayPlane(sh : Shape, o : DVec3, d : DVec3) : ShapeRay {
+        let dn : f64 = sh.normal.dot(d);
+        let dist : f64 = sh.normal.dot(o) - sh.offset;
+        if (dist < 0.0) {
+            return ShapeRay { hit: true, t: 0.0, normal: d.negated() };
+        }
+        if (dn >= -KINETIC_GEOMETRY_TINY) {
+            return ShapeRay {};
+        }
+        return ShapeRay { hit: true, t: -dist / dn, normal: sh.normal };
+    }
+
+    static fn raySphere(c : DVec3, rad : f64, o : DVec3, d : DVec3) : ShapeRay {
+        let m : DVec3 = o.minus(c);
+        let b : f64 = m.dot(d);
+        let cc : f64 = m.dot(m) - rad * rad;
+        if (cc <= 0.0) {
+            return ShapeRay { hit: true, t: 0.0, normal: d.negated() };
+        }
+        if (b >= 0.0) {
+            return ShapeRay {};
+        }
+        let disc : f64 = b * b - cc;
+        if (disc < 0.0) {
+            return ShapeRay {};
+        }
+        let t : f64 = -b - disc.sqrt();
+        let p : DVec3 = o.plus(d.scale(t));
+        return ShapeRay { hit: true, t: t, normal: p.minus(c).scale(1.0 / rad) };
+    }
+
+    static fn rayBox(h : DVec3, o : DVec3, d : DVec3) : ShapeRay {
+        if (absD(o.x) <= h.x && absD(o.y) <= h.y && absD(o.z) <= h.z) {
+            return ShapeRay { hit: true, t: 0.0, normal: d.negated() };
+        }
+        let mut tNear : f64 = -KINETIC_GEOMETRY_FAR;
+        let mut tFar : f64 = KINETIC_GEOMETRY_FAR;
+        let mut n : DVec3 = DVec3 { x: 0.0, y: 1.0, z: 0.0 };
+        for (axis of 0..3) {
+            let oa : f64 = KineticGeometry::component(o, axis);
+            let da : f64 = KineticGeometry::component(d, axis);
+            let ha : f64 = KineticGeometry::component(h, axis);
+            if (absD(da) < KINETIC_GEOMETRY_TINY) {
+                if (absD(oa) > ha) {
+                    return ShapeRay {};
+                }
+                continue;
+            }
+            let mut t1 : f64 = (-ha - oa) / da;
+            let mut t2 : f64 = (ha - oa) / da;
+            let mut sgn : f64 = -1.0;
+            if (t1 > t2) {
+                let sw : f64 = t1;
+                t1 = t2;
+                t2 = sw;
+                sgn = 1.0;
+            }
+            if (t1 > tNear) {
+                tNear = t1;
+                n = PhysicsQuery::axisVec(axis, sgn);
+            }
+            if (t2 < tFar) {
+                tFar = t2;
+            }
+            if (tNear > tFar) {
+                return ShapeRay {};
+            }
+        }
+        if (tFar < 0.0) {
+            return ShapeRay {};
+        }
+        return ShapeRay { hit: true, t: tNear, normal: n };
+    }
+
+    static fn rayCapsule(sh : Shape, o : DVec3, d : DVec3) : ShapeRay {
+        let hy : f64 = sh.half.y;
+        let r : f64 = sh.radius;
+        // Inside the capsule: no farther from the axis than the radius.
+        let onAxis : DVec3 = DVec3 { x: 0.0, y: clampD(o.y, -hy, hy), z: 0.0 };
+        if (o.minus(onAxis).lengthSquared() <= r * r) {
+            return ShapeRay { hit: true, t: 0.0, normal: d.negated() };
+        }
+        let mut best : ShapeRay = ShapeRay {};
+        let a : f64 = d.x * d.x + d.z * d.z;
+        if (a > KINETIC_GEOMETRY_TINY) {
+            let b : f64 = o.x * d.x + o.z * d.z;
+            let c : f64 = o.x * o.x + o.z * o.z - r * r;
+            let disc : f64 = b * b - a * c;
+            if (disc >= 0.0) {
+                let t : f64 = (-b - disc.sqrt()) / a;
+                let y : f64 = o.y + d.y * t;
+                if (t >= 0.0 && y >= -hy && y <= hy) {
+                    let p : DVec3 = o.plus(d.scale(t));
+                    best = ShapeRay { hit: true, t: t, normal: DVec3 { x: p.x / r, y: 0.0, z: p.z / r } };
+                }
+            }
+        }
+        for (e of 0..2) {
+            let mut cyc : f64 = hy;
+            if (e == 0) {
+                cyc = -hy;
+            }
+            let sr : ShapeRay = PhysicsQuery::raySphere(DVec3 { x: 0.0, y: cyc, z: 0.0 }, r, o, d);
+            if (sr.hit && (!best.hit || sr.t < best.t)) {
+                // A cap only counts on its own side of the cylinder part.
+                let p : DVec3 = o.plus(d.scale(sr.t));
+                if ((e == 0 && p.y <= -hy) || (e == 1 && p.y >= hy)) {
+                    best = sr;
+                }
+            }
+        }
+        return best;
+    }
+
+    static fn axisVec(i : i32, sgn : f64) : DVec3 {
+        if (i == 0) {
+            return DVec3 { x: sgn, y: 0.0, z: 0.0 };
+        }
+        if (i == 1) {
+            return DVec3 { x: 0.0, y: sgn, z: 0.0 };
+        }
+        return DVec3 { x: 0.0, y: 0.0, z: sgn };
+    }
+
+    // Appends the bodies that overlap the shape `q` placed at `pos`, in slot order.
+    static fn overlapInto(
+        bodies : BodyStore,
+        q : Shape,
+        pos : DVec3,
+        rot : DQuat,
+        found : Vec<EntityId>
+    ) : void {
+        let buf : ContactBuffer = new ContactBuffer();
+        let probe : Placed = Placed { shape: q, pos: pos, rot: rot };
+        let qb : DAabb = q.aabb(pos, rot);
+        for (i of 0..bodies.slotCount()) {
+            if (!bodies.isLive(i)) {
+                continue;
+            }
+            let other : Placed = Placed {
+                shape: bodies.shape.get(i),
+                pos: bodies.position.get(i),
+                rot: bodies.rotation.get(i),
+            };
+            let b : DAabb = other.shape.aabb(other.pos, other.rot);
+            let apartX : bool = b.max.x < qb.min.x || b.min.x > qb.max.x;
+            let apartY : bool = b.max.y < qb.min.y || b.min.y > qb.max.y;
+            let apartZ : bool = b.max.z < qb.min.z || b.min.z > qb.max.z;
+            if (apartX || apartY || apartZ) {
+                continue;
+            }
+            if (Narrow::collidePlaced(probe, other, buf)) {
+                found.push(bodies.handleOf(i));
+            }
+        }
+    }
+
+    /** The bodies, in slot order, that overlap the sphere at `centre` with radius `radius`. */
+    pub static fn overlapSphere(bodies : BodyStore, centre : DVec3, radius : f64) : Vec<EntityId> {
+        let found : Vec<EntityId> = new Vec<EntityId>();
+        PhysicsQuery::overlapInto(bodies, Shape::sphere(radius), centre, DQuat::identity(), found);
+        return found;
+    }
+
+    /** The bodies, in slot order, that overlap the box at `centre` with half extents `half`, turned by `rot`. */
+    pub static fn overlapBox(bodies : BodyStore, centre : DVec3, half : DVec3, rot : DQuat) : Vec<EntityId> {
+        let found : Vec<EntityId> = new Vec<EntityId>();
+        PhysicsQuery::overlapInto(bodies, Shape::cuboid(half.x, half.y, half.z), centre, rot, found);
+        return found;
+    }
+}

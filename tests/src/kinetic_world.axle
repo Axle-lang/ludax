@@ -1,0 +1,545 @@
+// kinetic_world — checks for ray casts, overlap queries, determinism, frame pacing and debug output.
+//
+// Determinism is checked the hard way: a 200-body pile is simulated twice and the state hashes (and every
+// position, bit for bit) must agree; the same scene driven by a FixedStep through two very different frame
+// patterns must end in the same state.
+
+use ludax::BodyDesc;
+use ludax::Checks;
+use ludax::DEBUG_COLOR_AWAKE;
+use ludax::DEBUG_COLOR_STATIC;
+use ludax::DQuat;
+use ludax::DVec3;
+use ludax::DebugDraw;
+use ludax::EntityId;
+use ludax::FixedStep;
+use ludax::HALF_PI_D;
+use ludax::Pcg32;
+use ludax::PhysicsSettings;
+use ludax::PhysicsWorld;
+use ludax::RayCastHit;
+use ludax::Shape;
+use ludax::Vec;
+use ludax::absD;
+use ludax::maxD;
+
+use crate::kinetic_shapes::{KIN_EDGE_TILT, KIN_HALF_SQRT2, KIN_LOOSE, KIN_TIGHT};
+
+// The pacing check runs two seconds at 120 Hz, once in 1 ms frames and once in uneven 0.5 to 40 ms frames.
+const KIN_PACING_HZ : i32 = 120;
+const KIN_TWO_SECONDS_NS : i64 = 2000000000;
+const KIN_ONE_MS_NS : i64 = 1000000;
+const KIN_MIN_FRAME_NS : i64 = 500000;
+const KIN_FRAME_SPREAD_NS : i32 = 39500000;
+
+/** Bodies dropped into the pile of `kinPile`. */
+const KIN_PILE_BODIES : i32 = 200;
+
+/** The static bodies of the yard around the pile: a floor and four walls. */
+const KIN_YARD_STATICS : i32 = 5;
+
+/** The seed of the pile every determinism check builds and compares against. */
+const KIN_PILE_SEED : u64 = 11;
+
+/** The random stream that scatters the pile; fixed so a seed names one pile. */
+const KIN_PILE_STREAM : u64 = 7;
+
+/** Steps the pile runs before its hash is compared; long enough for bodies to land and collide. */
+const KIN_PILE_STEPS : i32 = 300;
+
+/** Steps a lone body needs to fall from a few metres and settle on the ground. */
+const KIN_LANDING_STEPS : i32 = 130;
+
+/** How far the nudge of the sensitivity check moves one body, in metres: one micrometre. */
+const KIN_NUDGE : f64 = 0.000001;
+
+/** The far tower of the large-world check stands this far from the origin along x, in metres. */
+const KIN_FAR_X : f64 = 2000000.0;
+
+/** And this far along z, so the offset is large on two axes and a float32 position would lose centimetres. */
+const KIN_FAR_Z : f64 = -3000000.0;
+
+/** The query, determinism and debug-output checks. */
+pub class KineticWorldSuite {
+    /** Runs every check of the suite. */
+    pub static fn run(c : Checks) : void {
+        kinRaysShapes(c);
+        kinRaysNearest(c);
+        kinOverlaps(c);
+        kinDeterminism(c);
+        kinPacing(c);
+        kinLargeWorld(c);
+        kinDebugDraw(c);
+        kinHandles(c);
+    }
+}
+
+/** A world of one static body of each shape, spread along x so that a ray can be aimed at any one of them. */
+struct KinRayScene {
+    w      : PhysicsWorld;
+    sph    : EntityId;
+    bx     : EntityId;
+    cap    : EntityId;
+    ground : EntityId;
+    turned : EntityId;
+}
+
+fn kinRayScene() : KinRayScene {
+    let w : PhysicsWorld = new PhysicsWorld(PhysicsSettings {});
+    let sph : EntityId = w.addBody(BodyDesc::fixed(Shape::sphere(1.0), DVec3::make(0.0, 0.0, 5.0)));
+    let cube : Shape = Shape::cuboid(1.0, 1.0, 1.0);
+    let bx : EntityId = w.addBody(BodyDesc::fixed(cube, DVec3::make(10.0, 0.0, 5.0)));
+    let capsule : Shape = Shape::capsule(0.5, 1.0);
+    let cap : EntityId = w.addBody(BodyDesc::fixed(capsule, DVec3::make(20.0, 0.0, 5.0)));
+    let plane : Shape = Shape::plane(DVec3::unitY(), -3.0);
+    let ground : EntityId = w.addBody(BodyDesc::fixed(plane, DVec3::zero()));
+    let turned : EntityId = w.addBody(BodyDesc::fixed(cube, DVec3::make(30.0, 0.0, 5.0)));
+    w.setRotation(turned, DQuat::fromAxisAngle(DVec3::unitY(), KIN_EDGE_TILT));
+    return KinRayScene { w: w, sph: sph, bx: bx, cap: cap, ground: ground, turned: turned };
+}
+
+fn kinRaysSphere(c : Checks, s : KinRayScene) : void {
+    let w : PhysicsWorld = s.w;
+    let h : RayCastHit = w.raycast(DVec3::zero(), DVec3::unitZ(), 100.0);
+    c.that("ray: a ray down the axis hits the sphere body", h.hit && h.body.same(s.sph));
+    c.near("ray: the distance to the sphere is 4", h.distance, 4.0, KIN_TIGHT);
+    c.that(
+        "ray: sphere normal faces the ray",
+        h.normal.approxEq(DVec3::make(0.0, 0.0, -1.0), KIN_TIGHT)
+    );
+    c.that(
+        "ray: the hit point on the sphere is 4 along the ray",
+        h.point.approxEq(DVec3::make(0.0, 0.0, 4.0), KIN_TIGHT)
+    );
+
+    let off : RayCastHit = w.raycast(DVec3::make(0.0, 0.6, 0.0), DVec3::unitZ(), 100.0);
+    c.near(
+        "ray: an off-centre hit on the sphere is nearer to the edge (z = 5 - 0.8)",
+        off.point.z,
+        4.2,
+        KIN_TIGHT
+    );
+    c.near("ray: an off-centre sphere hit has a normal tilted up", off.normal.y, 0.6, KIN_TIGHT);
+
+    let above : RayCastHit = w.raycast(DVec3::make(0.0, 1.2, 0.0), DVec3::unitZ(), 100.0);
+    c.that("ray: a ray that passes above the sphere misses", !above.hit);
+    let short : RayCastHit = w.raycast(DVec3::zero(), DVec3::unitZ(), 3.9);
+    c.that("ray: max distance cuts the ray short", !short.hit);
+    let scaled : RayCastHit = w.raycast(DVec3::zero(), DVec3::make(0.0, 0.0, 7.0), 100.0);
+    c.that("ray: the direction need not be a unit vector", scaled.distance == h.distance);
+}
+
+fn kinRaysBox(c : Checks, s : KinRayScene) : void {
+    let w : PhysicsWorld = s.w;
+    let towardsFace : DVec3 = DVec3::make(0.0, 0.0, -1.0);
+    let towardsSide : DVec3 = DVec3::make(-1.0, 0.0, 0.0);
+
+    let hb : RayCastHit = w.raycast(DVec3::make(10.0, 0.3, 0.0), DVec3::unitZ(), 100.0);
+    c.that("ray: a ray down the axis hits the box body", hb.hit && hb.body.same(s.bx));
+    c.near("ray: the distance to the box is 4", hb.distance, 4.0, KIN_TIGHT);
+    c.that(
+        "ray: the box face normal points back toward the ray",
+        hb.normal.approxEq(towardsFace, KIN_TIGHT)
+    );
+
+    let hs : RayCastHit = w.raycast(DVec3::make(8.0, 0.5, 5.0), DVec3::unitX(), 100.0);
+    c.that(
+        "ray: side of the box",
+        hs.hit && hs.body.same(s.bx) && hs.normal.approxEq(towardsSide, KIN_TIGHT)
+    );
+    c.near("ray: the distance to the box side is 1", hs.distance, 1.0, KIN_TIGHT);
+
+    let ht : RayCastHit = w.raycast(DVec3::make(30.5, 0.0, 0.0), DVec3::unitZ(), 100.0);
+    c.that("ray: a ray hits a turned box body", ht.hit && ht.body.same(s.turned));
+    let offset : DVec3 = ht.point.minus(w.position(s.turned));
+    let local : DVec3 = w.rotation(s.turned).conjugate().rotate(offset);
+    c.near(
+        "ray: the point lies on the turned box's surface",
+        maxD(absD(local.x), absD(local.z)),
+        1.0,
+        KIN_TIGHT
+    );
+    c.near("ray: turned box normal is diagonal", absD(ht.normal.z), KIN_HALF_SQRT2, KIN_TIGHT);
+}
+
+fn kinRaysCapsule(c : Checks, s : KinRayScene) : void {
+    let w : PhysicsWorld = s.w;
+    let hc : RayCastHit = w.raycast(DVec3::make(18.0, 0.3, 5.0), DVec3::unitX(), 100.0);
+    let towardsSide : DVec3 = DVec3::make(-1.0, 0.0, 0.0);
+    c.that(
+        "ray: hits the capsule's side",
+        hc.hit && hc.body.same(s.cap) && hc.normal.approxEq(towardsSide, KIN_TIGHT)
+    );
+    c.near("ray: the distance to the capsule side is 1.5", hc.distance, 1.5, KIN_TIGHT);
+
+    let hcap : RayCastHit = w.raycast(DVec3::make(18.0, 1.3, 5.0), DVec3::unitX(), 100.0);
+    c.near(
+        "ray: the capsule's cap is a sphere (x = 20 - sqrt(0.25 - 0.09))",
+        hcap.point.x,
+        20.0 - 0.4,
+        KIN_TIGHT
+    );
+    c.that(
+        "ray: the normal on the capsule cap tilts away from the cap centre",
+        hcap.normal.approxEq(DVec3::make(-0.8, 0.6, 0.0), KIN_TIGHT)
+    );
+    let over : RayCastHit = w.raycast(DVec3::make(18.0, 1.6, 5.0), DVec3::unitX(), 100.0);
+    c.that("ray: above the cap is a miss", !over.hit);
+}
+
+fn kinRaysPlane(c : Checks, s : KinRayScene) : void {
+    let w : PhysicsWorld = s.w;
+    let down : DVec3 = DVec3::make(0.0, -1.0, 0.0);
+    let hg : RayCastHit = w.raycast(DVec3::make(5.0, 10.0, 0.0), down, 100.0);
+    c.that(
+        "ray: hits the plane",
+        hg.hit && hg.body.same(s.ground) && hg.normal.approxEq(DVec3::unitY(), KIN_TIGHT)
+    );
+    c.near("ray: the distance to the ground plane is 13", hg.distance, 13.0, KIN_TIGHT);
+
+    let slanted : RayCastHit = w.raycast(DVec3::zero(), DVec3::make(1.0, -1.0, 0.0), 100.0);
+    c.near("ray: a slanted ray reaches the plane at x of 3", slanted.point.x, 3.0, KIN_TIGHT);
+    let away : RayCastHit = w.raycast(DVec3::make(5.0, 10.0, 0.0), DVec3::unitY(), 100.0);
+    c.that("ray: away from the plane misses", !away.hit);
+}
+
+fn kinRaysShapes(c : Checks) : void {
+    let scene : KinRayScene = kinRayScene();
+    kinRaysSphere(c, scene);
+    kinRaysBox(c, scene);
+    kinRaysCapsule(c, scene);
+    kinRaysPlane(c, scene);
+}
+
+fn kinRaysNearest(c : Checks) : void {
+    // The nearest of several, whatever the order bodies were added in.
+    let w2 : PhysicsWorld = new PhysicsWorld(PhysicsSettings {});
+    let far : EntityId = w2.addBody(BodyDesc::fixed(
+        Shape::sphere(1.0),
+        DVec3::make(0.0, 0.0, 20.0)
+    ));
+    let near : EntityId = w2.addBody(BodyDesc::fixed(
+        Shape::sphere(1.0),
+        DVec3::make(0.0, 0.0, 8.0)
+    ));
+    let hn : RayCastHit = w2.raycast(DVec3::zero(), DVec3::unitZ(), 100.0);
+    c.that(
+        "ray: the nearest body wins over a farther one on the same ray",
+        hn.body.same(near) && !hn.body.same(far)
+    );
+    w2.removeBody(near);
+    c.that(
+        "ray: a removed body is not hit",
+        w2.raycast(DVec3::zero(), DVec3::unitZ(), 100.0).body.same(far)
+    );
+    let inside : RayCastHit = w2.raycast(DVec3::make(0.0, 0.0, 20.0), DVec3::unitZ(), 100.0);
+    c.that(
+        "ray: a ray starting inside a body hits it at distance 0",
+        inside.hit && inside.distance == 0.0
+    );
+}
+
+fn kinOverlaps(c : Checks) : void {
+    let w : PhysicsWorld = new PhysicsWorld(PhysicsSettings {});
+    for (i of 0..4) {
+        w.addBody(BodyDesc::fixed(Shape::sphere(0.5), DVec3::make((i as f64), 0.0, 0.0)));
+    }
+    let hits : Vec<EntityId> = w.overlapSphere(DVec3::make(1.5, 0.0, 0.0), 0.6);
+    c.sameInt("overlap: a sphere query finds the two neighbours", hits.len(), 2);
+    c.sameInt("overlap: the first hit is slot 1, in slot order", hits.get(0).index, 1);
+    c.sameInt("overlap: the second hit is slot 2, in slot order", hits.get(1).index, 2);
+    c.sameInt(
+        "overlap: a sphere beside the row finds none",
+        w.overlapSphere(DVec3::make(1.5, 1.2, 0.0), 0.4).len(),
+        0
+    );
+    c.sameInt(
+        "overlap: a big sphere finds all",
+        w.overlapSphere(DVec3::make(1.5, 0.0, 0.0), 5.0).len(),
+        4
+    );
+    let inBox : Vec<EntityId> = w.overlapBox(
+        DVec3::make(2.0, 0.0, 0.0),
+        DVec3::make(0.45, 2.0, 2.0),
+        DQuat::identity()
+    );
+    c.sameInt("overlap: a box over x = 1.55..2.45 finds only the sphere at 2", inBox.len(), 1);
+    c.sameInt("overlap: the box query's hit is slot 2", inBox.get(0).index, 2);
+    let along : Vec<EntityId> = w.overlapBox(
+        DVec3::make(1.5, 0.0, 2.0),
+        DVec3::make(0.1, 0.1, 2.0),
+        DQuat::identity()
+    );
+    c.sameInt(
+        "overlap: a long box lying along z reaches the two spheres at x = 1 and 2",
+        along.len(),
+        2
+    );
+    let across : Vec<EntityId> = w.overlapBox(
+        DVec3::make(1.5, 0.0, 2.0),
+        DVec3::make(0.1, 0.1, 2.0),
+        DQuat::fromAxisAngle(DVec3::unitY(), HALF_PI_D)
+    );
+    c.sameInt(
+        "overlap: the same box turned a quarter lies across, 2 m away, and reaches none",
+        across.len(),
+        0
+    );
+}
+
+// A static wall of half extents `half` centred at `at`.
+fn kinYardWall(w : PhysicsWorld, half : DVec3, at : DVec3) : void {
+    w.addBody(BodyDesc::fixed(Shape::cuboid(half.x, half.y, half.z), at));
+}
+
+// A pile of 200 spheres, boxes and capsules dropped into a walled yard.
+fn kinPile(seed : u64) : PhysicsWorld {
+    let w : PhysicsWorld = new PhysicsWorld(PhysicsSettings {});
+    w.addBody(BodyDesc::fixed(Shape::plane(DVec3::unitY(), 0.0), DVec3::zero()));
+    kinYardWall(w, DVec3::make(0.25, 2.0, 4.5), DVec3::make(4.5, 2.0, 0.0));
+    kinYardWall(w, DVec3::make(0.25, 2.0, 4.5), DVec3::make(-4.5, 2.0, 0.0));
+    kinYardWall(w, DVec3::make(4.5, 2.0, 0.25), DVec3::make(0.0, 2.0, 4.5));
+    kinYardWall(w, DVec3::make(4.5, 2.0, 0.25), DVec3::make(0.0, 2.0, -4.5));
+
+    let rng : Pcg32 = new Pcg32(seed, KIN_PILE_STREAM);
+    for (i of 0..KIN_PILE_BODIES) {
+        let gx : f64 = (((i % 5) as f64) - 2.0) * 1.3 + (rng.nextF64() - 0.5) * 0.3;
+        let gz : f64 = ((((i / 5) % 5) as f64) - 2.0) * 1.3 + (rng.nextF64() - 0.5) * 0.3;
+        let gy : f64 = 0.6 + ((i / 25) as f64) * 1.2;
+        let kind : i32 = i % 3;
+        let mut shape : Shape = Shape::sphere(0.4);
+        if (kind == 1) {
+            shape = Shape::cuboid(0.35, 0.35, 0.35);
+        } else if (kind == 2) {
+            shape = Shape::capsule(0.25, 0.3);
+        }
+        let mut d : BodyDesc = BodyDesc::dynamic(
+            shape,
+            DVec3::make(gx, gy, gz),
+            1.0 + (kind as f64)
+        );
+        let axis : DVec3 = DVec3::make(
+            rng.nextF64() - 0.5,
+            rng.nextF64() - 0.5,
+            rng.nextF64() - 0.5
+        ).normalizedOr(DVec3::unitX());
+        d.rotation = DQuat::fromAxisAngle(axis, rng.nextF64() * 3.0);
+        d.restitution = 0.2;
+        w.addBody(d);
+    }
+    return w;
+}
+
+fn kinDeterminism(c : Checks) : void {
+    let a : PhysicsWorld = kinPile(KIN_PILE_SEED);
+    let b : PhysicsWorld = kinPile(KIN_PILE_SEED);
+    c.that(
+        "determinism: two identical scenes start with the same hash",
+        a.stateHash() == b.stateHash()
+    );
+    for (i of 0..KIN_PILE_STEPS) {
+        a.advance();
+        b.advance();
+    }
+    c.that(
+        "determinism: after 300 steps of a 200-body pile the hashes agree",
+        a.stateHash() == b.stateHash()
+    );
+    let mut identical : bool = true;
+    for (i of 0..a.slotCount()) {
+        let ia : EntityId = a.bodyAt(i);
+        let ib : EntityId = b.bodyAt(i);
+        if (a.position(ia).x != b.position(ib).x || a.position(ia).y != b.position(ib).y
+            || a.position(ia).z != b.position(ib).z) {
+            identical = false;
+        }
+        if (a.rotation(ia).w != b.rotation(ib).w
+            || a.linearVelocity(ia).y != b.linearVelocity(ib).y) {
+            identical = false;
+        }
+    }
+    c.that("determinism: and every position, rotation and velocity is bit-identical", identical);
+    c.that(
+        "determinism: the pile is not at rest (the hash covers real motion)",
+        a.stateHash() != kinPile(KIN_PILE_SEED).stateHash()
+    );
+    c.that(
+        "determinism: another seed gives another hash",
+        kinPile(KIN_PILE_SEED + 1).stateHash() != kinPile(KIN_PILE_SEED).stateHash()
+    );
+    c.sameInt(
+        "determinism: the world holds the pile and its yard",
+        a.bodyCount(),
+        KIN_PILE_BODIES + KIN_YARD_STATICS
+    );
+    c.that("determinism: the broad phase finds more than 20 pairs", a.pairCount() > 20);
+    let mut inside : bool = true;
+    for (i of KIN_YARD_STATICS..a.slotCount()) {
+        let p : DVec3 = a.position(a.bodyAt(i));
+        if (p.y < 0.0 || absD(p.x) > 5.0 || absD(p.z) > 5.0) {
+            inside = false;
+        }
+    }
+    c.that("determinism: nothing fell through the floor or out of the yard", inside);
+    // A tiny perturbation changes the hash: it is sensitive.
+    let p : EntityId = b.bodyAt(10);
+    b.setPosition(p, b.position(p).plus(DVec3::make(KIN_NUDGE, 0.0, 0.0)));
+    c.that(
+        "determinism: moving one body by a micrometre changes the hash",
+        a.stateHash() != b.stateHash()
+    );
+}
+
+fn kinPacing(c : Checks) : void {
+    // The same 2 seconds of a pile, once in 1 ms frames and once in frames of 0.5 to 40 ms.
+    let a : PhysicsWorld = kinPile(5);
+    let fa : FixedStep = FixedStep::atHertz(KIN_PACING_HZ, 100);
+    for (i of 0..2000) {
+        fa.advanceNanos(KIN_ONE_MS_NS);
+        while (fa.takeStep()) {
+            a.advance();
+        }
+    }
+    let b : PhysicsWorld = kinPile(5);
+    let fb : FixedStep = FixedStep::atHertz(KIN_PACING_HZ, 100);
+    let rng : Pcg32 = new Pcg32(99, 1);
+    let mut total : i64 = 0;
+    let mut frames : i32 = 0;
+    while (total < KIN_TWO_SECONDS_NS) {
+        let mut len : i64 = KIN_MIN_FRAME_NS + (rng.range(0, KIN_FRAME_SPREAD_NS) as i64);
+        if (total + len > KIN_TWO_SECONDS_NS) {
+            len = KIN_TWO_SECONDS_NS - total;
+        }
+        total = total + len;
+        frames = frames + 1;
+        fb.advanceNanos(len);
+        while (fb.takeStep()) {
+            b.advance();
+        }
+    }
+    c.sameInt(
+        "pacing: both patterns release the same number of ticks (2 s at 120 Hz)",
+        fa.ticks(),
+        fb.ticks()
+    );
+    c.sameInt("pacing: a second of 60 Hz frames makes 240 ticks", fa.ticks(), 240);
+    c.that("pacing: the uneven pattern really was uneven", frames > 50 && frames < 1500);
+    c.that("pacing: the final states have the same hash", a.stateHash() == b.stateHash());
+    c.sameInt("pacing: worlds paced differently count the same steps", a.steps(), b.steps());
+
+    // step(dt) banks real time: 1/60 s frames and 1/30 s frames reach the same state.
+    let s1 : PhysicsWorld = kinPile(5);
+    let s2 : PhysicsWorld = kinPile(5);
+    for (i of 0..60) {
+        s1.step(1.0 / 60.0);
+    }
+    for (i of 0..30) {
+        s2.step(1.0 / 30.0);
+    }
+    c.sameInt("pacing: step(dt) runs 120 substeps for 1 s in 1/60 s frames", s1.steps(), 120);
+    c.sameInt("pacing: 1/30 s frames make 120 steps", s2.steps(), 120);
+    c.that(
+        "pacing: 60 Hz and 30 Hz pacing give identical state hashes",
+        s1.stateHash() == s2.stateHash()
+    );
+}
+
+fn kinLargeWorld(c : Checks) : void {
+    // The same tower at the origin and 2 million metres away: positions are f64, so it behaves identically.
+    let near : PhysicsWorld = new PhysicsWorld(PhysicsSettings { sleeping: false });
+    let far : PhysicsWorld = new PhysicsWorld(PhysicsSettings { sleeping: false });
+    near.addBody(BodyDesc::fixed(Shape::plane(DVec3::unitY(), 0.0), DVec3::zero()));
+    far.addBody(BodyDesc::fixed(Shape::plane(DVec3::unitY(), 0.0), DVec3::zero()));
+    let off : DVec3 = DVec3::make(KIN_FAR_X, 0.0, KIN_FAR_Z);
+    let mut topNear : EntityId = EntityId::none();
+    let mut topFar : EntityId = EntityId::none();
+    for (i of 0..4) {
+        let p : DVec3 = DVec3::make(0.0, 0.5 + (i as f64) * 1.001, 0.0);
+        topNear = near.addBody(BodyDesc::dynamic(Shape::cuboid(0.5, 0.5, 0.5), p, 1.0));
+        topFar = far.addBody(BodyDesc::dynamic(Shape::cuboid(0.5, 0.5, 0.5), p.plus(off), 1.0));
+    }
+    for (i of 0..360) {
+        near.advance();
+        far.advance();
+    }
+    c.that(
+        "large world: a tower 3.6 million metres from the origin stands as well",
+        far.position(topFar).y > 3.4
+    );
+    c.near(
+        "large world: and sits at the same height as at the origin (within 1 micrometre)",
+        far.position(topFar).y,
+        near.position(topNear).y,
+        KIN_LOOSE
+    );
+    c.near(
+        "large world: with the same sideways drift",
+        far.position(topFar).x - off.x,
+        near.position(topNear).x,
+        KIN_LOOSE
+    );
+}
+
+fn kinDebugDraw(c : Checks) : void {
+    let w : PhysicsWorld = new PhysicsWorld(PhysicsSettings {});
+    w.addBody(BodyDesc::fixed(Shape::plane(DVec3::unitY(), 0.0), DVec3::zero()));
+    w.addBody(BodyDesc::dynamic(Shape::cuboid(0.5, 0.5, 0.5), DVec3::make(0.0, 5.0, 0.0), 1.0));
+    w.addBody(BodyDesc::dynamic(Shape::sphere(0.5), DVec3::make(3.0, 5.0, 0.0), 1.0));
+    let d : DebugDraw = new DebugDraw();
+    w.debugDraw(d);
+    c.sameInt("debug: plane patch 4 + box 12 + sphere 3 rings of 24 = 88 lines", d.lineCount(), 88);
+    c.sameInt("debug: with no contacts there are no debug points", d.pointCount(), 0);
+    c.sameInt("debug: the line array holds six numbers per line", d.lines.len(), 88 * 6);
+    c.sameInt(
+        "debug: the plane is drawn in the static colour",
+        d.lineColors.get(0),
+        DEBUG_COLOR_STATIC
+    );
+    c.sameInt(
+        "debug: the box is drawn in the awake colour",
+        d.lineColors.get(4),
+        DEBUG_COLOR_AWAKE
+    );
+    c.near(
+        "debug: the first box edge starts at a corner (x = -0.5)",
+        d.lines.get(4 * 6),
+        -0.5,
+        KIN_TIGHT
+    );
+    for (i of 0..KIN_LANDING_STEPS) {
+        w.advance();
+    }
+    w.debugDraw(d);
+    c.that("debug: after landing, contact points and normals appear", d.pointCount() >= 4);
+    c.that("debug: a contact normal is drawn per point", d.lineCount() > 88 + 3);
+    w.debugDraw(d);
+    c.that(
+        "debug: drawing again starts from empty and gives one point per contact",
+        d.pointCount() == w.contactCount()
+    );
+}
+
+fn kinHandles(c : Checks) : void {
+    let w : PhysicsWorld = new PhysicsWorld(PhysicsSettings {});
+    let a : EntityId = w.addBody(BodyDesc::dynamic(
+        Shape::sphere(0.5),
+        DVec3::make(1.0, 2.0, 3.0),
+        1.0
+    ));
+    c.that("handles: a new body handle is live", w.hasBody(a));
+    c.that(
+        "handles: removing a body works once and the second removal is refused",
+        w.removeBody(a) && !w.removeBody(a)
+    );
+    c.that(
+        "handles: a stale handle reads as zeros and writes nothing",
+        !w.hasBody(a) && w.position(a).length() == 0.0
+    );
+    w.setPosition(a, DVec3::make(9.0, 9.0, 9.0));
+    let b : EntityId = w.addBody(BodyDesc::dynamic(Shape::sphere(0.5), DVec3::zero(), 1.0));
+    c.that("handles: a reused slot is a different handle", b.index == a.index && !b.same(a));
+    c.that("handles: and was not touched by the stale write", w.position(b).length() == 0.0);
+    let mut d : BodyDesc = BodyDesc::dynamic(Shape::sphere(0.5), DVec3::zero(), 1.0);
+    d.userData = 77;
+    c.sameInt("handles: user data reads back as stored", w.userData(w.addBody(d)), 77);
+}

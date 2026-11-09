@@ -1,0 +1,339 @@
+// joint_solver — sequential impulses for ball-and-socket, distance and hinge joints.
+//
+// Same scheme as the contact solver: every joint is a set of velocity constraints visited in a fixed order,
+// each iteration correcting the relative velocity at the joint and keeping the impulse applied so far. The
+// position error left by integration is fed back as a velocity (Baumgarte), a fraction `jointBeta` of it per
+// step, so a pendulum's length is held without a visible kick.
+
+use crate::core::math::dmat3::DMat3;
+use crate::core::math::dvec3::DVec3;
+use crate::core::math::trig::atan2D;
+use crate::sim::kinetic::body_store::BodyStore;
+use crate::sim::kinetic::joint_set::{
+    JOINT_DISTANCE, JOINT_HINGE, JOINT_LIMIT_LOWER, JOINT_LIMIT_NONE, JOINT_LIMIT_UPPER, Joint, JointSet
+};
+use crate::sim::kinetic::physics_settings::PhysicsSettings;
+use crate::sim::kinetic::solver_state::SolverState;
+
+// Where a joint attaches this step: the solver slots of its two bodies (the world's slot for -1) and the
+// world positions of the two anchors.
+struct JointEnds {
+    ia : i32 = 0;
+    ib : i32 = 0;
+    pA : DVec3 = DVec3 { x: 0.0, y: 0.0, z: 0.0 };
+    pB : DVec3 = DVec3 { x: 0.0, y: 0.0, z: 0.0 };
+}
+
+/** The joint half of the constraint solver. */
+pub(crate) class JointSolver {
+    /** Computes anchors, effective masses and error terms for every active joint; applies warm-start impulses. */
+    pub(crate) static fn prepare(
+        js : JointSet,
+        st : SolverState,
+        bodies : BodyStore,
+        cfg : PhysicsSettings
+    ) : void {
+        let k : f64 = cfg.jointBeta / cfg.substep;
+        let world : i32 = st.worldSlot();
+        for (i of 0..js.items.len()) {
+            let mut j : Joint = js.items.get(i);
+            if (!j.active) {
+                continue;
+            }
+            let ends : JointEnds = JointEnds {
+                ia: JointSolver::slotOf(j.a, world),
+                ib: JointSolver::slotOf(j.b, world),
+                pA: JointSolver::anchorWorld(bodies, j.a, j.anchorA),
+                pB: JointSolver::anchorWorld(bodies, j.b, j.anchorB),
+            };
+            j.rA = ends.pA.minus(JointSolver::centre(bodies, j.a));
+            j.rB = ends.pB.minus(JointSolver::centre(bodies, j.b));
+            if (j.kind == JOINT_DISTANCE) {
+                j = JointSolver::prepareRod(j, st, ends, k);
+            } else {
+                j = JointSolver::preparePoint(j, st, bodies, ends, k);
+            }
+            js.items.set(i, j);
+        }
+    }
+
+    // A distance joint: a rod along the line between the anchors, with the length error fed back at speed `k`.
+    static fn prepareRod(jin : Joint, st : SolverState, e : JointEnds, k : f64) : Joint {
+        let mut j : Joint = jin;
+        let d : DVec3 = e.pB.minus(e.pA);
+        let len : f64 = d.length();
+        j.rod = d.normalizedOr(DVec3::unitY());
+        j.bias = DVec3 { x: (len - j.length) * k, y: 0.0, z: 0.0 };
+        let ra : DVec3 = j.rA.cross(j.rod);
+        let rb : DVec3 = j.rB.cross(j.rod);
+        let linearPart : f64 = st.invMass(e.ia) + st.invMass(e.ib);
+        let angularA : f64 = ra.dot(st.invInertia(e.ia, ra));
+        let angularB : f64 = rb.dot(st.invInertia(e.ib, rb));
+        let invEffectiveMass : f64 = linearPart + angularA + angularB;
+        j.rodMass = 0.0;
+        if (invEffectiveMass > 0.0) {
+            j.rodMass = 1.0 / invEffectiveMass;
+        }
+        st.applyImpulse(e.ia, e.ib, j.rod.scale(j.lin.x), j.rA, j.rB);
+        return j;
+    }
+
+    // A ball-and-socket joint, which a hinge extends with its axis rows.
+    static fn preparePoint(
+        jin : Joint,
+        st : SolverState,
+        bodies : BodyStore,
+        e : JointEnds,
+        k : f64
+    ) : Joint {
+        let mut j : Joint = jin;
+        j.bias = e.pB.minus(e.pA).scale(k);
+        j.kInv = JointSolver::pointMass(st, e.ia, e.ib, j.rA, j.rB).inverse();
+        st.applyImpulse(e.ia, e.ib, j.lin, j.rA, j.rB);
+        if (j.kind == JOINT_HINGE) {
+            j = JointSolver::prepareHinge(j, st, bodies, e, k);
+            JointSolver::warmHinge(j, st, e);
+        }
+        return j;
+    }
+
+    // Re-applies the angular impulses the hinge's rows and limit carried over from the last step.
+    static fn warmHinge(joint : Joint, st : SolverState, e : JointEnds) : void {
+        let rows : DVec3 = joint.t1.scale(joint.imp1).plus(joint.t2.scale(joint.imp2));
+        let carried : DVec3 = rows.plus(joint.axisW.scale(joint.impLimit));
+        st.applyAngular(e.ia, e.ib, carried);
+    }
+
+    // The rows a hinge adds to the point joint: two keep the axes together, one holds the angle limit.
+    static fn prepareHinge(
+        jin : Joint,
+        st : SolverState,
+        bodies : BodyStore,
+        e : JointEnds,
+        k : f64
+    ) : Joint {
+        let ia : i32 = e.ia;
+        let ib : i32 = e.ib;
+        let mut j : Joint = jin;
+        let aw : DVec3 = JointSolver::dirWorld(bodies, j.a, j.axisA);
+        let bw : DVec3 = JointSolver::dirWorld(bodies, j.b, j.axisB);
+
+        // The two directions across the axis are the rows that keep the bodies' axes together.
+        j.axisW = aw;
+        j.t1 = aw.anyPerpendicular();
+        j.t2 = aw.cross(j.t1);
+        let e : DVec3 = bw.cross(aw);
+        j.bias1 = e.dot(j.t1) * k;
+        j.bias2 = e.dot(j.t2) * k;
+        j.mass1 = JointSolver::angularMass(st, ia, ib, j.t1);
+        j.mass2 = JointSolver::angularMass(st, ia, ib, j.t2);
+        j.massAxis = JointSolver::angularMass(st, ia, ib, aw);
+
+        // The limit row is live only while the angle is at or past a limit.
+        j.angle = JointSolver::angleOf(bodies, j);
+        j.limitSide = JOINT_LIMIT_NONE;
+        j.limitBias = 0.0;
+        j.limitPos = 0.0;
+        if (j.limited) {
+            if (j.angle <= j.lower) {
+                j.limitSide = JOINT_LIMIT_LOWER;
+                j.limitBias = -(j.angle - j.lower) * k;
+            } else if (j.angle >= j.upper) {
+                j.limitSide = JOINT_LIMIT_UPPER;
+                j.limitBias = -(j.angle - j.upper) * k;
+            }
+        }
+        if (j.limitSide == JOINT_LIMIT_NONE) {
+            j.impLimit = 0.0;
+        }
+        return j;
+    }
+
+    /** One pass over every joint. */
+    pub(crate) static fn iterate(js : JointSet, st : SolverState) : void {
+        let world : i32 = st.worldSlot();
+        for (i of 0..js.items.len()) {
+            let mut j : Joint = js.items.get(i);
+            if (!j.active) {
+                continue;
+            }
+            let ia : i32 = JointSolver::slotOf(j.a, world);
+            let ib : i32 = JointSolver::slotOf(j.b, world);
+            if (j.kind == JOINT_DISTANCE) {
+                let vrel : DVec3 = st.pointVelocity(ib, j.rB).minus(st.pointVelocity(ia, j.rA));
+                let lam : f64 = -j.rodMass * vrel.dot(j.rod);
+                j.lin = DVec3 { x: j.lin.x + lam, y: 0.0, z: 0.0 };
+                st.applyImpulse(ia, ib, j.rod.scale(lam), j.rA, j.rB);
+            } else {
+                if (j.kind == JOINT_HINGE) {
+                    j = JointSolver::iterateHinge(j, st, ia, ib);
+                }
+                let vrel : DVec3 = st.pointVelocity(ib, j.rB).minus(st.pointVelocity(ia, j.rA));
+                let p : DVec3 = j.kInv.transform(vrel.negated());
+                j.lin = j.lin.plus(p);
+                st.applyImpulse(ia, ib, p, j.rA, j.rB);
+            }
+            js.items.set(i, j);
+        }
+    }
+
+    /** One pass of the position pass: drives the joints' position errors out on the pseudo velocities. */
+    pub(crate) static fn iteratePosition(js : JointSet, st : SolverState) : void {
+        let world : i32 = st.worldSlot();
+        for (i of 0..js.items.len()) {
+            let mut j : Joint = js.items.get(i);
+            if (!j.active) {
+                continue;
+            }
+            let ia : i32 = JointSolver::slotOf(j.a, world);
+            let ib : i32 = JointSolver::slotOf(j.b, world);
+            if (j.kind == JOINT_DISTANCE) {
+                let vrel : DVec3 = st.pseudoPointVelocity(ib, j.rB).minus(st.pseudoPointVelocity(ia, j.rA));
+                let lam : f64 = -j.rodMass * (vrel.dot(j.rod) + j.bias.x);
+                st.applyPseudoImpulse(ia, ib, j.rod.scale(lam), j.rA, j.rB);
+            } else {
+                if (j.kind == JOINT_HINGE) {
+                    j = JointSolver::positionHinge(j, st, ia, ib);
+                }
+                let vrel : DVec3 = st.pseudoPointVelocity(ib, j.rB).minus(st.pseudoPointVelocity(ia, j.rA));
+                let p : DVec3 = j.kInv.transform(vrel.plus(j.bias).negated());
+                st.applyPseudoImpulse(ia, ib, p, j.rA, j.rB);
+            }
+            js.items.set(i, j);
+        }
+    }
+
+    // The impulse that moves a row's relative speed `rel` to `target`, through its effective mass.
+    static fn rowImpulse(mass : f64, target : f64, rel : f64) : f64 {
+        return mass * (target - rel);
+    }
+
+    // An accumulated limit impulse may only push the hinge back inside: up from the lower limit, down from the
+    // upper one. The wrong sign is dropped.
+    static fn clampToSide(side : i32, total : f64) : f64 {
+        if (side == JOINT_LIMIT_LOWER && total < 0.0) {
+            return 0.0;
+        }
+        if (side == JOINT_LIMIT_UPPER && total > 0.0) {
+            return 0.0;
+        }
+        return total;
+    }
+
+    static fn positionHinge(jin : Joint, st : SolverState, ia : i32, ib : i32) : Joint {
+        let mut j : Joint = jin;
+        let rel1 : f64 = st.pseudoAngularSpeedAbout(ia, ib, j.t1);
+        st.applyPseudoAngular(ia, ib, j.t1.scale(JointSolver::rowImpulse(j.mass1, j.bias1, rel1)));
+        let rel2 : f64 = st.pseudoAngularSpeedAbout(ia, ib, j.t2);
+        st.applyPseudoAngular(ia, ib, j.t2.scale(JointSolver::rowImpulse(j.mass2, j.bias2, rel2)));
+        if (j.limitSide != JOINT_LIMIT_NONE) {
+            let relA : f64 = st.pseudoAngularSpeedAbout(ia, ib, j.axisW);
+            let lam : f64 = JointSolver::rowImpulse(j.massAxis, j.limitBias, relA);
+            let total : f64 = JointSolver::clampToSide(j.limitSide, j.limitPos + lam);
+            let delta : f64 = total - j.limitPos;
+            j.limitPos = total;
+            st.applyPseudoAngular(ia, ib, j.axisW.scale(delta));
+        }
+        return j;
+    }
+
+    static fn iterateHinge(jin : Joint, st : SolverState, ia : i32, ib : i32) : Joint {
+        let mut j : Joint = jin;
+        let rel1 : f64 = st.angularSpeedAbout(ia, ib, j.t1);
+        let l1 : f64 = JointSolver::rowImpulse(j.mass1, 0.0, rel1);
+        j.imp1 = j.imp1 + l1;
+        st.applyAngular(ia, ib, j.t1.scale(l1));
+        let rel2 : f64 = st.angularSpeedAbout(ia, ib, j.t2);
+        let l2 : f64 = JointSolver::rowImpulse(j.mass2, 0.0, rel2);
+        j.imp2 = j.imp2 + l2;
+        st.applyAngular(ia, ib, j.t2.scale(l2));
+        if (j.limitSide != JOINT_LIMIT_NONE) {
+            let relA : f64 = st.angularSpeedAbout(ia, ib, j.axisW);
+            let lam : f64 = JointSolver::rowImpulse(j.massAxis, 0.0, relA);
+            let total : f64 = JointSolver::clampToSide(j.limitSide, j.impLimit + lam);
+            let delta : f64 = total - j.impLimit;
+            j.impLimit = total;
+            st.applyAngular(ia, ib, j.axisW.scale(delta));
+        }
+        return j;
+    }
+
+    /** The present angle of a hinge joint, in radians, from its reference directions. */
+    pub(crate) static fn angleOf(bodies : BodyStore, joint : Joint) : f64 {
+        let aw : DVec3 = JointSolver::dirWorld(bodies, joint.a, joint.axisA);
+        let ra : DVec3 = JointSolver::dirWorld(bodies, joint.a, joint.refA);
+        let rb : DVec3 = JointSolver::dirWorld(bodies, joint.b, joint.refB);
+        return atan2D(ra.cross(rb).dot(aw), ra.dot(rb));
+    }
+
+    // Slot `a` of the store, or the world slot for -1.
+    static fn slotOf(a : i32, world : i32) : i32 {
+        if (a < 0) {
+            return world;
+        }
+        return a;
+    }
+
+    static fn centre(bodies : BodyStore, a : i32) : DVec3 {
+        if (a < 0) {
+            return DVec3::zero();
+        }
+        return bodies.position.get(a);
+    }
+
+    static fn anchorWorld(bodies : BodyStore, a : i32, local : DVec3) : DVec3 {
+        if (a < 0) {
+            return local;
+        }
+        return bodies.worldPoint(a, local);
+    }
+
+    static fn dirWorld(bodies : BodyStore, a : i32, local : DVec3) : DVec3 {
+        if (a < 0) {
+            return local;
+        }
+        return bodies.rotation.get(a).rotate(local);
+    }
+
+    static fn angularMass(st : SolverState, ia : i32, ib : i32, d : DVec3) : f64 {
+        let k : f64 = d.dot(st.invInertia(ia, d)) + d.dot(st.invInertia(ib, d));
+        if (k <= 0.0) {
+            return 0.0;
+        }
+        return 1.0 / k;
+    }
+
+    static fn skew(r : DVec3) : DMat3 {
+        return DMat3 {
+            m00: 0.0,
+            m01: -r.z,
+            m02: r.y,
+            m10: r.z,
+            m11: 0.0,
+            m12: -r.x,
+            m20: -r.y,
+            m21: r.x,
+            m22: 0.0,
+        };
+    }
+
+    // K = (1/mA + 1/mB) I - [rA] IA [rA] - [rB] IB [rB]: how a point impulse changes the relative point velocity.
+    static fn pointMass(st : SolverState, ia : i32, ib : i32, ra : DVec3, rb : DVec3) : DMat3 {
+        let sa : DMat3 = JointSolver::skew(ra);
+        let sb : DMat3 = JointSolver::skew(rb);
+        let x : DMat3 = sa.mul(st.invInertiaMat(ia)).mul(sa);
+        let y : DMat3 = sb.mul(st.invInertiaMat(ib)).mul(sb);
+        let m : f64 = st.invMass(ia) + st.invMass(ib);
+        return DMat3 {
+            m00: m - x.m00 - y.m00,
+            m01: -x.m01 - y.m01,
+            m02: -x.m02 - y.m02,
+            m10: -x.m10 - y.m10,
+            m11: m - x.m11 - y.m11,
+            m12: -x.m12 - y.m12,
+            m20: -x.m20 - y.m20,
+            m21: -x.m21 - y.m21,
+            m22: m - x.m22 - y.m22,
+        };
+    }
+}

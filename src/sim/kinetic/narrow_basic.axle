@@ -1,0 +1,248 @@
+// narrow_basic — contact generation for spheres, capsules and planes.
+//
+// Every test here writes into a `ContactBuffer` with the normal pointing from the first argument to the second
+// and returns whether the shapes overlap. Spheres and capsules reduce to closest-point problems: a capsule is
+// a segment with a radius, so a capsule pair is the nearest points of two segments, and a capsule against a
+// sphere or a plane is a sphere (or two) at the nearest points.
+
+use crate::core::math::dvec3::DVec3;
+use crate::sim::kinetic::contact_buffer::ContactBuffer;
+use crate::sim::kinetic::kinetic_geometry::{KineticGeometry, KINETIC_GEOMETRY_TINY, KINETIC_GEOMETRY_SMALL};
+use crate::sim::kinetic::shape::{Placed, Shape};
+
+// A capsule pair gets a second contact only when an end point pushes along the main normal within this cosine
+// (about 18 degrees): that is "lying alongside", not "crossing".
+const NARROW_ALONGSIDE_DOT : f64 = 0.95;
+
+// The second contact must lie at least a tenth of the summed radii (squared: 0.01) from the main one, or it
+// adds nothing a single point does not already hold.
+const NARROW_MIN_SPREAD : f64 = 0.01;
+
+// A box has eight corners; the bits of a corner number say which side of each axis it is on.
+const NARROW_BOX_CORNERS : i32 = 8;
+
+// Two points: the end points of a capsule axis, or a pair of points that face each other. `at(t)` walks from
+// the first to the second.
+struct Segment {
+    from : DVec3 = DVec3 { x: 0.0, y: 0.0, z: 0.0 };
+    to   : DVec3 = DVec3 { x: 0.0, y: 0.0, z: 0.0 };
+
+    fn at(self, t : f64) : DVec3 {
+        return self.from.plus(self.to.minus(self.from).scale(t));
+    }
+}
+
+// The best second contact found alongside the main one of a capsule pair.
+struct ExtraContact {
+    found : bool = false;
+    id    : i32 = 0;
+    at    : DVec3 = DVec3 { x: 0.0, y: 0.0, z: 0.0 };
+    depth : f64 = 0.0;
+
+    // Squared distance from the main contact: the spread this point adds.
+    spread : f64 = 0.0;
+}
+
+/** Narrow-phase tests among spheres, capsules and planes, and box against plane. */
+pub(crate) class NarrowBasic {
+    /** Sphere against sphere. */
+    pub(crate) static fn sphereSphere(
+        pa : DVec3,
+        ra : f64,
+        pb : DVec3,
+        rb : f64,
+        out : ContactBuffer
+    ) : bool {
+        let d : DVec3 = pb.minus(pa);
+        let dist2 : f64 = d.lengthSquared();
+        let rs : f64 = ra + rb;
+        if (dist2 >= rs * rs) {
+            return false;
+        }
+
+        // Concentric spheres have no direction between them; any fixed one keeps the contact deterministic.
+        let dist : f64 = dist2.sqrt();
+        let mut n : DVec3 = DVec3::unitY();
+        if (dist > KINETIC_GEOMETRY_TINY) {
+            n = d.scale(1.0 / dist);
+        }
+        let depth : f64 = rs - dist;
+        out.setNormal(n);
+        out.add(pa.plus(n.scale(ra - depth * 0.5)), depth, 0);
+        return true;
+    }
+
+    /** A sphere (first) against a plane (second): the normal points into the plane. */
+    pub(crate) static fn spherePlane(p : DVec3, r : f64, plane : Shape, out : ContactBuffer) : bool {
+        let sd : f64 = plane.normal.dot(p) - plane.offset;
+        if (sd >= r) {
+            return false;
+        }
+        out.setNormal(plane.normal.negated());
+        out.add(p.minus(plane.normal.scale((r + sd) * 0.5)), r - sd, 0);
+        return true;
+    }
+
+    /** A sphere (first) against a capsule (second). */
+    pub(crate) static fn sphereCapsule(ps : DVec3, rs : f64, cap : Placed, out : ContactBuffer) : bool {
+        let axis : Segment = NarrowBasic::axisOf(cap);
+        let t : f64 = KineticGeometry::closestOnSegment(axis.from, axis.to, ps);
+        return NarrowBasic::sphereSphere(ps, rs, axis.at(t), cap.shape.radius, out);
+    }
+
+    /** A capsule (first) against a plane (second): one point per cap that dips below it. */
+    pub(crate) static fn capsulePlane(cap : Placed, plane : Shape, out : ContactBuffer) : bool {
+        let r : f64 = cap.shape.radius;
+        let mut hit : bool = false;
+        for (k of 0..2) {
+            let e : DVec3 = cap.shape.capsuleEnds(cap.pos, cap.rot, k == 1);
+            let sd : f64 = plane.normal.dot(e) - plane.offset;
+            if (sd < r) {
+                if (!hit) {
+                    out.setNormal(plane.normal.negated());
+                    hit = true;
+                }
+                out.add(e.minus(plane.normal.scale((r + sd) * 0.5)), r - sd, k);
+            }
+        }
+        return hit;
+    }
+
+    /** A box (first) against a plane (second): each corner below the plane is a contact point. */
+    pub(crate) static fn boxPlane(box : Placed, plane : Shape, out : ContactBuffer) : bool {
+        let m = box.rot.toMat3();
+        let half : DVec3 = box.shape.half;
+        let ax : DVec3 = KineticGeometry::column(m, 0).scale(half.x);
+        let ay : DVec3 = KineticGeometry::column(m, 1).scale(half.y);
+        let az : DVec3 = KineticGeometry::column(m, 2).scale(half.z);
+        let mut hit : bool = false;
+        for (k of 0..NARROW_BOX_CORNERS) {
+            let cx : DVec3 = ax.scale(NarrowBasic::cornerSign(k, 1));
+            let cy : DVec3 = ay.scale(NarrowBasic::cornerSign(k, 2));
+            let cz : DVec3 = az.scale(NarrowBasic::cornerSign(k, 4));
+            let c : DVec3 = box.pos.plus(cx).plus(cy).plus(cz);
+            let sd : f64 = plane.normal.dot(c) - plane.offset;
+            if (sd < 0.0) {
+                if (!hit) {
+                    out.setNormal(plane.normal.negated());
+                    hit = true;
+                }
+                out.add(c.minus(plane.normal.scale(sd * 0.5)), -sd, k);
+            }
+        }
+        if (hit) {
+            out.reduceToFour();
+        }
+        return hit;
+    }
+
+    // +1 when `bit` is set in the corner number, otherwise -1.
+    static fn cornerSign(corner : i32, bit : i32) : f64 {
+        if ((corner & bit) != 0) {
+            return 1.0;
+        }
+        return -1.0;
+    }
+
+    /**
+     * Capsule against capsule: the nearest points of the two axes make the main contact; when the axes are
+     * nearly parallel and overlap along their length, a second point at the far end of the overlap keeps a
+     * capsule lying on another from rocking.
+     */
+    pub(crate) static fn capsuleCapsule(a : Placed, b : Placed, out : ContactBuffer) : bool {
+        let axisA : Segment = NarrowBasic::axisOf(a);
+        let axisB : Segment = NarrowBasic::axisOf(b);
+        let r : f64 = a.shape.radius + b.shape.radius;
+        let nearest : DVec3 = KineticGeometry::segmentSegment(axisA.from, axisA.to, axisB.from, axisB.to);
+        if (nearest.z >= r * r) {
+            return false;
+        }
+
+        let ptA : DVec3 = axisA.at(nearest.x);
+        let ptB : DVec3 = axisB.at(nearest.y);
+        let dist : f64 = nearest.z.sqrt();
+        let n : DVec3 = NarrowBasic::axisNormal(axisA, axisB, ptA, ptB, dist);
+        let depth : f64 = r - dist;
+        let main : DVec3 = ptA.plus(n.scale(a.shape.radius - depth * 0.5));
+        out.setNormal(n);
+        out.add(main, depth, 0);
+
+        // A second contact at the far end of the overlap, when it is far enough from the first to steady the pair.
+        let extra : ExtraContact = NarrowBasic::alongsideContact(a.shape.radius, axisA, axisB, n, main, r);
+        let apart : bool = extra.spread > NARROW_MIN_SPREAD * r * r;
+        if (extra.found && apart) {
+            out.add(extra.at, extra.depth, extra.id);
+        }
+        return true;
+    }
+
+    static fn axisOf(c : Placed) : Segment {
+        let from : DVec3 = c.shape.capsuleEnds(c.pos, c.rot, false);
+        let to : DVec3 = c.shape.capsuleEnds(c.pos, c.rot, true);
+        return Segment { from: from, to: to };
+    }
+
+    // The normal from axis A to axis B at their nearest points. Axes that touch have no direction between the
+    // points: crossing ones take the perpendicular to both, parallel ones any perpendicular to them.
+    static fn axisNormal(axisA : Segment, axisB : Segment, ptA : DVec3, ptB : DVec3, dist : f64) : DVec3 {
+        if (dist > KINETIC_GEOMETRY_SMALL) {
+            return ptB.minus(ptA).scale(1.0 / dist);
+        }
+        let dirA : DVec3 = axisA.to.minus(axisA.from);
+        let across : DVec3 = dirA.cross(axisB.to.minus(axisB.from));
+        if (across.lengthSquared() > KINETIC_GEOMETRY_TINY) {
+            return across.normalized();
+        }
+        return dirA.anyPerpendicular();
+    }
+
+    // The pair of points that the k-th end point makes with the other axis: ends 0 and 1 are A's, matched to
+    // their nearest point on B (`from` is the end); ends 2 and 3 are B's, matched on A (`to` is the end).
+    static fn endPair(k : i32, axisA : Segment, axisB : Segment) : Segment {
+        if (k < 2) {
+            let mut end : DVec3 = axisA.from;
+            if (k == 1) {
+                end = axisA.to;
+            }
+            let t : f64 = KineticGeometry::closestOnSegment(axisB.from, axisB.to, end);
+            return Segment { from: end, to: axisB.at(t) };
+        }
+        let mut end : DVec3 = axisB.from;
+        if (k == 3) {
+            end = axisB.to;
+        }
+        let t : f64 = KineticGeometry::closestOnSegment(axisA.from, axisA.to, end);
+        return Segment { from: axisA.at(t), to: end };
+    }
+
+    // Of the four axis end points, the one that pushes along the main normal and lies farthest from the main
+    // contact; ids 1 to 4 name them, after the main contact's 0.
+    static fn alongsideContact(
+        radiusA : f64,
+        axisA : Segment,
+        axisB : Segment,
+        n : DVec3,
+        main : DVec3,
+        r : f64
+    ) : ExtraContact {
+        let mut best : ExtraContact = ExtraContact { at: main };
+        for (k of 0..4) {
+            let pair : Segment = NarrowBasic::endPair(k, axisA, axisB);
+            let d : DVec3 = pair.to.minus(pair.from);
+            let distSq : f64 = d.lengthSquared();
+            if (distSq >= r * r || distSq < KINETIC_GEOMETRY_TINY) {
+                continue;
+            }
+            let dk : f64 = distSq.sqrt();
+            if (d.scale(1.0 / dk).dot(n) < NARROW_ALONGSIDE_DOT) {
+                continue;
+            }
+            let at : DVec3 = pair.from.plus(n.scale(radiusA - (r - dk) * 0.5));
+            let spread : f64 = at.distanceSquared(main);
+            if (spread > best.spread) {
+                best = ExtraContact { found: true, id: k + 1, at: at, depth: r - dk, spread: spread };
+            }
+        }
+        return best;
+    }
+}

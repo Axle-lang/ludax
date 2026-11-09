@@ -1,0 +1,190 @@
+// sleeper — puts resting groups of bodies to sleep and wakes them when something touches them.
+//
+// A body is resting when both its speeds stay under the thresholds; a timer counts how long. Bodies that touch
+// each other (through contacts or joints) form an island, and an island sleeps only when every dynamic body in
+// it has rested long enough, so a stack never loses its top while the bottom still settles. A sleeping body
+// keeps its place, takes no part in the simulation and costs nothing until an awake body touches it; then the
+// whole island it belongs to wakes together. Static bodies never join an island, and a moving kinematic body
+// keeps whatever touches it awake.
+
+use crate::core::math::dvec3::DVec3;
+use crate::sim::kinetic::body_store::BodyStore;
+use crate::sim::kinetic::contact_set::{ContactSet, Manifold};
+use crate::sim::kinetic::joint_set::{Joint, JointSet};
+use crate::sim::kinetic::physics_settings::PhysicsSettings;
+
+/** Sleep bookkeeping for a physics world. */
+pub(crate) class Sleeper {
+    /** Wakes the body in slot `i` and every body that fell asleep in the same island. */
+    pub(crate) static fn wakeIsland(bodies : BodyStore, i : i32) : void {
+        let id : i32 = bodies.island.get(i);
+        bodies.wake(i);
+        if (id == 0) {
+            return;
+        }
+        for (k of 0..bodies.slotCount()) {
+            if (bodies.isLive(k) && bodies.asleep.get(k) && bodies.island.get(k) == id) {
+                bodies.wake(k);
+                bodies.island.set(k, 0);
+            }
+        }
+        bodies.island.set(i, 0);
+    }
+
+    // The root of slot `i` in the union-find forest, with path halving.
+    static fn find(parent : i32[], i : i32) : i32 {
+        let mut x : i32 = i;
+        while (parent[x as i64] != x) {
+            parent[x as i64] = parent[parent[x as i64] as i64];
+            x = parent[x as i64];
+        }
+        return x;
+    }
+
+    // Joins the islands of `a` and `b`; the lower root wins so the result does not depend on call order.
+    static fn join(parent : i32[], a : i32, b : i32) : void {
+        let ra : i32 = Sleeper::find(parent, a);
+        let rb : i32 = Sleeper::find(parent, b);
+        if (ra < rb) {
+            parent[rb as i64] = ra;
+        } else if (rb < ra) {
+            parent[ra as i64] = rb;
+        }
+    }
+
+    /**
+     * Advances the rest timers and puts the islands that have rested long enough to sleep. `nextIsland` numbers
+     * them.
+     */
+    pub(crate) static fn update(
+        bodies : BodyStore,
+        cs : ContactSet,
+        js : JointSet,
+        cfg : PhysicsSettings,
+        dt : f64,
+        nextIsland : i32
+    ) : i32 {
+        if (!cfg.sleeping) {
+            return nextIsland;
+        }
+        let n : i32 = bodies.slotCount();
+        let mut parent : i32[] = new i32[(n + 1) as i64];
+        let mut ready : i32[] = new i32[(n + 1) as i64];
+        for (i of 0..n) {
+            parent[i as i64] = i;
+            ready[i as i64] = 1;
+        }
+        Sleeper::advanceTimers(bodies, cfg, dt);
+
+        for (m of 0..cs.manifolds.len()) {
+            let mf : Manifold = cs.manifolds.get(m);
+            Sleeper::link(bodies, parent, ready, mf.a, mf.b);
+        }
+        for (j of 0..js.items.len()) {
+            let jt : Joint = js.items.get(j);
+            if (jt.active) {
+                Sleeper::link(bodies, parent, ready, jt.a, jt.b);
+            }
+        }
+
+        let blocked : i32[] = Sleeper::blockedRoots(bodies, cfg, parent, ready);
+        return Sleeper::sleepReady(bodies, parent, blocked, nextIsland);
+    }
+
+    // Whether slot `i` is a dynamic body that takes part in this step: the only kind that can fall asleep.
+    static fn isAwakeDynamic(bodies : BodyStore, i : i32) : bool {
+        return bodies.isLive(i) && bodies.isDynamic(i) && !bodies.asleep.get(i);
+    }
+
+    // A calm body that may sleep adds `dt` to its rest timer; any other restarts it.
+    static fn advanceTimers(bodies : BodyStore, cfg : PhysicsSettings, dt : f64) : void {
+        for (i of 0..bodies.slotCount()) {
+            if (!Sleeper::isAwakeDynamic(bodies, i)) {
+                continue;
+            }
+            let calm : bool = bodies.linearVelocity.get(i).length() < cfg.sleepLinearSpeed
+                && bodies.angularVelocity.get(i).length() < cfg.sleepAngularSpeed;
+            if (calm && bodies.canSleep.get(i)) {
+                bodies.sleepTimer.set(i, bodies.sleepTimer.get(i) + dt);
+            } else {
+                bodies.sleepTimer.set(i, 0.0);
+            }
+        }
+    }
+
+    // Marks the root of every island that must stay awake: one with a member that has not rested long enough,
+    // or that a moving kinematic body touches. An island sleeps only when none of its members blocks it.
+    static fn blockedRoots(bodies : BodyStore, cfg : PhysicsSettings, parent : i32[], ready : i32[]) : i32[] {
+        let n : i32 = bodies.slotCount();
+        let mut blocked : i32[] = new i32[(n + 1) as i64];
+        for (i of 0..n) {
+            blocked[i as i64] = 0;
+        }
+        for (i of 0..n) {
+            if (!Sleeper::isAwakeDynamic(bodies, i)) {
+                continue;
+            }
+            if (bodies.sleepTimer.get(i) < cfg.sleepTime || ready[i as i64] == 0) {
+                blocked[Sleeper::find(parent, i) as i64] = 1;
+            }
+        }
+        return blocked;
+    }
+
+    // Puts every island that nothing blocks to sleep, numbering each from `nextIsland`; answers the last number.
+    static fn sleepReady(bodies : BodyStore, parent : i32[], blocked : i32[], nextIsland : i32) : i32 {
+        let n : i32 = bodies.slotCount();
+        let mut issued : i32 = nextIsland;
+        let mut idOf : i32[] = new i32[(n + 1) as i64];
+        for (i of 0..n) {
+            idOf[i as i64] = 0;
+        }
+        for (i of 0..n) {
+            if (!Sleeper::isAwakeDynamic(bodies, i)) {
+                continue;
+            }
+            let root : i32 = Sleeper::find(parent, i);
+            if (blocked[root as i64] != 0) {
+                continue;
+            }
+            if (idOf[root as i64] == 0) {
+                issued = issued + 1;
+                idOf[root as i64] = issued;
+            }
+            bodies.asleep.set(i, true);
+            bodies.island.set(i, idOf[root as i64]);
+            bodies.linearVelocity.set(i, DVec3::zero());
+            bodies.angularVelocity.set(i, DVec3::zero());
+            bodies.prevLinearVelocity.set(i, DVec3::zero());
+            bodies.prevAngularVelocity.set(i, DVec3::zero());
+        }
+        return issued;
+    }
+
+    // A contact or joint between two bodies: dynamic ones share an island; a moving kinematic one keeps the
+    // dynamic body awake; static ones and the world do nothing.
+    static fn link(bodies : BodyStore, parent : i32[], ready : i32[], a : i32, b : i32) : void {
+        if (a < 0 || b < 0) {
+            return;
+        }
+        let da : bool = bodies.isDynamic(a);
+        let db : bool = bodies.isDynamic(b);
+        if (da && db) {
+            if (!bodies.asleep.get(a) && !bodies.asleep.get(b)) {
+                Sleeper::join(parent, a, b);
+            }
+            return;
+        }
+        if (da && bodies.isKinematic(b) && Sleeper::moving(bodies, b)) {
+            ready[a as i64] = 0;
+        }
+        if (db && bodies.isKinematic(a) && Sleeper::moving(bodies, a)) {
+            ready[b as i64] = 0;
+        }
+    }
+
+    static fn moving(bodies : BodyStore, k : i32) : bool {
+        return bodies.linearVelocity.get(k).lengthSquared() > 0.0
+            || bodies.angularVelocity.get(k).lengthSquared() > 0.0;
+    }
+}

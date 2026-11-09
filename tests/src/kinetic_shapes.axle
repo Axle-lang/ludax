@@ -1,0 +1,320 @@
+// kinetic_shapes — checks for shapes, the body store and the broad phase of kinetic.
+//
+// Mass properties are compared with closed forms and, for the capsule, with an independent numerical
+// integration over a voxel grid. Bounds, the body store and the broad phase's pair set are checked on
+// configurations whose answer is known by hand. The narrow phase is in `kinetic_narrow`.
+
+use ludax::BodyDesc;
+use ludax::BodyKind;
+use ludax::BodyStore;
+use ludax::BroadPhase;
+use ludax::Checks;
+use ludax::DAabb;
+use ludax::DQuat;
+use ludax::DVec3;
+use ludax::EntityId;
+use ludax::HALF_PI_D;
+use ludax::Shape;
+
+/** Tolerance for a kinetic result whose answer is closed-form and passes through no rotation. */
+pub const KIN_TIGHT : f64 = 0.000000001;
+
+/** Tolerance for a kinetic result reached through a rotation, where the trigonometry costs a few more digits. */
+pub const KIN_LOOSE : f64 = 0.000001;
+
+/** A cube turned this far about an axis (45 degrees) stands on an edge. */
+pub const KIN_EDGE_TILT : f64 = 0.7853981633974483;
+
+/** A box yawed this far (30 degrees) about the vertical axis rests on a flat one corner-first. */
+pub const KIN_YAW_30 : f64 = 0.5235987755982988;
+
+/** The square root of two, the half diagonal of a unit square. */
+pub const KIN_SQRT2 : f64 = 1.4142135623730951;
+
+/** The square root of three, the half diagonal of a unit cube. */
+pub const KIN_SQRT3 : f64 = 1.7320508075688772;
+
+/** Half of `KIN_SQRT2`: the sine of 45 degrees, and the half edge of a diagonal. */
+pub const KIN_HALF_SQRT2 : f64 = 0.7071067811865476;
+
+/** The shape, body store and broad phase checks. */
+pub class KineticShapesSuite {
+    /** Runs every check of the suite. */
+    pub static fn run(c : Checks) : void {
+        kinShapeMass(c);
+        kinShapeBounds(c);
+        kinStoreChecks(c);
+        kinBroadChecks(c);
+    }
+}
+
+/** Whether two vectors agree within `tol` on every component. */
+pub fn kinNear(a : DVec3, b : DVec3, tol : f64) : bool {
+    return a.approxEq(b, tol);
+}
+
+// Numerically integrates (y^2 + z^2) and (x^2 + y^2) over the capsule of radius r and half length hy.
+fn kinCapsuleInertiaByVoxels(r : f64, hy : f64, mass : f64) : DVec3 {
+    let step : f64 = 0.04;
+    let mut count : f64 = 0.0;
+    let mut sx : f64 = 0.0;
+    let mut sy : f64 = 0.0;
+    let nx : i32 = ((r + hy + 0.1) / step) as i32;
+    for (ix of (0 - nx)..(nx + 1)) {
+        for (iy of (0 - nx)..(nx + 1)) {
+            for (iz of (0 - nx)..(nx + 1)) {
+                let x : f64 = (ix as f64) * step;
+                let y : f64 = (iy as f64) * step;
+                let z : f64 = (iz as f64) * step;
+                let mut cy : f64 = y;
+                if (cy > hy) {
+                    cy = hy;
+                }
+                if (cy < -hy) {
+                    cy = -hy;
+                }
+                let dy : f64 = y - cy;
+                if (x * x + dy * dy + z * z <= r * r) {
+                    count = count + 1.0;
+                    sx = sx + y * y + z * z;
+                    sy = sy + x * x + z * z;
+                }
+            }
+        }
+    }
+    let m : f64 = mass / count;
+    return DVec3 { x: m * sx, y: m * sy, z: m * sx };
+}
+
+fn kinShapeMass(c : Checks) : void {
+    let sph : Shape = Shape::sphere(0.5);
+    c.near(
+        "shape: a sphere's volume is 4/3 pi r^3",
+        sph.volume(),
+        4.0 / 3.0 * 3.14159265358979 * 0.125,
+        KIN_TIGHT
+    );
+    c.near("shape: sphere inertia is 2/5 m r^2", sph.inertia(3.0).x, 0.4 * 3.0 * 0.25, KIN_TIGHT);
+    c.that(
+        "shape: sphere inertia is isotropic",
+        kinNear(sph.inertia(3.0), DVec3::splat(0.3), KIN_TIGHT)
+    );
+
+    let bx : Shape = Shape::cuboid(1.0, 2.0, 3.0);
+    c.near("shape: a box's volume is the product of its sides", bx.volume(), 48.0, KIN_TIGHT);
+    let ib : DVec3 = bx.inertia(12.0);
+    c.near("shape: box Ixx = m/12 (h^2 + d^2)", ib.x, 12.0 / 12.0 * (16.0 + 36.0), KIN_TIGHT);
+    c.near("shape: a box's Iyy is m/12 (w^2 + d^2)", ib.y, 4.0 + 36.0, KIN_TIGHT);
+    c.near("shape: a box's Izz is m/12 (w^2 + h^2)", ib.z, 4.0 + 16.0, KIN_TIGHT);
+
+    let cap : Shape = Shape::capsule(0.5, 1.0);
+    let ic : DVec3 = cap.inertia(2.0);
+    let by : DVec3 = kinCapsuleInertiaByVoxels(0.5, 1.0, 2.0);
+    c.near("shape: capsule Iyy matches numerical integration", ic.y, by.y, 0.02 * by.y);
+    c.near("shape: capsule Ixx matches numerical integration", ic.x, by.x, 0.02 * by.x);
+    c.near("shape: a capsule's Izz equals its Ixx", ic.z, ic.x, KIN_TIGHT);
+    let degenerate : Shape = Shape::capsule(0.5, 0.0);
+    c.near(
+        "shape: a capsule with no straight part is a sphere",
+        degenerate.inertia(3.0).y,
+        sph.inertia(3.0).y,
+        KIN_TIGHT
+    );
+    c.near("shape: a plane has no volume", Shape::plane(DVec3::unitY(), 0.0).volume(), 0.0, 0.0);
+    c.near(
+        "shape: plane normal is normalised",
+        Shape::plane(DVec3::make(0.0, 4.0, 0.0), 8.0).offset,
+        2.0,
+        KIN_TIGHT
+    );
+}
+
+fn kinShapeBounds(c : Checks) : void {
+    let b : Shape = Shape::cuboid(1.0, 2.0, 3.0);
+    let turned : DQuat = DQuat::fromAxisAngle(DVec3::unitZ(), HALF_PI_D);
+    let box : DAabb = b.aabb(DVec3::make(10.0, 0.0, 0.0), turned);
+    c.that(
+        "bounds: a box turned a quarter about z swaps its x and y reach",
+        kinNear(box.halfSize(), DVec3::make(2.0, 1.0, 3.0), KIN_TIGHT)
+    );
+    c.that(
+        "bounds: the box is centred on the body",
+        kinNear(box.center(), DVec3::make(10.0, 0.0, 0.0), KIN_TIGHT)
+    );
+
+    let eighth : DQuat = DQuat::fromAxisAngle(DVec3::unitY(), KIN_EDGE_TILT);
+    let diag : DAabb = Shape::cuboid(1.0, 1.0, 1.0).aabb(DVec3::zero(), eighth);
+    c.near(
+        "bounds: a cube turned 45 degrees reaches sqrt 2",
+        diag.max.x,
+        KIN_SQRT2,
+        KIN_TIGHT
+    );
+
+    let cap : DAabb = Shape::capsule(0.5, 1.0).aabb(DVec3::make(0.0, 3.0, 0.0), DQuat::identity());
+    c.that(
+        "bounds: an upright capsule",
+        kinNear(cap.min, DVec3::make(-0.5, 1.5, -0.5), KIN_TIGHT)
+            && kinNear(cap.max, DVec3::make(0.5, 4.5, 0.5), KIN_TIGHT)
+    );
+    let lying : DAabb = Shape::capsule(0.5, 1.0).aabb(
+        DVec3::zero(),
+        DQuat::fromAxisAngle(DVec3::unitZ(), HALF_PI_D)
+    );
+    c.that(
+        "bounds: a capsule on its side",
+        kinNear(lying.halfSize(), DVec3::make(1.5, 0.5, 0.5), KIN_TIGHT)
+    );
+    c.near(
+        "bounds: sphere",
+        Shape::sphere(2.0).aabb(DVec3::make(1.0, 1.0, 1.0), DQuat::identity()).max.z,
+        3.0,
+        KIN_TIGHT
+    );
+}
+
+fn kinStoreChecks(c : Checks) : void {
+    let s : BodyStore = new BodyStore();
+    let a : EntityId = s.add(BodyDesc::dynamic(
+        Shape::sphere(0.5),
+        DVec3::make(1.0, 2.0, 3.0),
+        2.0
+    ));
+    let b : EntityId = s.add(BodyDesc::fixed(Shape::cuboid(1.0, 1.0, 1.0), DVec3::zero()));
+    c.sameInt("store: two added bodies are two live bodies", s.liveCount(), 2);
+    c.near("store: a dynamic body's inverse mass is 1/m", s.inverseMass(s.slotOf(a)), 0.5, 0.0);
+    c.near("store: static inverse mass is zero", s.inverseMass(s.slotOf(b)), 0.0, 0.0);
+    c.that(
+        "store: static inverse inertia is zero",
+        kinNear(s.inverseInertia(s.slotOf(b)), DVec3::zero(), 0.0)
+    );
+    c.near(
+        "store: sphere inverse inertia",
+        s.inverseInertia(s.slotOf(a)).x,
+        1.0 / (0.4 * 2.0 * 0.25),
+        KIN_TIGHT
+    );
+    c.that(
+        "store: world point of a local point",
+        kinNear(
+            s.worldPoint(s.slotOf(a), DVec3::make(1.0, 0.0, 0.0)),
+            DVec3::make(2.0, 2.0, 3.0),
+            KIN_TIGHT
+        )
+    );
+
+    c.that("store: removing a live body succeeds", s.remove(a));
+    c.that("store: a removed handle is stale", s.slotOf(a) < 0);
+    c.that("store: a second remove is refused", !s.remove(a));
+    let d : EntityId = s.add(BodyDesc::dynamic(Shape::sphere(1.0), DVec3::zero(), 1.0));
+    c.sameInt("store: a body added after a removal reuses the freed slot", d.index, a.index);
+    c.that(
+        "store: the generation changes so the old handle stays stale",
+        d.generation != a.generation && s.slotOf(a) < 0 && s.slotOf(d) >= 0
+    );
+    c.near("store: a reused slot carries the new mass", s.massOf(s.slotOf(d)), 1.0, 0.0);
+    c.sameInt(
+        "store: a body's kind reads back as static",
+        s.kindOf(s.slotOf(b)),
+        BodyKind::Static.code()
+    );
+
+    let mut kd : BodyDesc = BodyDesc::dynamic(Shape::sphere(0.5), DVec3::zero(), 5.0);
+    kd.userData = 4242;
+    let k : EntityId = s.add(kd);
+    c.sameInt("store: a body's user data reads back as stored", s.userOf(s.slotOf(k)), 4242);
+    let v : DVec3 = s.velocityAt(s.slotOf(k), DVec3::make(1.0, 0.0, 0.0));
+    c.that("store: a body at rest has no point velocity", kinNear(v, DVec3::zero(), 0.0));
+}
+
+fn kinBroadChecks(c : Checks) : void {
+    let s : BodyStore = new BodyStore();
+    // A row of unit spheres at spacing 0.9 (neighbours overlap) and one far away; inserted out of order.
+    let mut order : f64[] = new f64[6];
+    order[0] = 4.5;
+    order[1] = 0.0;
+    order[2] = 2.7;
+    order[3] = 0.9;
+    order[4] = 100.0;
+    order[5] = 1.8;
+    for (i of 0..6) {
+        s.add(BodyDesc::dynamic(Shape::sphere(0.5), DVec3::make(order[i as i64], 0.0, 0.0), 1.0));
+    }
+    let bp : BroadPhase = new BroadPhase();
+    let none : i64[] = new i64[1];
+    bp.update(s, none, 0);
+    // Neighbours in x: 0.0-0.9, 0.9-1.8, 1.8-2.7, 2.7-4.5? (1.8 apart: boxes of width 1 do not touch). Pairs by slot:
+    // slots: 0:4.5 1:0.0 2:2.7 3:0.9 4:100 5:1.8 -> overlapping: (1,3) (3,5) (5,2).
+    c.sameInt("broad: the broad phase finds three overlapping pairs", bp.pairCount(), 3);
+    let mut sorted : bool = true;
+    for (k of 1..bp.pairCount()) {
+        let prev : i64 = ((bp.firstOf(k - 1) as i64) << 32) | (bp.secondOf(k - 1) as i64);
+        let cur : i64 = ((bp.firstOf(k) as i64) << 32) | (bp.secondOf(k) as i64);
+        if (cur <= prev) {
+            sorted = false;
+        }
+    }
+    c.that("broad: pairs are ordered by (lower slot, higher slot)", sorted);
+    c.that(
+        "broad: every pair lists the lower slot first",
+        bp.firstOf(0) < bp.secondOf(0) && bp.firstOf(1) < bp.secondOf(1)
+            && bp.firstOf(2) < bp.secondOf(2)
+    );
+    c.sameInt(
+        "broad: the first pair is slots 1 and 3",
+        (bp.firstOf(0) * 10 + bp.secondOf(0)) as i64,
+        13
+    );
+    c.sameInt(
+        "broad: the second pair is slots 2 and 5",
+        (bp.firstOf(1) * 10 + bp.secondOf(1)) as i64,
+        25
+    );
+    c.sameInt(
+        "broad: the third pair is slots 3 and 5",
+        (bp.firstOf(2) * 10 + bp.secondOf(2)) as i64,
+        35
+    );
+
+    // The same scene in another insertion order gives the same pairs by position.
+    let s2 : BodyStore = new BodyStore();
+    for (i of 0..6) {
+        s2.add(BodyDesc::dynamic(
+            Shape::sphere(0.5),
+            DVec3::make(order[(5 - i) as i64], 0.0, 0.0),
+            1.0
+        ));
+    }
+    let bp2 : BroadPhase = new BroadPhase();
+    bp2.update(s2, none, 0);
+    c.sameInt("broad: insertion order does not change the number of pairs", bp2.pairCount(), 3);
+
+    // Rules: two static bodies never pair; a plane pairs with whatever dips below it; a joint can forbid a pair.
+    let s3 : BodyStore = new BodyStore();
+    s3.add(BodyDesc::fixed(Shape::cuboid(1.0, 1.0, 1.0), DVec3::zero()));
+    s3.add(BodyDesc::fixed(Shape::cuboid(1.0, 1.0, 1.0), DVec3::make(0.5, 0.0, 0.0)));
+    s3.add(BodyDesc::fixed(Shape::plane(DVec3::unitY(), -5.0), DVec3::zero()));
+    s3.add(BodyDesc::dynamic(Shape::sphere(0.5), DVec3::make(0.0, 0.6, 0.0), 1.0));
+    s3.add(BodyDesc::dynamic(Shape::sphere(0.5), DVec3::make(0.0, -4.8, 0.0), 1.0));
+    let bp3 : BroadPhase = new BroadPhase();
+    bp3.update(s3, none, 0);
+    // dynamic 3 overlaps both boxes (0,3) (1,3); dynamic 4 touches the plane at y=-5 (2,4); 3 and 4 do not touch.
+    c.sameInt("broad: static pairs are skipped, plane and dynamic bodies pair", bp3.pairCount(), 3);
+    let mut forbid : i64[] = new i64[2];
+    forbid[0] = (0 << 32) | 3;
+    bp3.update(s3, forbid, 1);
+    c.sameInt("broad: a forbidden pair is left out of the pair list", bp3.pairCount(), 2);
+
+    let mut deaf : BodyDesc = BodyDesc::dynamic(
+        Shape::sphere(0.5),
+        DVec3::make(0.0, 0.0, 0.0),
+        1.0
+    );
+    deaf.group = 2;
+    deaf.mask = 4;
+    let s4 : BodyStore = new BodyStore();
+    s4.add(BodyDesc::dynamic(Shape::sphere(0.5), DVec3::zero(), 1.0));
+    s4.add(deaf);
+    bp3.update(s4, none, 0);
+    c.sameInt("broad: collision masks keep unrelated groups apart", bp3.pairCount(), 0);
+}

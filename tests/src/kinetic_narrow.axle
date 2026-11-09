@@ -1,0 +1,462 @@
+// kinetic_narrow — checks for the narrow phase of kinetic: contacts between pairs of shapes.
+//
+// Contacts are checked for normal, depth and point on configurations whose answer is known by hand (aligned
+// stacks, a crossed pair of edges, a capsule lying on a plane).
+
+use ludax::Checks;
+use ludax::ContactBuffer;
+use ludax::DQuat;
+use ludax::DVec3;
+use ludax::HALF_PI_D;
+use ludax::Narrow;
+use ludax::Shape;
+
+use crate::kinetic_shapes::{
+    kinNear, KIN_TIGHT, KIN_LOOSE, KIN_EDGE_TILT, KIN_SQRT2, KIN_SQRT3, KIN_HALF_SQRT2, KIN_YAW_30
+};
+
+/** A shape bundled with where it stands and how it is turned, so a pair reads as two values. */
+struct KinPlaced {
+    shape : Shape;
+    at    : DVec3;
+    turn  : DQuat;
+}
+
+// A shape at `at`, unturned.
+fn kinPlace(shape : Shape, at : DVec3) : KinPlaced {
+    return KinPlaced { shape: shape, at: at, turn: DQuat::identity() };
+}
+
+// A shape at `at`, turned by `turn`.
+fn kinTurn(shape : Shape, at : DVec3, turn : DQuat) : KinPlaced {
+    return KinPlaced { shape: shape, at: at, turn: turn };
+}
+
+// The narrow phase on two placed shapes, filling `out`.
+fn kinCollide(a : KinPlaced, b : KinPlaced, out : ContactBuffer) : bool {
+    return Narrow::collide(a.shape, a.at, a.turn, b.shape, b.at, b.turn, out);
+}
+
+// The unit vector pointing straight down, the normal of most contacts from above.
+fn kinDown() : DVec3 {
+    return DVec3::make(0.0, -1.0, 0.0);
+}
+
+/** The narrow phase checks. */
+pub class KineticNarrowSuite {
+    /** Runs every check of the suite. */
+    pub static fn run(c : Checks) : void {
+        kinNarrowSpheres(c);
+        kinNarrowBoxes(c);
+        kinNarrowBoxEdges(c);
+        kinNarrowCapsules(c);
+        kinNarrowPlanes(c);
+    }
+}
+
+fn kinNarrowSpheres(c : Checks) : void {
+    let out : ContactBuffer = new ContactBuffer();
+    let s : Shape = Shape::sphere(1.0);
+    let first : KinPlaced = kinPlace(s, DVec3::zero());
+
+    let overlapping : KinPlaced = kinPlace(s, DVec3::make(1.5, 0.0, 0.0));
+    let hit : bool = kinCollide(first, overlapping, out);
+    c.that("sphere-sphere: overlapping spheres produce one contact", hit && out.count() == 1);
+    c.that(
+        "sphere-sphere: the normal points from the first to the second",
+        kinNear(out.normal(), DVec3::unitX(), KIN_TIGHT)
+    );
+    c.near(
+        "sphere-sphere: the contact depth equals the overlap of 0.5",
+        out.depthAt(0),
+        0.5,
+        KIN_TIGHT
+    );
+    c.near(
+        "sphere-sphere: the point is in the middle of the overlap",
+        out.pointAt(0).x,
+        0.75,
+        KIN_TIGHT
+    );
+
+    let distant : KinPlaced = kinPlace(s, DVec3::make(2.5, 0.0, 0.0));
+    c.that("sphere-sphere: apart", !kinCollide(first, distant, out));
+    c.that("sphere-sphere: a separated pair leaves no contact points", out.count() == 0);
+
+    let flipped : bool = kinCollide(overlapping, first, out);
+    c.that(
+        "sphere-sphere: swapping the arguments flips the normal",
+        flipped && kinNear(out.normal(), DVec3::make(-1.0, 0.0, 0.0), KIN_TIGHT)
+    );
+
+    let box : KinPlaced = kinPlace(Shape::cuboid(1.0, 1.0, 1.0), DVec3::zero());
+    let ball : Shape = Shape::sphere(0.5);
+
+    let onFace : KinPlaced = kinPlace(ball, DVec3::make(0.0, 1.3, 0.0));
+    let face : bool = kinCollide(onFace, box, out);
+    c.that("sphere-box: resting on a face", face && kinNear(out.normal(), kinDown(), KIN_TIGHT));
+    c.near(
+        "sphere-box: a sphere on a box face has the penetration as depth",
+        out.depthAt(0),
+        0.2,
+        KIN_TIGHT
+    );
+    c.near(
+        "sphere-box: a sphere on a box face has its contact point between the surfaces",
+        out.pointAt(0).y,
+        0.9,
+        KIN_TIGHT
+    );
+
+    let beyond : KinPlaced = kinPlace(ball, DVec3::make(1.3, 1.3, 1.3));
+    let corner : bool = kinCollide(beyond, box, out);
+    c.that("sphere-box: beyond the corner but within the radius is no hit", !corner);
+
+    let big : KinPlaced = kinPlace(Shape::sphere(0.8), DVec3::make(1.3, 1.3, 1.3));
+    let near : bool = kinCollide(big, box, out);
+    let diag : f64 = 0.3 * KIN_SQRT3;
+    c.that(
+        "sphere-box: a sphere near a box corner touches it with positive depth",
+        near && out.depthAt(0) > 0.0
+    );
+    c.near(
+        "sphere-box: a sphere at a box corner has the depth to the corner point",
+        out.depthAt(0),
+        0.8 - diag,
+        KIN_TIGHT
+    );
+    c.near("sphere-box: corner normal is diagonal", out.normal().x, -1.0 / KIN_SQRT3, KIN_TIGHT);
+
+    let sunk : KinPlaced = kinPlace(Shape::sphere(0.2), DVec3::make(0.0, 0.9, 0.0));
+    let inside : bool = kinCollide(sunk, box, out);
+    c.that(
+        "sphere-box: a centre inside leaves through the nearest face",
+        inside && kinNear(out.normal(), kinDown(), KIN_TIGHT)
+    );
+    c.near(
+        "sphere-box: inside depth is radius plus distance to the face",
+        out.depthAt(0),
+        0.3,
+        KIN_TIGHT
+    );
+
+    let tilt : DQuat = DQuat::fromAxisAngle(DVec3::unitZ(), KIN_EDGE_TILT);
+    let turnedBox : KinPlaced = kinTurn(box.shape, DVec3::zero(), tilt);
+    let high : KinPlaced = kinPlace(ball, DVec3::make(0.0, 1.8, 0.0));
+    let rot : bool = kinCollide(high, turnedBox, out);
+    c.that("sphere-box: a turned box presents its corner", rot && out.depthAt(0) > 0.0);
+    c.near("sphere-box: turned corner depth", out.depthAt(0), 0.5 - (1.8 - KIN_SQRT2), KIN_TIGHT);
+}
+
+fn kinNarrowBoxes(c : Checks) : void {
+    let out : ContactBuffer = new ContactBuffer();
+    let bx : Shape = Shape::cuboid(1.0, 1.0, 1.0);
+    let base : KinPlaced = kinPlace(bx, DVec3::zero());
+
+    let stacked : KinPlaced = kinPlace(bx, DVec3::make(0.0, 1.8, 0.0));
+    let hit : bool = kinCollide(base, stacked, out);
+    c.that(
+        "box-box: stacked boxes overlap with a four-point face manifold",
+        hit && out.count() == 4
+    );
+    c.that(
+        "box-box: the normal of a stacked pair points up",
+        kinNear(out.normal(), DVec3::unitY(), KIN_TIGHT)
+    );
+
+    let mut allDeep : bool = true;
+    let mut xs : f64 = 0.0;
+    let mut zs : f64 = 0.0;
+    for (k of 0..4) {
+        if (out.depthAt(k) < 0.1999999 || out.depthAt(k) > 0.2000001) {
+            allDeep = false;
+        }
+        xs = xs + out.pointAt(k).x;
+        zs = zs + out.pointAt(k).z;
+        c.near(
+            "box-box: every stacked contact point lies at the mid height between the faces",
+            out.pointAt(k).y,
+            0.9,
+            KIN_TIGHT
+        );
+    }
+    c.that("box-box: every point has the penetration depth", allDeep);
+    c.near("box-box: the stacked contact points average to the centre in x", xs, 0.0, KIN_TIGHT);
+    c.near("box-box: the stacked contact points average to the centre in z", zs, 0.0, KIN_TIGHT);
+
+    let mut ids : i32 = 0;
+    for (k of 0..4) {
+        for (m of k + 1..4) {
+            if (out.idAt(k) == out.idAt(m)) {
+                ids = ids + 1;
+            }
+        }
+    }
+    c.sameInt("box-box: the stacked contact points carry no repeated feature id", ids, 0);
+
+    let again : bool = kinCollide(base, stacked, out);
+    let firstId : i32 = out.idAt(0);
+    let sunk : KinPlaced = kinPlace(bx, DVec3::make(0.0, 1.79, 0.0));
+    kinCollide(base, sunk, out);
+    c.that("box-box: feature ids are stable from step to step", again && out.idAt(0) == firstId);
+
+    let apart : KinPlaced = kinPlace(bx, DVec3::make(0.0, 2.01, 0.0));
+    c.that("box-box: separated", !kinCollide(base, apart, out));
+
+    let tilt : DQuat = DQuat::fromAxisAngle(DVec3::unitZ(), KIN_EDGE_TILT);
+    let aside : KinPlaced = kinTurn(bx, DVec3::make(2.3, 2.3, 0.0), tilt);
+    c.that("box-box: separated diagonally (edge axis)", !kinCollide(base, aside, out));
+
+    let flip : bool = kinCollide(stacked, base, out);
+    c.that(
+        "box-box: reversed order flips the normal",
+        flip && kinNear(out.normal(), kinDown(), KIN_TIGHT)
+    );
+
+    // A small box on a larger one, offset: only the overlap is in the manifold.
+    let small : KinPlaced = kinPlace(Shape::cuboid(0.25, 0.25, 0.25), DVec3::make(0.9, 1.2, 0.0));
+    let off : bool = kinCollide(base, small, out);
+    c.that(
+        "box-box: a small box on the edge of a big one has four points",
+        off && out.count() == 4
+    );
+
+    let mut inside : bool = true;
+    for (k of 0..out.count()) {
+        if (out.pointAt(k).x > 1.0000001 || out.pointAt(k).x < 0.6499999) {
+            inside = false;
+        }
+    }
+    c.that("box-box: the clipped points lie on the overlapping part", inside);
+}
+
+fn kinNarrowBoxEdges(c : Checks) : void {
+    let out : ContactBuffer = new ContactBuffer();
+    let base : KinPlaced = kinPlace(Shape::cuboid(1.0, 1.0, 1.0), DVec3::zero());
+    let half : Shape = Shape::cuboid(0.5, 0.5, 0.5);
+
+    // Crossed edges: a cube on its edge above a cube on its edge, the edges perpendicular.
+    let tiltA : DQuat = DQuat::fromAxisAngle(DVec3::unitZ(), KIN_EDGE_TILT);
+    let tiltB : DQuat = DQuat::fromAxisAngle(DVec3::unitX(), KIN_EDGE_TILT);
+    let upper : KinPlaced = kinTurn(half, DVec3::make(0.0, 1.3, 0.0), tiltA);
+    let lower : KinPlaced = kinTurn(half, DVec3::zero(), tiltB);
+    let edge : bool = kinCollide(upper, lower, out);
+    c.that("box-box: two crossed edges give exactly one contact point", edge && out.count() == 1);
+    c.that(
+        "box-box: crossed edges, the normal is down",
+        kinNear(out.normal(), kinDown(), KIN_LOOSE)
+    );
+    c.near(
+        "box-box: crossed edges depth",
+        out.depthAt(0),
+        KIN_HALF_SQRT2 - (1.3 - KIN_HALF_SQRT2),
+        KIN_LOOSE
+    );
+    c.that(
+        "box-box: crossed edges, the point is where they cross",
+        kinNear(out.pointAt(0), DVec3::make(0.0, 0.65, 0.0), KIN_LOOSE)
+    );
+
+    // A rotated box resting on a flat one (yaw 30 degrees): four corner points in the lower face.
+    let yaw : DQuat = DQuat::fromAxisAngle(DVec3::unitY(), KIN_YAW_30);
+    let yawedBox : KinPlaced = kinTurn(half, DVec3::make(0.2, 1.45, 0.1), yaw);
+    let yawed : bool = kinCollide(base, yawedBox, out);
+    c.that("box-box: a yawed box on a face has a four-point manifold", yawed && out.count() == 4);
+    c.that(
+        "box-box: the normal of a yawed stacked pair points up",
+        kinNear(out.normal(), DVec3::unitY(), KIN_LOOSE)
+    );
+    c.near(
+        "box-box: the depth of a yawed stacked pair is the overlap of 0.05",
+        out.depthAt(0),
+        0.05,
+        KIN_LOOSE
+    );
+}
+
+fn kinNarrowCapsules(c : Checks) : void {
+    let out : ContactBuffer = new ContactBuffer();
+    let cap : Shape = Shape::capsule(0.5, 1.0);
+    let sph : Shape = Shape::sphere(0.5);
+    let upright : KinPlaced = kinPlace(cap, DVec3::zero());
+
+    let beside : KinPlaced = kinPlace(sph, DVec3::make(0.8, 0.5, 0.0));
+    let hit : bool = kinCollide(upright, beside, out);
+    c.that(
+        "capsule-sphere: a sphere beside the capsule side gets a normal along x",
+        hit && kinNear(out.normal(), DVec3::unitX(), KIN_TIGHT)
+    );
+    c.near(
+        "capsule-sphere: a sphere beside the capsule side has the penetration as depth",
+        out.depthAt(0),
+        0.2,
+        KIN_TIGHT
+    );
+
+    let over : KinPlaced = kinPlace(sph, DVec3::make(0.0, 1.8, 0.0));
+    let cap2 : bool = kinCollide(upright, over, out);
+    c.that(
+        "capsule-sphere: a sphere over the capsule cap gets a normal along y",
+        cap2 && kinNear(out.normal(), DVec3::unitY(), KIN_TIGHT)
+    );
+    c.near(
+        "capsule-sphere: a sphere over the capsule cap has the penetration as depth",
+        out.depthAt(0),
+        0.2,
+        KIN_TIGHT
+    );
+
+    let swapped : bool = kinCollide(over, upright, out);
+    c.that(
+        "capsule-sphere: swapped order flips the normal",
+        swapped && kinNear(out.normal(), kinDown(), KIN_TIGHT)
+    );
+
+    let side : DQuat = DQuat::fromAxisAngle(DVec3::unitZ(), HALF_PI_D);
+    let crossing : KinPlaced = kinTurn(cap, DVec3::make(0.0, 0.0, 0.9), side);
+    let cross : bool = kinCollide(upright, crossing, out);
+    c.that(
+        "capsule-capsule: crossing capsules touch with one contact point",
+        cross && out.count() == 1
+    );
+    c.that(
+        "capsule-capsule: crossing capsules get a normal along z",
+        kinNear(out.normal(), DVec3::unitZ(), KIN_TIGHT)
+    );
+    c.near(
+        "capsule-capsule: crossing capsules have the penetration as depth",
+        out.depthAt(0),
+        0.1,
+        KIN_TIGHT
+    );
+
+    let neighbour : KinPlaced = kinPlace(cap, DVec3::make(0.9, 0.5, 0.0));
+    let parallel : bool = kinCollide(upright, neighbour, out);
+    c.that(
+        "capsule-capsule: parallel capsules side by side make two points",
+        parallel && out.count() == 2
+    );
+    c.near(
+        "capsule-capsule: parallel capsules have the penetration as depth",
+        out.depthAt(0),
+        0.1,
+        KIN_TIGHT
+    );
+    let distant : KinPlaced = kinPlace(cap, DVec3::make(1.1, 0.0, 0.0));
+    c.that("capsule-capsule: apart", !kinCollide(upright, distant, out));
+
+    let box : KinPlaced = kinPlace(Shape::cuboid(1.0, 1.0, 1.0), DVec3::zero());
+    let clear : KinPlaced = kinTurn(cap, DVec3::make(0.0, 3.0, 0.0), side);
+    c.that("capsule-box: a capsule above a box is clear", !kinCollide(clear, box, out));
+
+    let lying : KinPlaced = kinTurn(cap, DVec3::make(0.0, 1.45, 0.0), side);
+    let low : bool = kinCollide(lying, box, out);
+    c.that(
+        "capsule-box: lying low, penetrating, the normal points down into the box",
+        low && out.count() == 2 && kinNear(out.normal(), kinDown(), KIN_LOOSE)
+    );
+    c.near("capsule-box: depth along the contact line", out.depthAt(0), 0.05, KIN_LOOSE);
+
+    let overhang : KinPlaced = kinPlace(cap, DVec3::make(1.2, 3.1, 0.0));
+    let end : bool = kinCollide(overhang, box, out);
+    c.that("capsule-box: end cap above a corner region misses", !end);
+
+    let standing : KinPlaced = kinPlace(cap, DVec3::make(0.0, 2.45, 0.0));
+    let upend : bool = kinCollide(standing, box, out);
+    c.that(
+        "capsule-box: standing on its end",
+        upend && kinNear(out.normal(), kinDown(), KIN_LOOSE)
+    );
+    c.near(
+        "capsule-box: a capsule end on a box has the penetration as depth",
+        out.depthAt(0),
+        0.05,
+        KIN_LOOSE
+    );
+
+    let rev : bool = kinCollide(box, standing, out);
+    c.that(
+        "capsule-box: box first flips the normal",
+        rev && kinNear(out.normal(), DVec3::unitY(), KIN_LOOSE)
+    );
+}
+
+fn kinNarrowPlanes(c : Checks) : void {
+    let out : ContactBuffer = new ContactBuffer();
+    let ground : KinPlaced = kinPlace(Shape::plane(DVec3::unitY(), 0.0), DVec3::zero());
+    let ball : Shape = Shape::sphere(0.5);
+
+    let touching : KinPlaced = kinPlace(ball, DVec3::make(3.0, 0.4, 0.0));
+    let hit : bool = kinCollide(touching, ground, out);
+    c.that("sphere-plane: touching", hit && kinNear(out.normal(), kinDown(), KIN_TIGHT));
+    c.near(
+        "sphere-plane: a sphere through a plane has the penetration as depth",
+        out.depthAt(0),
+        0.1,
+        KIN_TIGHT
+    );
+    c.near(
+        "sphere-plane: the contact point of a sphere and a plane lies between the surfaces",
+        out.pointAt(0).y,
+        -0.05,
+        KIN_TIGHT
+    );
+
+    let above : KinPlaced = kinPlace(ball, DVec3::make(0.0, 0.6, 0.0));
+    c.that("sphere-plane: above", !kinCollide(above, ground, out));
+
+    let resting : KinPlaced = kinPlace(ball, DVec3::make(0.0, 0.4, 0.0));
+    let rev : bool = kinCollide(ground, resting, out);
+    c.that(
+        "sphere-plane: plane first gives the normal up",
+        rev && kinNear(out.normal(), DVec3::unitY(), KIN_TIGHT)
+    );
+
+    let slope : Shape = Shape::plane(DVec3::make(1.0, 1.0, 0.0), 0.0);
+    let tilted : KinPlaced = kinPlace(slope, DVec3::zero());
+    let low : KinPlaced = kinPlace(ball, DVec3::make(0.0, 0.3, 0.0));
+    c.that("sphere-plane: a tilted plane", kinCollide(low, tilted, out));
+    c.near("sphere-plane: tilted depth", out.depthAt(0), 0.5 - 0.3 * KIN_HALF_SQRT2, KIN_TIGHT);
+
+    let cube : Shape = Shape::cuboid(1.0, 1.0, 1.0);
+    let flat : KinPlaced = kinPlace(cube, DVec3::make(0.0, 0.9, 0.0));
+    let boxHit : bool = kinCollide(flat, ground, out);
+    c.that("box-plane: a flat box has four contact points", boxHit && out.count() == 4);
+    c.near(
+        "box-plane: a box through a plane has the penetration as depth",
+        out.depthAt(0),
+        0.1,
+        KIN_TIGHT
+    );
+
+    let edgeTilt : DQuat = DQuat::fromAxisAngle(DVec3::unitZ(), KIN_EDGE_TILT);
+    let onEdge : KinPlaced = kinTurn(cube, DVec3::make(0.0, 1.3, 0.0), edgeTilt);
+    let tip : bool = kinCollide(onEdge, ground, out);
+    c.that(
+        "box-plane: a box on its edge touches along the edge (two points)",
+        tip && out.count() == 2
+    );
+    c.near(
+        "box-plane: a box edge on a plane has the diagonal penetration as depth",
+        out.depthAt(0),
+        KIN_SQRT2 - 1.3,
+        KIN_TIGHT
+    );
+
+    let capsule : Shape = Shape::capsule(0.5, 1.0);
+    let sideways : DQuat = DQuat::fromAxisAngle(DVec3::unitZ(), HALF_PI_D);
+    let lyingCap : KinPlaced = kinTurn(capsule, DVec3::make(0.0, 0.45, 0.0), sideways);
+    let capHit : bool = kinCollide(lyingCap, ground, out);
+    c.that("capsule-plane: a lying capsule has two points", capHit && out.count() == 2);
+    c.near(
+        "capsule-plane: a lying capsule has the penetration as depth",
+        out.depthAt(0),
+        0.05,
+        KIN_TIGHT
+    );
+
+    let standingCap : KinPlaced = kinPlace(capsule, DVec3::make(0.0, 1.45, 0.0));
+    let stand : bool = kinCollide(standingCap, ground, out);
+    c.that("capsule-plane: a standing capsule has one point", stand && out.count() == 1);
+    c.that("plane-plane: never collide", !kinCollide(ground, ground, out));
+}

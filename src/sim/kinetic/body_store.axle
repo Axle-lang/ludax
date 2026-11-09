@@ -1,0 +1,375 @@
+// body_store — every rigid body of a physics world, one array per property.
+//
+// Struct-of-arrays: a body is a slot number, and each property (position, velocity, mass...) lives in its own
+// packed array indexed by it. The solver walks one property at a time, and a body never exists as an object
+// that could be aliased. Handles are `EntityId`s from an `IdAllocator`, so a handle to a removed body stays
+// invalid even after its slot is reused. Slot numbers are what the rest of kinetic uses internally; they are
+// issued in creation order, which is what keeps every iteration order deterministic.
+
+use crate::core::collections::vec::Vec;
+use crate::core::id::entity_id::EntityId;
+use crate::core::id::id_allocator::IdAllocator;
+use crate::core::math::dmat3::DMat3;
+use crate::core::math::dquat::DQuat;
+use crate::core::math::dvec3::DVec3;
+use crate::sim::kinetic::shape::{Shape, ShapeKind};
+
+/** How a body takes part in the simulation. */
+pub enum BodyKind : i8 {
+    Dynamic = 0,
+    Static = 1,
+    Kinematic = 2,
+
+    /** The stable number of this kind. */
+    pub fn code(self) : i32 {
+        return self as i32;
+    }
+}
+
+/**
+ * Everything needed to create a body. Build one with `BodyDesc::dynamic`, `fixed` or `kinematic`, then adjust
+ * fields.
+ */
+pub struct BodyDesc {
+    /** The collision shape, centred on the body's origin. */
+    pub shape : Shape = Shape { kind: ShapeKind::Sphere };
+
+    /** Dynamic bodies move under forces, static ones never move, kinematic ones move only as told. */
+    pub kind : BodyKind = BodyKind::Dynamic;
+
+    /** The world position of the body's centre of mass. */
+    pub position : DVec3 = DVec3 { x: 0.0, y: 0.0, z: 0.0 };
+
+    /** The body's orientation. */
+    pub rotation : DQuat = DQuat { x: 0.0, y: 0.0, z: 0.0, w: 1.0 };
+
+    /** Mass in kilograms; used by dynamic bodies only. */
+    pub mass : f64 = 1.0;
+
+    /** Bounciness in 0..1: 0 absorbs the impact, 1 returns all of it. */
+    pub restitution : f64 = 0.0;
+
+    /** Coulomb friction coefficient; two bodies in contact use the geometric mean of theirs. */
+    pub friction : f64 = 0.5;
+
+    /** Linear velocity lost per second as a fraction (air drag); 0 is none. */
+    pub linearDamping : f64 = 0.0;
+
+    /** Angular velocity lost per second as a fraction. */
+    pub angularDamping : f64 = 0.0;
+
+    /** How strongly gravity pulls on this body: 1 is full, 0 floats. */
+    pub gravityScale : f64 = 1.0;
+
+    /** Whether the body may fall asleep when it has been still for a while. */
+    pub canSleep : bool = true;
+
+    /** The collision groups the body belongs to, as bits. */
+    pub group : i32 = 1;
+
+    /**
+     * The groups it collides with, as bits (-1 is all of them): a pair collides when each one's mask holds the
+     * other's group.
+     */
+    pub mask : i32 = -1;
+
+    /** A number of the game's own, carried with the body and never read by the engine. */
+    pub userData : i64 = 0;
+
+    /** Initial linear velocity. */
+    pub linearVelocity : DVec3 = DVec3 { x: 0.0, y: 0.0, z: 0.0 };
+
+    /** Initial angular velocity (radians per second about each axis). */
+    pub angularVelocity : DVec3 = DVec3 { x: 0.0, y: 0.0, z: 0.0 };
+
+    /** A dynamic body of `shape` and `mass` at `position`. */
+    pub static fn dynamic(shape : Shape, position : DVec3, mass : f64) : BodyDesc {
+        return BodyDesc { shape: shape, position: position, mass: mass };
+    }
+
+    /** A body of `shape` at `position` that never moves (`static` is a keyword, hence `fixed`). */
+    pub static fn fixed(shape : Shape, position : DVec3) : BodyDesc {
+        return BodyDesc { shape: shape, position: position, kind: BodyKind::Static };
+    }
+
+    /** A body of `shape` at `position` that is moved by setting its velocity, and pushes dynamic bodies. */
+    pub static fn kinematic(shape : Shape, position : DVec3) : BodyDesc {
+        return BodyDesc { shape: shape, position: position, kind: BodyKind::Kinematic };
+    }
+}
+
+/** The packed arrays of all bodies. Internal to kinetic: games go through `PhysicsWorld`. */
+pub class BodyStore {
+    pub(crate) ids                 : IdAllocator;
+    pub(crate) live                : Vec<bool>;
+    pub(crate) kind                : Vec<i32>;
+    pub(crate) shape               : Vec<Shape>;
+    pub(crate) position            : Vec<DVec3>;
+    pub(crate) rotation            : Vec<DQuat>;
+    pub(crate) linearVelocity      : Vec<DVec3>;
+    pub(crate) angularVelocity     : Vec<DVec3>;
+    pub(crate) prevLinearVelocity  : Vec<DVec3>;
+    pub(crate) prevAngularVelocity : Vec<DVec3>;
+    pub(crate) force               : Vec<DVec3>;
+    pub(crate) torque              : Vec<DVec3>;
+    pub(crate) mass                : Vec<f64>;
+    pub(crate) invMass             : Vec<f64>;
+    pub(crate) invInertia          : Vec<DVec3>;
+    pub(crate) invInertiaW         : Vec<DMat3>;
+    pub(crate) restitution         : Vec<f64>;
+    pub(crate) friction            : Vec<f64>;
+    pub(crate) linearDamping       : Vec<f64>;
+    pub(crate) angularDamping      : Vec<f64>;
+    pub(crate) gravityScale        : Vec<f64>;
+    pub(crate) sleepTimer          : Vec<f64>;
+    pub(crate) asleep              : Vec<bool>;
+    pub(crate) canSleep            : Vec<bool>;
+    pub(crate) island              : Vec<i32>;
+    pub(crate) group               : Vec<i32>;
+    pub(crate) mask                : Vec<i32>;
+    pub(crate) userData            : Vec<i64>;
+
+    /** An empty store. */
+    constructor() {
+        self.ids = new IdAllocator();
+        self.live = new Vec<bool>();
+        self.kind = new Vec<i32>();
+        self.shape = new Vec<Shape>();
+        self.position = new Vec<DVec3>();
+        self.rotation = new Vec<DQuat>();
+        self.linearVelocity = new Vec<DVec3>();
+        self.angularVelocity = new Vec<DVec3>();
+        self.prevLinearVelocity = new Vec<DVec3>();
+        self.prevAngularVelocity = new Vec<DVec3>();
+        self.force = new Vec<DVec3>();
+        self.torque = new Vec<DVec3>();
+        self.mass = new Vec<f64>();
+        self.invMass = new Vec<f64>();
+        self.invInertia = new Vec<DVec3>();
+        self.invInertiaW = new Vec<DMat3>();
+        self.restitution = new Vec<f64>();
+        self.friction = new Vec<f64>();
+        self.linearDamping = new Vec<f64>();
+        self.angularDamping = new Vec<f64>();
+        self.gravityScale = new Vec<f64>();
+        self.sleepTimer = new Vec<f64>();
+        self.asleep = new Vec<bool>();
+        self.canSleep = new Vec<bool>();
+        self.island = new Vec<i32>();
+        self.group = new Vec<i32>();
+        self.mask = new Vec<i32>();
+        self.userData = new Vec<i64>();
+    }
+
+    /** How many slots exist, live or free. Slot numbers run `0..slotCount()`. */
+    pub fn slotCount(self) : i32 {
+        return self.ids.slotCount();
+    }
+
+    /** How many bodies are alive. */
+    pub fn liveCount(self) : i32 {
+        return self.ids.liveCount();
+    }
+
+    /** Whether slot `i` holds a body. */
+    pub fn isLive(self, i : i32) : bool {
+        return self.live.has(i) && self.live.get(i);
+    }
+
+    /** The slot of a handle, or -1 when the handle is stale or foreign. */
+    pub fn slotOf(self, id : EntityId) : i32 {
+        if (!self.ids.isAlive(id)) {
+            return -1;
+        }
+        return id.index;
+    }
+
+    /** The handle of the body in slot `i`. */
+    pub fn handleOf(self, i : i32) : EntityId {
+        return self.ids.idAt(i);
+    }
+
+    /** Adds a body; returns its handle. */
+    pub fn add(mut self, desc : BodyDesc) : EntityId {
+        let id : EntityId = self.ids.create();
+        let i : i32 = id.index;
+        let m : f64 = BodyStore::effectiveMass(desc);
+        let mut inv : f64 = 0.0;
+        let mut invI : DVec3 = DVec3::zero();
+        if (m > 0.0) {
+            inv = 1.0 / m;
+            invI = BodyStore::inverseOf(desc.shape.inertia(m));
+        }
+
+        // A removed body's slot is reused in place; a new one is appended to every array.
+        if (i >= self.live.len()) {
+            self.live.push(true);
+            self.kind.push(desc.kind.code());
+            self.shape.push(desc.shape);
+            self.position.push(desc.position);
+            self.rotation.push(desc.rotation.normalized());
+            self.linearVelocity.push(desc.linearVelocity);
+            self.angularVelocity.push(desc.angularVelocity);
+            self.prevLinearVelocity.push(desc.linearVelocity);
+            self.prevAngularVelocity.push(desc.angularVelocity);
+            self.force.push(DVec3::zero());
+            self.torque.push(DVec3::zero());
+            self.mass.push(m);
+            self.invMass.push(inv);
+            self.invInertia.push(invI);
+            self.invInertiaW.push(DMat3::identity());
+            self.restitution.push(desc.restitution);
+            self.friction.push(desc.friction);
+            self.linearDamping.push(desc.linearDamping);
+            self.angularDamping.push(desc.angularDamping);
+            self.gravityScale.push(desc.gravityScale);
+            self.sleepTimer.push(0.0);
+            self.asleep.push(false);
+            self.canSleep.push(desc.canSleep);
+            self.island.push(0);
+            self.group.push(desc.group);
+            self.mask.push(desc.mask);
+            self.userData.push(desc.userData);
+        } else {
+            self.live.set(i, true);
+            self.kind.set(i, desc.kind.code());
+            self.shape.set(i, desc.shape);
+            self.position.set(i, desc.position);
+            self.rotation.set(i, desc.rotation.normalized());
+            self.linearVelocity.set(i, desc.linearVelocity);
+            self.angularVelocity.set(i, desc.angularVelocity);
+            self.prevLinearVelocity.set(i, desc.linearVelocity);
+            self.prevAngularVelocity.set(i, desc.angularVelocity);
+            self.force.set(i, DVec3::zero());
+            self.torque.set(i, DVec3::zero());
+            self.mass.set(i, m);
+            self.invMass.set(i, inv);
+            self.invInertia.set(i, invI);
+            self.restitution.set(i, desc.restitution);
+            self.friction.set(i, desc.friction);
+            self.linearDamping.set(i, desc.linearDamping);
+            self.angularDamping.set(i, desc.angularDamping);
+            self.gravityScale.set(i, desc.gravityScale);
+            self.sleepTimer.set(i, 0.0);
+            self.asleep.set(i, false);
+            self.canSleep.set(i, desc.canSleep);
+            self.island.set(i, 0);
+            self.group.set(i, desc.group);
+            self.mask.set(i, desc.mask);
+            self.userData.set(i, desc.userData);
+        }
+        self.refreshInertia(i);
+        return id;
+    }
+
+    // Only a dynamic body has mass, and one with no mass given has none either: it behaves as immovable.
+    static fn effectiveMass(desc : BodyDesc) : f64 {
+        if (desc.kind == BodyKind::Dynamic && desc.mass > 0.0) {
+            return desc.mass;
+        }
+        return 0.0;
+    }
+
+    // Component-wise reciprocal of an inertia diagonal; an axis with none is locked and stays zero.
+    static fn inverseOf(inertia : DVec3) : DVec3 {
+        let mut inv : DVec3 = DVec3::zero();
+        if (inertia.x > 0.0) {
+            inv.x = 1.0 / inertia.x;
+        }
+        if (inertia.y > 0.0) {
+            inv.y = 1.0 / inertia.y;
+        }
+        if (inertia.z > 0.0) {
+            inv.z = 1.0 / inertia.z;
+        }
+        return inv;
+    }
+
+    /** Removes the body; false when the handle was already stale. */
+    pub fn remove(mut self, id : EntityId) : bool {
+        let i : i32 = self.slotOf(id);
+        if (i < 0) {
+            return false;
+        }
+        self.ids.destroy(id);
+        self.live.set(i, false);
+        self.asleep.set(i, false);
+        return true;
+    }
+
+    /** Recomputes the world-space inverse inertia tensor of slot `i` from its orientation: R diag(1/I) R^T. */
+    pub fn refreshInertia(mut self, i : i32) : void {
+        let r : DMat3 = self.rotation.get(i).toMat3();
+        let d : DVec3 = self.invInertia.get(i);
+        let world : DMat3 = DMat3 {
+            m00: r.m00 * d.x * r.m00 + r.m01 * d.y * r.m01 + r.m02 * d.z * r.m02,
+            m01: r.m00 * d.x * r.m10 + r.m01 * d.y * r.m11 + r.m02 * d.z * r.m12,
+            m02: r.m00 * d.x * r.m20 + r.m01 * d.y * r.m21 + r.m02 * d.z * r.m22,
+            m10: r.m10 * d.x * r.m00 + r.m11 * d.y * r.m01 + r.m12 * d.z * r.m02,
+            m11: r.m10 * d.x * r.m10 + r.m11 * d.y * r.m11 + r.m12 * d.z * r.m12,
+            m12: r.m10 * d.x * r.m20 + r.m11 * d.y * r.m21 + r.m12 * d.z * r.m22,
+            m20: r.m20 * d.x * r.m00 + r.m21 * d.y * r.m01 + r.m22 * d.z * r.m02,
+            m21: r.m20 * d.x * r.m10 + r.m21 * d.y * r.m11 + r.m22 * d.z * r.m12,
+            m22: r.m20 * d.x * r.m20 + r.m21 * d.y * r.m21 + r.m22 * d.z * r.m22,
+        };
+        self.invInertiaW.set(i, world);
+    }
+
+    /** Wakes slot `i` and restarts its sleep timer. */
+    pub fn wake(mut self, i : i32) : void {
+        self.asleep.set(i, false);
+        self.sleepTimer.set(i, 0.0);
+    }
+
+    /** Inverse mass of slot `i` (zero for bodies that cannot be pushed). */
+    pub fn inverseMass(self, i : i32) : f64 {
+        return self.invMass.get(i);
+    }
+
+    /** Mass of slot `i` (zero for static and kinematic bodies). */
+    pub fn massOf(self, i : i32) : f64 {
+        return self.mass.get(i);
+    }
+
+    /** The diagonal of the inverse inertia tensor of slot `i` in its own frame. */
+    pub fn inverseInertia(self, i : i32) : DVec3 {
+        return self.invInertia.get(i);
+    }
+
+    /** The kind of slot `i`: 0 dynamic, 1 static, 2 kinematic. */
+    pub fn kindOf(self, i : i32) : i32 {
+        return self.kind.get(i);
+    }
+
+    /** The user number stored with slot `i`. */
+    pub fn userOf(self, i : i32) : i64 {
+        return self.userData.get(i);
+    }
+
+    /** Whether slot `i` is dynamic. */
+    pub fn isDynamic(self, i : i32) : bool {
+        return self.kind.get(i) == BodyKind::Dynamic.code();
+    }
+
+    /** Whether slot `i` is static. */
+    pub fn isStatic(self, i : i32) : bool {
+        return self.kind.get(i) == BodyKind::Static.code();
+    }
+
+    /** Whether slot `i` is kinematic. */
+    pub fn isKinematic(self, i : i32) : bool {
+        return self.kind.get(i) == BodyKind::Kinematic.code();
+    }
+
+    /** The world position of a point given in the body's own frame. */
+    pub fn worldPoint(self, i : i32, local : DVec3) : DVec3 {
+        return self.position.get(i).plus(self.rotation.get(i).rotate(local));
+    }
+
+    /** The velocity of the material point of body `i` that is at world position `p`. */
+    pub fn velocityAt(self, i : i32, p : DVec3) : DVec3 {
+        return self.linearVelocity
+            .get(i)
+            .plus(self.angularVelocity.get(i).cross(p.minus(self.position.get(i))));
+    }
+}

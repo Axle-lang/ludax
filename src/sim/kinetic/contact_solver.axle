@@ -1,0 +1,155 @@
+// contact_solver — sequential impulses for contacts: non-penetration, Coulomb friction and restitution.
+//
+// Each contact point is a constraint on the relative velocity of the two bodies at that point. The solver
+// visits the points in a fixed order several times, correcting each in turn and keeping the total impulse
+// applied so far (clamped so that contacts only push, and friction stays inside its cone). Starting from the
+// previous step's totals (warm starting) is what lets a stack of boxes settle. Overlap is removed separately
+// by a position pass on pseudo velocities (split impulse), so fixing a penetration never adds real energy.
+
+use crate::core::math::dvec3::DVec3;
+use crate::core::math::scalar::{maxD, minD};
+use crate::sim::kinetic::body_store::BodyStore;
+use crate::sim::kinetic::contact_set::{ContactPoint, ContactSet};
+use crate::sim::kinetic::physics_settings::PhysicsSettings;
+use crate::sim::kinetic::solver_state::SolverState;
+
+/** The contact half of the constraint solver. */
+pub(crate) class ContactSolver {
+    /** Computes effective masses, friction directions, bounce and push-out speeds for every point. */
+    pub(crate) static fn prepare(
+        cs : ContactSet,
+        st : SolverState,
+        bodies : BodyStore,
+        cfg : PhysicsSettings
+    ) : void {
+        for (i of 0..cs.points.len()) {
+            let mut p : ContactPoint = cs.points.get(i);
+            p.rA = p.point.minus(bodies.position.get(p.a));
+            p.rB = p.point.minus(bodies.position.get(p.b));
+            let n : DVec3 = p.normal;
+            p.t1 = n.anyPerpendicular();
+            p.t2 = n.cross(p.t1);
+            p.massN = ContactSolver::effectiveMass(st, p, n);
+            p.massT1 = ContactSolver::effectiveMass(st, p, p.t1);
+            p.massT2 = ContactSolver::effectiveMass(st, p, p.t2);
+
+            let vn : f64 = st.pointVelocity(p.b, p.rB).minus(st.pointVelocity(p.a, p.rA)).dot(n);
+            p.bounce = ContactSolver::bounceSpeed(bodies, p, cfg);
+            p.push = ContactSolver::pushSpeed(p, vn, cfg);
+            p.jp = 0.0;
+
+            if (cfg.warmStarting) {
+                p = cs.inherit(p);
+            } else {
+                p.jn = 0.0;
+                p.jt1 = 0.0;
+                p.jt2 = 0.0;
+            }
+            cs.points.set(i, p);
+        }
+    }
+
+    // The separating speed restitution asks for, or zero for an impact too slow to bounce.
+    //
+    // It is taken off the speed the bodies had when the overlap was measured (the start of the step), not the
+    // speed after this step's gravity: reflecting that would hand the ball a step of speed it never earned and
+    // each bounce would climb a little higher.
+    static fn bounceSpeed(bodies : BodyStore, point : ContactPoint, cfg : PhysicsSettings) : f64 {
+        let velB : DVec3 = bodies.prevLinearVelocity
+            .get(point.b)
+            .plus(bodies.prevAngularVelocity.get(point.b).cross(point.rB));
+        let velA : DVec3 = bodies.prevLinearVelocity
+            .get(point.a)
+            .plus(bodies.prevAngularVelocity.get(point.a).cross(point.rA));
+        let before : f64 = velB.minus(velA).dot(point.normal);
+        if (before < -cfg.restitutionThreshold) {
+            return -point.restitution * before;
+        }
+        return 0.0;
+    }
+
+    // The speed at which the position pass pushes the overlap out: a fraction of what is left over the slop per
+    // step, capped. A contact that is already separating (or about to bounce, at `vn` and `p.bounce`) clears
+    // the overlap by itself; pushing it as well would lift it for free.
+    static fn pushSpeed(point : ContactPoint, vn : f64, cfg : PhysicsSettings) : f64 {
+        let over : f64 = maxD(point.depth - cfg.penetrationSlop, 0.0);
+        let push : f64 = minD(over * cfg.pushFactor / cfg.substep, cfg.maxPushSpeed);
+        let leaving : f64 = maxD(vn, point.bounce);
+        return maxD(push - leaving, 0.0);
+    }
+
+    // The inverse of how hard it is to change the relative speed along `d` at the contact point.
+    static fn effectiveMass(st : SolverState, point : ContactPoint, d : DVec3) : f64 {
+        let ra : DVec3 = point.rA.cross(d);
+        let rb : DVec3 = point.rB.cross(d);
+        let linearPart : f64 = st.invMass(point.a) + st.invMass(point.b);
+        let k : f64 = linearPart + ra.dot(st.invInertia(point.a, ra)) + rb.dot(st.invInertia(point.b, rb));
+        if (k <= 0.0) {
+            return 0.0;
+        }
+        return 1.0 / k;
+    }
+
+    /** Applies the impulses inherited from the previous step. */
+    pub(crate) static fn warmStart(cs : ContactSet, st : SolverState) : void {
+        for (i of 0..cs.points.len()) {
+            let p : ContactPoint = cs.points.get(i);
+            let imp : DVec3 = p.normal.scale(p.jn).plus(p.t1.scale(p.jt1)).plus(p.t2.scale(p.jt2));
+            st.applyImpulse(p.a, p.b, imp, p.rA, p.rB);
+        }
+    }
+
+    /** One pass over all points: friction first (limited by the normal impulse so far), then the normal. */
+    pub(crate) static fn iterate(cs : ContactSet, st : SolverState) : void {
+        for (i of 0..cs.points.len()) {
+            let mut p : ContactPoint = cs.points.get(i);
+            let n : DVec3 = p.normal;
+
+            // Friction: the accumulated tangent impulse stays inside the cone of the normal impulse so far.
+            let vrel : DVec3 = st.pointVelocity(p.b, p.rB).minus(st.pointVelocity(p.a, p.rA));
+            let mut n1 : f64 = p.jt1 - p.massT1 * vrel.dot(p.t1);
+            let mut n2 : f64 = p.jt2 - p.massT2 * vrel.dot(p.t2);
+            let limit : f64 = p.friction * p.jn;
+            let lengthSq : f64 = n1 * n1 + n2 * n2;
+            if (lengthSq > limit * limit) {
+                let k : f64 = limit / lengthSq.sqrt();
+                n1 = n1 * k;
+                n2 = n2 * k;
+            }
+            let d1 : f64 = n1 - p.jt1;
+            let d2 : f64 = n2 - p.jt2;
+            p.jt1 = n1;
+            p.jt2 = n2;
+            let tangential : DVec3 = p.t1.scale(d1).plus(p.t2.scale(d2));
+            st.applyImpulse(p.a, p.b, tangential, p.rA, p.rB);
+
+            // Normal: the accumulated impulse never pulls.
+            let vn : f64 = st.pointVelocity(p.b, p.rB).minus(st.pointVelocity(p.a, p.rA)).dot(n);
+            let lam : f64 = p.massN * (p.bounce - vn);
+            let total : f64 = maxD(p.jn + lam, 0.0);
+            let delta : f64 = total - p.jn;
+            p.jn = total;
+            st.applyImpulse(p.a, p.b, n.scale(delta), p.rA, p.rB);
+            cs.points.set(i, p);
+        }
+    }
+
+    /** One pass of the position pass: drives the pseudo velocity along each normal to the push-out speed. */
+    pub(crate) static fn iteratePosition(cs : ContactSet, st : SolverState) : void {
+        for (i of 0..cs.points.len()) {
+            let mut p : ContactPoint = cs.points.get(i);
+            if (p.push <= 0.0) {
+                continue;
+            }
+            let va : DVec3 = st.pseudoLin(p.a).plus(st.pseudoAng(p.a).cross(p.rA));
+            let vb : DVec3 = st.pseudoLin(p.b).plus(st.pseudoAng(p.b).cross(p.rB));
+            let vn : f64 = vb.minus(va).dot(p.normal);
+            let lam : f64 = p.massN * (p.push - vn);
+            let total : f64 = maxD(p.jp + lam, 0.0);
+            let delta : f64 = total - p.jp;
+            p.jp = total;
+            st.applyPseudoImpulse(p.a, p.b, p.normal.scale(delta), p.rA, p.rB);
+            cs.points.set(i, p);
+        }
+    }
+}

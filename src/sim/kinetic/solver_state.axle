@@ -1,0 +1,265 @@
+// solver_state — the flat working copy of body motion that the constraint solvers iterate on.
+//
+// Before solving, the velocities, inverse masses and world inverse inertias of every body are copied into plain
+// arrays; after solving, the velocities go back. Bodies that must not move under impulses (static, kinematic,
+// asleep) get zero inverse mass and inertia, so the same formulas serve every pair without branches. One extra
+// slot past the last body stands for "the world": a joint anchored to the world points at it, and since its
+// inverse mass is zero nothing ever moves it.
+
+use crate::core::math::dmat3::DMat3;
+use crate::core::math::dvec3::DVec3;
+use crate::sim::kinetic::body_store::BodyStore;
+
+// Numbers per slot in the flat arrays: a velocity is a linear and an angular vector, an inertia a 3x3 matrix.
+const SOLVER_VEL_STRIDE : i32 = 6;
+const SOLVER_INERTIA_STRIDE : i32 = 9;
+
+/** Working velocities and inverse masses for one solve. */
+pub(crate) class SolverState {
+    vel    : f64[];
+    pseudo : f64[];
+    invM   : f64[];
+    invI   : f64[];
+    room   : i32 = 0;
+    bodies : i32 = 0;
+
+    /** An empty state. */
+    constructor() {
+        self.vel = new f64[1];
+        self.pseudo = new f64[1];
+        self.invM = new f64[1];
+        self.invI = new f64[1];
+    }
+
+    /** The pseudo slot that stands for the world. */
+    pub(crate) fn worldSlot(self) : i32 {
+        return self.bodies;
+    }
+
+    /** Copies motion and mass data from the store; sleeping, static and kinematic bodies become immovable. */
+    pub(crate) fn load(mut self, bodies : BodyStore) : void {
+        let n : i32 = bodies.slotCount();
+        self.bodies = n;
+        self.reserve(n + 1);
+
+        // Slot `n` is the world: no velocity, no mass, so nothing it is joined to is ever pushed by it.
+        for (i of 0..n + 1) {
+            let awake : bool = i < n && bodies.isLive(i) && !bodies.asleep.get(i);
+            let mut lin : DVec3 = DVec3::zero();
+            let mut ang : DVec3 = DVec3::zero();
+            if (awake) {
+                lin = bodies.linearVelocity.get(i);
+                ang = bodies.angularVelocity.get(i);
+            }
+            self.setLin(i, lin);
+            self.setAng(i, ang);
+            self.setPseudo(i, DVec3::zero(), DVec3::zero());
+
+            if (awake && bodies.isDynamic(i)) {
+                self.invM[i as i64] = bodies.invMass.get(i);
+                self.setInvInertia(i, bodies.invInertiaW.get(i));
+            } else {
+                self.invM[i as i64] = 0.0;
+                self.clearInvInertia(i);
+            }
+        }
+    }
+
+    // Room for `slots` slots, growing by half again so a world that adds bodies does not reallocate every step.
+    fn reserve(mut self, slots : i32) : void {
+        if (slots <= self.room) {
+            return;
+        }
+        let cap : i32 = slots + (slots - 1) / 2;
+        self.vel = new f64[(cap * SOLVER_VEL_STRIDE) as i64];
+        self.pseudo = new f64[(cap * SOLVER_VEL_STRIDE) as i64];
+        self.invM = new f64[cap as i64];
+        self.invI = new f64[(cap * SOLVER_INERTIA_STRIDE) as i64];
+        self.room = cap;
+    }
+
+    fn clearInvInertia(mut self, i : i32) : void {
+        for (k of 0..SOLVER_INERTIA_STRIDE) {
+            self.invI[(i * SOLVER_INERTIA_STRIDE + k) as i64] = 0.0;
+        }
+    }
+
+    fn setInvInertia(mut self, i : i32, w : DMat3) : void {
+        let b : i64 = (i * SOLVER_INERTIA_STRIDE) as i64;
+        self.invI[b] = w.m00;
+        self.invI[b + 1] = w.m01;
+        self.invI[b + 2] = w.m02;
+        self.invI[b + 3] = w.m10;
+        self.invI[b + 4] = w.m11;
+        self.invI[b + 5] = w.m12;
+        self.invI[b + 6] = w.m20;
+        self.invI[b + 7] = w.m21;
+        self.invI[b + 8] = w.m22;
+    }
+
+    /** Writes the solved velocities of movable bodies back into the store. */
+    pub(crate) fn store(self, bodies : BodyStore) : void {
+        for (i of 0..self.bodies) {
+            if (self.invM[i as i64] > 0.0) {
+                bodies.linearVelocity.set(i, self.lin(i));
+                bodies.angularVelocity.set(i, self.ang(i));
+            }
+        }
+    }
+
+    /** Linear velocity of slot `i`. */
+    pub(crate) fn lin(self, i : i32) : DVec3 {
+        let b : i64 = (i * 6) as i64;
+        return DVec3 { x: self.vel[b], y: self.vel[b + 1], z: self.vel[b + 2] };
+    }
+
+    /** Angular velocity of slot `i`. */
+    pub(crate) fn ang(self, i : i32) : DVec3 {
+        let b : i64 = (i * 6) as i64;
+        return DVec3 { x: self.vel[b + 3], y: self.vel[b + 4], z: self.vel[b + 5] };
+    }
+
+    /** Sets the linear velocity of slot `i`. */
+    pub(crate) fn setLin(mut self, i : i32, v : DVec3) : void {
+        let b : i64 = (i * 6) as i64;
+        self.vel[b] = v.x;
+        self.vel[b + 1] = v.y;
+        self.vel[b + 2] = v.z;
+    }
+
+    /** Sets the angular velocity of slot `i`. */
+    pub(crate) fn setAng(mut self, i : i32, v : DVec3) : void {
+        let b : i64 = (i * 6) as i64;
+        self.vel[b + 3] = v.x;
+        self.vel[b + 4] = v.y;
+        self.vel[b + 5] = v.z;
+    }
+
+    /** The position pass's linear pseudo velocity of slot `i`. */
+    pub(crate) fn pseudoLin(self, i : i32) : DVec3 {
+        let b : i64 = (i * 6) as i64;
+        return DVec3 { x: self.pseudo[b], y: self.pseudo[b + 1], z: self.pseudo[b + 2] };
+    }
+
+    /** The position pass's angular pseudo velocity of slot `i`. */
+    pub(crate) fn pseudoAng(self, i : i32) : DVec3 {
+        let b : i64 = (i * 6) as i64;
+        return DVec3 { x: self.pseudo[b + 3], y: self.pseudo[b + 4], z: self.pseudo[b + 5] };
+    }
+
+    /** Sets both pseudo velocities of slot `i`. */
+    pub(crate) fn setPseudo(mut self, i : i32, l : DVec3, a : DVec3) : void {
+        let b : i64 = (i * 6) as i64;
+        self.pseudo[b] = l.x;
+        self.pseudo[b + 1] = l.y;
+        self.pseudo[b + 2] = l.z;
+        self.pseudo[b + 3] = a.x;
+        self.pseudo[b + 4] = a.y;
+        self.pseudo[b + 5] = a.z;
+    }
+
+    /** Inverse mass of slot `i` (zero when immovable). */
+    pub(crate) fn invMass(self, i : i32) : f64 {
+        return self.invM[i as i64];
+    }
+
+    /** The world inverse inertia tensor of slot `i` applied to `v`. */
+    pub(crate) fn invInertia(self, i : i32, v : DVec3) : DVec3 {
+        let b : i64 = (i * 9) as i64;
+        return DVec3 {
+            x: self.invI[b] * v.x + self.invI[b + 1] * v.y + self.invI[b + 2] * v.z,
+            y: self.invI[b + 3] * v.x + self.invI[b + 4] * v.y + self.invI[b + 5] * v.z,
+            z: self.invI[b + 6] * v.x + self.invI[b + 7] * v.y + self.invI[b + 8] * v.z,
+        };
+    }
+
+    /** The world inverse inertia tensor of slot `i` as a matrix. */
+    pub(crate) fn invInertiaMat(self, i : i32) : DMat3 {
+        let b : i64 = (i * 9) as i64;
+        return DMat3 {
+            m00: self.invI[b],
+            m01: self.invI[b + 1],
+            m02: self.invI[b + 2],
+            m10: self.invI[b + 3],
+            m11: self.invI[b + 4],
+            m12: self.invI[b + 5],
+            m20: self.invI[b + 6],
+            m21: self.invI[b + 7],
+            m22: self.invI[b + 8],
+        };
+    }
+
+    /** The pseudo velocity of the point at offset `r` from the centre of slot `i`. */
+    pub(crate) fn pseudoPointVelocity(self, i : i32, r : DVec3) : DVec3 {
+        return self.pseudoLin(i).plus(self.pseudoAng(i).cross(r));
+    }
+
+    /** How fast body `b` turns about the direction `d` relative to body `a`. */
+    pub(crate) fn angularSpeedAbout(self, a : i32, b : i32, d : DVec3) : f64 {
+        return self.ang(b).minus(self.ang(a)).dot(d);
+    }
+
+    /** As `angularSpeedAbout`, on the pseudo velocities of the position pass. */
+    pub(crate) fn pseudoAngularSpeedAbout(self, a : i32, b : i32, d : DVec3) : f64 {
+        return self.pseudoAng(b).minus(self.pseudoAng(a)).dot(d);
+    }
+
+    /** Applies an angular impulse `l` to body `b` and its opposite to body `a` on the pseudo velocities. */
+    pub(crate) fn applyPseudoAngular(mut self, a : i32, b : i32, l : DVec3) : void {
+        if (self.invM[a as i64] > 0.0) {
+            self.setPseudo(a, self.pseudoLin(a), self.pseudoAng(a).minus(self.invInertia(a, l)));
+        }
+        if (self.invM[b as i64] > 0.0) {
+            self.setPseudo(b, self.pseudoLin(b), self.pseudoAng(b).plus(self.invInertia(b, l)));
+        }
+    }
+
+    /** The velocity of the point at offset `r` from the centre of slot `i`. */
+    pub(crate) fn pointVelocity(self, i : i32, r : DVec3) : DVec3 {
+        return self.lin(i).plus(self.ang(i).cross(r));
+    }
+
+    /** Applies the impulse `p` at offset `ra` from body `a` (negated) and at `rb` from body `b`. */
+    pub(crate) fn applyImpulse(mut self, a : i32, b : i32, p : DVec3, ra : DVec3, rb : DVec3) : void {
+        let ma : f64 = self.invM[a as i64];
+        let mb : f64 = self.invM[b as i64];
+        if (ma > 0.0) {
+            self.setLin(a, self.lin(a).minus(p.scale(ma)));
+            self.setAng(a, self.ang(a).minus(self.invInertia(a, ra.cross(p))));
+        }
+        if (mb > 0.0) {
+            self.setLin(b, self.lin(b).plus(p.scale(mb)));
+            self.setAng(b, self.ang(b).plus(self.invInertia(b, rb.cross(p))));
+        }
+    }
+
+    /** As `applyImpulse`, on the pseudo velocities of the position pass. */
+    pub(crate) fn applyPseudoImpulse(mut self, a : i32, b : i32, p : DVec3, ra : DVec3, rb : DVec3) : void {
+        let ma : f64 = self.invM[a as i64];
+        let mb : f64 = self.invM[b as i64];
+        if (ma > 0.0) {
+            self.setPseudo(
+                a,
+                self.pseudoLin(a).minus(p.scale(ma)),
+                self.pseudoAng(a).minus(self.invInertia(a, ra.cross(p)))
+            );
+        }
+        if (mb > 0.0) {
+            self.setPseudo(
+                b,
+                self.pseudoLin(b).plus(p.scale(mb)),
+                self.pseudoAng(b).plus(self.invInertia(b, rb.cross(p)))
+            );
+        }
+    }
+
+    /** Applies an angular impulse `l` to body `b` and its opposite to body `a`. */
+    pub(crate) fn applyAngular(mut self, a : i32, b : i32, l : DVec3) : void {
+        if (self.invM[a as i64] > 0.0) {
+            self.setAng(a, self.ang(a).minus(self.invInertia(a, l)));
+        }
+        if (self.invM[b as i64] > 0.0) {
+            self.setAng(b, self.ang(b).plus(self.invInertia(b, l)));
+        }
+    }
+}

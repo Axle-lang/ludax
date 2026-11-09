@@ -1,0 +1,209 @@
+// broad_phase — finds the pairs of bodies whose bounding boxes overlap.
+//
+// Sweep and prune along the X axis: bodies are sorted by the low end of their box, then each one is compared
+// only with the bodies that start before it ends. The sort is stable and the result is reordered by
+// (lower slot, higher slot), so the pair list is the same for the same scene whatever order the sweep found
+// them in. Planes are infinite and never enter the sweep; they are tested against every other body directly.
+
+use crate::core::collections::vec::Vec;
+use crate::core::math::dgeom::DAabb;
+use crate::core::math::dvec3::DVec3;
+use crate::core::math::scalar::{absD, maxI, minI};
+use crate::sim::kinetic::body_store::BodyStore;
+use crate::sim::kinetic::kinetic_sort::KineticSort;
+use crate::sim::kinetic::shape::ShapeKind;
+
+// The pair list starts at this many pairs and doubles when full.
+const BROAD_MIN_PAIR_ROOM : i32 = 64;
+
+// The pairs a step must not test: ascending `(a << 32) | b` keys, the first `count` of `keys`.
+struct SkipPairs {
+    keys  : i64[];
+    count : i32;
+}
+
+/** Finds candidate pairs for the narrow phase. */
+pub class BroadPhase {
+    pub(crate) boxes : Vec<DAabb>;
+    order            : i32[];
+    keys             : f64[];
+    room             : i32 = 0;
+    found            : i64[];
+    foundCount       : i32 = 0;
+    foundRoom        : i32 = 0;
+
+    /** An empty broad phase. */
+    constructor() {
+        self.boxes = new Vec<DAabb>();
+        self.order = new i32[1];
+        self.keys = new f64[1];
+        self.found = new i64[1];
+    }
+
+    /** How many pairs the last `update` found. */
+    pub fn pairCount(self) : i32 {
+        return self.foundCount;
+    }
+
+    /** The lower slot of pair `k`; pairs ascend by (lower, higher). */
+    pub fn firstOf(self, k : i32) : i32 {
+        return KineticSort::pairFirst(self.found[k as i64]);
+    }
+
+    /** The higher slot of pair `k`. */
+    pub fn secondOf(self, k : i32) : i32 {
+        return KineticSort::pairSecond(self.found[k as i64]);
+    }
+
+    /** The bounding box of the body in slot `i` as of the last `update`. */
+    pub fn boxOf(self, i : i32) : DAabb {
+        return self.boxes.get(i);
+    }
+
+    /**
+     * Recomputes every box and the pair list. `noCollide` holds `(a << 32) | b` keys (a < b, ascending) of
+     * pairs that must be skipped, e.g. bodies joined by a joint that forbids their collision.
+     */
+    pub fn update(mut self, bodies : BodyStore, noCollide : i64[], noCount : i32) : void {
+        let n : i32 = bodies.slotCount();
+        self.ensure(n);
+        self.foundCount = 0;
+        while (self.boxes.len() < n) {
+            self.boxes.push(DAabb::empty());
+        }
+        let swept : i32 = self.computeBoxes(bodies);
+        KineticSort::indicesByKey(self.keys, self.order, swept);
+
+        let skip : SkipPairs = SkipPairs { keys: noCollide, count: noCount };
+        self.sweep(bodies, swept, skip);
+        self.testPlanes(bodies, swept, skip);
+        KineticSort::whole(self.found, self.foundCount);
+    }
+
+    // Refreshes every live body's box and lists the bodies that enter the sweep (all but planes) in `order`;
+    // answers how many that is.
+    fn computeBoxes(mut self, bodies : BodyStore) : i32 {
+        let mut m : i32 = 0;
+        for (i of 0..bodies.slotCount()) {
+            if (!bodies.isLive(i)) {
+                continue;
+            }
+            let sh = bodies.shape.get(i);
+            let b : DAabb = sh.aabb(bodies.position.get(i), bodies.rotation.get(i));
+            self.boxes.set(i, b);
+            if (sh.kind == ShapeKind::Plane) {
+                continue;
+            }
+            self.order[m as i64] = i;
+            self.keys[i as i64] = b.min.x;
+            m = m + 1;
+        }
+        return m;
+    }
+
+    // Each body against the ones that start before it ends along x, then the other two axes.
+    fn sweep(mut self, bodies : BodyStore, swept : i32, skip : SkipPairs) : void {
+        for (a of 0..swept) {
+            let i : i32 = self.order[a as i64];
+            let bi : DAabb = self.boxes.get(i);
+            let mut c : i32 = a + 1;
+            while (c < swept) {
+                let j : i32 = self.order[c as i64];
+                let bj : DAabb = self.boxes.get(j);
+                if (bj.min.x > bi.max.x) {
+                    break;
+                }
+                let overlapY : bool = bj.min.y <= bi.max.y && bj.max.y >= bi.min.y;
+                let overlapZ : bool = bj.min.z <= bi.max.z && bj.max.z >= bi.min.z;
+                if (overlapY && overlapZ) {
+                    self.offer(bodies, i, j, skip);
+                }
+                c = c + 1;
+            }
+        }
+    }
+
+    // Each plane against every swept body whose box reaches behind it.
+    fn testPlanes(mut self, bodies : BodyStore, swept : i32, skip : SkipPairs) : void {
+        for (p of 0..bodies.slotCount()) {
+            if (!bodies.isLive(p) || bodies.shape.get(p).kind != ShapeKind::Plane) {
+                continue;
+            }
+            let sh = bodies.shape.get(p);
+            for (a of 0..swept) {
+                let i : i32 = self.order[a as i64];
+                let b : DAabb = self.boxes.get(i);
+                let c : DVec3 = b.center();
+                let h : DVec3 = b.halfSize();
+
+                // `reach` is how far the box extends towards the plane from its centre.
+                let reach : f64 = absD(sh.normal.x) * h.x + absD(sh.normal.y) * h.y + absD(sh.normal.z) * h.z;
+                if (sh.normal.dot(c) - sh.offset - reach <= 0.0) {
+                    self.offer(bodies, p, i, skip);
+                }
+            }
+        }
+    }
+
+    fn ensure(mut self, n : i32) : void {
+        if (n <= self.room) {
+            return;
+        }
+        let cap : i32 = maxI(self.room * 2, n);
+        self.order = new i32[cap as i64];
+        self.keys = new f64[cap as i64];
+        self.room = cap;
+    }
+
+    // Whether the body takes part in this step: awake, and either dynamic or a kinematic body that moves.
+    static fn active(bodies : BodyStore, i : i32) : bool {
+        if (bodies.asleep.get(i)) {
+            return false;
+        }
+        if (bodies.isDynamic(i)) {
+            return true;
+        }
+        let moving : bool = bodies.linearVelocity.get(i).lengthSquared() > 0.0
+            || bodies.angularVelocity.get(i).lengthSquared() > 0.0;
+        return bodies.isKinematic(i) && moving;
+    }
+
+    // Records the pair (x, y) when it can produce a contact: one body is dynamic, one is active, the collision
+    // groups and masks allow it, and it is not on the skip list.
+    fn offer(mut self, bodies : BodyStore, x : i32, y : i32, skip : SkipPairs) : void {
+        if (!bodies.isDynamic(x) && !bodies.isDynamic(y)) {
+            return;
+        }
+        if (!BroadPhase::active(bodies, x) && !BroadPhase::active(bodies, y)) {
+            return;
+        }
+        let xHitsY : bool = (bodies.group.get(x) & bodies.mask.get(y)) != 0;
+        let yHitsX : bool = (bodies.group.get(y) & bodies.mask.get(x)) != 0;
+        if (!xHitsY || !yHitsX) {
+            return;
+        }
+
+        let key : i64 = KineticSort::pairKey(minI(x, y), maxI(x, y));
+        let at : i32 = KineticSort::lowerBound(skip.keys, skip.count, key);
+        if (at < skip.count && skip.keys[at as i64] == key) {
+            return;
+        }
+
+        if (self.foundCount >= self.foundRoom) {
+            self.growFound();
+        }
+        self.found[self.foundCount as i64] = key;
+        self.foundCount = self.foundCount + 1;
+    }
+
+    // Doubles the room for found pairs (at least the minimum), keeping those already found.
+    fn growFound(mut self) : void {
+        let cap : i32 = maxI(self.foundRoom * 2, BROAD_MIN_PAIR_ROOM);
+        let mut bigger : i64[] = new i64[cap as i64];
+        for (k of 0..self.foundCount) {
+            bigger[k as i64] = self.found[k as i64];
+        }
+        self.found = bigger;
+        self.foundRoom = cap;
+    }
+}
