@@ -1,0 +1,260 @@
+// block — what the light engine needs to know about a block, and nothing else.
+//
+// The lighting module is self-contained: it does not know the game's block registry. A block id is just an
+// `i32`; this table says how that id treats light. Three things matter to light: how much of each colour
+// channel it stops (opacity), what it emits, and what colour it reflects (albedo, used by the bounce tint).
+// Id 0 is always air. Opacity is per channel so glass can tint: red glass has opacity (0, 200, 200).
+//
+// All values are 8 bit (0..255). Unlike voxel's 4-bit levels this leaves room for a real falloff curve.
+
+use std::ffi::runtime::panicMsg;
+
+// Every light quantity is a byte, and a block has three colour channels.
+const BLOCK_FULL : i32 = 255;
+const BLOCK_HALF : i32 = 128;
+const BLOCK_CHANNELS : i32 = 3;
+
+/** How one block id treats light; every field is 0..255. */
+pub struct BlockLight {
+    /** Share of the red light it stops: 0 passes everything, 255 stops everything. */
+    pub opacityR : i32 = 0;
+
+    /** Share of the green light it stops. */
+    pub opacityG : i32 = 0;
+
+    /** Share of the blue light it stops. */
+    pub opacityB : i32 = 0;
+
+    /** Red light it emits (the strength of the source it makes). */
+    pub emitR : i32 = 0;
+
+    /** Green light it emits. */
+    pub emitG : i32 = 0;
+
+    /** Blue light it emits. */
+    pub emitB : i32 = 0;
+
+    /** Red reflectance, for the bounce tint. */
+    pub albedoR : i32 = 128;
+
+    /** Green reflectance. */
+    pub albedoG : i32 = 128;
+
+    /** Blue reflectance. */
+    pub albedoB : i32 = 128;
+
+    /**
+     * The obstacle classes the block belongs to, one bit each; the game gives the bits their meaning (terrain,
+     * foliage, glass, water...). A light with a pass mask goes through every block that shares a bit with it
+     * as if the block were air, whatever its opacity; the default is the single class 1.
+     */
+    pub classes : i32 = 1;
+
+    /** Air: stops nothing, emits nothing. */
+    pub static fn air() : BlockLight {
+        return BlockLight {};
+    }
+
+    /** A solid block that stops all light and reflects `r`, `g`, `b`. */
+    pub static fn solid(r : i32, g : i32, b : i32) : BlockLight {
+        return BlockLight {
+            opacityR: BLOCK_FULL,
+            opacityG: BLOCK_FULL,
+            opacityB: BLOCK_FULL,
+            albedoR: r,
+            albedoG: g,
+            albedoB: b,
+        };
+    }
+
+    /** A clear block that stops `r`, `g`, `b` of each channel: glass when they differ, leaves when all are alike. */
+    pub static fn tinted(r : i32, g : i32, b : i32) : BlockLight {
+        return BlockLight {
+            opacityR: r,
+            opacityG: g,
+            opacityB: b,
+            albedoR: BLOCK_FULL - r,
+            albedoG: BLOCK_FULL - g,
+            albedoB: BLOCK_FULL - b,
+        };
+    }
+
+    /** A solid light source of colour `r`, `g`, `b` (a lamp). */
+    pub static fn lamp(r : i32, g : i32, b : i32) : BlockLight {
+        return BlockLight {
+            opacityR: BLOCK_FULL,
+            opacityG: BLOCK_FULL,
+            opacityB: BLOCK_FULL,
+            emitR: r,
+            emitG: g,
+            emitB: b,
+            albedoR: r,
+            albedoG: g,
+            albedoB: b,
+        };
+    }
+
+    /** A source that does not block light, e.g. a torch flame or a glowing gas. */
+    pub static fn glow(r : i32, g : i32, b : i32) : BlockLight {
+        return BlockLight {
+            emitR: r,
+            emitG: g,
+            emitB: b,
+        };
+    }
+
+    /** True when every channel is fully stopped. */
+    pub fn isSolid(self) : bool {
+        return self.opacityR >= BLOCK_FULL && self.opacityG >= BLOCK_FULL && self.opacityB >= BLOCK_FULL;
+    }
+}
+
+/** The block-id to `BlockLight` lookup the engine reads on every step; flat arrays so a read is one load. */
+pub class BlockLightTable {
+    opacity : i32[];
+    emit    : i32[];
+    albedo  : i32[];
+    solid   : i8[];
+    classes : i32[];
+    room    : i32;
+
+    /** A table for ids `0 .. capacity-1`; every id starts as air. */
+    constructor(capacity : i32) {
+        self.room = capacity;
+        if (self.room < 1) {
+            self.room = 1;
+        }
+        let n : i64 = self.room as i64;
+        self.opacity = new i32[n * BLOCK_CHANNELS as i64];
+        self.emit = new i32[n * BLOCK_CHANNELS as i64];
+        self.albedo = new i32[n * BLOCK_CHANNELS as i64];
+        self.solid = new i8[n];
+        self.classes = new i32[n];
+        for (i of 0..self.room) {
+            self.define(i, BlockLight::air());
+        }
+    }
+
+    /** How many ids the table knows. */
+    pub fn capacity(self) : i32 {
+        return self.room;
+    }
+
+    /**
+     * Sets what id `id` does to light; aborts for an id outside the table, and for an id 0 that stops or emits
+     * light: the ray walker and the grid treat 0 as air without reading this table.
+     */
+    pub fn define(mut self, id : i32, b : BlockLight) : void {
+        if (id < 0 || id >= self.room) {
+            panicMsg("BlockLightTable.define: id out of range");
+        }
+        let stops : i32 = b.opacityR + b.opacityG + b.opacityB;
+        let emits : i32 = b.emitR + b.emitG + b.emitB;
+        if (id == 0 && (stops > 0 || emits > 0)) {
+            panicMsg("BlockLightTable.define: id 0 is air");
+        }
+        let at : i64 = id as i64 * BLOCK_CHANNELS as i64;
+        self.opacity[at] = voxClamp8(b.opacityR);
+        self.opacity[at + 1] = voxClamp8(b.opacityG);
+        self.opacity[at + 2] = voxClamp8(b.opacityB);
+        self.emit[at] = voxClamp8(b.emitR);
+        self.emit[at + 1] = voxClamp8(b.emitG);
+        self.emit[at + 2] = voxClamp8(b.emitB);
+        self.albedo[at] = voxClamp8(b.albedoR);
+        self.albedo[at + 1] = voxClamp8(b.albedoG);
+        self.albedo[at + 2] = voxClamp8(b.albedoB);
+        self.classes[id as i64] = b.classes;
+        self.solid[id as i64] = 0;
+        if (b.isSolid()) {
+            self.solid[id as i64] = 1;
+        }
+    }
+
+    /** What id `id` does to light; air for an id outside the table. */
+    pub fn get(self, id : i32) : BlockLight {
+        if (id < 0 || id >= self.room) {
+            return BlockLight::air();
+        }
+        let at : i64 = id as i64 * BLOCK_CHANNELS as i64;
+        return BlockLight {
+            opacityR: self.opacity[at],
+            opacityG: self.opacity[at + 1],
+            opacityB: self.opacity[at + 2],
+            emitR: self.emit[at],
+            emitG: self.emit[at + 1],
+            emitB: self.emit[at + 2],
+            albedoR: self.albedo[at],
+            albedoG: self.albedo[at + 1],
+            albedoB: self.albedo[at + 2],
+            classes: self.classes[id as i64],
+        };
+    }
+
+    /** True when id `id` stops every channel completely (ids outside the table are air). */
+    pub fn isSolid(self, id : i32) : bool {
+        if (id < 0 || id >= self.room) {
+            return false;
+        }
+        return self.solid[id as i64] == 1;
+    }
+
+    /** True when id `id` stops any of any channel: leaves, glass and water as well as stone (air and ids outside the table do not). */
+    pub fn blocksLight(self, id : i32) : bool {
+        if (id < 0 || id >= self.room) {
+            return false;
+        }
+        let at : i64 = id as i64 * BLOCK_CHANNELS as i64;
+        return self.opacity[at] + self.opacity[at + 1] + self.opacity[at + 2] > 0;
+    }
+
+    /** Share of channel `channel` (0 red, 1 green, 2 blue) that id `id` lets through, 0..255. */
+    pub fn transmit(self, id : i32, channel : i32) : i32 {
+        if (id < 0 || id >= self.room) {
+            return BLOCK_FULL;
+        }
+        return BLOCK_FULL - self.opacity[id as i64 * BLOCK_CHANNELS as i64 + channel as i64];
+    }
+
+    /** Share of the white sky or sun light that id `id` lets through: the mean of the three channels. */
+    pub fn transmitWhite(self, id : i32) : i32 {
+        if (id < 0 || id >= self.room) {
+            return BLOCK_FULL;
+        }
+        let at : i64 = id as i64 * BLOCK_CHANNELS as i64;
+        return BLOCK_FULL - (self.opacity[at] + self.opacity[at + 1] + self.opacity[at + 2]) / BLOCK_CHANNELS;
+    }
+
+    /** The obstacle classes of id `id` as a bit mask; 1 for an id outside the table. */
+    pub fn classOf(self, id : i32) : i32 {
+        if (id < 0 || id >= self.room) {
+            return 1;
+        }
+        return self.classes[id as i64];
+    }
+
+    /** What id `id` emits in channel `channel`, 0..255. */
+    pub fn emission(self, id : i32, channel : i32) : i32 {
+        if (id < 0 || id >= self.room) {
+            return 0;
+        }
+        return self.emit[id as i64 * BLOCK_CHANNELS as i64 + channel as i64];
+    }
+
+    /** Reflectance of id `id` in channel `channel`, 0..255. */
+    pub fn albedoOf(self, id : i32, channel : i32) : i32 {
+        if (id < 0 || id >= self.room) {
+            return BLOCK_HALF;
+        }
+        return self.albedo[id as i64 * BLOCK_CHANNELS as i64 + channel as i64];
+    }
+}
+
+fn voxClamp8(v : i32) : i32 {
+    if (v < 0) {
+        return 0;
+    }
+    if (v > BLOCK_FULL) {
+        return BLOCK_FULL;
+    }
+    return v;
+}

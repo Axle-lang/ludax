@@ -1,0 +1,268 @@
+// trace — one ray through the grid: how much light survives it, and what colour it picked up.
+//
+// The DDA walks the cells; every cell the ray enters lets a share `t` of the white light through (the mean
+// of its three channel transmittances, see `BlockLightTable.transmitWhite`) and absorbs the rest. What a cell
+// absorbs is not lost to the bounce: it is the light that *would have come from that cell*, so it is added
+// to the ray's colour weighted by the cell's albedo. A ray that is never stopped sees plain white sky; one
+// that hits a solid block at fraction f sees (1 - f) white plus f of that block's albedo; the fractions add
+// up to one, so the colour of a ray is an average of white and the albedos it ran into. That colour is what
+// the bounce tint is made of (voxel-axle kept only the first blocker's colour).
+//
+// A ray ends when it leaves the box spanned by all chunks (a straight line never comes back), when its entry
+// into a cell lies `reach` or more along the ray (what is further away is open sky, a cost cut documented as
+// part of the bake settings), or when nothing is left of it. The cell the ray starts in is not counted: the
+// light is at its centre.
+//
+// Air is block 0 and costs one byte load; a chunk or an 8-cell brick that never held a block (the grid keeps
+// a flag for each) is crossed without reading a block at all. The walker steps every cell either way, so the
+// crossings, the tie rule and the `crossed` count are exactly those of a plain walk, and the skip can be
+// tested against one.
+//
+// A tracer owns its walker and its result fields, so each thread of a bake makes its own. It does not hold the
+// grid and the table: they are handed to every `trace` call as borrowed parameters. A `Shared` handle that
+// is copied into a field counts a reference, and the count is only atomic for classes the compiler can see
+// crossing to another thread; copying handles on a worker thread of a bake raced the count in 0.18.3 and
+// died with "strong count underflow". Borrowing costs no count at all.
+
+use crate::core::math::dgeom::DRay;
+use crate::voxel::light::block::BlockLightTable;
+use crate::voxel::light::dda::VoxelDda;
+use crate::voxel::light::grid::{VoxelGrid, VOX_CHUNK, VOX_CHUNK_CELLS, voxBrickOf};
+
+// A ray with less than this share left stops: the rest cannot change a byte of light.
+const VOX_TRACE_FLOOR : f64 = 0.0001;
+
+// Transmittance and albedo are bytes; this turns one into a fraction.
+const VOX_TRACE_BYTE : f64 = 255.0;
+
+// A white transmittance byte.
+const VOX_TRACE_OPEN : i32 = 255;
+
+// The local cell index inside a chunk (x + z * 16 + y * 256).
+const VOX_TRACE_SHIFT_Z : i32 = 4;
+const VOX_TRACE_SHIFT_Y : i32 = 8;
+
+// A cell coordinate shifted right by this many bits names its chunk (4) or its brick (3).
+const VOX_TRACE_CHUNK_SHIFT : i32 = 4;
+const VOX_TRACE_BRICK_SHIFT : i32 = 3;
+
+// The cells a ray may walk in: the span of all chunks of the grid.
+struct VoxTraceBounds {
+    lowX  : i32;
+    lowY  : i32;
+    lowZ  : i32;
+    highX : i32;
+    highY : i32;
+    highZ : i32;
+}
+
+fn voxTraceBoundsOf(grid : Shared<VoxelGrid>) : VoxTraceBounds {
+    return VoxTraceBounds {
+        lowX: grid.lowCell(0),
+        lowY: grid.lowCell(1),
+        lowZ: grid.lowCell(2),
+        highX: grid.highCell(0),
+        highY: grid.highCell(1),
+        highZ: grid.highCell(2),
+    };
+}
+
+fn voxTraceInside(bounds : VoxTraceBounds, x : i32, y : i32, z : i32) : bool {
+    return x >= bounds.lowX && x < bounds.highX && y >= bounds.lowY && y < bounds.highY && z >= bounds.lowZ
+        && z < bounds.highZ;
+}
+
+/** Walks rays and reports their transmittance and colour. */
+pub class VoxRayTracer {
+    walk  : VoxelDda;
+    left  : f64 = 1.0;
+    seeR  : f64 = 1.0;
+    seeG  : f64 = 1.0;
+    seeB  : f64 = 1.0;
+    cells : i64 = 0;
+    pass  : i32 = 0;
+
+    // The colour the cells of the running ray took, before `left` is added: what `seeR..B` are made of.
+    takenR : f64 = 0.0;
+    takenG : f64 = 0.0;
+    takenB : f64 = 0.0;
+
+    /** A tracer. */
+    constructor() {
+        self.walk = new VoxelDda();
+    }
+
+    /**
+     * Sets the obstacle classes the next rays ignore: a block that shares a bit with `mask` lets everything
+     * through (0 restores the default, where every block counts).
+     */
+    pub fn setPass(mut self, mask : i32) : void {
+        self.pass = mask;
+    }
+
+    /** The share of the light that got through the last ray, 0..1. */
+    pub fn fraction(self) : f64 {
+        return self.left;
+    }
+
+    /** The red of the last ray's colour, 0..1. */
+    pub fn red(self) : f64 {
+        return self.seeR;
+    }
+
+    /** The green of the last ray's colour, 0..1. */
+    pub fn green(self) : f64 {
+        return self.seeG;
+    }
+
+    /** The blue of the last ray's colour, 0..1. */
+    pub fn blue(self) : f64 {
+        return self.seeB;
+    }
+
+    /** How many cells all rays together have crossed: the work done, for speed figures. */
+    pub fn crossed(self) : i64 {
+        return self.cells;
+    }
+
+    /**
+     * Shoots `ray` through `grid` (with the blocks' light properties from `table`) until the ray enters a cell
+     * `reach` or more along itself, and leaves the answer in `fraction` and the colour accessors.
+     */
+    pub fn trace(
+        mut self,
+        grid : Shared<VoxelGrid>,
+        table : Shared<BlockLightTable>,
+        ray : DRay,
+        reach : f64
+    ) : void {
+        self.begin(ray);
+        let bounds : VoxTraceBounds = voxTraceBoundsOf(grid);
+
+        // The chunk the walker is in is looked up once and kept until it leaves; a chunk that does not exist
+        // is void (slot -1). A cell read is then one add to the hoisted base id of the chunk.
+        let mut slot : i32 = -1;
+        let mut known : bool = false;
+        let mut slotX : i32 = 0;
+        let mut slotY : i32 = 0;
+        let mut slotZ : i32 = 0;
+        let mut chunkBase : i64 = 0;
+
+        // The cells counted go to a local and join `cells` once: a field store a cell is memory traffic in
+        // the one loop the bakes live in.
+        let mut walked : i64 = 0;
+        self.walk.advance();
+        while (self.walk.entryT() < reach) {
+            let x : i32 = self.walk.x();
+            let y : i32 = self.walk.y();
+            let z : i32 = self.walk.z();
+            if (!voxTraceInside(bounds, x, y, z)) {
+                break;
+            }
+            walked = walked + 1;
+
+            let cx : i32 = x >> VOX_TRACE_CHUNK_SHIFT;
+            let cy : i32 = y >> VOX_TRACE_CHUNK_SHIFT;
+            let cz : i32 = z >> VOX_TRACE_CHUNK_SHIFT;
+            if (!known || cx != slotX || cy != slotY || cz != slotZ) {
+                slot = grid.slotOf(cx, cy, cz);
+                slotX = cx;
+                slotY = cy;
+                slotZ = cz;
+                known = true;
+                chunkBase = slot as i64 * VOX_CHUNK_CELLS as i64;
+            }
+            let side : i32 = VOX_CHUNK - 1;
+            let local : i32 = ((y & side) << VOX_TRACE_SHIFT_Y) | ((z & side) << VOX_TRACE_SHIFT_Z)
+                | (x & side);
+
+            let voidChunk : bool = slot < 0 || !grid.chunkFilled(slot);
+            if (voidChunk || !grid.brickFilled(slot, voxBrickOf(local))) {
+                let mut shift : i32 = VOX_TRACE_BRICK_SHIFT;
+                if (voidChunk) {
+                    shift = VOX_TRACE_CHUNK_SHIFT;
+                }
+                if (self.skipRegion(bounds, reach, shift)) {
+                    break;
+                }
+                continue;
+            }
+
+            let block : i32 = grid.blockOfId(chunkBase + local as i64);
+            if (block != 0 && !self.absorb(table, block)) {
+                break;
+            }
+            self.walk.advance();
+        }
+        self.cells = self.cells + walked;
+        self.finish();
+    }
+
+    // Resets the answer and aims the walker along `ray`.
+    fn begin(mut self, ray : DRay) : void {
+        self.left = 1.0;
+        self.takenR = 0.0;
+        self.takenG = 0.0;
+        self.takenB = 0.0;
+        self.walk.start(ray);
+    }
+
+    // The colour of the ray: what got through is white, plus what the cells it crossed took.
+    fn finish(mut self) : void {
+        self.seeR = self.left + self.takenR;
+        self.seeG = self.left + self.takenG;
+        self.seeB = self.left + self.takenB;
+    }
+
+    // Steps the walker over the cells it shares with its current one in the region of 2^shift cells a side (a
+    // chunk or a brick) that holds only air, and stops on the first cell outside the region. True when the ray
+    // ended on the way (it left the grid or reached `reach`), which also ends the loop of `trace`.
+    fn skipRegion(mut self, bounds : VoxTraceBounds, reach : f64, shift : i32) : bool {
+        let rx : i32 = self.walk.x() >> shift;
+        let ry : i32 = self.walk.y() >> shift;
+        let rz : i32 = self.walk.z() >> shift;
+        let mut skipped : i64 = 0;
+        while (true) {
+            self.walk.advance();
+            let x : i32 = self.walk.x();
+            let y : i32 = self.walk.y();
+            let z : i32 = self.walk.z();
+
+            let ended : bool = !voxTraceInside(bounds, x, y, z) || self.walk.entryT() >= reach;
+            let inside : bool = (x >> shift) == rx && (y >> shift) == ry && (z >> shift) == rz;
+            if (ended || !inside) {
+                self.cells = self.cells + skipped;
+                return ended;
+            }
+            skipped = skipped + 1;
+        }
+        return false;
+    }
+
+    // Lets the cell holding `block` take its share of the ray; what it takes is added to the colour by its
+    // albedo. False when too little of the ray is left to go on.
+    fn absorb(mut self, table : Shared<BlockLightTable>, block : i32) : bool {
+        let mut t : i32 = table.transmitWhite(block);
+        if ((self.pass & table.classOf(block)) != 0) {
+            t = VOX_TRACE_OPEN;
+        }
+        if (t >= VOX_TRACE_OPEN) {
+            return true;
+        }
+        let through : f64 = t as f64 / VOX_TRACE_BYTE;
+        let taken : f64 = self.left * (1.0 - through);
+        // Multiply by the albedo byte first and scale after: the order the reference arithmetic fixes.
+        let takenR : f64 = taken * table.albedoOf(block, 0) as f64;
+        let takenG : f64 = taken * table.albedoOf(block, 1) as f64;
+        let takenB : f64 = taken * table.albedoOf(block, 2) as f64;
+        self.takenR = self.takenR + takenR / VOX_TRACE_BYTE;
+        self.takenG = self.takenG + takenG / VOX_TRACE_BYTE;
+        self.takenB = self.takenB + takenB / VOX_TRACE_BYTE;
+        self.left = self.left * through;
+        if (self.left < VOX_TRACE_FLOOR) {
+            self.left = 0.0;
+            return false;
+        }
+        return true;
+    }
+}

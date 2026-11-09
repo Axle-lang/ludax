@@ -1,0 +1,107 @@
+// curve — how block light fades with distance: the calibrated inverse-square table.
+//
+// Physical point light: irradiance ~ 1 / (d^2 + r^2), where `r` is the radius of the emitting body (it removes
+// the singularity at d = 0, exactly as the engine's point lights do) and the curve is then windowed so that it
+// reaches *exactly* zero at a finite `range` (the flood has to stop somewhere):
+//
+//     raw(d) = 1 / (1 + (d / r)^2)
+//     S(d)   = (raw(d) - raw(R)) / (1 - raw(R))        for d < R,  0 from d = R on
+//
+// S(0) = 1, S is strictly decreasing up to R, and for r << d << R it is the inverse-square law
+// S ~ r^2 / d^2 (doubling the distance quarters the light). voxel-axle subtracted one of sixteen levels per
+// block (a straight line); this is the calibration the lighting document asks for.
+//
+// The table holds S in 16.16 fixed point for every whole-cell distance 0..255, computed with `f64` divisions
+// only (no libm), so it is bit-identical on every machine. A source of strength E (0..255), seen through
+// cells that together let the fraction `m` of the light pass (16.16 fixed point, `VOX_MULT_ONE` = all), has
+// the level `round(E * m * S(d))` at distance d, and the levels of several sources add.
+
+use std::ffi::runtime::panicMsg;
+
+/** One in 16.16 fixed point. */
+pub const VOX_CURVE_ONE : i32 = 65536;
+
+/** The multiplier of a path that stops nothing, 16.16 fixed point. */
+pub const VOX_MULT_ONE : i32 = 65536;
+
+/** The core radius of the standard torch, in cells. */
+pub const VOX_CURVE_STD_RADIUS : f64 = 2.0;
+
+/** The range of the standard torch, in cells: where its light reaches zero. */
+pub const VOX_CURVE_STD_RANGE : f64 = 32.0;
+
+// Whole-cell distances the table holds: 0 to 255.
+const VOX_CURVE_CELLS : i32 = 256;
+
+// Half of 2^32, added before the shift that turns a 16.16 product into a level (round to nearest).
+const VOX_CURVE_ROUND : i64 = 2147483648;
+
+/** The distance table of a light's falloff, shared by every channel. */
+pub class VoxLightCurve {
+    table : i32[];
+    core  : f64;
+    reach : f64;
+
+    /**
+     * A curve with core radius `radius` cells (the distance at which the raw light has fallen to a half) and
+     * window `range` cells (where it reaches zero; at most 255).
+     */
+    constructor(radius : f64, range : f64) {
+        if (radius <= 0.0 || range <= radius || range > (VOX_CURVE_CELLS - 1) as f64) {
+            panicMsg("VoxLightCurve: need 0 < radius < range <= 255");
+        }
+        self.core = radius;
+        self.reach = range;
+        self.table = new i32[VOX_CURVE_CELLS as i64];
+        for (d of 0..VOX_CURVE_CELLS) {
+            self.table[d] = ((self.ideal(d as f64) * (VOX_CURVE_ONE as f64)) + 0.5) as i32;
+        }
+    }
+
+    /** The default torch: half brightness at `VOX_CURVE_STD_RADIUS` cells, nothing from `VOX_CURVE_STD_RANGE` on. */
+    pub static fn standard() : VoxLightCurve {
+        return new VoxLightCurve(VOX_CURVE_STD_RADIUS, VOX_CURVE_STD_RANGE);
+    }
+
+    /** The core radius in cells. */
+    pub fn radius(self) : f64 {
+        return self.core;
+    }
+
+    /** The distance in cells at which the curve reaches zero. */
+    pub fn range(self) : f64 {
+        return self.reach;
+    }
+
+    /** The windowed inverse-square factor S(d) for any real distance d >= 0 in cells, in full precision. */
+    pub fn ideal(self, d : f64) : f64 {
+        if (d >= self.reach) {
+            return 0.0;
+        }
+        let raw : f64 = 1.0 / (1.0 + (d / self.core) * (d / self.core));
+        let edge : f64 = 1.0 / (1.0 + (self.reach / self.core) * (self.reach / self.core));
+        return (raw - edge) / (1.0 - edge);
+    }
+
+    /** S(d) in 16.16 fixed point for the whole-cell distance `d` (0 beyond 255). */
+    pub fn factor(self, d : i32) : i32 {
+        if (d < 0 || d >= VOX_CURVE_CELLS) {
+            return 0;
+        }
+        return self.table[d];
+    }
+
+    /**
+     * The level (0..255 per lamp) of a source of strength `strength` at path distance `d` cells, after the
+     * path let the fraction `mult` (16.16 fixed point) of the light through.
+     */
+    pub fn level(self, strength : i32, mult : i32, d : i32) : i32 {
+        let scaled : i64 = strength as i64 * mult as i64 * self.factor(d) as i64;
+        return ((scaled + VOX_CURVE_ROUND) >> 32) as i32;
+    }
+
+    /** The level at a whole number of cells along a clear straight line. */
+    pub fn levelAtCells(self, strength : i32, cells : i32) : i32 {
+        return self.level(strength, VOX_MULT_ONE, cells);
+    }
+}

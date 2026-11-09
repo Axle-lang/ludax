@@ -1,0 +1,250 @@
+// streamer — which chunks to hold, given where the player is.
+//
+// The wanted set is every chunk column within `radius` chunks of the focus (a disc on the ground plane, all the
+// way up and down the world). A chunk is *loaded* when it is wanted, nearest first; it is *unloaded* only when
+// it falls outside `radius + hysteresis`, so a player walking along the border of the disc does not make the
+// same chunks come and go. Every update takes budgets: at most `loadBudget` chunks are generated and at most
+// `unloadBudget` dropped, so one frame never pays for a whole teleport; the rest waits for the next update.
+// Memory is therefore bounded by the size of the disc of `radius + hysteresis`, whatever the distance travelled.
+//
+// Order is a pure function of the geometry: distance (in whole chunks, squared) first, then z, then x, then the
+// height of the chunk. No clock and no hash order enters, so two runs load the same chunks in the same order.
+// The chunks of one update form a single batch handed to the world, which can generate them on the job pool.
+
+use crate::core::math::scalar::maxI;
+use crate::voxel::light::dda::voxFloor;
+use crate::voxel::world::chunk::VW_SIDE;
+use crate::voxel::world::store::VoxChunkStore;
+use crate::voxel::world::terrain::VW_COLUMN_CHUNKS;
+use crate::voxel::world::world::VoxWorld;
+
+// The disc offsets are (dx, dz) pairs; the load queue is (x, y, z) triples.
+const VW_OFFSET_PAIR : i32 = 2;
+const VW_QUEUE_TRIPLE : i32 = 3;
+
+// A budget that never runs out.
+const VW_BUDGET_UNLIMITED : i32 = 1000000;
+
+/** How much one `update` may do. */
+pub struct VoxStreamBudget {
+    /** The most chunks generated or restored. */
+    pub load : i32 = 1000000;
+
+    /** The most chunks dropped. */
+    pub unload : i32 = 1000000;
+
+    /** Generate on the job pool; false is the serial reference path with the same result. */
+    pub parallel : bool = false;
+
+    /** A budget with no limit, on the pool or not. */
+    pub static fn unlimited(parallel : bool) : VoxStreamBudget {
+        return VoxStreamBudget { load: VW_BUDGET_UNLIMITED, unload: VW_BUDGET_UNLIMITED, parallel: parallel };
+    }
+}
+
+/** What one `update` did. */
+pub struct VoxStreamReport {
+    /** Chunks generated or restored this update. */
+    pub loaded : i32 = 0;
+
+    /** Chunks dropped this update. */
+    pub unloaded : i32 = 0;
+
+    /** Wanted chunks still missing (the budget ran out), counted among the wanted columns scanned. */
+    pub pending : i32 = 0;
+}
+
+// What one pass of an update did: `done` chunks handled, `left` more that wanted handling but were over budget.
+struct VoxStreamStep {
+    done : i32 = 0;
+    left : i32 = 0;
+}
+
+/** Decides which chunks of a world are in memory around a moving focus. */
+pub class VoxStreamer {
+    radius    : i32;
+    keep      : i32;
+    offsets   : i32[];
+    offCount  : i32 = 0;
+    lastCx    : i32 = 0;
+    lastCz    : i32 = 0;
+    settled   : bool = false;
+    started   : bool = false;
+    queue     : i32[];
+    queueRoom : i32 = 0;
+
+    /** A streamer holding the columns within `radius` chunks, and letting go beyond `radius + hysteresis`. */
+    constructor(radius : i32, hysteresis : i32) {
+        self.radius = maxI(radius, 1);
+        self.keep = self.radius + maxI(hysteresis, 0);
+        self.offsets = new i32[VW_OFFSET_PAIR as i64];
+        self.queue = new i32[VW_QUEUE_TRIPLE as i64];
+        self.buildOffsets();
+    }
+
+    /** The load radius, in chunks. */
+    pub fn loadRadius(self) : i32 {
+        return self.radius;
+    }
+
+    /** The radius beyond which chunks are dropped. */
+    pub fn unloadRadius(self) : i32 {
+        return self.keep;
+    }
+
+    /** How many chunk columns lie within `r` chunks of the focus column (a disc). */
+    pub static fn discColumns(r : i32) : i32 {
+        let mut n : i32 = 0;
+        for (dz of (0 - r)..(r + 1)) {
+            for (dx of (0 - r)..(r + 1)) {
+                if (dx * dx + dz * dz <= r * r) {
+                    n = n + 1;
+                }
+            }
+        }
+        return n;
+    }
+
+    // The disc's columns as (dx, dz) pairs, nearest first: a counting sort on the squared distance, stable in
+    // the scan order z then x.
+    fn buildOffsets(mut self) : void {
+        let r : i32 = self.radius;
+        let top : i32 = r * r;
+        let mut counts : i32[] = new i32[top as i64 + 2];
+        for (d of 0..(top + 2)) {
+            counts[d as i64] = 0;
+        }
+
+        // Count the columns at each squared distance, then turn the counts into start offsets.
+        for (dz of (0 - r)..(r + 1)) {
+            for (dx of (0 - r)..(r + 1)) {
+                let d : i32 = dx * dx + dz * dz;
+                if (d <= top) {
+                    counts[(d + 1) as i64] = counts[(d + 1) as i64] + 1;
+                }
+            }
+        }
+        for (d of 1..(top + 2)) {
+            counts[d as i64] = counts[d as i64] + counts[(d - 1) as i64];
+        }
+        let total : i32 = counts[(top + 1) as i64];
+
+        // Place each column at the next free slot of its distance.
+        self.offsets = new i32[(total * VW_OFFSET_PAIR) as i64 + 2];
+        self.offCount = total;
+        for (dz of (0 - r)..(r + 1)) {
+            for (dx of (0 - r)..(r + 1)) {
+                let d : i32 = dx * dx + dz * dz;
+                if (d <= top) {
+                    let at : i32 = counts[d as i64];
+                    counts[d as i64] = at + 1;
+                    self.offsets[(at * VW_OFFSET_PAIR) as i64] = dx;
+                    self.offsets[(at * VW_OFFSET_PAIR + 1) as i64] = dz;
+                }
+            }
+        }
+
+        let cap : i32 = total * VW_COLUMN_CHUNKS;
+        self.queue = new i32[(cap * VW_QUEUE_TRIPLE) as i64 + VW_QUEUE_TRIPLE as i64];
+        self.queueRoom = cap;
+    }
+
+    /** Forgets that the loaded set was complete, so the next update looks again (call after unloading chunks by hand). */
+    pub fn invalidate(mut self) : void {
+        self.settled = false;
+    }
+
+    /** The chunk column (cx) of world coordinate `x` (rounds toward minus infinity). */
+    pub static fn chunkOf(x : f64) : i32 {
+        return voxFloor(x / VW_SIDE as f64);
+    }
+
+    /**
+     * Brings the loaded set of `world` toward the wanted set around (fx, fz): drops up to `budget.unload`
+     * chunks that are out of range, then loads up to `budget.load` wanted chunks, nearest first. Returns what
+     * it did.
+     */
+    pub fn update(
+        mut self,
+        world : VoxWorld,
+        fx : f64,
+        fz : f64,
+        budget : VoxStreamBudget
+    ) : VoxStreamReport {
+        let cx : i32 = VoxStreamer::chunkOf(fx);
+        let cz : i32 = VoxStreamer::chunkOf(fz);
+        let mut report : VoxStreamReport = VoxStreamReport {};
+        if (self.started && self.settled && cx == self.lastCx && cz == self.lastCz) {
+            return report;
+        }
+        self.started = true;
+        self.lastCx = cx;
+        self.lastCz = cz;
+
+        let dropped : VoxStreamStep = self.unloadFar(world, cx, cz, budget.unload);
+        report.unloaded = dropped.done;
+
+        let queued : VoxStreamStep = self.queueMissing(world, cx, cz, budget.load);
+        report.loaded = world.loadBatch(self.queue, queued.done, budget.parallel);
+        report.pending = queued.left;
+        self.settled = queued.left == 0 && dropped.left == 0;
+        return report;
+    }
+
+    // Unloads up to `budget` chunks farther than `keep` from chunk column (cx, cz); `left` counts those over budget.
+    fn unloadFar(self, world : VoxWorld, cx : i32, cz : i32, budget : i32) : VoxStreamStep {
+        let limit : i32 = self.keep * self.keep;
+        let mut doomed : i64[] = new i64[world.store.count() as i64 + 1];
+        let mut step : VoxStreamStep = VoxStreamStep {};
+        let mut pos : i32 = world.store.first();
+        while (pos >= 0) {
+            let key : i64 = world.store.keyAt(pos);
+            let dx : i32 = VoxChunkStore::keyX(key) - cx;
+            let dz : i32 = VoxChunkStore::keyZ(key) - cz;
+            pos = world.store.next(pos);
+            if (dx * dx + dz * dz <= limit) {
+                continue;
+            }
+            if (step.done >= budget) {
+                step.left = step.left + 1;
+                continue;
+            }
+            doomed[step.done as i64] = key;
+            step.done = step.done + 1;
+        }
+
+        for (i of 0..step.done) {
+            let key : i64 = doomed[i as i64];
+            let x : i32 = VoxChunkStore::keyX(key);
+            let y : i32 = VoxChunkStore::keyY(key);
+            let z : i32 = VoxChunkStore::keyZ(key);
+            world.unloadChunk(x, y, z);
+        }
+        return step;
+    }
+
+    // Fills the load queue with the wanted chunks around (cx, cz) that are not loaded, nearest first, up to
+    // `budget`; `left` counts the missing ones that did not fit.
+    fn queueMissing(mut self, world : VoxWorld, cx : i32, cz : i32, budget : i32) : VoxStreamStep {
+        let mut step : VoxStreamStep = VoxStreamStep {};
+        for (k of 0..self.offCount) {
+            let wx : i32 = cx + self.offsets[(k * VW_OFFSET_PAIR) as i64];
+            let wz : i32 = cz + self.offsets[(k * VW_OFFSET_PAIR + 1) as i64];
+            for (wy of 0..VW_COLUMN_CHUNKS) {
+                if (world.isLoaded(wx, wy, wz)) {
+                    continue;
+                }
+                if (step.done >= budget || step.done >= self.queueRoom) {
+                    step.left = step.left + 1;
+                    continue;
+                }
+                let at : i64 = (step.done * VW_QUEUE_TRIPLE) as i64;
+                self.queue[at] = wx;
+                self.queue[at + 1] = wy;
+                self.queue[at + 2] = wz;
+                step.done = step.done + 1;
+            }
+        }
+        return step;
+    }
+}

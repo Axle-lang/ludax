@@ -1,0 +1,184 @@
+// voxlight_emitter — lamps that are cells, not block ids: own colour and strength, switching off, pass masks.
+//
+// A block id gives every lantern the same light. An emitter override makes a cell its own source, and a pass
+// mask lets one lamp's light through the obstacle classes it names. These laws must hold: the override is what
+// the cell emits; clearing it gives the block back; an edit keeps the sum-of-fields rule (incremental equals
+// rebuild); a pass mask changes the lamp that has it and no other; the tracer honours the same mask.
+
+use ludax::{Checks, Pcg32, BlockLight, VoxRayTracer, VoxEmitter, DRay, DVec3};
+
+use crate::voxlight_support::{VoxIds, VoxLightRig, voxDiffer};
+
+/** The obstacle class bit foliage gets in these tests (the default class is 1). */
+const EMITTER_FOLIAGE : i32 = 2;
+
+/** Checks cell emitters, emitter overrides and pass masks through the flood and the tracer. */
+pub class VoxLightEmitterSuite {
+    // Leaves become class 2 and fully opaque, so a wall of them is a real obstacle with a name.
+    static fn foliage(rig : VoxLightRig) : void {
+        rig.table.define(4, BlockLight {
+            opacityR: 255,
+            opacityG: 255,
+            opacityB: 255,
+            classes: EMITTER_FOLIAGE,
+        });
+    }
+
+    // Two sources on the same block id (air) with different colours and strengths, and a lamp block dimmed.
+    static fn ownColour(c : Checks) : void {
+        let rig : VoxLightRig = new VoxLightRig(2, 2, 2, 16);
+        rig.flood.setEmitter(4, 8, 4, VoxEmitter { red: 255, green: 0, blue: 0, pass: 0 });
+        rig.flood.setEmitter(28, 8, 28, VoxEmitter { red: 0, green: 0, blue: 600, pass: 0 });
+        c.sameInt(
+            "a red source: the red level at its own cell is its strength",
+            rig.level(4, 8, 4, 0),
+            255
+        );
+        c.sameInt("a red source emits no green", rig.level(4, 8, 4, 1), 0);
+        c.sameInt("a red source emits no blue", rig.level(4, 8, 4, 2), 0);
+        c.sameInt(
+            "a blue source of 600 reads 600 at its own cell (more than a lamp block can)",
+            rig.level(28, 8, 28, 2),
+            600
+        );
+        c.that("light of the red source reaches a neighbour", rig.level(5, 8, 4, 0) > 0);
+        c.that("and falls off with distance", rig.level(5, 8, 4, 0) > rig.level(8, 8, 4, 0));
+        c.sameInt(
+            "a red source leaves the blue channel of its neighbour dark",
+            rig.level(5, 8, 4, 2),
+            0
+        );
+
+        let lamp : VoxLightRig = new VoxLightRig(2, 2, 2, 16);
+        lamp.set(10, 10, 10, VoxIds::lamp());
+        lamp.flood.rebuild();
+        c.sameInt("a lamp block alone lights its own cell to 255", lamp.level(10, 10, 10, 0), 255);
+        lamp.flood.setEmitter(10, 10, 10, VoxEmitter { red: 64, green: 64, blue: 64, pass: 0 });
+        c.sameInt(
+            "an override dims the block's lamp to its own strength",
+            lamp.level(10, 10, 10, 0),
+            64
+        );
+        lamp.flood.clearEmitter(10, 10, 10);
+        c.sameInt("clearing the override gives the block back", lamp.level(10, 10, 10, 0), 255);
+        lamp.flood.setEmitter(10, 10, 10, VoxEmitter { red: 0, green: 0, blue: 0, pass: 0 });
+        c.sameInt(
+            "an override of zero switches an emitting block off",
+            lamp.level(10, 10, 10, 0),
+            0
+        );
+        c.sameInt("and its surroundings go dark with it", lamp.level(12, 10, 10, 1), 0);
+        c.that("the cell reports the override", lamp.flood.hasEmitter(10, 10, 10));
+        lamp.put(10, 10, 10, VoxIds::stone());
+        c.that("replacing the block drops the override", !lamp.flood.hasEmitter(10, 10, 10));
+    }
+
+    // Overrides survive a rebuild; a rebuild of the edited scene equals the incrementally edited one.
+    static fn incrementalIsRebuild(c : Checks) : void {
+        let rig : VoxLightRig = new VoxLightRig(2, 2, 2, 24);
+        let r : Pcg32 = new Pcg32(7, 3);
+        VoxLightEmitterSuite::foliage(rig);
+        for (i of 0..60) {
+            rig.set(r.range(0, 32), r.range(2, 20), r.range(0, 32), VoxIds::leaves());
+        }
+        rig.flood.rebuild();
+        let n : i64 = rig.grid.slotCount() as i64 * 4096 * 4;
+        let mut bad : i32 = 0;
+        for (step of 0..40) {
+            let x : i32 = r.range(0, 32);
+            let y : i32 = r.range(0, 24);
+            let z : i32 = r.range(0, 32);
+            let roll : u32 = r.nextBelow(4);
+            if (roll == 0) {
+                rig.flood.clearEmitter(x, y, z);
+            } else if (roll == 1) {
+                let lamp : VoxEmitter = VoxEmitter {
+                    red: r.range(0, 300),
+                    green: r.range(0, 300),
+                    blue: r.range(0, 300),
+                    pass: r.range(0, 4),
+                };
+                rig.flood.setEmitter(x, y, z, lamp);
+            } else if (roll == 2) {
+                rig.put(x, y, z, VoxIds::leaves());
+            } else {
+                rig.put(x, y, z, VoxIds::lamp());
+            }
+            let live : i32[] = rig.snapshot();
+            rig.flood.rebuild();
+            let fresh : i32[] = rig.snapshot();
+            bad = bad + voxDiffer(live, fresh, n);
+        }
+        c.sameInt(
+            "40 random emitter, block and lamp edits: incremental equals rebuild, key for key",
+            bad,
+            0
+        );
+    }
+
+    // A wall of foliage splits the box in two. A lamp with the foliage class in its pass mask lights the far side
+    // as if the wall were not there; a lamp without it leaves the far side dark; and neither changes the other.
+    static fn passMask(c : Checks) : void {
+        let walled : VoxLightRig = new VoxLightRig(2, 2, 2, 16);
+        VoxLightEmitterSuite::foliage(walled);
+        walled.fill(12, 0, 0, 13, 32, 32, VoxIds::leaves());
+        walled.flood.setEmitter(8, 8, 8, VoxEmitter {
+            red: 255,
+            green: 255,
+            blue: 255,
+            pass: EMITTER_FOLIAGE,
+        });
+        let open : VoxLightRig = new VoxLightRig(2, 2, 2, 16);
+        open.flood.setEmitter(8, 8, 8, VoxEmitter { red: 255, green: 255, blue: 255, pass: 0 });
+        c.that("the masked lamp lights the far side of the wall", walled.level(16, 8, 8, 0) > 0);
+        c.sameInt(
+            "exactly as it would in open air",
+            walled.level(16, 8, 8, 0),
+            open.level(16, 8, 8, 0)
+        );
+
+        let plain : VoxLightRig = new VoxLightRig(2, 2, 2, 16);
+        VoxLightEmitterSuite::foliage(plain);
+        plain.fill(12, 0, 0, 13, 32, 32, VoxIds::leaves());
+        plain.flood.setEmitter(8, 8, 8, VoxEmitter { red: 255, green: 255, blue: 255, pass: 0 });
+        c.sameInt(
+            "the same lamp without the mask leaves the far side dark",
+            plain.level(16, 8, 8, 0),
+            0
+        );
+        c.that("and still lights its own side", plain.level(10, 8, 8, 0) > 0);
+
+        walled.flood.setEmitter(8, 8, 24, VoxEmitter { red: 255, green: 255, blue: 255, pass: 0 });
+        let fromFirst : i32 = open.level(16, 8, 24, 0);
+        c.sameInt(
+            "a second lamp without the mask adds only what the masked one already brought",
+            walled.level(16, 8, 24, 0),
+            fromFirst
+        );
+    }
+
+    // The ray tracer ignores the classes it is told to.
+    static fn tracer(c : Checks) : void {
+        let rig : VoxLightRig = new VoxLightRig(2, 2, 2, 16);
+        VoxLightEmitterSuite::foliage(rig);
+        rig.fill(12, 4, 4, 13, 14, 28, VoxIds::leaves());
+        let t : VoxRayTracer = new VoxRayTracer();
+        let ray : DRay = DRay::make(DVec3::make(4.5, 8.5, 8.5), DVec3::make(1.0, 0.0, 0.0));
+        t.trace(rig.grid, rig.table, ray, 40.0);
+        c.near("a ray through a foliage wall is stopped", t.fraction(), 0.0, 0.0001);
+        t.setPass(EMITTER_FOLIAGE);
+        t.trace(rig.grid, rig.table, ray, 40.0);
+        c.near("the same ray told to ignore foliage goes through", t.fraction(), 1.0, 0.0001);
+        t.setPass(4);
+        t.trace(rig.grid, rig.table, ray, 40.0);
+        c.near("ignoring some other class changes nothing", t.fraction(), 0.0, 0.0001);
+    }
+
+    /** Runs every check of the suite. */
+    pub static fn run(c : Checks) : void {
+        VoxLightEmitterSuite::ownColour(c);
+        VoxLightEmitterSuite::incrementalIsRebuild(c);
+        VoxLightEmitterSuite::passMask(c);
+        VoxLightEmitterSuite::tracer(c);
+    }
+}

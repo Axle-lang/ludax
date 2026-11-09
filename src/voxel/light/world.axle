@@ -1,0 +1,393 @@
+// world — the light engine of one voxel grid, and the read seam over it.
+//
+// `VoxLightWorld` owns the pieces (the grid and block table it was given, the flood, the surface shell and
+// the baker) and is what a mesher or a renderer talks to:
+//
+//   writing   `setBlock` (flood updated incrementally), `rebuildLight`, `bakeAll` / `bakeStale` / `bakeSlice`
+//   reading   `cellSample`, `cornerSample` (one corner of one face, the four-cell mean smooth lighting uses),
+//             `pointSample` (any world point, trilinear over the eight cells around it), `aoCorner`
+//
+// A read never lies about a cell the shell does not store: a cell outside the shell (or one whose term is
+// flagged stale) is baked on the spot with the same code and settings as the bulk bake, so the stored and the
+// live answer are the same bytes. `liveFallback` can turn that off for a mesher that prefers speed (such
+// cells then read as open). Cells in a chunk that does not exist read as open air.
+
+use crate::core::math::scalar::minI;
+use crate::core::math::vec3::Vec3;
+use crate::voxel::light::bake::{VoxBakeSettings, VoxJobList, VoxLightBaker, VoxSkyBake, voxByte};
+use crate::voxel::light::block::BlockLightTable;
+use crate::voxel::light::curve::VoxLightCurve;
+use crate::voxel::light::dda::voxFloor;
+use crate::voxel::light::flood::{VoxLightFlood, VoxEmitter};
+use crate::voxel::light::grid::{VoxelGrid, VOX_CELL_CENTRE, voxFaceSign};
+use crate::voxel::light::sample::{VoxelLightSample, VoxSampleMean, voxAo, voxUnit};
+use crate::voxel::light::surface::{VoxLightSurface, VOX_STALE_SUN, VOX_STALE_SKY};
+use crate::voxel::light::trace::VoxRayTracer;
+
+// The cells a trilinear blend reads: the corners of a cube.
+const VOX_BLEND_CELLS : i32 = 8;
+
+// A world cell.
+struct VoxCell {
+    x : i32 = 0;
+    y : i32 = 0;
+    z : i32 = 0;
+}
+
+// The four cells a face corner reads: the one in front of the face, the two beside it, and the diagonal.
+struct VoxCornerCells {
+    front : VoxCell;
+    sideA : VoxCell;
+    sideB : VoxCell;
+    diag  : VoxCell;
+}
+
+/** One corner of one face of one block: what `cornerSample` and `aoCorner` are asked about. */
+pub struct VoxCorner {
+    /** World x of the block. */
+    pub x : i32 = 0;
+
+    /** World y of the block. */
+    pub y : i32 = 0;
+
+    /** World z of the block. */
+    pub z : i32 = 0;
+
+    /** The face of the block, numbered as in `VoxelGrid` (0 +x, 1 -x, 2 +y, 3 -y, 4 +z, 5 -z). */
+    pub face : i32 = 0;
+
+    /**
+     * The corner of the face, 0..3: bit 0 picks the positive side along the face's first tangent axis, bit 1
+     * along the second.
+     */
+    pub corner : i32 = 0;
+}
+
+// The sample of a cell inside a solid block: no light of its own, and the block's colour for the bounce.
+fn voxSolidSample(table : Shared<BlockLightTable>, block : i32) : VoxelLightSample {
+    return VoxelLightSample {
+        blockLight: Vec3::zero(),
+        skyLight: 0.0,
+        sunVisibility: 0.0,
+        skyAccess: 0.0,
+        bounceTint: Vec3 {
+            x: voxUnit(table.albedoOf(block, 0)),
+            y: voxUnit(table.albedoOf(block, 1)),
+            z: voxUnit(table.albedoOf(block, 2)),
+        },
+    };
+}
+
+// The cell `k` steps from `at` along axis `axis` (0 x, 1 y, 2 z).
+fn voxCellMoved(at : VoxCell, axis : i32, k : i32) : VoxCell {
+    return match axis {
+        0 => VoxCell { x: at.x + k, y: at.y, z: at.z },
+        1 => VoxCell { x: at.x, y: at.y + k, z: at.z },
+        _ => VoxCell { x: at.x, y: at.y, z: at.z + k },
+    };
+}
+
+// The weight of the lower (`upper` false) or upper cell along one axis of a trilinear blend at fraction `t`.
+fn voxAxisWeight(upper : bool, t : f64) : f64 {
+    if (upper) {
+        return t;
+    }
+    return 1.0 - t;
+}
+
+// A step along the corner's side of `axis`: `side` is 1 for the positive side and 0 for the negative.
+fn voxCornerSide(side : i32) : i32 {
+    return side * 2 - 1;
+}
+
+/** The lighting of a voxel grid. */
+pub class VoxLightWorld {
+    /** The cells and their blocks. */
+    pub grid : Shared<VoxelGrid>;
+
+    table : Shared<BlockLightTable>;
+    curve : Shared<VoxLightCurve>;
+
+    /** The block-light and sky-light levels of every cell. */
+    pub flood : VoxLightFlood;
+
+    /** The cells whose faces receive baked sun and sky light. */
+    pub surface : Shared<VoxLightSurface>;
+
+    /** The sun and sky bakes over `surface`. */
+    pub baker : VoxLightBaker;
+
+    inline : VoxRayTracer;
+    config : VoxBakeSettings;
+    live   : bool = true;
+
+    /**
+     * The engine over `grid` and `table`, with block light falling off along `curve`, sky light losing
+     * `skyStep` levels per cell sideways, and `workers` threads for the bakes.
+     */
+    constructor(
+        own grid : Shared<VoxelGrid>,
+        own table : Shared<BlockLightTable>,
+        own curve : Shared<VoxLightCurve>,
+        skyStep : i32,
+        workers : i32
+    ) {
+        self.grid = grid;
+        self.table = table;
+        self.curve = curve;
+        self.flood = new VoxLightFlood(grid, table, curve, skyStep);
+        let surface : Shared<VoxLightSurface> = share new VoxLightSurface();
+        self.surface = surface;
+        self.baker = new VoxLightBaker(grid, table, surface, workers);
+        self.inline = new VoxRayTracer();
+        self.config = VoxBakeSettings {};
+        self.baker.kernel.configure(self.config);
+    }
+
+    /** Stops the bake threads. */
+    pub fn close(mut self) : void {
+        self.baker.close();
+    }
+
+    /** The settings the bakes and the on-demand reads use. */
+    pub fn settings(self) : VoxBakeSettings {
+        return self.config;
+    }
+
+    /** Changes the settings; stored terms are stale until baked again (`bakeAll`). */
+    pub fn configure(mut self, s : VoxBakeSettings) : void {
+        self.config = s;
+        self.baker.kernel.configure(s);
+    }
+
+    /** True: cells the shell does not store are baked when read. False: they read as open. */
+    pub fn setLiveFallback(mut self, on : bool) : void {
+        self.live = on;
+    }
+
+    /** Sets a block; the flood is updated. Baked terms are not touched (see `bakeSlice`). */
+    pub fn setBlock(mut self, x : i32, y : i32, z : i32, id : i32) : void {
+        self.flood.setBlock(x, y, z, id);
+    }
+
+    /** Makes a cell a lamp of its own colour, strength (0..1023 per channel) and pass mask; see the flood. */
+    pub fn setEmitter(mut self, x : i32, y : i32, z : i32, lamp : VoxEmitter) : void {
+        self.flood.setEmitter(x, y, z, lamp);
+    }
+
+    /** Gives a cell back to its block's own emission. */
+    pub fn clearEmitter(mut self, x : i32, y : i32, z : i32) : void {
+        self.flood.clearEmitter(x, y, z);
+    }
+
+    /** Floods all light from scratch. */
+    pub fn rebuildLight(mut self) : void {
+        self.flood.rebuild();
+    }
+
+    /** Recomputes the shell, keeping baked terms of cells that stay in it. */
+    pub fn rebuildSurface(mut self) : void {
+        self.surface.rebuild(self.grid, self.table);
+    }
+
+    /** Rebuilds the shell and bakes sun, sky access and bounce for every cell of it. */
+    pub fn bakeAll(mut self, parallel : bool) : void {
+        self.rebuildSurface();
+        let n : i32 = self.surface.count();
+        let jobs : VoxJobList = self.baker.jobs();
+        jobs.ensure(n);
+        for (i of 0..n) {
+            jobs.set(i, i);
+        }
+        self.baker.bakeSun(self.config, n, parallel);
+        self.baker.bakeSky(self.config, n, parallel);
+    }
+
+    /** Bakes only the entries flagged stale (those that joined the shell since they were last baked). */
+    pub fn bakeStale(mut self, parallel : bool) : void {
+        let sunCount : i32 = self.listStale(VOX_STALE_SUN);
+        self.baker.bakeSun(self.config, sunCount, parallel);
+
+        let skyCount : i32 = self.listStale(VOX_STALE_SKY);
+        self.baker.bakeSky(self.config, skyCount, parallel);
+    }
+
+    // Fills the baker's job list with the entries whose `term` is stale; returns how many.
+    fn listStale(self, term : i32) : i32 {
+        let n : i32 = self.surface.count();
+        let jobs : VoxJobList = self.baker.jobs();
+        jobs.ensure(n);
+        let mut count : i32 = 0;
+        for (i of 0..n) {
+            if ((self.surface.stale(i) & term) != 0) {
+                jobs.set(count, i);
+                count = count + 1;
+            }
+        }
+        return count;
+    }
+
+    /**
+     * Re-bakes the sun term of `count` entries starting at `from` (wrapping past the end): the round-robin
+     * refresh that lets shadows glide as the sun turns. Returns the entry to continue from.
+     */
+    pub fn bakeSunSlice(mut self, from : i32, count : i32, parallel : bool) : i32 {
+        let n : i32 = self.surface.count();
+        if (n == 0) {
+            return 0;
+        }
+        let take : i32 = minI(count, n);
+        let jobs : VoxJobList = self.baker.jobs();
+        jobs.ensure(take);
+        for (i of 0..take) {
+            jobs.set(i, (from + i) % n);
+        }
+        self.baker.bakeSun(self.config, take, parallel);
+        return (from + take) % n;
+    }
+
+    /** The light of the cell (x, y, z). */
+    pub fn cellSample(self, x : i32, y : i32, z : i32) : VoxelLightSample {
+        let id : i32 = self.grid.cellId(x, y, z);
+        if (id < 0) {
+            return VoxelLightSample::open();
+        }
+        let block : i32 = self.grid.blockOfId(id);
+        if (self.table.isSolid(block)) {
+            return voxSolidSample(self.table, block);
+        }
+
+        let blockLight : Vec3 = Vec3 {
+            x: voxUnit(self.flood.blockLevel(id, 0)),
+            y: voxUnit(self.flood.blockLevel(id, 1)),
+            z: voxUnit(self.flood.blockLevel(id, 2)),
+        };
+        let mut s : VoxelLightSample = VoxelLightSample {
+            blockLight: blockLight,
+            skyLight: voxUnit(self.flood.skyLevel(id)),
+        };
+
+        // A cell outside the shell has nothing stored: both terms are stale.
+        let ordinal : i32 = self.surface.ordinalOf(id);
+        let mut stale : i32 = VOX_STALE_SUN | VOX_STALE_SKY;
+        if (ordinal >= 0) {
+            stale = self.surface.stale(ordinal);
+        }
+
+        if ((stale & VOX_STALE_SUN) == 0) {
+            s.sunVisibility = voxUnit(self.surface.sun(ordinal));
+        } else if (self.live) {
+            s.sunVisibility = voxUnit(voxByte(self.baker.kernel.sunAt(self.inline, x, y, z)));
+        }
+        if ((stale & VOX_STALE_SKY) == 0) {
+            s.skyAccess = voxUnit(self.surface.access(ordinal));
+            s.bounceTint = Vec3 {
+                x: voxUnit(self.surface.tint(ordinal, 0)),
+                y: voxUnit(self.surface.tint(ordinal, 1)),
+                z: voxUnit(self.surface.tint(ordinal, 2)),
+            };
+        } else if (self.live) {
+            let b : VoxSkyBake = self.baker.kernel.skyAt(self.inline, x, y, z);
+            s.skyAccess = voxUnit(voxByte(b.access));
+            s.bounceTint = Vec3 {
+                x: voxUnit(voxByte(b.red)),
+                y: voxUnit(voxByte(b.green)),
+                z: voxUnit(voxByte(b.blue)),
+            };
+        }
+        return s;
+    }
+
+    fn solidAt(self, at : VoxCell) : bool {
+        return self.table.isSolid(self.grid.blockAt(at.x, at.y, at.z));
+    }
+
+    fn sampleAt(self, at : VoxCell) : VoxelLightSample {
+        return self.cellSample(at.x, at.y, at.z);
+    }
+
+    // The four cells a corner of a face reads. The two sides lie along the two tangent axes of the face, on
+    // the side the corner number picks.
+    static fn cornerCells(at : VoxCorner) : VoxCornerCells {
+        let axis : i32 = at.face >> 1;
+        let first : i32 = (axis + 1) % 3;
+        let second : i32 = (axis + 2) % 3;
+        let out : i32 = voxFaceSign(at.face);
+        let toA : i32 = voxCornerSide(at.corner & 1);
+        let toB : i32 = voxCornerSide((at.corner >> 1) & 1);
+
+        let front : VoxCell = voxCellMoved(VoxCell { x: at.x, y: at.y, z: at.z }, axis, out);
+        let sideA : VoxCell = voxCellMoved(front, first, toA);
+        let sideB : VoxCell = voxCellMoved(front, second, toB);
+        let diag : VoxCell = voxCellMoved(sideA, second, toB);
+        return VoxCornerCells { front: front, sideA: sideA, sideB: sideB, diag: diag };
+    }
+
+    /**
+     * The light at corner `at` of a face. It is the mean of the four cells that meet at that corner in front
+     * of the face; solid cells are left out, and the diagonal one too when both cells beside it are solid
+     * (that is how light is kept from leaking round a crease).
+     */
+    pub fn cornerSample(self, at : VoxCorner) : VoxelLightSample {
+        let c : VoxCornerCells = VoxLightWorld::cornerCells(at);
+        let sideASolid : bool = self.solidAt(c.sideA);
+        let sideBSolid : bool = self.solidAt(c.sideB);
+        let diagCounts : bool = !self.solidAt(c.diag) && !(sideASolid && sideBSolid);
+
+        let mean : VoxSampleMean = new VoxSampleMean();
+        if (!self.solidAt(c.front)) {
+            mean.add(self.sampleAt(c.front), 1.0);
+        }
+        if (!sideASolid) {
+            mean.add(self.sampleAt(c.sideA), 1.0);
+        }
+        if (!sideBSolid) {
+            mean.add(self.sampleAt(c.sideB), 1.0);
+        }
+        if (diagCounts) {
+            mean.add(self.sampleAt(c.diag), 1.0);
+        }
+        return mean.result(self.sampleAt(c.front));
+    }
+
+    /** The darkening count 0..3 (see `voxAo`) of corner `at` of a face. */
+    pub fn aoCorner(self, at : VoxCorner) : i32 {
+        let c : VoxCornerCells = VoxLightWorld::cornerCells(at);
+        return voxAo(self.solidAt(c.sideA), self.solidAt(c.sideB), self.solidAt(c.diag));
+    }
+
+    /**
+     * The light at the world point (px, py, pz): the trilinear blend of the eight cells whose centres
+     * surround it, solid cells left out (the weights of the others are renormalised), so a point beside a wall
+     * is not darkened by the wall's own zero. Inside solid it reads as the cell itself.
+     */
+    pub fn pointSample(self, px : f64, py : f64, pz : f64) : VoxelLightSample {
+        // Cell centres sit half a cell in from the cell's corner coordinate.
+        let gx : f64 = px - VOX_CELL_CENTRE;
+        let gy : f64 = py - VOX_CELL_CENTRE;
+        let gz : f64 = pz - VOX_CELL_CENTRE;
+        let ix : i32 = voxFloor(gx);
+        let iy : i32 = voxFloor(gy);
+        let iz : i32 = voxFloor(gz);
+        let tx : f64 = gx - ix as f64;
+        let ty : f64 = gy - iy as f64;
+        let tz : f64 = gz - iz as f64;
+
+        let mean : VoxSampleMean = new VoxSampleMean();
+        for (k of 0..VOX_BLEND_CELLS) {
+            let ox : i32 = k & 1;
+            let oy : i32 = (k >> 1) & 1;
+            let oz : i32 = (k >> 2) & 1;
+            let wx : f64 = voxAxisWeight(ox == 1, tx);
+            let wy : f64 = voxAxisWeight(oy == 1, ty);
+            let wz : f64 = voxAxisWeight(oz == 1, tz);
+            let w : f64 = wx * wy * wz;
+            let cell : VoxCell = VoxCell { x: ix + ox, y: iy + oy, z: iz + oz };
+            if (w > 0.0 && !self.solidAt(cell)) {
+                mean.add(self.sampleAt(cell), w);
+            }
+        }
+        let here : VoxCell = VoxCell { x: voxFloor(px), y: voxFloor(py), z: voxFloor(pz) };
+        return mean.result(self.sampleAt(here));
+    }
+}

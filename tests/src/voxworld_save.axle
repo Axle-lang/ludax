@@ -1,0 +1,235 @@
+// voxworld_save — the edit layer: edits survive unloading and saving, untouched chunks are never stored, damage is refused.
+//
+// A world is generator + edits, so these checks are about the seam between them. Unload an edited chunk and
+// load it back: the edit must be there. Save, load into a fresh world of the same seed: every chunk must equal
+// the original. And the file must hold only edited chunks. Corruption is planted byte by byte in each part of a
+// region file (magic, header, table, payload, tail) and every one must be refused.
+
+use std::sys::tempDir;
+
+use ludax::{
+    Checks, ByteBuf, DataFiles, VoxChunk, VoxChunkCodec, VoxChunkStore, VoxRegion, VoxWorld,
+    VoxWorldFiles, VoxStreamer, VoxStreamBudget, VW_STONE, VW_LAMP, VW_AIR
+};
+
+/** Checks the chunk codec, the edit layer, region files and damage refusal. */
+pub class VoxWorldSaveSuite {
+    static fn damaged(file : ByteBuf, at : i32) : ByteBuf {
+        let copy : ByteBuf = new ByteBuf(file.len() + 16);
+        copy.pushRange(file, 0, file.len());
+        copy.set(at, copy.get(at) ^ 1);
+        return copy;
+    }
+
+    static fn sameWorld(a : VoxWorld, b : VoxWorld) : bool {
+        let mut pos : i32 = a.store.first();
+        while (pos >= 0) {
+            let key : i64 = a.store.keyAt(pos);
+            let cx : i32 = VoxChunkStore::keyX(key);
+            let cy : i32 = VoxChunkStore::keyY(key);
+            let cz : i32 = VoxChunkStore::keyZ(key);
+            if (!b.isLoaded(cx, cy, cz)) {
+                return false;
+            }
+            let ca : VoxChunk = a.store.chunkAt(pos);
+            let cb : VoxChunk = b.store.chunk(cx, cy, cz);
+            for (i of 0..4096) {
+                if (ca.get(i) != cb.get(i)) {
+                    return false;
+                }
+            }
+            pos = a.store.next(pos);
+        }
+        return true;
+    }
+
+    // The stored form of one chunk: round trip, refusal of damage, and the size of a uniform chunk.
+    static fn codec(c : Checks) : void {
+        let one : VoxChunk = new VoxChunk();
+        for (i of 0..300) {
+            one.set(i * 7, 1 + i % 5);
+        }
+        let enc : ByteBuf = new ByteBuf(64);
+        VoxChunkCodec::encode(one, enc);
+        let back : VoxChunk = new VoxChunk();
+        c.that(
+            "a chunk decodes from its stored form",
+            VoxChunkCodec::decode(enc, 0, enc.len(), back)
+        );
+
+        let mut same : bool = true;
+        for (i of 0..4096) {
+            if (one.get(i) != back.get(i)) {
+                same = false;
+            }
+        }
+        c.that("the decoded chunk equals the original", same);
+
+        let probe : VoxChunk = new VoxChunk();
+        c.that(
+            "a truncated chunk is refused",
+            !VoxChunkCodec::decode(enc, 0, enc.len() - 1, probe)
+        );
+
+        let longer : ByteBuf = new ByteBuf(64);
+        longer.pushRange(enc, 0, enc.len());
+        longer.push(0);
+        c.that(
+            "a chunk with a stray byte is refused",
+            !VoxChunkCodec::decode(longer, 0, longer.len(), probe)
+        );
+
+        // A palette entry changed is still a chunk; an index past the palette is not. Break the width byte instead.
+        let wild : ByteBuf = new ByteBuf(enc.len());
+        wild.pushRange(enc, 0, enc.len());
+        wild.set(0, 7);
+        c.that(
+            "an impossible width is refused",
+            !VoxChunkCodec::decode(wild, 0, wild.len(), probe)
+        );
+        c.that(
+            "a failed decode leaves the chunk as it was",
+            probe.isUniform() && probe.firstBlock() == VW_AIR
+        );
+
+        let uni : VoxChunk = new VoxChunk();
+        uni.fillUniform(VW_STONE);
+        let ue : ByteBuf = new ByteBuf(16);
+        VoxChunkCodec::encode(uni, ue);
+        c.sameInt("a uniform chunk is stored in 9 bytes", ue.len(), 9);
+    }
+
+    // Edits against unloading, then far away and back: edits intact, nothing else stored. `h` is the ground
+    // height at (5, 5), where the first edit goes.
+    static fn edits(c : Checks, w : VoxWorld, s : VoxStreamer, h : i32) : void {
+        let lampChunkY : i32 = (h + 1) >> 4;
+        c.that("an edit changes the block", w.setBlock(5, h + 1, 5, VW_LAMP));
+        c.that("the same block again is no change", !w.setBlock(5, h + 1, 5, VW_LAMP));
+        c.that("a cell below the world is refused", !w.setBlock(5, -1, 5, VW_LAMP));
+        w.setBlock(15, h, 15, VW_STONE);
+        w.setBlock(16, h, 16, VW_LAMP);
+        c.sameInt("the journal recorded three edits", w.journal.end(), 3);
+        c.sameInt("the journal keeps the old block", w.journal.wasAt(0), VW_AIR);
+        c.sameInt("the journal records the new block as the lamp", w.journal.nowAt(0), VW_LAMP);
+
+        let edited : i32 = 3;
+        w.unloadChunk(0, lampChunkY, 0);
+        c.that("an unloaded chunk is out of memory", !w.isLoaded(0, lampChunkY, 0));
+        c.that("the edit layer took the edited chunk", w.editedStored() >= 1);
+        w.loadChunk(0, lampChunkY, 0);
+        c.sameInt("the edit survives unloading", w.blockAt(5, h + 1, 5), VW_LAMP);
+        c.that(
+            "an edited chunk comes back marked edited",
+            w.store.chunk(0, lampChunkY, 0).isEdited()
+        );
+
+        s.update(w, 3000.0, 3000.0, VoxStreamBudget::unlimited(false));
+        c.that("the edited chunk was unloaded with the rest", !w.isLoaded(0, lampChunkY, 0));
+        c.that("only edited chunks are in the layer", w.editedStored() <= edited);
+        c.that(
+            "the layer is tiny next to what was generated",
+            w.editBytes() * 20 < w.store.denseBytes()
+        );
+
+        s.update(w, 8.0, 8.0, VoxStreamBudget::unlimited(false));
+        c.sameInt("the lamp is where it was left", w.blockAt(5, h + 1, 5), VW_LAMP);
+        c.sameInt("the stone is where it was left", w.blockAt(15, h, 15), VW_STONE);
+        c.sameInt("the neighbour chunk's edit too", w.blockAt(16, h, 16), VW_LAMP);
+    }
+
+    // Saves `w` and loads the bytes into new worlds of the same seed; returns the saved bytes.
+    static fn roundTrip(c : Checks, w : VoxWorld, h : i32) : ByteBuf {
+        let bytes : ByteBuf = VoxWorldFiles::toBytes(w);
+        let region : VoxRegion = new VoxRegion();
+        c.that("the saved bytes load as a region", region.load(bytes));
+        c.sameInt("the region holds the edited chunks only", region.count(), w.editedStored());
+        println("  measured save: ${bytes.len()} bytes for ${region.count()} edited chunks of ${w.store.count()} loaded");
+        c.that(
+            "a save is far smaller than the loaded chunks",
+            (bytes.len() as i64) * 20 < w.store.denseBytes()
+        );
+
+        let fresh : VoxWorld = new VoxWorld(31, 44, 1);
+        c.that("the edits apply to a fresh world", VoxWorldFiles::fromBytes(fresh, bytes));
+        let sf : VoxStreamer = new VoxStreamer(3, 1);
+        sf.update(fresh, 8.0, 8.0, VoxStreamBudget::unlimited(false));
+        c.that(
+            "the reloaded world equals the saved one, block for block",
+            VoxWorldSaveSuite::sameWorld(w, fresh)
+        );
+        c.sameInt("the reloaded world holds the edited lamp", fresh.blockAt(5, h + 1, 5), VW_LAMP);
+
+        let untouched : VoxWorld = new VoxWorld(31, 44, 1);
+        let su : VoxStreamer = new VoxStreamer(3, 1);
+        su.update(untouched, 8.0, 8.0, VoxStreamBudget::unlimited(false));
+        c.that("a world without the edits differs", !VoxWorldSaveSuite::sameWorld(w, untouched));
+        c.sameInt("untouched chunks are regenerated, not stored", untouched.editedStored(), 0);
+        fresh.close();
+        untouched.close();
+        return bytes;
+    }
+
+    // The same through a file.
+    static fn throughDisk(c : Checks, w : VoxWorld) : void {
+        let mut wrote : bool = false;
+        // Under the temp folder, not `target/`: that only exists relative to the tests directory.
+        let path : string = "${tempDir()}/voxworld_save_test.region";
+        try {
+            VoxWorldFiles::save(path, w);
+            let again : VoxWorld = new VoxWorld(31, 44, 1);
+            wrote = VoxWorldFiles::load(path, again);
+            again.close();
+        } catch e : IOException {
+            wrote = false;
+        }
+        c.that("a region file round-trips through the disk", wrote);
+    }
+
+    // Planted bit flips, a truncated file and junk must all be refused, and a refused save changes nothing.
+    static fn damage(c : Checks, bytes : ByteBuf) : void {
+        let mut refused : i32 = 0;
+        let mut tried : i32 = 0;
+        let mut at : i32 = 0;
+        while (at < bytes.len()) {
+            let bad : ByteBuf = VoxWorldSaveSuite::damaged(bytes, at);
+            let probeRegion : VoxRegion = new VoxRegion();
+            tried = tried + 1;
+            if (!probeRegion.load(bad)) {
+                refused = refused + 1;
+            }
+            at = at + 1 + at / 40;
+        }
+        c.sameInt("every planted bit flip is refused (${tried} tried)", refused, tried);
+
+        let cut : ByteBuf = new ByteBuf(bytes.len());
+        cut.pushRange(bytes, 0, bytes.len() - 3);
+        c.that("a truncated region is refused", !(new VoxRegion()).load(cut));
+
+        let junk : ByteBuf = new ByteBuf(32);
+        junk.pushText("not a region at all, really");
+        let jr : VoxRegion = new VoxRegion();
+        c.that("a journal of junk bytes is refused", !jr.load(junk));
+        c.that("a refused journal says why", jr.error().byteLength > 0);
+
+        let guard : VoxWorld = new VoxWorld(31, 44, 1);
+        let loaded : bool = VoxWorldFiles::fromBytes(guard, VoxWorldSaveSuite::damaged(bytes, 40));
+        c.that("a damaged save leaves the world unchanged", !loaded && guard.editedStored() == 0);
+        guard.close();
+    }
+
+    /** Runs every check. */
+    pub static fn run(c : Checks) : void {
+        VoxWorldSaveSuite::codec(c);
+
+        let w : VoxWorld = new VoxWorld(31, 44, 1);
+        let s : VoxStreamer = new VoxStreamer(3, 1);
+        s.update(w, 8.0, 8.0, VoxStreamBudget::unlimited(false));
+        let h : i32 = w.terrain.heightAt(5, 5);
+        VoxWorldSaveSuite::edits(c, w, s, h);
+
+        let bytes : ByteBuf = VoxWorldSaveSuite::roundTrip(c, w, h);
+        VoxWorldSaveSuite::throughDisk(c, w);
+        VoxWorldSaveSuite::damage(c, bytes);
+        w.close();
+    }
+}

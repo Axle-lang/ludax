@@ -1,0 +1,501 @@
+// voxworld_gen — the terrain generator: same seed same blocks, in any order, on any number of threads.
+//
+// Trees cross chunk borders, which is where an order-dependent generator goes wrong, so the main check
+// generates a patch of forest chunk by chunk in two different orders and compares every cell. The others look
+// at what the generator is supposed to make: bedrock, water at sea level, caves below ground, several biomes.
+
+use ludax::{
+    Checks, Pcg32, VoxChunk, VoxChunkStore, VoxTerrain, VoxBiome, VoxWorld, VW_AIR, VW_WATER,
+    VW_BEDROCK, VW_LOG, VW_LEAVES, VW_CELLS, VW_SIDE
+};
+
+/** The seed every generated world of these checks shares, and the height of its sea. */
+const VGEN_SEED : i32 = 1234;
+const VGEN_SEA_LEVEL : i32 = 44;
+
+/** A different seed, to show that the seed matters. */
+const VGEN_OTHER_SEED : i32 = 99;
+
+/** The patch of forest the order checks generate: chunks wide, high and deep, around the found spot. */
+const VGEN_PATCH_W : i32 = 4;
+const VGEN_PATCH_H : i32 = 8;
+const VGEN_PATCH_D : i32 = 4;
+
+/** The shuffle that picks the second generation order: a fixed seed and stream, so a failure replays. */
+const VGEN_SHUFFLE_SEED : u64 = 5;
+const VGEN_SHUFFLE_STREAM : u64 = 9;
+
+/** Worker threads of the pooled world: one is the serial reference, three make the pool really parallel. */
+const VGEN_POOL_SERIAL : i32 = 1;
+const VGEN_POOL_THREADS : i32 = 3;
+
+/** The forest search: rings searched outward, blocks between probes, the probe's offset into its chunk. */
+const VGEN_FOREST_RINGS : i32 = 60;
+const VGEN_FOREST_STEP : i32 = 64;
+const VGEN_FOREST_OFFSET : i32 = 8;
+
+/** A forest counts as above water when its ground is this many blocks over the sea. */
+const VGEN_FOREST_DRY : i32 = 4;
+
+/** More logs than this in the patch show that it really is forest. */
+const VGEN_LOGS_MIN : i32 = 20;
+
+/** Chunk layers the seed, sky and floor checks look at: a layer of ground, the air layer and the bottom one. */
+const VGEN_GROUND_LAYER : i32 = 2;
+const VGEN_AIR_LAYER : i32 = 7;
+const VGEN_FLOOR_LAYER : i32 = 0;
+
+/** The column sample of the biome, water checks: a square of columns this wide, this many blocks apart. */
+const VGEN_SAMPLE_SIDE : i32 = 40;
+const VGEN_SAMPLE_STEP : i32 = 61;
+
+/** The number of biomes, and how many different ones the sample must contain. */
+const VGEN_BIOMES : i32 = 7;
+const VGEN_BIOMES_MIN : i32 = 4;
+
+/** The ground of every sampled column stays between these heights (the world is 128 blocks high). */
+const VGEN_HEIGHT_MIN : i32 = 4;
+const VGEN_HEIGHT_MAX : i32 = 119;
+
+/** More sampled columns than this must be ocean. */
+const VGEN_OCEAN_MIN : i32 = 100;
+
+/** Low ground is a lake when it lies this far under the sea; this many lakes are checked. */
+const VGEN_LAKE_DEPTH : i32 = 2;
+const VGEN_LAKE_CHECKS : i32 = 20;
+
+/** The cave probes: how many columns, their spacing in x and z, and the scatter that mixes z against x. */
+const VGEN_CAVE_PROBES : i32 = 80;
+const VGEN_CAVE_STEP_X : i32 = 37;
+const VGEN_CAVE_STEP_Z : i32 = 41;
+const VGEN_CAVE_SCATTER : i32 = 7;
+
+/** A chunk is `1 << VGEN_CHUNK_SHIFT` blocks wide; a shift floors negative coordinates where a division would not. */
+const VGEN_CHUNK_SHIFT : i32 = 4;
+
+/** The chunk layers under every cave probe that are loaded: the ground and rock below the ceiling. */
+const VGEN_CAVE_LAYERS : i32 = 3;
+
+/** Cells are counted from this height up to this many blocks under the surface, and below the ceiling. */
+const VGEN_CAVE_FLOOR : i32 = 8;
+const VGEN_CAVE_ROOF : i32 = 5;
+const VGEN_CAVE_CEILING : i32 = 48;
+
+/** Underground must be at least this many times more rock than hollow. */
+const VGEN_ROCK_FACTOR : i32 = 5;
+
+/** The chunk column of a found forest, and whether the search found one at all. */
+struct VoxForestSpot {
+    cx    : i32;
+    cz    : i32;
+    found : bool;
+}
+
+/** One chunk of the forest patch: its chunk coordinates. */
+struct VoxPatchCell {
+    cx : i32;
+    cy : i32;
+    cz : i32;
+}
+
+/** A block position: inside a chunk, or in the world. */
+struct VoxBlockPos {
+    x : i32;
+    y : i32;
+    z : i32;
+}
+
+/** What a sample of columns showed: biome counts by biome number, ocean columns and whether heights held. */
+struct VoxColumnSurvey {
+    biomes   : i32[];
+    ocean    : i32;
+    heightOk : bool;
+}
+
+/** Checks terrain generation: order, seeds, biomes, water and caves. */
+pub class VoxWorldGenSuite {
+    // The chunk column of the first forest above water, searched ring by ring outward on a coarse grid.
+    static fn findForest(t : VoxTerrain) : VoxForestSpot {
+        let chunksPerStep : i32 = VGEN_FOREST_STEP / VW_SIDE;
+        for (r of 0..VGEN_FOREST_RINGS) {
+            for (dz of -r..(r + 1)) {
+                for (dx of -r..(r + 1)) {
+                    let onRing : bool = dx == -r || dx == r || dz == -r || dz == r;
+                    if (!onRing) {
+                        continue;
+                    }
+
+                    let x : i32 = dx * VGEN_FOREST_STEP + VGEN_FOREST_OFFSET;
+                    let z : i32 = dz * VGEN_FOREST_STEP + VGEN_FOREST_OFFSET;
+                    let isForest : bool = t.biomeAt(x, z) == VoxBiome::Forest;
+                    let isDry : bool = t.heightAt(x, z) > t.seaLevel() + VGEN_FOREST_DRY;
+                    if (isForest && isDry) {
+                        return VoxForestSpot {
+                            cx: dx * chunksPerStep,
+                            cz: dz * chunksPerStep,
+                            found: true,
+                        };
+                    }
+                }
+            }
+        }
+        return VoxForestSpot { cx: 0, cz: 0, found: false };
+    }
+
+    static fn sameChunk(a : VoxChunk, b : VoxChunk) : bool {
+        for (i of 0..VW_CELLS) {
+            if (a.get(i) != b.get(i)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // The number of chunks in the patch.
+    static fn patchSize() : i32 {
+        return VGEN_PATCH_W * VGEN_PATCH_H * VGEN_PATCH_D;
+    }
+
+    // The i-th chunk of the patch, which is centred on the found spot in x and z and starts at the ground.
+    static fn patchCell(spot : VoxForestSpot, i : i32) : VoxPatchCell {
+        let column : i32 = i % VGEN_PATCH_W;
+        let row : i32 = (i / VGEN_PATCH_W) % VGEN_PATCH_D;
+        let layer : i32 = i / (VGEN_PATCH_W * VGEN_PATCH_D);
+        let cx : i32 = spot.cx - VGEN_PATCH_W / 2 + column;
+        let cz : i32 = spot.cz - VGEN_PATCH_D / 2 + row;
+        return VoxPatchCell { cx: cx, cy: layer, cz: cz };
+    }
+
+    // The position inside its chunk of the cell with index `k`: x runs fastest, then z, then y.
+    static fn localPos(k : i32) : VoxBlockPos {
+        let x : i32 = k % VW_SIDE;
+        let z : i32 = (k / VW_SIDE) % VW_SIDE;
+        let y : i32 = k / (VW_SIDE * VW_SIDE);
+        return VoxBlockPos { x: x, y: y, z: z };
+    }
+
+    // The world position of the block at `local` in the chunk `cell`.
+    static fn worldPos(cell : VoxPatchCell, local : VoxBlockPos) : VoxBlockPos {
+        return VoxBlockPos {
+            x: cell.cx * VW_SIDE + local.x,
+            y: cell.cy * VW_SIDE + local.y,
+            z: cell.cz * VW_SIDE + local.z,
+        };
+    }
+
+    // Generates every chunk of the patch into a store, visiting them in `order`.
+    static fn generatePatch(t : VoxTerrain, spot : VoxForestSpot, order : i32[]) : VoxChunkStore {
+        let store : VoxChunkStore = new VoxChunkStore();
+        for (k of 0..VoxWorldGenSuite::patchSize()) {
+            let cell : VoxPatchCell = VoxWorldGenSuite::patchCell(spot, order[k as i64]);
+            let ch : VoxChunk = new VoxChunk();
+            t.fillChunk(ch, cell.cx, cell.cy, cell.cz);
+            store.insert(cell.cx, cell.cy, cell.cz, ch);
+        }
+        return store;
+    }
+
+    // True when both stores hold equal blocks in every chunk of the patch.
+    static fn patchesAgree(a : VoxChunkStore, b : VoxChunkStore, spot : VoxForestSpot) : bool {
+        for (i of 0..VoxWorldGenSuite::patchSize()) {
+            let cell : VoxPatchCell = VoxWorldGenSuite::patchCell(spot, i);
+            let left : VoxChunk = a.chunk(cell.cx, cell.cy, cell.cz);
+            let right : VoxChunk = b.chunk(cell.cx, cell.cy, cell.cz);
+            if (!VoxWorldGenSuite::sameChunk(left, right)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // The trunk blocks in the patch.
+    static fn countLogs(store : VoxChunkStore, spot : VoxForestSpot) : i32 {
+        let mut logs : i32 = 0;
+        for (i of 0..VoxWorldGenSuite::patchSize()) {
+            let cell : VoxPatchCell = VoxWorldGenSuite::patchCell(spot, i);
+            let ch : VoxChunk = store.chunk(cell.cx, cell.cy, cell.cz);
+            for (k of 0..VW_CELLS) {
+                if (ch.get(k) == VW_LOG) {
+                    logs = logs + 1;
+                }
+            }
+        }
+        return logs;
+    }
+
+    // Pairs of leaf blocks that touch across the east or south border of a chunk: a tree that crosses it.
+    static fn countLeavesAcrossBorders(store : VoxChunkStore, spot : VoxForestSpot) : i32 {
+        let last : i32 = VW_SIDE - 1;
+        let mut across : i32 = 0;
+        for (i of 0..VoxWorldGenSuite::patchSize()) {
+            let cell : VoxPatchCell = VoxWorldGenSuite::patchCell(spot, i);
+            let ch : VoxChunk = store.chunk(cell.cx, cell.cy, cell.cz);
+            for (k of 0..VW_CELLS) {
+                if (ch.get(k) != VW_LEAVES) {
+                    continue;
+                }
+
+                let local : VoxBlockPos = VoxWorldGenSuite::localPos(k);
+                let at : VoxBlockPos = VoxWorldGenSuite::worldPos(cell, local);
+                if (local.x == last && store.blockAt(at.x + 1, at.y, at.z) == VW_LEAVES) {
+                    across = across + 1;
+                }
+                if (local.z == last && store.blockAt(at.x, at.y, at.z + 1) == VW_LEAVES) {
+                    across = across + 1;
+                }
+            }
+        }
+        return across;
+    }
+
+    // Same seed, same blocks whatever the order; trees must also continue across chunk borders.
+    // Returns the in-order store for the later checks to compare against.
+    static fn checkOrderIndependence(
+        c : Checks,
+        t : VoxTerrain,
+        spot : VoxForestSpot
+    ) : VoxChunkStore {
+        let n : i32 = VoxWorldGenSuite::patchSize();
+        let mut inOrder : i32[] = new i32[n as i64];
+        for (i of 0..n) {
+            inOrder[i as i64] = i;
+        }
+        let shuffled : i32[] = new Pcg32(VGEN_SHUFFLE_SEED, VGEN_SHUFFLE_STREAM).permutation(n);
+        let a : VoxChunkStore = VoxWorldGenSuite::generatePatch(t, spot, inOrder);
+        let b : VoxChunkStore = VoxWorldGenSuite::generatePatch(t, spot, shuffled);
+
+        let logs : i32 = VoxWorldGenSuite::countLogs(a, spot);
+        let acrossBorder : i32 = VoxWorldGenSuite::countLeavesAcrossBorders(a, spot);
+        c.that(
+            "generating chunks in two different orders gives identical blocks",
+            VoxWorldGenSuite::patchesAgree(a, b, spot)
+        );
+        c.that("the forest patch has more than 20 logs", logs > VGEN_LOGS_MIN);
+        c.that("a tree's leaves continue over a chunk border", acrossBorder > 0);
+        println("  measured trunk blocks in the patch: ${logs}, leaf pairs across borders: ${acrossBorder}");
+        return a;
+    }
+
+    // The same patch through the world, serial against the job pool, equals the direct generator.
+    static fn checkPoolMatchesDirect(
+        c : Checks,
+        spot : VoxForestSpot,
+        direct : VoxChunkStore
+    ) : void {
+        let n : i32 = VoxWorldGenSuite::patchSize();
+        let serial : VoxWorld = new VoxWorld(VGEN_SEED, VGEN_SEA_LEVEL, VGEN_POOL_SERIAL);
+        let pooled : VoxWorld = new VoxWorld(VGEN_SEED, VGEN_SEA_LEVEL, VGEN_POOL_THREADS);
+        let mut coords : i32[] = new i32[(n * 3) as i64];
+        for (i of 0..n) {
+            let cell : VoxPatchCell = VoxWorldGenSuite::patchCell(spot, i);
+            coords[(i * 3) as i64] = cell.cx;
+            coords[(i * 3 + 1) as i64] = cell.cy;
+            coords[(i * 3 + 2) as i64] = cell.cz;
+        }
+        c.sameInt("serial batch loads every chunk", serial.loadBatch(coords, n, false), n);
+        c.sameInt("pooled batch loads every chunk", pooled.loadBatch(coords, n, true), n);
+
+        let mut poolSame : bool = true;
+        for (i of 0..n) {
+            let cell : VoxPatchCell = VoxWorldGenSuite::patchCell(spot, i);
+            let want : VoxChunk = direct.chunk(cell.cx, cell.cy, cell.cz);
+            let fromSerial : VoxChunk = serial.store.chunk(cell.cx, cell.cy, cell.cz);
+            let fromPool : VoxChunk = pooled.store.chunk(cell.cx, cell.cy, cell.cz);
+            if (!VoxWorldGenSuite::sameChunk(fromSerial, want)) {
+                poolSame = false;
+            }
+            if (!VoxWorldGenSuite::sameChunk(fromPool, want)) {
+                poolSame = false;
+            }
+        }
+        c.that("serial and pooled generation equal the direct generator", poolSame);
+        serial.close();
+        pooled.close();
+    }
+
+    // Another seed differs, the same seed repeats, the layer above the world is air and the lowest is bedrock.
+    static fn checkSeedsSkyAndFloor(c : Checks, t : VoxTerrain, spot : VoxForestSpot) : void {
+        let other : VoxTerrain = new VoxTerrain(VGEN_OTHER_SEED, VGEN_SEA_LEVEL);
+        let c1 : VoxChunk = new VoxChunk();
+        let c2 : VoxChunk = new VoxChunk();
+        t.fillChunk(c1, spot.cx, VGEN_GROUND_LAYER, spot.cz);
+        other.fillChunk(c2, spot.cx, VGEN_GROUND_LAYER, spot.cz);
+        c.that("another seed makes another world", !VoxWorldGenSuite::sameChunk(c1, c2));
+
+        let c3 : VoxChunk = new VoxChunk();
+        t.fillChunk(c3, spot.cx, VGEN_GROUND_LAYER, spot.cz);
+        c.that("the same seed makes the same chunk", VoxWorldGenSuite::sameChunk(c1, c3));
+
+        let sky : VoxChunk = new VoxChunk();
+        t.fillChunk(sky, spot.cx, VGEN_AIR_LAYER, spot.cz);
+        c.that("the sky chunk is uniform air", sky.isUniform() && sky.firstBlock() == VW_AIR);
+
+        let floor : VoxChunk = new VoxChunk();
+        t.fillChunk(floor, spot.cx, VGEN_FLOOR_LAYER, spot.cz);
+        let mut bedrock : bool = true;
+        for (z of 0..VW_SIDE) {
+            for (x of 0..VW_SIDE) {
+                if (floor.at(x, 0, z) != VW_BEDROCK) {
+                    bedrock = false;
+                }
+            }
+        }
+        c.that("the world's floor is bedrock", bedrock);
+    }
+
+    // The world column of sample (ix, iz): the sample is a square centred on the origin.
+    static fn samplePos(ix : i32, iz : i32) : VoxBlockPos {
+        let half : i32 = VGEN_SAMPLE_SIDE / 2;
+        return VoxBlockPos {
+            x: (ix - half) * VGEN_SAMPLE_STEP,
+            y: 0,
+            z: (iz - half) * VGEN_SAMPLE_STEP,
+        };
+    }
+
+    // Heights, biomes and ocean columns over the whole sample.
+    static fn surveyColumns(t : VoxTerrain) : VoxColumnSurvey {
+        let mut survey : VoxColumnSurvey = VoxColumnSurvey {
+            biomes: new i32[VGEN_BIOMES as i64],
+            ocean: 0,
+            heightOk: true,
+        };
+        for (i of 0..VGEN_BIOMES) {
+            survey.biomes[i as i64] = 0;
+        }
+        for (iz of 0..VGEN_SAMPLE_SIDE) {
+            for (ix of 0..VGEN_SAMPLE_SIDE) {
+                let at : VoxBlockPos = VoxWorldGenSuite::samplePos(ix, iz);
+                let h : i32 = t.heightAt(at.x, at.z);
+                if (h < VGEN_HEIGHT_MIN || h > VGEN_HEIGHT_MAX) {
+                    survey.heightOk = false;
+                }
+                if (h < t.seaLevel()) {
+                    survey.ocean = survey.ocean + 1;
+                }
+
+                let biome : i64 = t.biomeAt(at.x, at.z) as i64;
+                survey.biomes[biome] = survey.biomes[biome] + 1;
+            }
+        }
+        return survey;
+    }
+
+    // The number of different biomes in the survey.
+    static fn biomesSeen(survey : VoxColumnSurvey) : i32 {
+        let mut seen : i32 = 0;
+        for (i of 0..VGEN_BIOMES) {
+            if (survey.biomes[i as i64] > 0) {
+                seen = seen + 1;
+            }
+        }
+        return seen;
+    }
+
+    // The survey's biome counts as `ocean 12, beach 3, ...`, by name.
+    static fn describeBiomes(survey : VoxColumnSurvey) : string {
+        let counts : i32[] = survey.biomes;
+        let ocean : i32 = counts[VoxBiome::Ocean as i64];
+        let beach : i32 = counts[VoxBiome::Beach as i64];
+        let plains : i32 = counts[VoxBiome::Plains as i64];
+        let forest : i32 = counts[VoxBiome::Forest as i64];
+        let desert : i32 = counts[VoxBiome::Desert as i64];
+        let tundra : i32 = counts[VoxBiome::Tundra as i64];
+        let mountain : i32 = counts[VoxBiome::Mountain as i64];
+        let shore : string = "ocean ${ocean}, beach ${beach}, plains ${plains}, forest ${forest}";
+        return "${shore}, desert ${desert}, tundra ${tundra}, mountain ${mountain}";
+    }
+
+    // Heights stay in bounds and several biomes occur over a square sample of columns.
+    static fn checkBiomes(c : Checks, t : VoxTerrain) : void {
+        let survey : VoxColumnSurvey = VoxWorldGenSuite::surveyColumns(t);
+        let columns : i32 = VGEN_SAMPLE_SIDE * VGEN_SAMPLE_SIDE;
+        println("  measured biomes over ${columns} columns: ${VoxWorldGenSuite::describeBiomes(survey)}");
+        c.that("heights stay inside the world", survey.heightOk);
+        c.that(
+            "at least four biomes occur",
+            VoxWorldGenSuite::biomesSeen(survey) >= VGEN_BIOMES_MIN
+        );
+        c.that("more than 100 columns are ocean", survey.ocean > VGEN_OCEAN_MIN);
+    }
+
+    // Water fills up to sea level above low ground; a lake column is water at sea level.
+    static fn checkLakes(c : Checks, t : VoxTerrain) : void {
+        let lakes : VoxWorld = new VoxWorld(VGEN_SEED, VGEN_SEA_LEVEL, VGEN_POOL_SERIAL);
+        let sea : i32 = t.seaLevel();
+        let mut waterOk : bool = true;
+        let mut checkedWater : i32 = 0;
+        for (iz of 0..VGEN_SAMPLE_SIDE) {
+            for (ix of 0..VGEN_SAMPLE_SIDE) {
+                let at : VoxBlockPos = VoxWorldGenSuite::samplePos(ix, iz);
+                if (t.heightAt(at.x, at.z) >= sea - VGEN_LAKE_DEPTH
+                    || checkedWater >= VGEN_LAKE_CHECKS) {
+                    continue;
+                }
+
+                lakes.loadChunk(
+                    at.x >> VGEN_CHUNK_SHIFT,
+                    sea >> VGEN_CHUNK_SHIFT,
+                    at.z >> VGEN_CHUNK_SHIFT
+                );
+                if (lakes.blockAt(at.x, sea, at.z) != VW_WATER) {
+                    waterOk = false;
+                }
+                checkedWater = checkedWater + 1;
+            }
+        }
+        lakes.close();
+        c.that("low ground is flooded to sea level", waterOk && checkedWater > 0);
+    }
+
+    // Caves: air under thick ground.
+    static fn checkCaves(c : Checks, t : VoxTerrain) : void {
+        let cave : VoxWorld = new VoxWorld(VGEN_SEED, VGEN_SEA_LEVEL, VGEN_POOL_SERIAL);
+        let half : i32 = VGEN_CAVE_PROBES / 2;
+        let mut hollow : i32 = 0;
+        let mut solid : i32 = 0;
+        for (i of 0..VGEN_CAVE_PROBES) {
+            let x : i32 = (i - half) * VGEN_CAVE_STEP_X;
+            let z : i32 = (i * VGEN_CAVE_SCATTER % VGEN_CAVE_PROBES - half) * VGEN_CAVE_STEP_Z;
+            let cx : i32 = x >> VGEN_CHUNK_SHIFT;
+            let cz : i32 = z >> VGEN_CHUNK_SHIFT;
+            for (layer of 0..VGEN_CAVE_LAYERS) {
+                cave.loadChunk(cx, layer, cz);
+            }
+
+            let h : i32 = t.heightAt(x, z);
+            for (y of VGEN_CAVE_FLOOR..(h - VGEN_CAVE_ROOF)) {
+                if (y >= VGEN_CAVE_CEILING) {
+                    continue;
+                }
+                if (cave.blockAt(x, y, z) == VW_AIR) {
+                    hollow = hollow + 1;
+                } else {
+                    solid = solid + 1;
+                }
+            }
+        }
+        cave.close();
+        println("  measured underground cells sampled: ${solid} solid, ${hollow} hollow");
+        c.that(
+            "underground is mostly rock, at least five times the hollows",
+            solid > hollow * VGEN_ROCK_FACTOR
+        );
+        c.that("there are caves underground", hollow > 0);
+    }
+
+    /** Runs every check. */
+    pub static fn run(c : Checks) : void {
+        let t : VoxTerrain = new VoxTerrain(VGEN_SEED, VGEN_SEA_LEVEL);
+        let spot : VoxForestSpot = VoxWorldGenSuite::findForest(t);
+        c.that("a forest exists near the origin", spot.found);
+        println("  measured forest patch near chunk column (${spot.cx}, ${spot.cz})");
+
+        let direct : VoxChunkStore = VoxWorldGenSuite::checkOrderIndependence(c, t, spot);
+        VoxWorldGenSuite::checkPoolMatchesDirect(c, spot, direct);
+        VoxWorldGenSuite::checkSeedsSkyAndFloor(c, t, spot);
+        VoxWorldGenSuite::checkBiomes(c, t);
+        VoxWorldGenSuite::checkLakes(c, t);
+        VoxWorldGenSuite::checkCaves(c, t);
+    }
+}

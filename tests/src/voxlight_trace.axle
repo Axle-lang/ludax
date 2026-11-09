@@ -1,0 +1,241 @@
+// voxlight_trace — the ray tracer against a plain cell-by-cell march, and the grid flags it skips air by.
+//
+// The tracer crosses a chunk or an 8-cell brick that never held a block without reading one. That is only
+// right if the flags are right and the skip walks the same cells as a plain walk, so the reference here reads
+// every cell through `blockAt` and the table and must agree with the tracer on the share of light, the colour
+// and the number of cells crossed, over rays that start inside the grid, outside it, on cell corners, and run
+// along an axis.
+
+use ludax::{
+    Checks, DRay, DVec3, Pcg32, VoxelDda, VoxelGrid, BlockLightTable, VoxRayTracer, voxFloor
+};
+
+use crate::voxlight_support::{VoxIds, VoxLightRig};
+
+// What the plain march found out about one ray.
+struct VoxMarch {
+    left  : f64 = 1.0;
+    red   : f64 = 0.0;
+    green : f64 = 0.0;
+    blue  : f64 = 0.0;
+    cells : i64 = 0;
+}
+
+// The distance between two numbers.
+fn voxTraceGap(a : f64, b : f64) : f64 {
+    if (a > b) {
+        return a - b;
+    }
+    return b - a;
+}
+
+/** Checks the tracer's air skipping against a plain march, and the grid flags it relies on. */
+pub class VoxLightTraceSuite {
+    // The three blocks the scene is scattered with: one that stops everything, one that tints, one that thins.
+    static fn kind(n : i32) : i32 {
+        if (n == 0) {
+            return VoxIds::stone();
+        }
+        if (n == 1) {
+            return VoxIds::redGlass();
+        }
+        return VoxIds::leaves();
+    }
+
+    // A world with every kind of region the tracer skips: a chunk of scattered blocks, a dense one, one that
+    // held a block once and is air again, an empty one, and a hole (a chunk that does not exist) between them.
+    static fn scene(r : Pcg32) : VoxLightRig {
+        let rig : VoxLightRig = new VoxLightRig(1, 1, 1, 16);
+        for (i of 0..400) {
+            rig.set(
+                r.range(0, 16),
+                r.range(0, 16),
+                r.range(0, 16),
+                VoxLightTraceSuite::kind(r.range(0, 3))
+            );
+        }
+        for (i of 0..1200) {
+            rig.set(
+                r.range(32, 48),
+                r.range(0, 16),
+                r.range(0, 16),
+                VoxLightTraceSuite::kind(r.range(0, 3))
+            );
+        }
+        rig.set(3, 17, 35, VoxIds::stone());
+        rig.set(3, 17, 35, VoxIds::air());
+        rig.grid.ensureChunk(2, 1, 2);
+        rig.grid.ensureChunk(0, 1, 2);
+        return rig;
+    }
+
+    // The plain march: the same rules as the tracer, one cell at a time, reading blocks through the grid.
+    static fn march(rig : VoxLightRig, ray : DRay, reach : f64, pass : i32) : VoxMarch {
+        let table : Shared<BlockLightTable> = rig.table;
+        let grid : Shared<VoxelGrid> = rig.grid;
+        let walk : VoxelDda = new VoxelDda();
+        walk.start(ray);
+        walk.advance();
+        let mut out : VoxMarch = VoxMarch {};
+        while (walk.entryT() < reach) {
+            let x : i32 = walk.x();
+            let y : i32 = walk.y();
+            let z : i32 = walk.z();
+            if (!grid.inBounds(x, y, z)) {
+                break;
+            }
+            out.cells = out.cells + 1;
+            let block : i32 = grid.blockAt(x, y, z);
+            let mut t : i32 = table.transmitWhite(block);
+            if ((pass & table.classOf(block)) != 0) {
+                t = 255;
+            }
+            if (t < 255) {
+                let through : f64 = t as f64 / 255.0;
+                let taken : f64 = out.left * (1.0 - through);
+                out.red = out.red + taken * table.albedoOf(block, 0) as f64 / 255.0;
+                out.green = out.green + taken * table.albedoOf(block, 1) as f64 / 255.0;
+                out.blue = out.blue + taken * table.albedoOf(block, 2) as f64 / 255.0;
+                out.left = out.left * through;
+                if (out.left < 0.0001) {
+                    out.left = 0.0;
+                    break;
+                }
+            }
+            walk.advance();
+        }
+        out.red = out.red + out.left;
+        out.green = out.green + out.left;
+        out.blue = out.blue + out.left;
+        return out;
+    }
+
+    // Shoots `count` random rays through a fresh scene and counts those the tracer and the march disagree on.
+    static fn disagreements(c : Checks, seed : u64, count : i32, pass : i32) : i32 {
+        let r : Pcg32 = new Pcg32(seed, 11);
+        let rig : VoxLightRig = VoxLightTraceSuite::scene(r);
+        let tracer : VoxRayTracer = new VoxRayTracer();
+        tracer.setPass(pass);
+        let mut bad : i32 = 0;
+        let mut blocked : i32 = 0;
+        for (i of 0..count) {
+            let mut ox : f64 = (r.nextF64() * 56.0) - 4.0;
+            let mut oy : f64 = (r.nextF64() * 40.0) - 4.0;
+            let mut oz : f64 = (r.nextF64() * 56.0) - 4.0;
+            let mut dx : f64 = r.nextF64() - 0.5;
+            let mut dy : f64 = r.nextF64() - 0.5;
+            let mut dz : f64 = r.nextF64() - 0.5;
+            if (i % 6 == 1) {
+                dy = 0.0;
+            }
+            if (i % 6 == 2) {
+                dx = 0.0;
+                dz = 0.0;
+                dy = dy + 0.2;
+            }
+            if (i % 6 == 3) {
+                ox = voxFloor(ox) as f64;
+                oy = voxFloor(oy) as f64;
+                oz = voxFloor(oz) as f64;
+            }
+            let len : f64 = (dx * dx + dy * dy + dz * dz).sqrt();
+            if (len < 0.01) {
+                continue;
+            }
+            let reach : f64 = 10.0 + r.nextF64() * 90.0;
+            let ray : DRay = DRay::make(
+                DVec3::make(ox, oy, oz),
+                DVec3::make(dx / len, dy / len, dz / len)
+            );
+            let before : i64 = tracer.crossed();
+            tracer.trace(rig.grid, rig.table, ray, reach);
+            let want : VoxMarch = VoxLightTraceSuite::march(rig, ray, reach, pass);
+            let crossed : i64 = tracer.crossed() - before;
+            let off : f64 = voxTraceGap(tracer.fraction(), want.left)
+                + voxTraceGap(tracer.red(), want.red)
+                + voxTraceGap(tracer.green(), want.green)
+                + voxTraceGap(tracer.blue(), want.blue);
+            if (off > 0.000000000001 || crossed != want.cells) {
+                bad = bad + 1;
+            }
+            if (want.left < 1.0) {
+                blocked = blocked + 1;
+            }
+        }
+        if (pass == 0) {
+            c.that(
+                "the sample rays include ones the blocks stop (${blocked} of ${count})",
+                blocked > count / 20
+            );
+        }
+        return bad;
+    }
+
+    // The brick of the cell at (x, y, z), 0..7: x half in bit 0, z half in bit 1, y half in bit 2.
+    static fn brickOf(x : i32, y : i32, z : i32) : i32 {
+        return (((y >> 3) & 1) << 2) | (((z >> 3) & 1) << 1) | ((x >> 3) & 1);
+    }
+
+    // A block goes in at each corner of two chunks, one by one; only its own chunk and brick may light up.
+    static fn flags(c : Checks) : void {
+        let grid : VoxelGrid = new VoxelGrid();
+        let slot : i32 = grid.ensureChunk(-1, 0, 0);
+        let mut raised : i32 = 0;
+        for (b of 0..8) {
+            if (grid.brickFilled(slot, b)) {
+                raised = raised + 1;
+            }
+        }
+        c.that("a new chunk has no brick filled", raised == 0 && !grid.chunkFilled(slot));
+        grid.setBlock(-5, 3, 3, VoxIds::air());
+        c.that(
+            "air alone fills no chunk and no brick",
+            !grid.chunkFilled(slot) && !grid.brickFilled(slot, 0)
+        );
+
+        let mut wrong : i32 = 0;
+        for (b of 0..8) {
+            let fresh : VoxelGrid = new VoxelGrid();
+            let x : i32 = -16 + (b & 1) * 8 + 7;
+            let z : i32 = ((b >> 1) & 1) * 8 + 7;
+            let y : i32 = ((b >> 2) & 1) * 8 + 7;
+            fresh.setBlock(x, y, z, VoxIds::stone());
+            let at : i32 = fresh.slotOf(-1, 0, 0);
+            for (k of 0..8) {
+                if (fresh.brickFilled(at, k) != (k == b)) {
+                    wrong = wrong + 1;
+                }
+            }
+            if (VoxLightTraceSuite::brickOf(x, y, z) != b || !fresh.chunkFilled(at)) {
+                wrong = wrong + 1;
+            }
+        }
+        c.sameInt("one block lights its own brick and no other (misses)", wrong, 0);
+
+        let direct : VoxelGrid = new VoxelGrid();
+        let id : i32 = direct.ensureChunk(0, 0, 0) * 4096 + (9 << 8) + (2 << 4) + 12;
+        direct.setBlockOfId(id, VoxIds::stone());
+        c.that(
+            "a write by cell id raises the same flags",
+            direct.chunkFilled(0) && direct.brickFilled(0, 5)
+        );
+        direct.setBlockOfId(id, VoxIds::air());
+        c.that(
+            "clearing the block leaves the flags up: the skip may only be missed",
+            direct.chunkFilled(0)
+        );
+    }
+
+    /** Runs every check. */
+    pub static fn run(c : Checks) : void {
+        VoxLightTraceSuite::flags(c);
+        let plain : i32 = VoxLightTraceSuite::disagreements(c, 21, 2500, 0);
+        c.sameInt(
+            "2500 rays: the tracer equals the plain march in light, colour and cells (rays off)",
+            plain,
+            0
+        );
+        let passing : i32 = VoxLightTraceSuite::disagreements(c, 22, 600, 1);
+        c.sameInt("600 rays with every class passed: the same agreement (rays off)", passing, 0);
+    }
+}

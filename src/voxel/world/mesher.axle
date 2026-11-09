@@ -1,0 +1,389 @@
+// mesher — turns the blocks of one chunk into a `VoxMesh`, looking across the borders into its neighbours.
+//
+// The chunk and a one-block shell around it are copied into an 18 x 18 x 18 array first (the shell comes from
+// the six face neighbours, the twelve edge neighbours and the eight corner neighbours through the store; a chunk
+// that is not loaded reads as air). After that every question is an array read: whether a face shows, and the
+// three cells that decide the ambient occlusion of each of a face's four corners.
+//
+// A face of block A shows when the cell across it is clear and not the same stuff as A (see `faceShows`). For
+// each of the six directions and each of the 16 layers a 16 x 16 mask of shown faces is built and then either
+// emitted tile by tile (face culling) or merged greedily into rectangles of one block id. Rectangles are only
+// merged when the shading is flat across them, i.e. all four corners of a tile have the same occlusion count and
+// neighbouring tiles agree: merging a tile whose corners differ would smear its shading over the rectangle, so
+// those stay single. The result is identical in light to the tile-by-tile mesh, with fewer triangles.
+
+use crate::voxel::light::sample::voxAo;
+use crate::voxel::world::blocks::VoxBlocks;
+use crate::voxel::world::chunk::{VoxChunk, vwLocal};
+use crate::voxel::world::mesh::{VoxMesh, VoxVertex};
+use crate::voxel::world::store::VoxChunkStore;
+
+// The padded grid is one block of shell around a 16-cube, 18 cells a side.
+const MESH_SIDE : i32 = 16;
+const MESH_SHELL : i32 = 1;
+const MESH_PAD : i32 = 18;
+
+// Its strides: local (x, y, z) sits at MESH_ORIGIN + x + MESH_STRIDE_Y * y + MESH_STRIDE_Z * z.
+const MESH_STRIDE_X : i32 = 1;
+const MESH_STRIDE_Y : i32 = 324;
+const MESH_STRIDE_Z : i32 = 18;
+const MESH_ORIGIN : i32 = 343;
+
+// The padded array, one layer of the padded grid, and the chunk it wraps.
+const MESH_PAD_CELLS : i32 = 5832;
+const MESH_LAYER_CELLS : i32 = 256;
+const MESH_CHUNK_CELLS : i32 = 4096;
+
+// The four corners of a tile each have an occlusion count 0..3, packed two bits apiece into its shade.
+const MESH_AO_BITS : i32 = 2;
+const MESH_AO_MASK : i32 = 3;
+
+const MESH_ZERO : f32 = 0.0;
+
+// The occlusion count of corner `k` (0..3) in a packed shade.
+fn meshAoOf(shade : i32, k : i32) : i32 {
+    return (shade >> (k * MESH_AO_BITS)) & MESH_AO_MASK;
+}
+
+// The shade of a tile with the occlusion counts of its four corners.
+fn meshShadeOf(c0 : i32, c1 : i32, c2 : i32, c3 : i32) : i32 {
+    return c0 | (c1 << MESH_AO_BITS) | (c2 << (2 * MESH_AO_BITS)) | (c3 << (3 * MESH_AO_BITS));
+}
+
+// True when all four corners of a shade agree, so merging the tile cannot smear its shading.
+fn meshIsFlat(shade : i32) : bool {
+    let first : i32 = meshAoOf(shade, 0);
+    return meshAoOf(shade, 1) == first && meshAoOf(shade, 2) == first && meshAoOf(shade, 3) == first;
+}
+
+// One rectangle of a layer: which axis and side, the layer it sits on, where and how big, and what it shows.
+struct MeshRect {
+    axis   : i32 = 0;
+    sign   : i32 = 1;
+    layer  : i32 = 0;
+    a      : i32 = 0;
+    b      : i32 = 0;
+    width  : i32 = 0;
+    height : i32 = 0;
+    block  : i32 = 0;
+    shade  : i32 = 0;
+}
+
+/** A mesh builder. It keeps scratch arrays, so reuse one per thread. */
+pub class VoxMesher {
+    cells : i32[];
+    block : i32[];
+    shade : i32[];
+    taken : i32[];
+    flat  : i32[];
+
+    /** A mesher. */
+    constructor() {
+        self.cells = new i32[MESH_PAD_CELLS as i64];
+        self.block = new i32[MESH_LAYER_CELLS as i64];
+        self.shade = new i32[MESH_LAYER_CELLS as i64];
+        self.taken = new i32[MESH_LAYER_CELLS as i64];
+        self.flat = new i32[MESH_CHUNK_CELLS as i64];
+    }
+
+    fn stride(axis : i32) : i32 {
+        if (axis == 0) {
+            return MESH_STRIDE_X;
+        }
+        if (axis == 1) {
+            return MESH_STRIDE_Y;
+        }
+        return MESH_STRIDE_Z;
+    }
+
+    // Copies chunk (cx, cy, cz) and the shell around it into the padded array.
+    fn gather(mut self, store : VoxChunkStore, cx : i32, cy : i32, cz : i32) : void {
+        let x0 : i32 = cx * MESH_SIDE;
+        let y0 : i32 = cy * MESH_SIDE;
+        let z0 : i32 = cz * MESH_SIDE;
+        if (store.has(cx, cy, cz)) {
+            let chunk : VoxChunk = store.chunk(cx, cy, cz);
+            chunk.copyCells(self.flat);
+        } else {
+            for (i of 0..MESH_CHUNK_CELLS) {
+                self.flat[i as i64] = 0;
+            }
+        }
+        for (y of 0 - MESH_SHELL..MESH_SIDE + MESH_SHELL) {
+            for (z of 0 - MESH_SHELL..MESH_SIDE + MESH_SHELL) {
+                for (x of 0 - MESH_SHELL..MESH_SIDE + MESH_SHELL) {
+                    let at : i64 = (MESH_ORIGIN + x * MESH_STRIDE_X + y * MESH_STRIDE_Y
+                        + z * MESH_STRIDE_Z) as i64;
+                    if (x >= 0 && x < MESH_SIDE && y >= 0 && y < MESH_SIDE && z >= 0 && z < MESH_SIDE) {
+                        let local : i32 = vwLocal(x, y, z);
+                        self.cells[at] = self.flat[local as i64];
+                    } else {
+                        self.cells[at] = store.blockAt(x0 + x, y0 + y, z0 + z);
+                    }
+                }
+            }
+        }
+    }
+
+    fn occludes(self, at : i32) : bool {
+        return VoxBlocks::occludes(self.cells[at as i64]);
+    }
+
+    // The occlusion count of the corner of a face whose front cell is `front`, towards the offsets `du` and `dv`.
+    fn cornerAo(self, front : i32, du : i32, dv : i32) : i32 {
+        let sideU : bool = self.occludes(front + du);
+        let sideV : bool = self.occludes(front + dv);
+        let diagonal : bool = self.occludes(front + du + dv);
+
+        return voxAo(sideU, sideV, diagonal);
+    }
+
+    // The coordinate on world axis `ax` of a point given by its coordinate along the face axis `d` and along the
+    // two tangents `d + 1` and `d + 2`.
+    fn coordinateOn(d : i32, ax : i32, pd : f32, pu : f32, pv : f32) : f32 {
+        if (ax == d) {
+            return pd;
+        }
+        if (ax == (d + 1) % 3) {
+            return pu;
+        }
+        return pv;
+    }
+
+    // The component on world axis `ax` of the normal of a face whose axis is `d` and which looks towards `sign`.
+    fn normalOn(d : i32, ax : i32, sign : i32) : f32 {
+        if (ax != d) {
+            return MESH_ZERO;
+        }
+        return sign as f32;
+    }
+
+    // Adds the vertex at corner `k` of the rectangle (0 low/low, 1 high/low, 2 high/high, 3 low/high along the two
+    // tangents), on `plane` cells along the face axis, carrying the occlusion count packed for that corner.
+    fn emitCorner(mut self, mesh : VoxMesh, r : MeshRect, plane : i32, k : i32) : void {
+        let mut cu : i32 = 0;
+        if (k == 1 || k == 2) {
+            cu = 1;
+        }
+        let mut cv : i32 = 0;
+        if (k >= 2) {
+            cv = 1;
+        }
+
+        let pu : f32 = (r.a + cu * r.width) as f32;
+        let pv : f32 = (r.b + cv * r.height) as f32;
+        let pd : f32 = plane as f32;
+        let vertex : VoxVertex = VoxVertex {
+            px: VoxMesher::coordinateOn(r.axis, 0, pd, pu, pv),
+            py: VoxMesher::coordinateOn(r.axis, 1, pd, pu, pv),
+            pz: VoxMesher::coordinateOn(r.axis, 2, pd, pu, pv),
+            nx: VoxMesher::normalOn(r.axis, 0, r.sign),
+            ny: VoxMesher::normalOn(r.axis, 1, r.sign),
+            nz: VoxMesher::normalOn(r.axis, 2, r.sign),
+            u: (cu * r.width) as f32,
+            v: (cv * r.height) as f32,
+            id: r.block,
+            ao: meshAoOf(r.shade, k),
+        };
+        mesh.vertex(vertex);
+    }
+
+    // Emits the four vertices of `r` in the winding its side needs.
+    fn emit(mut self, mesh : VoxMesh, r : MeshRect) : void {
+        if (r.sign > 0) {
+            let plane : i32 = r.layer + 1;
+            self.emitCorner(mesh, r, plane, 0);
+            self.emitCorner(mesh, r, plane, 1);
+            self.emitCorner(mesh, r, plane, 2);
+            self.emitCorner(mesh, r, plane, 3);
+        } else {
+            self.emitCorner(mesh, r, r.layer, 0);
+            self.emitCorner(mesh, r, r.layer, 3);
+            self.emitCorner(mesh, r, r.layer, 2);
+            self.emitCorner(mesh, r, r.layer, 1);
+        }
+
+        // Flipping the split when corners 0 and 2 are the more occluded pair keeps the shading gradient from creasing.
+        let diagonal02 : i32 = meshAoOf(r.shade, 0) + meshAoOf(r.shade, 2);
+        let diagonal13 : i32 = meshAoOf(r.shade, 1) + meshAoOf(r.shade, 3);
+        mesh.quad(r.width * r.height, diagonal02 > diagonal13);
+    }
+
+    /**
+     * Builds the mesh of chunk (cx, cy, cz) into `mesh` (which is cleared first). `greedy` merges equal flat
+     * tiles into rectangles; false emits one quad per exposed block face. Neighbouring chunks that are not
+     * loaded count as air, so build once the neighbours are in.
+     */
+    pub fn build(
+        mut self,
+        store : VoxChunkStore,
+        cx : i32,
+        cy : i32,
+        cz : i32,
+        mesh : VoxMesh,
+        greedy : bool
+    ) : void {
+        mesh.clear();
+        if (!store.has(cx, cy, cz)) {
+            return;
+        }
+        let here : VoxChunk = store.chunk(cx, cy, cz);
+        if (here.isUniform() && here.firstBlock() == 0) {
+            return;
+        }
+        self.gather(store, cx, cy, cz);
+
+        for (d of 0..3) {
+            for (side of 0..2) {
+                let mut sign : i32 = 1;
+                if (side == 1) {
+                    sign = -1;
+                }
+                for (s of 0..MESH_SIDE) {
+                    if (self.fillMask(mesh, d, sign, s)) {
+                        self.mergeSlice(mesh, d, sign, s, greedy);
+                    }
+                }
+            }
+        }
+    }
+
+    // Fills the `block` / `shade` mask of layer `s` of axis `d` with the faces that show towards `sign`, clearing
+    // `taken`; true when any face shows.
+    fn fillMask(mut self, mesh : VoxMesh, d : i32, sign : i32, s : i32) : bool {
+        let sd : i32 = VoxMesher::stride(d);
+        let su : i32 = VoxMesher::stride((d + 1) % 3);
+        let sv : i32 = VoxMesher::stride((d + 2) % 3);
+        let mut any : bool = false;
+        for (b of 0..MESH_SIDE) {
+            for (a of 0..MESH_SIDE) {
+                let base : i32 = MESH_ORIGIN + s * sd + a * su + b * sv;
+                let at : i64 = (b * MESH_SIDE + a) as i64;
+                let mine : i32 = self.cells[base as i64];
+                let front : i32 = base + sign * sd;
+                self.taken[at] = 0;
+                self.block[at] = 0;
+                if (!VoxBlocks::faceShows(mine, self.cells[front as i64])) {
+                    continue;
+                }
+
+                self.block[at] = mine;
+                let c0 : i32 = self.cornerAo(front, 0 - su, 0 - sv);
+                let c1 : i32 = self.cornerAo(front, su, 0 - sv);
+                let c2 : i32 = self.cornerAo(front, su, sv);
+                let c3 : i32 = self.cornerAo(front, 0 - su, sv);
+                self.shade[at] = meshShadeOf(c0, c1, c2, c3);
+                mesh.expose();
+                any = true;
+            }
+        }
+        return any;
+    }
+
+    // Emits the rectangles of the mask in `block` / `shade` for layer `s`.
+    fn mergeSlice(mut self, mesh : VoxMesh, d : i32, sign : i32, s : i32, greedy : bool) : void {
+        for (b of 0..MESH_SIDE) {
+            let mut a : i32 = 0;
+            while (a < MESH_SIDE) {
+                let i : i32 = b * MESH_SIDE + a;
+                if (self.block[i as i64] == 0 || self.taken[i as i64] == 1) {
+                    a = a + 1;
+                    continue;
+                }
+
+                let id : i32 = self.block[i as i64];
+                let sig : i32 = self.shade[i as i64];
+                let mut w : i32 = 1;
+                let mut h : i32 = 1;
+                if (greedy && meshIsFlat(sig)) {
+                    while (a + w < MESH_SIDE && self.same(i + w, id, sig)) {
+                        w = w + 1;
+                    }
+                    h = self.growHeight(a, b, w, id, sig);
+                }
+
+                for (rb of 0..h) {
+                    for (ra of 0..w) {
+                        self.taken[((b + rb) * MESH_SIDE + a + ra) as i64] = 1;
+                    }
+                }
+                let r : MeshRect = MeshRect {
+                    axis: d,
+                    sign: sign,
+                    layer: s,
+                    a: a,
+                    b: b,
+                    width: w,
+                    height: h,
+                    block: id,
+                    shade: sig,
+                };
+                self.emit(mesh, r);
+                a = a + w;
+            }
+        }
+    }
+
+    // How many rows from row `b` down a rectangle of width `w` at column `a` extends over equal free cells.
+    fn growHeight(self, a : i32, b : i32, w : i32, id : i32, sig : i32) : i32 {
+        let mut h : i32 = 1;
+        while (b + h < MESH_SIDE) {
+            for (k of 0..w) {
+                if (!self.same((b + h) * MESH_SIDE + a + k, id, sig)) {
+                    return h;
+                }
+            }
+            h = h + 1;
+        }
+        return h;
+    }
+
+    // True when mask cell `i` is free and holds the same block and shading.
+    fn same(self, i : i32, id : i32, sig : i32) : bool {
+        return self.taken[i as i64] == 0 && self.block[i as i64] == id && self.shade[i as i64] == sig;
+    }
+
+    /** Counts the exposed block faces of chunk (cx, cy, cz) the slow, obvious way: every cell against its six neighbours. */
+    pub static fn bruteExposed(store : VoxChunkStore, cx : i32, cy : i32, cz : i32) : i32 {
+        let mut n : i32 = 0;
+        for (y of 0..MESH_SIDE) {
+            for (z of 0..MESH_SIDE) {
+                for (x of 0..MESH_SIDE) {
+                    let wx : i32 = cx * MESH_SIDE + x;
+                    let wy : i32 = cy * MESH_SIDE + y;
+                    let wz : i32 = cz * MESH_SIDE + z;
+                    n = n + VoxMesher::exposedAround(store, wx, wy, wz);
+                }
+            }
+        }
+        return n;
+    }
+
+    // How many of the six faces of world cell (x, y, z) show.
+    static fn exposedAround(store : VoxChunkStore, x : i32, y : i32, z : i32) : i32 {
+        let here : i32 = store.blockAt(x, y, z);
+        let mut shown : i32 = 0;
+        for (axis of 0..3) {
+            for (side of 0..2) {
+                let step : i32 = 1 - 2 * side;
+                let across : i32 = store.blockAt(
+                    x + VoxMesher::stepAlong(axis, 0, step),
+                    y + VoxMesher::stepAlong(axis, 1, step),
+                    z + VoxMesher::stepAlong(axis, 2, step)
+                );
+                if (VoxBlocks::faceShows(here, across)) {
+                    shown = shown + 1;
+                }
+            }
+        }
+        return shown;
+    }
+
+    // `step` when coordinate `coord` is the axis being walked, else 0.
+    static fn stepAlong(axis : i32, coord : i32, step : i32) : i32 {
+        if (axis == coord) {
+            return step;
+        }
+        return 0;
+    }
+}

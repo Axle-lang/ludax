@@ -1,0 +1,178 @@
+// journal — the log of block changes that the mesher and the light bridge consume.
+//
+// Every edit made through the world is appended here as (x, y, z, old block, new block). Entries have absolute
+// sequence numbers that never change, so each consumer keeps its own cursor (the number of the next entry it
+// has not seen) and asks for `from(cursor)..end()`; nobody has to tell the journal who is listening. The owner
+// calls `trim` with the smallest cursor of all consumers to let go of entries nobody needs any more.
+
+use crate::core::collections::map::Map;
+use crate::core::collections::vec::Vec;
+use crate::voxel::world::chunk::{VW_SIDE, vwChunkOf};
+use crate::voxel::world::store::VoxChunkStore;
+
+// A chunk border is local coordinate 0 or 15; an edit there reaches the chunk next to it.
+const VW_EDGE_LOW : i32 = 0;
+const VW_EDGE_HIGH : i32 = 15;
+
+/** One block change: the cell, the block that was there, and the block put there. */
+pub struct VoxEdit {
+    /** World x of the cell. */
+    pub x : i32 = 0;
+
+    /** World y of the cell. */
+    pub y : i32 = 0;
+
+    /** World z of the cell. */
+    pub z : i32 = 0;
+
+    /** The block the edit replaced. */
+    pub was : i32 = 0;
+
+    /** The block the edit put there. */
+    pub now : i32 = 0;
+}
+
+// How far an edit at local coordinate `l` reaches into the chunk below: one step on the low border only.
+fn voxJournalReachLow(l : i32) : i32 {
+    if (l == VW_EDGE_LOW) {
+        return -1;
+    }
+    return 0;
+}
+
+// How far an edit at local coordinate `l` reaches into the chunk above: one step on the high border only.
+fn voxJournalReachHigh(l : i32) : i32 {
+    if (l == VW_EDGE_HIGH) {
+        return 1;
+    }
+    return 0;
+}
+
+/** The log of block edits. */
+pub class VoxJournal {
+    xs      : Vec<i32>;
+    ys      : Vec<i32>;
+    zs      : Vec<i32>;
+    before  : Vec<i32>;
+    after   : Vec<i32>;
+    dropped : i32 = 0;
+
+    /** An empty journal; the first entry will be number 0. */
+    constructor() {
+        self.xs = new Vec<i32>();
+        self.ys = new Vec<i32>();
+        self.zs = new Vec<i32>();
+        self.before = new Vec<i32>();
+        self.after = new Vec<i32>();
+    }
+
+    /** Appends an edit and returns its sequence number. */
+    pub fn record(mut self, edit : VoxEdit) : i32 {
+        self.xs.push(edit.x);
+        self.ys.push(edit.y);
+        self.zs.push(edit.z);
+        self.before.push(edit.was);
+        self.after.push(edit.now);
+        return self.dropped + self.xs.len() - 1;
+    }
+
+    /** The number of the oldest entry still kept. */
+    pub fn first(self) : i32 {
+        return self.dropped;
+    }
+
+    /** One past the number of the newest entry: a consumer that has read everything has this cursor. */
+    pub fn end(self) : i32 {
+        return self.dropped + self.xs.len();
+    }
+
+    /** The x of entry `n` (aborts for a number that was trimmed or does not exist yet). */
+    pub fn xAt(self, n : i32) : i32 {
+        return self.xs.get(n - self.dropped);
+    }
+
+    /** The y of entry `n`. */
+    pub fn yAt(self, n : i32) : i32 {
+        return self.ys.get(n - self.dropped);
+    }
+
+    /** The z of entry `n`. */
+    pub fn zAt(self, n : i32) : i32 {
+        return self.zs.get(n - self.dropped);
+    }
+
+    /** The block entry `n` replaced. */
+    pub fn wasAt(self, n : i32) : i32 {
+        return self.before.get(n - self.dropped);
+    }
+
+    /** The block entry `n` put there. */
+    pub fn nowAt(self, n : i32) : i32 {
+        return self.after.get(n - self.dropped);
+    }
+
+    /** Forgets every entry numbered below `upTo`. */
+    pub fn trim(mut self, upTo : i32) : void {
+        let mut cut : i32 = upTo - self.dropped;
+        if (cut <= 0) {
+            return;
+        }
+        if (cut > self.xs.len()) {
+            cut = self.xs.len();
+        }
+        let n : i32 = self.xs.len();
+        let nx : Vec<i32> = new Vec<i32>();
+        let ny : Vec<i32> = new Vec<i32>();
+        let nz : Vec<i32> = new Vec<i32>();
+        let nb : Vec<i32> = new Vec<i32>();
+        let na : Vec<i32> = new Vec<i32>();
+        for (i of cut..n) {
+            nx.push(self.xs.get(i));
+            ny.push(self.ys.get(i));
+            nz.push(self.zs.get(i));
+            nb.push(self.before.get(i));
+            na.push(self.after.get(i));
+        }
+        self.xs = nx;
+        self.ys = ny;
+        self.zs = nz;
+        self.before = nb;
+        self.after = na;
+        self.dropped = self.dropped + cut;
+    }
+
+    // Appends the key of the chunk holding cell (x, y, z), and of each chunk its border position reaches, that
+    // `seen` has not got yet.
+    fn collectAround(self, x : i32, y : i32, z : i32, seen : Map<i64, i32>, out : Vec<i64>) : void {
+        let lx : i32 = x & (VW_SIDE - 1);
+        let ly : i32 = y & (VW_SIDE - 1);
+        let lz : i32 = z & (VW_SIDE - 1);
+        for (dz of voxJournalReachLow(lz)..(voxJournalReachHigh(lz) + 1)) {
+            for (dy of voxJournalReachLow(ly)..(voxJournalReachHigh(ly) + 1)) {
+                for (dx of voxJournalReachLow(lx)..(voxJournalReachHigh(lx) + 1)) {
+                    let key : i64 = VoxChunkStore::key(
+                        vwChunkOf(x) + dx,
+                        vwChunkOf(y) + dy,
+                        vwChunkOf(z) + dz
+                    );
+                    if (!seen.has(key)) {
+                        seen.put(key, 1);
+                        out.push(key);
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * The chunks whose *mesh* an edit among entries `from..to` can change, appended to `out` as packed keys in
+     * order of first appearance, each once. An edit on the border of its chunk changes the neighbouring chunks
+     * too (their faces and corner shading look across the border), so up to eight chunks per edit.
+     */
+    pub fn dirtyChunks(self, from : i32, to : i32, out : Vec<i64>) : void {
+        let seen : Map<i64, i32> = new Map<i64, i32>();
+        for (n of from..to) {
+            self.collectAround(self.xAt(n), self.yAt(n), self.zAt(n), seen, out);
+        }
+    }
+}

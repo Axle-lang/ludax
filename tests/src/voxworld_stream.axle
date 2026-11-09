@@ -1,0 +1,213 @@
+// voxworld_stream — the streamer: the loaded set is the expected set, memory stays bounded, budgets hold.
+//
+// The expected set is computed by brute force from the geometry (a disc of columns, hysteresis kept from the
+// previous set), then compared with what the streamer left in the store. The long walk moves the focus
+// across ten thousand blocks and checks the memory figure at every step against a bound derived from the
+// radius alone, so a leak of chunks (or of bytes inside them) shows as a failure.
+
+use ludax::{
+    Checks, VoxWorld, VoxStreamer, VoxStreamBudget, VoxStreamReport, VoxChunkStore, VoxChunk, sinD
+};
+
+// The largest a chunk can be: 16-bit cells (8192 bytes) plus palette and bookkeeping.
+const VOXSTREAM_CHUNK_MAX_BYTES : i64 = 10240;
+
+/** Checks the streamer's loaded set, hysteresis, budgets and memory bound. */
+pub class VoxWorldStreamSuite {
+    // True when every chunk of every column within `r` of (cx, cz) is loaded.
+    static fn discLoaded(w : VoxWorld, cx : i32, cz : i32, r : i32) : bool {
+        for (dz of (0 - r)..(r + 1)) {
+            for (dx of (0 - r)..(r + 1)) {
+                if (dx * dx + dz * dz <= r * r) {
+                    for (cy of 0..8) {
+                        if (!w.isLoaded(cx + dx, cy, cz + dz)) {
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
+        return true;
+    }
+
+    // How many loaded chunks lie outside the disc of radius `r` around (cx, cz).
+    static fn outside(w : VoxWorld, cx : i32, cz : i32, r : i32) : i32 {
+        let mut n : i32 = 0;
+        let mut pos : i32 = w.store.first();
+        while (pos >= 0) {
+            let key : i64 = w.store.keyAt(pos);
+            let dx : i32 = VoxChunkStore::keyX(key) - cx;
+            let dz : i32 = VoxChunkStore::keyZ(key) - cz;
+            if (dx * dx + dz * dz > r * r) {
+                n = n + 1;
+            }
+            pos = w.store.next(pos);
+        }
+        return n;
+    }
+
+    // A checksum of the loaded keys in store order and of every block of every loaded chunk.
+    static fn digest(w : VoxWorld) : i64 {
+        let mut h : i64 = 1469598103934665603;
+        let mut pos : i32 = w.store.first();
+        while (pos >= 0) {
+            h = (h ^ w.store.keyAt(pos)) * 1099511628211;
+            let ch : VoxChunk = w.store.chunkAt(pos);
+            for (i of 0..4096) {
+                h = (h ^ (ch.get(i) as i64)) * 1099511628211;
+            }
+            pos = w.store.next(pos);
+        }
+        return h;
+    }
+
+    static fn settle(s : VoxStreamer, w : VoxWorld, x : f64, z : f64, parallel : bool) : i32 {
+        let mut rounds : i32 = 0;
+        let mut rep : VoxStreamReport = s.update(w, x, z, VoxStreamBudget::unlimited(parallel));
+        while (rep.pending > 0 && rounds < 50) {
+            rep = s.update(w, x, z, VoxStreamBudget::unlimited(parallel));
+            rounds = rounds + 1;
+        }
+        return rounds;
+    }
+
+    /** Runs every check. */
+    pub static fn run(c : Checks) : void {
+        // A fresh world holds exactly the disc.
+        let w : VoxWorld = new VoxWorld(77, 44, 1);
+        let s : VoxStreamer = new VoxStreamer(3, 1);
+        s.update(w, 8.0, 8.0, VoxStreamBudget::unlimited(false));
+        c.sameInt(
+            "a fresh world loads the whole disc",
+            w.store.count(),
+            VoxStreamer::discColumns(3) * 8
+        );
+        c.that("every wanted chunk is loaded", VoxWorldStreamSuite::discLoaded(w, 0, 0, 3));
+        c.sameInt(
+            "no chunk outside the disc is loaded",
+            VoxWorldStreamSuite::outside(w, 0, 0, 3),
+            0
+        );
+        let again : VoxStreamReport = s.update(w, 9.0, 9.0, VoxStreamBudget::unlimited(false));
+        c.sameInt("a settled streamer does nothing", again.loaded + again.unloaded, 0);
+
+        // Hysteresis: one chunk east, the western edge stays loaded; two chunks, it goes.
+        s.update(w, 24.0, 8.0, VoxStreamBudget::unlimited(false));
+        c.that("after moving, the new disc is loaded", VoxWorldStreamSuite::discLoaded(w, 1, 0, 3));
+        c.that("the old border is kept inside the hysteresis radius", w.isLoaded(-3, 3, 0));
+        c.that(
+            "nothing beyond the keep radius is kept",
+            VoxWorldStreamSuite::outside(w, 1, 0, 4) == 0
+        );
+        s.update(w, 40.0, 8.0, VoxStreamBudget::unlimited(false));
+        c.that("a column two chunks behind is released", !w.isLoaded(-3, 3, 0));
+        c.sameInt(
+            "nothing beyond the keep radius (2)",
+            VoxWorldStreamSuite::outside(w, 2, 0, 4),
+            0
+        );
+        w.close();
+
+        // Budgets: a teleport is spread over several updates, nearest chunks first.
+        let b : VoxWorld = new VoxWorld(77, 44, 1);
+        let sb : VoxStreamer = new VoxStreamer(4, 1);
+        let r1 : VoxStreamReport = sb.update(b, 0.0, 0.0, VoxStreamBudget {
+            load: 20,
+            unload: 5,
+            parallel: false,
+        });
+        c.sameInt("the load budget is the most one update loads", r1.loaded, 20);
+        c.that(
+            "the nearest column comes first",
+            b.isLoaded(0, 0, 0) && b.isLoaded(0, 7, 0) && b.isLoaded(0, 3, 0)
+        );
+        c.that("the farthest column does not come early", !b.isLoaded(4, 0, 0));
+        c.that("after the first update some work is still pending", r1.pending > 0);
+        let mut total : i32 = r1.loaded;
+        let mut updates : i32 = 1;
+        let mut last : VoxStreamReport = r1;
+        while (last.pending > 0 && updates < 100) {
+            last = sb.update(b, 0.0, 0.0, VoxStreamBudget { load: 20, unload: 5, parallel: false });
+            c.that("every update stays inside its budget", last.loaded <= 20);
+            total = total + last.loaded;
+            updates = updates + 1;
+        }
+        c.sameInt(
+            "the budgeted updates reach the same set",
+            b.store.count(),
+            VoxStreamer::discColumns(4) * 8
+        );
+        c.that("loading the whole disc took more than five updates", updates > 5);
+        let far : VoxStreamReport = sb.update(b, 4000.0, 0.0, VoxStreamBudget {
+            load: 1000000,
+            unload: 6,
+            parallel: false,
+        });
+        c.sameInt("the unload budget bounds the drops", far.unloaded, 6);
+        b.close();
+
+        // The long walk: 10,000 blocks.
+        let walk : VoxWorld = new VoxWorld(2024, 44, 3);
+        let sw : VoxStreamer = new VoxStreamer(2, 1);
+        let mut x : f64 = 0.0;
+        sw.update(walk, x, 0.0, VoxStreamBudget::unlimited(true));
+        let steady : i64 = walk.store.bytesUsed();
+        let columns : i32 = VoxStreamer::discColumns(3);
+        let bound : i64 = (columns * 8) as i64 * VOXSTREAM_CHUNK_MAX_BYTES;
+        let mut peak : i64 = steady;
+        let mut peakChunks : i32 = walk.store.count();
+        let mut okSet : bool = true;
+        let mut steps : i32 = 0;
+        while (x < 10000.0) {
+            x = x + 24.0;
+            let z : f64 = 40.0 * sinD(x / 500.0);
+            let rep : VoxStreamReport = sw.update(walk, x, z, VoxStreamBudget::unlimited(true));
+            let cx : i32 = VoxStreamer::chunkOf(x);
+            let cz : i32 = VoxStreamer::chunkOf(z);
+            if (!VoxWorldStreamSuite::discLoaded(walk, cx, cz, 2)
+                || VoxWorldStreamSuite::outside(walk, cx, cz, 3) != 0) {
+                okSet = false;
+            }
+            let bytes : i64 = walk.store.bytesUsed();
+            if (bytes > peak) {
+                peak = bytes;
+            }
+            if (walk.store.count() > peakChunks) {
+                peakChunks = walk.store.count();
+            }
+            steps = steps + 1;
+        }
+        println("  measured walk of 10000 blocks: ${steps} updates, ${walk.generated()} chunks generated, steady ${steady} bytes, peak ${peak} bytes (${peakChunks} chunks), bound ${bound}");
+        c.that("the loaded set is the expected set at every step of the walk", okSet);
+        c.that("memory never exceeds the bound given by the radius", peak <= bound);
+        c.that(
+            "palettes hold the walk in a quarter of the dense cost (one i32 per cell)",
+            peak * 4 <= (peakChunks as i64) * 16384
+        );
+        c.that("memory stays within three times the first fill", peak <= steady * 3);
+        c.that("chunk count never exceeds the keep disc", peakChunks <= columns * 8);
+        c.that(
+            "the walk generated far more chunks than it holds",
+            walk.generated() > (peakChunks as i64) * 10
+        );
+        walk.close();
+
+        // Two runs of the same walk, one serial and one on the pool, end in the same world.
+        let ra : VoxWorld = new VoxWorld(5, 44, 1);
+        let rb : VoxWorld = new VoxWorld(5, 44, 3);
+        let sa : VoxStreamer = new VoxStreamer(2, 1);
+        let sc : VoxStreamer = new VoxStreamer(2, 1);
+        let mut px : f64 = 0.0;
+        for (k of 0..40) {
+            px = px + 21.0;
+            sa.update(ra, px, px * 0.3, VoxStreamBudget { load: 7, unload: 1000, parallel: false });
+            sc.update(rb, px, px * 0.3, VoxStreamBudget { load: 7, unload: 1000, parallel: true });
+        }
+        c.that(
+            "serial and pooled streaming end in the same world",
+            VoxWorldStreamSuite::digest(ra) == VoxWorldStreamSuite::digest(rb)
+        );
+        ra.close();
+        rb.close();
+    }
+}

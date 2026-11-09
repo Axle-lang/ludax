@@ -1,0 +1,230 @@
+// voxworld_mesh — the mesher: quad counts of known shapes, exposed faces against brute force, borders, shading.
+//
+// A flat slab merges into exactly its six sides, and across a chunk border the wall between two slab chunks is
+// not drawn. On generated terrain the number of exposed faces the mesher counts must equal a brute-force count
+// over every cell and its six neighbours, and the merged quads must cover exactly that many faces: a merge that
+// loses or doubles a face breaks one of the two equalities.
+
+use ludax::{
+    Checks, VoxChunk, VoxChunkStore, VoxMesh, VoxMesher, VoxWorld, VoxStreamer, VoxStreamBudget,
+    VW_STONE, VW_WATER, VW_AIR
+};
+
+/** Checks the mesher's quad counts, exposure against brute force, borders and shading. */
+pub class VoxWorldMeshSuite {
+    static fn slab(s : VoxChunkStore, cx : i32, x1 : i32, y1 : i32, z1 : i32) : void {
+        let ch : VoxChunk = new VoxChunk();
+        for (y of 0..y1) {
+            for (z of 0..z1) {
+                for (x of 0..x1) {
+                    ch.put(x, y, z, VW_STONE);
+                }
+            }
+        }
+        s.insert(cx, 0, 0, ch);
+    }
+
+    static fn maxOcclusion(m : VoxMesh) : i32 {
+        let mut top : i32 = 0;
+        for (i of 0..m.vertexCount()) {
+            if (m.occlusion(i) > top) {
+                top = m.occlusion(i);
+            }
+        }
+        return top;
+    }
+
+    // A slab filling x 0..15, z 0..15, y 0..3: its quad counts, normals and texture runs, then the wall that a
+    // neighbouring slab chunk hides.
+    static fn slabs(c : Checks, mesher : VoxMesher, mesh : VoxMesh) : void {
+        let s : VoxChunkStore = new VoxChunkStore();
+        VoxWorldMeshSuite::slab(s, 0, 16, 4, 16);
+        mesher.build(s, 0, 0, 0, mesh, true);
+        c.sameInt("a flat slab merges into its six sides", mesh.quadCount(), 6);
+        c.sameInt("a single block meshes to 24 vertices, four per face", mesh.vertexCount(), 24);
+        c.sameInt("a single block meshes to 36 indices, six per face", mesh.indexCount(), 36);
+        c.sameInt(
+            "exposed faces: top and bottom 256 each, four sides 64 each",
+            mesh.exposedFaces(),
+            2 * 256 + 4 * 64
+        );
+        c.sameInt(
+            "the quads cover every exposed face",
+            mesh.coveredFaces() as i32,
+            mesh.exposedFaces()
+        );
+        c.sameInt("a flat slab has no occlusion", VoxWorldMeshSuite::maxOcclusion(mesh), 0);
+
+        let plain : VoxMesh = new VoxMesh();
+        mesher.build(s, 0, 0, 0, plain, false);
+        c.sameInt("face culling emits one quad per exposed face", plain.quadCount(), 768);
+        c.sameInt(
+            "both meshers agree on the exposed faces",
+            plain.exposedFaces(),
+            mesh.exposedFaces()
+        );
+
+        VoxWorldMeshSuite::topQuad(c, mesh);
+
+        // A second slab chunk next door: the wall between them is not drawn.
+        VoxWorldMeshSuite::slab(s, 1, 16, 4, 16);
+        mesher.build(s, 0, 0, 0, mesh, true);
+        c.sameInt("a neighbour's blocks hide the shared wall", mesh.quadCount(), 5);
+        c.sameInt("exposed faces lose that wall", mesh.exposedFaces(), 2 * 256 + 3 * 64);
+        c.sameInt(
+            "brute force agrees across the border",
+            VoxMesher::bruteExposed(s, 0, 0, 0),
+            mesh.exposedFaces()
+        );
+        s.remove(1, 0, 0);
+        mesher.build(s, 0, 0, 0, mesh, true);
+        c.sameInt("an unloaded neighbour reads as air", mesh.quadCount(), 6);
+    }
+
+    // Normals point out of the slab: the top quad's vertices are at y = 4 with normal +y, and it runs 16 units.
+    static fn topQuad(c : Checks, mesh : VoxMesh) : void {
+        let mut topQuads : i32 = 0;
+        for (i of 0..mesh.vertexCount()) {
+            if (mesh.ny(i) > 0.5) {
+                topQuads = topQuads + 1;
+                c.near("a top vertex lies on the top plane", mesh.y(i) as f64, 4.0, 0.0001);
+            }
+        }
+        c.sameInt(
+            "the flat top of the slab is one quad of four upward-facing vertices",
+            topQuads,
+            4
+        );
+
+        let mut topU : f32 = 0.0;
+        let mut topV : f32 = 0.0;
+        for (i of 0..mesh.vertexCount()) {
+            if (mesh.ny(i) > 0.5 && mesh.u(i) > topU) {
+                topU = mesh.u(i);
+            }
+            if (mesh.ny(i) > 0.5 && mesh.v(i) > topV) {
+                topV = mesh.v(i);
+            }
+        }
+        c.near("a merged 16 x 16 quad runs 16 texture units across", topU as f64, 16.0, 0.0001);
+        c.near("the merged top quad runs 16 texture units along v", topV as f64, 16.0, 0.0001);
+    }
+
+    // Shading: a pillar on a floor darkens the floor tiles beside it and splits the top quad.
+    static fn shading(c : Checks, mesher : VoxMesher, mesh : VoxMesh) : void {
+        let f : VoxChunkStore = new VoxChunkStore();
+        VoxWorldMeshSuite::slab(f, 0, 16, 1, 16);
+        mesher.build(f, 0, 0, 0, mesh, true);
+        c.sameInt("a bare floor meshes to six quads", mesh.quadCount(), 6);
+
+        f.setBlock(8, 1, 8, VW_STONE);
+        mesher.build(f, 0, 0, 0, mesh, true);
+        c.that(
+            "a pillar darkens the corners beside it",
+            VoxWorldMeshSuite::maxOcclusion(mesh) >= 1
+        );
+        c.that("the pillar breaks up the merge", mesh.quadCount() > 6);
+        c.sameInt(
+            "a pillar adds four sides and a top and takes one top tile",
+            mesh.exposedFaces(),
+            2 * 256 + 4 * 16 + 4
+        );
+        c.sameInt(
+            "coverage still equals exposure",
+            mesh.coveredFaces() as i32,
+            mesh.exposedFaces()
+        );
+
+        f.setBlock(8, 1, 8, VW_AIR);
+        mesher.build(f, 0, 0, 0, mesh, true);
+        c.sameInt("removing the pillar restores the floor mesh", mesh.quadCount(), 6);
+    }
+
+    // Water against water has no wall, water against air has.
+    static fn water(c : Checks, mesher : VoxMesher, mesh : VoxMesh) : void {
+        let wat : VoxChunkStore = new VoxChunkStore();
+        let wc : VoxChunk = new VoxChunk();
+        for (z of 0..16) {
+            for (x of 0..16) {
+                wc.put(x, 0, z, VW_WATER);
+                wc.put(x, 1, z, VW_WATER);
+            }
+        }
+        wat.insert(0, 0, 0, wc);
+        mesher.build(wat, 0, 0, 0, mesh, true);
+        c.sameInt("a water body is six quads, none between its layers", mesh.quadCount(), 6);
+    }
+
+    // Generated terrain: exposure against brute force, coverage against exposure.
+    static fn terrain(c : Checks, mesher : VoxMesher, mesh : VoxMesh, w : VoxWorld) : void {
+        let plain : VoxMesh = new VoxMesh();
+        let mut matched : bool = true;
+        let mut covered : bool = true;
+        let mut cappedGreedy : bool = true;
+        let mut quadsGreedy : i32 = 0;
+        let mut quadsPlain : i32 = 0;
+        let mut checked : i32 = 0;
+        for (cy of 0..8) {
+            for (cz of -1..2) {
+                for (cx of -1..2) {
+                    mesher.build(w.store, cx, cy, cz, mesh, true);
+                    mesher.build(w.store, cx, cy, cz, plain, false);
+                    if (mesh.exposedFaces() != VoxMesher::bruteExposed(w.store, cx, cy, cz)) {
+                        matched = false;
+                    }
+                    let greedyCovers : bool = mesh.coveredFaces() == mesh.exposedFaces() as i64;
+                    let plainCovers : bool = plain.coveredFaces() == plain.exposedFaces() as i64;
+                    if (!greedyCovers || !plainCovers) {
+                        covered = false;
+                    }
+                    if (mesh.quadCount() > plain.quadCount()) {
+                        cappedGreedy = false;
+                    }
+                    quadsGreedy = quadsGreedy + mesh.quadCount();
+                    quadsPlain = quadsPlain + plain.quadCount();
+                    checked = checked + 1;
+                }
+            }
+        }
+        println("  measured terrain meshing over ${checked} chunks: ${quadsPlain} quads culled, ${quadsGreedy} quads greedy");
+        c.that("exposed faces equal the brute-force count on terrain", matched);
+        c.that("merged quads cover exactly the exposed faces on terrain", covered);
+        c.that("greedy never emits more quads than culling", cappedGreedy);
+        c.that("greedy emits clearly fewer quads on terrain", quadsGreedy * 10 < quadsPlain * 7);
+    }
+
+    // An edit on a chunk border changes the neighbour's mesh too.
+    static fn seam(c : Checks, mesher : VoxMesher, w : VoxWorld) : void {
+        let seam : VoxMesh = new VoxMesh();
+        let before : VoxMesh = new VoxMesh();
+        w.setBlock(16, 125, 4, VW_STONE);
+        mesher.build(w.store, 1, 7, 0, before, true);
+        c.sameInt("a lone block in the sky shows six faces", before.exposedFaces(), 6);
+
+        w.setBlock(15, 125, 4, VW_STONE);
+        mesher.build(w.store, 1, 7, 0, seam, true);
+        c.sameInt(
+            "a block placed at x = 15 hides one face of the chunk beyond the border",
+            seam.exposedFaces(),
+            5
+        );
+        mesher.build(w.store, 0, 7, 0, seam, true);
+        c.sameInt("and the chunk it is in shows five of its own", seam.exposedFaces(), 5);
+    }
+
+    /** Runs every check. */
+    pub static fn run(c : Checks) : void {
+        let mesher : VoxMesher = new VoxMesher();
+        let mesh : VoxMesh = new VoxMesh();
+        VoxWorldMeshSuite::slabs(c, mesher, mesh);
+        VoxWorldMeshSuite::shading(c, mesher, mesh);
+        VoxWorldMeshSuite::water(c, mesher, mesh);
+
+        let w : VoxWorld = new VoxWorld(11, 44, 1);
+        let st : VoxStreamer = new VoxStreamer(3, 1);
+        st.update(w, 8.0, 8.0, VoxStreamBudget::unlimited(false));
+        VoxWorldMeshSuite::terrain(c, mesher, mesh, w);
+        VoxWorldMeshSuite::seam(c, mesher, w);
+        w.close();
+    }
+}

@@ -1,0 +1,625 @@
+// flood — block light (red, green, blue at 8 bits and beyond) and sky light, edited incrementally.
+//
+// Block light is a *sum over sources*. Every emitting block ("lamp") floods its own field: the light it
+// brings to a cell is `round(strength * S(d))` where `S` is the calibrated inverse-square curve (see curve)
+// and `d` the length in cells of the shortest path from the lamp, a cell that stops part of a channel
+// multiplying what arrives by its transmittance (so red glass stops green and blue, per channel). Among
+// shortest paths the least absorbed wins. That order (shorter first, then brighter) is monotone under a step,
+// so the field of one lamp is a pure function of the scene and the lamp, found by a breadth-first flood, and
+// does not depend on the order cells are visited in; the world's light is the plain integer sum of these
+// fields.
+//
+// Why a sum of fields instead of voxel's "brightest wins" flood, which was the first design here and is
+// wrong in a way worth recording: with an inverse-square curve, "which of two states is better" depends on how
+// far the light still has to go, so a per-cell maximum is not order-independent and an incremental removal
+// cannot restore what a rebuild would give (the randomised test found it at once). Superposition needs no
+// such choice, it is physically what light does, and integer addition is exactly invertible: an edit
+// subtracts the fields of the lamps it can affect in the old scene, changes the block, and adds their
+// fields in the new one. Remove-then-add is the identity by arithmetic. Lamps farther from the edit than the
+// curve's range cannot be affected and are skipped.
+//
+// Sky light is one scalar plane. A column open to the sky is 255 down to its first block (leaves and glass
+// multiply it by their transmittance on the way); that is the *seed* of each cell, found by scanning the
+// column. From the seeds light spreads sideways and upward losing `skyStep` per cell, which gives the soft
+// gradient into overhangs. Here "brightest wins" is right (the step is monotone in the level) and the classic
+// two-pass removal is used; an edit rescans its column and floods the difference.
+//
+// Per-cell emitters. A lamp is a cell, not a block id: `setEmitter` gives any cell its own colour and strength
+// (0..1023 per channel, a lamp block is 255) and its own pass mask, and that replaces what the cell's block
+// would emit; `clearEmitter` gives the cell back to its block. Two lanterns of one block id can therefore
+// differ, and a cell that is air can be a source. The override is scene data, not derived light, so a rebuild
+// keeps it and a `setBlock` on the cell drops it (a new block is a new thing). A pass mask lets that one lamp's
+// light through every block that shares an obstacle class with it (a torch that ignores leaves, a spotlight
+// that ignores glass); other lamps are unaffected. All edits keep the sum-of-fields rule, so remove-then-add is
+// still the identity.
+//
+// Differences from voxel-axle (4-bit levels, one stack per channel, `15 - level` falloff): 8-bit levels;
+// a physical falloff with an exact finite range; per-channel transmittance; sums, so overlapping lamps add;
+// exact remove-then-add; the queues are Rings.
+
+use crate::core::collections::vec::Vec;
+use crate::core::math::scalar::{absI, clampI, maxI};
+use crate::voxel::light::block::BlockLightTable;
+use crate::voxel::light::curve::{VoxLightCurve, VOX_MULT_ONE};
+use crate::voxel::light::grid::{VoxelGrid, VOX_CHUNK, VOX_CHUNK_CELLS, voxChunkOf, voxLocal};
+use crate::voxel::light::plane::VoxLightPlane;
+use crate::voxel::light::queue::VoxLightQueue;
+
+// One byte of a packed plane word.
+const VOX_BYTE_MASK : i32 = 255;
+const VOX_BYTE_BITS : i32 = 8;
+
+// A level is a byte; a lamp override carries 10 bits per channel behind a presence bit.
+const VOX_LEVEL_MAX : i32 = 255;
+
+// The curve table covers whole-cell distances 0..255; further away nothing arrives.
+const VOX_PATH_MAX : i32 = 255;
+
+// A lamp override carries 10 bits per channel.
+const VOX_LAMP_MAX : i32 = 1023;
+const VOX_EMIT_BITS : i32 = 10;
+const VOX_EMIT_PRESENT : i32 = 30;
+
+// Half of 255, added before dividing to round to nearest.
+const VOX_FLOOD_ROUND : i32 = 127;
+
+// The starting room of the two work queues.
+const VOX_FLOOD_QUEUE_ROOM : i32 = 65536;
+
+/** What one cell emits instead of its block: a strength per channel, and the obstacle classes its light ignores. */
+pub struct VoxEmitter {
+    /** Red strength, 0..1023 (a lamp block is 255); more is clamped. */
+    pub red : i32 = 0;
+
+    /** Green strength, same range. */
+    pub green : i32 = 0;
+
+    /** Blue strength, same range. */
+    pub blue : i32 = 0;
+
+    /** Light from this lamp passes every block sharing an obstacle class with this mask as if it were air. */
+    pub pass : i32 = 0;
+}
+
+/** The flooded light fields of one grid, with the incremental edit. */
+pub class VoxLightFlood {
+    grid    : Shared<VoxelGrid>;
+    table   : Shared<BlockLightTable>;
+    curve   : Shared<VoxLightCurve>;
+    skyStep : i32;
+    red     : VoxLightPlane;
+    green   : VoxLightPlane;
+    blue    : VoxLightPlane;
+
+    // The sky domain packed in one plane: the sky seed of a cell in the low byte, the flooded sky level in the
+    // byte above it. One plane fewer is held for the whole world.
+    skySeed : VoxLightPlane;
+
+    // The path state of the block-light spread, packed in one plane: the path length (0..VOX_PATH_MAX, the
+    // spread refuses longer) in the low byte, the 16.16 pass multiplier above it. It is scratch: a spread
+    // writes every cell before it reads it, so a rebuild does not clear it.
+    path      : VoxLightPlane;
+    stamp     : VoxLightPlane;
+    epoch     : i32 = 0;
+    adds      : VoxLightQueue;
+    removes   : VoxLightQueue;
+    changes   : Vec<i64>;
+    touched   : Vec<i32>;
+    lamps     : Vec<i32>;
+    emitters  : VoxLightPlane;
+    passMasks : VoxLightPlane;
+    near      : Vec<i32>;
+    steps     : i64 = 0;
+
+    /**
+     * A flood over `grid` using `table` for the blocks and `curve` for the block-light falloff. Sky light loses
+     * `skyStep` levels (1..255) per cell it spreads sideways. Nothing is lit until `rebuild`.
+     */
+    constructor(
+        own grid : Shared<VoxelGrid>,
+        own table : Shared<BlockLightTable>,
+        own curve : Shared<VoxLightCurve>,
+        skyStep : i32
+    ) {
+        self.grid = grid;
+        self.table = table;
+        self.curve = curve;
+        self.skyStep = maxI(skyStep, 1);
+        self.red = new VoxLightPlane();
+        self.green = new VoxLightPlane();
+        self.blue = new VoxLightPlane();
+        self.skySeed = new VoxLightPlane();
+        self.path = new VoxLightPlane();
+        self.stamp = new VoxLightPlane();
+        self.adds = new VoxLightQueue(VOX_FLOOD_QUEUE_ROOM);
+        self.removes = new VoxLightQueue(VOX_FLOOD_QUEUE_ROOM);
+        self.changes = new Vec<i64>();
+        self.touched = new Vec<i32>();
+        self.lamps = new Vec<i32>();
+        self.emitters = new VoxLightPlane();
+        self.passMasks = new VoxLightPlane();
+        self.near = new Vec<i32>();
+    }
+
+    /** How many cells the block-light floods have processed since this was made: the work done. */
+    pub fn work(self) : i64 {
+        return self.steps;
+    }
+
+    /** How many lamps (emitting blocks and emitter overrides) the flood knows. */
+    pub fn lampCount(self) : i32 {
+        return self.lamps.len();
+    }
+
+    /**
+     * What plane `plane` holds at cell id `id`: 0, 1, 2 the block light of red, green, blue (the sum of the
+     * lamps' levels, so it can exceed 255 where lamps overlap), 3 the sky light level 0..255; any other plane
+     * is 0.
+     */
+    pub fn valueAt(self, plane : i32, id : i32) : i32 {
+        return match plane {
+            0 => self.blockPlane(0).get(id),
+            1 => self.blockPlane(1).get(id),
+            2 => self.blockPlane(2).get(id),
+            3 => self.skyGet(id),
+            _ => 0,
+        };
+    }
+
+    /** The block light of channel `channel` (0 red, 1 green, 2 blue) at cell id `id`. */
+    pub fn blockLevel(self, id : i32, channel : i32) : i32 {
+        return self.blockPlane(channel).get(id);
+    }
+
+    /** The sky light level 0..255 at cell id `id`. */
+    pub fn skyLevel(self, id : i32) : i32 {
+        return self.skyGet(id);
+    }
+
+    fn skyGet(self, id : i32) : i32 {
+        return (self.skySeed.get(id) >>> VOX_BYTE_BITS) & VOX_BYTE_MASK;
+    }
+
+    fn skySet(mut self, id : i32, level : i32) : void {
+        let word : i32 = self.skySeed.get(id);
+        self.skySeed.set(id, (word & VOX_BYTE_MASK) | ((level & VOX_BYTE_MASK) << VOX_BYTE_BITS));
+    }
+
+    fn seedGet(self, id : i32) : i32 {
+        return self.skySeed.get(id) & VOX_BYTE_MASK;
+    }
+
+    fn seedSet(mut self, id : i32, seed : i32) : void {
+        let word : i32 = self.skySeed.get(id);
+        self.skySeed.set(id, (word & (VOX_BYTE_MASK << VOX_BYTE_BITS)) | (seed & VOX_BYTE_MASK));
+    }
+
+    fn pathLen(self, id : i32) : i32 {
+        return self.path.get(id) & VOX_BYTE_MASK;
+    }
+
+    fn pathMult(self, id : i32) : i32 {
+        return self.path.get(id) >>> VOX_BYTE_BITS;
+    }
+
+    fn pathSet(mut self, id : i32, len : i32, mult : i32) : void {
+        self.path.set(id, len | (mult << VOX_BYTE_BITS));
+    }
+
+    /** Throws away all light and floods the whole grid from its blocks. */
+    pub fn rebuild(mut self) : void {
+        self.sync();
+        self.red.clear();
+        self.green.clear();
+        self.blue.clear();
+        self.skySeed.clear();
+        self.stamp.clear();
+        self.epoch = 0;
+
+        self.floodAllLamps();
+        self.floodAllSky();
+    }
+
+    // Finds every emitting cell and floods its field in.
+    fn floodAllLamps(mut self) : void {
+        self.lamps.clear();
+        let cells : i32 = self.grid.slotCount() * VOX_CHUNK_CELLS;
+        for (id of 0..cells) {
+            if (self.emitsAt(id)) {
+                self.lamps.push(id);
+            }
+        }
+        for (i of 0..self.lamps.len()) {
+            self.floodLamp(self.lamps.get(i), 1);
+        }
+    }
+
+    // Scans the seed of every column, then floods the sky outward from the seeded cells.
+    fn floodAllSky(mut self) : void {
+        self.changes.clear();
+        for (z of self.grid.lowCell(2)..self.grid.highCell(2)) {
+            for (x of self.grid.lowCell(0)..self.grid.highCell(0)) {
+                self.scanColumn(x, z);
+            }
+        }
+        self.changes.clear();
+
+        let cells : i32 = self.grid.slotCount() * VOX_CHUNK_CELLS;
+        for (id of 0..cells) {
+            let seed : i32 = self.seedGet(id);
+            if (seed > 0) {
+                self.skySet(id, seed);
+                self.adds.push(id, 0);
+            }
+        }
+        self.propagateSky();
+    }
+
+    /**
+     * Sets the block at (x, y, z) to `block` and brings the light up to date. A chunk that does not exist yet
+     * is created (dark until the next `rebuild`; the cell itself and what it touches are right).
+     */
+    pub fn setBlock(mut self, x : i32, y : i32, z : i32, block : i32) : void {
+        let id : i32 = self.beginEdit(x, y, z);
+        self.grid.setBlockOfId(id, block);
+        self.emitters.set(id, 0);
+        self.passMasks.set(id, 0);
+        self.endEdit(id);
+        self.updateColumn(x, z);
+        self.refloodSky(id);
+        self.propagateSky();
+    }
+
+    /**
+     * Makes the cell (x, y, z) a lamp of its own: the strengths of `lamp` replace what its block emits. All
+     * three zero is a switched-off lamp even on an emitting block. A chunk that does not exist yet is created.
+     */
+    pub fn setEmitter(mut self, x : i32, y : i32, z : i32, lamp : VoxEmitter) : void {
+        let red : i32 = clampI(lamp.red, 0, VOX_LAMP_MAX);
+        let green : i32 = clampI(lamp.green, 0, VOX_LAMP_MAX) << VOX_EMIT_BITS;
+        let blue : i32 = clampI(lamp.blue, 0, VOX_LAMP_MAX) << (2 * VOX_EMIT_BITS);
+        let packed : i32 = red | green | blue | (1 << VOX_EMIT_PRESENT);
+        self.applyEmitter(x, y, z, packed, lamp.pass);
+    }
+
+    /** Gives the cell back to its block: whatever the block emits, with no pass mask. */
+    pub fn clearEmitter(mut self, x : i32, y : i32, z : i32) : void {
+        self.applyEmitter(x, y, z, 0, 0);
+    }
+
+    /** True when cell (x, y, z) has an emitter override. */
+    pub fn hasEmitter(self, x : i32, y : i32, z : i32) : bool {
+        let id : i32 = self.grid.cellId(x, y, z);
+        return id >= 0 && ((self.emitters.get(id) >>> VOX_EMIT_PRESENT) & 1) == 1;
+    }
+
+    // Swaps the override of a cell the way `setBlock` swaps a block: out with every field the cell can reach,
+    // change, back in.
+    fn applyEmitter(mut self, x : i32, y : i32, z : i32, packed : i32, pass : i32) : void {
+        let id : i32 = self.beginEdit(x, y, z);
+        self.emitters.set(id, packed);
+        self.passMasks.set(id, pass);
+        self.endEdit(id);
+    }
+
+    // The first half of every edit of a cell: creates its chunk, takes out the field of every lamp the cell can
+    // reach (they are listed in `near`) and unregisters the cell's own lamp, so the caller changes the scene
+    // with no light in it from the lamps that matter. Returns the cell id.
+    fn beginEdit(mut self, x : i32, y : i32, z : i32) : i32 {
+        self.grid.ensureChunk(voxChunkOf(x), voxChunkOf(y), voxChunkOf(z));
+        self.sync();
+        let id : i32 = self.grid.cellId(x, y, z);
+        let reach : i32 = self.curve.range() as i32 + 1;
+        self.near.clear();
+        for (i of 0..self.lamps.len()) {
+            let lamp : i32 = self.lamps.get(i);
+            if (self.distanceBetween(lamp, x, y, z) < reach) {
+                self.near.push(lamp);
+            }
+        }
+        for (i of 0..self.near.len()) {
+            self.floodLamp(self.near.get(i), -1);
+        }
+        if (self.emitsAt(id)) {
+            self.forgetLamp(id);
+        }
+        return id;
+    }
+
+    // The second half: registers the cell's lamp as the changed scene has it and floods every lamp of `near`
+    // (and the cell's own) back in. Remove-then-add is the identity by integer arithmetic, so what is left is
+    // exactly the light of the new scene.
+    fn endEdit(mut self, id : i32) : void {
+        let lit : bool = self.emitsAt(id);
+        if (lit) {
+            self.lamps.push(id);
+        }
+        for (i of 0..self.near.len()) {
+            if (self.near.get(i) != id) {
+                self.floodLamp(self.near.get(i), 1);
+            }
+        }
+        if (lit) {
+            self.floodLamp(id, 1);
+        }
+    }
+
+    // Makes every plane cover the grid's current chunks.
+    fn sync(mut self) : void {
+        let slots : i32 = self.grid.slotCount();
+        self.red.ensure(slots);
+        self.green.ensure(slots);
+        self.blue.ensure(slots);
+        self.skySeed.ensure(slots);
+        self.path.ensure(slots);
+        self.stamp.ensure(slots);
+        self.emitters.ensure(slots);
+        self.passMasks.ensure(slots);
+    }
+
+    // The plane of block-light channel `channel`: 0 red, 1 green, anything else blue.
+    fn blockPlane(self, channel : i32) : VoxLightPlane {
+        if (channel == 0) {
+            return self.red;
+        }
+        if (channel == 1) {
+            return self.green;
+        }
+        return self.blue;
+    }
+
+    // What cell `id` emits in channel `ch`: its override when it has one, else what its block emits.
+    fn emissionAt(self, id : i32, ch : i32) : i32 {
+        let o : i32 = self.emitters.get(id);
+        if (((o >>> VOX_EMIT_PRESENT) & 1) == 1) {
+            return (o >>> (VOX_EMIT_BITS * ch)) & VOX_LAMP_MAX;
+        }
+        return self.table.emission(self.grid.blockOfId(id), ch);
+    }
+
+    fn emitsAt(self, id : i32) : bool {
+        return self.emissionAt(id, 0) + self.emissionAt(id, 1) + self.emissionAt(id, 2) > 0;
+    }
+
+    // Taxicab distance from lamp cell `lamp` to the world cell (x, y, z).
+    fn distanceBetween(self, lamp : i32, x : i32, y : i32, z : i32) : i32 {
+        let dx : i32 = absI(self.grid.cellX(lamp) - x);
+        let dy : i32 = absI(self.grid.cellY(lamp) - y);
+        let dz : i32 = absI(self.grid.cellZ(lamp) - z);
+        return dx + dy + dz;
+    }
+
+    // Takes cell `id` out of the lamp registry (the order of the registry does not matter: sums commute).
+    fn forgetLamp(mut self, id : i32) : void {
+        for (i of 0..self.lamps.len()) {
+            if (self.lamps.get(i) == id) {
+                self.lamps.swapRemove(i);
+                return;
+            }
+        }
+    }
+
+    // Adds (sign 1) or subtracts (sign -1) the field of the lamp in cell `lamp`, in the current scene.
+    fn floodLamp(mut self, lamp : i32, sign : i32) : void {
+        let pass : i32 = self.passMasks.get(lamp);
+        for (ch of 0..3) {
+            let strength : i32 = self.emissionAt(lamp, ch);
+            if (strength <= 0) {
+                continue;
+            }
+
+            self.spread(lamp, ch, strength, pass);
+            let plane : VoxLightPlane = self.blockPlane(ch);
+            for (i of 0..self.touched.len()) {
+                let id : i32 = self.touched.get(i);
+                let through : i32 = self.pathMult(id);
+                let level : i32 = self.curve.level(strength, through, self.pathLen(id));
+                plane.set(id, plane.get(id) + sign * level);
+            }
+        }
+    }
+
+    // Finds, for every cell the lamp at `start` lights in channel `ch`, the length of the shortest path and the
+    // share of the light that path lets through, leaving the cells in `touched`, the lengths in `reached` and
+    // the shares in `through`. Breadth first: every cell is popped after all cells one step nearer, so by then
+    // it has seen every way in of that length and holds the least absorbed one.
+    fn spread(mut self, start : i32, ch : i32, strength : i32, pass : i32) : void {
+        self.epoch = self.epoch + 1;
+        self.touched.clear();
+        self.stamp.set(start, self.epoch);
+        self.pathSet(start, 0, VOX_MULT_ONE);
+        self.touched.push(start);
+        self.adds.push(start, 0);
+        while (!self.adds.isEmpty()) {
+            let id : i32 = VoxLightQueue::idOf(self.adds.pop());
+            let d : i32 = self.pathLen(id) + 1;
+            let m : i32 = self.pathMult(id);
+            self.steps = self.steps + 1;
+            if (d > VOX_PATH_MAX) {
+                continue;
+            }
+            for (f of 0..6) {
+                let n : i32 = self.grid.neighbour(id, f);
+                if (n < 0) {
+                    continue;
+                }
+                let t : i32 = self.lampTransmit(self.grid.blockOfId(n), ch, pass);
+                if (t == 0) {
+                    continue;
+                }
+
+                let scaled : i64 = m as i64 * t as i64 + VOX_FLOOD_ROUND as i64;
+                let nm : i32 = (scaled / VOX_LEVEL_MAX as i64) as i32;
+                if (self.curve.level(strength, nm, d) == 0) {
+                    continue;
+                }
+                if (self.stamp.get(n) != self.epoch) {
+                    self.stamp.set(n, self.epoch);
+                    self.pathSet(n, d, nm);
+                    self.touched.push(n);
+                    self.adds.push(n, 0);
+                } else if (self.pathLen(n) == d && nm > self.pathMult(n)) {
+                    self.pathSet(n, d, nm);
+                }
+            }
+        }
+    }
+
+    // How much of channel `ch` a cell of block `block` lets through to the lamp's light: all of it for a block
+    // class the lamp's pass mask names.
+    fn lampTransmit(self, block : i32, ch : i32, pass : i32) : i32 {
+        if ((pass & self.table.classOf(block)) != 0) {
+            return VOX_LEVEL_MAX;
+        }
+        return self.table.transmit(block, ch);
+    }
+
+    // The sky level the light of a neighbour at `level` brings through a cell that lets `t` through.
+    fn skyStepped(self, level : i32, t : i32) : i32 {
+        let lost : i32 = level - self.skyStep;
+        if (lost <= 0) {
+            return 0;
+        }
+        return (lost * t + VOX_FLOOD_ROUND) / VOX_LEVEL_MAX;
+    }
+
+    // Floods the sky plane outward from every cell in the add queue until nothing improves.
+    fn propagateSky(mut self) : void {
+        while (!self.adds.isEmpty()) {
+            let id : i32 = VoxLightQueue::idOf(self.adds.pop());
+            let level : i32 = self.skyGet(id);
+            if (level == 0) {
+                continue;
+            }
+            for (f of 0..6) {
+                let n : i32 = self.grid.neighbour(id, f);
+                if (n < 0) {
+                    continue;
+                }
+                let t : i32 = self.table.transmitWhite(self.grid.blockOfId(n));
+                if (t == 0) {
+                    continue;
+                }
+                let cand : i32 = self.skyStepped(level, t);
+                if (cand > self.skyGet(n)) {
+                    self.skySet(n, cand);
+                    self.adds.push(n, 0);
+                }
+            }
+        }
+    }
+
+    // Recomputes the sky around cell `id` after its block (or its seed) changed: whatever was derived from its
+    // old level is cleared, then its own seed and its neighbours flow back in. The add queue is left filled;
+    // `propagateSky` finishes the job.
+    fn refloodSky(mut self, id : i32) : void {
+        let old : i32 = self.skyGet(id);
+        if (old > 0) {
+            self.skySet(id, 0);
+            self.removes.push(id, old);
+            self.removeSky();
+        }
+        let seed : i32 = self.seedGet(id);
+        if (seed > 0) {
+            self.skySet(id, seed);
+            self.adds.push(id, 0);
+        }
+        for (f of 0..6) {
+            let n : i32 = self.grid.neighbour(id, f);
+            if (n >= 0 && self.skyGet(n) > 0) {
+                self.adds.push(n, 0);
+            }
+        }
+    }
+
+    // The removal pass. The queue holds cells already cleared, each with the level it had. Invariant: after the
+    // pass, every cell still holding light is *supported* (its level is its own seed, or the step of a
+    // neighbour's surviving level), because a cell fed by a removed cell has a strictly smaller level than it
+    // (each step loses at least one) and every such neighbour is reached here:
+    //   * neighbour level < removed level, and it is not just its own seed: it may depend on the removed cell,
+    //     so it is cleared (back to its own seed, which is then flooded again) and the pass continues from it;
+    //   * neighbour level >= removed level: it cannot depend on the removed cell, so it is a border cell and
+    //     goes to the add queue, from where it refills the hole.
+    // A cell cleared wrongly (it had another source) is refilled by exactly that border. The step is monotone
+    // in the level, which is what makes "brightest wins" order-independent for the sky, as it was not for the
+    // block light.
+    fn removeSky(mut self) : void {
+        while (!self.removes.isEmpty()) {
+            let entry : i64 = self.removes.pop();
+            let id : i32 = VoxLightQueue::idOf(entry);
+            let level : i32 = VoxLightQueue::payloadOf(entry);
+            for (f of 0..6) {
+                let n : i32 = self.grid.neighbour(id, f);
+                if (n < 0) {
+                    continue;
+                }
+                let nl : i32 = self.skyGet(n);
+                if (nl == 0) {
+                    continue;
+                }
+                let seed : i32 = self.seedGet(n);
+                if (nl < level && nl != seed) {
+                    self.skySet(n, seed);
+                    self.removes.push(n, nl);
+                    if (seed > 0) {
+                        self.adds.push(n, 0);
+                    }
+                } else {
+                    self.adds.push(n, 0);
+                }
+            }
+        }
+    }
+
+    // Rescans the sky seeds of column (x, z) and floods the difference.
+    fn updateColumn(mut self, x : i32, z : i32) : void {
+        self.changes.clear();
+        self.scanColumn(x, z);
+        // Seeds that fell first, so every removal sees the final seeds; then the ones that rose.
+        for (i of 0..self.changes.len()) {
+            let change : i64 = self.changes.get(i);
+            let id : i32 = VoxLightQueue::idOf(change);
+            if (self.seedGet(id) < VoxLightQueue::payloadOf(change)) {
+                self.refloodSky(id);
+            }
+        }
+        for (i of 0..self.changes.len()) {
+            let change : i64 = self.changes.get(i);
+            let id : i32 = VoxLightQueue::idOf(change);
+            let seed : i32 = self.seedGet(id);
+            if (seed > VoxLightQueue::payloadOf(change) && seed > self.skyGet(id)) {
+                self.skySet(id, seed);
+                self.adds.push(id, 0);
+            }
+        }
+        self.propagateSky();
+        self.changes.clear();
+    }
+
+    // Walks column (x, z) from the top of the grid down, storing each cell's sky seed. Every cell whose seed
+    // changed is appended to `changes` as `(old seed, id)`.
+    fn scanColumn(mut self, x : i32, z : i32) : void {
+        let mut level : i32 = VOX_LEVEL_MAX;
+        let cx : i32 = voxChunkOf(x);
+        let cz : i32 = voxChunkOf(z);
+        let mut cy : i32 = self.grid.highChunk(1);
+        while (cy >= self.grid.lowChunk(1)) {
+            let slot : i32 = self.grid.slotOf(cx, cy, cz);
+            if (slot >= 0) {
+                let mut ly : i32 = VOX_CHUNK - 1;
+                while (ly >= 0) {
+                    let id : i32 = slot * VOX_CHUNK_CELLS + voxLocal(x, ly, z);
+                    let white : i32 = self.table.transmitWhite(self.grid.blockOfId(id));
+                    level = (level * white + VOX_FLOOD_ROUND) / VOX_LEVEL_MAX;
+                    let old : i32 = self.seedGet(id);
+                    if (level != old) {
+                        self.seedSet(id, level);
+                        self.changes.push(VoxLightQueue::pack(id, old));
+                    }
+                    ly = ly - 1;
+                }
+            }
+            cy = cy - 1;
+        }
+    }
+}
