@@ -1,0 +1,319 @@
+// game_loop — the main loop, with the clock supplied from outside.
+//
+// `GameLoop<M>` is one function of the frame's duration: the caller says how long the last frame took (from a
+// window's present call, a test's script or a replay) and the loop does the rest — clamp a runaway frame, bank
+// the time in a `FixedStep`, run the module's `simulate` for every whole step, then `render` once with the
+// interpolation factor. It never reads a clock, so a test can drive it with any pacing and get exactly the
+// same steps for the same total time; only the optional profiler reads real time, and only to tell people
+// where a frame went.
+//
+// Controls: `pause` stops the clock, `requestStep` runs single steps while paused, `setTimeScale` slows or
+// speeds the simulation (in thousandths, an integer, so the banked time stays exact), `requestQuit` ends the
+// loop. A module can also end it from `wantsQuit`, checked after every step, so a run stops on the very tick
+// the game decides, not at the end of the frame that contained it.
+//
+// Frame times are smoothed over the last eight frames for display (`smoothedFrameNanos`); the simulation never
+// sees the smoothed value, because smoothing it would make the number of steps depend on the pacing.
+
+use crate::core::math::scalar::{maxI, maxI64};
+use crate::core::profile::entry::ProfileEntry;
+use crate::core::profile::names::ProfileNames;
+use crate::core::profile::profiler::Profiler;
+use crate::core::time::clock::{NANOS_PER_SECOND, nanosToSeconds};
+use crate::core::time::fixedstep::FixedStep;
+use crate::runtime::game_module::GameModule;
+
+/** How many recent frames the display average covers. */
+const LOOP_SMOOTH_FRAMES : i32 = 8;
+
+/** 1000 means real time; the time scale is carried in thousandths so the banked time stays exact. */
+const LOOP_SCALE_ONE : i32 = 1000;
+
+// The loop's profiler: scopes (input, simulate, render and room to spare), frames of history and samples a frame.
+const LOOP_PROFILE_SCOPES : i32 = 8;
+const LOOP_PROFILE_FRAMES : i32 = 8;
+const LOOP_PROFILE_SAMPLES : i32 = 16;
+
+// The standard loop's settings.
+const LOOP_STANDARD_HZ : i32 = 60;
+const LOOP_STANDARD_MAX_STEPS : i32 = 8;
+const LOOP_STANDARD_MAX_FRAME_NANOS : i64 = 250000000;
+
+/** The settings of a loop. */
+pub struct LoopConfig {
+    /** Simulation steps per second. */
+    pub stepHz : i32;
+
+    /** The most steps one frame may run; the time beyond that is dropped and counted. */
+    pub maxStepsPerFrame : i32;
+
+    /** The longest frame the loop believes, in nanoseconds; a longer one counts as this (a debugger stop, a window drag). */
+    pub maxFrameNanos : i64;
+
+    /** The simulation speed in thousandths: 1000 is real time, 500 half speed, 0 stopped. */
+    pub timeScaleMilli : i32;
+
+    /** 60 steps a second, at most 8 per frame, frames believed up to 250 ms, real time. */
+    pub static fn standard() : LoopConfig {
+        return LoopConfig {
+            stepHz: LOOP_STANDARD_HZ,
+            maxStepsPerFrame: LOOP_STANDARD_MAX_STEPS,
+            maxFrameNanos: LOOP_STANDARD_MAX_FRAME_NANOS,
+            timeScaleMilli: LOOP_SCALE_ONE,
+        };
+    }
+}
+
+/** Drives a `GameModule` from frame durations. */
+pub class GameLoop<M : GameModule> {
+    fixed        : FixedStep;
+    config       : LoopConfig;
+    names        : ProfileNames;
+    prof         : Profiler;
+    scopeInput   : i32 = 0;
+    scopeSim     : i32 = 0;
+    scopeRender  : i32 = 0;
+    recent       : i64[];
+    recentUsed   : i32 = 0;
+    recentAt     : i32 = 0;
+    paused       : bool = false;
+    stepsOwed    : i32 = 0;
+    quit         : bool = false;
+    frameCount   : i64 = 0;
+    clampedCount : i64 = 0;
+    clampedNanos : i64 = 0;
+    stepsLast    : i32 = 0;
+    scaleMilli   : i32 = LOOP_SCALE_ONE;
+    totalNanos   : i64 = 0;
+
+    /** A loop with the given settings. */
+    constructor(config : LoopConfig) {
+        self.config = config;
+        self.fixed = FixedStep::atHertz(config.stepHz, config.maxStepsPerFrame);
+        self.scaleMilli = maxI(config.timeScaleMilli, 0);
+        self.names = new ProfileNames(LOOP_PROFILE_SCOPES);
+        self.scopeInput = self.names.id("input");
+        self.scopeSim = self.names.id("simulate");
+        self.scopeRender = self.names.id("render");
+        self.prof = new Profiler(LOOP_PROFILE_FRAMES, LOOP_PROFILE_SAMPLES, LOOP_PROFILE_SCOPES);
+        self.recent = new i64[LOOP_SMOOTH_FRAMES as i64];
+        for (i of 0..LOOP_SMOOTH_FRAMES) {
+            self.recent[i] = 0;
+        }
+    }
+
+    /**
+     * Runs one frame that took `frameNanos` of real time. Answers false when the loop has ended (by
+     * `requestQuit` or by the module), in which case this call did nothing or finished the last frame.
+     */
+    pub fn frame(mut self, module : M, frameNanos : i64) : bool {
+        if (self.quit) {
+            return false;
+        }
+        self.prof.beginFrame();
+        let dt : i64 = self.clampFrame(frameNanos);
+        self.remember(dt);
+        self.totalNanos = self.totalNanos + dt;
+
+        let inputToken : i32 = self.prof.begin(self.scopeInput);
+        module.input(self.frameCount);
+        self.prof.end(inputToken);
+
+        self.advanceClock(dt);
+
+        let simToken : i32 = self.prof.begin(self.scopeSim);
+        self.stepsLast = self.runSteps(module);
+        self.prof.end(simToken);
+
+        let renderToken : i32 = self.prof.begin(self.scopeRender);
+        module.render(self.fixed.alpha());
+        self.prof.end(renderToken);
+        self.prof.endFrame();
+
+        self.frameCount = self.frameCount + 1;
+        if (module.wantsQuit()) {
+            self.quit = true;
+        }
+        return !self.quit;
+    }
+
+    // The frame time the loop believes: not negative, not beyond the clamp (the excess is counted).
+    fn clampFrame(mut self, frameNanos : i64) : i64 {
+        let mut dt : i64 = maxI64(frameNanos, 0);
+        if (dt > self.config.maxFrameNanos) {
+            self.clampedCount = self.clampedCount + 1;
+            self.clampedNanos = self.clampedNanos + (dt - self.config.maxFrameNanos);
+            dt = self.config.maxFrameNanos;
+        }
+        return dt;
+    }
+
+    // Banks `dt` of real time scaled by the time scale, or, while paused, the steps that were asked for.
+    fn advanceClock(mut self, dt : i64) : void {
+        if (self.paused) {
+            let owed : i32 = self.stepsOwed;
+            self.stepsOwed = 0;
+            for (i of 0..owed) {
+                self.fixed.advanceNanos(self.fixed.stepNanos());
+            }
+            return;
+        }
+        self.fixed.advanceNanos(dt * self.scaleMilli as i64 / LOOP_SCALE_ONE as i64);
+    }
+
+    // Runs the steps the clock released, stopping on the one after which the module wants to quit; returns how many.
+    fn runSteps(mut self, module : M) : i32 {
+        let mut ran : i32 = 0;
+        let stepSeconds : f32 = self.fixed.stepSeconds();
+        while (!self.quit && self.fixed.takeStep()) {
+            module.simulate(self.fixed.ticks() - 1, stepSeconds);
+            ran = ran + 1;
+            if (module.wantsQuit()) {
+                self.quit = true;
+            }
+        }
+        return ran;
+    }
+
+    // Keeps the last few frame times for the display average.
+    fn remember(mut self, dt : i64) : void {
+        self.recent[self.recentAt] = dt;
+        self.recentAt = (self.recentAt + 1) % LOOP_SMOOTH_FRAMES;
+        if (self.recentUsed < LOOP_SMOOTH_FRAMES) {
+            self.recentUsed = self.recentUsed + 1;
+        }
+    }
+
+    /** Asks the loop to end; the next `frame` answers false. */
+    pub fn requestQuit(mut self) : void {
+        self.quit = true;
+    }
+
+    /** True once the loop has ended. */
+    pub fn hasQuit(self) : bool {
+        return self.quit;
+    }
+
+    /** Stops (or resumes) the simulation clock; frames still render. */
+    pub fn setPaused(mut self, paused : bool) : void {
+        self.paused = paused;
+        if (!paused) {
+            self.stepsOwed = 0;
+        }
+    }
+
+    /** True while paused. */
+    pub fn isPaused(self) : bool {
+        return self.paused;
+    }
+
+    /** While paused, makes the next frame run one more step (they add up; unpaused, the request is dropped). */
+    pub fn requestStep(mut self) : void {
+        if (self.paused) {
+            self.stepsOwed = self.stepsOwed + 1;
+        }
+    }
+
+    /** Sets the simulation speed in thousandths (1000 is real time); negative counts as 0. */
+    pub fn setTimeScale(mut self, milli : i32) : void {
+        self.scaleMilli = milli;
+        if (milli < 0) {
+            self.scaleMilli = 0;
+        }
+    }
+
+    /** The simulation speed in thousandths. */
+    pub fn timeScale(self) : i32 {
+        return self.scaleMilli;
+    }
+
+    /** Frames run so far. */
+    pub fn frames(self) : i64 {
+        return self.frameCount;
+    }
+
+    /** Simulation steps run so far. */
+    pub fn ticks(self) : i64 {
+        return self.fixed.ticks();
+    }
+
+    /** Steps the last frame ran. */
+    pub fn stepsLastFrame(self) : i32 {
+        return self.stepsLast;
+    }
+
+    /** The interpolation factor the last render was given, in [0, 1). */
+    pub fn alpha(self) : f32 {
+        return self.fixed.alpha();
+    }
+
+    /** Simulated time in seconds: whole steps only, whatever the frames were. */
+    pub fn simulatedSeconds(self) : f64 {
+        return self.fixed.simulatedSeconds();
+    }
+
+    /** Real time the loop was told about (after clamping), in nanoseconds. */
+    pub fn elapsedNanos(self) : i64 {
+        return self.totalNanos;
+    }
+
+    /** How many frames were longer than the clamp. */
+    pub fn clampedFrames(self) : i64 {
+        return self.clampedCount;
+    }
+
+    /** Real time cut off by the frame clamp. */
+    pub fn clampedTime(self) : i64 {
+        return self.clampedNanos;
+    }
+
+    /** Real time dropped because a frame owed more steps than the per-frame cap. */
+    pub fn droppedTime(self) : i64 {
+        return self.fixed.droppedNanos();
+    }
+
+    /** The average of the last eight frames, for a frame-rate display; 0 before the first frame. */
+    pub fn smoothedFrameNanos(self) : i64 {
+        if (self.recentUsed == 0) {
+            return 0;
+        }
+        let mut sum : i64 = 0;
+        for (i of 0..self.recentUsed) {
+            sum = sum + self.recent[i];
+        }
+        return sum / self.recentUsed as i64;
+    }
+
+    /** The smoothed frame rate in frames per second; 0 before the first frame. */
+    pub fn smoothedFps(self) : f64 {
+        let n : i64 = self.smoothedFrameNanos();
+        if (n <= 0) {
+            return 0.0;
+        }
+        return nanosToSeconds(NANOS_PER_SECOND) / nanosToSeconds(n);
+    }
+
+    /** Turns the per-phase profiler on or off (it reads the real clock; its numbers are for people only). */
+    pub fn setProfiling(mut self, on : bool) : void {
+        self.prof.setEnabled(on);
+    }
+
+    /** The profiler, for reading its history. */
+    pub fn profiler(self) : Profiler {
+        return self.prof;
+    }
+
+    /**
+     * The inclusive nanoseconds of the phase called `name` ("input", "simulate" or "render") in the last
+     * profiled frame; 0 when profiling is off or the name is unknown.
+     */
+    pub fn phaseNanos(self, name : string) : i64 {
+        for (r of 0..self.prof.entryCount()) {
+            let e : ProfileEntry = self.prof.entry(r);
+            if (self.names.name(e.scope) == name) {
+                return e.inclusiveNanos;
+            }
+        }
+        return 0;
+    }
+}

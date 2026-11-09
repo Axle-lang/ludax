@@ -1,0 +1,427 @@
+// runtime_input — checks for input snapshots, the action map and the input tape.
+//
+// Edges must be derived from two frames, analog values must be exact integers, bindings must resolve to the
+// strongest source, and a tape must replay the live run so exactly that a simulation fed from it ends in the
+// same hash — twice.
+
+use ludax::ActionMap;
+use ludax::ByteBuf;
+use ludax::Checks;
+use ludax::InputState;
+use ludax::InputTape;
+use ludax::Pcg32;
+use ludax::hashCombine;
+
+// An axis is stored as this many steps across [-1, 1], so a value is an exact multiple of 1 / INPUT_AXIS_STEPS.
+const INPUT_AXIS_STEPS : f64 = 4096.0;
+
+// A little simulation that reads one snapshot per step: a point steered by axis 0, nudged by key 10 and
+// kicked by the mouse. Its hash is what the replay must reproduce.
+fn inSimStep(state : InputState, x : i64, v : i64) : i64 {
+    let mut nv : i64 = v + (state.axis(0) * 100.0 as f32) as i64;
+    if (state.isDown(10)) {
+        nv = nv + 3;
+    }
+    if (state.wasPressed(11)) {
+        nv = nv * 2;
+    }
+    nv = nv + (state.mouseDx() * 8.0 as f32) as i64;
+    return hashCombine(x + nv, nv);
+}
+
+// Random input for frame `n`: a few keys flip, the mouse moves, axis 0 wanders.
+fn inGenerate(r : Pcg32, state : InputState) : void {
+    state.beginFrame();
+    for (k of 0..3) {
+        let code : i32 = r.range(0, 24);
+        state.setDown(code, r.nextBool());
+    }
+    state.setDown(256 + r.range(0, 4), r.nextBool());
+    state.addMouseDelta(r.rangeF32(-5.0, 5.0), r.rangeF32(-5.0, 5.0));
+    state.setAxis(0, r.rangeF32(-1.0, 1.0));
+    state.setAxis(r.range(1, 8), r.rangeF32(-1.0, 1.0));
+}
+
+/** The input checks. */
+pub class RuntimeInputSuite {
+    /** Runs every check of the suite. */
+    pub static fn run(c : Checks) : void {
+        inState(c);
+        inActions(c);
+        inTape(c);
+        inReplay(c);
+        inDamage(c);
+    }
+}
+
+fn inState(c : Checks) : void {
+    let s : InputState = new InputState();
+    c.that("input: nothing is down at the start", s.downCount() == 0 && !s.isDown(5));
+    s.setDown(5, true);
+    s.setDown(300, true);
+    c.that(
+        "input: a key and a button are down",
+        s.isDown(5) && s.isDown(300) && s.isDown(InputState::mouseButton(44))
+    );
+    c.sameInt("input: two held keys give a downCount of 2", s.downCount(), 2);
+    c.that(
+        "input: a key pressed this frame reads as pressed and not released",
+        s.wasPressed(5) && !s.wasReleased(5)
+    );
+    s.beginFrame();
+    c.that("input: next frame it is held, not pressed", s.isDown(5) && !s.wasPressed(5));
+    s.setDown(5, false);
+    c.that(
+        "input: a key released this frame reads as released, not down and not pressed",
+        !s.isDown(5) && s.wasReleased(5) && !s.wasPressed(5)
+    );
+    s.beginFrame();
+    c.that("input: the frame after a release reads as not released", !s.wasReleased(5));
+    s.setDown(5, true);
+    s.setDown(5, false);
+    c.that(
+        "input: a press and release inside one frame leaves no edge",
+        !s.wasPressed(5) && !s.wasReleased(5)
+    );
+    s.setDown(-1, true);
+    s.setDown(320, true);
+    c.that(
+        "input: codes out of range are ignored",
+        !s.isDown(-1) && !s.isDown(320) && s.downCount() == 1
+    );
+    c.that(
+        "input: pad button code",
+        InputState::padButton(0) == 272 && InputState::mouseButton(0) == 256
+    );
+    s.setDown(31, true);
+    s.setDown(32, true);
+    c.that(
+        "input: bits across a word boundary stay apart",
+        s.isDown(31) && s.isDown(32) && !s.isDown(30) && !s.isDown(33)
+    );
+
+    let m : InputState = new InputState();
+    m.addMouseDelta(1.5, -2.25);
+    m.addMouseDelta(0.5, 0.25);
+    c.near("input: mouse movement adds up within a frame", m.mouseDx() as f64, 2.0, 0.0);
+    c.near("input: the mouse moves vertically by -2 this frame", m.mouseDy() as f64, -2.0, 0.0);
+    m.beginFrame();
+    c.near("input: mouse movement restarts at 0 each frame", m.mouseDx() as f64, 0.0, 0.0);
+    m.setAxis(2, 0.5);
+    m.setAxis(3, 7.0);
+    m.setAxis(9, 1.0);
+    m.beginFrame();
+    c.near("input: an axis keeps its level across frames", m.axis(2) as f64, 0.5, 0.0);
+    c.near("input: an axis value above 1 is clamped to 1", m.axis(3) as f64, 1.0, 0.0);
+    c.near("input: an axis out of range reads 0", m.axis(9) as f64, 0.0, 0.0);
+    m.setAxis(4, 0.3);
+    c.that(
+        "input: analog values are exact multiples of 1/4096",
+        (m.axis(4) as f64 * INPUT_AXIS_STEPS)
+            == ((m.axis(4) as f64 * INPUT_AXIS_STEPS) as i64) as f64
+    );
+
+    let a : InputState = new InputState();
+    let b : InputState = new InputState();
+    a.setDown(7, true);
+    b.setDown(7, true);
+    a.setAxis(1, 0.25);
+    b.setAxis(1, 0.25);
+    c.that(
+        "input: equal snapshots compare the same and hash the same",
+        a.same(b) && a.hash() == b.hash()
+    );
+    b.setAxis(1, 0.26);
+    c.that(
+        "input: a snapshot with a different axis differs in comparison and hash",
+        !a.same(b) && a.hash() != b.hash()
+    );
+    b.setAxis(1, 0.25);
+    b.addMouseDelta(0.001, 0.0);
+    c.that(
+        "input: a snapshot with a different mouse differs in comparison and hash",
+        !a.same(b) && a.hash() != b.hash()
+    );
+    a.clear();
+    c.that(
+        "input: clear releases every key and zeroes the axes",
+        a.downCount() == 0 && a.axis(1) == 0.0 as f32
+    );
+}
+
+fn inActions(c : Checks) : void {
+    let map : ActionMap = new ActionMap();
+    let jump : i32 = map.action("jump");
+    let save : i32 = map.action("save");
+    let steer : i32 = map.action("steer");
+    let fire : i32 = map.action("fire");
+    c.sameInt("actions: declaring twice gives one action", map.action("jump"), jump);
+    c.sameInt("actions: four declared actions are counted", map.count(), 4);
+    c.sameInt("actions: find answers the index of a declared action", map.find("save"), save);
+    c.sameInt("actions: find of an unknown name answers -1", map.find("dance"), -1);
+    c.that("actions: nameOf answers the name of an action", map.nameOf(steer) == "steer");
+    map.bindKey(jump, 32);
+    map.bindKey(jump, InputState::padButton(0));
+    map.bindChord(save, 17, 83);
+    map.bindAxis(steer, 0, 1.0, 0.2);
+    map.bindKeyPair(steer, 65, 68, 1.0);
+    map.bindAxis(fire, 5, 1.0, 0.0);
+    c.sameInt("actions: bindings are counted", map.bindingCount(), 6);
+
+    let s : InputState = new InputState();
+    map.evaluate(s);
+    c.that(
+        "actions: nothing pressed, nothing down",
+        !map.isDown(jump) && map.valueOf(steer) == 0.0 as f32
+    );
+    s.beginFrame();
+    s.setDown(32, true);
+    map.evaluate(s);
+    c.that(
+        "actions: a key drives its action and it is pressed",
+        map.isDown(jump) && map.wasPressed(jump) && map.valueOf(jump) == 1.0 as f32
+    );
+    s.beginFrame();
+    map.evaluate(s);
+    c.that(
+        "actions: a held action is down but not pressed again",
+        map.isDown(jump) && !map.wasPressed(jump)
+    );
+    s.beginFrame();
+    s.setDown(32, false);
+    s.setDown(InputState::padButton(0), true);
+    map.evaluate(s);
+    c.that(
+        "actions: a second binding takes over without a release edge",
+        map.isDown(jump) && !map.wasReleased(jump) && !map.wasPressed(jump)
+    );
+    s.beginFrame();
+    s.setDown(InputState::padButton(0), false);
+    map.evaluate(s);
+    c.that(
+        "actions: a released action is not down and reads as released",
+        !map.isDown(jump) && map.wasReleased(jump)
+    );
+
+    s.beginFrame();
+    s.setDown(17, true);
+    map.evaluate(s);
+    c.that("actions: half a chord leaves the action up", !map.isDown(save));
+    s.beginFrame();
+    s.setDown(83, true);
+    map.evaluate(s);
+    c.that(
+        "actions: the whole chord puts the action down and pressed",
+        map.isDown(save) && map.wasPressed(save)
+    );
+    s.clear();
+
+    s.beginFrame();
+    s.setAxis(0, 0.1);
+    map.evaluate(s);
+    c.near("actions: an axis inside the dead zone reads 0", map.valueOf(steer) as f64, 0.0, 0.0);
+    s.setAxis(0, 0.6);
+    map.evaluate(s);
+    c.near(
+        "actions: outside it is stretched to the full range",
+        map.valueOf(steer) as f64,
+        0.5,
+        0.001
+    );
+    s.setAxis(0, -1.0);
+    map.evaluate(s);
+    c.near(
+        "actions: the full deflection of the negative key reaches -1",
+        map.valueOf(steer) as f64,
+        -1.0,
+        0.0
+    );
+    s.setAxis(0, 0.0);
+    s.setDown(68, true);
+    map.evaluate(s);
+    c.near("actions: a key pair stands in for an axis", map.valueOf(steer) as f64, 1.0, 0.0);
+    s.setDown(65, true);
+    map.evaluate(s);
+    c.near("actions: both keys of an axis cancel to 0", map.valueOf(steer) as f64, 0.0, 0.0);
+    s.setDown(65, false);
+    s.setAxis(0, 0.8);
+    map.evaluate(s);
+    c.near("actions: the strongest binding sets the value", map.valueOf(steer) as f64, 1.0, 0.0);
+    s.setDown(68, false);
+    s.setAxis(0, 0.5);
+    s.setAxis(5, 0.4);
+    map.evaluate(s);
+    c.that(
+        "actions: an axis below half is not down",
+        !map.isDown(fire) && map.valueOf(fire) > 0.39 as f32
+    );
+    s.setAxis(5, 0.55);
+    map.evaluate(s);
+    c.that("actions: an analog value at or above half counts as down", map.isDown(fire));
+
+    map.clearBindings(jump);
+    s.setDown(32, true);
+    map.evaluate(s);
+    c.that("actions: clearBindings leaves the action unbound and up", !map.isDown(jump));
+    map.bindKey(jump, 33);
+    s.setDown(33, true);
+    map.evaluate(s);
+    c.that("actions: rebinding after clearBindings puts the action down again", map.isDown(jump));
+    c.that(
+        "actions: an unknown action is quiet",
+        !map.isDown(99) && map.valueOf(-1) == 0.0 as f32 && !map.wasPressed(99)
+    );
+}
+
+fn inTape(c : Checks) : void {
+    let tape : InputTape = new InputTape();
+    let live : InputState = new InputState();
+    let r : Pcg32 = new Pcg32(5, 1);
+    let copies : ByteBuf = new ByteBuf(16);
+    for (n of 0..200) {
+        inGenerate(r, live);
+        tape.record(live);
+        copies.pushBe32(live.hash() as i32);
+    }
+    c.sameInt("tape: a recorded tape has the recorded length of 200", tape.count(), 200);
+    c.that("tape: a recorded tape is valid and has no error", tape.ok() && tape.error() == "");
+    let bytes : ByteBuf = tape.toBytes();
+    let back : InputTape = InputTape::fromBytes(bytes);
+    c.that("tape: the written bytes read back as a valid tape", back.ok());
+    c.sameInt("tape: the read-back tape has the same length", back.count(), 200);
+    c.that("tape: the read-back tape has the same snapshots", back.same(tape));
+    let play : InputState = new InputState();
+    let mut same : bool = true;
+    for (n of 0..200) {
+        back.play(n, play);
+        if ((play.hash() as i32) != copies.be32(n * 4)) {
+            same = false;
+        }
+    }
+    c.that("tape: every replayed snapshot has the recorded hash", same);
+    c.that("tape: playing past the end is refused", !back.play(200, play) && !back.play(-1, play));
+
+    let held : InputTape = new InputTape();
+    let still : InputState = new InputState();
+    still.setDown(3, true);
+    for (n of 0..1000) {
+        held.record(still);
+    }
+    c.that("tape: unchanged frames cost four bytes each", held.toBytes().len() < 1000 * 4 + 64);
+    c.that(
+        "tape: a held tape still reads back to the same snapshots",
+        InputTape::fromBytes(held.toBytes()).same(held)
+    );
+    let none : InputTape = new InputTape();
+    let nb : InputTape = InputTape::fromBytes(none.toBytes());
+    c.that("tape: an empty tape round-trips", nb.ok() && nb.count() == 0);
+
+    let edge : InputTape = new InputTape();
+    let e : InputState = new InputState();
+    e.setDown(9, true);
+    edge.record(e);
+    e.beginFrame();
+    e.setDown(9, false);
+    edge.record(e);
+    let ep : InputState = new InputState();
+    edge.play(0, ep);
+    let pressed : bool = ep.wasPressed(9);
+    edge.play(1, ep);
+    c.that("tape: replay rebuilds press and release edges", pressed && ep.wasReleased(9));
+}
+
+fn inReplay(c : Checks) : void {
+    // Live run: random input each step, recorded; the simulation hash is the check value.
+    let tape : InputTape = new InputTape();
+    let live : InputState = new InputState();
+    let r : Pcg32 = new Pcg32(77, 9);
+    let mut x : i64 = 0;
+    let mut v : i64 = 0;
+    for (n of 0..600) {
+        inGenerate(r, live);
+        tape.record(live);
+        v = inSimStep(live, x, v);
+        x = x + v;
+    }
+    let liveHash : i64 = hashCombine(x, v);
+
+    let first : i64 = inReplayOnce(tape);
+    let second : i64 = inReplayOnce(tape);
+    c.that("replay: replaying a tape twice gives the same simulation hash", first == second);
+    c.that("replay: the replay hash equals the live run's hash", first == liveHash);
+    let loaded : InputTape = InputTape::fromBytes(tape.toBytes());
+    c.that(
+        "replay: a tape saved to bytes and loaded replays the same",
+        inReplayOnce(loaded) == liveHash
+    );
+
+    let other : InputTape = new InputTape();
+    let o : InputState = new InputState();
+    let r2 : Pcg32 = new Pcg32(78, 9);
+    for (n of 0..600) {
+        inGenerate(r2, o);
+        other.record(o);
+    }
+    c.that("replay: a different tape gives a different hash", inReplayOnce(other) != liveHash);
+}
+
+fn inReplayOnce(tape : InputTape) : i64 {
+    let state : InputState = new InputState();
+    let mut x : i64 = 0;
+    let mut v : i64 = 0;
+    for (n of 0..tape.count()) {
+        tape.play(n, state);
+        v = inSimStep(state, x, v);
+        x = x + v;
+    }
+    return hashCombine(x, v);
+}
+
+fn inDamage(c : Checks) : void {
+    let tape : InputTape = new InputTape();
+    let s : InputState = new InputState();
+    let r : Pcg32 = new Pcg32(3, 3);
+    for (n of 0..50) {
+        inGenerate(r, s);
+        tape.record(s);
+    }
+    let good : ByteBuf = tape.toBytes();
+    let size : i32 = good.len();
+
+    let cut : ByteBuf = new ByteBuf(16);
+    cut.pushRange(good, 0, size - 9);
+    let t1 : InputTape = InputTape::fromBytes(cut);
+    c.that(
+        "tape damage: a cut tape is refused",
+        !t1.ok() && t1.count() == 0 && t1.error().byteLength > 0
+    );
+
+    let flipped : ByteBuf = new ByteBuf(16);
+    flipped.pushRange(good, 0, size);
+    flipped.set(size / 2, flipped.get(size / 2) ^ 4);
+    let t2 : InputTape = InputTape::fromBytes(flipped);
+    c.that(
+        "tape damage: a flipped bit fails the checksum",
+        !t2.ok() && t2.error() == "the tape is damaged (checksum differs)"
+    );
+
+    let wrongTag : ByteBuf = new ByteBuf(16);
+    wrongTag.pushRange(good, 0, size);
+    wrongTag.set(0, 77);
+    c.that(
+        "tape damage: a wrong tag is refused",
+        InputTape::fromBytes(wrongTag).error() == "not an input tape (wrong tag)"
+    );
+
+    let tiny : ByteBuf = new ByteBuf(16);
+    tiny.pushText("LXIT");
+    c.that("tape damage: a few bytes are refused", !InputTape::fromBytes(tiny).ok());
+    c.that("tape damage: no bytes are refused", !InputTape::fromBytes(new ByteBuf(16)).ok());
+
+    let lie : ByteBuf = new ByteBuf(16);
+    lie.pushRange(good, 0, 8);
+    lie.pushBe32(1000000);
+    lie.pushRange(good, 12, size - 4);
+    lie.pushBe32(0);
+    c.that("tape damage: an impossible length is refused", !InputTape::fromBytes(lie).ok());
+}

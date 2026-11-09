@@ -1,0 +1,231 @@
+// input_tape — a recording of input snapshots, to play back later.
+//
+// A tape is a list of `InputState` snapshots, one per simulation step (or per frame, the recorder's choice).
+// Played back into the same simulation from the same start, it gives the same run: that is how a bug report
+// carries its own reproduction, how a regression test drives a whole level, and how two machines can be shown
+// to agree. Because snapshots hold integers only, "the same" is exact.
+//
+// In bytes: the tag `LXIT`, a version, the number of snapshots, then per snapshot a 20-bit mask of which of its
+// 20 fields (10 down-bit words, 2 mouse, 8 axes) differ from the snapshot before (the first is compared with
+// all zeros) followed by just those fields, and at the end a CRC-32 of everything before it. A tape that has
+// been cut, edited or damaged fails to load, and says why.
+
+use crate::core::collections::vec::Vec;
+use crate::data::bytes::{ByteBuf, Crc32};
+use crate::runtime::input_state::{InputState, INPUT_FIELDS};
+
+// The newest tape version this code reads and writes.
+const TAPE_VERSION : i32 = 1;
+
+// The fixed part of a tape: tag, version and snapshot count.
+const TAPE_HEAD : i32 = 12;
+
+// The first guess of how many bytes `toBytes` needs: the fixed part with room for the first snapshots, then a mask and
+// one changed field for each snapshot.
+const TAPE_GUESS_BASE : i32 = 64;
+const TAPE_GUESS_PER_SNAPSHOT : i32 = 8;
+
+// Layout offsets inside the fixed part.
+const TAPE_AT_TAG : i32 = 0;
+const TAPE_AT_VERSION : i32 = 4;
+const TAPE_AT_COUNT : i32 = 8;
+
+// The tag, its length and the trailing checksum.
+const TAPE_TAG : string = "LXIT";
+const TAPE_TAG_BYTES : i32 = 4;
+const TAPE_CRC_BYTES : i32 = 4;
+
+// A field change is one big-endian 32-bit word.
+const TAPE_WORD : i32 = 4;
+
+/** An ordered list of input snapshots. */
+pub class InputTape {
+    data   : Vec<i32>;
+    frames : i32 = 0;
+    why    : string = "";
+
+    /** An empty tape. */
+    constructor() {
+        self.data = new Vec<i32>();
+    }
+
+    /** Appends a copy of `state` as the next snapshot. */
+    pub fn record(mut self, state : InputState) : void {
+        for (f of 0..INPUT_FIELDS) {
+            self.data.push(state.field(f));
+        }
+        self.frames = self.frames + 1;
+    }
+
+    /** How many snapshots the tape holds. */
+    pub fn count(self) : i32 {
+        return self.frames;
+    }
+
+    /**
+     * Starts a new frame on `state` (so edges are right) and loads snapshot `index` into it. False, leaving
+     * `state` untouched, when the tape has no such snapshot.
+     */
+    pub fn play(self, index : i32, state : InputState) : bool {
+        if (index < 0 || index >= self.frames) {
+            return false;
+        }
+        state.beginFrame();
+        for (f of 0..INPUT_FIELDS) {
+            state.setField(f, self.data.get(index * INPUT_FIELDS + f));
+        }
+        return true;
+    }
+
+    /** True when both tapes hold the same snapshots. */
+    pub fn same(self, other : InputTape) : bool {
+        if (self.frames != other.frames) {
+            return false;
+        }
+        for (i of 0..self.data.len()) {
+            if (self.data.get(i) != other.data.get(i)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /** The tape as bytes (see the header of this file for the layout). */
+    pub fn toBytes(self) : ByteBuf {
+        let out : ByteBuf = new ByteBuf(TAPE_GUESS_BASE + self.frames * TAPE_GUESS_PER_SNAPSHOT);
+        out.pushText(TAPE_TAG);
+        out.pushBe32(TAPE_VERSION);
+        out.pushBe32(self.frames);
+        for (n of 0..self.frames) {
+            let mask : i32 = self.changeMask(n);
+            out.pushBe32(mask);
+            for (f of 0..INPUT_FIELDS) {
+                if (InputTape::hasField(mask, f)) {
+                    out.pushBe32(self.data.get(n * INPUT_FIELDS + f));
+                }
+            }
+        }
+        out.pushBe32(new Crc32().sum(out, 0, out.len()));
+        return out;
+    }
+
+    // Which fields of snapshot `n` differ from the snapshot before it.
+    fn changeMask(self, n : i32) : i32 {
+        let mut mask : i32 = 0;
+        for (f of 0..INPUT_FIELDS) {
+            if (self.data.get(n * INPUT_FIELDS + f) != self.before(n, f)) {
+                mask = mask | (1 << f);
+            }
+        }
+        return mask;
+    }
+
+    // Field `f` of the snapshot before `n`; zero before the first.
+    fn before(self, n : i32, f : i32) : i32 {
+        if (n == 0) {
+            return 0;
+        }
+        return self.data.get((n - 1) * INPUT_FIELDS + f);
+    }
+
+    static fn hasField(mask : i32, f : i32) : bool {
+        return (mask & (1 << f)) != 0;
+    }
+
+    /** Reads a tape from bytes. Check `ok` before using it: a damaged tape is empty and `error` says what was wrong. */
+    pub static fn fromBytes(b : ByteBuf) : InputTape {
+        let t : InputTape = new InputTape();
+        let problem : string = InputTape::headerProblem(b);
+        if (problem.byteLength > 0) {
+            t.fail(problem);
+            return t;
+        }
+        let body : i32 = b.len() - TAPE_CRC_BYTES;
+        let count : i32 = b.be32(TAPE_AT_COUNT);
+        if (count < 0 || count > body) {
+            t.fail("the tape claims ${count} snapshots");
+            return t;
+        }
+        let mut at : i32 = TAPE_HEAD;
+        for (n of 0..count) {
+            at = t.readSnapshot(b, at, body, n);
+            if (at < 0) {
+                return t;
+            }
+        }
+        if (at != body) {
+            t.reset("bytes left over after the last snapshot");
+        }
+        return t;
+    }
+
+    // What is wrong with the fixed part and the checksum of `b`, or "".
+    static fn headerProblem(b : ByteBuf) : string {
+        if (b.len() < TAPE_HEAD + TAPE_TAG_BYTES) {
+            return "the tape is too short";
+        }
+        if (!b.tagAt(TAPE_AT_TAG, TAPE_TAG)) {
+            return "not an input tape (wrong tag)";
+        }
+        let version : i32 = b.be32(TAPE_AT_VERSION);
+        if (version != TAPE_VERSION) {
+            return "unsupported tape version ${version}";
+        }
+        let body : i32 = b.len() - TAPE_CRC_BYTES;
+        if (new Crc32().sum(b, 0, body) != b.be32(body)) {
+            return "the tape is damaged (checksum differs)";
+        }
+        return "";
+    }
+
+    // Reads snapshot `n` from byte `at` of `b` (the body ends at `body`) into the tape and answers where the next one
+    // starts; -1, with the tape emptied and the reason recorded, when the bytes do not hold it.
+    fn readSnapshot(mut self, b : ByteBuf, at : i32, body : i32, n : i32) : i32 {
+        let mut pos : i32 = at;
+        if (pos + TAPE_WORD > body) {
+            self.reset("the tape ends inside snapshot ${n}");
+            return -1;
+        }
+        let mask : i32 = b.be32(pos);
+        pos = pos + TAPE_WORD;
+        if ((mask >>> INPUT_FIELDS) != 0) {
+            self.reset("snapshot ${n} names a field that does not exist");
+            return -1;
+        }
+        for (f of 0..INPUT_FIELDS) {
+            if (!InputTape::hasField(mask, f)) {
+                self.data.push(self.before(n, f));
+                continue;
+            }
+            if (pos + TAPE_WORD > body) {
+                self.reset("the tape ends inside snapshot ${n}");
+                return -1;
+            }
+            self.data.push(b.be32(pos));
+            pos = pos + TAPE_WORD;
+        }
+        self.frames = self.frames + 1;
+        return pos;
+    }
+
+    fn fail(mut self, why : string) : void {
+        self.why = why;
+    }
+
+    // Empties the tape and records why.
+    fn reset(mut self, why : string) : void {
+        self.data.clear();
+        self.frames = 0;
+        self.why = why;
+    }
+
+    /** True when the tape was read without a problem (a tape made with `record` is always ok). */
+    pub fn ok(self) : bool {
+        return self.why.byteLength == 0;
+    }
+
+    /** What was wrong with the bytes, or "". */
+    pub fn error(self) : string {
+        return self.why + "";
+    }
+}

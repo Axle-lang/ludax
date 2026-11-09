@@ -1,0 +1,271 @@
+// runtime_loop — checks for the main loop driver.
+//
+// The loop is driven with frame times we write ourselves. What must hold: the same total time gives the same
+// steps whatever the pacing; a runaway frame is clamped and counted; pause, single steps, time scale and quit
+// do what they say; and a module can end the run on the exact tick it chooses.
+
+use ludax::Checks;
+use ludax::CountingModule;
+use ludax::GameLoop;
+use ludax::GameModule;
+use ludax::LoopConfig;
+use ludax::Pcg32;
+use ludax::hashCombine;
+
+// A module whose state is a hash of the tick numbers and the order of calls: any step run twice, skipped or
+// reordered changes it.
+class LoopProbe : GameModule {
+    /** Hash of every call the loop made, in order. */
+    pub hash : i64 = 7;
+
+    /** How many times `simulate` ran. */
+    pub calls : i64 = 0;
+
+    /** The `calls` count at which the module asks the loop to quit, or -1 for never. */
+    pub wantQuitAt : i64 = -1;
+
+    constructor() {}
+
+    /** Mixes the input phase of `frame` into the hash. */
+    pub fn input(mut self, frame : i64) : void {
+        self.hash = hashCombine(self.hash, frame * 3 + 1);
+    }
+
+    /** Mixes tick `tick` and its `dt` into the hash. */
+    pub fn simulate(mut self, tick : i64, dt : f32) : void {
+        self.hash = hashCombine(self.hash, tick * 3 + 2);
+        self.calls = self.calls + 1;
+    }
+
+    /** Nothing to draw: the loop must run render every frame all the same. */
+    pub fn render(mut self, alpha : f32) : void {}
+
+    /** Quits once the module has been stepped `wantQuitAt` times. */
+    pub fn wantsQuit(self) : bool {
+        return self.wantQuitAt >= 0 && self.calls >= self.wantQuitAt;
+    }
+}
+
+// One step at 60 Hz, as the loop computes it.
+const LOOPT_STEP : i64 = 16666666;
+
+fn loopRunSteady(frames : i32, frameNanos : i64) : LoopProbe {
+    let p : LoopProbe = new LoopProbe();
+    let l : GameLoop<LoopProbe> = new GameLoop<LoopProbe>(LoopConfig::standard());
+    for (i of 0..frames) {
+        l.frame(p, frameNanos);
+    }
+    return p;
+}
+
+// Frames of random length (1 to 60 ms) that add up to exactly `total` nanoseconds.
+fn loopRunRandom(total : i64, seed : u64) : LoopProbe {
+    let p : LoopProbe = new LoopProbe();
+    let l : GameLoop<LoopProbe> = new GameLoop<LoopProbe>(LoopConfig::standard());
+    let r : Pcg32 = new Pcg32(seed, 3);
+    let mut left : i64 = total;
+    while (left > 0) {
+        let mut f : i64 = 1000000 + r.nextBelow(59000000 as u32) as i64;
+        if (f > left) {
+            f = left;
+        }
+        l.frame(p, f);
+        left = left - f;
+    }
+    return p;
+}
+
+/** The game loop checks. */
+pub class RuntimeLoopSuite {
+    /** Runs every check of the suite. */
+    pub static fn run(c : Checks) : void {
+        loopBasics(c);
+        loopPacing(c);
+        loopClamp(c);
+        loopControls(c);
+        loopQuit(c);
+        loopSmoothing(c);
+        loopProfiling(c);
+    }
+}
+
+fn loopBasics(c : Checks) : void {
+    let m : CountingModule = new CountingModule();
+    let l : GameLoop<CountingModule> = new GameLoop<CountingModule>(LoopConfig::standard());
+    c.that("loop: a frame answers true while running", l.frame(m, LOOPT_STEP));
+    c.sameInt("loop: a frame of exactly one step runs one step", m.steps, 1);
+    c.sameInt("loop: input is called once per frame", m.inputs, 1);
+    c.sameInt("loop: render is called once per frame", m.renders, 1);
+    c.sameInt("loop: the first step is tick 0", m.lastTick, 0);
+    l.frame(m, 25000000);
+    c.sameInt("loop: 25 ms is one more step", m.steps, 2);
+    c.near("loop: alpha is the fraction of a step banked", m.lastAlpha as f64, 0.5, 0.001);
+    c.that(
+        "loop: the interpolation alpha after a partial step is below 1",
+        m.lastAlpha < 1.0 as f32
+    );
+    c.sameInt("loop: ticks counts the steps run", l.ticks(), 2);
+    c.sameInt("loop: frames counts the frames run", l.frames(), 2);
+    c.sameInt("loop: stepsLastFrame reports the one step of the last frame", l.stepsLastFrame(), 1);
+    l.frame(m, -5000000);
+    c.sameInt("loop: a negative frame time banks nothing", l.ticks(), 2);
+    c.sameInt("loop: a zero-step frame still renders", m.renders, 3);
+    c.near(
+        "loop: simulated seconds are whole steps",
+        l.simulatedSeconds(),
+        2.0 * 0.016666666,
+        0.0000001
+    );
+}
+
+fn loopPacing(c : Checks) : void {
+    let a : LoopProbe = loopRunSteady(100, 10000000);
+    c.sameInt("loop: 100 frames of 10 ms are 1 s = 60 steps", a.calls, 60);
+    let b : LoopProbe = loopRunRandom(1000000000, 11);
+    let d : LoopProbe = loopRunRandom(1000000000, 99);
+    c.sameInt("loop: random pacing, same time, same steps (seed 11)", b.calls, 60);
+    c.sameInt("loop: random pacing, same time, same steps (seed 99)", d.calls, 60);
+    // The step hash depends on tick numbers and on input calls (which depend on frames), so compare steps only.
+    let e : LoopProbe = new LoopProbe();
+    let f : LoopProbe = new LoopProbe();
+    let le : GameLoop<LoopProbe> = new GameLoop<LoopProbe>(LoopConfig::standard());
+    let lf : GameLoop<LoopProbe> = new GameLoop<LoopProbe>(LoopConfig::standard());
+    for (i of 0..30) {
+        le.frame(e, 2 * LOOPT_STEP);
+    }
+    for (i of 0..60) {
+        lf.frame(f, LOOPT_STEP);
+    }
+    c.sameInt("loop: 30 double frames and 60 single frames run the same steps", e.calls, f.calls);
+    c.sameInt(
+        "loop: and the same simulated time",
+        (le.simulatedSeconds() * 1000000.0) as i64,
+        (lf.simulatedSeconds() * 1000000.0) as i64
+    );
+}
+
+fn loopClamp(c : Checks) : void {
+    let m : CountingModule = new CountingModule();
+    let l : GameLoop<CountingModule> = new GameLoop<CountingModule>(LoopConfig::standard());
+    l.frame(m, 10000000000);
+    c.sameInt("loop: a 10 s frame is clamped and counted", l.clampedFrames(), 1);
+    c.sameInt(
+        "loop: the clamped time is what was cut off",
+        l.clampedTime(),
+        10000000000 - 250000000
+    );
+    c.sameInt("loop: a clamped frame still obeys the per-frame step cap", m.steps, 8);
+    c.that("loop: the steps beyond the cap are dropped and counted", l.droppedTime() > 0);
+    c.sameInt(
+        "loop: elapsed time counts the clamped frame, not the real one",
+        l.elapsedNanos(),
+        250000000
+    );
+    l.frame(m, LOOPT_STEP);
+    c.sameInt("loop: after a stall the next normal frame runs one step", l.stepsLastFrame(), 1);
+}
+
+fn loopControls(c : Checks) : void {
+    let m : CountingModule = new CountingModule();
+    let l : GameLoop<CountingModule> = new GameLoop<CountingModule>(LoopConfig::standard());
+    l.setPaused(true);
+    c.that("loop: a paused loop reports isPaused", l.isPaused());
+    l.frame(m, 100000000);
+    c.sameInt("loop: a paused frame runs no step", m.steps, 0);
+    c.sameInt("loop: a paused frame still renders", m.renders, 1);
+    l.requestStep();
+    l.requestStep();
+    l.frame(m, 100000000);
+    c.sameInt("loop: two step requests run two steps while paused", m.steps, 2);
+    l.frame(m, 100000000);
+    c.sameInt("loop: a step request while paused is consumed by one step", m.steps, 2);
+    l.setPaused(false);
+    l.requestStep();
+    l.frame(m, LOOPT_STEP);
+    c.sameInt("loop: a step request while unpaused is ignored", m.steps, 3);
+
+    let fast : CountingModule = new CountingModule();
+    let lf : GameLoop<CountingModule> = new GameLoop<CountingModule>(LoopConfig::standard());
+    lf.setTimeScale(2000);
+    c.sameInt("loop: timeScale reads back what was set", lf.timeScale(), 2000);
+    lf.frame(fast, LOOPT_STEP);
+    c.sameInt("loop: double speed runs two steps in one step's time", fast.steps, 2);
+    lf.setTimeScale(0);
+    lf.frame(fast, LOOPT_STEP);
+    c.sameInt("loop: a time scale of 0 stops the simulation clock", fast.steps, 2);
+    lf.setTimeScale(500);
+    lf.frame(fast, LOOPT_STEP);
+    lf.frame(fast, LOOPT_STEP);
+    c.sameInt("loop: half speed runs one step per two frames", fast.steps, 3);
+    lf.setTimeScale(-3);
+    c.sameInt("loop: a negative time scale is stored as 0", lf.timeScale(), 0);
+}
+
+fn loopQuit(c : Checks) : void {
+    let m : CountingModule = new CountingModule();
+    let l : GameLoop<CountingModule> = new GameLoop<CountingModule>(LoopConfig::standard());
+    l.requestQuit();
+    c.that("loop: hasQuit is true after requestQuit", l.hasQuit());
+    c.that("loop: a frame after quit answers false", !l.frame(m, LOOPT_STEP));
+    c.sameInt(
+        "loop: a frame after quit runs no input, step or render",
+        m.inputs + m.steps + m.renders,
+        0
+    );
+
+    let mut p : LoopProbe = new LoopProbe();
+    p.wantQuitAt = 5;
+    let lp : GameLoop<LoopProbe> = new GameLoop<LoopProbe>(LoopConfig::standard());
+    let more : bool = lp.frame(p, 6 * LOOPT_STEP);
+    c.that("loop: the frame in which the module quits answers false", !more);
+    c.sameInt("loop: the module's quit stops on the exact step", p.calls, 5);
+    c.sameInt("loop: the loop's tick count matches the steps that ran", lp.ticks(), 5);
+    c.that(
+        "loop: a frame after the loop stopped itself does nothing",
+        !lp.frame(p, LOOPT_STEP) && p.calls == 5
+    );
+}
+
+fn loopSmoothing(c : Checks) : void {
+    let m : CountingModule = new CountingModule();
+    let l : GameLoop<CountingModule> = new GameLoop<CountingModule>(LoopConfig::standard());
+    c.sameInt("loop: no smoothed time before a frame", l.smoothedFrameNanos(), 0);
+    c.near("loop: smoothedFps is 0 before any frame", l.smoothedFps(), 0.0, 0.0);
+    for (i of 0..4) {
+        l.frame(m, 10000000);
+        l.frame(m, 20000000);
+    }
+    c.sameInt(
+        "loop: smoothed time is the mean of the last 8 frames",
+        l.smoothedFrameNanos(),
+        15000000
+    );
+    c.near(
+        "loop: smoothedFps is the rate of the 15 ms frames",
+        l.smoothedFps(),
+        1000.0 / 15.0,
+        0.001
+    );
+    for (i of 0..8) {
+        l.frame(m, 30000000);
+    }
+    c.sameInt("loop: old frames fall out of the window", l.smoothedFrameNanos(), 30000000);
+}
+
+fn loopProfiling(c : Checks) : void {
+    let m : CountingModule = new CountingModule();
+    let l : GameLoop<CountingModule> = new GameLoop<CountingModule>(LoopConfig::standard());
+    l.frame(m, LOOPT_STEP);
+    c.sameInt("loop: no frame is profiled by default", l.profiler().framesRecorded(), 0);
+    c.sameInt("loop: a phase has no time while profiling is off", l.phaseNanos("simulate"), 0);
+    l.setProfiling(true);
+    c.that("loop: setProfiling reaches the profiler", l.profiler().enabled());
+    l.frame(m, LOOPT_STEP);
+    c.sameInt("loop: a profiled frame is recorded", l.profiler().framesRecorded(), 1);
+    c.sameInt("loop: a profiled frame has the three phase entries", l.profiler().entryCount(), 3);
+    c.that(
+        "loop: a phase has a non-negative time",
+        l.phaseNanos("input") >= 0 && l.phaseNanos("render") >= 0 && l.phaseNanos("simulate") >= 0
+    );
+    c.sameInt("loop: an unknown phase has 0 nanoseconds", l.phaseNanos("physics"), 0);
+}

@@ -1,0 +1,342 @@
+// scheduler — named systems, the order between them, and what each costs.
+//
+// A game is a handful of systems (input, vehicles, missions, streaming...) that must run in a certain order
+// each step. Declaring that order as "A before B" constraints, rather than as a hard-coded list, lets a
+// module add a system without knowing the others. `resolve` turns the constraints into one order: of all the
+// systems that may go next it always picks the one registered first, so the order is a function of the
+// declarations alone — the same on every run and every machine. A cycle, or a constraint naming a system that
+// does not exist, makes `resolve` answer false and `problem` says which.
+//
+// Systems themselves are code, and a class cannot be stored in a trait-typed field, so the scheduler holds
+// only names and flags; `run` walks the order and hands each enabled system's number to a `SystemRunner`
+// the caller passes in (usually a `match` on the number). The runner returns the cost of what it did, in
+// whatever unit the caller keeps — nanoseconds from a `Stopwatch`, or a simulated count in a test — and the
+// scheduler adds it up per system and per run and counts the runs that went over the system's budget.
+
+use crate::core::collections::vec::Vec;
+use crate::core::id::string_id::{StringId, StringInterner};
+
+/** Something that can run a system by number. */
+pub trait SystemRunner {
+    /** Runs system `id` for step `tick` and answers what it cost. */
+    fn runSystem(mut self, id : i32, tick : i64) : i64;
+}
+
+/** A runner that does nothing and costs nothing; the library's own implementor of `SystemRunner`. */
+pub class NullRunner : SystemRunner {
+    /** The empty runner. */
+    constructor() {}
+
+    /** Does nothing. */
+    pub fn runSystem(mut self, id : i32, tick : i64) : i64 {
+        return 0;
+    }
+}
+
+// An ordering constraint: `first` runs before `second`.
+struct SchedulerEdge {
+    first  : i32;
+    second : i32;
+}
+
+/** The registered systems and their order. */
+pub class Scheduler {
+    names     : StringInterner;
+    enabled   : Vec<bool>;
+    budget    : Vec<i64>;
+    lastCost  : Vec<i64>;
+    totalCost : Vec<i64>;
+    overs     : Vec<i32>;
+    runs      : Vec<i64>;
+    edges     : Vec<SchedulerEdge>;
+    orderIds  : Vec<i32>;
+    pending   : Vec<SchedulerEdge>;
+    resolved  : bool = false;
+    why       : string = "";
+    lastTotal : i64 = 0;
+    unknowns  : StringInterner;
+
+    /** No systems. */
+    constructor() {
+        self.names = new StringInterner();
+        self.enabled = new Vec<bool>();
+        self.budget = new Vec<i64>();
+        self.lastCost = new Vec<i64>();
+        self.totalCost = new Vec<i64>();
+        self.overs = new Vec<i32>();
+        self.runs = new Vec<i64>();
+        self.edges = new Vec<SchedulerEdge>();
+        self.orderIds = new Vec<i32>();
+        self.pending = new Vec<SchedulerEdge>();
+        self.unknowns = new StringInterner();
+    }
+
+    /** Registers a system (enabled, no budget) and answers its number; a name already registered answers its old number. */
+    pub fn add(mut self, name : string) : i32 {
+        let known : StringId = self.names.find(name);
+        if (!known.isNone()) {
+            return known.raw;
+        }
+        let id : StringId = self.names.intern(name);
+        self.enabled.push(true);
+        self.budget.push(0);
+        self.lastCost.push(0);
+        self.totalCost.push(0);
+        self.overs.push(0);
+        self.runs.push(0);
+        self.resolved = false;
+        return id.raw;
+    }
+
+    /** The number of system `name`, or -1. */
+    pub fn find(self, name : string) : i32 {
+        return self.names.find(name).raw;
+    }
+
+    /** How many systems are registered. */
+    pub fn count(self) : i32 {
+        return self.enabled.len();
+    }
+
+    /** The name of system `id`. */
+    pub fn nameOf(self, id : i32) : string {
+        return self.names.name(StringId { raw: id }) + "";
+    }
+
+    /**
+     * Declares that `first` runs before `second`. Names that are not registered yet are fine: they are checked
+     * by `resolve`, so declarations can come in any order.
+     */
+    pub fn before(mut self, first : string, second : string) : void {
+        self.pending.push(SchedulerEdge {
+            first: self.unknowns.intern(first).raw,
+            second: self.unknowns.intern(second).raw,
+        });
+        self.resolved = false;
+    }
+
+    /** Declares that `later` runs after `earlier`. */
+    pub fn after(mut self, later : string, earlier : string) : void {
+        self.before(earlier, later);
+    }
+
+    /**
+     * Works out the order. False when a constraint names an unknown system or the constraints contradict each
+     * other; `problem` then says which, and the old order (if any) stays.
+     */
+    pub fn resolve(mut self) : bool {
+        if (!self.bindEdges()) {
+            return false;
+        }
+
+        let n : i32 = self.enabled.len();
+        let waiting : i32[] = self.countWaiting();
+        let mut placed : bool[] = new bool[n as i64];
+        for (i of 0..n) {
+            placed[i] = false;
+        }
+
+        let order : Vec<i32> = new Vec<i32>();
+        for (step of 0..n) {
+            let pick : i32 = Scheduler::firstReady(waiting, placed, n);
+            if (pick < 0) {
+                let stuck : string = self.unplacedNames(placed);
+                self.why = "the order constraints form a cycle among: ${stuck}";
+                return false;
+            }
+            placed[pick] = true;
+            order.push(pick);
+            self.release(pick, waiting);
+        }
+
+        self.orderIds = order;
+        self.resolved = true;
+        self.why = "";
+        return true;
+    }
+
+    // How many constraints each system still waits on: the edges that end in it.
+    fn countWaiting(self) : i32[] {
+        let n : i32 = self.enabled.len();
+        let mut waiting : i32[] = new i32[n as i64];
+        for (i of 0..n) {
+            waiting[i] = 0;
+        }
+        for (e of 0..self.edges.len()) {
+            let s : i32 = self.edges.get(e).second;
+            waiting[s] = waiting[s] + 1;
+        }
+        return waiting;
+    }
+
+    // The first registered system that is not placed and waits on nothing, or -1.
+    static fn firstReady(waiting : i32[], placed : bool[], n : i32) : i32 {
+        for (i of 0..n) {
+            if (!placed[i] && waiting[i] == 0) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    // Placing `pick` satisfies every constraint that starts at it.
+    fn release(self, pick : i32, waiting : i32[]) : void {
+        for (e of 0..self.edges.len()) {
+            if (self.edges.get(e).first == pick) {
+                let s : i32 = self.edges.get(e).second;
+                waiting[s] = waiting[s] - 1;
+            }
+        }
+    }
+
+    // Turns the declared name pairs into edges between registered systems; false (with `why` set) for an unknown
+    // name or a system ordered before itself.
+    fn bindEdges(mut self) : bool {
+        self.edges.clear();
+        for (e of 0..self.pending.len()) {
+            let p : SchedulerEdge = self.pending.get(e);
+            let a : StringId = self.names.find(self.unknowns.name(StringId { raw: p.first }));
+            let b : StringId = self.names.find(self.unknowns.name(StringId { raw: p.second }));
+            if (a.isNone() || b.isNone()) {
+                let mut missing : i32 = p.second;
+                if (a.isNone()) {
+                    missing = p.first;
+                }
+                let unknown : string = self.unknowns.name(StringId { raw: missing });
+                self.why = "no system called '${unknown}'";
+                return false;
+            }
+            if (a.raw == b.raw) {
+                let name : string = self.nameOf(a.raw);
+                self.why = "'${name}' cannot run before itself";
+                return false;
+            }
+            self.edges.push(SchedulerEdge { first: a.raw, second: b.raw });
+        }
+        return true;
+    }
+
+    // The names of the systems not yet placed, comma separated.
+    fn unplacedNames(self, placed : bool[]) : string {
+        let mut names : string = "";
+        for (i of 0..self.enabled.len()) {
+            if (placed[i]) {
+                continue;
+            }
+            if (names.byteLength > 0) {
+                names = "${names}, ";
+            }
+            names = "${names}${self.nameOf(i)}";
+        }
+        return names;
+    }
+
+    /** What was wrong with the last `resolve`, or "". */
+    pub fn problem(self) : string {
+        return self.why + "";
+    }
+
+    /** True when the current declarations have been resolved. */
+    pub fn isResolved(self) : bool {
+        return self.resolved;
+    }
+
+    /** The system that runs at position `i` of the resolved order. */
+    pub fn orderAt(self, i : i32) : i32 {
+        return self.orderIds.get(i);
+    }
+
+    /** The resolved order as names joined by " > ", for logs and tests. */
+    pub fn orderText(self) : string {
+        let mut out : string = "";
+        for (i of 0..self.orderIds.len()) {
+            if (i > 0) {
+                out = out + " > ";
+            }
+            out = out + self.nameOf(self.orderIds.get(i));
+        }
+        return out;
+    }
+
+    /** Turns a system on or off; a disabled system keeps its place in the order but is skipped. */
+    pub fn setEnabled(mut self, id : i32, on : bool) : void {
+        if (self.enabled.has(id)) {
+            self.enabled.set(id, on);
+        }
+    }
+
+    /** True when system `id` is on. */
+    pub fn isEnabled(self, id : i32) : bool {
+        return self.enabled.getOr(id, false);
+    }
+
+    /** Sets the cost a run of system `id` may take before it counts as over budget (0: no budget). */
+    pub fn setBudget(mut self, id : i32, cost : i64) : void {
+        if (self.budget.has(id)) {
+            self.budget.set(id, cost);
+        }
+    }
+
+    /**
+     * Runs every enabled system once in the resolved order, handing each to `runner`. False, running nothing,
+     * when the order is not resolved.
+     */
+    pub fn run(mut self, runner : SystemRunner, tick : i64) : bool {
+        if (!self.resolved) {
+            return false;
+        }
+        self.lastTotal = 0;
+        for (i of 0..self.orderIds.len()) {
+            let id : i32 = self.orderIds.get(i);
+            if (!self.enabled.get(id)) {
+                self.lastCost.set(id, 0);
+                continue;
+            }
+            let cost : i64 = runner.runSystem(id, tick);
+            self.lastCost.set(id, cost);
+            self.totalCost.set(id, self.totalCost.get(id) + cost);
+            self.runs.set(id, self.runs.get(id) + 1);
+            self.lastTotal = self.lastTotal + cost;
+            if (self.budget.get(id) > 0 && cost > self.budget.get(id)) {
+                self.overs.set(id, self.overs.get(id) + 1);
+            }
+        }
+        return true;
+    }
+
+    /** The cost of system `id` in the last `run` (0 when it was skipped). */
+    pub fn lastCostOf(self, id : i32) : i64 {
+        return self.lastCost.getOr(id, 0);
+    }
+
+    /** The cost of all systems in the last `run`. */
+    pub fn lastTotalCost(self) : i64 {
+        return self.lastTotal;
+    }
+
+    /** The cost of system `id` summed over all runs. */
+    pub fn totalCostOf(self, id : i32) : i64 {
+        return self.totalCost.getOr(id, 0);
+    }
+
+    /** How many times system `id` ran. */
+    pub fn runCount(self, id : i32) : i64 {
+        return self.runs.getOr(id, 0);
+    }
+
+    /** How many runs of system `id` cost more than its budget. */
+    pub fn overBudgetCount(self, id : i32) : i32 {
+        return self.overs.getOr(id, 0);
+    }
+
+    /** Forgets the accumulated costs and counts (not the order, flags or budgets). */
+    pub fn resetAccounts(mut self) : void {
+        for (i of 0..self.enabled.len()) {
+            self.lastCost.set(i, 0);
+            self.totalCost.set(i, 0);
+            self.overs.set(i, 0);
+            self.runs.set(i, 0);
+        }
+        self.lastTotal = 0;
+    }
+}
