@@ -1,0 +1,683 @@
+// paletted_pool — many paletted containers of equal size, stored side by side in two pools.
+//
+// A voxel chunk has dozens of sections of 4096 cells, most of them one value. Making each an object with its
+// own palette array and data array costs a few hundred bytes for a section that is nothing but air. A
+// `PalettedPool` instead keeps, for `count` containers, five small per-container numbers (bits, single value,
+// palette offset and length, data offset) and two growable pools: one of `u16` palette entries, one of `u64`
+// packed cells. A container that is one value (air, or a stone column) is the number alone and takes no pool
+// space at all, which is cheaper than a shared object because nothing has to be allocated or counted.
+//
+// A container is in one of three forms: *single* (bits 0, every cell the same state); *paletted* (bits from
+// `minBits` up to `maxPaletteBits`: a palette of up to 2^bits states and packed indices); *direct* (bits =
+// `directBits`: packed state ids, no palette, once a palette would pass 2^maxPaletteBits entries). Growing
+// from one form or width to the next repacks the container; shrinking only happens when a container is
+// rebuilt by `pack`. Pool space a container leaves behind is garbage until the pool next needs room, when it
+// is compacted.
+//
+// A state is a `u16` (palette entries and single values are stored as 16 bits), so a pool holds ids below
+// 65536 and `directBits` is at most 16. `maxPaletteBits` defaults to `PALETTED_PALETTE_BITS` (8: palettes of
+// up to 256 states).
+//
+// Memory is measured, not estimated: `bytesUsed` is the sum of the arrays' live parts.
+
+use std::ffi::runtime::panicMsg;
+
+use crate::core::collections::packed_cells::{PackedCells, PackedLayout};
+
+/** The widest palette form by default: 8 bits, so up to 256 states before a container goes direct. */
+pub const PALETTED_PALETTE_BITS : i32 = 8;
+
+/** The widest entry a container can hold: states are `u16`. */
+pub const PALETTED_STATE_BITS : i32 = 16;
+
+const PALETTED_MIN_POOL : i32 = 16;
+const PALETTED_GARBAGE_MIN : i32 = 256;
+const PALETTED_PER_CONTAINER : i32 = 13;
+const PALETTED_PALETTE_BYTES : i32 = 2;
+const PALETTED_LONG_BYTES : i32 = 8;
+
+/** Reusable buffers for packing a flat array of states, and for writing a container: one per thread. */
+pub class PalettedScratch {
+    /** State id to palette position; -1 when not yet in the palette. Sized to the largest id plus one. */
+    pub map : i32[];
+
+    /** The distinct states met, in first-seen order. */
+    pub list : u16[];
+
+    /** The packed cells of the last `prepareWrite` or pack. */
+    pub longs : u64[];
+
+    /** How many distinct states `list` holds. */
+    pub listLen : i32 = 0;
+
+    /** The bits per entry of the form last prepared. */
+    pub outBits : i32 = 0;
+
+    /** The number of longs of `longs` in use. */
+    pub outLongs : i32 = 0;
+
+    /** A flat copy of a container, for expansion. */
+    pub flat : u16[];
+
+    /** Buffers for ids below `idRange` and containers of up to `cells` cells. */
+    constructor(idRange : i32, cells : i32) {
+        self.map = new i32[idRange as i64];
+        for (i of 0..idRange) {
+            self.map[i] = -1;
+        }
+        self.list = new u16[cells as i64];
+        self.longs = new u64[cells as i64];
+        self.flat = new u16[cells as i64];
+    }
+}
+
+/** The paletted containers of one chunk (all blocks, or all biomes), sharing two pools. */
+pub class PalettedPool {
+    count           : i32;
+    cells           : i32;
+    minBits         : i32;
+    directBits      : i32;
+    maxPaletteBits  : i32;
+    layouts         : PackedLayout[];
+    hitContainer    : i32 = -1;
+    hitValue        : i32 = 0;
+    hitIndex        : i32 = 0;
+    bits            : u8[];
+    single          : u16[];
+    paletteStart    : i32[];
+    paletteSize     : u16[];
+    dataStart       : i32[];
+    palettes        : u16[];
+    palettesUsed    : i32 = 0;
+    palettesGarbage : i32 = 0;
+    data            : u64[];
+    dataUsed        : i32 = 0;
+    dataGarbage     : i32 = 0;
+
+    /**
+     * `count` containers of `cells` cells, all initially the single state 0; palettes up to
+     * `PALETTED_PALETTE_BITS` bits, direct entries of `directBits` (at most 16).
+     */
+    constructor(count : i32, cells : i32, minBits : i32, directBits : i32) {
+        self.count = count;
+        self.cells = cells;
+        self.minBits = minBits;
+        self.directBits = directBits;
+        self.maxPaletteBits = PALETTED_PALETTE_BITS;
+        self.layouts = new PackedLayout[(PALETTED_STATE_BITS + 1) as i64];
+        for (b of 1..(PALETTED_STATE_BITS + 1)) {
+            self.layouts[b] = PackedCells::layoutOf(b);
+        }
+        self.bits = new u8[count as i64];
+        self.single = new u16[count as i64];
+        self.paletteStart = new i32[count as i64];
+        self.paletteSize = new u16[count as i64];
+        self.dataStart = new i32[count as i64];
+        self.palettes = new u16[PALETTED_MIN_POOL as i64];
+        self.data = new u64[PALETTED_MIN_POOL as i64];
+    }
+
+    /**
+     * Like the constructor, with palettes up to `maxPaletteBits` bits (from `minBits` to `directBits - 1`)
+     * instead of the default 8: a wider palette trades pool space for fewer direct containers.
+     */
+    pub static fn withPaletteBits(
+        count : i32,
+        cells : i32,
+        minBits : i32,
+        directBits : i32,
+        maxPaletteBits : i32
+    ) : PalettedPool {
+        let mut pool : PalettedPool = new PalettedPool(count, cells, minBits, directBits);
+        pool.maxPaletteBits = maxPaletteBits;
+        return pool;
+    }
+
+    /** How many containers. */
+    pub fn containers(self) : i32 {
+        return self.count;
+    }
+
+    /** True when container `c` is one state in every cell (no pool space used). */
+    pub fn isUniform(self, c : i32) : bool {
+        return self.bits[c] == 0;
+    }
+
+    /** The one state of a uniform container (the first palette entry otherwise). */
+    pub fn uniformValue(self, c : i32) : i32 {
+        if (self.bits[c] == 0) {
+            return self.single[c] as i32;
+        }
+        return self.get(c, 0);
+    }
+
+    /** Bits per entry of container `c`: 0 single, then the packed width. */
+    pub fn bitsOf(self, c : i32) : i32 {
+        return self.bits[c] as i32;
+    }
+
+    /** The palette length of container `c` (1 for single, 0 for the direct form, which has none). */
+    pub fn paletteLen(self, c : i32) : i32 {
+        if (self.bits[c] == 0) {
+            return 1;
+        }
+        return self.paletteSize[c] as i32;
+    }
+
+    /** The state at cell `i` of container `c`. */
+    pub fn get(self, c : i32, i : i32) : i32 {
+        let b : i32 = self.bits[c] as i32;
+        if (b == 0) {
+            return self.single[c] as i32;
+        }
+        let v : i32 = PackedCells::getIn(self.layouts[b], self.data, self.dataStart[c], i);
+        if (b == self.directBits) {
+            return v;
+        }
+        return self.palettes[self.paletteStart[c] + v] as i32;
+    }
+
+    // ---- pools --------------------------------------------------------------------------------------------
+
+    fn dataLenOf(self, c : i32) : i32 {
+        let b : i32 = self.bits[c] as i32;
+        if (b == 0) {
+            return 0;
+        }
+        return PackedCells::longsFor(self.cells, b);
+    }
+
+    fn palCapOf(self, c : i32) : i32 {
+        let b : i32 = self.bits[c] as i32;
+        if (b == 0 || b == self.directBits) {
+            return 0;
+        }
+        return 1 << b;
+    }
+
+    // Gives container `c`'s pool space back (it becomes garbage, or shrinks the pool when it was the last).
+    fn release(mut self, c : i32) : void {
+        self.hitContainer = -1;
+        let dl : i32 = self.dataLenOf(c);
+        if (dl > 0) {
+            if (self.dataStart[c] + dl == self.dataUsed) {
+                self.dataUsed = self.dataUsed - dl;
+            } else {
+                self.dataGarbage = self.dataGarbage + dl;
+            }
+        }
+        let pc : i32 = self.palCapOf(c);
+        if (pc > 0) {
+            if (self.paletteStart[c] + pc == self.palettesUsed) {
+                self.palettesUsed = self.palettesUsed - pc;
+            } else {
+                self.palettesGarbage = self.palettesGarbage + pc;
+            }
+        }
+        self.bits[c] = 0;
+        self.paletteSize[c] = 0;
+    }
+
+    // Rebuilds the pools without garbage, keeping `extraData` and `extraPal` entries of room at the end.
+    fn compact(mut self, extraData : i32, extraPal : i32) : void {
+        let mut nd : u64[] = new u64[(self.dataUsed - self.dataGarbage + extraData
+            + PALETTED_MIN_POOL) as i64];
+        let mut np : u16[] = new u16[(self.palettesUsed - self.palettesGarbage + extraPal
+            + PALETTED_MIN_POOL) as i64];
+        let mut d : i32 = 0;
+        let mut p : i32 = 0;
+        for (c of 0..self.count) {
+            let dl : i32 = self.dataLenOf(c);
+            for (k of 0..dl) {
+                nd[d + k] = self.data[self.dataStart[c] + k];
+            }
+            if (dl > 0) {
+                self.dataStart[c] = d;
+            }
+            d = d + dl;
+            let pc : i32 = self.palCapOf(c);
+            for (k of 0..pc) {
+                np[p + k] = self.palettes[self.paletteStart[c] + k];
+            }
+            if (pc > 0) {
+                self.paletteStart[c] = p;
+            }
+            p = p + pc;
+        }
+        self.data = nd;
+        self.palettes = np;
+        self.dataUsed = d;
+        self.palettesUsed = p;
+        self.dataGarbage = 0;
+        self.palettesGarbage = 0;
+    }
+
+    // Reserves `n` longs and `m` palette entries at the end of the pools; returns nothing, the caller reads
+    // `dataUsed` / `palUsed` before and after.
+    fn reserve(mut self, n : i32, m : i32) : void {
+        let needData : bool = self.dataUsed + n > (self.data.length as i32);
+        let needPal : bool = self.palettesUsed + m > (self.palettes.length as i32);
+        if (!needData && !needPal) {
+            return;
+        }
+        let garbage : i32 = self.dataGarbage + self.palettesGarbage;
+        if (garbage >= PALETTED_GARBAGE_MIN && garbage * 2 >= self.dataUsed + self.palettesUsed) {
+            self.compact(n, m);
+            return;
+        }
+        if (needData) {
+            let mut cap : i32 = (self.data.length as i32) * 2;
+            while (cap < self.dataUsed + n) {
+                cap = cap * 2;
+            }
+            let mut bigger : u64[] = new u64[cap as i64];
+            for (i of 0..self.dataUsed) {
+                bigger[i] = self.data[i];
+            }
+            self.data = bigger;
+        }
+        if (needPal) {
+            let mut cap : i32 = (self.palettes.length as i32) * 2;
+            while (cap < self.palettesUsed + m) {
+                cap = cap * 2;
+            }
+            let mut bigger : u16[] = new u16[cap as i64];
+            for (i of 0..self.palettesUsed) {
+                bigger[i] = self.palettes[i];
+            }
+            self.palettes = bigger;
+        }
+    }
+
+    // Allocates a paletted container of `b` bits whose packed cells are all index 0; the palette holds
+    // `first`.
+    fn openPaletted(mut self, c : i32, b : i32, first : i32) : void {
+        let dl : i32 = PackedCells::longsFor(self.cells, b);
+        let pc : i32 = 1 << b;
+        self.reserve(dl, pc);
+        self.dataStart[c] = self.dataUsed;
+        self.paletteStart[c] = self.palettesUsed;
+        for (k of 0..dl) {
+            self.data[self.dataUsed + k] = 0;
+        }
+        self.dataUsed = self.dataUsed + dl;
+        self.palettesUsed = self.palettesUsed + pc;
+        self.palettes[self.paletteStart[c]] = first as u16;
+        self.paletteSize[c] = 1;
+        self.bits[c] = b as u8;
+    }
+
+    // Allocates a direct container; its cells are filled by the caller.
+    fn openDirect(mut self, c : i32) : void {
+        let dl : i32 = PackedCells::longsFor(self.cells, self.directBits);
+        self.reserve(dl, 0);
+        self.dataStart[c] = self.dataUsed;
+        for (k of 0..dl) {
+            self.data[self.dataUsed + k] = 0;
+        }
+        self.dataUsed = self.dataUsed + dl;
+        self.bits[c] = self.directBits as u8;
+        self.paletteSize[c] = 0;
+    }
+
+    // ---- writing cells
+    // ---------------------------------------------------------------------------------------
+
+    /** Makes container `c` the single state `v`, releasing its pool space. */
+    pub fn fill(mut self, c : i32, v : i32) : void {
+        self.release(c);
+        self.single[c] = v as u16;
+    }
+
+    /** Stores state `v` at cell `i` of container `c`, growing the form when needed. */
+    pub fn set(mut self, c : i32, i : i32, v : i32) : void {
+        let b : i32 = self.bits[c] as i32;
+        if (b == 0) {
+            if (self.single[c] as i32 == v) {
+                return;
+            }
+            let old : i32 = self.single[c] as i32;
+            self.openPaletted(c, self.minBits, old);
+            self.palettes[self.paletteStart[c] + 1] = v as u16;
+            self.paletteSize[c] = 2;
+            PackedCells::setIn(self.layouts[self.minBits], self.data, self.dataStart[c], i, 1);
+            return;
+        }
+        if (b == self.directBits) {
+            PackedCells::setIn(self.layouts[b], self.data, self.dataStart[c], i, v);
+            return;
+        }
+
+        // Worldgen writes runs of one state, so the last (container, state) found is tried before the palette
+        // is.
+        let mut idx : i32 = -1;
+        if (self.hitContainer == c && self.hitValue == v) {
+            idx = self.hitIndex;
+        } else {
+            idx = self.indexOf(c, v);
+        }
+        if (idx < 0) {
+            if (self.paletteSize[c] as i32 == (1 << b)) {
+                self.grow(c);
+                self.set(c, i, v);
+                return;
+            }
+            idx = self.paletteSize[c] as i32;
+            self.palettes[self.paletteStart[c] + idx] = v as u16;
+            self.paletteSize[c] = (idx + 1) as u16;
+        }
+        self.hitContainer = c;
+        self.hitValue = v;
+        self.hitIndex = idx;
+        PackedCells::setIn(self.layouts[b], self.data, self.dataStart[c], i, idx);
+    }
+
+    // The palette position of `v` in container `c`, or -1.
+    fn indexOf(self, c : i32, v : i32) : i32 {
+        let off : i32 = self.paletteStart[c];
+        let n : i32 = self.paletteSize[c] as i32;
+        for (k of 0..n) {
+            if (self.palettes[off + k] as i32 == v) {
+                return k;
+            }
+        }
+        return -1;
+    }
+
+    // Moves a full palette to the next width, or to the direct form past `maxPaletteBits`. The palette of the
+    // wider form lists the states in the order the cells first use them, so entries an edit left unused are
+    // dropped.
+    fn grow(mut self, c : i32) : void {
+        let b : i32 = self.bits[c] as i32;
+        let n : i32 = self.cells;
+        let mut flat : u16[] = new u16[n as i64];
+        self.expand(c, flat);
+        self.release(c);
+        if (b + 1 > self.maxPaletteBits) {
+            self.openDirect(c);
+            PackedCells::packValues(self.data, self.dataStart[c], self.directBits, n, flat);
+            return;
+        }
+        self.openPaletted(c, b + 1, flat[0] as i32);
+
+        // One pass turns each state into its palette index in place, then the indices are packed a word at a
+        // time.
+        let palOff : i32 = self.paletteStart[c];
+        let mut len : i32 = 1;
+        let mut lastState : i32 = flat[0] as i32;
+        let mut lastIndex : i32 = 0;
+        for (i of 0..n) {
+            let v : i32 = flat[i] as i32;
+            if (v != lastState || i == 0) {
+                let mut k : i32 = 0;
+                while (k < len && self.palettes[palOff + k] as i32 != v) {
+                    k = k + 1;
+                }
+                if (k == len) {
+                    self.palettes[palOff + len] = v as u16;
+                    len = len + 1;
+                }
+                lastState = v;
+                lastIndex = k;
+            }
+            flat[i] = lastIndex as u16;
+        }
+        PackedCells::packValues(self.data, self.dataStart[c], b + 1, n, flat);
+        self.paletteSize[c] = len as u16;
+    }
+
+    /** Writes every cell of container `c` into `out[0..cells]` as state ids. */
+    pub fn expand(self, c : i32, out : u16[]) : void {
+        self.expandAt(c, out, 0);
+    }
+
+    /** Like `expand`, writing at `out[dst..dst + cells]` (a pooled buffer holding many sections). */
+    pub fn expandAt(self, c : i32, out : u16[], dst : i32) : void {
+        let b : i32 = self.bits[c] as i32;
+        let n : i32 = self.cells;
+        if (b == 0) {
+            let v : u16 = self.single[c];
+            for (i of 0..n) {
+                out[dst + i] = v;
+            }
+            return;
+        }
+        let off : i32 = self.dataStart[c];
+        if (b == self.directBits) {
+            PackedCells::unpackRun(self.data, off, b, n, out, dst);
+            return;
+        }
+
+        let per : i32 = PackedCells::perLong(b);
+        let mask : u64 = ((1 as u64) << (b as u64)) - 1;
+        let po : i32 = self.paletteStart[c];
+        let pal : u16[] = self.palettes;
+        let data : u64[] = self.data;
+        let mut cell : i32 = 0;
+        let mut w : i32 = 0;
+        while (cell < n) {
+            let mut word : u64 = data[off + w];
+            let mut k : i32 = 0;
+            while (k < per && cell < n) {
+                out[dst + cell] = pal[po + ((word & mask) as i32)];
+                word = word >> (b as u64);
+                cell = cell + 1;
+                k = k + 1;
+            }
+            w = w + 1;
+        }
+    }
+
+    /**
+     * Replaces container `c` with the states in `flat[0..cells]`, in the smallest form: single when all
+     * agree, else a palette of the distinct states (direct past 256). `scratch.map` must be all -1 and is
+     * left so.
+     */
+    pub fn pack(mut self, c : i32, flat : u16[], scratch : PalettedScratch) : void {
+        self.release(c);
+        let n : i32 = self.cells;
+        scratch.listLen = 0;
+        for (i of 0..n) {
+            let v : i32 = flat[i] as i32;
+            if (scratch.map[v] < 0) {
+                scratch.map[v] = scratch.listLen;
+                scratch.list[scratch.listLen] = v as u16;
+                scratch.listLen = scratch.listLen + 1;
+            }
+        }
+
+        let distinct : i32 = scratch.listLen;
+        if (distinct == 1) {
+            self.single[c] = flat[0];
+        } else if (distinct > (1 << self.maxPaletteBits)) {
+            self.openDirect(c);
+            PackedCells::packValues(self.data, self.dataStart[c], self.directBits, n, flat);
+        } else {
+            let b : i32 = PackedCells::bitsFor(distinct, self.minBits);
+            self.openPaletted(c, b, scratch.list[0] as i32);
+            for (k of 0..distinct) {
+                self.palettes[self.paletteStart[c] + k] = scratch.list[k];
+            }
+            self.paletteSize[c] = distinct as u16;
+            PackedCells::packRun(self.data, self.dataStart[c], b, n, flat, scratch.map);
+        }
+
+        // Leave the map clean for the next call: only the entries touched are reset. `list` holds `cells`
+        // entries and there are never more distinct states than cells, so every one of them is in it.
+        for (k of 0..distinct) {
+            scratch.map[scratch.list[k] as i32] = -1;
+        }
+        scratch.listLen = 0;
+    }
+
+    // ---- disk forms
+    // --------------------------------------------------------------------------------------------
+
+    /**
+     * Installs a container read from disk: `palette[0..paletteCount]` already mapped to state ids, `diskBits`
+     * per entry and `longs[0..longCount]` of packed indices. A single-entry palette needs no data. Data of
+     * the wrong length or an index outside the palette is damage: the container becomes the first palette
+     * state.
+     */
+    pub fn load(
+        mut self,
+        c : i32,
+        palette : u16[],
+        paletteCount : i32,
+        diskBits : i32,
+        longs : u64[],
+        longCount : i32
+    ) : void {
+        self.release(c);
+        if (paletteCount <= 0) {
+            self.single[c] = 0;
+            return;
+        }
+        self.single[c] = palette[0];
+        if (paletteCount == 1) {
+            return;
+        }
+        if (diskBits < 1 || diskBits > PALETTED_STATE_BITS
+            || longCount != PackedCells::longsFor(self.cells, diskBits)) {
+            return;
+        }
+        if (diskBits <= self.maxPaletteBits && diskBits >= self.minBits) {
+            self.openPaletted(c, diskBits, palette[0] as i32);
+            for (k of 0..paletteCount) {
+                self.palettes[self.paletteStart[c] + k] = palette[k];
+            }
+            self.paletteSize[c] = paletteCount as u16;
+            for (k of 0..longCount) {
+                self.data[self.dataStart[c] + k] = longs[k];
+            }
+            if (!self.indicesValid(c, paletteCount)) {
+                self.release(c);
+                self.single[c] = palette[0];
+            }
+            return;
+        }
+        self.loadWide(c, palette, paletteCount, diskBits, longs);
+    }
+
+    // Narrow-below-minimum or wide (above `maxPaletteBits`) palettes are re-expressed cell by cell.
+    fn loadWide(
+        mut self,
+        c : i32,
+        palette : u16[],
+        paletteCount : i32,
+        diskBits : i32,
+        longs : u64[]
+    ) : void {
+        let n : i32 = self.cells;
+        let mut flat : u16[] = new u16[n as i64];
+        let layout : PackedLayout = self.layouts[diskBits];
+        for (i of 0..n) {
+            let idx : i32 = PackedCells::getIn(layout, longs, 0, i);
+            if (idx >= paletteCount) {
+                return;
+            }
+            flat[i] = palette[idx];
+        }
+        let scratch : PalettedScratch = new PalettedScratch(1 << self.directBits, n);
+        self.pack(c, flat, scratch);
+    }
+
+    // True when every packed index of container `c` is inside its palette. A palette that fills its width
+    // cannot be exceeded; otherwise the words are scanned entry by entry without dividing.
+    fn indicesValid(self, c : i32, paletteCount : i32) : bool {
+        let b : i32 = self.bits[c] as i32;
+        if (paletteCount == (1 << b)) {
+            return true;
+        }
+        let per : i32 = PackedCells::perLong(b);
+        let mask : u64 = ((1 as u64) << (b as u64)) - 1;
+        let off : i32 = self.dataStart[c];
+        let mut cell : i32 = 0;
+        let mut w : i32 = 0;
+        while (cell < self.cells) {
+            let mut word : u64 = self.data[off + w];
+            let mut k : i32 = 0;
+            while (k < per && cell < self.cells) {
+                if ((word & mask) as i32 >= paletteCount) {
+                    return false;
+                }
+                word = word >> (b as u64);
+                cell = cell + 1;
+                k = k + 1;
+            }
+            w = w + 1;
+        }
+        return true;
+    }
+
+    /**
+     * Prepares container `c` for writing in the form the game writes: the distinct states in `scratch.list`
+     * (`listLen` of them), `outBits` per entry, and the packed cells in `scratch.longs` (`outLongs` of them;
+     * zero when the container is a single state). The palette is rebuilt from the cells, so entries an edit
+     * left unused are dropped.
+     */
+    pub fn prepareWrite(self, c : i32, scratch : PalettedScratch) : void {
+        let n : i32 = self.cells;
+        self.expand(c, scratch.flat);
+        scratch.listLen = 0;
+        for (i of 0..n) {
+            let v : i32 = scratch.flat[i] as i32;
+            if (scratch.map[v] < 0) {
+                scratch.map[v] = scratch.listLen;
+                scratch.list[scratch.listLen] = v as u16;
+                scratch.listLen = scratch.listLen + 1;
+            }
+        }
+        if (scratch.listLen == 1) {
+            scratch.outBits = 0;
+            scratch.outLongs = 0;
+            scratch.map[scratch.list[0] as i32] = -1;
+            return;
+        }
+        let b : i32 = PackedCells::bitsFor(scratch.listLen, self.minBits);
+        let nl : i32 = PackedCells::longsFor(n, b);
+        PackedCells::packRun(scratch.longs, 0, b, n, scratch.flat, scratch.map);
+        scratch.outBits = b;
+        scratch.outLongs = nl;
+        for (k of 0..scratch.listLen) {
+            scratch.map[scratch.list[k] as i32] = -1;
+        }
+    }
+
+    // ---- accounting
+    // ------------------------------------------------------------------------------------------
+
+    /** Bytes of live data: per-container numbers plus the used part of both pools. */
+    pub fn bytesUsed(self) : i32 {
+        return self.count * PALETTED_PER_CONTAINER
+            + (self.palettesUsed - self.palettesGarbage) * PALETTED_PALETTE_BYTES
+            + (self.dataUsed - self.dataGarbage) * PALETTED_LONG_BYTES;
+    }
+
+    /** Bytes held by the arrays, live or not (what the allocator was asked for). */
+    pub fn bytesReserved(self) : i32 {
+        return self.count * PALETTED_PER_CONTAINER + self.palettes.length as i32 * PALETTED_PALETTE_BYTES
+            + self.data.length as i32 * PALETTED_LONG_BYTES;
+    }
+
+    /** Throws away every container's contents and the pools' garbage, keeping the arrays for reuse. */
+    pub fn clear(mut self) : void {
+        self.hitContainer = -1;
+        for (c of 0..self.count) {
+            self.bits[c] = 0;
+            self.single[c] = 0;
+            self.paletteSize[c] = 0;
+        }
+        self.palettesUsed = 0;
+        self.dataUsed = 0;
+        self.palettesGarbage = 0;
+        self.dataGarbage = 0;
+    }
+
+    /** Aborts on a container index outside the store (a bug in the caller). */
+    pub fn check(self, c : i32) : void {
+        if (c < 0 || c >= self.count) {
+            panicMsg("PalettedPool: container index out of range");
+        }
+    }
+}

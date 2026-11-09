@@ -1,0 +1,216 @@
+// core_packed_layout — checks for the division-free paths of PackedCells and the widths of PalettedPool.
+//
+// `getIn`/`setIn` replace the division of `get`/`set` by a multiplication that is exact below
+// `PACKED_FAST_LIMIT` and divides above it, so the checks compare them with `get`/`set` for every width, at
+// the cell indices where a wrong magic number would first show (the multiples of the entries per word and the
+// cell before each), and across the limit. `packValues` and `unpackRun` are checked against `set` and `get`;
+// the pool's `maxPaletteBits` against its forms.
+
+use ludax::{
+    Checks, PACKED_FAST_LIMIT, PALETTED_PALETTE_BITS, PackedCells, PackedLayout, PalettedPool,
+    PalettedScratch, Pcg32
+};
+
+/** The checks of the layout paths and the pool widths. */
+pub class PackedLayoutSuite {
+    /** Runs every check of the suite. */
+    pub static fn run(c : Checks) : void {
+        layoutAgreementChecks(c);
+        layoutLimitChecks(c);
+        layoutRunChecks(c);
+        layoutPoolChecks(c);
+    }
+}
+
+fn layoutAgreementChecks(c : Checks) : void {
+    let r : Pcg32 = new Pcg32(4, 4);
+    let mut wrong : i32 = 0;
+    let mut checked : i32 = 0;
+    for (bits of 1..17) {
+        let layout : PackedLayout = PackedCells::layoutOf(bits);
+        let mask : i32 = (1 << bits) - 1;
+        let n : i32 = 8192;
+        let mut viaStatic : u64[] = new u64[(PackedCells::longsFor(n, bits) + 1) as i64];
+        let mut viaLayout : u64[] = new u64[(PackedCells::longsFor(n, bits) + 1) as i64];
+        for (i of 0..n) {
+            let v : i32 = (r.nextU32() as i32) & mask;
+            PackedCells::set(viaStatic, 0, bits, i, v);
+            PackedCells::setIn(layout, viaLayout, 0, i, v);
+        }
+        for (w of 0..PackedCells::longsFor(n, bits)) {
+            if (viaStatic[w] != viaLayout[w]) {
+                wrong = wrong + 1;
+            }
+        }
+        for (i of 0..n) {
+            checked = checked + 1;
+            if (PackedCells::get(viaStatic, 0, bits, i)
+                != PackedCells::getIn(layout, viaStatic, 0, i)) {
+                wrong = wrong + 1;
+            }
+        }
+        // The same at an offset.
+        let v : i32 = mask;
+        PackedCells::setIn(layout, viaLayout, 2, 100, v);
+        if (PackedCells::get(viaLayout, 2, bits, 100) != v) {
+            wrong = wrong + 1;
+        }
+    }
+    c.sameInt(
+        "packed layout: getIn and setIn equal get and set for every width (${checked} cells)",
+        wrong,
+        0
+    );
+    let layout5 : PackedLayout = PackedCells::layoutOf(5);
+    c.sameInt("packed layout: 5 bits hold 12 entries per word", layout5.per, 12);
+    c.sameInt("packed layout: ... under the mask 31", layout5.mask as i64, 31);
+    c.sameInt("packed layout: ... and the width 5", layout5.bits, 5);
+}
+
+fn layoutLimitChecks(c : Checks) : void {
+    // A division-free quotient must equal the division for every index up to the limit: test the widths 1 to
+    // 5 (the array for the limit is 50 MB at 5 bits) at the indices around multiples of the entries per word,
+    // near the start, near the limit, and above it.
+    let mut wrong : i32 = 0;
+    for (bits of 1..6) {
+        let layout : PackedLayout = PackedCells::layoutOf(bits);
+        let per : i32 = layout.per;
+        let mut data : u64[] = new u64[(PackedCells::longsFor(PACKED_FAST_LIMIT + 70, bits)
+            + 1) as i64];
+        let mut probes : i32[] = new i32[8];
+        probes[0] = PACKED_FAST_LIMIT - 1;
+        probes[1] = PACKED_FAST_LIMIT - per;
+        probes[2] = PACKED_FAST_LIMIT - per - 1;
+        probes[3] = PACKED_FAST_LIMIT;
+        probes[4] = PACKED_FAST_LIMIT + 1;
+        probes[5] = PACKED_FAST_LIMIT + 65;
+        probes[6] = per * 1000;
+        probes[7] = per * 1000 - 1;
+        for (k of 0..8) {
+            let i : i32 = probes[k];
+            let v : i32 = ((i % 7) + 1) & ((1 << bits) - 1);
+            PackedCells::setIn(layout, data, 0, i, v);
+            if (PackedCells::get(data, 0, bits, i) != v
+                || PackedCells::getIn(layout, data, 0, i) != v) {
+                wrong = wrong + 1;
+            }
+        }
+    }
+    c.sameInt(
+        "packed layout: indices around the multiplication limit agree with the division",
+        wrong,
+        0
+    );
+}
+
+fn layoutRunChecks(c : Checks) : void {
+    let r : Pcg32 = new Pcg32(9, 9);
+    let mut wrong : i32 = 0;
+    for (bits of 1..17) {
+        let mask : i32 = (1 << bits) - 1;
+        let counts : i32[] = layoutRunCounts();
+        for (k of 0..counts.length as i32) {
+            let n : i32 = counts[k];
+            let mut values : u16[] = new u16[n as i64 + 1];
+            for (i of 0..n) {
+                values[i] = ((r.nextU32() as i32) & mask) as u16;
+            }
+            let longs : i32 = PackedCells::longsFor(n, bits);
+            let mut viaSet : u64[] = new u64[(longs + 1) as i64];
+            for (i of 0..n) {
+                PackedCells::set(viaSet, 0, bits, i, values[i] as i32);
+            }
+            let mut viaPack : u64[] = new u64[(longs + 1) as i64];
+            PackedCells::packValues(viaPack, 0, bits, n, values);
+            for (w of 0..longs) {
+                if (viaSet[w] != viaPack[w]) {
+                    wrong = wrong + 1;
+                }
+            }
+            let mut back : u16[] = new u16[n as i64 + 1];
+            PackedCells::unpackRun(viaPack, 0, bits, n, back, 0);
+            for (i of 0..n) {
+                if (back[i] != values[i]) {
+                    wrong = wrong + 1;
+                }
+            }
+        }
+    }
+    c.sameInt(
+        "packed layout: packValues writes what set writes and unpackRun reads it back",
+        wrong,
+        0
+    );
+}
+
+fn layoutRunCounts() : i32[] {
+    let mut counts : i32[] = new i32[6];
+    counts[0] = 0;
+    counts[1] = 1;
+    counts[2] = 63;
+    counts[3] = 64;
+    counts[4] = 65;
+    counts[5] = 4096;
+    return counts;
+}
+
+fn layoutPoolChecks(c : Checks) : void {
+    // A pool whose widest palette is 6 bits (64 states) goes direct at the 65th state; the default goes at
+    // the 257th.
+    let narrow : PalettedPool = PalettedPool::withPaletteBits(1, 4096, 4, 15, 6);
+    let normal : PalettedPool = new PalettedPool(1, 4096, 4, 15);
+    let mut narrowForm : i32 = 0;
+    let mut normalForm : i32 = 0;
+    for (i of 0..70) {
+        narrow.set(0, i, i + 10);
+        normal.set(0, i, i + 10);
+    }
+    narrowForm = narrow.bitsOf(0);
+    normalForm = normal.bitsOf(0);
+    c.sameInt("pool widths: a 6-bit limit goes direct past 64 states", narrowForm, 15);
+    c.sameInt("pool widths: the default keeps a 7-bit palette for 70 states", normalForm, 7);
+    c.sameInt("pool widths: the default palette width constant is 8", PALETTED_PALETTE_BITS, 8);
+    let mut same : bool = true;
+    for (i of 0..70) {
+        if (narrow.get(0, i) != i + 10 || normal.get(0, i) != i + 10) {
+            same = false;
+        }
+    }
+    c.that("pool widths: both forms hold every state", same);
+
+    // pack and load follow the limit as well.
+    let scratch : PalettedScratch = new PalettedScratch(1 << 15, 4096);
+    let mut flat : u16[] = new u16[4096];
+    for (i of 0..4096) {
+        flat[i] = (i % 100) as u16;
+    }
+    narrow.pack(0, flat, scratch);
+    normal.pack(0, flat, scratch);
+    c.sameInt(
+        "pool widths: pack of 100 states is direct under a 6-bit limit",
+        narrow.bitsOf(0),
+        15
+    );
+    c.sameInt("pool widths: ... and a 7-bit palette under the default", normal.bitsOf(0), 7);
+    let mut back : u16[] = new u16[4096];
+    narrow.expandAt(0, back, 0);
+    let mut equal : bool = true;
+    for (i of 0..4096) {
+        if (back[i] != flat[i]) {
+            equal = false;
+        }
+    }
+    c.that("pool widths: the direct container expands to the same cells", equal);
+
+    // A single-bit-minimum pool (biome-like: 64 cells, 1 to 6 bits).
+    let biomes : PalettedPool = new PalettedPool(2, 64, 1, 6);
+    for (i of 0..64) {
+        biomes.set(0, i, i % 3);
+    }
+    c.sameInt(
+        "pool widths: three states in 64 cells use 2 bits when the minimum is 1",
+        biomes.bitsOf(0),
+        2
+    );
+    c.sameInt("pool widths: ... and keep every state", biomes.get(0, 62), 62 % 3);
+}

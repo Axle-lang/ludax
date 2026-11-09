@@ -1,0 +1,199 @@
+// arena — a bump allocator over one block of raw memory, freed all at once.
+//
+// For data with a shared lifetime: a frame's scratch, a level's load buffers. Allocation moves a cursor, so
+// it costs next to nothing and never fragments; `reset` rewinds to empty, and `mark` / `rewindTo` rewind to a
+// point taken earlier. The block is fixed at construction: an allocation that does not fit fails (returns -1)
+// rather than growing, because growing would move memory that earlier offsets name.
+//
+// Axle cannot turn raw memory into a typed array, so the arena hands out byte offsets (never addresses) and
+// has typed accessors for numbers. Offsets stay valid until a reset or rewind past them. All accessors are
+// bounds checked against the block and abort on a bad offset.
+
+use std::ffi::libc::mem::libc_calloc;
+use std::ffi::libc::mem::libc_free;
+use std::ffi::libc::mem::libc_memset;
+use std::ffi::runtime::panicMsg;
+
+use crate::core::math::scalar::atLeastOneI64;
+
+// Widths of the numbers the typed accessors read and write; also their natural alignment.
+const ARENA_WORD32 : i64 = 4;
+const ARENA_WORD64 : i64 = 8;
+
+/** A fixed block of zeroed memory with a cursor that only moves forward until it is rewound. */
+pub class Arena {
+    base   : i64;
+    size   : i64;
+    cursor : i64 = 0;
+
+    /** An arena of `bytes` bytes (at least 1), all zero. */
+    constructor(bytes : i64) {
+        self.size = atLeastOneI64(bytes);
+        self.base = 0;
+        unsafe {
+            let block : ptr = libc_calloc(self.size, 1);
+            self.base = block as i64;
+            if (self.base == 0) {
+                panicMsg("Arena: out of memory");
+            }
+        }
+    }
+
+    drop() {
+        unsafe {
+            libc_free(self.base as ptr);
+        }
+    }
+
+    /** The block's size in bytes. */
+    pub fn capacity(self) : i64 {
+        return self.size;
+    }
+
+    /** How many bytes are handed out, padding included. */
+    pub fn used(self) : i64 {
+        return self.cursor;
+    }
+
+    /** How many bytes are left. */
+    pub fn remaining(self) : i64 {
+        return self.size - self.cursor;
+    }
+
+    /**
+     * Reserves `bytes` bytes at an offset that is a multiple of `align` (a power of two); returns it, or
+     * -1 when they do not fit. Bytes are zero unless the region was
+     * handed out before and given back by `rewindTo` (only `reset` zeroes).
+     */
+    pub fn alloc(mut self, bytes : i64, align : i64) : i64 {
+        if (bytes < 0 || align < 1 || (align & (align - 1)) != 0) {
+            panicMsg("Arena.alloc: bad size or alignment");
+        }
+        let start : i64 = (self.cursor + align - 1) & ~(align - 1);
+        if (start + bytes > self.size) {
+            return -1;
+        }
+        self.cursor = start + bytes;
+        return start;
+    }
+
+    /** Reserves room for `count` `i32`s; returns the offset of the first, or -1. */
+    pub fn allocI32(mut self, count : i64) : i64 {
+        return self.alloc(count * ARENA_WORD32, ARENA_WORD32);
+    }
+
+    /** Reserves room for `count` `i64`s; returns the offset of the first, or -1. */
+    pub fn allocI64(mut self, count : i64) : i64 {
+        return self.alloc(count * ARENA_WORD64, ARENA_WORD64);
+    }
+
+    /** Reserves room for `count` `f32`s; returns the offset of the first, or -1. */
+    pub fn allocF32(mut self, count : i64) : i64 {
+        return self.alloc(count * ARENA_WORD32, ARENA_WORD32);
+    }
+
+    /** Reserves room for `count` `f64`s; returns the offset of the first, or -1. */
+    pub fn allocF64(mut self, count : i64) : i64 {
+        return self.alloc(count * ARENA_WORD64, ARENA_WORD64);
+    }
+
+    /** The current position, to give back to `rewindTo`. */
+    pub fn mark(self) : i64 {
+        return self.cursor;
+    }
+
+    /** Frees everything reserved after `mark` was taken; aborts on a mark ahead of the cursor. */
+    pub fn rewindTo(mut self, mark : i64) : void {
+        if (mark < 0 || mark > self.cursor) {
+            panicMsg("Arena.rewindTo: mark is not behind the cursor");
+        }
+        self.cursor = mark;
+    }
+
+    /** Frees everything and zeroes the block, ready for reuse. */
+    pub fn reset(mut self) : void {
+        unsafe {
+            libc_memset(self.base as ptr, 0, self.cursor);
+        }
+        self.cursor = 0;
+    }
+
+    /** Reads the `i32` at byte offset `at`. */
+    pub fn getI32(self, at : i64) : i32 {
+        self.check(at, ARENA_WORD32);
+        unsafe {
+            let p : ptr<i32> = (self.base + at) as ptr<i32>;
+            return *p;
+        }
+    }
+
+    /** Writes an `i32` at byte offset `at`. */
+    pub fn setI32(mut self, at : i64, v : i32) : void {
+        self.check(at, ARENA_WORD32);
+        unsafe {
+            let mut p : ptr<i32> = (self.base + at) as ptr<i32>;
+            *p = v;
+        }
+    }
+
+    /** Reads the `i64` at byte offset `at`. */
+    pub fn getI64(self, at : i64) : i64 {
+        self.check(at, ARENA_WORD64);
+        unsafe {
+            let p : ptr<i64> = (self.base + at) as ptr<i64>;
+            return *p;
+        }
+    }
+
+    /** Writes an `i64` at byte offset `at`. */
+    pub fn setI64(mut self, at : i64, v : i64) : void {
+        self.check(at, ARENA_WORD64);
+        unsafe {
+            let mut p : ptr<i64> = (self.base + at) as ptr<i64>;
+            *p = v;
+        }
+    }
+
+    /** Reads the `f32` at byte offset `at`. */
+    pub fn getF32(self, at : i64) : f32 {
+        self.check(at, ARENA_WORD32);
+        unsafe {
+            let p : ptr<f32> = (self.base + at) as ptr<f32>;
+            return *p;
+        }
+    }
+
+    /** Writes an `f32` at byte offset `at`. */
+    pub fn setF32(mut self, at : i64, v : f32) : void {
+        self.check(at, ARENA_WORD32);
+        unsafe {
+            let mut p : ptr<f32> = (self.base + at) as ptr<f32>;
+            *p = v;
+        }
+    }
+
+    /** Reads the `f64` at byte offset `at`. */
+    pub fn getF64(self, at : i64) : f64 {
+        self.check(at, ARENA_WORD64);
+        unsafe {
+            let p : ptr<f64> = (self.base + at) as ptr<f64>;
+            return *p;
+        }
+    }
+
+    /** Writes an `f64` at byte offset `at`. */
+    pub fn setF64(mut self, at : i64, v : f64) : void {
+        self.check(at, ARENA_WORD64);
+        unsafe {
+            let mut p : ptr<f64> = (self.base + at) as ptr<f64>;
+            *p = v;
+        }
+    }
+
+    // Aborts unless `width` bytes at `at` lie inside the block.
+    fn check(self, at : i64, width : i64) : void {
+        if (at < 0 || at + width > self.size) {
+            panicMsg("Arena: offset outside the block");
+        }
+    }
+}

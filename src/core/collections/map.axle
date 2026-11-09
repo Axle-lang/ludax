@@ -1,0 +1,262 @@
+// map — a hash map whose iteration order is the order the keys were first inserted.
+//
+// `std`'s `HashMap` is seeded per process and iterates keys only, so what a game does with it can differ from
+// one run to the next. This map is for everything whose order can be seen: entries sit in an array in
+// insertion order and an open-addressing table of indices finds them. Lookup is O(1); `remove` leaves a hole
+// that iteration skips, and the holes are squeezed out (order kept) the next time an insert finds the array
+// full.
+//
+// Keys are `i64` or `i32` (anything with a `MapKey` impl); `StringMap` is the same for string keys. Values
+// may be numbers, bools and plain structs, not strings (see Vec). Walk it by slot:
+//
+//     let s : i32 = map.first();
+//     while (s >= 0) {
+//         use(map.keyAt(s), map.valueAt(s));
+//         s = map.next(s);
+//     }
+//
+// Slot numbers are valid until the next `put` of a new key or `clear`; removing while walking is fine.
+// Replacing the value of an existing key keeps its position; removing a key and putting it again moves it to
+// the end.
+
+use std::ffi::runtime::panicMsg;
+
+use crate::core::id::hash::MapKey;
+
+// Entries live in an array of this many slots before the first growth.
+const MAP_INITIAL_CAPACITY : i32 = 8;
+
+// The probe table starts with this many cells: twice the entry capacity, so it is at most half full.
+const MAP_INITIAL_TABLE : i32 = 16;
+
+// Marks in `live`: an entry slot holds a present entry, or one that was removed (or never used).
+const MAP_SLOT_LIVE : i8 = 1;
+const MAP_SLOT_DEAD : i8 = 0;
+
+// An unoccupied cell of the probe table; occupied cells hold an entry slot, which is never negative.
+const MAP_NO_ENTRY : i32 = -1;
+
+/** Values of type `V` keyed by `K` (`i64` or `i32`), iterated in insertion order. */
+pub class Map<K : MapKey, V> {
+    keys   : K[];
+    values : V[];
+    live   : i8[];
+    table  : i32[];
+    room   : i32;
+    used   : i32 = 0;
+    count  : i32 = 0;
+    mask   : i64;
+
+    /** An empty map. */
+    constructor() {
+        self.room = match type V {
+            string => unsupported "Map<K, string>: generic arrays of strings corrupt memory in Axle 0.18.3",
+            _ => MAP_INITIAL_CAPACITY,
+        };
+        self.mask = (MAP_INITIAL_TABLE - 1) as i64;
+        self.keys = new K[self.room as i64];
+        self.values = new V[self.room as i64];
+        self.live = new i8[self.room as i64];
+        self.table = mapEmptyTable(MAP_INITIAL_TABLE);
+    }
+
+    /** How many keys are present. */
+    pub fn len(self) : i32 {
+        return self.count;
+    }
+
+    /** True when no key is present. */
+    pub fn isEmpty(self) : bool {
+        return self.count == 0;
+    }
+
+    /** The slot holding `key`, or -1 when it is absent. */
+    pub fn find(self, key : K) : i32 {
+        let mut p : i64 = key.hashKey() & self.mask;
+        while (true) {
+            let e : i32 = self.table[p];
+            if (e == MAP_NO_ENTRY) {
+                return -1;
+            }
+            if (self.live[e as i64] == MAP_SLOT_LIVE && self.keys[e as i64] == key) {
+                return e;
+            }
+            p = (p + 1) & self.mask;
+        }
+        return -1;
+    }
+
+    /** True when `key` is present. */
+    pub fn has(self, key : K) : bool {
+        return self.find(key) >= 0;
+    }
+
+    /** Stores `v` under `key`. True when the key is new (and goes last); false when it replaced a value. */
+    pub fn put(mut self, key : K, v : V) : bool {
+        let at : i32 = self.find(key);
+        if (at >= 0) {
+            let held : V = v;
+            self.storeValue(at, held);
+            return false;
+        }
+        if (self.used == self.room) {
+            self.rebuild();
+        }
+        let e : i32 = self.used;
+        let heldKey : K = key;
+        let heldValue : V = v;
+        self.storeKey(e, heldKey);
+        self.storeValue(e, heldValue);
+        self.live[e as i64] = MAP_SLOT_LIVE;
+        self.used = self.used + 1;
+        self.count = self.count + 1;
+        self.link(key, e);
+        return true;
+    }
+
+    /** The value under `key`; aborts when the key is absent. */
+    pub fn get(self, key : K) : V {
+        let at : i32 = self.find(key);
+        if (at < 0) {
+            panicMsg("Map.get: key absent");
+        }
+        return self.values[at as i64];
+    }
+
+    /** The value under `key`, or `fallback` when the key is absent. */
+    pub fn getOr(self, key : K, fallback : V) : V {
+        let at : i32 = self.find(key);
+        if (at < 0) {
+            return fallback;
+        }
+        return self.values[at as i64];
+    }
+
+    /** Removes `key`. True when it was present. */
+    pub fn remove(mut self, key : K) : bool {
+        let at : i32 = self.find(key);
+        if (at < 0) {
+            return false;
+        }
+        self.live[at as i64] = MAP_SLOT_DEAD;
+        self.count = self.count - 1;
+        return true;
+    }
+
+    /** Removes every key; the storage is kept. */
+    pub fn clear(mut self) : void {
+        for (e of 0..self.used) {
+            self.live[e as i64] = MAP_SLOT_DEAD;
+        }
+        for (p of 0..self.table.length) {
+            self.table[p as i64] = MAP_NO_ENTRY;
+        }
+        self.used = 0;
+        self.count = 0;
+    }
+
+    /** The first slot in insertion order, or -1 when the map is empty. */
+    pub fn first(self) : i32 {
+        return self.next(-1);
+    }
+
+    /** The slot after `slot` in insertion order, or -1 at the end. */
+    pub fn next(self, slot : i32) : i32 {
+        let mut e : i32 = slot + 1;
+        while (e < self.used) {
+            if (self.live[e as i64] == MAP_SLOT_LIVE) {
+                return e;
+            }
+            e = e + 1;
+        }
+        return -1;
+    }
+
+    /** The key in `slot`; aborts when the slot is not a present entry. */
+    pub fn keyAt(self, slot : i32) : K {
+        self.checkSlot(slot);
+        return self.keys[slot as i64];
+    }
+
+    /** The value in `slot`; aborts when the slot is not a present entry. */
+    pub fn valueAt(self, slot : i32) : V {
+        self.checkSlot(slot);
+        return self.values[slot as i64];
+    }
+
+    /** Replaces the value in `slot`; aborts when the slot is not a present entry. */
+    pub fn setValueAt(mut self, slot : i32, v : V) : void {
+        self.checkSlot(slot);
+        let held : V = v;
+        self.storeValue(slot, held);
+    }
+
+    // The only places a key or a value enters its array; see `Vec.store` for why the copy is made by the
+    // caller.
+    fn storeKey(mut self, e : i32, own key : K) : void {
+        self.keys[e as i64] = key;
+    }
+
+    fn storeValue(mut self, e : i32, own v : V) : void {
+        self.values[e as i64] = v;
+    }
+
+    fn checkSlot(self, slot : i32) : void {
+        if (slot < 0 || slot >= self.used || self.live[slot as i64] != MAP_SLOT_LIVE) {
+            panicMsg("Map: slot is not a present entry");
+        }
+    }
+
+    // Records entry `e` in the first free cell of its probe sequence.
+    fn link(mut self, key : K, e : i32) : void {
+        mapLink(self.table, self.mask, key.hashKey(), e);
+    }
+
+    // Squeezes out removed entries (order kept), doubling the capacity when more than half are present.
+    fn rebuild(mut self) : void {
+        let mut room : i32 = self.room;
+        if (self.count * 2 > self.room) {
+            room = self.room * 2;
+        }
+        let mut newKeys : K[] = new K[room as i64];
+        let mut newValues : V[] = new V[room as i64];
+        let mut newLive : i8[] = new i8[room as i64];
+        let newTable : i32[] = mapEmptyTable(room * 2);
+        let newMask : i64 = (room * 2 - 1) as i64;
+        let mut kept : i32 = 0;
+        for (e of 0..self.used) {
+            if (self.live[e as i64] == MAP_SLOT_LIVE) {
+                newKeys[kept as i64] = self.keys[e as i64];
+                newValues[kept as i64] = self.values[e as i64];
+                newLive[kept as i64] = MAP_SLOT_LIVE;
+                mapLink(newTable, newMask, self.keys[e as i64].hashKey(), kept);
+                kept = kept + 1;
+            }
+        }
+        self.keys = newKeys;
+        self.values = newValues;
+        self.live = newLive;
+        self.table = newTable;
+        self.mask = newMask;
+        self.room = room;
+        self.used = kept;
+    }
+}
+
+// Records entry `e` in the first free cell of the probe sequence that starts at `hash`.
+fn mapLink(table : i32[], mask : i64, hash : i64, e : i32) : void {
+    let mut p : i64 = hash & mask;
+    while (table[p] != MAP_NO_ENTRY) {
+        p = (p + 1) & mask;
+    }
+    table[p] = e;
+}
+
+// A probe table of `size` cells (a power of two), all empty.
+fn mapEmptyTable(size : i32) : i32[] {
+    let mut t : i32[] = new i32[size as i64];
+    for (p of 0..size) {
+        t[p as i64] = MAP_NO_ENTRY;
+    }
+    return t;
+}

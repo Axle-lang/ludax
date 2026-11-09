@@ -1,0 +1,567 @@
+// core_packed — checks for PackedCells and PalettedPool: every width and form, bad input, rates.
+//
+// `PackedCells` is the layout (entries of `bits` width in 64-bit words, none spanning two) and `PalettedPool`
+// is the storage built on it (a single value, a palette of up to 2^bits states, or direct state ids). The
+// checks compare each against a plain array: every width from 1 to 16 with random content, writes that must
+// not disturb a neighbour, a pool that grows through every form, `pack` and `expandAt` as inverses, and
+// `load` of a disk form that lies. Two `measured:` lines give cells per second for `get`/`set` and for the
+// pool.
+
+use ludax::{PackedCells, PalettedPool, PalettedScratch, Pcg32, Checks, nowNanos};
+
+/** The PackedCells and PalettedPool checks. */
+pub class PackedSuite {
+    /** Runs every check of the suite. */
+    pub static fn run(c : Checks) : void {
+        packedLayoutChecks(c);
+        packedWidthChecks(c);
+        packedRunChecks(c);
+        pooledGrowthChecks(c);
+        pooledPackChecks(c);
+        pooledLoadChecks(c);
+        pooledAccountingChecks(c);
+        packedMeasure(c);
+    }
+
+    /** Prints the `measured:` lines alone. */
+    pub static fn measure(c : Checks) : void {
+        packedMeasure(c);
+    }
+}
+
+fn packedLayoutChecks(c : Checks) : void {
+    c.sameInt("packed: 1 bit per entry gives 64 per long", PackedCells::perLong(1), 64);
+    c.sameInt("packed: 4 bits give 16 per long", PackedCells::perLong(4), 16);
+    c.sameInt("packed: 5 bits give 12 per long (4 bits of padding)", PackedCells::perLong(5), 12);
+    c.sameInt("packed: 15 bits give 4 per long", PackedCells::perLong(15), 4);
+    c.sameInt("packed: 16 bits give 4 per long", PackedCells::perLong(16), 4);
+    c.sameInt("packed: 4096 cells of 4 bits take 256 longs", PackedCells::longsFor(4096, 4), 256);
+    c.sameInt("packed: 4096 cells of 5 bits take 342 longs", PackedCells::longsFor(4096, 5), 342);
+    c.sameInt(
+        "packed: 4096 cells of 15 bits take 1024 longs",
+        PackedCells::longsFor(4096, 15),
+        1024
+    );
+    c.sameInt("packed: 0 cells take 0 longs", PackedCells::longsFor(0, 7), 0);
+    c.sameInt("packed: 1 cell takes 1 long", PackedCells::longsFor(1, 7), 1);
+    c.sameInt("packed: 64 cells of 1 bit take 1 long", PackedCells::longsFor(64, 1), 1);
+    c.sameInt("packed: 65 cells of 1 bit take 2 longs", PackedCells::longsFor(65, 1), 2);
+    c.sameInt("packed: a palette of 16 needs 4 bits", PackedCells::bitsFor(16, 4), 4);
+    c.sameInt("packed: a palette of 17 needs 5 bits", PackedCells::bitsFor(17, 4), 5);
+    c.sameInt("packed: a palette of 2 still needs the minimum of 4", PackedCells::bitsFor(2, 4), 4);
+    c.sameInt("packed: a palette of 256 needs 8 bits", PackedCells::bitsFor(256, 1), 8);
+    c.sameInt("packed: a palette of 257 needs 9 bits", PackedCells::bitsFor(257, 1), 9);
+    c.sameInt("packed: a palette of 1 needs the minimum", PackedCells::bitsFor(1, 1), 1);
+}
+
+fn packedWidthChecks(c : Checks) : void {
+    let r : Pcg32 = new Pcg32(11, 1);
+    let cellCounts : i32[] = packedCellCounts();
+    let mut wrong : i32 = 0;
+    let mut checked : i32 = 0;
+    for (bits of 1..17) {
+        let mask : i32 = (1 << bits) - 1;
+        for (k of 0..cellCounts.length as i32) {
+            let n : i32 = cellCounts[k];
+            let off : i32 = 3;
+            let mut data : u64[] = new u64[(PackedCells::longsFor(n, bits) + off + 2) as i64];
+            let mut plain : i32[] = new i32[n as i64];
+            for (i of 0..n) {
+                let v : i32 = (r.nextU32() as i32) & mask;
+                plain[i] = v;
+                PackedCells::set(data, off, bits, i, v);
+            }
+            for (i of 0..n) {
+                checked = checked + 1;
+                if (PackedCells::get(data, off, bits, i) != plain[i]) {
+                    wrong = wrong + 1;
+                }
+            }
+
+            // Overwrite every other cell with the extremes; the neighbours must keep their values.
+            for (i of 0..n) {
+                if (i % 2 == 0) {
+                    plain[i] = mask - plain[i];
+                    PackedCells::set(data, off, bits, i, plain[i]);
+                }
+            }
+            for (i of 0..n) {
+                checked = checked + 1;
+                if (PackedCells::get(data, off, bits, i) != plain[i]) {
+                    wrong = wrong + 1;
+                }
+            }
+            // The words around the run are untouched.
+            if (data[0] != 0 || data[(off + PackedCells::longsFor(n, bits)) as i64] != 0) {
+                wrong = wrong + 1;
+            }
+        }
+    }
+    c.sameInt(
+        "packed: get returns what set stored for widths 1..16, neighbours hold (${checked} cells)",
+        wrong,
+        0
+    );
+}
+
+fn packedCellCounts() : i32[] {
+    let mut counts : i32[] = new i32[6];
+    counts[0] = 1;
+    counts[1] = 63;
+    counts[2] = 64;
+    counts[3] = 65;
+    counts[4] = 4096;
+    counts[5] = 4097;
+    return counts;
+}
+
+fn packedRunChecks(c : Checks) : void {
+    let r : Pcg32 = new Pcg32(5, 2);
+    let n : i32 = 4096;
+    let mut flat : u16[] = new u16[n as i64];
+    let mut mismatched : i32 = 0;
+    for (bits of 1..9) {
+        let palette : i32 = 1 << bits;
+        let mut map : i32[] = new i32[300];
+        for (i of 0..300) {
+            map[i] = (i * 7) % palette;
+        }
+        for (i of 0..n) {
+            flat[i] = (r.nextU32() % 300) as u16;
+        }
+        let mut viaSet : u64[] = new u64[(PackedCells::longsFor(n, bits) + 1) as i64];
+        for (i of 0..n) {
+            PackedCells::set(viaSet, 0, bits, i, map[flat[i] as i64]);
+        }
+        let mut viaRun : u64[] = new u64[(PackedCells::longsFor(n, bits) + 1) as i64];
+        PackedCells::packRun(viaRun, 0, bits, n, flat, map);
+        for (w of 0..PackedCells::longsFor(n, bits)) {
+            if (viaSet[w] != viaRun[w]) {
+                mismatched = mismatched + 1;
+            }
+        }
+    }
+    c.sameInt("packed: packRun writes the same words as repeated set (widths 1..8)", mismatched, 0);
+}
+
+// A pool for states below 30000: blocks-like (4096 cells, 4..15 bits).
+fn pooledNew(containers : i32) : PalettedPool {
+    return new PalettedPool(containers, 4096, 4, 15);
+}
+
+fn pooledGrowthChecks(c : Checks) : void {
+    let pool : PalettedPool = pooledNew(3);
+    c.that(
+        "pool: a new container is a single state 0",
+        pool.isUniform(0) && pool.uniformValue(0) == 0
+    );
+    c.sameInt("pool: ... of width 0", pool.bitsOf(0), 0);
+    c.sameInt("pool: ... with a palette of 1", pool.paletteLen(0), 1);
+    c.sameInt("pool: every cell reads the single value", pool.get(0, 4095), 0);
+
+    // Distinct states 1..n written one per cell: the width steps at 16, 32, 64, 128 and 256 states.
+    let mut wrong : i32 = 0;
+    let mut stepsOk : bool = true;
+    pool.set(0, 0, 0);
+    c.that("pool: setting the value a single already holds changes nothing", pool.isUniform(0));
+    for (n of 1..400) {
+        pool.set(0, n, n * 3);
+        let distinct : i32 = n + 1;
+        let want : i32 = pooledWidth(distinct);
+        if (pool.bitsOf(0) != want) {
+            stepsOk = false;
+        }
+        if (n % 37 == 0 || n == 399) {
+            for (i of 0..(n + 1)) {
+                if (pool.get(0, i) != i * 3) {
+                    wrong = wrong + 1;
+                }
+            }
+        }
+    }
+    c.that(
+        "pool: the width follows the number of distinct states (4, 5, 6, 7, 8, then direct)",
+        stepsOk
+    );
+    c.sameInt("pool: every cell holds its state through every growth", wrong, 0);
+    c.sameInt("pool: after 400 distinct states the form is direct", pool.bitsOf(0), 15);
+    c.sameInt("pool: a direct container has no palette", pool.paletteLen(0), 0);
+    c.sameInt("pool: the other containers are untouched", pool.bitsOf(1) + pool.bitsOf(2), 0);
+
+    // Writing the same state many times does not grow the palette; fill releases the space.
+    for (i of 0..4096) {
+        pool.set(1, i, 7);
+    }
+    c.that(
+        "pool: filling every cell with one state by set leaves a 2-entry palette",
+        pool.paletteLen(1) == 2
+    );
+    pool.fill(1, 9);
+    c.that(
+        "pool: fill makes it single again",
+        pool.isUniform(1) && pool.uniformValue(1) == 9 && pool.get(1, 100) == 9
+    );
+    let before : i32 = pool.bytesUsed();
+    pool.fill(0, 4);
+    c.that("pool: fill of a direct container gives its space back", pool.bytesUsed() < before);
+}
+
+fn pooledWidth(distinct : i32) : i32 {
+    if (distinct <= 1) {
+        return 0;
+    }
+    if (distinct <= 16) {
+        return 4;
+    }
+    if (distinct <= 32) {
+        return 5;
+    }
+    if (distinct <= 64) {
+        return 6;
+    }
+    if (distinct <= 128) {
+        return 7;
+    }
+    if (distinct <= 256) {
+        return 8;
+    }
+    return 15;
+}
+
+fn pooledPackChecks(c : Checks) : void {
+    let r : Pcg32 = new Pcg32(21, 4);
+    let pool : PalettedPool = pooledNew(6);
+    let scratch : PalettedScratch = new PalettedScratch(1 << 15, 4096);
+    let mut flat : u16[] = new u16[4096];
+    let mut back : u16[] = new u16[4096];
+    let mut wrong : i32 = 0;
+    let distinctCounts : i32[] = pooledDistinctCounts();
+    for (k of 0..6) {
+        let distinct : i32 = distinctCounts[k];
+        for (i of 0..4096) {
+            flat[i] = ((((r.nextU32() % (distinct as u32)) as i32) * 5) as u16);
+        }
+        // Make sure every one of the states occurs.
+        for (s of 0..distinct) {
+            flat[s] = (s * 5) as u16;
+        }
+        pool.pack(k, flat, scratch);
+        pool.expandAt(k, back, 0);
+        for (i of 0..4096) {
+            if (back[i] != flat[i]) {
+                wrong = wrong + 1;
+            }
+            if (pool.get(k, i) != (flat[i] as i32)) {
+                wrong = wrong + 1;
+            }
+        }
+        c.sameInt(
+            "pool: pack of ${distinct} distinct states gives the width ${pooledWidth(distinct)}",
+            pool.bitsOf(k),
+            pooledWidth(distinct)
+        );
+    }
+    c.sameInt("pool: pack then expand and get are the identity (random content)", wrong, 0);
+
+    let mut clean : bool = true;
+    for (i of 0..(1 << 15)) {
+        if (scratch.map[i] != -1) {
+            clean = false;
+        }
+    }
+    c.that("pool: pack leaves its scratch map clean", clean);
+
+    // A uniform array packs to a single state; a second pack replaces the first form.
+    for (i of 0..4096) {
+        flat[i] = 77;
+    }
+    pool.pack(0, flat, scratch);
+    c.that(
+        "pool: a uniform array packs to the single form",
+        pool.isUniform(0) && pool.uniformValue(0) == 77
+    );
+
+    // expandAt writes at an offset of a larger buffer and leaves the rest.
+    let mut wide : u16[] = new u16[8192];
+    for (i of 0..8192) {
+        wide[i] = 9;
+    }
+    pool.expandAt(0, wide, 4096);
+    c.that(
+        "pool: expandAt fills its half and leaves the other",
+        wide[4095] == 9 && wide[4096] == 77 && wide[8191] == 77
+    );
+
+    // prepareWrite rebuilds the smallest palette and the same cells.
+    let pw : PalettedPool = pooledNew(1);
+    pw.set(0, 0, 100);
+    pw.set(0, 1, 200);
+    pw.set(0, 2, 300);
+    pw.set(0, 1, 100);
+    pw.prepareWrite(0, scratch);
+    c.sameInt("pool: prepareWrite drops the entry an edit left unused", scratch.listLen, 3);
+    c.sameInt("pool: ... at the minimum width", scratch.outBits, 4);
+    c.sameInt("pool: ... in 256 longs", scratch.outLongs, 256);
+    let uniform : PalettedPool = pooledNew(1);
+    uniform.fill(0, 5);
+    uniform.prepareWrite(0, scratch);
+    c.that(
+        "pool: prepareWrite of a single state answers no longs",
+        scratch.outBits == 0 && scratch.outLongs == 0 && scratch.listLen == 1
+    );
+}
+
+fn pooledDistinctCounts() : i32[] {
+    let mut counts : i32[] = new i32[6];
+    counts[0] = 2;
+    counts[1] = 16;
+    counts[2] = 17;
+    counts[3] = 200;
+    counts[4] = 256;
+    counts[5] = 300;
+    return counts;
+}
+
+fn pooledLoadChecks(c : Checks) : void {
+    let r : Pcg32 = new Pcg32(8, 8);
+    let source : PalettedPool = pooledNew(1);
+    let scratch : PalettedScratch = new PalettedScratch(1 << 15, 4096);
+    let mut flat : u16[] = new u16[4096];
+    for (i of 0..4096) {
+        flat[i] = ((((r.nextU32() % 40) as i32) + 100) as u16);
+    }
+    for (s of 0..40) {
+        flat[s] = (s + 100) as u16;
+    }
+    source.pack(0, flat, scratch);
+    source.prepareWrite(0, scratch);
+
+    // The disk form of that container: palette, width, longs. Load it into another pool.
+    let mut palette : u16[] = new u16[scratch.listLen as i64];
+    for (k of 0..scratch.listLen) {
+        palette[k] = scratch.list[k];
+    }
+    let mut longs : u64[] = new u64[scratch.outLongs as i64];
+    for (k of 0..scratch.outLongs) {
+        longs[k] = scratch.longs[k];
+    }
+    let target : PalettedPool = pooledNew(2);
+    target.load(0, palette, scratch.listLen, scratch.outBits, longs, scratch.outLongs);
+    let mut same : bool = true;
+    for (i of 0..4096) {
+        if (target.get(0, i) != (flat[i] as i32)) {
+            same = false;
+        }
+    }
+    c.that("pool: a container written by prepareWrite loads back to the same cells", same);
+
+    // A wrong data length: the container becomes the first palette state.
+    target.load(1, palette, scratch.listLen, scratch.outBits, longs, scratch.outLongs - 1);
+    c.that(
+        "pool: data of the wrong length leaves the first palette state",
+        target.isUniform(1) && target.uniformValue(1) == (palette[0] as i32)
+    );
+
+    // An index outside the palette is damage too.
+    let mut bad : u64[] = new u64[scratch.outLongs as i64];
+    for (k of 0..scratch.outLongs) {
+        bad[k] = longs[k];
+    }
+    bad[3] = ((0 - 1) as i64) as u64;
+    target.load(1, palette, scratch.listLen, scratch.outBits, bad, scratch.outLongs);
+    c.that(
+        "pool: an index outside the palette leaves the first palette state",
+        target.isUniform(1) && target.uniformValue(1) == (palette[0] as i32)
+    );
+
+    // A palette of one, of none, and a width outside 1..16.
+    target.load(1, palette, 1, 0, longs, 0);
+    c.that(
+        "pool: a palette of one is a single state",
+        target.isUniform(1) && target.uniformValue(1) == (palette[0] as i32)
+    );
+    target.load(1, palette, 0, 0, longs, 0);
+    c.that(
+        "pool: an empty palette is the single state 0",
+        target.isUniform(1) && target.uniformValue(1) == 0
+    );
+    target.load(1, palette, 5, 17, longs, scratch.outLongs);
+    c.that("pool: a width of 17 is damage", target.isUniform(1));
+
+    // A wide (9 bit) disk form is re-expressed in the pool's own forms.
+    let mut widePalette : u16[] = new u16[300];
+    for (k of 0..300) {
+        widePalette[k] = (k + 1000) as u16;
+    }
+    let mut wideLongs : u64[] = new u64[PackedCells::longsFor(4096, 9) as i64];
+    for (i of 0..4096) {
+        PackedCells::set(wideLongs, 0, 9, i, i % 300);
+    }
+    target.load(1, widePalette, 300, 9, wideLongs, PackedCells::longsFor(4096, 9));
+    let mut wideOk : bool = true;
+    for (i of 0..4096) {
+        if (target.get(1, i) != 1000 + (i % 300)) {
+            wideOk = false;
+        }
+    }
+    c.that("pool: a 9-bit disk palette loads cell by cell", wideOk);
+}
+
+fn pooledAccountingChecks(c : Checks) : void {
+    let pool : PalettedPool = pooledNew(40);
+    c.sameInt("pool: containers answers the count", pool.containers(), 40);
+    let empty : i32 = pool.bytesUsed();
+    for (k of 0..40) {
+        pool.set(k, 1, 5);
+        pool.set(k, 2, 6);
+    }
+    let full : i32 = pool.bytesUsed();
+    c.that("pool: bytesUsed grows with the containers (${empty} to ${full})", full > empty);
+    c.that("pool: bytesReserved is at least bytesUsed", pool.bytesReserved() >= full);
+    for (k of 0..40) {
+        pool.fill(k, 0);
+    }
+    c.sameInt("pool: filling every container gives back all pool space", pool.bytesUsed(), empty);
+
+    // Garbage left by growth is compacted before the pools grow again: a long cycle stays bounded.
+    let churn : PalettedPool = pooledNew(8);
+    for (round of 0..30) {
+        for (k of 0..8) {
+            for (i of 0..40) {
+                churn.set(k, i, round * 40 + i);
+            }
+            churn.fill(k, 1);
+        }
+    }
+    c.that(
+        "pool: a long cycle of growth and fill stays bounded (${churn.bytesReserved()} bytes)",
+        churn.bytesReserved() < 400000
+    );
+    churn.clear();
+    c.that(
+        "pool: clear empties every container",
+        churn.isUniform(3) && churn.uniformValue(3) == 0 && churn.bytesUsed() == 8 * 13
+    );
+
+    // Determinism: the same writes give the same cells and sizes.
+    let a : PalettedPool = pooledNew(2);
+    let b : PalettedPool = pooledNew(2);
+    let r1 : Pcg32 = new Pcg32(3, 3);
+    let r2 : Pcg32 = new Pcg32(3, 3);
+    for (i of 0..3000) {
+        a.set(i % 2, (r1.nextU32() % 4096) as i32, (r1.nextU32() % 300) as i32);
+        b.set(i % 2, (r2.nextU32() % 4096) as i32, (r2.nextU32() % 300) as i32);
+    }
+    let mut equal : bool = a.bytesUsed() == b.bytesUsed();
+    for (i of 0..4096) {
+        if (a.get(0, i) != b.get(0, i) || a.get(1, i) != b.get(1, i)) {
+            equal = false;
+        }
+    }
+    c.that("pool: the same writes give the same pool", equal);
+    c.that("pool: check accepts a container inside the pool", ok(a));
+}
+
+fn ok(pool : PalettedPool) : bool {
+    pool.check(1);
+    return true;
+}
+
+fn packedMeasure(c : Checks) : void {
+    let r : Pcg32 = new Pcg32(1, 1);
+    let mut longs : u64[] = new u64[2048];
+    let mut sum : i64 = 0;
+    let mut bestGet : i64 = (1 as i64) << 60;
+    let mut bestSet : i64 = (1 as i64) << 60;
+    for (run of 0..9) {
+        let t0 : i64 = nowNanos();
+        for (round of 0..250) {
+            for (i of 0..4096) {
+                PackedCells::set(longs, 0, 5, i, (i + round) & 31);
+            }
+        }
+        let t1 : i64 = nowNanos();
+        for (round of 0..250) {
+            for (i of 0..4096) {
+                sum = sum + (PackedCells::get(longs, 0, 5, i) as i64);
+            }
+        }
+        let t2 : i64 = nowNanos();
+        if (t1 - t0 < bestSet) {
+            bestSet = t1 - t0;
+        }
+        if (t2 - t1 < bestGet) {
+            bestGet = t2 - t1;
+        }
+    }
+    let cells : i64 = 250 * 4096;
+    let setRate : i64 = cells * 1000 / (bestSet + 1);
+    let getRate : i64 = cells * 1000 / (bestGet + 1);
+    println("measured: PackedCells 5-bit set ${setRate} Mcells/s, get ${getRate} Mcells/s (best of 9)");
+
+    // The pool as worldgen uses it: runs of one state with the occasional other, 4096 cells.
+    let pool : PalettedPool = new PalettedPool(1, 4096, 4, 15);
+    let scratch : PalettedScratch = new PalettedScratch(1 << 15, 4096);
+    let mut flat : u16[] = new u16[4096];
+    let mut back : u16[] = new u16[4096];
+    for (i of 0..4096) {
+        flat[i] = (((i / 64) % 20 + ((r.nextU32() % 3) as i32)) as u16);
+    }
+    let mut bestGetPool : i64 = (1 as i64) << 60;
+    let mut bestWrite : i64 = (1 as i64) << 60;
+    let mut bestExpand : i64 = (1 as i64) << 60;
+    let mut bestPack : i64 = (1 as i64) << 60;
+    let mut agree : bool = true;
+    for (run of 0..9) {
+        let t0 : i64 = nowNanos();
+        for (round of 0..20) {
+            pool.fill(0, 0);
+            for (i of 0..4096) {
+                pool.set(0, i, flat[i] as i32);
+            }
+        }
+        let t1 : i64 = nowNanos();
+        for (round of 0..200) {
+            for (i of 0..4096) {
+                sum = sum + (pool.get(0, i) as i64);
+            }
+        }
+        let tGet : i64 = nowNanos();
+        if (tGet - t1 < bestGetPool) {
+            bestGetPool = tGet - t1;
+        }
+        let t1b : i64 = nowNanos();
+        for (round of 0..200) {
+            pool.expandAt(0, back, 0);
+        }
+        let t2 : i64 = nowNanos();
+        for (round of 0..200) {
+            pool.pack(0, flat, scratch);
+        }
+        let t3 : i64 = nowNanos();
+        if (t1 - t0 < bestWrite) {
+            bestWrite = t1 - t0;
+        }
+        if (t2 - t1b < bestExpand) {
+            bestExpand = t2 - t1b;
+        }
+        if (t3 - t2 < bestPack) {
+            bestPack = t3 - t2;
+        }
+    }
+    for (i of 0..4096) {
+        if (back[i] != flat[i]) {
+            agree = false;
+        }
+    }
+    c.that(
+        "packed: the measured pool round trips and the sums are used (${sum})",
+        agree && sum > 0
+    );
+    let getPoolRate : i64 = 200 * 4096 * 1000 / (bestGetPool + 1);
+    let writeRate : i64 = 20 * 4096 * 1000 / (bestWrite + 1);
+    let expandRate : i64 = 200 * 4096 * 1000 / (bestExpand + 1);
+    let packRate : i64 = 200 * 4096 * 1000 / (bestPack + 1);
+    let rates : string = "get ${getPoolRate}, set ${writeRate}, expand ${expandRate}, pack ${packRate}";
+    println("measured: PalettedPool ${rates} Mcells/s (best of 9)");
+}

@@ -1,0 +1,200 @@
+// packed_cells — fixed-width entries packed into 64-bit words, never spanning two words.
+//
+// A container of small integers (palette indices, ids, flags) is stored `bits` per entry in `u64` words: a
+// word holds `64 / bits` entries and the rest of its bits are padding. So 4 bits give 16 entries per word, 5
+// bits give 12, 15 bits give 4. This file holds the one definition of that layout, shared by `PalettedPool`
+// and by any reader or writer of the same layout, so they cannot disagree about where entry `i` lives. The
+// width is a parameter of every call: nothing here knows what the entries mean.
+//
+// Locating entry `i` takes a division by the entries per word. `get` and `set` do it with the plain operator,
+// which is right for a one-off access. A caller that touches many cells of one width builds a `PackedLayout`
+// once (`layoutOf`) and uses `getIn`/`setIn`, which replace the division by a multiplication that gives the
+// same quotient for every cell index below `PACKED_FAST_LIMIT` (and divide above it); `packRun`, `packValues`
+// and `unpackRun` do whole runs a word at a time with no division at all.
+
+/**
+ * Cell indices below this use the multiplication in `getIn`/`setIn`; above it they divide, so the answers
+ * never differ.
+ */
+pub const PACKED_FAST_LIMIT : i32 = 67108864;
+
+/** The bits of a `u64`, the word the layout packs into. */
+pub const PACKED_CELLS_WORD_BITS : i32 = 64;
+
+const PACKED_CELLS_SHIFT_32 : i64 = 32;
+
+/**
+ * The constants of one entry width, computed once so a loop over cells does not divide: see
+ * `PackedCells::layoutOf`.
+ */
+pub struct PackedLayout {
+    /** Bits per entry. */
+    pub bits : i32;
+
+    /** Entries per 64-bit word. */
+    pub per : i32;
+
+    /** The mask of one entry, `(1 << bits) - 1`. */
+    pub mask : u64;
+
+    /** `2^32 / per + 1`: the multiplier that turns `i / per` into `(i * magic) >> 32`. */
+    pub magic : i64;
+}
+
+/** Packing arithmetic over `u64[]` runs: width, offset and index are arguments, the class holds no state. */
+pub class PackedCells {
+    /** The bits needed to index a palette of `n` entries, at least `minBits`. */
+    pub static fn bitsFor(n : i32, minBits : i32) : i32 {
+        let mut bits : i32 = minBits;
+        while ((1 << bits) < n) {
+            bits = bits + 1;
+        }
+        return bits;
+    }
+
+    /** How many entries one long holds at `bits` per entry. */
+    pub static fn perLong(bits : i32) : i32 {
+        return PACKED_CELLS_WORD_BITS / bits;
+    }
+
+    /** How many longs `cells` entries of `bits` bits occupy. */
+    pub static fn longsFor(cells : i32, bits : i32) : i32 {
+        let per : i32 = PACKED_CELLS_WORD_BITS / bits;
+        return (cells + per - 1) / per;
+    }
+
+    /** The division-free constants of width `bits` (1 to 32), for `getIn` and `setIn`. */
+    pub static fn layoutOf(bits : i32) : PackedLayout {
+        let per : i32 = PACKED_CELLS_WORD_BITS / bits;
+        return PackedLayout {
+            bits: bits,
+            per: per,
+            mask: ((1 as u64) << (bits as u64)) - 1,
+            magic: (((1 as i64) << PACKED_CELLS_SHIFT_32) / (per as i64)) + 1,
+        };
+    }
+
+    /** The entry at cell `i` of the packed run starting at `data[off]`. */
+    pub static fn get(data : u64[], off : i32, bits : i32, i : i32) : i32 {
+        let per : i32 = PACKED_CELLS_WORD_BITS / bits;
+        let word : u64 = data[off + i / per];
+        let shift : u64 = ((i % per) * bits) as u64;
+        return ((word >> shift) & (((1 as u64) << (bits as u64)) - 1)) as i32;
+    }
+
+    /** Stores `v` (below `1 << bits`) at cell `i` of the packed run starting at `data[off]`. */
+    pub static fn set(mut data : u64[], off : i32, bits : i32, i : i32, v : i32) : void {
+        let per : i32 = PACKED_CELLS_WORD_BITS / bits;
+        let at : i32 = off + i / per;
+        let shift : u64 = ((i % per) * bits) as u64;
+        let mask : u64 = ((1 as u64) << (bits as u64)) - 1;
+        data[at] = (data[at] & ~(mask << shift)) | ((v as u64) << shift);
+    }
+
+    // The word index of cell `i` for a layout: a multiplication below `PACKED_FAST_LIMIT`, a division above.
+    static fn wordOf(layout : PackedLayout, i : i32) : i32 {
+        if (i < PACKED_FAST_LIMIT) {
+            return (((i as i64) * layout.magic) >> PACKED_CELLS_SHIFT_32) as i32;
+        }
+        return i / layout.per;
+    }
+
+    /** `get` with the constants of `layout` (from `layoutOf`): the same entry, without a division. */
+    pub static fn getIn(layout : PackedLayout, data : u64[], off : i32, i : i32) : i32 {
+        let word : i32 = PackedCells::wordOf(layout, i);
+        let shift : u64 = ((i - word * layout.per) * layout.bits) as u64;
+        return ((data[off + word] >> shift) & layout.mask) as i32;
+    }
+
+    /** `set` with the constants of `layout` (from `layoutOf`): the same write, without a division. */
+    pub static fn setIn(layout : PackedLayout, mut data : u64[], off : i32, i : i32, v : i32) : void {
+        let word : i32 = PackedCells::wordOf(layout, i);
+        let shift : u64 = ((i - word * layout.per) * layout.bits) as u64;
+        let at : i32 = off + word;
+        data[at] = (data[at] & ~(layout.mask << shift)) | ((v as u64) << shift);
+    }
+
+    /**
+     * Packs `cells` palette indices, `map[flat[i]]`, into `data[off..]` at `bits` per entry, a long at a
+     * time: one shift per entry and no division, where `set` divides to find the long. The same bytes as
+     * `set` would write.
+     */
+    pub static fn packRun(
+        data : u64[],
+        off : i32,
+        bits : i32,
+        cells : i32,
+        flat : u16[],
+        map : i32[]
+    ) : void {
+        let per : i32 = PACKED_CELLS_WORD_BITS / bits;
+        let mut cell : i32 = 0;
+        let mut w : i32 = off;
+        while (cell < cells) {
+            let mut word : u64 = 0;
+            let mut k : i32 = 0;
+            let mut shift : u64 = 0;
+            while (k < per && cell < cells) {
+                word = word | ((map[flat[cell] as i64] as u64) << shift);
+                shift = shift + (bits as u64);
+                cell = cell + 1;
+                k = k + 1;
+            }
+            data[w] = word;
+            w = w + 1;
+        }
+    }
+
+    /**
+     * Packs `values[0..cells]` as they are (no map) into `data[off..]` at `bits` per entry, a long at a time.
+     * The same words as `set` would write for each cell of an all-zero run; a value must be below `1 <<
+     * bits`.
+     */
+    pub static fn packValues(data : u64[], off : i32, bits : i32, cells : i32, values : u16[]) : void {
+        let per : i32 = PACKED_CELLS_WORD_BITS / bits;
+        let mut cell : i32 = 0;
+        let mut w : i32 = off;
+        while (cell < cells) {
+            let mut word : u64 = 0;
+            let mut k : i32 = 0;
+            let mut shift : u64 = 0;
+            while (k < per && cell < cells) {
+                word = word | ((values[cell] as u64) << shift);
+                shift = shift + (bits as u64);
+                cell = cell + 1;
+                k = k + 1;
+            }
+            data[w] = word;
+            w = w + 1;
+        }
+    }
+
+    /**
+     * The inverse of `packValues`: `cells` entries of `bits` bits from `data[off..]` into `out[outAt..outAt +
+     * cells]`.
+     */
+    pub static fn unpackRun(
+        data : u64[],
+        off : i32,
+        bits : i32,
+        cells : i32,
+        out : u16[],
+        outAt : i32
+    ) : void {
+        let per : i32 = PACKED_CELLS_WORD_BITS / bits;
+        let mask : u64 = ((1 as u64) << (bits as u64)) - 1;
+        let mut cell : i32 = 0;
+        let mut w : i32 = off;
+        while (cell < cells) {
+            let mut word : u64 = data[w];
+            let mut k : i32 = 0;
+            while (k < per && cell < cells) {
+                out[outAt + cell] = (word & mask) as u16;
+                word = word >> (bits as u64);
+                cell = cell + 1;
+                k = k + 1;
+            }
+            w = w + 1;
+        }
+    }
+}
