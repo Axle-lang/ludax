@@ -1,0 +1,244 @@
+// grid_map — a walkability and cost grid for path finding.
+//
+// Each cell is blocked (cost 0) or open with a traversal cost of 1 or more: 1 is plain ground, larger numbers
+// are mud, shallows or danger the finder avoids when it can. On top of that static layer sits a dynamic one:
+// moving obstacles (a crate, a parked car, another unit) block a rectangle of cells with `blockRect` and free
+// it with `unblockRect`; blocks count, so two overlapping obstacles leave the cells blocked until both go.
+// Every change bumps `revision`, which a `FlowField` compares with the one it was built at to know it is stale.
+//
+// Movement is 4-connected unless `setDiagonal(true)`. A diagonal step between two cells that touch only at a
+// corner is the "corner cutting" case: with `setCutCorners(false)` (the default) both cells beside the move must
+// be open, so an agent cannot slip between two diagonal walls or graze a wall's corner; with
+// `setCutCorners(true)` one open side is enough. Squeezing between two blocked corners is never allowed.
+//
+// Step costs are integers (1000 per orthogonal step, 1414 per diagonal one, times the cost of the cell
+// entered), so path costs add without rounding and equal costs compare exactly.
+
+use crate::core::math::scalar::maxI;
+
+/** The cost of an orthogonal step onto a cell of traversal cost 1. */
+pub const NAV_STEP_ORTHO : i32 = 1000;
+
+/** The cost of a diagonal step onto a cell of traversal cost 1 (1000 times the square root of two, rounded). */
+pub const NAV_STEP_DIAG : i32 = 1414;
+
+/** The traversal cost of a cell that cannot be entered. */
+pub const NAV_COST_BLOCKED : i32 = 0;
+
+/** The traversal cost of plain ground. */
+pub const NAV_COST_OPEN : i32 = 1;
+
+/** The `-1` of every navigation lookup that finds no cell: no parent, no next step, no cost. */
+pub const NAV_NONE : i32 = -1;
+
+// The neighbour directions in use: the four orthogonal ones, or those and the four diagonals.
+const NAV_DIRS_ORTHO : i32 = 4;
+const NAV_DIRS_ALL : i32 = 8;
+
+/** A rectangular grid of cells with costs, obstacles and a movement rule. */
+pub class GridMap {
+    w          : i32;
+    h          : i32;
+    cost       : i32[];
+    blocks     : i32[];
+    diagonal   : bool = false;
+    cutCorners : bool = false;
+    changes    : i32 = 0;
+
+    /** A grid of `width` x `height` open cells of cost 1; sizes below 1 become 1. */
+    constructor(width : i32, height : i32) {
+        let cw : i32 = maxI(width, 1);
+        let ch : i32 = maxI(height, 1);
+        self.w = cw;
+        self.h = ch;
+        self.cost = new i32[(cw * ch) as i64];
+        self.blocks = new i32[(cw * ch) as i64];
+        for (i of 0..(cw * ch)) {
+            self.cost[i] = NAV_COST_OPEN;
+            self.blocks[i] = 0;
+        }
+    }
+
+    /** The number of columns. */
+    pub fn width(self) : i32 {
+        return self.w;
+    }
+
+    /** The number of rows. */
+    pub fn height(self) : i32 {
+        return self.h;
+    }
+
+    /** The index of cell (`x`, `y`) in row-major order; the cell must be inside the grid. */
+    pub fn index(self, x : i32, y : i32) : i32 {
+        return y * self.w + x;
+    }
+
+    /** True when (`x`, `y`) is a cell of the grid. */
+    pub fn inBounds(self, x : i32, y : i32) : bool {
+        return x >= 0 && y >= 0 && x < self.w && y < self.h;
+    }
+
+    /** True when an agent can stand on the cell: inside the grid, open, and not covered by a dynamic obstacle. */
+    pub fn isWalkable(self, x : i32, y : i32) : bool {
+        if (!self.inBounds(x, y)) {
+            return false;
+        }
+        let i : i32 = y * self.w + x;
+        return self.cost[i] > NAV_COST_BLOCKED && self.blocks[i] == 0;
+    }
+
+    /** The traversal cost of the cell, 0 when it cannot be entered. */
+    pub fn costAt(self, x : i32, y : i32) : i32 {
+        if (!self.isWalkable(x, y)) {
+            return NAV_COST_BLOCKED;
+        }
+        return self.cost[y * self.w + x];
+    }
+
+    /** Sets the static traversal cost of a cell (0 blocks it for good); cells outside are ignored. */
+    pub fn setCost(mut self, x : i32, y : i32, cost : i32) : void {
+        if (!self.inBounds(x, y)) {
+            return;
+        }
+        self.cost[y * self.w + x] = maxI(cost, NAV_COST_BLOCKED);
+        self.changes = self.changes + 1;
+    }
+
+    /** Blocks or opens a cell in the static layer (an opened cell has cost 1). */
+    pub fn setBlocked(mut self, x : i32, y : i32, blocked : bool) : void {
+        if (blocked) {
+            self.setCost(x, y, NAV_COST_BLOCKED);
+        } else {
+            self.setCost(x, y, NAV_COST_OPEN);
+        }
+    }
+
+    /** Puts a dynamic obstacle on the `w` x `h` cells from (`x`, `y`); parts outside the grid are ignored. */
+    pub fn blockRect(mut self, x : i32, y : i32, w : i32, h : i32) : void {
+        self.addBlocks(x, y, w, h, 1);
+    }
+
+    /** Takes away a dynamic obstacle placed with the same rectangle by `blockRect`. */
+    pub fn unblockRect(mut self, x : i32, y : i32, w : i32, h : i32) : void {
+        self.addBlocks(x, y, w, h, -1);
+    }
+
+    /** Removes every dynamic obstacle. */
+    pub fn clearObstacles(mut self) : void {
+        for (i of 0..(self.w * self.h)) {
+            self.blocks[i] = 0;
+        }
+        self.changes = self.changes + 1;
+    }
+
+    /** Allows or forbids diagonal moves. */
+    pub fn setDiagonal(mut self, on : bool) : void {
+        self.diagonal = on;
+        self.changes = self.changes + 1;
+    }
+
+    /** Sets whether a diagonal move may pass one blocked corner (see the file header). */
+    pub fn setCutCorners(mut self, on : bool) : void {
+        self.cutCorners = on;
+        self.changes = self.changes + 1;
+    }
+
+    /** True when diagonal moves are allowed. */
+    pub fn allowsDiagonal(self) : bool {
+        return self.diagonal;
+    }
+
+    /** True when diagonal moves may cut a corner. */
+    pub fn allowsCornerCutting(self) : bool {
+        return self.cutCorners;
+    }
+
+    /** A number that changes whenever the map does; a cache compares it to know it is out of date. */
+    pub fn revision(self) : i32 {
+        return self.changes;
+    }
+
+    /**
+     * True when an agent on the walkable cell (`x`, `y`) may step by (`dx`, `dy`), each -1, 0 or 1: the
+     * target cell is walkable and, for a diagonal, diagonals are on and the corner rule holds.
+     */
+    pub fn canStep(self, x : i32, y : i32, dx : i32, dy : i32) : bool {
+        if (!self.isWalkable(x + dx, y + dy)) {
+            return false;
+        }
+        if (dx == 0 || dy == 0) {
+            return true;
+        }
+        if (!self.diagonal) {
+            return false;
+        }
+        let sideA : bool = self.isWalkable(x + dx, y);
+        let sideB : bool = self.isWalkable(x, y + dy);
+        if (self.cutCorners) {
+            return sideA || sideB;
+        }
+        return sideA && sideB;
+    }
+
+    /** The cost of stepping by (`dx`, `dy`) onto the cell it reaches; call only when `canStep` holds. */
+    pub fn stepCost(self, x : i32, y : i32, dx : i32, dy : i32) : i32 {
+        let mut base : i32 = NAV_STEP_ORTHO;
+        if (dx != 0 && dy != 0) {
+            base = NAV_STEP_DIAG;
+        }
+        return base * self.costAt(x + dx, y + dy);
+    }
+
+    /** The x of neighbour direction `k`: 0..3 are the orthogonal ones, 4..7 the diagonals. */
+    pub static fn dirX(k : i32) : i32 {
+        return match k {
+            0 => 0,
+            1 => 1,
+            2 => 0,
+            3 => -1,
+            4 => 1,
+            5 => 1,
+            6 => -1,
+            _ => -1,
+        };
+    }
+
+    /** The y of neighbour direction `k` (see `dirX`). */
+    pub static fn dirY(k : i32) : i32 {
+        return match k {
+            0 => -1,
+            1 => 0,
+            2 => 1,
+            3 => 0,
+            4 => -1,
+            5 => 1,
+            6 => 1,
+            _ => -1,
+        };
+    }
+
+    /** How many neighbour directions are in use: 8 with diagonals, else 4. */
+    pub fn directions(self) : i32 {
+        if (self.diagonal) {
+            return NAV_DIRS_ALL;
+        }
+        return NAV_DIRS_ORTHO;
+    }
+
+    fn addBlocks(mut self, x : i32, y : i32, w : i32, h : i32, delta : i32) : void {
+        for (cy of y..(y + h)) {
+            for (cx of x..(x + w)) {
+                if (self.inBounds(cx, cy)) {
+                    let i : i32 = cy * self.w + cx;
+                    let mut n : i32 = self.blocks[i] + delta;
+                    if (n < 0) {
+                        n = 0;
+                    }
+                    self.blocks[i] = n;
+                }
+            }
+        }
+        self.changes = self.changes + 1;
+    }
+}

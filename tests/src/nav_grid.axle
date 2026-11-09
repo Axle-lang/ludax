@@ -1,0 +1,435 @@
+// nav_grid — the grid map, A*, path smoothing and the flow field, checked against breadth-first search.
+//
+// The random cases compare the finder with an independent breadth-first search on the same maze: the same
+// reachability, the same step count at unit cost, and a walk that is legal at every step. The hand-built maps
+// then pin what a search cannot show — weighted costs, the corner rule, smoothing, the flow field, dynamic
+// edits and determinism — so a failure names the law that broke rather than "the path looks odd".
+
+use ludax::{
+    Checks, Pcg32, GridMap, GridPath, GridPathfinder, GridLine, FlowField, NAV_STEP_ORTHO,
+    NAV_STEP_DIAG
+};
+
+/** Breadth-first search on a 4-connected unit-cost grid: the number of steps, or -1 when unreachable. */
+pub fn navBfsSteps(map : GridMap, sx : i32, sy : i32, gx : i32, gy : i32) : i32 {
+    if (!map.isWalkable(sx, sy) || !map.isWalkable(gx, gy)) {
+        return -1;
+    }
+    let w : i32 = map.width();
+    let h : i32 = map.height();
+    let mut dist : i32[] = new i32[(w * h) as i64];
+    let mut queue : i32[] = new i32[(w * h) as i64];
+    for (i of 0..(w * h)) {
+        dist[i] = -1;
+    }
+    let mut head : i32 = 0;
+    let mut tail : i32 = 0;
+    dist[sy * w + sx] = 0;
+    queue[tail] = sy * w + sx;
+    tail = tail + 1;
+    while (head < tail) {
+        let at : i32 = queue[head];
+        head = head + 1;
+        let x : i32 = at % w;
+        let y : i32 = at / w;
+        for (k of 0..4) {
+            let nx : i32 = x + GridMap::dirX(k);
+            let ny : i32 = y + GridMap::dirY(k);
+            if (map.isWalkable(nx, ny) && dist[ny * w + nx] < 0) {
+                dist[ny * w + nx] = dist[at] + 1;
+                queue[tail] = ny * w + nx;
+                tail = tail + 1;
+            }
+        }
+    }
+    return dist[gy * w + gx];
+}
+
+/** A random map: each cell blocked with chance `percent`/100. */
+pub fn navRandomMap(rng : Pcg32, w : i32, h : i32, percent : i32) : GridMap {
+    let map : GridMap = new GridMap(w, h);
+    for (y of 0..h) {
+        for (x of 0..w) {
+            if (rng.range(0, 100) < percent) {
+                map.setBlocked(x, y, true);
+            }
+        }
+    }
+    return map;
+}
+
+fn navPathValid(map : GridMap, p : GridPath, sx : i32, sy : i32, gx : i32, gy : i32) : bool {
+    if (!p.found() || p.len() < 1) {
+        return false;
+    }
+    if (p.xAt(0) != sx || p.yAt(0) != sy || p.xAt(p.len() - 1) != gx || p.yAt(p.len() - 1) != gy) {
+        return false;
+    }
+    for (i of 0..p.len()) {
+        if (!map.isWalkable(p.xAt(i), p.yAt(i))) {
+            return false;
+        }
+        if (i > 0
+            && !map.canStep(
+                p.xAt(i - 1),
+                p.yAt(i - 1),
+                p.xAt(i) - p.xAt(i - 1),
+                p.yAt(i) - p.yAt(i - 1)
+            )) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn navGridTestKnown(c : Checks) : void {
+    // A 5x5 map with a wall down column 2 that has one gap, at the bottom.
+    let map : GridMap = new GridMap(5, 5);
+    for (y of 0..4) {
+        map.setBlocked(2, y, true);
+    }
+    let finder : GridPathfinder = new GridPathfinder(map);
+    let p : GridPath = finder.find(map, 0, 0, 4, 0);
+    c.that("the path round the wall is found", p.found());
+    c.sameInt(
+        "it goes down 4, across 4 and up 4: 12 steps",
+        p.cost() as i64,
+        12 * NAV_STEP_ORTHO as i64
+    );
+    c.sameInt("which is 13 cells with both ends", p.len() as i64, 13);
+    c.that("every step is a legal move", navPathValid(map, p, 0, 0, 4, 0));
+    c.sameInt("the plain path length is 12 cells", p.length() as i64, 12);
+
+    map.setBlocked(2, 4, true);
+    let none : GridPath = finder.find(map, 0, 0, 4, 0);
+    c.that("no path when the wall is closed", !none.found());
+    c.sameInt("and the empty path lists nothing", none.len() as i64, 0);
+    c.that("no path into a blocked cell", !finder.find(map, 0, 0, 2, 2).found());
+    c.that("no path out of a blocked cell", !finder.find(map, 2, 2, 0, 0).found());
+    c.that("no path to a cell outside", !finder.find(map, 0, 0, 9, 9).found());
+    let same : GridPath = finder.find(map, 1, 1, 1, 1);
+    c.that("start = goal: a path of one cell", same.found() && same.len() == 1 && same.cost() == 0);
+}
+
+fn navGridTestCosts(c : Checks) : void {
+    // A mud strip (cost 9) across the middle row with one dry crossing at the far end: going round beats wading.
+    let map : GridMap = new GridMap(7, 3);
+    for (x of 0..6) {
+        map.setCost(x, 1, 9);
+    }
+    let finder : GridPathfinder = new GridPathfinder(map);
+    let p : GridPath = finder.find(map, 0, 0, 0, 2);
+    c.that("found across the strip", p.found());
+    // Wading: 2 steps, one into mud (9000) and one onto dry ground (1000) = 10000.
+    // Going round via the dry column x = 6: 6 + 2 + 6 = 14 steps of 1000.
+    c.sameInt("wading is cheaper than 14 dry steps", p.cost() as i64, 10000);
+    map.setCost(0, 1, 40);
+    let q : GridPath = finder.find(map, 0, 0, 0, 2);
+    c.sameInt(
+        "with the left cell dear (40) the path wades one cell to the right: 1 + 9 + 1 + 1",
+        q.cost() as i64,
+        12000
+    );
+    let wet : GridMap = new GridMap(7, 3);
+    for (x of 0..6) {
+        wet.setCost(x, 1, 100);
+    }
+    let f2 : GridPathfinder = new GridPathfinder(wet);
+    c.sameInt(
+        "a very dear strip makes the dry detour win",
+        f2.find(wet, 0, 0, 0, 2).cost() as i64,
+        14000
+    );
+}
+
+fn navGridTestDiagonals(c : Checks) : void {
+    let open : GridMap = new GridMap(6, 6);
+    open.setDiagonal(true);
+    let finder : GridPathfinder = new GridPathfinder(open);
+    c.sameInt(
+        "five diagonal steps across an open field",
+        finder.find(open, 0, 0, 5, 5).cost() as i64,
+        5 * NAV_STEP_DIAG as i64
+    );
+    c.sameInt(
+        "a knight's route: one diagonal and some straight",
+        finder.find(open, 0, 0, 5, 2).cost() as i64,
+        2 * NAV_STEP_DIAG as i64 + 3 * NAV_STEP_ORTHO as i64
+    );
+
+    // Two diagonal walls: a gap only a corner wide. Never passable.
+    let pinch : GridMap = new GridMap(2, 2);
+    pinch.setDiagonal(true);
+    pinch.setBlocked(1, 0, true);
+    pinch.setBlocked(0, 1, true);
+    let fp : GridPathfinder = new GridPathfinder(pinch);
+    c.that("no squeezing between two diagonal walls", !fp.find(pinch, 0, 0, 1, 1).found());
+    pinch.setCutCorners(true);
+    c.that("not even when corner cutting is on", !fp.find(pinch, 0, 0, 1, 1).found());
+
+    // One wall: the corner rule decides.
+    let corner : GridMap = new GridMap(2, 2);
+    corner.setDiagonal(true);
+    corner.setBlocked(1, 0, true);
+    let fc : GridPathfinder = new GridPathfinder(corner);
+    c.sameInt(
+        "without corner cutting the long way round",
+        fc.find(corner, 0, 0, 1, 1).cost() as i64,
+        2 * NAV_STEP_ORTHO as i64
+    );
+    corner.setCutCorners(true);
+    c.sameInt(
+        "with corner cutting the diagonal",
+        fc.find(corner, 0, 0, 1, 1).cost() as i64,
+        NAV_STEP_DIAG as i64
+    );
+    c.that("the map reports its rule", corner.allowsCornerCutting() && corner.allowsDiagonal());
+}
+
+fn navGridTestRandom(c : Checks) : void {
+    let rng : Pcg32 = new Pcg32(20240607, 3);
+    let mut agree : bool = true;
+    let mut valid : bool = true;
+    let mut reachable : i32 = 0;
+    let mut blocked : i32 = 0;
+    for (m of 0..60) {
+        let map : GridMap = navRandomMap(rng, 22, 16, 15 + (m % 4) * 8);
+        let finder : GridPathfinder = new GridPathfinder(map);
+        for (q of 0..6) {
+            let sx : i32 = rng.range(0, 22);
+            let sy : i32 = rng.range(0, 16);
+            let gx : i32 = rng.range(0, 22);
+            let gy : i32 = rng.range(0, 16);
+            let steps : i32 = navBfsSteps(map, sx, sy, gx, gy);
+            let p : GridPath = finder.find(map, sx, sy, gx, gy);
+            if (steps < 0) {
+                if (p.found()) {
+                    agree = false;
+                }
+                blocked = blocked + 1;
+            } else {
+                reachable = reachable + 1;
+                if (!p.found() || p.cost() != steps * NAV_STEP_ORTHO || p.len() != steps + 1) {
+                    agree = false;
+                }
+                if (!navPathValid(map, p, sx, sy, gx, gy)) {
+                    valid = false;
+                }
+            }
+        }
+    }
+    c.that("A* is as short as breadth-first search on 360 random mazes' queries", agree);
+    c.that("and every path it returns is a legal walk", valid);
+    c.that("the sample had both reachable and walled-off queries", reachable > 50 && blocked > 5);
+}
+
+fn navGridTestFlowAgainstAStar(c : Checks) : void {
+    let rng : Pcg32 = new Pcg32(99, 5);
+    let mut same : bool = true;
+    let mut walked : bool = true;
+    for (m of 0..30) {
+        let map : GridMap = navRandomMap(rng, 20, 14, 20 + (m % 3) * 8);
+        map.setDiagonal(m % 2 == 0);
+        map.setCutCorners(m % 4 == 0);
+        let finder : GridPathfinder = new GridPathfinder(map);
+        let field : FlowField = new FlowField(map);
+        let gx : i32 = rng.range(0, 20);
+        let gy : i32 = rng.range(0, 14);
+        field.rebuildFor(map, gx, gy);
+        for (q of 0..8) {
+            let sx : i32 = rng.range(0, 20);
+            let sy : i32 = rng.range(0, 14);
+            let p : GridPath = finder.find(map, sx, sy, gx, gy);
+            let fc : i32 = field.costAt(sx, sy);
+            if (p.found()) {
+                if (fc != p.cost()) {
+                    same = false;
+                }
+                // Walking the field from the start reaches the goal and pays exactly the field's cost.
+                let mut x : i32 = sx;
+                let mut y : i32 = sy;
+                let mut paid : i32 = 0;
+                let mut guard : i32 = 0;
+                while ((x != gx || y != gy) && guard < 1000) {
+                    let dx : i32 = field.stepX(x, y);
+                    let dy : i32 = field.stepY(x, y);
+                    if (!map.canStep(x, y, dx, dy)) {
+                        guard = 1000;
+                    } else {
+                        paid = paid + map.stepCost(x, y, dx, dy);
+                        x = x + dx;
+                        y = y + dy;
+                        guard = guard + 1;
+                    }
+                }
+                if (x != gx || y != gy || paid != fc) {
+                    walked = false;
+                }
+            } else if (fc >= 0 && map.isWalkable(sx, sy)) {
+                same = false;
+            }
+        }
+    }
+    c.that(
+        "flow field cost equals the A* cost (4 and 8 connected, with and without corner cutting)",
+        same
+    );
+    c.that("walking the field reaches the goal and pays its cost", walked);
+}
+
+fn navGridTestFlowMulti(c : Checks) : void {
+    let map : GridMap = new GridMap(9, 1);
+    let field : FlowField = new FlowField(map);
+    let mut xs : i32[] = new i32[2];
+    let mut ys : i32[] = new i32[2];
+    xs[0] = 0;
+    xs[1] = 8;
+    ys[0] = 0;
+    ys[1] = 0;
+    field.rebuild(map, xs, ys, 2);
+    c.sameInt("a goal costs nothing", field.costAt(0, 0) as i64, 0);
+    c.sameInt(
+        "the middle is four steps from either goal",
+        field.costAt(4, 0) as i64,
+        4 * NAV_STEP_ORTHO as i64
+    );
+    c.sameInt("cells head for the nearer goal (left)", field.stepX(2, 0) as i64, -1);
+    c.sameInt("cells head for the nearer goal (right)", field.stepX(6, 0) as i64, 1);
+    c.sameInt("a goal has no step", field.stepX(0, 0) as i64, 0);
+    c.sameInt("outside the grid is unreachable", field.costAt(-1, 0) as i64, -1);
+}
+
+fn navGridTestDynamic(c : Checks) : void {
+    let map : GridMap = new GridMap(8, 5);
+    let finder : GridPathfinder = new GridPathfinder(map);
+    let field : FlowField = new FlowField(map);
+    field.rebuildFor(map, 7, 2);
+    c.that("fresh field is not stale", !field.isStale(map));
+    c.sameInt(
+        "open ground: seven steps",
+        finder.find(map, 0, 2, 7, 2).cost() as i64,
+        7 * NAV_STEP_ORTHO as i64
+    );
+    map.blockRect(3, 0, 1, 4);
+    c.that("changing the map makes the field stale", field.isStale(map));
+    let round : GridPath = finder.find(map, 0, 2, 7, 2);
+    c.sameInt(
+        "a crate across rows 0-3 sends the path round the bottom: 7 + 2 * 2 steps",
+        round.cost() as i64,
+        11 * NAV_STEP_ORTHO as i64
+    );
+    field.rebuildFor(map, 7, 2);
+    c.sameInt("the rebuilt field agrees", field.costAt(0, 2) as i64, 11 * NAV_STEP_ORTHO as i64);
+    map.blockRect(3, 4, 1, 1);
+    c.that("a closed wall leaves no path", !finder.find(map, 0, 2, 7, 2).found());
+    map.blockRect(3, 0, 1, 4);
+    map.unblockRect(3, 0, 1, 4);
+    c.that("blocks count: one removal of two leaves the cells blocked", !map.isWalkable(3, 1));
+    map.unblockRect(3, 0, 1, 4);
+    map.unblockRect(3, 4, 1, 1);
+    c.that(
+        "removing every obstacle opens the path again",
+        map.isWalkable(3, 1) && finder.find(map, 0, 2, 7, 2).found()
+    );
+    map.blockRect(6, 2, 5, 5);
+    c.that(
+        "a rectangle overlapping the edge is clipped",
+        !map.isWalkable(7, 4) && map.isWalkable(5, 2)
+    );
+    map.clearObstacles();
+    c.that("clearObstacles frees every cell", map.isWalkable(7, 4));
+}
+
+fn navGridTestSmoothing(c : Checks) : void {
+    // Open ground, 4-connected: the staircase A* returns smooths to a single segment.
+    let map : GridMap = new GridMap(12, 12);
+    let finder : GridPathfinder = new GridPathfinder(map);
+    let raw : GridPath = finder.find(map, 0, 0, 10, 7);
+    let fine : GridPath = raw.smoothed(map);
+    c.sameInt("open ground smooths to two corners", fine.len() as i64, 2);
+    c.that("the ends are kept", fine.xAt(0) == 0 && fine.yAt(1) == 7 && fine.xAt(1) == 10);
+    c.that("and the smoothed route is shorter", fine.length() < raw.length());
+
+    // A wall with a gap forces a corner at the gap; the smoothed path must stay legal and not longer.
+    let wall : GridMap = new GridMap(14, 10);
+    for (y of 0..10) {
+        if (y != 8) {
+            wall.setBlocked(7, y, true);
+        }
+    }
+    let f2 : GridPathfinder = new GridPathfinder(wall);
+    let r2 : GridPath = f2.find(wall, 1, 1, 12, 1);
+    let s2 : GridPath = r2.smoothed(wall);
+    c.that("the wall path was found", r2.found() && s2.found());
+    c.that("smoothing keeps fewer cells", s2.len() < r2.len() && s2.len() >= 3);
+    let mut legal : bool = true;
+    for (i of 1..s2.len()) {
+        if (!GridLine::clear(wall, s2.xAt(i - 1), s2.yAt(i - 1), s2.xAt(i), s2.yAt(i), 1)) {
+            legal = false;
+        }
+    }
+    c.that("every smoothed segment is in clear sight", legal);
+    c.that("and no longer than the raw path", s2.length() <= r2.length() + 0.0001);
+
+    c.that("a line through a wall is not clear", !GridLine::clear(wall, 1, 1, 12, 1, 1));
+    c.that("a line along open ground is clear", GridLine::clear(wall, 1, 1, 6, 5, 1));
+    c.that("a line is symmetric", GridLine::clear(wall, 6, 5, 1, 1, 1));
+    // A line through the exact corner of four cells obeys the corner rule.
+    let corner : GridMap = new GridMap(3, 3);
+    corner.setBlocked(1, 0, true);
+    corner.setBlocked(0, 1, true);
+    c.that(
+        "a diagonal between two blocked corners is not clear",
+        !GridLine::clear(corner, 0, 0, 2, 2, 1)
+    );
+}
+
+fn navGridTestDeterminism(c : Checks) : void {
+    let rng : Pcg32 = new Pcg32(7, 7);
+    let map : GridMap = navRandomMap(rng, 40, 30, 28);
+    map.setDiagonal(true);
+    let a : GridPathfinder = new GridPathfinder(map);
+    let b : GridPathfinder = new GridPathfinder(map);
+    let mut identical : bool = true;
+    let mut found : i32 = 0;
+    for (q of 0..30) {
+        let sx : i32 = rng.range(0, 40);
+        let sy : i32 = rng.range(0, 30);
+        let gx : i32 = rng.range(0, 40);
+        let gy : i32 = rng.range(0, 30);
+        let p1 : GridPath = a.find(map, sx, sy, gx, gy);
+        // Query b twice, with an unrelated query in between, to shake out any state left in the finder.
+        b.find(map, 0, 0, 39, 29);
+        let p2 : GridPath = b.find(map, sx, sy, gx, gy);
+        if (p1.found() != p2.found() || p1.len() != p2.len() || p1.cost() != p2.cost()) {
+            identical = false;
+        } else {
+            for (i of 0..p1.len()) {
+                if (p1.xAt(i) != p2.xAt(i) || p1.yAt(i) != p2.yAt(i)) {
+                    identical = false;
+                }
+            }
+        }
+        if (p1.found()) {
+            found = found + 1;
+        }
+    }
+    c.that("the same query gives the identical path, whatever was asked before", identical);
+    c.that("the sample found paths", found > 5);
+}
+
+/** The grid path finding suite. */
+pub class NavGridSuite {
+    /** Runs the grid navigation checks. */
+    pub static fn run(c : Checks) : void {
+        navGridTestKnown(c);
+        navGridTestCosts(c);
+        navGridTestDiagonals(c);
+        navGridTestRandom(c);
+        navGridTestFlowAgainstAStar(c);
+        navGridTestFlowMulti(c);
+        navGridTestDynamic(c);
+        navGridTestSmoothing(c);
+        navGridTestDeterminism(c);
+    }
+}

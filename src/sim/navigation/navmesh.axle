@@ -1,0 +1,512 @@
+// navmesh — a navigation mesh of convex polygons joined by portals, with A* over the portals.
+//
+// Where a grid says "this cell is open", a mesh says "this convex region is open": big open rooms are one
+// polygon, and agents move in straight lines inside it. Build one by adding vertices and convex polygons and
+// calling `build()`; edges that two polygons share become portals (doorways) between them. Meshes made some
+// other way (`NavMeshGrid` from a walkability grid) add their portals by hand with `addPortal`. After `build`
+// the mesh is fixed.
+//
+// Coordinates are a plane (x, y), y up; polygons are stored counter-clockwise (a clockwise one is reversed on
+// the way in). A polygon must be convex; a concave or degenerate one is refused (`addPolygon` answers -1).
+//
+// A query (`findPath`) locates the polygons holding the start and goal, runs A* where the search nodes are the
+// portals (each is a directed doorway from one polygon to the next, entered at its midpoint), and pulls the
+// resulting corridor straight with the funnel algorithm (`Funnel`). The A* cost is exactly the length of
+// the polyline through the portal midpoints, which the funnel path can only improve on. The same query always
+// gives the same path: ties are broken by the heap's insertion order and portals are numbered in the order
+// the polygons were added.
+
+use crate::core::collections::heap::Heap;
+use crate::core::collections::map::Map;
+use crate::core::collections::vec::Vec;
+use crate::core::math::vec2::Vec2;
+use crate::sim::navigation::funnel::Funnel;
+use crate::sim::navigation::nav_path::NavPath;
+
+// A point this far outside an edge still counts as inside the polygon (rounding at shared edges).
+const NAVMESH_SLACK : f32 = 0.00001;
+
+// The index that means no polygon, no portal, no parent.
+const NAVMESH_NONE : i32 = -1;
+
+// Search states of a portal: not met, waiting in the open list, settled.
+const NAVMESH_UNSEEN : i32 = 0;
+const NAVMESH_OPEN : i32 = 1;
+const NAVMESH_CLOSED : i32 = 2;
+
+// A heap key is the cost in 1/1024 units, so costs that agree to that precision tie.
+const NAVMESH_KEY_SCALE : f32 = 1024.0;
+
+// Numbers per portal in the array the funnel reads: left x, left y, right x, right y.
+const NAVMESH_PORTAL_STRIDE : i32 = 4;
+
+// The working memory of one query: cost so far, the portal each was reached from, and the search state of
+// every portal, with one extra node past the last portal standing for the goal point.
+class NavSearch {
+    pub(crate) g        : f32[];
+    pub(crate) parent   : i32[];
+    pub(crate) state    : i32[];
+    pub(crate) open     : Heap<i32>;
+    pub(crate) goalNode : i32;
+
+    constructor(portals : i32) {
+        let n : i64 = (portals + 1) as i64;
+        self.goalNode = portals;
+        self.g = new f32[n];
+        self.parent = new i32[n];
+        self.state = new i32[n];
+        for (i of 0..(portals + 1)) {
+            self.g[i] = 0.0;
+            self.parent[i] = NAVMESH_NONE;
+            self.state[i] = NAVMESH_UNSEEN;
+        }
+        self.open = new Heap<i32>();
+    }
+
+    // How many portals the route to the goal crosses.
+    pub(crate) fn crossedCount(self) : i32 {
+        let mut crossed : i32 = 0;
+        let mut at : i32 = self.parent[self.goalNode];
+        while (at != NAVMESH_NONE) {
+            crossed = crossed + 1;
+            at = self.parent[at];
+        }
+        return crossed;
+    }
+}
+
+/** A fixed set of convex polygons and the doorways between them. */
+pub class NavMesh {
+    vx        : Vec<f32>;
+    vy        : Vec<f32>;
+    polyStart : Vec<i32>;
+    polyVert  : Vec<i32>;
+    cx        : Vec<f32>;
+    cy        : Vec<f32>;
+    pFrom     : Vec<i32>;
+    pTo       : Vec<i32>;
+    pLeftX    : Vec<f32>;
+    pLeftY    : Vec<f32>;
+    pRightX   : Vec<f32>;
+    pRightY   : Vec<f32>;
+    pMidX     : Vec<f32>;
+    pMidY     : Vec<f32>;
+    outStart  : Vec<i32>;
+    outList   : Vec<i32>;
+    frozen    : bool = false;
+
+    /** An empty mesh to be filled with vertices and polygons. */
+    constructor() {
+        self.vx = new Vec<f32>();
+        self.vy = new Vec<f32>();
+        self.polyStart = new Vec<i32>();
+        self.polyStart.push(0);
+        self.polyVert = new Vec<i32>();
+        self.cx = new Vec<f32>();
+        self.cy = new Vec<f32>();
+        self.pFrom = new Vec<i32>();
+        self.pTo = new Vec<i32>();
+        self.pLeftX = new Vec<f32>();
+        self.pLeftY = new Vec<f32>();
+        self.pRightX = new Vec<f32>();
+        self.pRightY = new Vec<f32>();
+        self.pMidX = new Vec<f32>();
+        self.pMidY = new Vec<f32>();
+        self.outStart = new Vec<i32>();
+        self.outList = new Vec<i32>();
+    }
+
+    /** Adds a vertex and returns its index. */
+    pub fn addVertex(mut self, x : f32, y : f32) : i32 {
+        self.vx.push(x);
+        self.vy.push(y);
+        return self.vx.len() - 1;
+    }
+
+    /**
+     * Adds the polygon through the first `n` vertex indices of `corners`. Returns its index, or -1 when it has
+     * fewer than three corners, names a vertex that does not exist, has no area, is not convex, or the mesh is
+     * already built.
+     */
+    pub fn addPolygon(mut self, corners : i32[], n : i32) : i32 {
+        if (self.frozen || n < 3) {
+            return NAVMESH_NONE;
+        }
+        for (i of 0..n) {
+            if (corners[i] < 0 || corners[i] >= self.vx.len()) {
+                return NAVMESH_NONE;
+            }
+        }
+        let area : f32 = self.signedArea(corners, n);
+        if (area == 0.0) {
+            return NAVMESH_NONE;
+        }
+
+        // Counter-clockwise, as stored.
+        let mut order : i32[] = new i32[n as i64];
+        for (i of 0..n) {
+            if (area > 0.0) {
+                order[i] = corners[i];
+            } else {
+                order[i] = corners[n - 1 - i];
+            }
+        }
+        if (!self.isConvex(order, n)) {
+            return NAVMESH_NONE;
+        }
+
+        let mut sx : f32 = 0.0;
+        let mut sy : f32 = 0.0;
+        for (i of 0..n) {
+            self.polyVert.push(order[i]);
+            sx = sx + self.vx.get(order[i]);
+            sy = sy + self.vy.get(order[i]);
+        }
+        let count : f32 = n as f32;
+        self.cx.push(sx / count);
+        self.cy.push(sy / count);
+        self.polyStart.push(self.polyVert.len());
+        return self.cx.len() - 1;
+    }
+
+    // Twice the signed area of the polygon through `corners` (shoelace): positive when counter-clockwise.
+    fn signedArea(self, corners : i32[], n : i32) : f32 {
+        let mut area : f32 = 0.0;
+        for (i of 0..n) {
+            let a : i32 = corners[i];
+            let b : i32 = corners[(i + 1) % n];
+            area = area + self.vx.get(a) * self.vy.get(b) - self.vx.get(b) * self.vy.get(a);
+        }
+        return area;
+    }
+
+    // True when no corner of the counter-clockwise polygon `order` turns clockwise (beyond rounding).
+    fn isConvex(self, order : i32[], n : i32) : bool {
+        for (i of 0..n) {
+            let a : i32 = order[i];
+            let b : i32 = order[(i + 1) % n];
+            let c : i32 = order[(i + 2) % n];
+            let turn : f32 = (self.vx.get(b) - self.vx.get(a)) * (self.vy.get(c) - self.vy.get(b))
+                - (self.vy.get(b) - self.vy.get(a)) * (self.vx.get(c) - self.vx.get(b));
+            if (turn < -NAVMESH_SLACK) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Adds a doorway between polygons `a` and `b` along the segment from `from` to `to`, usable in both
+     * directions. For meshes whose polygons do not share whole edges. Refused (false) for unknown polygons,
+     * a zero-length doorway or a built mesh.
+     */
+    pub fn addPortal(mut self, a : i32, b : i32, from : Vec2, to : Vec2) : bool {
+        if (self.frozen || a < 0 || b < 0 || a >= self.cx.len() || b >= self.cx.len() || a == b) {
+            return false;
+        }
+        if (from.x == to.x && from.y == to.y) {
+            return false;
+        }
+        self.makeDoorway(a, b, from, to);
+        return true;
+    }
+
+    /**
+     * Finishes the mesh: every edge that exactly two polygons share (the same two vertices) becomes a doorway,
+     * and the lists the search walks are laid out. Returns the number of polygons.
+     */
+    pub fn build(mut self) : i32 {
+        if (self.frozen) {
+            return self.cx.len();
+        }
+        self.linkSharedEdges();
+        self.layoutOutLists();
+        self.frozen = true;
+        return self.cx.len();
+    }
+
+    // A doorway for every edge that exactly two polygons have in common.
+    fn linkSharedEdges(mut self) : void {
+        let owner : Map<i64, i32> = new Map<i64, i32>();
+        for (p of 0..self.cx.len()) {
+            let first : i32 = self.polyStart.get(p);
+            let n : i32 = self.polyStart.get(p + 1) - first;
+            for (k of 0..n) {
+                let a : i32 = self.polyVert.get(first + k);
+                let b : i32 = self.polyVert.get(first + (k + 1) % n);
+                let key : i64 = NavMesh::edgeKey(a, b);
+                if (!owner.has(key)) {
+                    owner.put(key, p);
+                    continue;
+                }
+
+                let other : i32 = owner.get(key);
+                owner.remove(key);
+                let from : Vec2 = Vec2::make(self.vx.get(a), self.vy.get(a));
+                let to : Vec2 = Vec2::make(self.vx.get(b), self.vy.get(b));
+                self.makeDoorway(other, p, from, to);
+            }
+        }
+    }
+
+    // The portals leaving each polygon, in portal order: `outStart` holds the offsets into `outList`.
+    fn layoutOutLists(mut self) : void {
+        let np : i32 = self.cx.len();
+        let mut counts : i32[] = new i32[(np + 1) as i64];
+        for (p of 0..(np + 1)) {
+            counts[p] = 0;
+        }
+        for (e of 0..self.pFrom.len()) {
+            counts[self.pFrom.get(e)] = counts[self.pFrom.get(e)] + 1;
+        }
+
+        let mut run : i32 = 0;
+        for (p of 0..np) {
+            self.outStart.push(run);
+            run = run + counts[p];
+        }
+        self.outStart.push(run);
+
+        let mut fill : i32[] = new i32[(np + 1) as i64];
+        for (p of 0..np) {
+            fill[p] = self.outStart.get(p);
+        }
+        for (e of 0..run) {
+            self.outList.push(0);
+        }
+        for (e of 0..self.pFrom.len()) {
+            let p : i32 = self.pFrom.get(e);
+            self.outList.set(fill[p], e);
+            fill[p] = fill[p] + 1;
+        }
+    }
+
+    /** The number of polygons. */
+    pub fn polygonCount(self) : i32 {
+        return self.cx.len();
+    }
+
+    /** The number of directed portals (two per doorway). */
+    pub fn portalCount(self) : i32 {
+        return self.pFrom.len();
+    }
+
+    /** The number of doorways leading out of polygon `p`. */
+    pub fn neighbourCount(self, p : i32) : i32 {
+        if (!self.frozen || p < 0 || p >= self.cx.len()) {
+            return 0;
+        }
+        return self.outStart.get(p + 1) - self.outStart.get(p);
+    }
+
+    /** The x of the center of polygon `p`. */
+    pub fn centerX(self, p : i32) : f32 {
+        return self.cx.get(p);
+    }
+
+    /** The y of the center of polygon `p`. */
+    pub fn centerY(self, p : i32) : f32 {
+        return self.cy.get(p);
+    }
+
+    /** True when the point lies in polygon `p` (its border included, within a hair of rounding). */
+    pub fn contains(self, p : i32, x : f32, y : f32) : bool {
+        if (p < 0 || p >= self.cx.len()) {
+            return false;
+        }
+        let first : i32 = self.polyStart.get(p);
+        let n : i32 = self.polyStart.get(p + 1) - first;
+        for (k of 0..n) {
+            let a : i32 = self.polyVert.get(first + k);
+            let b : i32 = self.polyVert.get(first + (k + 1) % n);
+            let ex : f32 = self.vx.get(b) - self.vx.get(a);
+            let ey : f32 = self.vy.get(b) - self.vy.get(a);
+            let side : f32 = ex * (y - self.vy.get(a)) - ey * (x - self.vx.get(a));
+            let len : f32 = (ex * ex + ey * ey).sqrt();
+            if (side < -NAVMESH_SLACK * len) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /** The first polygon (lowest index) containing the point, or -1 when it is off the mesh. */
+    pub fn locate(self, x : f32, y : f32) : i32 {
+        for (p of 0..self.cx.len()) {
+            if (self.contains(p, x, y)) {
+                return p;
+            }
+        }
+        return NAVMESH_NONE;
+    }
+
+    /**
+     * The shortest route inside the mesh from (`sx`, `sy`) to (`gx`, `gy`) as a few corner points. Not found
+     * when a point is off the mesh or the polygons are not connected, or the mesh is not built.
+     */
+    pub fn findPath(self, sx : f32, sy : f32, gx : f32, gy : f32) : NavPath {
+        let path : NavPath = new NavPath();
+        if (!self.frozen) {
+            return path;
+        }
+        let start : Vec2 = Vec2::make(sx, sy);
+        let goal : Vec2 = Vec2::make(gx, gy);
+        let from : i32 = self.locate(sx, sy);
+        let to : i32 = self.locate(gx, gy);
+        if (from == NAVMESH_NONE || to == NAVMESH_NONE) {
+            return path;
+        }
+        if (from == to) {
+            path.push(sx, sy);
+            path.push(gx, gy);
+            path.finish(true, NavMesh::dist(start, goal), 1);
+            return path;
+        }
+
+        let search : NavSearch = new NavSearch(self.pFrom.len());
+        self.seedSearch(search, from, start, goal);
+        if (!self.runSearch(search, to, goal)) {
+            return path;
+        }
+
+        let crossed : i32 = search.crossedCount();
+        let portals : f32[] = self.corridorPortals(search, crossed);
+        Funnel::pull(portals, crossed, start, goal, path);
+        path.finish(true, search.g[search.goalNode], crossed + 1);
+        return path;
+    }
+
+    // Opens the portals leaving the start polygon, each entered at its midpoint.
+    fn seedSearch(self, search : NavSearch, from : i32, start : Vec2, goal : Vec2) : void {
+        for (i of self.outStart.get(from)..self.outStart.get(from + 1)) {
+            let e : i32 = self.outList.get(i);
+            search.g[e] = self.pointToMid(start, e);
+            search.parent[e] = NAVMESH_NONE;
+            search.state[e] = NAVMESH_OPEN;
+            search.open.push(NavMesh::key(search.g[e] + self.pointToMid(goal, e)), e);
+        }
+    }
+
+    // A* over the portals; true when the goal polygon `to` was reached, the `goal` point being the last node.
+    fn runSearch(self, search : NavSearch, to : i32, goal : Vec2) : bool {
+        let goalNode : i32 = search.goalNode;
+        while (!search.open.isEmpty()) {
+            let e : i32 = search.open.pop();
+            if (search.state[e] == NAVMESH_CLOSED) {
+                continue;
+            }
+            search.state[e] = NAVMESH_CLOSED;
+            if (e == goalNode) {
+                return true;
+            }
+
+            let into : i32 = self.pTo.get(e);
+            if (into == to) {
+                let total : f32 = search.g[e] + self.pointToMid(goal, e);
+                if (search.state[goalNode] == NAVMESH_UNSEEN || total < search.g[goalNode]) {
+                    search.g[goalNode] = total;
+                    search.parent[goalNode] = e;
+                    search.state[goalNode] = NAVMESH_OPEN;
+                    search.open.push(NavMesh::key(total), goalNode);
+                }
+                continue;
+            }
+
+            for (i of self.outStart.get(into)..self.outStart.get(into + 1)) {
+                let f : i32 = self.outList.get(i);
+                if (search.state[f] == NAVMESH_CLOSED) {
+                    continue;
+                }
+                let ng : f32 = search.g[e] + self.midToMid(e, f);
+                if (search.state[f] == NAVMESH_UNSEEN || ng < search.g[f]) {
+                    search.g[f] = ng;
+                    search.parent[f] = e;
+                    search.state[f] = NAVMESH_OPEN;
+                    search.open.push(NavMesh::key(ng + self.pointToMid(goal, f)), f);
+                }
+            }
+        }
+        return false;
+    }
+
+    // The ends of the `crossed` portals the search passed, in the order crossed, as the funnel reads them.
+    fn corridorPortals(self, search : NavSearch, crossed : i32) : f32[] {
+        let stride : i32 = NAVMESH_PORTAL_STRIDE;
+        let mut portals : f32[] = new f32[(crossed * stride + stride) as i64];
+        let mut at : i32 = search.parent[search.goalNode];
+        let mut slot : i32 = crossed - 1;
+        while (at != NAVMESH_NONE) {
+            portals[slot * stride] = self.pLeftX.get(at);
+            portals[slot * stride + 1] = self.pLeftY.get(at);
+            portals[slot * stride + 2] = self.pRightX.get(at);
+            portals[slot * stride + 3] = self.pRightY.get(at);
+            slot = slot - 1;
+            at = search.parent[at];
+        }
+        return portals;
+    }
+
+    // Distance from a point to the midpoint of portal `e`.
+    fn pointToMid(self, p : Vec2, e : i32) : f32 {
+        return NavMesh::dist(p, Vec2::make(self.pMidX.get(e), self.pMidY.get(e)));
+    }
+
+    // Distance between the midpoints of portals `e` and `f`.
+    fn midToMid(self, e : i32, f : i32) : f32 {
+        let from : Vec2 = Vec2::make(self.pMidX.get(e), self.pMidY.get(e));
+        let to : Vec2 = Vec2::make(self.pMidX.get(f), self.pMidY.get(f));
+        return NavMesh::dist(from, to);
+    }
+
+    // A doorway between two polygons: one portal each way.
+    fn makeDoorway(mut self, a : i32, b : i32, from : Vec2, to : Vec2) : void {
+        self.makePortal(a, b, from, to);
+        self.makePortal(b, a, from, to);
+    }
+
+    // A directed doorway from polygon `from` to `to` along the segment, ends sorted into left and right as seen
+    // when walking from one centre to the other.
+    fn makePortal(mut self, from : i32, to : i32, a : Vec2, b : Vec2) : void {
+        let dx : f32 = self.cx.get(to) - self.cx.get(from);
+        let dy : f32 = self.cy.get(to) - self.cy.get(from);
+        let ex : f32 = b.x - a.x;
+        let ey : f32 = b.y - a.y;
+        self.pFrom.push(from);
+        self.pTo.push(to);
+        if (dx * ey - dy * ex > 0.0) {
+            self.pLeftX.push(b.x);
+            self.pLeftY.push(b.y);
+            self.pRightX.push(a.x);
+            self.pRightY.push(a.y);
+        } else {
+            self.pLeftX.push(a.x);
+            self.pLeftY.push(a.y);
+            self.pRightX.push(b.x);
+            self.pRightY.push(b.y);
+        }
+        let half : f32 = 0.5;
+        self.pMidX.push((a.x + b.x) * half);
+        self.pMidY.push((a.y + b.y) * half);
+    }
+
+    static fn edgeKey(a : i32, b : i32) : i64 {
+        let mut lo : i32 = a;
+        let mut hi : i32 = b;
+        if (b < a) {
+            lo = b;
+            hi = a;
+        }
+        return ((lo as i64) << 32) | (hi as i64);
+    }
+
+    static fn dist(a : Vec2, b : Vec2) : f32 {
+        let dx : f32 = a.x - b.x;
+        let dy : f32 = a.y - b.y;
+        return (dx * dx + dy * dy).sqrt();
+    }
+
+    // Heap key of a cost: fixed point, so equal costs tie and the heap's insertion order decides.
+    static fn key(cost : f32) : i64 {
+        return (cost * NAVMESH_KEY_SCALE) as i64;
+    }
+}

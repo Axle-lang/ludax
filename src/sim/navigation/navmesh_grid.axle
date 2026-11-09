@@ -1,0 +1,200 @@
+// navmesh_grid — a navigation mesh made from a walkability grid.
+//
+// The walkable cells are covered with rectangles, each as large as a greedy scan finds: take the first free
+// open cell in row order, stretch it right as far as the row stays open and free, then down as far as the whole
+// span stays open and free. Rectangles are convex, so they are valid mesh polygons, and a large room becomes
+// a handful of them instead of hundreds of cells. Two rectangles that touch along a side are joined by a
+// doorway as wide as their overlap.
+//
+// The mesh is a snapshot of the map at the moment of the call: cells under a dynamic obstacle count as blocked,
+// traversal costs are ignored, and a changed map needs a new mesh. One cell is `cellSize` units wide, with the
+// corner of cell (0, 0) at the origin and y growing with the row.
+
+use crate::core::collections::vec::Vec;
+use crate::core::math::vec2::Vec2;
+use crate::sim::navigation::grid_map::GridMap;
+use crate::sim::navigation::navmesh::NavMesh;
+
+// `owner` of a cell that belongs to no rectangle (blocked, or not yet reached by the scan).
+const NAVGRID_FREE : i32 = -1;
+
+// The run owner past the end of a side, which never equals a real owner, so the last run is always closed.
+const NAVGRID_BEYOND : i32 = -2;
+
+// Corners of a rectangle.
+const NAVGRID_CORNERS : i32 = 4;
+
+// A block of cells, `x0..x1` by `y0..y1` (end exclusive).
+struct NavRect {
+    pub(crate) x0 : i32;
+    pub(crate) y0 : i32;
+    pub(crate) x1 : i32;
+    pub(crate) y1 : i32;
+}
+
+/** Builds navigation meshes from grids. */
+pub class NavMeshGrid {
+    /** The mesh of the open cells of `map`, built and ready for queries; polygon `i` is the `i`th rectangle in row-major scan order. */
+    pub static fn build(map : GridMap, cellSize : f32) : NavMesh {
+        let cover : NavCover = new NavCover(map, cellSize);
+        cover.scan();
+        cover.emitPolygons();
+        cover.joinNeighbours();
+        cover.mesh.build();
+        return cover.mesh;
+    }
+}
+
+// The rectangles covering a grid, and the mesh they are poured into.
+class NavCover {
+    pub(crate) open     : bool[];
+    pub(crate) mesh     : NavMesh;
+    pub(crate) owner    : i32[];
+    pub(crate) rects    : Vec<NavRect>;
+    pub(crate) w        : i32;
+    pub(crate) h        : i32;
+    pub(crate) cellSize : f32;
+
+    constructor(map : GridMap, cellSize : f32) {
+        self.mesh = new NavMesh();
+        self.w = map.width();
+        self.h = map.height();
+        self.cellSize = cellSize;
+        self.rects = new Vec<NavRect>();
+        self.owner = new i32[(self.w * self.h) as i64];
+        self.open = new bool[(self.w * self.h) as i64];
+        for (y of 0..self.h) {
+            for (x of 0..self.w) {
+                self.owner[y * self.w + x] = NAVGRID_FREE;
+                self.open[y * self.w + x] = map.isWalkable(x, y);
+            }
+        }
+    }
+
+    // Greedy cover: the first free open cell in row order grows right, then down.
+    pub(crate) fn scan(mut self) : void {
+        for (y of 0..self.h) {
+            for (x of 0..self.w) {
+                if (!self.cellFree(x, y)) {
+                    continue;
+                }
+                let mut x1 : i32 = x + 1;
+                while (x1 < self.w && self.cellFree(x1, y)) {
+                    x1 = x1 + 1;
+                }
+                let mut y1 : i32 = y + 1;
+                while (y1 < self.h && self.rowFree(y1, x, x1)) {
+                    y1 = y1 + 1;
+                }
+
+                let id : i32 = self.rects.len();
+                for (cy of y..y1) {
+                    for (cx of x..x1) {
+                        self.owner[cy * self.w + cx] = id;
+                    }
+                }
+                self.rects.push(NavRect { x0: x, y0: y, x1: x1, y1: y1 });
+            }
+        }
+    }
+
+    pub(crate) fn cellFree(self, x : i32, y : i32) : bool {
+        return self.contains(x, y) && self.open[y * self.w + x] && self.owner[y * self.w + x] == NAVGRID_FREE;
+    }
+
+    pub(crate) fn contains(self, x : i32, y : i32) : bool {
+        return x >= 0 && y >= 0 && x < self.w && y < self.h;
+    }
+
+    // True when cells x0..x1 of row y are all open and not yet part of a rectangle.
+    pub(crate) fn rowFree(self, y : i32, x0 : i32, x1 : i32) : bool {
+        for (x of x0..x1) {
+            if (!self.cellFree(x, y)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // A convex polygon per rectangle, in scan order.
+    pub(crate) fn emitPolygons(mut self) : void {
+        let mut corners : i32[] = new i32[NAVGRID_CORNERS as i64];
+        for (r of 0..self.rects.len()) {
+            let rect : NavRect = self.rects.get(r);
+            let ax : f32 = (rect.x0 as f32) * self.cellSize;
+            let ay : f32 = (rect.y0 as f32) * self.cellSize;
+            let bx : f32 = (rect.x1 as f32) * self.cellSize;
+            let by : f32 = (rect.y1 as f32) * self.cellSize;
+            corners[0] = self.mesh.addVertex(ax, ay);
+            corners[1] = self.mesh.addVertex(bx, ay);
+            corners[2] = self.mesh.addVertex(bx, by);
+            corners[3] = self.mesh.addVertex(ax, by);
+            self.mesh.addPolygon(corners, NAVGRID_CORNERS);
+        }
+    }
+
+    // Each rectangle opens onto its right and lower neighbours; the others reach it from their side.
+    pub(crate) fn joinNeighbours(mut self) : void {
+        for (r of 0..self.rects.len()) {
+            let rect : NavRect = self.rects.get(r);
+            self.joinRight(rect, r);
+            self.joinBelow(rect, r);
+        }
+    }
+
+    // Doorways along the right side of `rect`, one per neighbour met there.
+    pub(crate) fn joinRight(mut self, rect : NavRect, r : i32) : void {
+        let x : i32 = rect.x1;
+        if (x >= self.w) {
+            return;
+        }
+        let fx : f32 = (x as f32) * self.cellSize;
+        let mut runStart : i32 = rect.y0;
+        let mut runOwner : i32 = self.owner[rect.y0 * self.w + x];
+        for (y of (rect.y0 + 1)..(rect.y1 + 1)) {
+            let mut here : i32 = NAVGRID_BEYOND;
+            if (y < rect.y1) {
+                here = self.owner[y * self.w + x];
+            }
+            if (here == runOwner) {
+                continue;
+            }
+
+            if (runOwner != NAVGRID_FREE) {
+                let from : Vec2 = Vec2::make(fx, (runStart as f32) * self.cellSize);
+                let to : Vec2 = Vec2::make(fx, (y as f32) * self.cellSize);
+                self.mesh.addPortal(r, runOwner, from, to);
+            }
+            runStart = y;
+            runOwner = here;
+        }
+    }
+
+    // Doorways along the lower side of `rect`.
+    pub(crate) fn joinBelow(mut self, rect : NavRect, r : i32) : void {
+        let y : i32 = rect.y1;
+        if (y >= self.h) {
+            return;
+        }
+        let fy : f32 = (y as f32) * self.cellSize;
+        let mut runStart : i32 = rect.x0;
+        let mut runOwner : i32 = self.owner[y * self.w + rect.x0];
+        for (x of (rect.x0 + 1)..(rect.x1 + 1)) {
+            let mut here : i32 = NAVGRID_BEYOND;
+            if (x < rect.x1) {
+                here = self.owner[y * self.w + x];
+            }
+            if (here == runOwner) {
+                continue;
+            }
+
+            if (runOwner != NAVGRID_FREE) {
+                let from : Vec2 = Vec2::make((runStart as f32) * self.cellSize, fy);
+                let to : Vec2 = Vec2::make((x as f32) * self.cellSize, fy);
+                self.mesh.addPortal(r, runOwner, from, to);
+            }
+            runStart = x;
+            runOwner = here;
+        }
+    }
+}

@@ -1,0 +1,164 @@
+// grid_pathfinder — A* on a `GridMap`.
+//
+// `GridPathfinder` runs A* with an octile (or Manhattan, without diagonals) heuristic, which never overestimates
+// because the cheapest cell costs 1. The open list is our `Heap`, ordered by `f` and, among equal `f`, by the
+// smaller remaining estimate (it dives towards the goal instead of flooding); the heap itself breaks any
+// remaining tie by insertion order. Neighbours are visited in a fixed order. So the same map, start and goal
+// always give the same path, on every run and every machine.
+//
+// The finder keeps its working arrays between calls and stamps them with a run number instead of clearing
+// them, so a query costs what it explores, not the size of the map.
+
+use std::ffi::runtime::panicMsg;
+
+use crate::core::collections::heap::Heap;
+use crate::core::math::scalar::{absI, minI64};
+use crate::sim::navigation::grid_map::{GridMap, NAV_NONE, NAV_STEP_ORTHO, NAV_STEP_DIAG};
+use crate::sim::navigation::grid_path::GridPath;
+
+// The heap key is `f * GRID_KEY_SCALE + tie`, so the tie must stay below the scale; it is the estimate, capped.
+const GRID_KEY_SCALE : i64 = 65536;
+const GRID_TIE_CAP : i64 = 65535;
+
+/** A* over a `GridMap`, reusing its working memory between queries. */
+pub class GridPathfinder {
+    width    : i32;
+    height   : i32;
+    g        : i32[];
+    parent   : i32[];
+    seen     : i32[];
+    closed   : i32[];
+    run      : i32 = 0;
+    open     : Heap<i32>;
+    explored : i32 = 0;
+
+    /** A finder sized for `map` (a map of another size is refused by `find`). */
+    constructor(map : GridMap) {
+        self.width = map.width();
+        self.height = map.height();
+        let n : i64 = (self.width * self.height) as i64;
+        self.g = new i32[n];
+        self.parent = new i32[n];
+        self.seen = new i32[n];
+        self.closed = new i32[n];
+        for (i of 0..(self.width * self.height)) {
+            self.seen[i] = 0;
+            self.closed[i] = 0;
+        }
+        self.open = new Heap<i32>();
+    }
+
+    /** How many cells the last query closed (a measure of the work done). */
+    pub fn expanded(self) : i32 {
+        return self.explored;
+    }
+
+    /**
+     * The cheapest route from cell (`sx`, `sy`) to (`gx`, `gy`) on `map`, or a path with `found() == false`
+     * when either cell is blocked or the goal is walled off. The path includes both ends.
+     */
+    pub fn find(mut self, map : GridMap, sx : i32, sy : i32, gx : i32, gy : i32) : GridPath {
+        if (map.width() != self.width || map.height() != self.height) {
+            panicMsg("GridPathfinder: map size differs from the finder's");
+        }
+        let path : GridPath = new GridPath();
+        self.explored = 0;
+        if (!map.isWalkable(sx, sy) || !map.isWalkable(gx, gy)) {
+            return path;
+        }
+        self.run = self.run + 1;
+        self.open.clear();
+        let start : i32 = map.index(sx, sy);
+        let goal : i32 = map.index(gx, gy);
+        self.g[start] = 0;
+        self.parent[start] = NAV_NONE;
+        self.seen[start] = self.run;
+        self.open.push(self.key(map, 0, sx, sy, gx, gy), start);
+        let dirs : i32 = map.directions();
+        while (!self.open.isEmpty()) {
+            let here : i32 = self.open.pop();
+            if (self.closed[here] == self.run) {
+                continue;
+            }
+            self.closed[here] = self.run;
+            self.explored = self.explored + 1;
+            if (here == goal) {
+                break;
+            }
+            let x : i32 = here % self.width;
+            let y : i32 = here / self.width;
+            for (k of 0..dirs) {
+                let dx : i32 = GridMap::dirX(k);
+                let dy : i32 = GridMap::dirY(k);
+                if (!map.canStep(x, y, dx, dy)) {
+                    continue;
+                }
+                let next : i32 = map.index(x + dx, y + dy);
+                if (self.closed[next] == self.run) {
+                    continue;
+                }
+                let ng : i32 = self.g[here] + map.stepCost(x, y, dx, dy);
+                if (self.seen[next] != self.run || ng < self.g[next]) {
+                    self.seen[next] = self.run;
+                    self.g[next] = ng;
+                    self.parent[next] = here;
+                    self.open.push(self.key(map, ng, x + dx, y + dy, gx, gy), next);
+                }
+            }
+        }
+        if (self.closed[goal] != self.run) {
+            return path;
+        }
+        return self.trace(goal);
+    }
+
+    // The cells from the start to `goal`, following the parents back.
+    fn trace(self, goal : i32) : GridPath {
+        let mut count : i32 = 0;
+        let mut at : i32 = goal;
+        while (at != NAV_NONE) {
+            count = count + 1;
+            at = self.parent[at];
+        }
+        let path : GridPath = new GridPath();
+        let mut rev : i32[] = new i32[count as i64];
+        at = goal;
+        let mut i : i32 = 0;
+        while (at != NAV_NONE) {
+            rev[i] = at;
+            i = i + 1;
+            at = self.parent[at];
+        }
+        let mut k : i32 = count - 1;
+        while (k >= 0) {
+            path.push(rev[k] % self.width, rev[k] / self.width);
+            k = k - 1;
+        }
+        path.finish(true, self.g[goal]);
+        return path;
+    }
+
+    // The heap key: f = g + h first, then the estimate h among equal f.
+    fn key(self, map : GridMap, g : i32, x : i32, y : i32, gx : i32, gy : i32) : i64 {
+        let h : i64 = GridPathfinder::estimate(map, x, y, gx, gy);
+        let tie : i64 = minI64(h, GRID_TIE_CAP);
+        return ((g as i64) + h) * GRID_KEY_SCALE + tie;
+    }
+
+    /** The lower bound on the cost from (`x`, `y`) to (`gx`, `gy`): octile with diagonals, Manhattan without. */
+    pub static fn estimate(map : GridMap, x : i32, y : i32, gx : i32, gy : i32) : i64 {
+        let dx : i64 = absI(gx - x) as i64;
+        let dy : i64 = absI(gy - y) as i64;
+        if (!map.allowsDiagonal()) {
+            return (dx + dy) * (NAV_STEP_ORTHO as i64);
+        }
+        let mut lo : i64 = dx;
+        let mut hi : i64 = dy;
+        if (dy < dx) {
+            lo = dy;
+            hi = dx;
+        }
+        // hi straight steps, of which lo are diagonal: a diagonal costs `NAV_STEP_DIAG - NAV_STEP_ORTHO` more than an orthogonal step.
+        return hi * (NAV_STEP_ORTHO as i64) + lo * ((NAV_STEP_DIAG - NAV_STEP_ORTHO) as i64);
+    }
+}
