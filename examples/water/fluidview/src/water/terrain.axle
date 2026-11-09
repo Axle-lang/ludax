@@ -1,0 +1,280 @@
+// terrain — the colour of the ground at a point: material, fine detail, wetness and light.
+//
+// The ground is whatever the field's bed says, marched by `march`; this file answers what a point of it looks
+// like. The material is chosen from the height and slope with a low-frequency noise breaking up the borders (pale
+// mineral crust on the flats, dark rock on the steep, sand low down, grass on high flat patches), then layered with
+// noise at three finer scales so no flat colour survives a close look. The normal is the bed's interpolated
+// slope plus the gradient of the same noise, so grain catches the sun. Light is the sun through the baked soft
+// shadow, plus the sky dome through the baked ambient occlusion. Ground near water, or under spray, is darker and
+// glossier. Detail fades with the pixel's footprint (the octave whose wavelength is under two pixels is dropped),
+// which is what keeps distant ground from shimmering.
+//
+// Everything is a read of the field and the sky; the class holds references, not state, and `WaterModules.terrain`
+// off swaps the whole thing for a flat grey-lit plain so the water can be looked at alone.
+
+use ludax::{lerp, saturate, smoothstep, sqrt, Vec3};
+
+use crate::water::field::{Quad4, WaterField};
+use crate::water::look::TerrainLook;
+use crate::water::noise::{waterCell2, waterFbm2, waterHash, waterValue2, waterValue2Slope};
+use crate::water::sky::WaterSky;
+
+// The three noise scales of the detail, in cycles per cell, and how steep each one makes the surface.
+const TERR_FREQ_BROAD : f32 = 0.35;
+const TERR_FREQ_MID : f32 = 2.3;
+const TERR_FREQ_FINE : f32 = 7.0;
+const TERR_FREQ_GRAIN : f32 = 26.0;
+const TERR_BUMP_MID : f32 = 0.18;
+const TERR_BUMP_FINE : f32 = 0.10;
+const TERR_BUMP_GRAIN : f32 = 0.06;
+
+// Seeds of the noise layers.
+const TERR_SEED_PATCH : i32 = 11;
+const TERR_SEED_ROCK : i32 = 17;
+const TERR_SEED_MID : i32 = 23;
+const TERR_SEED_FINE : i32 = 29;
+const TERR_SEED_GRAIN : i32 = 31;
+const TERR_SEED_GRASS : i32 = 37;
+
+// A noise wavelength under this many pixels is averaged away: it would alias.
+const TERR_PIXELS_PER_CYCLE : f32 = 2.2;
+
+// How the brightness varies with the grain: the least of the unit, and how much the mid scale adds.
+const TERR_TONE_BASE : f32 = 0.62;
+const TERR_TONE_MID : f32 = 0.55;
+const TERR_TONE_FINE : f32 = 0.30;
+
+// Wet ground reflects the sky a little: the share at normal view, and how glossy it gets.
+const TERR_WET_SHEEN : f32 = 0.10;
+
+// Ground this far below the sand line is fully sand, and how far up from it grass may start.
+const TERR_SAND_BLEND : f32 = 0.6;
+
+// The sky share of the light that bounces back up from sunlit ground onto shadowed faces.
+const TERR_BOUNCE : f32 = 0.12;
+
+// The wooded hills beyond the grid: where they start to take over from the near ground and are complete (cells
+// outside the grid), the scale of the forest's patches, and how dark and how varied its green is.
+const TERR_FAR_FROM : f32 = 12.0;
+const TERR_FAR_TO : f32 = 60.0;
+const TERR_FREQ_FOREST : f32 = 0.09;
+const TERR_FOREST_DARK : f32 = 0.45;
+const TERR_FOREST_LIGHT : f32 = 0.9;
+
+// The bands around water: noise scale and how far it bends them, how many there are across the damp, and the damp's
+// range over which they show; the conifers' blob grid, blob size, mean cover and how dark a tree is next to the forest.
+const TERR_BAND_FREQ : f32 = 0.7;
+const TERR_BAND_WANDER : f32 = 1.4;
+const TERR_BAND_COUNT : f32 = 3.2;
+const TERR_BAND_FROM : f32 = 0.04;
+const TERR_BAND_TO : f32 = 0.3;
+const TERR_SEED_BAND : i32 = 43;
+const TERR_TREE_FREQ : f32 = 0.34;
+const TERR_TREE_IN : f32 = 0.1;
+const TERR_TREE_OUT : f32 = 0.3;
+const TERR_TREE_MEAN : f32 = 0.35;
+const TERR_TREE_DARK : f32 = 0.42;
+const TERR_SEED_TREE : i32 = 47;
+
+// The colour of the plain a picture with no terrain module shows.
+const TERR_FLAT_ALBEDO : f32 = 0.35;
+
+/** Where on the ground a shading is asked for. */
+pub struct GroundSpot {
+    /** The point on the ground. */
+    pub point : Vec3;
+
+    /** Unit direction from the eye to the point. */
+    pub view : Vec3;
+
+    /** World size of one pixel at the point. */
+    pub footprint : f32 = 0.01;
+
+    /** Extra wetness, 0 to 1, that spray or a shore adds to the field's own. */
+    pub wet : f32 = 0.0;
+
+    /** How much of the sun's light is missing, 0 to 1: the shadow of water on its bed,. */
+    pub dim : f32 = 0.0;
+}
+
+/** Shades ground. */
+pub class WaterTerrain {
+    field : Shared<WaterField>;
+    sky   : Shared<WaterSky>;
+    look  : TerrainLook;
+    drawn : bool;
+
+    /** A shader over `field` lit by `sky`; `drawn` false gives a flat plain. */
+    constructor(field : Shared<WaterField>, sky : Shared<WaterSky>, look : TerrainLook, drawn : bool) {
+        self.field = field;
+        self.sky = sky;
+        self.look = look;
+        self.drawn = drawn;
+    }
+
+    /** Points the shader at the params of a new frame. */
+    pub fn setLook(mut self, look : TerrainLook, drawn : bool) : void {
+        self.look = look;
+        self.drawn = drawn;
+    }
+
+    // Noise of wavelength 1/freq fades out when a pixel spans more than half of it.
+    static fn visible(freq : f32, footprint : f32) : f32 {
+        return saturate((1.0 as f32) - freq * footprint * TERR_PIXELS_PER_CYCLE);
+    }
+
+    // The detail normal: the bed's slope, tilted by the gradient of three noise octaves.
+    fn normal(self, bed : Quad4, x : f32, z : f32, footprint : f32) : Vec3 {
+        let mid : Vec3 = waterValue2Slope(x * TERR_FREQ_MID, z * TERR_FREQ_MID, TERR_SEED_MID);
+        let fine : Vec3 = waterValue2Slope(x * TERR_FREQ_FINE, z * TERR_FREQ_FINE, TERR_SEED_FINE);
+        let grain : Vec3 = waterValue2Slope(x * TERR_FREQ_GRAIN, z * TERR_FREQ_GRAIN, TERR_SEED_GRAIN);
+        let a : f32 = self.look.detail * WaterTerrain::visible(TERR_FREQ_MID, footprint) * TERR_BUMP_MID;
+        let b : f32 = self.look.detail * WaterTerrain::visible(TERR_FREQ_FINE, footprint) * TERR_BUMP_FINE;
+        let c : f32 = self.look.detail * WaterTerrain::visible(TERR_FREQ_GRAIN, footprint) * TERR_BUMP_GRAIN;
+        let sx : f32 = bed.b + a * mid.y * TERR_FREQ_MID + b * fine.y * TERR_FREQ_FINE
+            + c * grain.y * TERR_FREQ_GRAIN;
+        let sz : f32 = bed.c + a * mid.z * TERR_FREQ_MID + b * fine.z * TERR_FREQ_FINE
+            + c * grain.z * TERR_FREQ_GRAIN;
+        return Vec3 { x: -sx, y: 1.0, z: -sz }.normalized();
+    }
+
+    // The albedo of the material at the point: height, slope and noise choose among the four.
+    fn albedo(self, x : f32, y : f32, z : f32, slope : f32, footprint : f32, far : f32, wet : f32) : Vec3 {
+        let patch : f32 = waterFbm2(x * TERR_FREQ_BROAD, z * TERR_FREQ_BROAD, 3, TERR_SEED_PATCH);
+        let wobble : f32 = waterFbm2(
+            x * TERR_FREQ_BROAD * (3.0 as f32),
+            z * TERR_FREQ_BROAD * (3.0 as f32),
+            2,
+            TERR_SEED_ROCK
+        );
+        let l : TerrainLook = self.look;
+
+        let sandWeight : f32 = smoothstep(
+            l.sandTop,
+            l.sandTop - TERR_SAND_BLEND,
+            y + (patch - (0.5 as f32)) * (0.8 as f32)
+        );
+        let flatness : f32 = saturate((1.0 as f32) - slope / l.rockSlope);
+        let grassWeight : f32 = smoothstep(0.55, 0.75, patch) * l.grassAmount * ((1.0 as f32) - sandWeight)
+            * flatness;
+        let rockWeight : f32 = smoothstep(
+            0.45,
+            1.0,
+            slope / l.rockSlope + (wobble - (0.5 as f32)) * (0.5 as f32)
+        );
+
+        let mut c : Vec3 = l.sinter.lerp(l.sand, sandWeight);
+        c = c.lerp(l.grass, grassWeight);
+        c = c.lerp(l.rock, rockWeight);
+
+        // Around water the ground is banded, ring after ring, orange crust and green algae and cream sinter.
+        if (l.bandAmount > 0.0) {
+            c = self.banded(c, x, z, wet, footprint);
+        }
+
+        // Far from the grid the land is wooded hills: dark grass in patches of forest, rock on the steep.
+        let wooded : f32 = smoothstep(TERR_FAR_FROM, TERR_FAR_TO, far);
+        if (wooded > 0.0) {
+            let forest : f32 = waterFbm2(x * TERR_FREQ_FOREST, z * TERR_FREQ_FOREST, 3, TERR_SEED_GRASS + 9);
+            let cover : Vec3 = l.grass
+                .scale(TERR_FOREST_DARK + forest * TERR_FOREST_LIGHT)
+                .lerp(l.rock, rockWeight);
+            let trees : f32 = WaterTerrain::trees(x, z, footprint);
+            let forested : Vec3 = cover.lerp(cover.scale(TERR_TREE_DARK), trees);
+            c = c.lerp(forested, wooded);
+        }
+
+        let mid : f32 = waterValue2(
+            x * TERR_FREQ_MID * (1.7 as f32),
+            z * TERR_FREQ_MID * (1.7 as f32),
+            TERR_SEED_GRASS
+        );
+        let fine : f32 = waterValue2(
+            x * TERR_FREQ_FINE * (1.3 as f32),
+            z * TERR_FREQ_FINE * (1.3 as f32),
+            TERR_SEED_FINE + 5
+        );
+        let grain : f32 = waterHash(
+            (x * TERR_FREQ_GRAIN) as i32,
+            0,
+            (z * TERR_FREQ_GRAIN) as i32,
+            TERR_SEED_GRAIN
+        );
+        let tone : f32 = TERR_TONE_BASE
+            + TERR_TONE_MID * lerp(0.5, mid, WaterTerrain::visible(TERR_FREQ_MID, footprint))
+            + TERR_TONE_FINE * lerp(0.5, fine, WaterTerrain::visible(TERR_FREQ_FINE, footprint))
+            + (0.25 as f32)
+                * (lerp(0.5, grain, WaterTerrain::visible(TERR_FREQ_GRAIN, footprint)) - (0.5 as f32));
+        return c.scale(tone);
+    }
+
+    // The colour of damp ground at `wet` (1 at the water's edge, 0 at the edge of the damp): concentric bands whose
+    // widths wander with noise.
+    fn banded(self, base : Vec3, x : f32, z : f32, wet : f32, footprint : f32) : Vec3 {
+        let l : TerrainLook = self.look;
+        let wander : f32 = waterFbm2(x * TERR_BAND_FREQ, z * TERR_BAND_FREQ, 2, TERR_SEED_BAND);
+        let ring : f32 = wet * TERR_BAND_COUNT + wander * TERR_BAND_WANDER;
+        let phase : f32 = ring - (ring as i32 as f32);
+        let rust : f32 = smoothstep(0.0, 0.12, phase) * ((1.0 as f32) - smoothstep(0.30, 0.42, phase));
+        let green : f32 = smoothstep(0.38, 0.5, phase) * ((1.0 as f32) - smoothstep(0.66, 0.78, phase));
+        let reach : f32 = smoothstep(TERR_BAND_FROM, TERR_BAND_TO, wet);
+        let weight : f32 = l.bandAmount * reach
+            * WaterTerrain::visible(TERR_BAND_COUNT, footprint * TERR_BAND_FREQ);
+        let mut c : Vec3 = base.lerp(l.rust, rust * weight);
+        c = c.lerp(l.algae, green * weight);
+        return c;
+    }
+
+    // How much of the far ground a conifer covers at (x, z), 0 to 1: blobs of a jittered grid, averaged out where a
+    // pixel spans several of them.
+    static fn trees(x : f32, z : f32, footprint : f32) : f32 {
+        let d : f32 = waterCell2(x * TERR_TREE_FREQ, z * TERR_TREE_FREQ, TERR_SEED_TREE);
+        let blob : f32 = (1.0 as f32) - smoothstep(TERR_TREE_IN, TERR_TREE_OUT, d);
+        return lerp(TERR_TREE_MEAN, blob, WaterTerrain::visible(TERR_TREE_FREQ, footprint));
+    }
+
+    /** The radiance leaving the ground at `spot` toward the eye, before haze. */
+    pub fn shade(self, spot : GroundSpot) : Vec3 {
+        let p : Vec3 = spot.point;
+        if (!self.drawn) {
+            return self.flatPlain(p);
+        }
+
+        let bed : Quad4 = self.field.bedAt(p.x, p.z);
+        let n : Vec3 = self.normal(bed, p.x, p.z, spot.footprint);
+        let slope : f32 = sqrt(bed.b * bed.b + bed.c * bed.c);
+        let wet : f32 = saturate(bed.d + spot.wet);
+
+        let mut albedo : Vec3 = self.albedo(
+            p.x,
+            p.y,
+            p.z,
+            slope,
+            spot.footprint,
+            self.field.outside(p.x, p.z),
+            bed.d
+        );
+        albedo = albedo.scale((1.0 as f32) - self.look.wetDarkening * wet);
+
+        let lit : Quad4 = self.field.lightAt(p.x, p.z);
+        let sunShare : f32 = lit.a * ((1.0 as f32) - spot.dim);
+        let direct : Vec3 = self.sky.direct(n).scale(sunShare);
+        let ambient : Vec3 = self.sky.ambient(n).scale(lit.b);
+        let bounce : Vec3 = self.sky.direct(Vec3::unitY()).scale(TERR_BOUNCE * lit.b);
+        let mut out : Vec3 = albedo.times(direct.plus(ambient).plus(bounce));
+
+        // Damp ground shows a sheen of sky at grazing angles.
+        let facing : f32 = saturate(-spot.view.dot(n));
+        let grazing : f32 = (1.0 as f32) - facing;
+        let sheen : f32 = TERR_WET_SHEEN * wet * grazing * grazing * grazing;
+        out = out.plus(self.sky.prefiltered(spot.view.reflect(n), 0.4).scale(sheen));
+        return out;
+    }
+
+    // What a picture without a terrain module shows: a flat, evenly lit plain.
+    fn flatPlain(self, p : Vec3) : Vec3 {
+        let up : Vec3 = Vec3::unitY();
+        let light : Vec3 = self.sky.direct(up).plus(self.sky.ambient(up));
+        return light.scale(TERR_FLAT_ALBEDO);
+    }
+}

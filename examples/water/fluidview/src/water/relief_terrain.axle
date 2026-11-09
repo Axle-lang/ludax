@@ -1,0 +1,138 @@
+// relief_terrain — the generated `HydroTerrain` as the vista's `Relief`.
+//
+// The terrain agent's landscape is a bed (`f32` metres), a material class a texel (`u8`), a lake mask and a lake
+// level. The relief wants heights, four graded masks (rock, forest, meadow, river bed) and the lake. A class
+// becomes a mask by being 255 where the texel has it and 0 elsewhere, so the bilinear read of the mask is a smooth
+// ramp over a cell of the terrain and the ground shader roughens that ramp with noise (a forest edge is a ramp,
+// never a stair). Scree counts as half rock, gravel and mud as river bed. The heights are copied, not aliased: the
+// relief builds its pyramid in them.
+
+use crate::terrain::hydro_terrain::{
+    HydroTerrain, HYDRO_FIELD, HYDRO_FOREST, HYDRO_GRASS, HYDRO_GRAVEL, HYDRO_MUD, HYDRO_ROCK, HYDRO_SCREE
+};
+use crate::water::relief::{Relief, RELIEF_CHANNELS};
+use crate::water::relief_rough::ReliefRough;
+
+// Passes of the mask blur.
+const RT_PASSES : i32 = 2;
+
+// The mask value of a class a texel has, 0 to 1, and of scree's share of rock.
+const RT_HALF : f32 = 0.3;
+
+/** Builds reliefs from terrains. */
+pub class ReliefTerrain {
+    /** A relief of `terrain` (with the lake's flat plane when `withLake`; a scene that simulates the lake draws none) with its pyramid built (serially) and its lake set; light is baked later by the renderer. */
+    pub static fn make(terrain : HydroTerrain, withLake : bool) : Shared<Relief> {
+        let mut relief : Shared<Relief> = share new Relief(
+            terrain.width,
+            terrain.depth,
+            terrain.cellSize,
+            (0.0 as f32),
+            (0.0 as f32)
+        );
+        let cells : i64 = (terrain.width as i64) * terrain.depth;
+        for (i of 0..cells) {
+            relief.grid.heights[i] = terrain.bed[i];
+        }
+        ReliefRough::apply(relief, terrain);
+        for (j of 0..terrain.depth) {
+            for (i of 0..terrain.width) {
+                let at : i64 = ((j * terrain.width) + i) as i64;
+                ReliefTerrain::texel(relief, terrain, i, j, terrain.material[at]);
+                relief.setExtras(
+                    i,
+                    j,
+                    ReliefTerrain::share(terrain.material[at], HYDRO_SCREE),
+                    ReliefTerrain::share(terrain.material[at], HYDRO_FIELD),
+                    ReliefTerrain::share(terrain.material[at], HYDRO_MUD),
+                    (terrain.wetness[at] as f32) / (255.0 as f32)
+                );
+                if (withLake && terrain.lakeMask[at] != (0 as u8)) {
+                    relief.lake[at] = 255 as u8;
+                }
+            }
+        }
+        if (withLake) {
+            relief.lakeLevel = terrain.lake.level;
+        }
+        ReliefTerrain::soften(relief);
+        relief.grid.build();
+        return relief;
+    }
+
+    // 1 when `material` is the class `wanted`, else 0.
+    static fn share(material : u8, wanted : u8) : f32 {
+        if (material == wanted) {
+            return (1.0 as f32);
+        }
+        return (0.0 as f32);
+    }
+
+    // The four masks of texel (`i`, `j`) of class `material`.
+    static fn texel(relief : Shared<Relief>, terrain : HydroTerrain, i : i32, j : i32, material : u8) : void {
+        let mut rock : f32 = (0.0 as f32);
+        let mut forest : f32 = (0.0 as f32);
+        let mut meadow : f32 = (0.0 as f32);
+        let mut bed : f32 = (0.0 as f32);
+        if (material == HYDRO_ROCK) {
+            rock = (1.0 as f32);
+        } else if (material == HYDRO_SCREE) {
+            rock = RT_HALF;
+        } else if (material == HYDRO_FOREST) {
+            forest = (1.0 as f32);
+        } else if (material == HYDRO_GRASS) {
+            meadow = (1.0 as f32);
+        } else if (material == HYDRO_GRAVEL || material == HYDRO_MUD) {
+            bed = (1.0 as f32);
+        }
+        relief.setMasks(i, j, rock, forest, meadow, bed);
+    }
+
+    // Two passes of a [1 2 1] x [1 2 1] blur over each material mask: a class is 0 or 255 a texel, and the ground shader
+    // wants a continuous mask (it roughens the ramp with noise); this widens the ramp from one texel to several so a
+    // boundary between two materials is a gradient and not a staircase of the terrain's cells.
+    static fn soften(relief : Shared<Relief>) : void {
+        let w : i32 = relief.grid.w;
+        let d : i32 = relief.grid.d;
+        let scratch : u8[] = new u8[(w as i64) * d];
+        for (pass of 0..RT_PASSES) {
+            for (channel of 0..RELIEF_CHANNELS) {
+                ReliefTerrain::blur(relief.masks, scratch, w, d, channel);
+            }
+        }
+    }
+
+    // One blur of channel `channel` of the interleaved masks through `scratch`.
+    static fn blur(mut masks : u8[], mut scratch : u8[], w : i32, d : i32, channel : i32) : void {
+        let step : i64 = RELIEF_CHANNELS as i64;
+        for (j of 0..d) {
+            for (i of 0..w) {
+                let mut sum : i32 = 0;
+                let mut weight : i32 = 0;
+                for (dj of -1..2) {
+                    for (di of -1..2) {
+                        let x : i32 = i + di;
+                        let z : i32 = j + dj;
+                        if (x < 0 || z < 0 || x >= w || z >= d) {
+                            continue;
+                        }
+                        let k : i32 = (2 - ReliefTerrain::abs1(di)) * (2 - ReliefTerrain::abs1(dj));
+                        sum = sum + k * (masks[(((z * w) + x) as i64) * step + (channel as i64)] as i32);
+                        weight = weight + k;
+                    }
+                }
+                scratch[((j * w) + i) as i64] = (sum / weight) as u8;
+            }
+        }
+        for (c of 0..((w as i64) * d)) {
+            masks[c * step + (channel as i64)] = scratch[c];
+        }
+    }
+
+    static fn abs1(v : i32) : i32 {
+        if (v < 0) {
+            return 0 - v;
+        }
+        return v;
+    }
+}

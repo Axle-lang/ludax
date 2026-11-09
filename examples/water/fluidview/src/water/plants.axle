@@ -1,0 +1,406 @@
+// plants — trees as instanced shapes: a jittered lattice of cells, one tree per cell, traced by the primary ray.
+//
+// A forest of a hundred thousand trees is not stored. Each cell of a 5.5 m lattice owns at most one tree whose place,
+// size, kind and tint are hashes of the cell's address, and whether it exists at all depends on the stand map (the
+// terrain's forest mask, kept where the ground is gentle) and a ragged edge. The ray of a pixel walks the lattice
+// cell by cell (the Amanatides-Woo walk) out to the tree range or the ground it already hit, and tests the one
+// tree of each cell it crosses; the first cell with a hit ends the walk. A cell with no stand costs one byte read.
+//
+// Conifers are six overlapping cones whose lower rims are scalloped by angular noise; broadleaf trees are a trunk
+// and an ellipsoid canopy that is alpha-tested with clumped noise, the more so near the silhouette, so the edge is
+// ragged and the light comes through. Both sway a little with the wind, more at the top. Trees are lit by the sun
+// with the terrain baked shadow at their foot, by the sky dome with an occlusion that deepens toward the inside and
+// the bottom of the crown, and a leaf lets some of the sun through. Beyond the range the ground paints the same
+// stand as a canopy texture (`ground_canopy`), so the change from shape to texture is a change of detail only.
+
+use ludax::{abs, cos, max, min, saturate, sin, smoothstep, sqrt, Vec3, PI};
+
+use crate::water::ground_noise::groundFade;
+use crate::water::noise::{waterFloor, waterHash, waterPick, waterValue2, waterValue3};
+use crate::water::plant_shapes::{
+    plantSpread, PlantShape, Strike, Tree, PLANT_EPS, PLANT_LEAF, PLANT_SEED_LEAF
+};
+use crate::water::relief::{Relief, RELIEF_CHANNELS, RELIEF_FOREST};
+use crate::water::sky::WaterSky;
+use crate::water::vista_look::GroundLook;
+
+/** How far from the eye, metres, trees are drawn as shapes. */
+pub const PLANT_RANGE : f32 = 420.0;
+
+// The lattice: metres a cell, and the margin a tree's foot keeps from the cell's edge as a share of it.
+const PLANT_CELL : f32 = 5.5;
+const PLANT_MARGIN : f32 = 0.12;
+
+// The most a tree's crown reaches beyond its own cell, metres.
+const PLANT_REACH : f32 = 4.3;
+
+// How much higher than a tree's cell centre the ground may rise within the cell's reach, metres.
+const PLANT_SLOPE : f32 = 5.0;
+
+// Beyond any distance a ray can reach.
+const PLANT_FAR : f32 = 1000000.0;
+
+// The most cells one ray walks, and the lowest stand weight (of 255) that holds a tree at all.
+const PLANT_STEPS : i32 = 170;
+const PLANT_MIN_STAND : i32 = 6;
+
+// A direction component smaller than this counts as zero.
+
+// Seeds.
+const PLANT_SEED : i32 = 801;
+const PLANT_SEED_EDGE : i32 = 803;
+
+// Conifers: tiers, the height of one as a share of the crown, and the clear trunk as a share of the tree.
+
+// The tallest a tree grows, metres: the walk's ceiling over the highest ground.
+const PLANT_TALLEST : f32 = 26.0;
+
+// Colour gain of the crowns over the palette (the palette is leaf albedo; a crown is brighter than one needle).
+const PLANT_GAIN : f32 = 2.3;
+
+// The size of a broadleaf leaf, metres, which is drawn as cut-outs while a pixel is smaller than a fraction of it.
+
+// Lobes in a broadleaf canopy.
+
+// Wind: sway of the top, metres, and its angular frequency.
+const PLANT_SWAY : f32 = 0.35;
+const PLANT_WIND : f32 = 1.3;
+
+/** What a ray found of the trees. */
+pub struct PlantHit {
+    /** Distance along the ray, or negative for no tree. */
+    pub t : f32 = -(1.0 as f32);
+
+    /** Radiance leaving the tree toward the eye, before haze. */
+    pub colour : Vec3 = Vec3 { x: (0.0 as f32), y: (0.0 as f32), z: (0.0 as f32) };
+}
+
+// The state of a ray walking the lattice: the nearest hit so far, with the tree and the surface.
+struct Walk {
+    t      : f32 = (0.0 as f32);
+    found  : bool = false;
+    strike : Strike = Strike {};
+    tree   : Tree = Tree {};
+}
+
+// A stretch of a ray.
+struct Span {
+    near : f32 = (0.0 as f32);
+    far  : f32 = (0.0 as f32);
+}
+
+/** The trees of a landscape. */
+pub class PlantField {
+    relief : Shared<Relief>;
+    sky    : Shared<WaterSky>;
+
+    /** The materials: the crowns' palette and where the broadleaf trees give way to conifers. */
+    pub look : GroundLook = GroundLook {};
+
+    stands : u8[];
+
+    /** The tree field of `relief`, lit by `sky`; builds the stand map, so make it once per renderer, not per frame. */
+    constructor(relief : Shared<Relief>, sky : Shared<WaterSky>) {
+        self.relief = relief;
+        self.sky = sky;
+        self.stands = new u8[(relief.grid.w as i64) * relief.grid.d];
+        PlantField::fillStands(relief, self.stands);
+    }
+
+    // The stand map: the forest mask where the ground is gentle enough to hold a tree, a byte a texel.
+    static fn fillStands(relief : Shared<Relief>, mut stands : u8[]) : void {
+        let w : i32 = relief.grid.w;
+        let d : i32 = relief.grid.d;
+        let step : i64 = RELIEF_CHANNELS as i64;
+        for (j of 0..d) {
+            for (i of 0..w) {
+                let at : i64 = ((j * w) + i) as i64;
+                let forest : f32 = (relief.masks[at * step + (RELIEF_FOREST as i64)] as f32) / (255.0 as f32);
+                let x : f32 = relief.grid.originX + (i as f32) * relief.grid.cell;
+                let z : f32 = relief.grid.originZ + (j as f32) * relief.grid.cell;
+                let n : Vec3 = relief.grid.normalAt(x, z);
+                let slope : f32 = sqrt(saturate((1.0 as f32) - n.y * n.y)) / max(n.y, (0.05 as f32));
+                let ok : f32 = (1.0 as f32) - smoothstep((0.32 as f32), (0.55 as f32), slope);
+                stands[at] = (saturate(forest * ok) * (255.0 as f32) + (0.5 as f32)) as u8;
+            }
+        }
+    }
+
+    /**
+     * The first tree the ray (`eye`, unit `dir`) meets before distance `limit` (the ground it already hit, or far),
+     * shaded, with the wind of second `time` and a pixel `spread` metres wide a metre away; `t` of the answer is negative when there is none.
+     */
+    pub fn hit(self, eye : Vec3, dir : Vec3, limit : f32, time : f32, spread : f32) : PlantHit {
+        let top : f32 = self.relief.grid.high + PLANT_TALLEST;
+        let mut t0 : f32 = (0.0 as f32);
+        let mut t1 : f32 = min(limit, PLANT_RANGE);
+        if (eye.y > top) {
+            if (dir.y >= -PLANT_EPS) {
+                return PlantHit {};
+            }
+            t0 = (top - eye.y) / dir.y;
+        }
+        if (dir.y > PLANT_EPS) {
+            t1 = min(t1, (top - eye.y) / dir.y);
+        }
+        if (t0 >= t1) {
+            return PlantHit {};
+        }
+
+        let start : Vec3 = eye.plus(dir.scale(t0));
+        let mut ix : i32 = waterFloor(start.x / PLANT_CELL);
+        let mut iz : i32 = waterFloor(start.z / PLANT_CELL);
+        let mut stepX : i32 = 1;
+        let mut stepZ : i32 = 1;
+        let mut gapX : f32 = ((ix + 1) as f32) * PLANT_CELL - start.x;
+        let mut gapZ : f32 = ((iz + 1) as f32) * PLANT_CELL - start.z;
+        if (dir.x < (0.0 as f32)) {
+            stepX = -1;
+            gapX = start.x - (ix as f32) * PLANT_CELL;
+        }
+        if (dir.z < (0.0 as f32)) {
+            stepZ = -1;
+            gapZ = start.z - (iz as f32) * PLANT_CELL;
+        }
+        let mut deltaX : f32 = PLANT_FAR;
+        let mut deltaZ : f32 = PLANT_FAR;
+        let mut nextX : f32 = PLANT_FAR;
+        let mut nextZ : f32 = PLANT_FAR;
+        if (abs(dir.x) > PLANT_EPS) {
+            deltaX = PLANT_CELL / abs(dir.x);
+            nextX = t0 + gapX / abs(dir.x);
+        }
+        if (abs(dir.z) > PLANT_EPS) {
+            deltaZ = PLANT_CELL / abs(dir.z);
+            nextZ = t0 + gapZ / abs(dir.z);
+        }
+
+        let mut walk : Walk = Walk { t: t1 };
+        if (!self.above(ix, iz, eye, dir, t0)) {
+            for (dz of -1..2) {
+                for (dx of -1..2) {
+                    walk = self.probe(walk, ix + dx, iz + dz, eye, dir, time, spread);
+                }
+            }
+        }
+        for (k of 0..PLANT_STEPS) {
+            let cellEnd : f32 = min(nextX, nextZ);
+            if ((walk.found && walk.t <= cellEnd) || cellEnd >= t1) {
+                break;
+            }
+            let along : bool = nextX < nextZ;
+            if (along) {
+                ix = ix + stepX;
+                nextX = nextX + deltaX;
+            } else {
+                iz = iz + stepZ;
+                nextZ = nextZ + deltaZ;
+            }
+            if (self.above(ix, iz, eye, dir, cellEnd)) {
+                continue;
+            }
+            for (side of -1..2) {
+                if (along) {
+                    walk = self.probe(walk, ix + stepX, iz + side, eye, dir, time, spread);
+                } else {
+                    walk = self.probe(walk, ix + side, iz + stepZ, eye, dir, time, spread);
+                }
+            }
+        }
+        if (!walk.found) {
+            return PlantHit {};
+        }
+        return PlantHit { t: walk.t, colour: self.paint(walk.tree, walk.strike, eye, dir) };
+    }
+
+    // Whether the ray, at distance `t`, is too far above the ground around cell (`ix`, `iz`) to touch any tree there
+    // for the next few cells: the ground under the cell's middle plus the tallest tree and the slope's rise.
+    fn above(self, ix : i32, iz : i32, eye : Vec3, dir : Vec3, t : f32) : bool {
+        let reach : f32 = (3.0 as f32) * PLANT_CELL;
+        let slack : f32 = abs(dir.y) * reach / max(sqrt(dir.x * dir.x + dir.z * dir.z), (0.05 as f32));
+        let cx : f32 = ((ix as f32) + (0.5 as f32)) * PLANT_CELL;
+        let cz : f32 = ((iz as f32) + (0.5 as f32)) * PLANT_CELL;
+        return eye.y + dir.y * t - slack
+            > self.relief.grid.ceilingAt(cx, cz, 1) + PLANT_TALLEST + PLANT_SLOPE;
+    }
+
+    // The walk after testing the tree of cell (`ix`, `iz`): the nearer of what it had and what that tree gives.
+    fn probe(self, walk : Walk, ix : i32, iz : i32, eye : Vec3, dir : Vec3, time : f32, spread : f32) : Walk {
+        let cx : f32 = ((ix as f32) + (0.5 as f32)) * PLANT_CELL;
+        let cz : f32 = ((iz as f32) + (0.5 as f32)) * PLANT_CELL;
+        if (self.standAt(cx, cz) < PLANT_MIN_STAND) {
+            return walk;
+        }
+        let span : Span = PlantField::crosses(ix, iz, eye, dir, walk.t);
+        if (span.far < span.near) {
+            return walk;
+        }
+        let lowest : f32 = eye.y + dir.y * waterPick(dir.y < (0.0 as f32), span.far, span.near);
+        if (lowest > self.relief.grid.heightAt(cx, cz) + PLANT_TALLEST + PLANT_SLOPE) {
+            return walk;
+        }
+        let tree : Tree = self.treeAt(ix, iz, time, spread);
+        if (!tree.real) {
+            return walk;
+        }
+        let s : Strike = self.strike(tree, eye, dir, walk.t);
+        if (s.t < (0.0 as f32)) {
+            return walk;
+        }
+        return Walk { t: s.t, found: true, strike: s, tree: tree };
+    }
+
+    // The distances along the ray, before `limit`, at which it enters and leaves the cell (`ix`, `iz`) grown by the most a
+    // tree reaches out of it; `far` is less than `near` when it misses.
+    static fn crosses(ix : i32, iz : i32, eye : Vec3, dir : Vec3, limit : f32) : Span {
+        let mut near : f32 = (0.0 as f32);
+        let mut far : f32 = limit;
+        let lowX : f32 = (ix as f32) * PLANT_CELL - PLANT_REACH;
+        let lowZ : f32 = (iz as f32) * PLANT_CELL - PLANT_REACH;
+        let span : f32 = PLANT_CELL + (2.0 as f32) * PLANT_REACH;
+        if (abs(dir.x) > PLANT_EPS) {
+            let a : f32 = (lowX - eye.x) / dir.x;
+            let b : f32 = (lowX + span - eye.x) / dir.x;
+            near = max(near, min(a, b));
+            far = min(far, max(a, b));
+        } else if (eye.x < lowX || eye.x > lowX + span) {
+            return Span { near: (1.0 as f32), far: (0.0 as f32) };
+        }
+        if (abs(dir.z) > PLANT_EPS) {
+            let a : f32 = (lowZ - eye.z) / dir.z;
+            let b : f32 = (lowZ + span - eye.z) / dir.z;
+            near = max(near, min(a, b));
+            far = min(far, max(a, b));
+        } else if (eye.z < lowZ || eye.z > lowZ + span) {
+            return Span { near: (1.0 as f32), far: (0.0 as f32) };
+        }
+        return Span { near: near, far: far };
+    }
+
+    // The stand weight, 0 to 255, of the texel nearest (`x`, `z`).
+    fn standAt(self, x : f32, z : f32) : i32 {
+        let i : i32 = waterFloor((x - self.relief.grid.originX) / self.relief.grid.cell + (0.5 as f32));
+        let j : i32 = waterFloor((z - self.relief.grid.originZ) / self.relief.grid.cell + (0.5 as f32));
+        if (i < 0 || j < 0 || i >= self.relief.grid.w || j >= self.relief.grid.d) {
+            return 0;
+        }
+        return self.stands[((j * self.relief.grid.w) + i) as i64] as i32;
+    }
+
+    // The tree of cell (`ix`, `iz`), if the cell has one.
+    fn treeAt(self, ix : i32, iz : i32, time : f32, spread : f32) : Tree {
+        let room : f32 = (1.0 as f32) - (2.0 as f32) * PLANT_MARGIN;
+        let id : f32 = waterHash(ix, 3, iz, PLANT_SEED);
+        let x : f32 = ((ix as f32) + PLANT_MARGIN + room * plantSpread(id, 1)) * PLANT_CELL;
+        let z : f32 = ((iz as f32) + PLANT_MARGIN + room * plantSpread(id, 2)) * PLANT_CELL;
+        let density : f32 = (self.standAt(x, z) as f32) / (255.0 as f32);
+        let edge : f32 = waterValue2(x * (0.06 as f32), z * (0.06 as f32), PLANT_SEED_EDGE);
+        if (id > density * (1.2 as f32) + (edge - (0.5 as f32)) * (1.0 as f32) - (0.1 as f32)) {
+            return Tree {};
+        }
+
+        let base : f32 = self.relief.grid.heightAt(x, z);
+        let lowland : f32 = (1.0 as f32)
+            - smoothstep(self.look.plainHeight, self.look.plainHeight + (70.0 as f32), base);
+        let mut broad : f32 = (0.0 as f32);
+        if (plantSpread(id, 5) < lowland * (0.75 as f32)) {
+            broad = (1.0 as f32);
+        }
+        let grow : f32 = plantSpread(id, 4);
+        let mut height : f32 = (13.0 as f32) + (12.0 as f32) * grow;
+        let mut radius : f32 = (1.9 as f32) + (1.0 as f32) * grow;
+        if (broad > (0.5 as f32)) {
+            height = (11.0 as f32) + (7.0 as f32) * grow;
+            radius = (2.9 as f32) + (1.0 as f32) * grow;
+        }
+        return Tree {
+            real: true,
+            x: x,
+            z: z,
+            base: base,
+            height: height,
+            radius: radius,
+            id: id,
+            broad: broad,
+            spread: spread,
+            sway: PLANT_SWAY * sin(time * PLANT_WIND + id * (40.0 as f32)) * (height / (20.0 as f32)),
+        };
+    }
+
+    // The nearest surface of `tree` along the ray closer than `limit`; `t` is negative when it misses.
+    fn strike(self, tree : Tree, eye : Vec3, dir : Vec3, limit : f32) : Strike {
+        let centre : Vec3 = Vec3 { x: tree.x, y: tree.base + tree.height * (0.5 as f32), z: tree.z };
+        let reach : f32 = max(tree.height * (0.5 as f32), tree.radius * (1.5 as f32)) * (1.08 as f32);
+        let oc : Vec3 = eye.minus(centre);
+        let b : f32 = oc.dot(dir);
+        let disc : f32 = b * b - (oc.dot(oc) - reach * reach);
+        if (disc < (0.0 as f32)) {
+            return Strike {};
+        }
+        let root : f32 = sqrt(disc);
+        if (root - b < (0.0 as f32) || -b - root > limit) {
+            return Strike {};
+        }
+        if (tree.broad > (0.5 as f32)) {
+            return PlantShape::broad(tree, eye, dir, limit);
+        }
+        return PlantShape::conifer(tree, eye, dir, limit);
+    }
+
+    // The radiance of the surface `strike` of `tree`: palette, sun with the terrain's shadow, sky with occlusion, and the
+    // light a leaf lets through.
+    fn paint(self, tree : Tree, strike : Strike, eye : Vec3, dir : Vec3) : Vec3 {
+        let p : Vec3 = eye.plus(dir.scale(strike.t));
+        let sun : Vec3 = self.sky.sunDir;
+        let shadow : f32 = self.relief.sunAt(tree.x, tree.z);
+        let open : f32 = self.relief.openAt(tree.x, tree.z);
+        let tone : f32 = (0.72 as f32)
+            + (0.56 as f32) * waterValue2(tree.id * (91.0 as f32), tree.id * (37.0 as f32), PLANT_SEED + 5);
+        let patchy : f32 = (0.8 as f32)
+            + (0.4 as f32) * waterValue3(p.scale((0.5 as f32)), PLANT_SEED_LEAF + 9);
+        let fresh : f32 = plantSpread(tree.id, 7);
+        let warm : Vec3 = Vec3 {
+            x: (0.8 as f32) + fresh * (0.9 as f32),
+            y: (0.95 as f32) + fresh * (0.15 as f32),
+            z: (1.0 as f32) - fresh * (0.5 as f32),
+        };
+        let near : f32 = groundFade(PLANT_LEAF, tree.spread * strike.t, 0.12, 0.7);
+        let speck : f32 = (1.0 as f32)
+            + near * (waterValue3(p.scale((7.0 as f32)), PLANT_SEED_LEAF + 29) - (0.5 as f32)) * (1.2 as f32);
+        let mut albedo : Vec3 = self.look.conifer.scale(PLANT_GAIN * tone * patchy * speck);
+        if (tree.broad > (0.5 as f32)) {
+            albedo = self.look.broadleaf.scale(PLANT_GAIN * tone * patchy * speck).times(warm);
+        }
+        if (strike.wood) {
+            let ridges : f32 = waterValue2(
+                (p.x + p.z) * (11.0 as f32),
+                p.y * (0.9 as f32),
+                PLANT_SEED_LEAF + 31
+            );
+            albedo = self.look.duff.scale((0.25 as f32) + (0.6 as f32) * ridges);
+        }
+
+        let bumpy : Vec3 = Vec3 {
+            x: waterValue3(p.scale((1.9 as f32)), PLANT_SEED_LEAF + 11) - (0.5 as f32),
+            y: waterValue3(p.scale((1.9 as f32)), PLANT_SEED_LEAF + 17) - (0.5 as f32),
+            z: waterValue3(p.scale((1.9 as f32)), PLANT_SEED_LEAF + 23) - (0.5 as f32),
+        };
+        let rough : f32 = waterPick(strike.wood, (0.0 as f32), (0.9 as f32));
+        let facing : Vec3 = strike.n.plus(bumpy.scale(rough)).normalized();
+        let wrap : f32 = saturate((facing.dot(sun) + (0.25 as f32)) / (1.25 as f32));
+        let mut occlusion : f32 = (0.22 as f32)
+            + (0.78 as f32) * smoothstep((0.0 as f32), (0.85 as f32), strike.up);
+        let mut reach : f32 = (1.0 as f32);
+        if (strike.inner) {
+            occlusion = occlusion * (0.5 as f32);
+            reach = (0.3 as f32);
+        }
+        let lit : f32 = wrap * shadow * reach * ((0.4 as f32) + (0.6 as f32) * occlusion);
+        let direct : Vec3 = self.sky.sunIrr.scale(lit / PI);
+        let ambient : Vec3 = self.sky.ambient(facing).scale(open * occlusion);
+        let through : f32 = saturate(-facing.dot(sun)) * shadow * (0.35 as f32) * reach;
+        let tint : Vec3 = Vec3 { x: (1.0 as f32), y: (1.5 as f32), z: (0.5 as f32) };
+        let glow : Vec3 = self.sky.sunIrr.scale(through / PI).times(tint);
+        return albedo.times(direct.plus(ambient).plus(glow));
+    }
+}

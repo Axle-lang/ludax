@@ -1,0 +1,149 @@
+// check — what the geyser must show, as numbers: pressure that builds, bursts, throws water that high, and recedes.
+//
+// The claims are the ones that would fail first if the model were wrong. The three places the water can be
+// (pool, chamber, droplets) always add up to what the spring injected. The vent opens by itself, repeatedly,
+// with a steady period. The jet reaches the height its pressure predicts (`h = v^2 / 2g` with the head at the
+// burst), measured on the droplets that actually flew, and the water thrown late in the eruption, when the
+// chamber is nearly empty, goes much less high than the first. The eruption ends because the chamber ran
+// down, not because anything told it to.
+
+use fluidview::Verdict;
+use ludax::maxD;
+
+use crate::sim::chamber::{GeyserChamber, GY_HEAD_BURST, GY_HEAD_CLOSE};
+use crate::sim::geyser::{GeyserSim, GY_DT};
+
+/** Eruptions a run waits for; the first starts from an empty chamber and is left out of the period claim. */
+const GY_CHECK_ERUPTIONS : i32 = 4;
+
+/** Ticks a run gives up after if the geyser has not erupted enough times. */
+const GY_CHECK_LIMIT : i32 = 40000;
+
+/** Largest imbalance the volume bookkeeping may show, cell units. */
+const GY_BALANCE_TOL : f64 = 0.000000001;
+
+/** Cycle periods agree within this fraction. */
+const GY_PERIOD_TOL : f64 = 0.03;
+
+/** The first drops climb to the burst head times a factor in this range: 1 less a hair for the launch lift
+ * is the floor, the launch speed jitter squared is the ceiling. */
+const GY_RISE_LOW : f64 = 0.97;
+const GY_RISE_HIGH : f64 = 1.10;
+
+/** The jet after the vent shuts has dropped to under this fraction of the first. */
+const GY_LATE_FRACTION : f64 = 0.6;
+
+/** Ticks after an eruption starts that the first drops have all landed and been measured. */
+const GY_FIRST_WINDOW : i32 = 130;
+
+/** Ticks after the vent shuts that the late drops are measured over. */
+const GY_LATE_WINDOW : i32 = 100;
+
+/** What one run measured. */
+struct GyRun {
+    maxImbalance : f64 = 0.0;
+    firstRise    : f64 = 0.0;
+    lateRise     : f64 = 0.0;
+}
+
+/** The geyser's self-check. */
+pub class GeyserCheck {
+    /** Runs every claim and answers how many failed. */
+    pub static fn run() : i32 {
+        let v : Verdict = new Verdict();
+        let sim : GeyserSim = new GeyserSim();
+        let starts : i64[] = new i64[GY_CHECK_ERUPTIONS as i64];
+        let run : GyRun = GeyserCheck::measure(sim, starts);
+
+        v.claim(
+            "the vent opens by itself",
+            sim.chamberRef().eruptions() >= GY_CHECK_ERUPTIONS,
+            "${sim.chamberRef().eruptions()} eruptions in ${sim.tickCount()} ticks, no timer"
+        );
+        let worst : f64 = run.maxImbalance;
+        v.claim(
+            "water is conserved",
+            worst < GY_BALANCE_TOL,
+            "pool + chamber + droplets - injected never left ${worst}"
+        );
+        GeyserCheck::period(v, starts);
+        GeyserCheck::jet(v, run);
+        v.summary("geyser");
+        return v.failures();
+    }
+
+    // Runs until enough eruptions have begun, noting when each started and, around the second, the height
+    // the droplets reached early and late.
+    static fn measure(sim : GeyserSim, starts : i64[]) : GyRun {
+        let mut run : GyRun = GyRun {};
+        let chamber : GeyserChamber = sim.chamberRef();
+        let mut seen : i32 = 0;
+        let mut began : i64 = 0;
+        let mut closed : i64 = -1;
+        let mut venting : bool = false;
+        while (seen < GY_CHECK_ERUPTIONS && (sim.tickCount() as i32) < GY_CHECK_LIMIT) {
+            sim.tick();
+            run.maxImbalance = maxD(run.maxImbalance, sim.imbalance().abs());
+
+            if (chamber.eruptions() > seen) {
+                starts[seen as i64] = sim.tickCount();
+                seen = chamber.eruptions();
+                if (seen == 2) {
+                    sim.sprayRef().forgetRise();
+                    began = sim.tickCount();
+                }
+            }
+            if (venting && !chamber.isVenting() && seen == 2) {
+                closed = sim.tickCount();
+                sim.sprayRef().forgetRise();
+            }
+            venting = chamber.isVenting();
+            if (seen == 2 && began > 0 && sim.tickCount() == began + (GY_FIRST_WINDOW as i64)) {
+                run.firstRise = sim.sprayRef().rise() as f64;
+                sim.sprayRef().forgetRise();
+            }
+            if (closed > 0 && sim.tickCount() == closed + (GY_LATE_WINDOW as i64)) {
+                run.lateRise = sim.sprayRef().rise() as f64;
+            }
+        }
+        return run;
+    }
+
+    // The interval between eruptions, cycle to cycle, after the first (empty-start) one.
+    static fn period(v : Verdict, starts : i64[]) : void {
+        let mut shortest : i64 = 1000000;
+        let mut longest : i64 = 0;
+        for (i of 2..GY_CHECK_ERUPTIONS) {
+            let gap : i64 = starts[i as i64] - starts[(i - 1) as i64];
+            if (gap < shortest) {
+                shortest = gap;
+            }
+            if (gap > longest) {
+                longest = gap;
+            }
+        }
+        let spread : f64 = ((longest - shortest) as f64) / (longest as f64);
+        let seconds : f64 = (shortest as f64) * GY_DT;
+        v.claim(
+            "the period is steady",
+            longest > 0 && spread <= GY_PERIOD_TOL,
+            "eruptions ${shortest}..${longest} ticks apart (${seconds} s), spread ${spread}"
+        );
+    }
+
+    // The height the first drops reached against the head that threw them, and the later, lower ones.
+    static fn jet(v : Verdict, run : GyRun) : void {
+        let first : f64 = run.firstRise;
+        let late : f64 = run.lateRise;
+        v.claim(
+            "the jet climbs to its pressure head",
+            first >= GY_RISE_LOW * GY_HEAD_BURST && first <= GY_RISE_HIGH * GY_HEAD_BURST,
+            "drops rose ${first} cells against a head of ${GY_HEAD_BURST}"
+        );
+        v.claim(
+            "the jet sinks as the chamber empties",
+            late <= GY_LATE_FRACTION * first,
+            "late drops rose ${late} cells (head falls to ${GY_HEAD_CLOSE} at the close)"
+        );
+    }
+}

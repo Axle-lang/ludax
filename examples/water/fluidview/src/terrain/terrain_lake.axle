@@ -1,0 +1,193 @@
+// terrain_lake — the reservoir's basin, spill level and volume, found by flood fill of the finished grid.
+//
+// The plan says where the reservoir should be; this pass says what the grid actually holds. A flood fill from the
+// middle of the basin visits every 4-connected cell lower than a level. Raise the level and the fill grows; at one
+// level it first reaches ground far below (it spills over the escarpment): that level, found by bisection to a
+// millimetre, is the spill level, and the southernmost cell the fill reaches there is the lip of the waterfall. A
+// fill just under the spill level is the closed basin: its cells are the lake mask, and the sum of the depths below
+// the level times the cell area is the retained volume, in cubic metres. Nothing here trusts the generator: if the
+// rim had a second, lower gap, the spill would be found there instead and the check against the plan would fail.
+//
+// The fill uses its own queue, which is also the list of what it visited, so the marks are cleared by walking the
+// queue and a probe costs only the cells it reached.
+
+use crate::terrain::hydro_parts::HydroSpot;
+
+// Bisection steps (the bracket is eight metres wide: 2^-17 of that is far below a millimetre), and the bracket's reach
+// above and below the planned level, metres.
+const LAKE_STEPS : i32 = 22;
+const LAKE_BRACKET : f32 = 4.0;
+
+// Rim cells within this many metres of the spill level are candidates for the lip: the contour of the closed basin is a ring
+// of such cells, and the sill is the southernmost of them, where the water leaves toward the cliff.
+const LAKE_RIM : f32 = 0.003;
+
+/** What one flood fill found. */
+pub struct LakeFill {
+    /** Cells visited. */
+    pub cells : i64 = 0;
+
+    /** True when the fill reached the grid's border or ground below the sink height (it does not spread past either). */
+    pub escaped : bool = false;
+}
+
+/** The reservoir's measurements. */
+pub class TerrainLake {
+    /**
+     * Floods from cell `start` over every cell below `level`, marking `mask` with 1 and listing the visited cells in
+     * `queue`. A fill that reaches the border or a cell below `sink` has `escaped`.
+     */
+    pub static fn fill(
+        bed : f32[],
+        mask : u8[],
+        queue : i32[],
+        width : i32,
+        start : i64,
+        level : f32,
+        sink : f32
+    ) : LakeFill {
+        let mut found : LakeFill = LakeFill {};
+        if (bed[start] >= level) {
+            return found;
+        }
+        let mut tail : i64 = 1;
+        let mut head : i64 = 0;
+        queue[0] = start as i32;
+        mask[start] = 1;
+        while (head < tail) {
+            let c : i64 = queue[head] as i64;
+            head = head + 1;
+            let col : i32 = (c % (width as i64)) as i32;
+            let row : i32 = (c / (width as i64)) as i32;
+            if (bed[c] < sink || col == 0 || row == 0 || col == width - 1 || row == width - 1) {
+                found.escaped = true;
+                continue;
+            }
+            for (k of 0..4) {
+                let n : i64 = c + TerrainLake::offset(k, width);
+                if (n < 0 || n >= (width as i64) * (width as i64) || mask[n] != (0 as u8)
+                    || bed[n] >= level) {
+                    continue;
+                }
+                if ((k == 0 && col == width - 1) || (k == 1 && col == 0)) {
+                    continue;
+                }
+                mask[n] = 1;
+                queue[tail] = n as i32;
+                tail = tail + 1;
+            }
+        }
+        found.cells = tail;
+        return found;
+    }
+
+    static fn offset(k : i32, width : i32) : i64 {
+        return match k {
+            0 => 1,
+            1 => -1,
+            2 => width as i64,
+            _ => 0 - (width as i64),
+        };
+    }
+
+    /** Clears the cells a fill visited (the first `cells` of `queue`) from `mask`. */
+    pub static fn clear(mask : u8[], queue : i32[], cells : i64) : void {
+        for (i of 0..cells) {
+            mask[queue[i] as i64] = 0;
+        }
+    }
+
+    /**
+     * The level at which a fill from `start` first escapes, searched in `planned` minus and plus four metres, with
+     * `sink` the height below which ground counts as beyond the rim.
+     */
+    pub static fn spillLevel(
+        bed : f32[],
+        mask : u8[],
+        queue : i32[],
+        width : i32,
+        start : i64,
+        planned : f32,
+        sink : f32
+    ) : f32 {
+        let mut lo : f32 = planned - LAKE_BRACKET;
+        let mut hi : f32 = planned + LAKE_BRACKET;
+        for (step of 0..LAKE_STEPS) {
+            let mid : f32 = (lo + hi) * 0.5 as f32;
+            let probe : LakeFill = TerrainLake::fill(bed, mask, queue, width, start, mid, sink);
+            TerrainLake::clear(mask, queue, probe.cells);
+            if (probe.escaped) {
+                hi = mid;
+            } else {
+                lo = mid;
+            }
+        }
+        return hi;
+    }
+
+    /**
+     * The lip of a closed basin (the `cells` visited cells of `queue`) that fills to `level`: among the cells beside the
+     * basin but not in it and within millimetres of `level`, the southmost, then the westmost. This is the sill the water
+     * will leave over, the lip of the waterfall. `mask` must still mark the basin.
+     */
+    pub static fn lowestRim(
+        bed : f32[],
+        mask : u8[],
+        queue : i32[],
+        width : i32,
+        cells : i64,
+        level : f32
+    ) : i64 {
+        let mut best : i64 = -1;
+        for (i of 0..cells) {
+            let c : i64 = queue[i] as i64;
+            let col : i32 = (c % (width as i64)) as i32;
+            for (k of 0..4) {
+                let n : i64 = c + TerrainLake::offset(k, width);
+                if (n < 0 || n >= (width as i64) * (width as i64) || mask[n] != (0 as u8)) {
+                    continue;
+                }
+                if ((k == 0 && col == width - 1) || (k == 1 && col == 0)) {
+                    continue;
+                }
+                if (bed[n] > level + LAKE_RIM) {
+                    continue;
+                }
+                if (best < 0 || TerrainLake::lower(bed, width, n, best)) {
+                    best = n;
+                }
+            }
+        }
+        return best;
+    }
+
+    // True when cell `a` is a better sill than `b`: further south, then further west.
+    static fn lower(bed : f32[], width : i32, a : i64, b : i64) : bool {
+        let rowA : i64 = a / (width as i64);
+        let rowB : i64 = b / (width as i64);
+        if (rowA != rowB) {
+            return rowA > rowB;
+        }
+        return a < b;
+    }
+
+    /** The cubic metres held below `level` by the `cells` visited cells of `queue`. */
+    pub static fn volume(bed : f32[], queue : i32[], cells : i64, level : f32, cell : f32) : f32 {
+        let mut sum : f32 = 0.0 as f32;
+        for (i of 0..cells) {
+            sum = sum + (level - bed[queue[i] as i64]);
+        }
+        return sum * cell * cell;
+    }
+
+    /** The spot of cell `c` of a grid `width` wide, with its height. */
+    pub static fn spot(bed : f32[], width : i32, cell : f32, c : i64) : HydroSpot {
+        let col : i32 = (c % (width as i64)) as i32;
+        let row : i32 = (c / (width as i64)) as i32;
+        return HydroSpot {
+            x: ((col as f32) + 0.5 as f32) * cell,
+            z: ((row as f32) + 0.5 as f32) * cell,
+            height: bed[c],
+        };
+    }
+}

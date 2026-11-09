@@ -1,0 +1,159 @@
+// foam — the white of broken water: how much of a point the foam covers, how thick it is, and its lace.
+//
+// The engine says how much foam there is in a column (a number a cell wide); what foam looks like is smaller than
+// that. The amount decides coverage, and the coverage is cut out of a lace of bubbles: cellular noise at two
+// scales, blobs for bubbles, with a low-frequency streakiness so a patch is not a polka dot. A little foam is a
+// scatter of isolated bubbles, more of it joins into a web with holes of water in it, a lot is solid white. The
+// pattern rides the surface velocity (two phases of the field blended, so it flows without stretching without
+// end), and viscosity softens it: a thick liquid does not hold a fine froth. Contact foam is the same lace
+// laid along the line where water meets ground, so a shore has the thin lacy edge of the photographs.
+//
+// Pure functions of a position, a time and the amounts; the surface shader decides what colour foam is.
+
+use ludax::{abs, lerp, saturate, smoothstep};
+
+use crate::water::noise::{waterCell2, waterValue2};
+
+// The two scales of bubbles, in cells per cell of the point's position, and the streak noise.
+const FOAM_SCALE_BIG : f32 = 4.2;
+const FOAM_SCALE_SMALL : f32 = 12.0;
+const FOAM_SCALE_STREAK : f32 = 0.7;
+
+// Seeds of the three noises.
+const FOAM_SEED_BIG : i32 = 41;
+const FOAM_SEED_SMALL : i32 = 43;
+const FOAM_SEED_STREAK : i32 = 47;
+
+// A bubble is full inside this feature distance and gone beyond the second one.
+const FOAM_BUBBLE_IN : f32 = 0.12;
+const FOAM_BUBBLE_OUT : f32 = 0.5;
+
+// Seconds a flow phase lasts before it is replaced.
+const FOAM_PHASE : f32 = 1.6;
+
+// How much the lace weighs in coverage, and the edge softness of the cut.
+const FOAM_LACE_WEIGHT : f32 = 0.8;
+const FOAM_EDGE : f32 = 0.14;
+
+// The weights of the two bubble scales, how much viscosity softens the fine one, and the streakiness' range.
+const FOAM_BIG_WEIGHT : f32 = 0.7;
+const FOAM_SMALL_WEIGHT : f32 = 0.55;
+const FOAM_VISCOUS : f32 = 0.15;
+const FOAM_STREAK_BASE : f32 = 0.55;
+const FOAM_STREAK_GAIN : f32 = 0.9;
+
+// Pixels a bubble must span before it is drawn, else the lace is averaged to its mean.
+const FOAM_MIN_PIXELS : f32 = 1.6;
+
+/** What foam does at one point. */
+pub struct FoamCover {
+    /** How much of the point is covered by foam, 0 to 1. */
+    pub mask : f32 = 0.0;
+
+    /** How thick the foam is, 0 thin film to 1 deep froth: thick foam is brighter and rougher. */
+    pub thick : f32 = 0.0;
+
+    /** The lace value at the point, 0 to 1, for shading the creases between bubbles. */
+    pub lace : f32 = 0.0;
+}
+
+/** Where and when a foam is asked for. */
+pub struct FoamSpot {
+    /** Position on the water, cells. */
+    pub x : f32;
+
+    /** Position on the water, cells. */
+    pub z : f32;
+
+    /** Surface velocity along x. */
+    pub vx : f32 = 0.0;
+
+    /** Surface velocity along z. */
+    pub vz : f32 = 0.0;
+
+    /** Simulation seconds. */
+    pub time : f32 = 0.0;
+
+    /** World size of a pixel here, cells. */
+    pub footprint : f32 = 0.01;
+
+    /** Viscosity of the water: it smooths the froth. */
+    pub viscosity : f32 = 0.0;
+}
+
+/** Foam patterns. */
+pub class WaterFoam {
+    // How much of a bubble pattern of `scale` cells a pixel of `footprint` resolves: 1 sharp, 0 averaged away.
+    static fn seen(scale : f32, footprint : f32) : f32 {
+        return saturate((1.0 as f32) - footprint * scale * FOAM_MIN_PIXELS);
+    }
+
+    // One phase of the flow-advected lace at the point displaced by `shift` seconds of drift.
+    static fn lace(spot : FoamSpot, shift : f32) : f32 {
+        let x : f32 = spot.x - spot.vx * shift;
+        let z : f32 = spot.z - spot.vz * shift;
+        let big : f32 = (1.0 as f32)
+            - smoothstep(
+                FOAM_BUBBLE_IN,
+                FOAM_BUBBLE_OUT,
+                waterCell2(x * FOAM_SCALE_BIG, z * FOAM_SCALE_BIG, FOAM_SEED_BIG)
+            );
+        let small : f32 = (1.0 as f32)
+            - smoothstep(
+                FOAM_BUBBLE_IN,
+                FOAM_BUBBLE_OUT,
+                waterCell2(x * FOAM_SCALE_SMALL, z * FOAM_SCALE_SMALL, FOAM_SEED_SMALL)
+            );
+        let streak : f32 = waterValue2(x * FOAM_SCALE_STREAK, z * FOAM_SCALE_STREAK, FOAM_SEED_STREAK);
+        let fine : f32 = lerp(0.5, small, WaterFoam::seen(FOAM_SCALE_SMALL, spot.footprint));
+        let coarse : f32 = lerp(0.5, big, WaterFoam::seen(FOAM_SCALE_BIG, spot.footprint));
+        let soft : f32 = (1.0 as f32) / ((1.0 as f32) + spot.viscosity * FOAM_VISCOUS);
+        let weight : f32 = coarse * FOAM_BIG_WEIGHT + fine * FOAM_SMALL_WEIGHT * soft;
+        return saturate(weight * (FOAM_STREAK_BASE + FOAM_STREAK_GAIN * streak));
+    }
+
+    /** The lace at `spot`: two phases of the advected pattern, blended so it flows without stretching. */
+    pub static fn pattern(spot : FoamSpot) : f32 {
+        let phase : f32 = spot.time / FOAM_PHASE;
+        let a : f32 = phase - (phase as i32 as f32);
+        let mut b : f32 = a + (0.5 as f32);
+        if (b >= 1.0) {
+            b = b - (1.0 as f32);
+        }
+        let weightA : f32 = (1.0 as f32) - abs((1.0 as f32) - (2.0 as f32) * a);
+        let laceA : f32 = WaterFoam::lace(spot, a * FOAM_PHASE);
+        let laceB : f32 = WaterFoam::lace(spot, b * FOAM_PHASE);
+        return lerp(laceB, laceA, weightA);
+    }
+
+    /** The cover of `amount` (0 to 1, from the field) of foam over the lace at `spot`. */
+    pub static fn cover(spot : FoamSpot, amount : f32) : FoamCover {
+        if (amount <= 0.003) {
+            return FoamCover {};
+        }
+        let lace : f32 = WaterFoam::pattern(spot);
+        let a : f32 = saturate(amount);
+        let cut : f32 = a * (1.5 as f32)
+            + (lace - (0.5 as f32)) * FOAM_LACE_WEIGHT * saturate(a * (4.0 as f32));
+        let mask : f32 = smoothstep((0.5 as f32) - FOAM_EDGE, (0.5 as f32) + FOAM_EDGE, cut)
+            * saturate(a * (6.0 as f32));
+        return FoamCover { mask: mask, thick: saturate(a * (1.2 as f32) + lace * (0.25 as f32)), lace: lace };
+    }
+
+    /** The cover of a line of foam `width` cells wide along the shore where the water is `depth` deep. */
+    pub static fn contact(spot : FoamSpot, depth : f32, width : f32) : FoamCover {
+        if (depth >= width || width <= 0.0) {
+            return FoamCover {};
+        }
+        let near : f32 = (1.0 as f32) - depth / width;
+        return WaterFoam::cover(spot, near * (0.9 as f32));
+    }
+
+    /** The larger cover of two. */
+    pub static fn merge(a : FoamCover, b : FoamCover) : FoamCover {
+        if (b.mask > a.mask) {
+            return b;
+        }
+        return a;
+    }
+}

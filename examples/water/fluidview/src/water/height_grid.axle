@@ -1,0 +1,460 @@
+// height_grid — a regular grid of heights with a max-height mip pyramid, and the ray march it makes cheap.
+//
+// A mountain valley a few kilometres wide is far too big for a fixed-step march or a slope-bound sphere trace:
+// a steep cliff forces tiny steps everywhere. The pyramid (Tevs et al., maximum mipmaps) answers "can this ray
+// touch anything in this block of columns" with one read: level k holds, for every block of 2^k by 2^k cells,
+// the highest corner height in it, and since a bilinear patch never rises above its corners that is a true bound.
+// The march climbs to coarse blocks while the ray flies over them, descends where it might touch, and at the
+// finest level solves the ray against the bilinear patch exactly (a quadratic), so there is no stair-step and no
+// bisection at any scale.
+//
+// Storage is typed for the job: heights are `f32` metres, pyramid levels `u16` quantised between the lowest and
+// the highest height and rounded up, which keeps every bound conservative and halves the memory traffic. Nothing
+// here is allocated after the constructor, and `build` is split in a parallel part (`buildRows`) and a short
+// serial one (`buildUpper`) so a job pool can cut it by rows. Normals come from central differences stored
+// nowhere: `normalAt` blends the four corner gradients bilinearly, so lighting is continuous across cell edges.
+
+use ludax::{max, min, sqrt, Vec3};
+
+use crate::water::noise::{waterFloor, waterHighI, waterLowI};
+
+/** Most levels a pyramid has. */
+pub const GRID_LEVELS : i32 = 12;
+
+// The most iterations of one march: climbing, descending and stepping over cells together.
+const GRID_STEPS : i32 = 900;
+
+// How far, in lattice units, the block lookup leans in the direction of travel: the exit point of a block lies on its
+// boundary to within the rounding of f32, which at a few thousand lattice units is far more than a tiny step.
+const GRID_BIAS : f32 = 0.01;
+
+// A quantisation step of the pyramid is rounded up by this much so a bound never undershoots by rounding.
+const GRID_Q_LEVELS : f32 = 65534.0;
+
+// Divides that are safe: a direction component below this counts as zero.
+const GRID_TINY : f32 = 0.0000001;
+const GRID_FAR : f32 = 100000000.0;
+
+/** One bilinear cell's intersection with a ray: whether it hit and the distance along the ray. */
+struct GridCellHit {
+    hit : bool = false;
+    t   : f32 = (0.0 as f32);
+}
+
+/** The grid. */
+pub class HeightGrid {
+    /** Lattice points along x and along z. */
+    pub w : i32;
+    pub d : i32;
+
+    /** Metres between lattice points. */
+    pub cell : f32;
+
+    /** One over `cell`, so a hot path multiplies instead of dividing. */
+    pub invCell : f32;
+
+    /** World position of lattice point (0, 0). */
+    pub originX : f32;
+    pub originZ : f32;
+
+    /** Heights in metres, row after row (`z * w + x`). Fill them, then call `prepare`, `buildRows`, `buildUpper`. */
+    pub heights : f32[];
+
+    /** The lowest and highest height, set by `prepare`. */
+    pub low  : f32 = (0.0 as f32);
+    pub high : f32 = (1.0 as f32);
+
+    levels  : i32 = 1;
+    offset  : i32[];
+    levelW  : i32[];
+    levelD  : i32[];
+    pyramid : u16[];
+    quantum : f32 = (1.0 as f32);
+
+    /** A grid of `w` by `d` lattice points `cell` metres apart whose corner (0, 0) is at (`originX`, `originZ`). */
+    constructor(w : i32, d : i32, cell : f32, originX : f32, originZ : f32) {
+        self.w = w;
+        self.d = d;
+        self.cell = cell;
+        self.invCell = (1.0 as f32) / cell;
+        self.originX = originX;
+        self.originZ = originZ;
+        self.heights = new f32[(w as i64) * d];
+        self.offset = new i32[GRID_LEVELS as i64];
+        self.levelW = new i32[GRID_LEVELS as i64];
+        self.levelD = new i32[GRID_LEVELS as i64];
+        let mut total : i64 = 0;
+        let mut lw : i32 = w;
+        let mut ld : i32 = d;
+        let mut count : i32 = 0;
+        for (k of 0..GRID_LEVELS) {
+            self.offset[k as i64] = total as i32;
+            self.levelW[k as i64] = lw;
+            self.levelD[k as i64] = ld;
+            total = total + (lw as i64) * ld;
+            count = count + 1;
+            if (lw <= 1 && ld <= 1) {
+                break;
+            }
+            lw = (lw + 1) / 2;
+            ld = (ld + 1) / 2;
+        }
+        self.levels = count;
+        self.pyramid = new u16[total];
+    }
+
+    /** Rows of lattice points, for a job pool. */
+    pub fn rows(self) : i32 {
+        return self.d;
+    }
+
+    /** Finds the height range; call once the heights are in and before `buildRows`. */
+    pub fn prepare(mut self) : void {
+        let n : i64 = (self.w as i64) * self.d;
+        let mut lo : f32 = self.heights[0];
+        let mut hi : f32 = lo;
+        for (i of 0..n) {
+            let h : f32 = self.heights[i];
+            lo = min(lo, h);
+            hi = max(hi, h);
+        }
+        self.low = lo;
+        self.high = max(hi, lo + (1.0 as f32));
+        self.quantum = (self.high - self.low) / GRID_Q_LEVELS;
+    }
+
+    // The quantised bound of height `h`, rounded up.
+    fn quantise(self, h : f32) : u16 {
+        let q : f32 = (h - self.low) / self.quantum;
+        let mut v : i32 = q as i32;
+        if ((v as f32) < q) {
+            v = v + 1;
+        }
+        if (v > 65535) {
+            v = 65535;
+        }
+        return v as u16;
+    }
+
+    /** Level 0 of the pyramid for lattice rows `begin` up to `end`: the highest corner of each cell. */
+    pub fn buildRows(mut self, begin : i32, end : i32) : void {
+        for (z of begin..end) {
+            let z1 : i32 = waterLowI(z + 1, self.d - 1);
+            for (x of 0..self.w) {
+                let x1 : i32 = waterLowI(x + 1, self.w - 1);
+                let a : f32 = self.heights[((z * self.w) + x) as i64];
+                let b : f32 = self.heights[((z * self.w) + x1) as i64];
+                let c : f32 = self.heights[((z1 * self.w) + x) as i64];
+                let e : f32 = self.heights[((z1 * self.w) + x1) as i64];
+                self.pyramid[((z * self.w) + x) as i64] = self.quantise(max(max(a, b), max(c, e)));
+            }
+        }
+    }
+
+    /** The coarser levels, from level 0; the serial last step of a build. */
+    pub fn buildUpper(mut self) : void {
+        for (k of 1..self.levels) {
+            let w : i32 = self.levelW[k as i64];
+            let d : i32 = self.levelD[k as i64];
+            let pw : i32 = self.levelW[(k - 1) as i64];
+            let pd : i32 = self.levelD[(k - 1) as i64];
+            let base : i64 = self.offset[k as i64] as i64;
+            let prev : i64 = self.offset[(k - 1) as i64] as i64;
+            for (z of 0..d) {
+                let z0 : i32 = z * 2;
+                let z1 : i32 = waterLowI(z0 + 1, pd - 1);
+                for (x of 0..w) {
+                    let x0 : i32 = x * 2;
+                    let x1 : i32 = waterLowI(x0 + 1, pw - 1);
+                    let a : u16 = self.pyramid[prev + ((z0 * pw) + x0) as i64];
+                    let b : u16 = self.pyramid[prev + ((z0 * pw) + x1) as i64];
+                    let c : u16 = self.pyramid[prev + ((z1 * pw) + x0) as i64];
+                    let e : u16 = self.pyramid[prev + ((z1 * pw) + x1) as i64];
+                    let mut m : u16 = a;
+                    if (b > m) { m = b; }
+                    if (c > m) { m = c; }
+                    if (e > m) { m = e; }
+                    self.pyramid[base + ((z * w) + x) as i64] = m;
+                }
+            }
+        }
+    }
+
+    /** The whole build on the calling thread. */
+    pub fn build(mut self) : void {
+        self.prepare();
+        self.buildRows(0, self.d);
+        self.buildUpper();
+    }
+
+    // The bound of block (`bx`, `bz`) of level `k`, metres.
+    fn bound(self, k : i32, bx : i32, bz : i32) : f32 {
+        let at : i64 = (self.offset[k as i64] as i64) + ((bz * self.levelW[k as i64]) + bx) as i64;
+        return self.low + (self.pyramid[at] as f32) * self.quantum;
+    }
+
+    /**
+     * The highest the surface can be anywhere in the block of 2^`level` cells around (`x`, `z`): an upper bound of
+     * `heightAt` there (and of the nearest edge height outside the grid), one pyramid read.
+     */
+    pub fn ceilingAt(self, x : f32, z : f32, level : i32) : f32 {
+        let u : f32 = (x - self.originX) / self.cell;
+        let v : f32 = (z - self.originZ) / self.cell;
+        let iu : i32 = waterHighI(0, waterLowI(self.w - 1, waterFloor(u)));
+        let iv : i32 = waterHighI(0, waterLowI(self.d - 1, waterFloor(v)));
+        return self.bound(level, iu >> level, iv >> level);
+    }
+
+    /** True when (`x`, `z`) lies over the grid. */
+    pub fn covers(self, x : f32, z : f32) : bool {
+        let u : f32 = (x - self.originX) / self.cell;
+        let v : f32 = (z - self.originZ) / self.cell;
+        return u >= (0.0 as f32) && v >= (0.0 as f32) && u <= ((self.w - 1) as f32)
+            && v <= ((self.d - 1) as f32);
+    }
+
+    // The lattice height at a clamped index.
+    fn at(self, x : i32, z : i32) : f32 {
+        let cx : i32 = waterHighI(0, waterLowI(self.w - 1, x));
+        let cz : i32 = waterHighI(0, waterLowI(self.d - 1, z));
+        return self.heights[((cz * self.w) + cx) as i64];
+    }
+
+    /** The bilinear height at (`x`, `z`) metres; the nearest edge height outside the grid. */
+    pub fn heightAt(self, x : f32, z : f32) : f32 {
+        let u : f32 = (x - self.originX) / self.cell;
+        let v : f32 = (z - self.originZ) / self.cell;
+        let iu : i32 = waterFloor(u);
+        let iv : i32 = waterFloor(v);
+        let fu : f32 = u - (iu as f32);
+        let fv : f32 = v - (iv as f32);
+        let mut a : f32 = 0.0;
+        let mut b : f32 = 0.0;
+        let mut c : f32 = 0.0;
+        let mut e : f32 = 0.0;
+        if (iu >= 0 && iv >= 0 && iu < self.w - 1 && iv < self.d - 1) {
+            let base : i64 = ((iv * self.w) + iu) as i64;
+            a = self.heights[base];
+            b = self.heights[base + 1];
+            c = self.heights[base + (self.w as i64)];
+            e = self.heights[base + (self.w as i64) + 1];
+        } else {
+            a = self.at(iu, iv);
+            b = self.at(iu + 1, iv);
+            c = self.at(iu, iv + 1);
+            e = self.at(iu + 1, iv + 1);
+        }
+        let top : f32 = a + (b - a) * fu;
+        let bottom : f32 = c + (e - c) * fu;
+        return top + (bottom - top) * fv;
+    }
+
+    // Slope (rise over run) of lattice point (`x`, `z`) along x and along z by central differences.
+    fn gradient(self, x : i32, z : i32) : Vec3 {
+        let inv : f32 = (0.5 as f32) / self.cell;
+        if (x >= 1 && z >= 1 && x < self.w - 1 && z < self.d - 1) {
+            let base : i64 = ((z * self.w) + x) as i64;
+            let row : i64 = self.w as i64;
+            return Vec3 {
+                x: (self.heights[base + 1] - self.heights[base - 1]) * inv,
+                y: (0.0 as f32),
+                z: (self.heights[base + row] - self.heights[base - row]) * inv,
+            };
+        }
+        return Vec3 {
+            x: (self.at(x + 1, z) - self.at(x - 1, z)) * inv,
+            y: (0.0 as f32),
+            z: (self.at(x, z + 1) - self.at(x, z - 1)) * inv,
+        };
+    }
+
+    /** The slope vector (rise over run along x and z, in `x` and `z`) at (`x`, `z`): continuous across cells. */
+    pub fn slopeAt(self, x : f32, z : f32) : Vec3 {
+        let u : f32 = (x - self.originX) / self.cell;
+        let v : f32 = (z - self.originZ) / self.cell;
+        let iu : i32 = waterFloor(u);
+        let iv : i32 = waterFloor(v);
+        let fu : f32 = u - (iu as f32);
+        let fv : f32 = v - (iv as f32);
+        let g00 : Vec3 = self.gradient(iu, iv);
+        let g10 : Vec3 = self.gradient(iu + 1, iv);
+        let g01 : Vec3 = self.gradient(iu, iv + 1);
+        let g11 : Vec3 = self.gradient(iu + 1, iv + 1);
+        let top : Vec3 = g00.lerp(g10, fu);
+        let bottom : Vec3 = g01.lerp(g11, fu);
+        return top.lerp(bottom, fv);
+    }
+
+    /** The unit surface normal at (`x`, `z`). */
+    pub fn normalAt(self, x : f32, z : f32) : Vec3 {
+        let s : Vec3 = self.slopeAt(x, z);
+        return Vec3 { x: (0.0 as f32) - s.x, y: (1.0 as f32), z: (0.0 as f32) - s.z }.normalized();
+    }
+
+    // Clips the ray to the grid's box; the entry and the exit distance, exit below entry for a miss.
+    fn clip(self, o : Vec3, d : Vec3, tmin : f32, tmax : f32) : Vec3 {
+        let mut t0 : f32 = tmin;
+        let mut t1 : f32 = tmax;
+        let lo : Vec3 = Vec3 { x: self.originX, y: self.low, z: self.originZ };
+        let hi : Vec3 = Vec3 {
+            x: self.originX + ((self.w - 1) as f32) * self.cell,
+            y: self.high,
+            z: self.originZ + ((self.d - 1) as f32) * self.cell,
+        };
+        for (axis of 0..3) {
+            let oa : f32 = HeightGrid::component(o, axis);
+            let da : f32 = HeightGrid::component(d, axis);
+            let la : f32 = HeightGrid::component(lo, axis);
+            let ha : f32 = HeightGrid::component(hi, axis);
+            if (da > -GRID_TINY && da < GRID_TINY) {
+                if (oa < la || oa > ha) {
+                    return Vec3 { x: (1.0 as f32), y: (0.0 as f32), z: (0.0 as f32) };
+                }
+                continue;
+            }
+            let ta : f32 = (la - oa) / da;
+            let tb : f32 = (ha - oa) / da;
+            t0 = max(t0, min(ta, tb));
+            t1 = min(t1, max(ta, tb));
+        }
+        return Vec3 { x: t0, y: t1, z: (0.0 as f32) };
+    }
+
+    // The lean of the block lookup along a direction component: toward its sign, none when it is parallel.
+    static fn lean(speed : f32) : f32 {
+        if (speed > GRID_TINY) {
+            return GRID_BIAS;
+        }
+        if (speed < (0.0 as f32) - GRID_TINY) {
+            return (0.0 as f32) - GRID_BIAS;
+        }
+        return 0.0;
+    }
+
+    static fn component(v : Vec3, axis : i32) : f32 {
+        if (axis == 0) {
+            return v.x;
+        }
+        if (axis == 1) {
+            return v.y;
+        }
+        return v.z;
+    }
+
+    // The distance along the ray at which it leaves a block boundary at `bound` lattice units, GRID_FAR if parallel.
+    static fn exitAt(origin : f32, speed : f32, lower : f32, upper : f32) : f32 {
+        if (speed > GRID_TINY) {
+            return (upper - origin) / speed;
+        }
+        if (speed < -GRID_TINY) {
+            return (lower - origin) / speed;
+        }
+        return GRID_FAR;
+    }
+
+    /**
+     * The distance along the ray (`o`, unit `d`) at which it first goes below the surface between `tmin` and `tmax`,
+     * or -1 for a miss. A ray that starts below the surface hits at once.
+     */
+    pub fn march(self, o : Vec3, d : Vec3, tmin : f32, tmax : f32) : f32 {
+        let span : Vec3 = self.clip(o, d, tmin, tmax);
+        let mut t : f32 = span.x;
+        let t1 : f32 = span.y;
+        if (t > t1) {
+            return -(1.0 as f32);
+        }
+        let inv : f32 = self.invCell;
+        let uo : f32 = (o.x - self.originX) * inv;
+        let vo : f32 = (o.z - self.originZ) * inv;
+        let du : f32 = d.x * inv;
+        let dv : f32 = d.z * inv;
+        let leanU : f32 = HeightGrid::lean(du);
+        let leanV : f32 = HeightGrid::lean(dv);
+        let top : i32 = self.levels - 1;
+        let mut level : i32 = top;
+
+        for (step of 0..GRID_STEPS) {
+            if (t >= t1) {
+                return -(1.0 as f32);
+            }
+            let size : f32 = (1 << level) as f32;
+            let mut bx : i32 = waterFloor((uo + du * t + leanU) / size);
+            let mut bz : i32 = waterFloor((vo + dv * t + leanV) / size);
+            bx = waterHighI(0, waterLowI(self.levelW[level as i64] - 1, bx));
+            bz = waterHighI(0, waterLowI(self.levelD[level as i64] - 1, bz));
+            let tx : f32 = HeightGrid::exitAt(uo, du, (bx as f32) * size, ((bx + 1) as f32) * size);
+            let tz : f32 = HeightGrid::exitAt(vo, dv, (bz as f32) * size, ((bz + 1) as f32) * size);
+            let exit : f32 = min(min(tx, tz), t1);
+            let y0 : f32 = o.y + d.y * t;
+            let y1 : f32 = o.y + d.y * exit;
+            if (min(y0, y1) > self.bound(level, bx, bz)) {
+                t = max(exit, t);
+                level = waterLowI(level + 1, top);
+                continue;
+            }
+            if (level > 0) {
+                level = level - 1;
+                continue;
+            }
+            let found : GridCellHit = self.cellHit(o, d, t, max(exit, t), bx, bz);
+            if (found.hit) {
+                return found.t;
+            }
+            t = max(exit, t);
+        }
+        return -(1.0 as f32);
+    }
+
+    // Solves the ray against the bilinear patch of cell (`cx`, `cz`) between `t0` and `t1`: a quadratic in t.
+    fn cellHit(self, o : Vec3, d : Vec3, t0 : f32, t1 : f32, cx : i32, cz : i32) : GridCellHit {
+        let h00 : f32 = self.at(cx, cz);
+        let h10 : f32 = self.at(cx + 1, cz);
+        let h01 : f32 = self.at(cx, cz + 1);
+        let h11 : f32 = self.at(cx + 1, cz + 1);
+        let inv : f32 = self.invCell;
+        let s0 : f32 = (o.x + d.x * t0 - self.originX) * inv - (cx as f32);
+        let r0 : f32 = (o.z + d.z * t0 - self.originZ) * inv - (cz as f32);
+        let ds : f32 = d.x * inv;
+        let dr : f32 = d.z * inv;
+        let ax : f32 = h10 - h00;
+        let az : f32 = h01 - h00;
+        let k : f32 = h00 - h10 - h01 + h11;
+        let q0 : f32 = o.y + d.y * t0 - (h00 + ax * s0 + az * r0 + k * s0 * r0);
+        if (q0 <= (0.0 as f32)) {
+            return GridCellHit { hit: true, t: t0 };
+        }
+        let q1 : f32 = d.y - ax * ds - az * dr - k * (s0 * dr + r0 * ds);
+        let q2 : f32 = (0.0 as f32) - k * ds * dr;
+        let span : f32 = t1 - t0;
+        let mut root : f32 = GRID_FAR;
+        if (q2 > -GRID_TINY * GRID_TINY && q2 < GRID_TINY * GRID_TINY) {
+            if (q1 < (0.0 as f32)) {
+                root = ((0.0 as f32) - q0) / q1;
+            }
+        } else {
+            let disc : f32 = q1 * q1 - (4.0 as f32) * q2 * q0;
+            if (disc >= (0.0 as f32)) {
+                let sq : f32 = sqrt(disc);
+                let mut qq : f32 = (0.0 as f32) - (0.5 as f32) * (q1 + sq);
+                if (q1 < (0.0 as f32)) {
+                    qq = (0.0 as f32) - (0.5 as f32) * (q1 - sq);
+                }
+                let ra : f32 = qq / q2;
+                let mut rb : f32 = GRID_FAR;
+                if (qq > GRID_TINY || qq < -GRID_TINY) {
+                    rb = q0 / qq;
+                }
+                if (ra >= (0.0 as f32)) {
+                    root = ra;
+                }
+                if (rb >= (0.0 as f32) && rb < root) {
+                    root = rb;
+                }
+            }
+        }
+        if (root <= span) {
+            return GridCellHit { hit: true, t: t0 + root };
+        }
+        return GridCellHit {};
+    }
+}

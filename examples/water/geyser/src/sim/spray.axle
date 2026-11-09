@@ -1,0 +1,337 @@
+// spray — what the vent throws: droplets that carry the water, and the bubbles that dress it.
+//
+// The droplets are the physics. Each carries an equal share of the volume the chamber discharged this tick,
+// leaves the vent straight up at the exit speed the chamber's pressure gave it, flies ballistically under
+// the same gravity the fluid world flows by, is scattered a little sideways by the jet's turbulence, and pours
+// its share back into whatever column it lands in (`FluidWorld.pour`). The volume is therefore always
+// somewhere: in the chamber, on a droplet, or in the world; if the droplet pool is full the discharge is
+// poured back at the vent at once, so nothing is lost. Bubbles (a plume rising through a submerged vent)
+// are pure decoration and carry no volume. One `Pcg32` supplies every random number, so a run replays
+// bit for bit.
+
+use ludax::{cos, sin, FluidWorld, Pcg32};
+
+/** Droplet pool size: a plume is thousands of drops, not dozens. */
+const GY_DROP_MAX : i32 = 9000;
+
+/** Volume one droplet stands for; the spawn count is the tick's discharge divided by this. */
+const GY_DROP_VOL : f64 = 0.025;
+
+/** Most droplets one tick may spawn, so a burst cannot monopolise the pool. */
+const GY_DROPS_PER_TICK_MAX : i32 = 460;
+
+/** How far the launch speeds of the drops of one tick differ, as a fraction: the jet is not a laser. */
+const GY_SPEED_JITTER : f32 = 0.03;
+
+/** Radial speed a droplet is thrown out with, at most, cells a second: a tight column near the vent. */
+const GY_SPREAD : f32 = 1.4;
+
+/** A droplet's radial speed is this share of `GY_SPREAD` at least, and up to `GY_SPREAD_RANGE` more. */
+const GY_SPREAD_MIN : f32 = 0.3;
+const GY_SPREAD_RANGE : f32 = 0.7;
+
+/** Turbulent sideways acceleration the rising jet's air drag applies to a droplet, cells a second squared:
+ * what widens the column with height. */
+const GY_TURBULENCE : f32 = 6.0;
+
+/** Width of the launch jitter around the vent, cells. */
+const GY_VENT_JITTER : f32 = 0.8;
+
+/** Height above the water surface drops leave the vent at, cells. */
+const GY_LAUNCH_LIFT : f32 = 0.3;
+
+/** Stream of the spray's random generator, chosen once and never changed. */
+const GY_STREAM : u64 = 54;
+
+/** Two pi, where the droplets' launch angle is drawn. */
+const GY_TAU_F : f32 = 6.2831855;
+
+/** Bubble pool size. */
+const GY_BUBBLE_MAX : i32 = 900;
+
+/** Bubbles one tick may spawn. */
+const GY_BUBBLES_PER_TICK : i32 = 60;
+
+/** Terminal rise velocity of a bubble, cells a second. */
+const GY_BUBBLE_RISE : f32 = 2.8;
+
+/** How far below the surface a bubble starts, cells. */
+const GY_BUBBLE_DEPTH : f32 = 0.8;
+
+/** A bubble pops when it is this close under the surface, cells. */
+const GY_BUBBLE_POP : f32 = 0.12;
+
+/** Sideways wobble speed of a bubble, cells a second. */
+const GY_BUBBLE_WOBBLE : f32 = 0.06;
+
+/** One droplet in flight: position, velocity, and the volume it will pour where it lands. */
+pub struct GxDrop {
+    /** World x. */
+    pub x : f32 = 0.0;
+
+    /** World y. */
+    pub y : f32 = 0.0;
+
+    /** World z. */
+    pub z : f32 = 0.0;
+
+    /** Velocity x, cells a second. */
+    pub vx : f32 = 0.0;
+
+    /** Velocity y, cells a second. */
+    pub vy : f32 = 0.0;
+
+    /** Velocity z, cells a second. */
+    pub vz : f32 = 0.0;
+
+    /** Volume this droplet pours into the column it lands in, cell units. */
+    pub vol : f64 = 0.0;
+
+    /** The height this droplet left the vent at, cells. */
+    pub launch : f32 = 0.0;
+
+    /** The highest point this droplet has reached, cells: with `launch`, how far the jet threw it. */
+    pub apex : f32 = 0.0;
+}
+
+/** One bubble of the vent plume: position and wobble phase. */
+pub struct GxBubble {
+    /** World x. */
+    pub x : f32 = 0.0;
+
+    /** World y. */
+    pub y : f32 = 0.0;
+
+    /** World z. */
+    pub z : f32 = 0.0;
+
+    /** Wobble phase, radians. */
+    pub phase : f32 = 0.0;
+}
+
+/** Where the vent is and how the spray leaves it: what `GeyserSpray::launch` needs besides the discharge. */
+pub struct GxVent {
+    /** Column x of the vent. */
+    pub x : i32 = 0;
+
+    /** Column z of the vent. */
+    pub z : i32 = 0;
+
+    /** Gravity on the droplets, cells a second squared; the world's own. */
+    pub gravity : f64 = 9.81;
+
+    /** Length of one tick, seconds. */
+    pub dt : f64 = 0.05;
+}
+
+/** The droplets and bubbles of one vent. */
+pub class GeyserSpray {
+    drops    : GxDrop[];
+    bubbles  : GxBubble[];
+    nDrops   : i32 = 0;
+    nBubbles : i32 = 0;
+    risen    : f32 = 0.0;
+    rng      : Pcg32;
+    vent     : GxVent;
+
+    /** An empty spray at `vent`, its random stream seeded by `seed`. */
+    constructor(vent : GxVent, seed : u64) {
+        self.vent = vent;
+        self.rng = new Pcg32(seed, GY_STREAM);
+        self.drops = new GxDrop[GY_DROP_MAX as i64];
+        self.bubbles = new GxBubble[GY_BUBBLE_MAX as i64];
+    }
+
+    /** Droplets in flight. */
+    pub fn dropCount(self) : i32 {
+        return self.nDrops;
+    }
+
+    /** The `i`-th droplet; `i` must be inside `0..dropCount()`. */
+    pub fn dropAt(self, i : i32) : GxDrop {
+        return self.drops[i as i64];
+    }
+
+    /** Bubbles of the plume rising. */
+    pub fn bubbleCount(self) : i32 {
+        return self.nBubbles;
+    }
+
+    /** The `i`-th bubble; `i` must be inside `0..bubbleCount()`. */
+    pub fn bubbleAt(self, i : i32) : GxBubble {
+        return self.bubbles[i as i64];
+    }
+
+    /** Volume carried by the droplets in flight, cell units. */
+    pub fn volumeInFlight(self) : f64 {
+        let mut sum : f64 = 0.0;
+        for (i of 0..self.nDrops) {
+            sum = sum + self.drops[i as i64].vol;
+        }
+        return sum;
+    }
+
+    /** The greatest height any droplet that has landed since the last `forgetRise` climbed above where it left
+     * the vent, cells: how high the jet threw the water. */
+    pub fn rise(self) : f32 {
+        return self.risen;
+    }
+
+    /** Starts a new measurement of `rise`. */
+    pub fn forgetRise(mut self) : void {
+        self.risen = 0.0;
+    }
+
+    /**
+     * Turns `discharge` (volume that left the chamber this tick) into droplets leaving the vent upward at
+     * `speed` (cells a second) from the water surface `surface`. A full pool gives the water back to the
+     * world at the vent at once.
+     */
+    pub fn launch(mut self, world : FluidWorld, discharge : f64, speed : f64, surface : f32) : void {
+        if (discharge <= 0.0) {
+            return;
+        }
+        let mut n : i32 = (discharge / GY_DROP_VOL) as i32;
+        if (n < 1) {
+            n = 1;
+        }
+        if (n > GY_DROPS_PER_TICK_MAX) {
+            n = GY_DROPS_PER_TICK_MAX;
+        }
+        if (n > GY_DROP_MAX - self.nDrops) {
+            n = GY_DROP_MAX - self.nDrops;
+        }
+        if (n <= 0) {
+            world.pour(self.vent.x, self.vent.z, discharge);
+            return;
+        }
+
+        // The share is an f64 so the volume is exactly what left the chamber, whatever the count.
+        let share : f64 = discharge / (n as f64);
+        for (i of 0..n) {
+            self.drops[self.nDrops as i64] = self.newDrop(share, speed, surface);
+            self.nDrops = self.nDrops + 1;
+        }
+    }
+
+    /** Flies every droplet one tick and pours the ones that reached the water; bubbles follow. */
+    pub fn advance(mut self, world : FluidWorld, erupting : bool, time : f32) : void {
+        self.moveDrops(world);
+        self.moveBubbles(world, time);
+    }
+
+    /** Releases the plume's bubbles under the surface at the vent. */
+    pub fn bubble(mut self, surface : f32) : void {
+        let room : i32 = GY_BUBBLE_MAX - self.nBubbles;
+        let mut n : i32 = GY_BUBBLES_PER_TICK;
+        if (n > room) {
+            n = room;
+        }
+        for (i of 0..n) {
+            let at : GxBubble = GxBubble {
+                x: self.around(self.vent.x, GY_VENT_JITTER),
+                y: surface - GY_BUBBLE_DEPTH,
+                z: self.around(self.vent.z, GY_VENT_JITTER),
+                phase: self.rng.nextF32() * GY_TAU_F,
+            };
+            self.bubbles[self.nBubbles as i64] = at;
+            self.nBubbles = self.nBubbles + 1;
+        }
+    }
+
+    // The centre of column `cell` with a uniform spread of `width` around it.
+    fn around(mut self, cell : i32, width : f32) : f32 {
+        return (cell as f32) + (0.5 as f32) + (self.rng.nextF32() - (0.5 as f32)) * width;
+    }
+
+    // One droplet leaving the vent: up at the jet's speed, out a little at random.
+    fn newDrop(mut self, share : f64, speed : f64, surface : f32) : GxDrop {
+        let a : f32 = self.rng.nextF32() * GY_TAU_F;
+        let radial : f32 = GY_SPREAD * (GY_SPREAD_MIN + self.rng.nextF32() * GY_SPREAD_RANGE);
+        let swing : f32 = (self.rng.nextF32() - (0.5 as f32)) * (2.0 as f32);
+        let jitter : f32 = (1.0 as f32) + swing * GY_SPEED_JITTER;
+        let y : f32 = surface + GY_LAUNCH_LIFT;
+        return GxDrop {
+            x: self.around(self.vent.x, GY_VENT_JITTER),
+            y: y,
+            z: self.around(self.vent.z, GY_VENT_JITTER),
+            vx: cos(a) * radial,
+            vy: (speed as f32) * jitter,
+            vz: sin(a) * radial,
+            vol: share,
+            launch: y,
+            apex: y,
+        };
+    }
+
+    // Ballistic integration: gravity pulls, turbulence nudges sideways, and a droplet falling onto the
+    // surface pours its share into that column. The jet pierces the water going up, so only a falling drop lands.
+    fn moveDrops(mut self, world : FluidWorld) : void {
+        let dt : f32 = self.vent.dt as f32;
+        let g : f32 = self.vent.gravity as f32;
+        let mut i : i32 = 0;
+        while (i < self.nDrops) {
+            let mut d : GxDrop = self.drops[i as i64];
+            d.vx = d.vx + (self.rng.nextF32() - (0.5 as f32)) * GY_TURBULENCE * dt;
+            d.vz = d.vz + (self.rng.nextF32() - (0.5 as f32)) * GY_TURBULENCE * dt;
+            d.vy = d.vy - g * dt;
+            d.x = d.x + d.vx * dt;
+            d.y = d.y + d.vy * dt;
+            d.z = d.z + d.vz * dt;
+            if (d.y > d.apex) {
+                d.apex = d.y;
+            }
+
+            let cx : i32 = GeyserSpray::column(d.x, world.width());
+            let cz : i32 = GeyserSpray::column(d.z, world.depth());
+            let surface : f32 = (world.groundAt(cx, cz) + world.levelAt(cx, cz)) as f32;
+            if (d.y <= surface && d.vy <= 0.0) {
+                world.pour(cx, cz, d.vol);
+                if (d.apex - d.launch > self.risen) {
+                    self.risen = d.apex - d.launch;
+                }
+                self.nDrops = self.nDrops - 1;
+                self.drops[i as i64] = self.drops[self.nDrops as i64];
+                continue;
+            }
+            self.drops[i as i64] = d;
+            i = i + 1;
+        }
+    }
+
+    // Bubbles climb at their terminal velocity, wobble, and pop just under the surface.
+    fn moveBubbles(mut self, world : FluidWorld, time : f32) : void {
+        let dt : f32 = self.vent.dt as f32;
+        let mut i : i32 = 0;
+        while (i < self.nBubbles) {
+            let mut b : GxBubble = self.bubbles[i as i64];
+            b.x = b.x + sin(b.phase + time * (3.1 as f32)) * GY_BUBBLE_WOBBLE * dt;
+            b.z = b.z + cos(b.phase + time * (2.3 as f32)) * GY_BUBBLE_WOBBLE * dt;
+            b.y = b.y + GY_BUBBLE_RISE * dt;
+
+            let cx : i32 = b.x as i32;
+            let cz : i32 = b.z as i32;
+            let inside : bool = cx >= 0 && cx < world.width() && cz >= 0 && cz < world.depth();
+            let surface : f32 = (world.groundAt(cx, cz) + world.levelAt(cx, cz)) as f32;
+            if (inside && b.y < surface - GY_BUBBLE_POP) {
+                self.bubbles[i as i64] = b;
+                i = i + 1;
+                continue;
+            }
+            self.nBubbles = self.nBubbles - 1;
+            self.bubbles[i as i64] = self.bubbles[self.nBubbles as i64];
+        }
+    }
+
+    // The column a coordinate falls in, clamped into the grid.
+    static fn column(v : f32, size : i32) : i32 {
+        let i : i32 = v as i32;
+        if (i < 0) {
+            return 0;
+        }
+        if (i >= size) {
+            return size - 1;
+        }
+        return i;
+    }
+}

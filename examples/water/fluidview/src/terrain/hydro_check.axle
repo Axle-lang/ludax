@@ -1,0 +1,197 @@
+// hydro_check — the proof that a HydroTerrain is ground water can be put on.
+//
+// A scene that pours a river over this terrain needs five things to hold, and each is measured here from the grid and
+// the records, not trusted from the generator: no cell is not-a-number; the river's bed strictly descends from the
+// plunge pool to the end lake (a single uphill step would be a dam); the channel is carved below its banks along the
+// whole river; the reservoir is closed (a flood fill just under its spill level stays inside) and does spill (one a
+// decimetre above escapes); and the escarpment has its drop. The sinuosity and the river's slope are measured too, so a
+// caller can compare them with what it asked for. `report` returns every measurement; the first failed claim is named
+// in `problem`.
+
+use crate::terrain::hydro_parts::{HydroReport, HydroSpot, RiverPoint};
+use crate::terrain::hydro_terrain::HydroTerrain;
+use crate::terrain::terrain_lake::{LakeFill, TerrainLake};
+
+// The drop of the cliff must reach this share of the height asked for.
+const CHECK_FALL_SHARE : f32 = 0.94;
+
+// The sinuosity must lie within this share of the request.
+const CHECK_SINUOSITY_TOLERANCE : f32 = 0.06;
+
+// A river point's grid height must be this share of its depth below the bank.
+const CHECK_CARVED : f32 = 0.5;
+
+// A bed that rises by more than this between two points is uphill (float rounding of heights is far below it).
+const CHECK_RISE : f32 = 0.00001;
+
+// Probes of the flood fill: just under and a little over the spill level, metres.
+const CHECK_UNDER : f32 = 0.01;
+const CHECK_OVER : f32 = 0.1;
+
+/** The consistency check. */
+pub class HydroCheck {
+    /** Measures `t` and judges it. */
+    pub static fn report(t : HydroTerrain) : HydroReport {
+        let mut r : HydroReport = new HydroReport();
+        r.badCells = HydroCheck::badCells(t);
+        HydroCheck::river(t, r);
+        HydroCheck::lake(t, r);
+        HydroCheck::cliff(t, r);
+        HydroCheck::face(t, r);
+        r.pits = t.pitCount;
+        HydroCheck::judge(t, r);
+        return r;
+    }
+
+    static fn badCells(t : HydroTerrain) : i32 {
+        let n : i64 = (t.width as i64) * (t.depth as i64);
+        let mut bad : i32 = 0;
+        for (i of 0..n) {
+            let h : f32 = t.bed[i];
+            if (!(h > -100000.0 as f32 && h < 100000.0 as f32)) {
+                bad = bad + 1;
+            }
+        }
+        return bad;
+    }
+
+    static fn river(t : HydroTerrain, r : HydroReport) : void {
+        if (t.riverCount < 2) {
+            return;
+        }
+        let first : RiverPoint = t.river[0];
+        let last : RiverPoint = t.river[(t.riverCount - 1) as i64];
+        let dx : f32 = last.x - first.x;
+        let dz : f32 = last.z - first.z;
+        let chord : f32 = ludax::sqrt(dx * dx + dz * dz);
+        r.riverLength = last.arc;
+        if (chord > 1.0 as f32) {
+            r.sinuosity = last.arc / chord;
+        }
+        r.riverSlope = (first.bedHeight - last.bedHeight) / ludax::max(last.arc, 1.0 as f32);
+
+        let mut worst : f32 = -1000.0 as f32;
+        let mut shallow : i32 = 0;
+        for (i of 0..t.riverCount) {
+            let p : RiverPoint = t.river[i as i64];
+            if (i > 0) {
+                let rise : f32 = p.bedHeight - t.river[(i - 1) as i64].bedHeight;
+                worst = ludax::max(worst, rise);
+            }
+            if (t.heightAt(p.x, p.z) > p.bankHeight - p.depth * CHECK_CARVED) {
+                shallow = shallow + 1;
+            }
+        }
+        r.worstRise = worst;
+        r.shallowPoints = shallow;
+    }
+
+    static fn lake(t : HydroTerrain, r : HydroReport) : void {
+        let n : i64 = (t.width as i64) * (t.depth as i64);
+        let queue : i32[] = new i32[n];
+        let scratch : u8[] = new u8[n];
+        let col : i32 = t.clampColumn((t.lake.center.x / t.cellSize) as i32);
+        let row : i32 = t.clampRow((t.lake.center.z / t.cellSize) as i32);
+        let start : i64 = (row as i64) * (t.width as i64) + (col as i64);
+        let sink : f32 = t.lake.level
+            - ludax::max(t.params.escarpmentHeight * 0.5 as f32, t.params.lakeDepth + 2.0 as f32);
+
+        r.spillLevel = TerrainLake::spillLevel(t.bed, scratch, queue, t.width, start, t.lake.level, sink);
+        let under : LakeFill = TerrainLake::fill(
+            t.bed,
+            scratch,
+            queue,
+            t.width,
+            start,
+            r.spillLevel - CHECK_UNDER,
+            sink
+        );
+        r.lakeClosed = !under.escaped && under.cells > 0;
+        r.lakeVolume = TerrainLake::volume(t.bed, queue, under.cells, r.spillLevel, t.cellSize);
+        TerrainLake::clear(scratch, queue, under.cells);
+
+        let over : LakeFill = TerrainLake::fill(
+            t.bed,
+            scratch,
+            queue,
+            t.width,
+            start,
+            r.spillLevel + CHECK_OVER,
+            sink
+        );
+        r.lakeSpills = over.escaped;
+    }
+
+    // The drop of the face, from the crest at the lip to the ground south of the face beside the pool.
+    static fn cliff(t : HydroTerrain, r : HydroReport) : void {
+        let lip : HydroSpot = t.escarpment.lip;
+        let side : f32 = lip.x + t.pool.radius * 1.6 as f32;
+        let mut at : i32 = 0;
+        for (i of 0..t.crestCount) {
+            if (t.crest[i as i64].x <= side) {
+                at = i;
+            }
+        }
+        let crest : HydroSpot = t.crest[at as i64];
+        let apron : f32 = t.heightAt(crest.x, crest.z + t.escarpment.faceRun + t.cellSize * 2.0 as f32);
+        r.fall = crest.height - apron;
+    }
+
+    // The face at the lip: the steepest step between adjacent grid cells down the column of the lip, the steepest step between
+    // points a metre apart (from `bedAt`), and the share of the drop that happens in the first four metres below the crest.
+    static fn face(t : HydroTerrain, r : HydroReport) : void {
+        let lip : HydroSpot = t.escarpment.lip;
+        let col : i32 = t.clampColumn((lip.x / t.cellSize) as i32);
+        let row : i32 = t.clampRow((lip.z / t.cellSize) as i32);
+        let mut cells : f32 = 0.0 as f32;
+        for (k of -2..8) {
+            let a : f32 = t.cellHeight(col, row + k);
+            let b : f32 = t.cellHeight(col, row + k + 1);
+            cells = ludax::max(cells, a - b);
+        }
+        r.cellDrop = cells;
+
+        let run : i32 = (t.escarpment.faceRun + 12.0 as f32) as i32;
+        let mut step : f32 = 0.0 as f32;
+        let mut crest : f32 = lip.z;
+        let top : f32 = t.bedAt(lip.x, lip.z - 2.0 as f32);
+        let mut found : bool = false;
+        for (k of -2..run) {
+            let z : f32 = lip.z + (k as f32);
+            let here : f32 = t.bedAt(lip.x, z);
+            step = ludax::max(step, here - t.bedAt(lip.x, z + 1.0 as f32));
+            if (!found && here < top - 0.3 as f32) {
+                found = true;
+                crest = z;
+            }
+        }
+        r.metreDrop = step;
+        let whole : f32 = top - t.escarpment.footHeight;
+        if (whole > 1.0 as f32) {
+            r.faceShare = ludax::min(1.0 as f32, (top - t.bedAt(lip.x, crest + 4.0 as f32)) / whole);
+        }
+    }
+
+    static fn judge(t : HydroTerrain, r : HydroReport) : void {
+        let asked : f32 = t.params.sinuosity;
+        if (r.badCells > 0) {
+            r.problem = "${r.badCells} cells are not finite numbers";
+        } else if (t.riverCount < 2) {
+            r.problem = "the river has no points";
+        } else if (r.worstRise > 0.0 as f32 - CHECK_RISE) {
+            r.problem = "the river bed does not strictly descend (worst step ${r.worstRise} m)";
+        } else if (r.shallowPoints > 0) {
+            r.problem = "${r.shallowPoints} river points are not carved below their banks";
+        } else if (!r.lakeClosed) {
+            r.problem = "the reservoir basin is not closed just under its spill level";
+        } else if (!r.lakeSpills) {
+            r.problem = "the reservoir does not spill above its spill level";
+        } else if (r.fall < t.params.escarpmentHeight * CHECK_FALL_SHARE) {
+            r.problem = "the escarpment drops only ${r.fall} m";
+        } else if (r.sinuosity < asked * (1.0 as f32 - CHECK_SINUOSITY_TOLERANCE)
+            || r.sinuosity > asked * (1.0 as f32 + CHECK_SINUOSITY_TOLERANCE)) {
+            r.problem = "the sinuosity is ${r.sinuosity}, asked ${asked}";
+        }
+        r.passed = r.problem.length == 0;
+    }
+}

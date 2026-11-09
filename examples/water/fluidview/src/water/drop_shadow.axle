@@ -1,0 +1,272 @@
+// drop_shadow — a coarse grid of how much water lies between a point and the sun and the sky, for lighting drops.
+//
+// A dense column of drops lights itself: its sunlit side is bright white, its core and far side are dark blue-grey.
+// So the drops of a frame (liquid and spray; nothing else exists) are deposited into a grid of coarse voxels,
+// single-threaded and in particle order so the grid is the same on every run: each drop adds the extinction of a
+// sphere of its radius (a spray drop, a fixed halo), divided by the voxel volume and spread by a kernel as wide as
+// the drop, so overlapping drops add up to the density of the column. A second pass marches from each voxel toward
+// the sun and toward the sky to store how much water lies between it and each; those two optical depths are all
+// the lighting a drop needs. The grid is never drawn and never marched by a pixel: it only answers `shadowAt`.
+
+use ludax::{clamp, max, Vec3, PI};
+
+use crate::water::noise::{waterFloor, waterHighI, waterLowI, waterPick};
+use crate::water::particles::{WaterKind, WaterParticles};
+
+// The most voxels along the longest side of the grid, and the most voxels it ever holds (allocated once).
+const SHADOW_LONG_SIDE : i32 = 72;
+const SHADOW_VOXELS_MAX : i32 = 330000;
+
+// Voxels of padding around the drops.
+const SHADOW_PAD : f32 = 3.0;
+
+// The radius a spray drop is deposited with, and the factor a liquid drop's radius is multiplied by.
+const SHADOW_SPRAY_HALO : f32 = 0.55;
+const SHADOW_LIQUID_HALO : f32 = 4.0;
+
+// The kernel of a drop: its width in drop radii, and its least and most width in voxels.
+const SHADOW_KERNEL : f32 = 1.4;
+const SHADOW_KERNEL_MIN : f32 = 0.5;
+const SHADOW_KERNEL_MAX : f32 = 3.0;
+
+// Steps of the march toward the sun and the sky, in voxels.
+const SHADOW_LIGHT_STEPS : i32 = 40;
+
+// The factor the voxel grows by while the grid is too big.
+const SHADOW_GROW : f32 = 1.15;
+
+/** The water of one frame, as optical depths. */
+pub class DropShadow {
+    nx : i32 = 1;
+    ny : i32 = 1;
+    nz : i32 = 1;
+
+    /** True when the frame has any water to shade by. */
+    pub filled : bool = false;
+
+    origin : Vec3 = Vec3 { x: (0.0 as f32), y: (0.0 as f32), z: (0.0 as f32) };
+    voxel  : f32 = (1.0 as f32);
+
+    // `density` is the extinction per voxel; `light` holds two floats a voxel, the optical depth to the sun and to the sky.
+    density : f32[];
+    light   : f32[];
+    sunDir  : Vec3 = Vec3 { x: (0.0 as f32), y: (1.0 as f32), z: (0.0 as f32) };
+    scale   : f32 = (0.006 as f32);
+
+    /** An empty grid; `build` fills it. */
+    constructor() {
+        self.density = new f32[SHADOW_VOXELS_MAX as i64];
+        self.light = new f32[(SHADOW_VOXELS_MAX as i64) * 2];
+    }
+
+    // The index of voxel (x, y, z).
+    fn at(self, x : i32, y : i32, z : i32) : i64 {
+        return ((((z * self.ny) + y) * self.nx) + x) as i64;
+    }
+
+    /** Points the lighting at the sun in direction `sun`. */
+    pub fn setSun(mut self, sun : Vec3) : void {
+        self.sunDir = sun;
+    }
+
+    /** Bins the drops of `drops` into the grid with `density` extinction per unit of drop volume; false when empty. */
+    pub fn build(mut self, drops : WaterParticles, density : f32) : bool {
+        self.scale = density;
+        self.filled = false;
+        if (drops.count <= 0) {
+            return false;
+        }
+        let mut lo : Vec3 = Vec3::splat((1000000.0 as f32));
+        let mut hi : Vec3 = Vec3::splat(-(1000000.0 as f32));
+        for (k of 0..drops.count) {
+            let p : Vec3 = drops.positionAt(k);
+            let halo : f32 = DropShadow::reach(drops, k);
+            lo = lo.componentMin(p.minus(Vec3::splat(halo)));
+            hi = hi.componentMax(p.plus(Vec3::splat(halo)));
+        }
+        self.layout(lo, hi);
+        for (i of 0..((self.nx as i64) * self.ny * self.nz)) {
+            self.density[i] = (0.0 as f32);
+            self.light[i * 2] = (0.0 as f32);
+            self.light[i * 2 + 1] = (0.0 as f32);
+        }
+        for (k of 0..drops.count) {
+            self.deposit(drops, k, density);
+        }
+        self.filled = true;
+        return true;
+    }
+
+    // The radius the grid sees drop `k` as: a liquid drop's own enlarged, a spray drop's halo.
+    static fn reach(drops : WaterParticles, k : i32) : f32 {
+        return waterPick(
+            drops.isKind(k, WaterKind::Liquid),
+            drops.radiusAt(k) * SHADOW_LIQUID_HALO,
+            SHADOW_SPRAY_HALO
+        );
+    }
+
+    // Sizes the grid around the box `lo`..`hi` with isotropic voxels.
+    fn layout(mut self, lo : Vec3, hi : Vec3) : void {
+        let span : Vec3 = hi.minus(lo);
+        let longest : f32 = max(max(span.x, span.y), max(span.z, (1.0 as f32)));
+        let mut voxel : f32 = longest / (SHADOW_LONG_SIDE as f32);
+        let mut fits : bool = false;
+        while (!fits) {
+            self.voxel = voxel;
+            self.origin = lo.minus(Vec3::splat(SHADOW_PAD * voxel));
+            self.nx = ((span.x / voxel) + (2.0 as f32) * SHADOW_PAD) as i32 + 1;
+            self.ny = ((span.y / voxel) + (2.0 as f32) * SHADOW_PAD) as i32 + 1;
+            self.nz = ((span.z / voxel) + (2.0 as f32) * SHADOW_PAD) as i32 + 1;
+            fits = self.nx * self.ny * self.nz <= SHADOW_VOXELS_MAX;
+            voxel = voxel * SHADOW_GROW;
+        }
+    }
+
+    // Spreads one drop's extinction over the voxels its kernel covers, conserving it.
+    fn deposit(mut self, drops : WaterParticles, k : i32, share : f32) : void {
+        let p : Vec3 = drops.positionAt(k);
+        let r : f32 = DropShadow::reach(drops, k);
+        let core : f32 = (4.0 as f32) / (3.0 as f32) * PI * r * r * r * share;
+        let amount : f32 = core / (self.voxel * self.voxel * self.voxel);
+        let c : Vec3 = p.minus(self.origin).scale((1.0 as f32) / self.voxel);
+        let reach : f32 = clamp(r / self.voxel * SHADOW_KERNEL, SHADOW_KERNEL_MIN, SHADOW_KERNEL_MAX);
+        let x0 : i32 = waterHighI(waterFloor(c.x - reach), 0);
+        let y0 : i32 = waterHighI(waterFloor(c.y - reach), 0);
+        let z0 : i32 = waterHighI(waterFloor(c.z - reach), 0);
+        let x1 : i32 = waterLowI(waterFloor(c.x + reach) + 1, self.nx - 1);
+        let y1 : i32 = waterLowI(waterFloor(c.y + reach) + 1, self.ny - 1);
+        let z1 : i32 = waterLowI(waterFloor(c.z + reach) + 1, self.nz - 1);
+
+        let mut total : f32 = (0.0 as f32);
+        for (z of z0..(z1 + 1)) {
+            for (y of y0..(y1 + 1)) {
+                for (x of x0..(x1 + 1)) {
+                    total = total + DropShadow::kernel(c, x, y, z, reach);
+                }
+            }
+        }
+        if (total <= (0.0 as f32)) {
+            return;
+        }
+        let each : f32 = amount / total;
+        for (z of z0..(z1 + 1)) {
+            for (y of y0..(y1 + 1)) {
+                for (x of x0..(x1 + 1)) {
+                    let i : i64 = self.at(x, y, z);
+                    self.density[i] = self.density[i] + DropShadow::kernel(c, x, y, z, reach) * each;
+                }
+            }
+        }
+    }
+
+    // The kernel weight of voxel (x, y, z) for a drop at voxel-space position `c`: a smooth bump.
+    static fn kernel(c : Vec3, x : i32, y : i32, z : i32, reach : f32) : f32 {
+        let d : Vec3 = Vec3 {
+            x: (x as f32) + (0.5 as f32) - c.x,
+            y: (y as f32) + (0.5 as f32) - c.y,
+            z: (z as f32) + (0.5 as f32) - c.z,
+        };
+        let q : f32 = d.lengthSquared() / (reach * reach);
+        if (q >= (1.0 as f32)) {
+            return (0.0 as f32);
+        }
+        let f : f32 = (1.0 as f32) - q;
+        return f * f;
+    }
+
+    /** The density and the optical depths toward the sun (y) and the sky (z) at world point `p`; zero outside. */
+    pub fn shadowAt(self, p : Vec3) : Vec3 {
+        if (!self.filled) {
+            return Vec3::zero();
+        }
+        return self.sample(p.minus(self.origin).scale((1.0 as f32) / self.voxel));
+    }
+
+    /** Slabs of the light pass, for the job pool. */
+    pub fn lightRows(self) : i32 {
+        return self.ny;
+    }
+
+    /** Stores for the voxels of height slabs `begin` up to `end` the optical depth toward the sun and the sky. */
+    pub fn bakeLight(mut self, begin : i32, end : i32) : void {
+        if (!self.filled) {
+            return;
+        }
+        for (y of begin..waterLowI(end, self.ny)) {
+            for (z of 0..self.nz) {
+                for (x of 0..self.nx) {
+                    let i : i64 = self.at(x, y, z);
+                    if (self.density[i] <= (0.0 as f32)) {
+                        continue;
+                    }
+                    let c : Vec3 = Vec3 {
+                        x: (x as f32) + (0.5 as f32),
+                        y: (y as f32) + (0.5 as f32),
+                        z: (z as f32) + (0.5 as f32),
+                    };
+                    self.light[i * 2] = self.opticalDepth(c, self.sunDir);
+                    self.light[i * 2 + 1] = self.opticalDepth(c, Vec3::unitY());
+                }
+            }
+        }
+    }
+
+    // The water between voxel-space point `c` and the grid's edge along unit `dir`, as optical depth.
+    fn opticalDepth(self, c : Vec3, dir : Vec3) : f32 {
+        let mut tau : f32 = (0.0 as f32);
+        let mut p : Vec3 = c;
+        for (i of 0..SHADOW_LIGHT_STEPS) {
+            p = p.plus(dir);
+            let x : i32 = p.x as i32;
+            let y : i32 = p.y as i32;
+            let z : i32 = p.z as i32;
+            if (p.x < (0.0 as f32) || p.y < (0.0 as f32) || p.z < (0.0 as f32) || x >= self.nx || y >= self.ny
+                || z >= self.nz) {
+                break;
+            }
+            tau = tau + self.density[self.at(x, y, z)];
+        }
+        return tau * self.voxel;
+    }
+
+    // The trilinear blend of the grid at voxel-space point `p`: x is the density, y and z the optical depths to
+    // the sun and to the sky. Outside the grid it is empty.
+    fn sample(self, p : Vec3) : Vec3 {
+        let gx : f32 = p.x - (0.5 as f32);
+        let gy : f32 = p.y - (0.5 as f32);
+        let gz : f32 = p.z - (0.5 as f32);
+        let x0 : i32 = waterFloor(gx);
+        let y0 : i32 = waterFloor(gy);
+        let z0 : i32 = waterFloor(gz);
+        if (x0 < -1 || y0 < -1 || z0 < -1 || x0 >= self.nx || y0 >= self.ny || z0 >= self.nz) {
+            return Vec3::zero();
+        }
+        let fx : f32 = gx - (x0 as f32);
+        let fy : f32 = gy - (y0 as f32);
+        let fz : f32 = gz - (z0 as f32);
+        let mut sum : Vec3 = Vec3::zero();
+        for (dz of 0..2) {
+            for (dy of 0..2) {
+                for (dx of 0..2) {
+                    let x : i32 = x0 + dx;
+                    let y : i32 = y0 + dy;
+                    let z : i32 = z0 + dz;
+                    if (x < 0 || y < 0 || z < 0 || x >= self.nx || y >= self.ny || z >= self.nz) {
+                        continue;
+                    }
+                    let wx : f32 = waterPick(dx == 0, (1.0 as f32) - fx, fx);
+                    let wy : f32 = waterPick(dy == 0, (1.0 as f32) - fy, fy);
+                    let wz : f32 = waterPick(dz == 0, (1.0 as f32) - fz, fz);
+                    let i : i64 = self.at(x, y, z);
+                    sum = sum.plus(Vec3 {
+                        x: self.density[i],
+                        y: self.light[i * 2],
+                        z: self.light[i * 2 + 1],
+                    }.scale(wx * wy * wz));
+                }
+            }
+        }
+        return sum;
+    }
+}

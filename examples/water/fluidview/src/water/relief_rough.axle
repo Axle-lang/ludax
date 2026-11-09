@@ -1,0 +1,116 @@
+// relief_rough — the terrain's steep faces, given the irregularity a four metre grid cannot hold.
+//
+// The generated escarpment is a straight wall with a straight crest: the generator draws it from a few smooth
+// functions, and a heightfield cannot overhang or notch it at any finer step. What a heightfield can do is move its
+// lookups sideways: the height of the relief at a steep texel is the terrain's height a few metres to one side, the
+// offset a smooth noise of the place. On a wall, where height changes fast with position, that bends the crest into
+// bays and headlands and breaks the face into buttresses and chutes; on gentle ground it changes nothing, so the
+// warp is weighted by steepness. It is also weighted to zero near the lip of the fall and near the lake, where the
+// engine's water meets the ground and the two must agree to the centimetre; away from them the water never touches it.
+
+use ludax::{saturate, smoothstep, sqrt};
+
+use crate::terrain::hydro_terrain::HydroTerrain;
+use crate::water::noise::{waterFbm2, waterFloor, waterHighI, waterLowI};
+use crate::water::relief::Relief;
+
+// Slopes (rise over run) between which a face is warped from nothing to fully.
+const RR_STEEP_LOW : f32 = 0.9;
+const RR_STEEP_HIGH : f32 = 1.8;
+
+// Metres from the lip of the fall, over which the warp comes in from nothing to fully.
+const RR_LIP_NEAR : f32 = 100.0;
+const RR_LIP_FAR : f32 = 170.0;
+
+// Texels around a texel that is looked at for the lake: the warp stays that far from it.
+const RR_LAKE_REACH : i32 = 8;
+
+// The warp's wavelengths and reach, metres: big bays and small buttresses.
+const RR_BAY : f32 = 70.0;
+const RR_BAY_REACH : f32 = 14.0;
+const RR_BUTTRESS : f32 = 19.0;
+const RR_BUTTRESS_REACH : f32 = 8.0;
+
+// Noise seeds.
+const RR_SEED : i32 = 1301;
+
+/** Roughens the steep faces of a relief. */
+pub class ReliefRough {
+    /** Resamples the heights of `relief` (already a copy of `terrain`'s bed) where the ground is steep. */
+    pub static fn apply(mut relief : Shared<Relief>, terrain : HydroTerrain) : void {
+        let w : i32 = terrain.width;
+        let d : i32 = terrain.depth;
+        let cell : f32 = terrain.cellSize;
+        for (j of 1..(d - 1)) {
+            for (i of 1..(w - 1)) {
+                let steep : f32 = ReliefRough::steepness(terrain, i, j);
+                if (steep <= (0.0 as f32)) {
+                    continue;
+                }
+                let x : f32 = (i as f32) * cell;
+                let z : f32 = (j as f32) * cell;
+                let weight : f32 = steep * ReliefRough::awayFromWater(terrain, i, j, x, z);
+                if (weight <= (0.0 as f32)) {
+                    continue;
+                }
+                let dx : f32 = ReliefRough::offset(x, z, RR_SEED) * weight;
+                let dz : f32 = ReliefRough::offset(x, z, RR_SEED + 17) * weight;
+                relief.grid.heights[((j * w) + i) as i64] = ReliefRough::bed(
+                    terrain,
+                    (x + dx) / cell,
+                    (z + dz) / cell
+                );
+            }
+        }
+    }
+
+    // The slope at texel (`i`, `j`) by central differences, as a weight from `RR_STEEP_LOW` to `RR_STEEP_HIGH`.
+    static fn steepness(terrain : HydroTerrain, i : i32, j : i32) : f32 {
+        let w : i64 = terrain.width as i64;
+        let at : i64 = ((j * terrain.width) + i) as i64;
+        let inv : f32 = (0.5 as f32) / terrain.cellSize;
+        let gx : f32 = (terrain.bed[at + 1] - terrain.bed[at - 1]) * inv;
+        let gz : f32 = (terrain.bed[at + w] - terrain.bed[at - w]) * inv;
+        return smoothstep(RR_STEEP_LOW, RR_STEEP_HIGH, sqrt(gx * gx + gz * gz));
+    }
+
+    // 0 within `RR_LIP_NEAR` of the lip or `RR_LAKE_REACH` texels of the lake, 1 beyond `RR_LIP_FAR`.
+    static fn awayFromWater(terrain : HydroTerrain, i : i32, j : i32, x : f32, z : f32) : f32 {
+        let lx : f32 = x - terrain.escarpment.lip.x;
+        let lz : f32 = z - terrain.escarpment.lip.z;
+        let far : f32 = smoothstep(RR_LIP_NEAR, RR_LIP_FAR, sqrt(lx * lx + lz * lz));
+        if (far <= (0.0 as f32)) {
+            return (0.0 as f32);
+        }
+        for (k of -1..2) {
+            for (m of -1..2) {
+                let ci : i32 = waterHighI(0, waterLowI(terrain.width - 1, i + m * RR_LAKE_REACH));
+                let cj : i32 = waterHighI(0, waterLowI(terrain.depth - 1, j + k * RR_LAKE_REACH));
+                if (terrain.lakeMask[((cj * terrain.width) + ci) as i64] != (0 as u8)) {
+                    return (0.0 as f32);
+                }
+            }
+        }
+        return far;
+    }
+
+    // The sideways offset at (`x`, `z`), metres: big bays and small buttresses of noise, centred on zero.
+    static fn offset(x : f32, z : f32, seed : i32) : f32 {
+        let bay : f32 = waterFbm2(x / RR_BAY, z / RR_BAY, 3, seed) - (0.5 as f32);
+        let buttress : f32 = waterFbm2(x / RR_BUTTRESS, z / RR_BUTTRESS, 2, seed + 5) - (0.5 as f32);
+        return bay * RR_BAY_REACH * (2.0 as f32) + buttress * RR_BUTTRESS_REACH * (2.0 as f32);
+    }
+
+    // The terrain's bed at the fractional texel (`u`, `v`), bilinear.
+    static fn bed(terrain : HydroTerrain, u : f32, v : f32) : f32 {
+        let iu : i32 = waterHighI(0, waterLowI(terrain.width - 2, waterFloor(u)));
+        let iv : i32 = waterHighI(0, waterLowI(terrain.depth - 2, waterFloor(v)));
+        let fu : f32 = saturate(u - (iu as f32));
+        let fv : f32 = saturate(v - (iv as f32));
+        let at : i64 = ((iv * terrain.width) + iu) as i64;
+        let w : i64 = terrain.width as i64;
+        let top : f32 = terrain.bed[at] + (terrain.bed[at + 1] - terrain.bed[at]) * fu;
+        let bottom : f32 = terrain.bed[at + w] + (terrain.bed[at + w + 1] - terrain.bed[at + w]) * fu;
+        return top + (bottom - top) * fv;
+    }
+}

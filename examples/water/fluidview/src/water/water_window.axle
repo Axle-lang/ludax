@@ -1,0 +1,368 @@
+// water_window — the engine's water, as a fine grid laid over a stretch of the terrain.
+//
+// A river a few tens of metres wide cannot be drawn from the terrain's 1.5 m lattice, so the water lives in a
+// window of its own at a finer step (one metre here). The window holds, per column, the bed height, the surface
+// (a `HeightGrid`, so the surface is ray-marched with the same pyramid as the ground and has smooth normals), the
+// surface velocity as `i16` in 1/256 m/s, and the foam, turbulence and ground moisture as `u8`. Depth is the
+// surface minus the bed, both read bilinearly, so the wet edge is a smooth ramp and not a stair-step. Where there
+// is no water the surface equals the bed, which is what lets one march serve dry and wet columns. Everything is
+// stored once and read by the shaders; whoever drives the window (the demo's formulas, or the engine's world)
+// writes columns with `set` and then builds the surface's pyramid.
+
+use ludax::{abs, clamp, Vec3};
+
+use crate::water::height_grid::HeightGrid;
+use crate::water::noise::{waterFloor, waterHighI, waterLowI};
+
+/** Velocity is stored in this many steps per metre a second. */
+const WIN_VELOCITY_STEPS : f32 = 256.0;
+
+/** A column with less water than this (metres) is dry.*/
+pub const WIN_DRY : f32 = 0.002;
+
+/** The byte scale of foam, turbulence and moisture. */
+const WIN_BYTE : f32 = 255.0;
+
+// The bed or the surface of a neighbouring column that differs from the nearest one by more than this (metres) is across a lip or a
+// bank wall: the smooth sampler does not interpolate across it (the engine's own surface reader makes the same rule).
+const WIN_LIP_JUMP : f32 = 1.5;
+
+// A cubic spline's weight of the four columns around a point: the Catmull-Rom basis of the fraction `t` and its derivative.
+struct Spline {
+    a  : f32;
+    b  : f32;
+    c  : f32;
+    d  : f32;
+    da : f32;
+    db : f32;
+    dc : f32;
+    dd : f32;
+
+    static fn make(t : f32) : Spline {
+        let t2 : f32 = t * t;
+        let t3 : f32 = t2 * t;
+        return Spline {
+            a: (0.0 as f32) - (0.5 as f32) * t3 + t2 - (0.5 as f32) * t,
+            b: (1.5 as f32) * t3 - (2.5 as f32) * t2 + (1.0 as f32),
+            c: (0.0 as f32) - (1.5 as f32) * t3 + (2.0 as f32) * t2 + (0.5 as f32) * t,
+            d: (0.5 as f32) * t3 - (0.5 as f32) * t2,
+            da: (0.0 as f32) - (1.5 as f32) * t2 + (2.0 as f32) * t - (0.5 as f32),
+            db: (4.5 as f32) * t2 - (5.0 as f32) * t,
+            dc: (0.0 as f32) - (4.5 as f32) * t2 + (4.0 as f32) * t + (0.5 as f32),
+            dd: (1.5 as f32) * t2 - t,
+        };
+    }
+
+    fn weight(self, k : i32) : f32 {
+        return match k {
+            0 => self.a,
+            1 => self.b,
+            2 => self.c,
+            _ => self.d,
+        };
+    }
+
+    fn slope(self, k : i32) : f32 {
+        return match k {
+            0 => self.da,
+            1 => self.db,
+            2 => self.dc,
+            _ => self.dd,
+        };
+    }
+}
+
+/** The values read at one point of the window. */
+pub struct WindowSpot {
+    /** Bed height, metres. */
+    pub bed : f32 = (0.0 as f32);
+
+    /** Water depth over the bed, metres; zero when dry. */
+    pub depth : f32 = (0.0 as f32);
+
+    /** Surface velocity, metres a second, in x and z. */
+    pub vx : f32 = (0.0 as f32);
+    pub vz : f32 = (0.0 as f32);
+
+    /** Foam amount, 0 to 1. */
+    pub foam : f32 = (0.0 as f32);
+
+    /** Turbulence, 0 glass to 1 whitewater. */
+    pub turbulence : f32 = (0.0 as f32);
+
+    /** Wetness of the ground, 0 dry to 1 soaked, which extends beyond the water. */
+    pub moist : f32 = (0.0 as f32);
+
+    /** Dye concentration, 0 to 1. */
+    pub dye : f32 = (0.0 as f32);
+
+    /** Slope of the water surface (rise over run) along x and along z; only the smooth reader fills it. */
+    pub slopeX : f32 = (0.0 as f32);
+    pub slopeZ : f32 = (0.0 as f32);
+}
+
+/** The window. */
+pub class WaterWindow {
+    /** Columns along x and along z. */
+    pub w : i32;
+    pub d : i32;
+
+    /** Metres between columns. */
+    pub cell : f32;
+
+    /** One over `cell`. */
+    pub invCell : f32;
+
+    /** World position of column (0, 0). */
+    pub originX : f32;
+    pub originZ : f32;
+
+    /** The surface; its heights are the bed where dry. */
+    pub top : Shared<HeightGrid>;
+
+    bed        : f32[];
+    velocity   : i16[];
+    foam       : u8[];
+    turbulence : u8[];
+    moist      : u8[];
+    dye        : u8[];
+
+    /** A window of `w` by `d` columns `cell` metres apart with its corner at (`originX`, `originZ`). */
+    constructor(w : i32, d : i32, cell : f32, originX : f32, originZ : f32) {
+        self.w = w;
+        self.d = d;
+        self.cell = cell;
+        self.invCell = (1.0 as f32) / cell;
+        self.originX = originX;
+        self.originZ = originZ;
+        self.top = share new HeightGrid(w, d, cell, originX, originZ);
+        let n : i64 = (w as i64) * d;
+        self.bed = new f32[n];
+        self.velocity = new i16[n * 2];
+        self.foam = new u8[n];
+        self.turbulence = new u8[n];
+        self.moist = new u8[n];
+        self.dye = new u8[n];
+    }
+
+    /** One column's values; `level` is the water surface height (at or below `bed` for a dry column). */
+    pub fn set(
+        mut self,
+        x : i32,
+        z : i32,
+        bed : f32,
+        level : f32,
+        flow : Vec3,
+        foam : f32,
+        turbulence : f32,
+        moist : f32
+    ) : void {
+        let at : i64 = ((z * self.w) + x) as i64;
+        self.bed[at] = bed;
+        self.top.heights[at] = ludax::max(bed, level);
+        self.velocity[at * 2] = WaterWindow::fixed(flow.x);
+        self.velocity[at * 2 + 1] = WaterWindow::fixed(flow.z);
+        self.foam[at] = WaterWindow::byte(foam);
+        self.turbulence[at] = WaterWindow::byte(turbulence);
+        self.moist[at] = WaterWindow::byte(moist);
+    }
+
+    static fn fixed(v : f32) : i16 {
+        return (clamp(v * WIN_VELOCITY_STEPS, -(32000.0 as f32), (32000.0 as f32))) as i16;
+    }
+
+    static fn byte(v : f32) : u8 {
+        return (clamp(v, (0.0 as f32), (1.0 as f32)) * WIN_BYTE + (0.5 as f32)) as u8;
+    }
+
+    /** Sets column (`x`, `z`)'s bed alone (the surface is the bed until `feed` says otherwise). */
+    pub fn setBed(mut self, x : i32, z : i32, bed : f32) : void {
+        let at : i64 = ((z * self.w) + x) as i64;
+        self.bed[at] = bed;
+        self.top.heights[at] = bed;
+    }
+
+    /** Sets column (`x`, `z`)'s water: `depth` over the bed, the surface velocity, the foam and the turbulence. */
+    pub fn feed(mut self, x : i32, z : i32, depth : f32, flow : Vec3, foam : f32, turbulence : f32) : void {
+        let at : i64 = ((z * self.w) + x) as i64;
+        let mut over : f32 = 0.0;
+        if (depth > WIN_DRY) {
+            over = depth;
+        }
+        self.top.heights[at] = self.bed[at] + over;
+        self.velocity[at * 2] = WaterWindow::fixed(flow.x);
+        self.velocity[at * 2 + 1] = WaterWindow::fixed(flow.z);
+        self.foam[at] = WaterWindow::byte(foam);
+        self.turbulence[at] = WaterWindow::byte(turbulence);
+    }
+
+    /** Sets the dye concentration of column (`x`, `z`), 0 to 1: a passive tracer the engine carries with the water. */
+    pub fn setDye(mut self, x : i32, z : i32, dye : f32) : void {
+        self.dye[((z * self.w) + x) as i64] = WaterWindow::byte(dye);
+    }
+
+    /** Sets the ground moisture of column (`x`, `z`), 0 to 1. */
+    pub fn setMoist(mut self, x : i32, z : i32, moist : f32) : void {
+        self.moist[((z * self.w) + x) as i64] = WaterWindow::byte(moist);
+    }
+
+    /** True when (`x`, `z`) is over the window. */
+    pub fn covers(self, x : f32, z : f32) : bool {
+        return self.top.covers(x, z);
+    }
+
+    fn column(self, x : i32, z : i32) : i64 {
+        let cx : i32 = waterHighI(0, waterLowI(self.w - 1, x));
+        let cz : i32 = waterHighI(0, waterLowI(self.d - 1, z));
+        return ((cz * self.w) + cx) as i64;
+    }
+
+    /** The ground moisture alone at (`x`, `z`), bilinear: what the ground shader needs from every pixel. */
+    pub fn moistAt(self, x : f32, z : f32) : f32 {
+        let u : f32 = (x - self.originX) / self.cell;
+        let v : f32 = (z - self.originZ) / self.cell;
+        let iu : i32 = waterFloor(u);
+        let iv : i32 = waterFloor(v);
+        let fu : f32 = u - (iu as f32);
+        let fv : f32 = v - (iv as f32);
+        let c00 : i64 = self.column(iu, iv);
+        let c10 : i64 = self.column(iu + 1, iv);
+        let c01 : i64 = self.column(iu, iv + 1);
+        let c11 : i64 = self.column(iu + 1, iv + 1);
+        let w00 : f32 = ((1.0 as f32) - fu) * ((1.0 as f32) - fv);
+        let w10 : f32 = fu * ((1.0 as f32) - fv);
+        let w01 : f32 = ((1.0 as f32) - fu) * fv;
+        let w11 : f32 = fu * fv;
+        let byteScale : f32 = (1.0 as f32) / WIN_BYTE;
+        return ((self.moist[c00] as f32) * w00 + (self.moist[c10] as f32) * w10
+            + (self.moist[c01] as f32) * w01
+            + (self.moist[c11] as f32) * w11)
+            * byteScale;
+    }
+
+    /** All the window's values at (`x`, `z`) metres, bilinear. */
+    pub fn at(self, x : f32, z : f32) : WindowSpot {
+        let u : f32 = (x - self.originX) / self.cell;
+        let v : f32 = (z - self.originZ) / self.cell;
+        let iu : i32 = waterFloor(u);
+        let iv : i32 = waterFloor(v);
+        let fu : f32 = u - (iu as f32);
+        let fv : f32 = v - (iv as f32);
+        let c00 : i64 = self.column(iu, iv);
+        let c10 : i64 = self.column(iu + 1, iv);
+        let c01 : i64 = self.column(iu, iv + 1);
+        let c11 : i64 = self.column(iu + 1, iv + 1);
+        let w00 : f32 = ((1.0 as f32) - fu) * ((1.0 as f32) - fv);
+        let w10 : f32 = fu * ((1.0 as f32) - fv);
+        let w01 : f32 = ((1.0 as f32) - fu) * fv;
+        let w11 : f32 = fu * fv;
+        let bed : f32 = self.bed[c00] * w00 + self.bed[c10] * w10 + self.bed[c01] * w01 + self.bed[c11] * w11;
+        let top : f32 = self.top.heightAt(x, z);
+        let scale : f32 = (1.0 as f32) / WIN_VELOCITY_STEPS;
+        let vx : f32 = ((self.velocity[c00 * 2] as f32) * w00 + (self.velocity[c10 * 2] as f32) * w10
+            + (self.velocity[c01 * 2] as f32) * w01
+            + (self.velocity[c11 * 2] as f32) * w11)
+            * scale;
+        let vz : f32 = ((self.velocity[c00 * 2 + 1] as f32) * w00 + (self.velocity[c10 * 2 + 1] as f32) * w10
+            + (self.velocity[c01 * 2 + 1] as f32) * w01
+            + (self.velocity[c11 * 2 + 1] as f32) * w11)
+            * scale;
+        let byteScale : f32 = (1.0 as f32) / WIN_BYTE;
+        return WindowSpot {
+            bed: bed,
+            depth: ludax::max(top - bed, (0.0 as f32)),
+            vx: vx,
+            vz: vz,
+            foam: ((self.foam[c00] as f32) * w00 + (self.foam[c10] as f32) * w10
+                + (self.foam[c01] as f32) * w01
+                + (self.foam[c11] as f32) * w11)
+                * byteScale,
+            turbulence: ((self.turbulence[c00] as f32) * w00 + (self.turbulence[c10] as f32) * w10
+                + (self.turbulence[c01] as f32) * w01
+                + (self.turbulence[c11] as f32) * w11)
+                * byteScale,
+            moist: ((self.moist[c00] as f32) * w00 + (self.moist[c10] as f32) * w10
+                + (self.moist[c01] as f32) * w01
+                + (self.moist[c11] as f32) * w11)
+                * byteScale,
+            dye: ((self.dye[c00] as f32) * w00 + (self.dye[c10] as f32) * w10 + (self.dye[c01] as f32) * w01
+                + (self.dye[c11] as f32) * w11)
+                * byteScale,
+        };
+    }
+
+    /**
+     * All the window's values at (`x`, `z`) metres by Catmull-Rom splines over the sixteen columns around the point, so the
+     * engine's cells never show: depth, flow, foam and turbulence are smooth, the surface slope is the spline's own
+     * derivative, and the wet edge is a smooth line. Where a neighbour lies across a lip or a wall (see `WIN_LIP_JUMP`) nothing
+     * is interpolated across it: the point is read bilinearly, which keeps the film that clings to a cliff face where it is.
+     */
+    pub fn smooth(self, x : f32, z : f32) : WindowSpot {
+        let u : f32 = (x - self.originX) * self.invCell;
+        let v : f32 = (z - self.originZ) * self.invCell;
+        let iu : i32 = waterFloor(u);
+        let iv : i32 = waterFloor(v);
+        let fu : f32 = u - (iu as f32);
+        let fv : f32 = v - (iv as f32);
+        let sx : Spline = Spline::make(fu);
+        let sz : Spline = Spline::make(fv);
+        let nearest : i64 = self.column(iu + ((fu + (0.5 as f32)) as i32), iv + ((fv + (0.5 as f32)) as i32));
+        let heightHere : f32 = self.top.heights[nearest];
+        let bedHere : f32 = self.bed[nearest];
+
+        let mut bed : f32 = (0.0 as f32);
+        let mut depth : f32 = (0.0 as f32);
+        let mut sdx : f32 = (0.0 as f32);
+        let mut sdz : f32 = (0.0 as f32);
+        let mut vx : f32 = (0.0 as f32);
+        let mut vz : f32 = (0.0 as f32);
+        let mut foam : f32 = (0.0 as f32);
+        let mut turbulence : f32 = (0.0 as f32);
+        let mut dye : f32 = (0.0 as f32);
+        for (jj of 0..4) {
+            for (ii of 0..4) {
+                let c : i64 = self.column(iu - 1 + ii, iv - 1 + jj);
+                if (abs(self.top.heights[c] - heightHere) > WIN_LIP_JUMP
+                    || abs(self.bed[c] - bedHere) > WIN_LIP_JUMP) {
+                    return self.wall(x, z);
+                }
+                let w : f32 = sx.weight(ii) * sz.weight(jj);
+                let height : f32 = self.top.heights[c];
+                bed = bed + w * self.bed[c];
+                depth = depth + w * (height - self.bed[c]);
+                sdx = sdx + sx.slope(ii) * sz.weight(jj) * height;
+                sdz = sdz + sx.weight(ii) * sz.slope(jj) * height;
+                vx = vx + w * (self.velocity[c * 2] as f32);
+                vz = vz + w * (self.velocity[c * 2 + 1] as f32);
+                foam = foam + w * (self.foam[c] as f32);
+                turbulence = turbulence + w * (self.turbulence[c] as f32);
+                dye = dye + w * (self.dye[c] as f32);
+            }
+        }
+        let scale : f32 = (1.0 as f32) / WIN_VELOCITY_STEPS;
+        let byteScale : f32 = (1.0 as f32) / WIN_BYTE;
+        let unit : f32 = (1.0 as f32);
+        let zero : f32 = (0.0 as f32);
+        return WindowSpot {
+            bed: bed,
+            depth: ludax::max(depth, zero),
+            vx: vx * scale,
+            vz: vz * scale,
+            foam: clamp(foam * byteScale, zero, unit),
+            turbulence: clamp(turbulence * byteScale, zero, unit),
+            moist: self.moistAt(x, z),
+            dye: clamp(dye * byteScale, zero, unit),
+            slopeX: sdx * self.invCell,
+            slopeZ: sdz * self.invCell,
+        };
+    }
+
+    // The bilinear reading with the surface's slope, for a point whose neighbours are not one smooth surface.
+    fn wall(self, x : f32, z : f32) : WindowSpot {
+        let mut spot : WindowSpot = self.at(x, z);
+        let slope : Vec3 = self.top.slopeAt(x, z);
+        spot.slopeX = slope.x;
+        spot.slopeZ = slope.z;
+        return spot;
+    }
+}

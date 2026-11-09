@@ -1,0 +1,178 @@
+// ground_rock — bedded rock: beds of different hardness, ledges, joints, lichen and wet streaks.
+//
+// A sedimentary cliff is a pile of beds. Each bed has its own thickness, colour and hardness; the hard ones stand
+// proud and the soft ones recede, which is what throws the long horizontal light and shadow bands on a real wall.
+// Here the beds are cuts of the height (warped by noise so they undulate and dip), the bed number picks the colour
+// and the hardness from a hash, and the hardness profile's slope tilts the normal: that is the ledge, with no
+// geometry. Vertical joints break each bed into blocks whose offsets differ from bed to bed like masonry. Thin
+// lines are drawn as coverage: a crack narrower than a pixel is a faint darkening of that pixel, so a far cliff is a
+// soft banded colour and a near one is cracked. Every coordinate is a world position (3D noise, or the plane the
+// wall lies in), so a face is never stretched; on a floor the same function gives weathered bedrock slabs.
+
+use ludax::{abs, max, min, saturate, smoothstep, Vec3};
+
+use crate::water::ground_noise::{groundFade, groundPlanes, groundSlope3};
+use crate::water::ground_site::{GroundPatch, GroundSite};
+use crate::water::noise::{waterFbm2, waterFloor, waterHash, waterValue2, waterValue3};
+use crate::water::vista_look::GroundLook;
+
+// Seeds.
+const GR_SEED_BED : i32 = 401;
+const GR_SEED_WARP : i32 = 409;
+const GR_SEED_JOINT : i32 = 419;
+const GR_SEED_GRAIN : i32 = 431;
+const GR_SEED_LICHEN : i32 = 433;
+const GR_SEED_STREAK : i32 = 439;
+
+// Bed thickness, metres, and the thin laminae inside a bed.
+const GR_BED : f32 = 6.5;
+const GR_LAMINA : f32 = 0.55;
+
+// How far a hard bed's face stands proud of a soft one, metres, and the distance its edge rounds off over.
+const GR_PROUD : f32 = 0.9;
+const GR_ROUND : f32 = 0.16;
+
+// Block width along a bed, metres, and the width of a joint's dark line.
+const GR_BLOCK : f32 = 4.2;
+const GR_JOINT : f32 = 0.07;
+
+// The rock turns from the ground's own tint to bare strata between these slopes.
+const GR_WALL_LOW : f32 = 0.5;
+const GR_WALL_HIGH : f32 = 1.1;
+
+/** Bedded rock. */
+pub class GroundRock {
+    /** The rock of `site`: strata colour, ledges and cracks, lichen, and dark streaks where it is damp. */
+    pub static fn patch(site : GroundSite, look : GroundLook) : GroundPatch {
+        let p : Vec3 = site.p;
+        let planes : Vec3 = groundPlanes(site.n);
+        let wall : f32 = smoothstep(GR_WALL_LOW, GR_WALL_HIGH, site.slope);
+        // The beds are surfaces of a gently folded stack: their height depends on the plan position only, so the
+        // lines they cut on a wall undulate and never close into rings.
+        let fold : f32 = waterFbm2(p.x * (0.0045 as f32), p.z * (0.0045 as f32), 3, GR_SEED_WARP);
+        let dip : f32 = p.x * (0.03 as f32) - p.z * (0.015 as f32);
+        let level : f32 = p.y - (fold - (0.5 as f32)) * (9.0 as f32) + dip;
+
+        let bed : f32 = level / GR_BED;
+        let index : i32 = waterFloor(bed);
+        let hard : f32 = waterHash(index, 0, 0, GR_SEED_BED);
+        let tone : f32 = waterHash(index, 1, 0, GR_SEED_BED);
+        let mut albedo : Vec3 = GroundRock::bedColour(look, tone, hard);
+        // Soil and weathering blur the beds where the face is not a wall.
+        albedo = look.rockGrey.lerp(albedo, (0.3 as f32) + (0.7 as f32) * wall);
+
+        let laminaId : i32 = waterFloor(level / GR_LAMINA);
+        let thin : f32 = waterHash(laminaId, 2, 0, GR_SEED_BED);
+        albedo = albedo.scale((0.9 as f32) + (0.2 as f32) * thin * wall);
+
+        let mut tilt : Vec3 = Vec3::zero();
+        let mut open : f32 = (1.0 as f32);
+        if (site.fine) {
+            let ledge : f32 = GroundRock::ledge(level, site.footprint);
+            tilt = Vec3 { x: (0.0 as f32), y: ledge * wall, z: (0.0 as f32) };
+
+            let cracks : f32 = GroundRock::joints(site, level, index, wall);
+            albedo = albedo.scale((1.0 as f32) - cracks * (0.75 as f32));
+            open = (1.0 as f32) - cracks * (0.5 as f32);
+
+            albedo = albedo.scale(GroundRock::speckle(p, site.footprint));
+            tilt = tilt.plus(GroundRock::grain(p, planes, site.footprint));
+        }
+        albedo = GroundRock::stain(site, look, albedo, wall);
+        albedo = GroundRock::lichen(site, look, albedo, wall);
+        return GroundPatch { albedo: albedo, tilt: tilt, gloss: site.damp * (0.5 as f32), open: open };
+    }
+
+    // The colour of a bed: dark, grey and warm tones and an occasional rust band, mixed by its hashes.
+    static fn bedColour(look : GroundLook, tone : f32, hard : f32) : Vec3 {
+        let cool : Vec3 = look.rockDark.lerp(look.rockGrey, smoothstep((0.0 as f32), (0.55 as f32), tone));
+        let warm : Vec3 = look.rockGrey.lerp(look.rockWarm, smoothstep((0.45 as f32), (1.0 as f32), tone));
+        let base : Vec3 = cool.lerp(warm, smoothstep((0.35 as f32), (0.65 as f32), tone));
+        let rust : f32 = smoothstep((0.82 as f32), (0.95 as f32), hard) * (0.7 as f32);
+        return base.lerp(look.rockRust, rust).scale((0.8 as f32) + (0.45 as f32) * hard);
+    }
+
+    // The slope of the hardness profile that follows the beds, which tilts the normal into ledges and recesses.
+    static fn ledge(level : f32, footprint : f32) : f32 {
+        let e : f32 = (0.25 as f32);
+        let slope : f32 = (GroundRock::proud(level + e) - GroundRock::proud(level - e)) / (e * (2.0 as f32));
+        return slope * groundFade(GR_ROUND, footprint, 0.5, 4.0);
+    }
+
+    // How far the face stands out at height `level`, metres: a hard bed is proud, its upper edge slumps.
+    static fn proud(level : f32) : f32 {
+        let bed : f32 = level / GR_BED;
+        let index : i32 = waterFloor(bed);
+        let across : f32 = (bed - (index as f32)) * GR_BED;
+        let here : f32 = waterHash(index, 0, 0, GR_SEED_BED);
+        let rise : f32 = smoothstep((0.0 as f32), GR_ROUND, across);
+        let fall : f32 = smoothstep(GR_BED - GR_ROUND * (3.0 as f32), GR_BED, across);
+        return here * GR_PROUD * (rise - fall * (0.5 as f32));
+    }
+
+    // Vertical joints: each bed is cut into blocks at its own offsets, and a cut wanders. 0 to 1 of darkness.
+    static fn joints(site : GroundSite, level : f32, index : i32, wall : f32) : f32 {
+        if (wall <= (0.0 as f32)) {
+            return (0.0 as f32);
+        }
+        let sideways : f32 = max(site.n.x * site.n.x + site.n.z * site.n.z, (0.0025 as f32));
+        let along : f32 = (site.p.x * site.n.z * site.n.z + site.p.z * site.n.x * site.n.x) / sideways;
+        let wander : f32 = waterFbm2(along * (0.09 as f32), level * (0.05 as f32), 2, GR_SEED_JOINT)
+            * (0.45 as f32);
+        let width : f32 = GR_BLOCK * ((0.6 as f32) + (0.9 as f32) * waterHash(index, 3, 0, GR_SEED_JOINT));
+        let offset : f32 = waterHash(index, 4, 0, GR_SEED_JOINT) * width;
+        let block : f32 = (along + wander + offset) / width;
+        let frac : f32 = block - (waterFloor(block) as f32);
+        let distance : f32 = min(frac, (1.0 as f32) - frac) * width;
+        let reach : f32 = max(GR_JOINT, site.footprint * (0.8 as f32));
+        let coverage : f32 = min((1.0 as f32), GR_JOINT / reach);
+        return smoothstep(reach, (0.0 as f32), distance) * coverage * wall;
+    }
+
+    // Fine grain: two scales of speckle that average out with distance.
+    static fn speckle(p : Vec3, footprint : f32) : f32 {
+        let coarse : f32 = waterValue3(p.scale((1.7 as f32)), GR_SEED_GRAIN + 11);
+        let fine : f32 = waterValue3(p.scale((9.0 as f32)), GR_SEED_GRAIN + 13);
+        let near : f32 = groundFade((0.11 as f32), footprint, 0.3, 1.5);
+        return (0.88 as f32) + (0.24 as f32) * coarse + (fine - (0.5 as f32)) * (0.14 as f32) * near;
+    }
+
+    // The micro-relief of the rock: knobbly at half a metre, rough at ten centimetres.
+    static fn grain(p : Vec3, planes : Vec3, footprint : f32) : Vec3 {
+        let knobs : Vec3 = groundSlope3(p, (0.45 as f32), planes, GR_SEED_GRAIN).scale((0.05 as f32));
+        let rough : Vec3 = groundSlope3(p, (0.09 as f32), planes, GR_SEED_GRAIN + 3).scale((0.012 as f32)
+            * groundFade((0.09 as f32), footprint, 0.4, 1.2));
+        return knobs.plus(rough);
+    }
+
+    // Dark water streaks that run down a face, strongest where it is damp.
+    static fn stain(site : GroundSite, look : GroundLook, albedo : Vec3, wall : f32) : Vec3 {
+        if (wall <= (0.0 as f32)) {
+            return albedo;
+        }
+        let p : Vec3 = site.p;
+        let along : f32 = p.x * abs(site.n.z) + p.z * abs(site.n.x);
+        let bands : f32 = waterValue2(along * (0.7 as f32), p.y * (0.045 as f32), GR_SEED_STREAK);
+        let thin : f32 = waterValue2(along * (2.3 as f32), p.y * (0.09 as f32), GR_SEED_STREAK + 3);
+        let streak : f32 = smoothstep((0.55 as f32), (0.85 as f32), bands * thin * (1.6 as f32));
+        let amount : f32 = saturate(streak * ((0.25 as f32) + site.damp * (1.5 as f32))) * wall;
+        return albedo.lerp(albedo.times(look.rockStain).scale((4.0 as f32)), amount * (0.75 as f32));
+    }
+
+    // Lichen: round patches of grey-green and orange on dry rock; sparse, and absent on a far face.
+    static fn lichen(site : GroundSite, look : GroundLook, albedo : Vec3, wall : f32) : Vec3 {
+        let near : f32 = groundFade((2.0 as f32), site.footprint, 0.05, 0.5);
+        if (near <= (0.0 as f32)) {
+            return albedo;
+        }
+        let patch : f32 = waterValue3(site.p.scale((0.45 as f32)), GR_SEED_LICHEN);
+        let dots : f32 = waterValue3(site.p.scale((3.5 as f32)), GR_SEED_LICHEN + 7);
+        let on : f32 = smoothstep((0.64 as f32), (0.8 as f32), patch)
+            * smoothstep((0.35 as f32), (0.6 as f32), dots);
+        let hue : f32 = waterValue3(site.p.scale((0.13 as f32)), GR_SEED_LICHEN + 3);
+        let colour : Vec3 = look.lichen.lerp(look.lichenOrange, smoothstep((0.5 as f32), (0.7 as f32), hue));
+        let share : f32 = on * near * ((1.0 as f32) - site.damp * (0.7 as f32))
+            * ((1.0 as f32) - wall * (0.4 as f32));
+        return albedo.lerp(colour, share * (0.45 as f32));
+    }
+}

@@ -1,0 +1,135 @@
+// terrain_relief — the raw ground: valley floor, escarpment, reservoir bowl and the mountains around them.
+//
+// The height of a point is the plan's `base` (valley floor with the cliff's step) plus the mountains plus the
+// reservoir's bowl. The mountains are ridged multifractal noise, domain-warped so crests do not follow the grid, laid
+// on two supports that make a range and not a lump: the valley walls, which rise from the floodplain's edge, and
+// the cirque, which rises from the reservoir's shore on the three sides away from the cliff. Their size follows
+// `tall`, big in the north and falling south toward the end lake. A floor under the noise (30 percent of the support)
+// keeps valleys draining toward the middle instead of closing into basins.
+//
+// The notch the river leaves the lake by is made here: the shore bench and the cirque are gated to nothing inside
+// the notch, so the rim there is flat at exactly the lake level, the lowest point of the whole rim. Nothing else
+// in the pipeline lowers or raises the rim (`terrain_erosion` leaves the lake's surroundings alone), so that is
+// the spill point.
+
+use ludax::{abs, max, smoothstep};
+
+use crate::terrain::terrain_noise::{terrainFbm, terrainRidged};
+use crate::terrain::terrain_plan::TerrainPlan;
+
+// Wavelength of the biggest mountain features, metres, and how far the warp moves a point.
+const RELIEF_SCALE : f32 = 900.0;
+const RELIEF_WARP : f32 = 280.0;
+const RELIEF_WARP_SCALE : f32 = 1700.0;
+
+// Octaves of the ridged sum (down to about 10 m) and of the warp.
+const RELIEF_OCTAVES : i32 = 8;
+const RELIEF_WARP_OCTAVES : i32 = 3;
+
+// The share of the support that the noise cannot take away: the slope the valleys drain down.
+const RELIEF_FLOOR : f32 = 0.12;
+
+// How fast the walls rise from the floodplain's edge, metres, and the cirque's span in lake radii.
+const RELIEF_WALL_RUN : f32 = 900.0;
+const RELIEF_CIRQUE_FROM : f32 = 1.1;
+const RELIEF_CIRQUE_TO : f32 = 3.0;
+
+// The cirque fades out south of the crest over this span (metres from 100 north of the crest to 500 south of it): a
+// short fade would leave a long straight scarp across the hills where the cirque ends and the valley walls begin.
+const RELIEF_NORTH_FROM : f32 = 100.0;
+const RELIEF_NORTH_TO : f32 = 500.0;
+const RELIEF_NORTH_WANDER : f32 = 420.0;
+const RELIEF_NORTH_SCALE : f32 = 900.0;
+const RELIEF_SEED_NORTH : i32 = 29;
+
+// The ridges lose this share of their height between the cliff and the end lake.
+const RELIEF_FADE : f32 = 0.72;
+
+// How far under the rim's height the notch's floor lies, metres: the sill is the lowest point of the rim by a margin
+// that rounding and erosion cannot undo, so the lake spills there and nowhere else.
+const RELIEF_SILL : f32 = 0.3;
+
+// Noise seeds of the relief.
+const RELIEF_SEED_RIDGE : i32 = 21;
+const RELIEF_SEED_WARP_X : i32 = 11;
+const RELIEF_SEED_WARP_Z : i32 = 13;
+
+/** The raw ground of a plan. */
+pub class TerrainRelief {
+    /** Fills rows `begin` up to `end` of `bed` (`width` columns) with the raw ground. */
+    pub static fn rows(plan : TerrainPlan, bed : f32[], width : i32, begin : i32, end : i32) : void {
+        for (j of begin..end) {
+            let z : f32 = ((j as f32) + 0.5 as f32) * plan.cell;
+            for (i of 0..width) {
+                let x : f32 = ((i as f32) + 0.5 as f32) * plan.cell;
+                bed[((j as i64) * (width as i64)) + (i as i64)] = TerrainRelief::height(plan, x, z);
+            }
+        }
+    }
+
+    /** The raw height at (x, z). */
+    pub static fn height(plan : TerrainPlan, x : f32, z : f32) : f32 {
+        let crest : f32 = plan.crestZ(x);
+        let r : f32 = plan.lakeRadius(x, z);
+        let lateral : f32 = plan.lateral(x, z);
+        let shift : f32 = RELIEF_NORTH_WANDER
+            * terrainFbm(x / RELIEF_NORTH_SCALE, 0.5 as f32, plan.seed + RELIEF_SEED_NORTH, 3);
+        let north : f32 = 1.0 as f32
+            - smoothstep(crest - RELIEF_NORTH_FROM + shift, crest + RELIEF_NORTH_TO + shift, z);
+
+        let wall : f32 = smoothstep(plan.floodHalf * 0.9 as f32, plan.floodHalf + RELIEF_WALL_RUN, lateral);
+        let cirque : f32 = smoothstep(RELIEF_CIRQUE_FROM, RELIEF_CIRQUE_TO, r) * north;
+        let support : f32 = max(wall, cirque) * TerrainRelief::tall(plan, z);
+        let mountains : f32 = plan.params.mountainHeight * support * TerrainRelief::core(plan, x, z);
+
+        let gate : f32 = TerrainRelief::gate(plan, x, z, crest);
+        let bench : f32 = plan.shoreRise(r)
+            * (1.0 as f32 - smoothstep(crest - 20.0 as f32, crest + 60.0 as f32, z));
+        let bowl : f32 = plan.params.lakeDepth * (1.0 as f32 - smoothstep(0.6 as f32, 1.0 as f32, r));
+        let sill : f32 = RELIEF_SILL * (1.0 as f32 - gate);
+        return plan.base(x, z) + (mountains + bench) * gate - bowl - sill;
+    }
+
+    // How tall the range is at south coordinate z: 1 in the north, falling toward the end lake.
+    static fn tall(plan : TerrainPlan, z : f32) : f32 {
+        return 1.0 as f32 - RELIEF_FADE * smoothstep(plan.notchZ * 0.6 as f32, plan.size * 0.95 as f32, z);
+    }
+
+    // The ridged noise, warped, in [0.3, 1]: what the support is multiplied by.
+    static fn core(plan : TerrainPlan, x : f32, z : f32) : f32 {
+        let seed : i32 = plan.seed;
+        let warpX : f32 = RELIEF_WARP
+            * terrainFbm(
+                x / RELIEF_WARP_SCALE,
+                z / RELIEF_WARP_SCALE,
+                seed + RELIEF_SEED_WARP_X,
+                RELIEF_WARP_OCTAVES
+            );
+        let warpZ : f32 = RELIEF_WARP
+            * terrainFbm(
+                x / RELIEF_WARP_SCALE + 7.3 as f32,
+                z / RELIEF_WARP_SCALE - 3.1 as f32,
+                seed + RELIEF_SEED_WARP_Z,
+                RELIEF_WARP_OCTAVES
+            );
+        let px : f32 = (x + warpX) / RELIEF_SCALE;
+        let pz : f32 = (z + warpZ) / RELIEF_SCALE;
+        let ridge : f32 = terrainRidged(
+            px,
+            pz,
+            seed + RELIEF_SEED_RIDGE,
+            RELIEF_OCTAVES,
+            plan.params.ridgeSharpness
+        );
+        return RELIEF_FLOOR + (1.0 as f32 - RELIEF_FLOOR) * ridge;
+    }
+
+    // 0 inside the notch between the reservoir and the crest, 1 elsewhere: the rim there is left at the lake level.
+    static fn gate(plan : TerrainPlan, x : f32, z : f32, crest : f32) : f32 {
+        let wn : f32 = plan.params.lipNotchWidth;
+        let across : f32 = smoothstep(wn * 0.45 as f32, wn * 2.0 as f32, abs(x - plan.axisX0));
+        let toward : f32 = smoothstep(plan.lakeZ, plan.lakeZ + plan.lakeB * 0.55 as f32, z);
+        let before : f32 = 1.0 as f32 - smoothstep(crest - 5.0 as f32, crest + 10.0 as f32, z);
+        return 1.0 as f32 - (1.0 as f32 - across) * toward * before;
+    }
+}

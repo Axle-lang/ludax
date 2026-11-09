@@ -1,0 +1,313 @@
+// sky — the daytime sky as a radiance grid, the sun, the ambient dome and the haze toward the horizon.
+//
+// Ludax's `LightSky` integrates single scattering along a view ray, which is right and far too slow to ask once
+// per pixel. So when the time of day changes the radiance is evaluated over a latitude-longitude grid (in
+// parallel, rows to the pool) and every ray afterwards is a bilinear lookup; blurred copies stand in for a
+// prefiltered environment, so a rough reflection reads the blur and a mirror the sharp grid. The sun is a disc
+// added to the grid at its true irradiance (so it is far brighter than anything it lights, and the bloom of `post`
+// carries the glare). The ambient light on the ground and the water is the dome's SH9, evaluated per normal.
+//
+// This is the module that `WaterModules.sky` switches off: `view` then answers one flat colour. It owns no
+// geometry and no water.
+
+use ludax::{asin, atan2, cos, saturate, sin, smoothstep, LightSh9, LightSky, Vec2, Vec3, PI, TAU};
+
+use crate::water::look::SkyLook;
+use crate::water::noise::{waterBillow3, waterFbm2};
+use crate::water::skygrid::WaterSkyGrid;
+
+/** Cells of the sharp grid around the horizon and from nadir to zenith, and of the two blurred levels. */
+const WSKY_W : i32 = 128;
+const WSKY_H : i32 = 64;
+const WSKY_MID_W : i32 = 32;
+const WSKY_MID_H : i32 = 16;
+const WSKY_LOW_W : i32 = 8;
+const WSKY_LOW_H : i32 = 4;
+
+/** Rows of the grid one pool job bakes. */
+pub const WSKY_ROWS_PER_JOB : i32 = 1;
+
+// Roughness below which a reflection reads the sharp grid, and below which it reads the middle blur.
+const WSKY_ROUGH_SHARP : f32 = 0.18;
+const WSKY_ROUGH_MID : f32 = 0.5;
+
+// The sun's angular radius as drawn (a little larger than life, which is what a camera's glare does), the width
+// of the disc's edge in cosine units, and the order of the ambient dome's quadrature.
+const WSKY_SUN_RADIUS : f32 = 0.012;
+const WSKY_SUN_EDGE : f32 = 0.00002;
+const WSKY_DOME_ORDER : i32 = 12;
+
+// The cloud deck: the lowest elevation (sine) it shows at and where it is fully shown, the noise scale on the deck,
+// how far toward the sun the shading looks (noise units), the edge softness of a cloud, how much the shading
+// weighs, the brightness of a lit cloud against the sun's radiance, how white it is, and its belly's share of the
+// zenith.
+const WSKY_CLOUD_MIN : f32 = 0.03;
+const WSKY_CLOUD_FULL : f32 = 0.22;
+const WSKY_CLOUD_SCALE : f32 = 0.0009;
+const WSKY_CLOUD_LEAN : f32 = 0.35;
+const WSKY_CLOUD_EDGE : f32 = 0.3;
+const WSKY_CLOUD_MID : f32 = 0.62;
+const WSKY_CLOUD_RELIEF : f32 = 3.2;
+const WSKY_CLOUD_SUN : f32 = 0.85;
+const WSKY_CLOUD_WHITEN : f32 = 0.5;
+const WSKY_CLOUD_BELLY : f32 = 1.5;
+const WSKY_CLOUD_OCTAVES : i32 = 4;
+const WSKY_CLOUD_SEED : i32 = 131;
+
+// The cirrus deck: its height, the lowest elevation (sine) it shows at, the noise frequencies along the wind and across
+// it (the streaks are long in the wind's direction), the cover threshold, and how opaque the thickest streak is.
+const WSKY_CIRRUS_HEIGHT : f32 = 9000.0;
+const WSKY_CIRRUS_MIN : f32 = 0.02;
+const WSKY_CIRRUS_ALONG : f32 = 0.00016;
+const WSKY_CIRRUS_ACROSS : f32 = 0.0011;
+const WSKY_CIRRUS_EDGE : f32 = 0.6;
+const WSKY_CIRRUS_OPACITY : f32 = 0.26;
+const WSKY_CIRRUS_SEED : i32 = 157;
+
+// The sun's glare: the cosine from which the haze around the disc starts, and its strength as a share of the sun's
+// radiance over pi (a camera's glare, which the bloom of `post` carries on).
+const WSKY_GLARE_START : f32 = 0.985;
+const WSKY_GLARE : f32 = 0.025;
+
+// The eye's height over the ground the sky is evaluated for, and the albedo of that ground.
+const WSKY_GROUND_HORIZON : f32 = 0.02;
+
+// Where the haze reads the sky: the direction is flattened toward the horizon by this and lifted by that.
+const WSKY_HAZE_FLATTEN : f32 = 0.25;
+const WSKY_HAZE_LIFT : f32 = 0.05;
+
+// The ground below the horizon fades into the horizon colour at this rate per unit of dip.
+const WSKY_GROUND_FADE : f32 = 14.0;
+
+/** The sky of one moment of the day. */
+pub class WaterSky {
+    grid : WaterSkyGrid;
+    mid  : WaterSkyGrid;
+    low  : WaterSkyGrid;
+    day  : LightSky;
+
+    /** Unit direction toward the sun. */
+    pub sunDir : Vec3;
+
+    /** The sun's irradiance on a surface facing it, per channel, reddened by the air. */
+    pub sunIrr : Vec3;
+
+    /** The sky dome as spherical harmonics, for ambient light. */
+    pub dome : LightSh9;
+
+    /** The radiance of the zenith, a measure of how bright the blue is. */
+    pub zenith : Vec3;
+
+    /** Where the deck sits, how much it covers and how far it has drifted: set once a frame with the look. */
+    pub cover  : f32 = 0.0;
+    pub height : f32 = 700.0;
+    pub drift  : f32 = 0.0;
+
+    sunLimit : f32;
+    sunScale : f32;
+    flat     : Vec3;
+    shown    : bool = true;
+    gain     : f32 = 1.0;
+
+    /** A sky at noon; `configure` and `bake` move it to the time of day a scene asks for. */
+    constructor() {
+        self.grid = new WaterSkyGrid(WSKY_W, WSKY_H);
+        self.mid = new WaterSkyGrid(WSKY_MID_W, WSKY_MID_H);
+        self.low = new WaterSkyGrid(WSKY_LOW_W, WSKY_LOW_H);
+        self.day = LightSky::atDayTime(0.5, 0.2);
+        self.sunDir = self.day.sunDirection();
+        self.sunIrr = self.day.sunIrradiance();
+        self.dome = LightSh9::zero();
+        self.zenith = Vec3::zero();
+        self.sunLimit = cos(WSKY_SUN_RADIUS);
+        self.sunScale = (1.0 as f32) / (PI * sin(WSKY_SUN_RADIUS) * sin(WSKY_SUN_RADIUS));
+        self.flat = Vec3::zero();
+    }
+
+    /** Points the sky at the time of day of `look`; follow it with the baking of every row and `finish`. */
+    pub fn configure(mut self, look : SkyLook, shown : bool) : void {
+        self.shown = shown;
+        self.gain = look.gain;
+        self.cover = look.cloudCover;
+        self.height = look.cloudHeight;
+        self.day = LightSky::atDayTime(look.dayTime, look.tilt);
+        self.sunDir = self.day.sunDirection();
+        self.sunIrr = self.day.sunIrradiance();
+        self.flat = look.flat;
+    }
+
+    /** Rows of the grid, for the job pool. */
+    pub fn rows(self) : i32 {
+        return WSKY_H;
+    }
+
+    /** Evaluates rows `begin` up to `end` of the radiance grid. */
+    pub fn bakeRows(mut self, begin : i32, end : i32) : void {
+        for (row of begin..end) {
+            let elevation : f32 = ((((row as f32) + (0.5 as f32)) / (WSKY_H as f32)) - (0.5 as f32)) * PI;
+            for (col of 0..WSKY_W) {
+                let azimuth : f32 = (((col as f32) + (0.5 as f32)) / (WSKY_W as f32)) * TAU;
+                let ce : f32 = cos(elevation);
+                let dir : Vec3 = Vec3 { x: sin(azimuth) * ce, y: sin(elevation), z: cos(azimuth) * ce };
+                self.grid.put(col, row, self.day.skyRadiance(dir).scale(self.gain));
+            }
+        }
+    }
+
+    /** Blurs the baked grid and integrates the dome once every row is in. */
+    pub fn finish(mut self) : void {
+        self.grid.downsampleInto(self.mid);
+        self.grid.downsampleInto(self.low);
+        self.dome = self.day.ambient(WSKY_DOME_ORDER).scaled(self.gain);
+        self.zenith = self.base(Vec3::unitY());
+    }
+
+    // The place of `dir` on the grid as (u, v) in 0..1.
+    fn place(dir : Vec3) : Vec2 {
+        let mut az : f32 = atan2(dir.x, dir.z);
+        if (az < 0.0) {
+            az = az + TAU;
+        }
+        let el : f32 = asin(saturate((dir.y + (1.0 as f32)) * (0.5 as f32)) * (2.0 as f32) - (1.0 as f32));
+        return Vec2 { x: az / TAU, y: el / PI + (0.5 as f32) };
+    }
+
+    /** The radiance of the clear sky toward `dir`: the grid itself, without the sun's disc. */
+    pub fn base(self, dir : Vec3) : Vec3 {
+        return self.grid.look(WaterSky::place(dir));
+    }
+
+    /** The environment's radiance along `dir` as a surface of perceptual `roughness` reflects it. */
+    pub fn prefiltered(self, dir : Vec3, roughness : f32) : Vec3 {
+        let place : Vec2 = WaterSky::place(dir);
+        if (roughness < WSKY_ROUGH_MID) {
+            let sharp : Vec3 = self.grid.look(place);
+            if (roughness < WSKY_ROUGH_SHARP) {
+                return sharp;
+            }
+            let blur : Vec3 = self.mid.look(place);
+            return sharp.lerp(blur, (roughness - WSKY_ROUGH_SHARP) / (WSKY_ROUGH_MID - WSKY_ROUGH_SHARP));
+        }
+        let blur : Vec3 = self.mid.look(place);
+        return blur.lerp(self.low.look(place), saturate((roughness - WSKY_ROUGH_MID) / WSKY_ROUGH_MID));
+    }
+
+    /** What an eye sees along `dir`: the sky, the clouds and the sun's disc, and below the horizon the plain's haze. */
+    pub fn view(self, dir : Vec3) : Vec3 {
+        if (!self.shown) {
+            return self.flat;
+        }
+        let backdrop : Vec3 = self.cloudsOver(self.backdrop(dir), dir);
+        let sunCos : f32 = dir.dot(self.sunDir);
+        let glare : f32 = smoothstep(WSKY_GLARE_START, (1.0 as f32), sunCos);
+        let halo : Vec3 = self.sunIrr.scale(WSKY_GLARE * glare * glare / PI);
+        if (sunCos <= self.sunLimit) {
+            return backdrop.plus(halo);
+        }
+        let edge : f32 = smoothstep(self.sunLimit, self.sunLimit + WSKY_SUN_EDGE, sunCos);
+        return backdrop.plus(halo).plus(self.sunIrr.scale(edge * self.sunScale));
+    }
+
+    /**
+     * `base` (the clear sky toward `dir`) with the cumulus deck over it. The deck is a plane at `cloudHeight`; the
+     * clouds are folded noise cut at the cover, lit white where the deck thins toward the sun and grey-blue where it is
+     * thick, so each cloud has a bright edge and a shaded belly. Clouds thin out to the horizon, where they would
+     * only alias.
+     */
+    pub fn cloudsOver(self, clear : Vec3, dir : Vec3) : Vec3 {
+        let base : Vec3 = self.cirrusOver(clear, dir);
+        if (self.cover <= 0.0 || dir.y <= WSKY_CLOUD_MIN) {
+            return base;
+        }
+        let reach : f32 = self.height / dir.y;
+        let at : Vec3 = Vec3 { x: dir.x * reach + self.drift, y: 0.0, z: dir.z * reach };
+        let q : Vec3 = at.scale(WSKY_CLOUD_SCALE);
+        let thick : f32 = WaterSky::cloudNoise(q);
+        let lean : Vec3 = q.plus(Vec3 { x: self.sunDir.x, y: 0.0, z: self.sunDir.z }.scale(WSKY_CLOUD_LEAN));
+        let toward : f32 = WaterSky::cloudNoise(lean);
+        let body : f32 = smoothstep(
+            (1.0 as f32) - self.cover,
+            (1.0 as f32) - self.cover + WSKY_CLOUD_EDGE,
+            thick
+        );
+        if (body <= 0.0) {
+            return base;
+        }
+        let lit : f32 = saturate(WSKY_CLOUD_MID + (thick - toward) * WSKY_CLOUD_RELIEF);
+        let white : Vec3 = self.sunIrr
+            .scale(WSKY_CLOUD_SUN / PI)
+            .lerp(Vec3::splat(self.sunIrr.maxComponent() / PI), WSKY_CLOUD_WHITEN);
+        let belly : Vec3 = self.zenith.scale(WSKY_CLOUD_BELLY);
+        let colour : Vec3 = belly.lerp(white, lit);
+        let fade : f32 = smoothstep(WSKY_CLOUD_MIN, WSKY_CLOUD_FULL, dir.y);
+        return base.lerp(colour, body * fade);
+    }
+
+    // `base` with the high ice clouds over it: long thin streaks lit white, thickest where two noises agree.
+    fn cirrusOver(self, base : Vec3, dir : Vec3) : Vec3 {
+        if (self.cover <= 0.0 || dir.y <= WSKY_CIRRUS_MIN) {
+            return base;
+        }
+        let reach : f32 = WSKY_CIRRUS_HEIGHT / dir.y;
+        let x : f32 = dir.x * reach + self.drift * (3.0 as f32);
+        let z : f32 = dir.z * reach;
+        let warp : f32 = waterFbm2(x * (0.0004 as f32), z * (0.0004 as f32), 2, WSKY_CIRRUS_SEED + 7);
+        let streak : f32 = waterFbm2(
+            x * WSKY_CIRRUS_ALONG,
+            z * WSKY_CIRRUS_ACROSS + warp * (0.8 as f32),
+            4,
+            WSKY_CIRRUS_SEED
+        );
+        let fibre : f32 = waterFbm2(
+            x * WSKY_CIRRUS_ALONG * (6.0 as f32),
+            z * WSKY_CIRRUS_ACROSS * (4.0 as f32),
+            3,
+            WSKY_CIRRUS_SEED + 11
+        );
+        let body : f32 = smoothstep(WSKY_CIRRUS_EDGE, WSKY_CIRRUS_EDGE + (0.3 as f32), streak)
+            * ((0.35 as f32) + (0.65 as f32) * fibre);
+        let fade : f32 = smoothstep(WSKY_CIRRUS_MIN, WSKY_CLOUD_FULL, dir.y) * self.cover * (2.0 as f32);
+        let white : Vec3 = Vec3::splat(self.sunIrr.maxComponent() / PI).scale(WSKY_CLOUD_SUN * (0.7 as f32));
+        return base.lerp(white, saturate(body * fade) * WSKY_CIRRUS_OPACITY);
+    }
+
+    // Four octaves of rounded noise on the deck, in [0, 1).
+    static fn cloudNoise(q : Vec3) : f32 {
+        return waterBillow3(Vec3 { x: q.x, y: 0.0, z: q.z }, WSKY_CLOUD_OCTAVES, WSKY_CLOUD_SEED);
+    }
+
+    // The sky without the sun; below the horizon the colour of the horizon.
+    fn backdrop(self, dir : Vec3) : Vec3 {
+        if (dir.y < 0.0) {
+            let along : Vec3 = Vec3 { x: dir.x, y: WSKY_GROUND_HORIZON, z: dir.z }.normalized();
+            return self.base(along);
+        }
+        return self.base(dir);
+    }
+
+    /**
+     * The colour of the air along `dir`, what a distant surface dissolves into: the sky just above the horizon in
+     * that direction, so far terrain and far water take the colour of the sky they stand against.
+     */
+    pub fn haze(self, dir : Vec3) : Vec3 {
+        let lowered : f32 = dir.y * WSKY_HAZE_FLATTEN + WSKY_HAZE_LIFT;
+        let flat : Vec3 = Vec3 { x: dir.x, y: lowered, z: dir.z }.normalized();
+        return self.base(flat);
+    }
+
+    /** The radiance a white diffuse surface with unit normal `n` shows under the dome alone. */
+    pub fn ambient(self, n : Vec3) : Vec3 {
+        return self.dome.irradiance(n);
+    }
+
+    /** The radiance a white diffuse surface of normal `n` shows under the sun alone, before shadow. */
+    pub fn direct(self, n : Vec3) : Vec3 {
+        let lit : f32 = ludax::max(n.dot(self.sunDir), 0.0);
+        return self.sunIrr.scale(lit / PI);
+    }
+
+    /** The colour a picture without a sky shows (`WaterModules.sky` off). */
+    pub fn flatColour(self) : Vec3 {
+        return self.flat;
+    }
+}

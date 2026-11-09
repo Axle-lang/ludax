@@ -1,0 +1,133 @@
+// landscape — the ground of a fluid world as lit terrain: tiles shaded by slope and the walls between steps.
+//
+// One tile per column at its ground height, lambert-shaded from the finite-difference normal of the baked
+// ground and tinted from a low colour to a high one by height, plus a wall wherever a neighbour is lower by
+// more than `wallMin` (a smaller step would turn the deterministic noise of a plain into a maze). The ground
+// of a `FluidWorld` is baked once and never moves, but the tiles are re-projected every frame because the
+// camera does; there is no state to keep.
+
+use ludax::{saturate, FluidWorld, Vec3};
+use smalt::Color;
+
+use crate::shade::brush::{BRUSH_SUN_X, BRUSH_SUN_Y, BRUSH_SUN_Z};
+use crate::shade::brush::{brushBlend, brushLit, brushPack, Brush, Look};
+
+/** The y of an un-normalised terrain normal, whose x and z are the height differences. */
+const LAND_NORMAL_Y : f32 = 2.0;
+
+/** Shortest terrain normal the division by its length may see. */
+const LAND_NORMAL_MIN : f32 = 0.3;
+
+/** Colours and thresholds that make one landscape look like itself. */
+pub struct LandStyle {
+    /** Albedo of the lowest ground. */
+    pub rockLow : Color = Color { r: 0.4, g: 0.34, b: 0.28 };
+
+    /** Albedo of the highest ground. */
+    pub rockHigh : Color = Color { r: 0.58, g: 0.55, b: 0.5 };
+
+    /** Ground height the colour ramp starts at, cells. */
+    pub heightLow : f32 = 0.0;
+
+    /** Ground height the colour ramp ends at, cells. */
+    pub heightHigh : f32 = 8.0;
+
+    /** Albedo of the cut faces a step exposes. */
+    pub wall : i32 = 0x4d4438;
+
+    /** A wall is drawn when the neighbour is this much lower, cells. */
+    pub wallMin : f32 = 0.55;
+}
+
+/** Draws terrain; all of its state is the arguments. */
+pub class Landscape {
+    /** Pushes the tiles and walls of every column of `world` through `b`. */
+    pub static fn draw(b : Brush, world : FluidWorld, style : LandStyle) : void {
+        for (z of 0..world.depth()) {
+            for (x of 0..world.width()) {
+                let h : f32 = world.groundAt(x, z) as f32;
+                b.top(x, z, h, Landscape::tileLook(world, style, x, z));
+                Landscape::walls(b, world, style, x, z);
+            }
+        }
+    }
+
+    // The tile's albedo from its height and the sun's share from its slope.
+    static fn tileLook(world : FluidWorld, style : LandStyle, x : i32, z : i32) : Look {
+        let nx : f32 = (world.groundAt(Landscape::edge(x - 1, world.width()), z)
+            - world.groundAt(Landscape::edge(x + 1, world.width()), z)) as f32;
+        let nz : f32 = (world.groundAt(x, Landscape::edge(z - 1, world.depth()))
+            - world.groundAt(x, Landscape::edge(z + 1, world.depth()))) as f32;
+        let mut len : f32 = (nx * nx + LAND_NORMAL_Y * LAND_NORMAL_Y + nz * nz).sqrt();
+        if (len < LAND_NORMAL_MIN) {
+            len = LAND_NORMAL_MIN;
+        }
+        let sun : f32 = nx * BRUSH_SUN_X + LAND_NORMAL_Y * BRUSH_SUN_Y + nz * BRUSH_SUN_Z;
+
+        let h : f32 = world.groundAt(x, z) as f32;
+        let tall : f32 = (h - style.heightLow) / (style.heightHigh - style.heightLow);
+        let albedo : Color = brushBlend(style.rockLow, style.rockHigh, tall);
+        return Look { albedo: brushPack(albedo), lit: brushLit(saturate(sun / len)) };
+    }
+
+    // The coordinate `i` clamped into 0..size-1: the ground slopes on at the border as it was.
+    static fn edge(i : i32, size : i32) : i32 {
+        if (i < 0) {
+            return 0;
+        }
+        if (i >= size) {
+            return size - 1;
+        }
+        return i;
+    }
+
+    // The four walls a column can show, one per neighbour whose ground is lower. The sun reaches only the
+    // faces that look toward +x and +z.
+    static fn walls(b : Brush, world : FluidWorld, style : LandStyle, x : i32, z : i32) : void {
+        Landscape::wall(b, world, style, x, z, 1, 0, BRUSH_SUN_X);
+        Landscape::wall(b, world, style, x, z, -1, 0, 0.0);
+        Landscape::wall(b, world, style, x, z, 0, 1, BRUSH_SUN_Z);
+        Landscape::wall(b, world, style, x, z, 0, -1, 0.0);
+    }
+
+    // The wall down the shared edge toward (`dx`, `dz`), from this column's height to the neighbour's.
+    static fn wall(
+        b : Brush,
+        world : FluidWorld,
+        style : LandStyle,
+        x : i32,
+        z : i32,
+        dx : i32,
+        dz : i32,
+        sun : f32
+    ) : void {
+        let nx : i32 = x + dx;
+        let nz : i32 = z + dz;
+        if (nx < 0 || nz < 0 || nx >= world.width() || nz >= world.depth()) {
+            return;
+        }
+        let top : f32 = world.groundAt(x, z) as f32;
+        let low : f32 = world.groundAt(nx, nz) as f32;
+        if (top - low < style.wallMin) {
+            return;
+        }
+
+        // The shared edge lies at x + 1 for a +x neighbour and at x for a -x one, likewise in z.
+        let ex : f32 = (x + (dx + 1) / 2) as f32;
+        let ez : f32 = (z + (dz + 1) / 2) as f32;
+        let x0 : f32 = x as f32;
+        let z0 : f32 = z as f32;
+        let one : f32 = 1.0;
+        let mut p0 : Vec3 = Vec3::make(ex, top, z0);
+        let mut p1 : Vec3 = Vec3::make(ex, top, z0 + one);
+        let mut p2 : Vec3 = Vec3::make(ex, low, z0 + one);
+        let mut p3 : Vec3 = Vec3::make(ex, low, z0);
+        if (dz != 0) {
+            p0 = Vec3::make(x0, top, ez);
+            p1 = Vec3::make(x0 + one, top, ez);
+            p2 = Vec3::make(x0 + one, low, ez);
+            p3 = Vec3::make(x0, low, ez);
+        }
+        b.quad(p0, p1, p2, p3, Look { albedo: style.wall, lit: brushLit(sun) });
+    }
+}

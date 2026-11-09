@@ -1,0 +1,114 @@
+// ground_canopy — the forest seen from afar: crowns as a texture on the ground.
+//
+// Trees nearer than the tree range are real shapes (`plants`); beyond it a stand is far too small to draw one by one
+// and too important to leave flat, so the ground itself is painted as a canopy: a lattice of crowns, each a dome with
+// its hue tint (the tilt the dome gives the normal does the shading, the gaps between crowns are dark), conifers in
+// their narrow dark green on the slopes and broadleaf in a lighter, rounder green on the lowland. The lattice is
+// the same one the tree placement uses, so a tree stands where its crown was painted and the change from picture to
+// shape does not move anything. Crowns smaller than a pixel average into the stand's mean colour.
+
+use ludax::{saturate, smoothstep, Vec3};
+
+use crate::water::ground_noise::{groundCells, groundFade, GroundCell};
+use crate::water::ground_site::{GroundPatch, GroundSite};
+use crate::water::noise::{waterFbm2, waterValue2};
+use crate::water::vista_look::GroundLook;
+
+// Seeds.
+const GC_SEED_CROWN : i32 = 601;
+const GC_SEED_TONE : i32 = 607;
+const GC_SEED_EDGE : i32 = 613;
+
+// Spacing of the crowns, metres, for conifers and for broadleaf trees.
+const GC_CONIFER : f32 = 5.2;
+const GC_BROADLEAF : f32 = 8.5;
+
+// Colour gain of a crown over the plain palette: the palette is albedo of a leaf, a stand is a bit brighter in the
+// sun than a single needle looks.
+const GC_GAIN : f32 = 3.2;
+
+/** The far forest. */
+pub class GroundCanopy {
+    /** The share of the stand at `site` that is broadleaf, 0 to 1: the lowland and the wet ground. */
+    pub static fn broadleaf(look : GroundLook, y : f32, wet : f32) : f32 {
+        let low : f32 = (1.0 as f32) - smoothstep(look.plainHeight, look.plainHeight + (70.0 as f32), y);
+        return saturate(low * ((0.55 as f32) + wet * (0.6 as f32)));
+    }
+
+    /**
+     * The look of a stand of `density` (0 to 1, from the forest mask after the noise) at `site`, over the floor `floor`.
+     * `broad` is the broadleaf share.
+     */
+    pub static fn patch(
+        site : GroundSite,
+        look : GroundLook,
+        density : f32,
+        broad : f32,
+        floor : GroundPatch
+    ) : GroundPatch {
+        let p : Vec3 = site.p;
+        let spacing : f32 = GC_CONIFER + (GC_BROADLEAF - GC_CONIFER) * broad;
+        let tone : f32 = (0.8 as f32)
+            + (0.9 as f32) * waterFbm2(p.x * (0.04 as f32), p.z * (0.04 as f32), 3, GC_SEED_TONE);
+        let conifer : Vec3 = look.conifer.scale(GC_GAIN * tone);
+        let leaf : Vec3 = look.broadleaf.scale(GC_GAIN * tone);
+        let mean : Vec3 = conifer.lerp(leaf, broad);
+        let mottle : f32 = (0.75 as f32)
+            + (0.5 as f32) * waterFbm2(p.x * (0.22 as f32), p.z * (0.22 as f32), 3, GC_SEED_TONE + 5);
+        let average : Vec3 = floor.albedo.lerp(mean.scale(mottle), density * (0.94 as f32));
+        let near : f32 = groundFade(spacing, site.footprint, 0.12, 0.6);
+        if (!site.fine || near <= (0.0 as f32)) {
+            return GroundPatch {
+                albedo: average,
+                tilt: floor.tilt,
+                gloss: (0.0 as f32),
+                open: floor.open * (0.9 as f32),
+                sun: (1.0 as f32),
+            };
+        }
+
+        let cell : GroundCell = groundCells(p.x / spacing, p.z / spacing, GC_SEED_CROWN);
+        let present : f32 = GroundCanopy::present(site, cell.id, density);
+        let dome : f32 = saturate((1.0 as f32) - cell.dist * (1.55 as f32));
+        let hue : Vec3 = conifer
+            .lerp(
+                leaf,
+                smoothstep((0.0 as f32), (1.0 as f32), broad - (cell.id - (0.5 as f32)) * (1.2 as f32))
+            )
+            .scale((0.6 as f32)
+                + (0.9 as f32)
+                    * waterValue2(cell.id * (31.0 as f32), cell.id * (17.0 as f32), GC_SEED_CROWN + 3));
+        let crown : f32 = smoothstep((0.0 as f32), (0.25 as f32), dome) * present;
+        let shown : Vec3 = floor.albedo
+            .scale((0.45 as f32))
+            .lerp(hue.scale((0.55 as f32) + (0.6 as f32) * dome), crown);
+        let tilt : Vec3 = Vec3 { x: -cell.dx * dome, y: (0.0 as f32), z: -cell.dz * dome }.scale((1.5 as f32)
+            * crown);
+        let open : f32 = (0.25 as f32) + (0.75 as f32) * crown * smoothstep((0.1 as f32), (0.7 as f32), dome);
+        return GroundPatch {
+            albedo: shown.lerp(average, (1.0 as f32) - near),
+            tilt: tilt.scale(near),
+            gloss: (0.0 as f32),
+            open: open + ((0.9 as f32) - open) * ((1.0 as f32) - near),
+            sun: (1.0 as f32),
+        };
+    }
+
+    /** The forest floor seen between near trees: in the shade of the crowns, with a few flecks of sun. */
+    pub static fn shaded(floor : GroundPatch) : GroundPatch {
+        return GroundPatch {
+            albedo: floor.albedo,
+            tilt: floor.tilt,
+            gloss: floor.gloss,
+            open: floor.open * (0.7 as f32),
+            sun: (0.3 as f32),
+        };
+    }
+
+    /** Whether the lattice cell with number `id` holds a tree at density `density`: sparse stands thin out raggedly. */
+    pub static fn present(site : GroundSite, id : f32, density : f32) : f32 {
+        let lone : f32 = waterValue2(site.p.x * (0.045 as f32), site.p.z * (0.045 as f32), GC_SEED_EDGE);
+        let bias : f32 = (lone - (0.5 as f32)) * (0.4 as f32);
+        return smoothstep(density + bias, density + bias - (0.12 as f32), id);
+    }
+}

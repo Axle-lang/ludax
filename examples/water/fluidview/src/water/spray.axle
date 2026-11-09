@@ -1,0 +1,448 @@
+// spray — liquid drops and spray as thousands of small lit, streaked, depth-sorted splats.
+//
+// A drop is smaller than a pixel to a few pixels across, so it is not geometry but a splat: an ellipse of coverage
+// whose long axis is the drop's velocity projected on the picture (the camera's shutter is open for a moment, so a
+// fast drop is a streak and a falling one a dash) and whose area is conserved when it is stretched or when it is
+// smaller than a pixel (a drop that would vanish fades instead, which is what keeps a distant jet from flickering).
+// Each drop is lit once, at the point, by the sun through a forward-peaked phase (drops glow when the sun is behind
+// them) and by the sky dome; large drops get a sparkle of the sun on their surface. Where many overlap, the over
+// operator saturates toward white, which is why a dense jet reads as a white mass without any special case.
+//
+// Compositing is by screen tile. The drops are sorted far to near once (a stable counting sort on a quantised
+// depth), binned into 16 by 16 pixel tiles in that order, and a tile is one job of the pool that owns its pixels:
+// so the order of compositing, and with it the picture, does not depend on the thread count. Each pixel keeps one
+// layer; drops behind the opaque scene are dropped at the pixel.
+
+use ludax::{saturate, sqrt, Vec3, PI};
+
+use crate::water::camera::{Landing, WaterCamera};
+use crate::water::drop_shadow::DropShadow;
+use crate::water::look::SprayLook;
+use crate::water::noise::{waterExpNeg, waterHash, waterHighI, waterLowI};
+use crate::water::particles::{WaterKind, WaterParticles};
+use crate::water::sky::WaterSky;
+
+/** Side of a screen tile, pixels. */
+pub const SPRAY_TILE : i32 = 16;
+
+// Buckets of the depth sort: a quantised depth in 0..SPRAY_BUCKETS - 1.
+const SPRAY_BUCKETS : i32 = 4096;
+
+// Tile entries the bins may hold per drop on average; a drop past the capacity is skipped.
+const SPRAY_ENTRIES_PER_DROP : i32 = 5;
+
+// The largest and smallest a splat's semi-axis may be, pixels.
+const SPRAY_RADIUS_MAX : f32 = 28.0;
+
+// The splat's edge reaches this many semi-axes where its coverage is gone, and the falloff exponent inside.
+const SPRAY_REACH : f32 = 1.0;
+
+// The anisotropy of a drop's scattering of the sun, the share of its light that does not depend on the sun's
+// direction, and how much the whiteness of the drop mixes the sky in.
+const SPRAY_FORWARD : f32 = 0.55;
+const SPRAY_ISOTROPIC : f32 = 0.55;
+const SPRAY_FORWARD_GAIN : f32 = 3.0;
+
+// How fast the sun's light, the multiply-scattered fill and the sky's light die in the water between the drop and
+// their source (per unit of optical depth), and the fill's share of the sun.
+const SPRAY_SUN_DECAY : f32 = 0.9;
+const SPRAY_FILL_DECAY : f32 = 0.18;
+const SPRAY_SKY_DECAY : f32 = 0.5;
+const SPRAY_FILL : f32 = 0.3;
+
+// The brightness of the sun's sparkle on a drop, relative to the sun's irradiance over pi, and the share of drops
+// that sparkle at all; the sparkle is a point this many pixels across.
+const SPRAY_SPARKLE : f32 = 0.5;
+const SPRAY_SPARKLE_SHARE : f32 = 0.35;
+const SPRAY_SPARKLE_SIZE : f32 = 0.6;
+
+// A drop's blue tint: the share of red it loses to the water it is made of.
+const SPRAY_TINT : f32 = 0.08;
+
+// A drop wider than this many pixels starts to read as a lens (clear in the middle, bright rim); it is fully a lens
+// this many pixels later; the least opacity of its middle and how much brighter the rim is.
+const SPRAY_BLOB_FROM : f32 = 1.8;
+const SPRAY_BLOB_SPAN : f32 = 2.5;
+const SPRAY_CLEAR : f32 = 0.35;
+const SPRAY_RIM : f32 = 0.9;
+
+// Drops fade out over the last share of their life.
+const SPRAY_FADE : f32 = 0.35;
+
+// The seed of the per-drop random numbers.
+const SPRAY_SEED : i32 = 71;
+
+// How much of a streak's length thins the drop's light: the same water spread over a longer mark.
+const SPRAY_STREAK_SHARE : f32 = 0.35;
+
+/** The drops of a frame, ready to composite. */
+pub class WaterSpray {
+    width  : i32;
+    height : i32;
+    tilesX : i32;
+    tilesY : i32;
+
+    // One splat per drop, in the order the drops came: centre, semi-axes, axis direction, opacity, colour,
+    // distance, sparkle brightness.
+    centre  : f32[];
+    axes    : f32[];
+    colour  : f32[];
+    opacity : f32[];
+    dist    : f32[];
+    sparkle : f32[];
+    splats  : i32 = 0;
+
+    // The counting sort and the tile bins.
+    order    : i32[];
+    buckets  : i32[];
+    binStart : i32[];
+    binItems : i32[];
+    binFill  : i32[];
+
+    /** The drops' layer: premultiplied rgb and coverage, four floats a pixel. */
+    pub layer : f32[];
+
+    /** Distance of the opaque scene at each pixel: drops behind it are hidden. The trace writes it. */
+    pub sceneDepth : f32[];
+
+    /** A compositor for pictures `width` by `height` that holds at most `capacity` drops. */
+    constructor(width : i32, height : i32, capacity : i32) {
+        self.width = width;
+        self.height = height;
+        self.tilesX = (width + SPRAY_TILE - 1) / SPRAY_TILE;
+        self.tilesY = (height + SPRAY_TILE - 1) / SPRAY_TILE;
+        let c : i64 = capacity as i64;
+        self.centre = new f32[c * 2];
+        self.axes = new f32[c * 4];
+        self.colour = new f32[c * 3];
+        self.opacity = new f32[c];
+        self.dist = new f32[c];
+        self.sparkle = new f32[c];
+        self.order = new i32[c];
+        self.buckets = new i32[(SPRAY_BUCKETS + 1) as i64];
+        let tiles : i64 = (self.tilesX as i64) * self.tilesY;
+        self.binStart = new i32[tiles + 1];
+        self.binFill = new i32[tiles];
+        self.binItems = new i32[c * SPRAY_ENTRIES_PER_DROP];
+        let px : i64 = (width as i64) * height;
+        self.layer = new f32[px * 4];
+        self.sceneDepth = new f32[px];
+    }
+
+    /** Forgets the frame's drops. */
+    pub fn clear(mut self) : void {
+        self.splats = 0;
+        self.bin();
+    }
+
+    /** How many tiles the picture has: the pool's job count of the splat stage. */
+    pub fn tiles(self) : i32 {
+        return self.tilesX * self.tilesY;
+    }
+
+    /** How many splats the frame holds. */
+    pub fn count(self) : i32 {
+        return self.splats;
+    }
+
+    /** Projects, lights, sorts and bins the drops of `drops` for the picture `cam` takes. */
+    pub fn prepare(
+        mut self,
+        drops : WaterParticles,
+        cam : WaterCamera,
+        look : SprayLook,
+        sky : Shared<WaterSky>,
+        shade : DropShadow,
+        offset : Vec3
+    ) : void {
+        self.splats = 0;
+        for (k of 0..drops.count) {
+            self.project(drops, k, cam, look, sky, shade, offset);
+        }
+        self.sort();
+        self.bin();
+    }
+
+    // Turns drop `k` into a splat, if it lands in view.
+    fn project(
+        mut self,
+        drops : WaterParticles,
+        k : i32,
+        cam : WaterCamera,
+        look : SprayLook,
+        sky : Shared<WaterSky>,
+        shade : DropShadow,
+        offset : Vec3
+    ) : void {
+        let p : Vec3 = drops.positionAt(k);
+        let here : Landing = cam.project(p);
+        if (!here.ok) {
+            return;
+        }
+        let life : f32 = drops.ageAt(k);
+        let fade : f32 = saturate(((1.0 as f32) - life) / SPRAY_FADE);
+        if (fade <= 0.0) {
+            return;
+        }
+
+        // The drop's radius on the picture, and the streak its velocity draws across the shutter time.
+        let radius : f32 = drops.radiusAt(k) * look.sizeGain;
+        let mut round : f32 = cam.pixelsAt(radius, here.depth);
+        let v : Vec3 = drops.velocityAt(k);
+        let ahead : Landing = cam.project(p.plus(v.scale(look.shutter * (0.5 as f32))));
+        let behind : Landing = cam.project(p.minus(v.scale(look.shutter * (0.5 as f32))));
+        let mut dx : f32 = 0.0;
+        let mut dy : f32 = 0.0;
+        if (ahead.ok && behind.ok) {
+            dx = ahead.x - behind.x;
+            dy = ahead.y - behind.y;
+        }
+        let streak : f32 = sqrt(dx * dx + dy * dy);
+
+        // A drop under the least size fades by its area; a streak spreads the same light over more pixels.
+        let mut cover : f32 = look.opacity * fade;
+        if (round < look.minPixels) {
+            let ratio : f32 = round / look.minPixels;
+            cover = cover * ratio * ratio;
+            round = look.minPixels;
+        }
+        if (round > SPRAY_RADIUS_MAX) {
+            round = SPRAY_RADIUS_MAX;
+        }
+        let mut along : f32 = round + streak * (0.5 as f32);
+        cover = cover * round / (round + streak * SPRAY_STREAK_SHARE);
+        if (along > SPRAY_RADIUS_MAX) {
+            along = SPRAY_RADIUS_MAX;
+        }
+        let mut cs : f32 = 1.0;
+        let mut sn : f32 = 0.0;
+        if (streak > 0.001) {
+            cs = dx / streak;
+            sn = dy / streak;
+        }
+
+        let toDrop : Vec3 = p.minus(cam.eye).normalized();
+        let c : Vec3 = self.lit(toDrop, p, sky, shade);
+        let i : i64 = self.splats as i64;
+        self.centre[i * 2] = here.x + offset.x;
+        self.centre[i * 2 + 1] = here.y + offset.y;
+        self.axes[i * 4] = along;
+        self.axes[i * 4 + 1] = round;
+        self.axes[i * 4 + 2] = cs;
+        self.axes[i * 4 + 3] = sn;
+        self.colour[i * 3] = c.x;
+        self.colour[i * 3 + 1] = c.y;
+        self.colour[i * 3 + 2] = c.z;
+        self.opacity[i] = cover;
+        self.dist[i] = here.depth;
+        self.sparkle[i] = self.sparkleOf(k, look, sky, drops.isKind(k, WaterKind::Liquid), round);
+        self.splats = self.splats + 1;
+    }
+
+    // The colour of a drop at `p` seen along `view`: the sun through a forward-peaked phase, dimmed by the water
+    // between the drop and the sun (the shadow grid), a fill of multiply-scattered sunlight that decays slowly, and
+    // the sky dome dimmed by the water above. The sunlit side of a dense column is bright white, its core and its far
+    // side a dark blue-grey: that is what gives a jet its volume.
+    fn lit(self, view : Vec3, p : Vec3, sky : Shared<WaterSky>, shade : DropShadow) : Vec3 {
+        let depth : Vec3 = shade.shadowAt(p);
+        let toward : f32 = saturate(view.dot(sky.sunDir) * (0.5 as f32) + (0.5 as f32));
+        let forward : f32 = toward * toward * toward * SPRAY_FORWARD;
+        let open : f32 = waterExpNeg(depth.y * SPRAY_SUN_DECAY);
+        let sun : Vec3 = sky.sunIrr.scale((SPRAY_ISOTROPIC + forward * SPRAY_FORWARD_GAIN) / PI * open);
+        let fill : Vec3 = sky.sunIrr.scale(SPRAY_FILL / PI * waterExpNeg(depth.y * SPRAY_FILL_DECAY));
+        let dome : Vec3 = sky.ambient(Vec3::unitY()).scale(waterExpNeg(depth.z * SPRAY_SKY_DECAY));
+        let tint : Vec3 = Vec3 { x: (1.0 as f32) - SPRAY_TINT, y: 1.0, z: 1.0 };
+        return sun.plus(fill).plus(dome).times(tint);
+    }
+
+    // The brightness of the sun's sparkle on drop `k`: some drops, chosen by hash, flash.
+    fn sparkleOf(self, k : i32, look : SprayLook, sky : Shared<WaterSky>, big : bool, round : f32) : f32 {
+        let roll : f32 = waterHash(k, 3, 0, SPRAY_SEED);
+        if (roll > SPRAY_SPARKLE_SHARE && !big) {
+            return 0.0;
+        }
+        let flash : f32 = (0.4 as f32) + (0.6 as f32) * waterHash(k, 5, 0, SPRAY_SEED);
+        return look.sparkle * SPRAY_SPARKLE * flash * sky.sunIrr.maxComponent() / PI;
+    }
+
+    // Sorts the splats far to near by a counting sort on the quantised distance (stable: equal buckets keep order).
+    fn sort(mut self) : void {
+        if (self.splats == 0) {
+            return;
+        }
+        let mut near : f32 = 1000000.0;
+        let mut far : f32 = 0.0;
+        for (i of 0..self.splats) {
+            near = ludax::min(near, self.dist[i as i64]);
+            far = ludax::max(far, self.dist[i as i64]);
+        }
+        let span : f32 = ludax::max(far - near, 0.001);
+        for (b of 0..(SPRAY_BUCKETS + 1)) {
+            self.buckets[b as i64] = 0;
+        }
+        for (i of 0..self.splats) {
+            let b : i32 = self.bucket(self.dist[i as i64], near, span);
+            self.buckets[(b + 1) as i64] = self.buckets[(b + 1) as i64] + 1;
+        }
+        for (b of 0..SPRAY_BUCKETS) {
+            self.buckets[(b + 1) as i64] = self.buckets[(b + 1) as i64] + self.buckets[b as i64];
+        }
+        for (i of 0..self.splats) {
+            let b : i64 = self.bucket(self.dist[i as i64], near, span) as i64;
+            self.order[self.buckets[b] as i64] = i;
+            self.buckets[b] = self.buckets[b] + 1;
+        }
+    }
+
+    // The bucket of a distance: bucket 0 is the farthest.
+    fn bucket(self, d : f32, near : f32, span : f32) : i32 {
+        let t : f32 = (d - near) / span;
+        return (SPRAY_BUCKETS - 1) - ((t * ((SPRAY_BUCKETS - 1) as f32)) as i32);
+    }
+
+    // Bins the sorted splats into tiles, keeping their order within a tile.
+    fn bin(mut self) : void {
+        let tiles : i32 = self.tilesX * self.tilesY;
+        for (t of 0..(tiles + 1)) {
+            self.binStart[t as i64] = 0;
+        }
+        for (j of 0..self.splats) {
+            self.touch(self.order[j as i64], false);
+        }
+        for (t of 0..tiles) {
+            self.binStart[(t + 1) as i64] = self.binStart[(t + 1) as i64] + self.binStart[t as i64];
+            self.binFill[t as i64] = 0;
+        }
+        for (j of 0..self.splats) {
+            self.touch(self.order[j as i64], true);
+        }
+    }
+
+    // Counts splat `s` into the tiles it covers, or (`fill`) writes it into their bins.
+    fn touch(mut self, s : i32, fill : bool) : void {
+        let i : i64 = s as i64;
+        let reach : f32 = ludax::max(self.axes[i * 4], self.axes[i * 4 + 1]) * SPRAY_REACH + (1.0 as f32);
+        let x0 : i32 = self.tileOf(self.centre[i * 2] - reach, self.tilesX);
+        let x1 : i32 = self.tileOf(self.centre[i * 2] + reach, self.tilesX);
+        let y0 : i32 = self.tileOf(self.centre[i * 2 + 1] - reach, self.tilesY);
+        let y1 : i32 = self.tileOf(self.centre[i * 2 + 1] + reach, self.tilesY);
+        let limit : i32 = (self.splats) * SPRAY_ENTRIES_PER_DROP;
+        for (ty of y0..(y1 + 1)) {
+            for (tx of x0..(x1 + 1)) {
+                let t : i64 = ((ty * self.tilesX) + tx) as i64;
+                if (!fill) {
+                    self.binStart[t + 1] = self.binStart[t + 1] + 1;
+                } else {
+                    let at : i32 = self.binStart[t] + self.binFill[t];
+                    if (at < limit) {
+                        self.binItems[at as i64] = s;
+                    }
+                    self.binFill[t] = self.binFill[t] + 1;
+                }
+            }
+        }
+    }
+
+    // The tile index of picture coordinate `v`, clamped into the picture.
+    fn tileOf(self, v : f32, count : i32) : i32 {
+        let t : i32 = (v / (SPRAY_TILE as f32)) as i32;
+        if (v < 0.0 || t < 0) {
+            return 0;
+        }
+        if (t >= count) {
+            return count - 1;
+        }
+        return t;
+    }
+
+    /** Composites the drops of tile `tile` into the two layers, for the pool. */
+    pub fn splatTile(mut self, tile : i32) : void {
+        let tx : i32 = tile % self.tilesX;
+        let ty : i32 = tile / self.tilesX;
+        let x0 : i32 = tx * SPRAY_TILE;
+        let y0 : i32 = ty * SPRAY_TILE;
+        let x1 : i32 = waterLowI(x0 + SPRAY_TILE, self.width);
+        let y1 : i32 = waterLowI(y0 + SPRAY_TILE, self.height);
+        for (y of y0..y1) {
+            for (x of x0..x1) {
+                let i : i64 = (((y * self.width) + x) as i64) * 4;
+                for (c of 0..4) {
+                    self.layer[i + c] = 0.0;
+                }
+            }
+        }
+        let from : i32 = self.binStart[tile as i64];
+        let to : i32 = self.binStart[(tile + 1) as i64];
+        for (e of from..to) {
+            self.splat(self.binItems[e as i64], x0, y0, x1, y1);
+        }
+    }
+
+    // Composites splat `s` over the pixels of the tile box (`x0`, `y0`) up to (`x1`, `y1`).
+    fn splat(mut self, s : i32, x0 : i32, y0 : i32, x1 : i32, y1 : i32) : void {
+        let i : i64 = s as i64;
+        let cx : f32 = self.centre[i * 2];
+        let cy : f32 = self.centre[i * 2 + 1];
+        let ax : f32 = self.axes[i * 4];
+        let ay : f32 = self.axes[i * 4 + 1];
+        let length : f32 = ax - ay;
+        let cs : f32 = self.axes[i * 4 + 2];
+        let sn : f32 = self.axes[i * 4 + 3];
+        let reach : f32 = ludax::max(ax, ay) + (1.0 as f32);
+        let bx0 : i32 = waterHighI(x0, (cx - reach) as i32);
+        let bx1 : i32 = waterLowI(x1, (cx + reach) as i32 + 1);
+        let by0 : i32 = waterHighI(y0, (cy - reach) as i32);
+        let by1 : i32 = waterLowI(y1, (cy + reach) as i32 + 1);
+        let tint : Vec3 = Vec3 {
+            x: self.colour[i * 3],
+            y: self.colour[i * 3 + 1],
+            z: self.colour[i * 3 + 2],
+        };
+        let depth : f32 = self.dist[i];
+        let flash : f32 = self.sparkle[i];
+        let half : f32 = 0.5;
+        for (y of by0..by1) {
+            for (x of bx0..bx1) {
+                let px : i64 = ((y * self.width) + x) as i64;
+                if (depth > self.sceneDepth[px]) {
+                    continue;
+                }
+                let dx : f32 = (x as f32) + half - cx;
+                let dy : f32 = (y as f32) + half - cy;
+                let u : f32 = ludax::abs(dx * cs + dy * sn);
+                let v : f32 = dy * cs - dx * sn;
+                let past : f32 = ludax::max(u - length, 0.0);
+                let q : f32 = (past * past + v * v) / (ay * ay);
+                if (q >= 1.0) {
+                    continue;
+                }
+                let falloff : f32 = (1.0 as f32) - q;
+                let mut a : f32 = self.opacity[i] * falloff * falloff;
+                let mut c : Vec3 = tint;
+                if (ay > SPRAY_BLOB_FROM) {
+                    // A big drop is a lens: clear in the middle, bright and opaque toward its rim.
+                    let blob : f32 = saturate((ay - SPRAY_BLOB_FROM) / SPRAY_BLOB_SPAN);
+                    let lens : f32 = (SPRAY_CLEAR + ((1.0 as f32) - SPRAY_CLEAR) * q)
+                        * ((1.0 as f32) + SPRAY_RIM * q);
+                    a = a * ((1.0 as f32) - blob + blob * lens);
+                    c = c.scale((1.0 as f32) + blob * SPRAY_RIM * q);
+                }
+                if (flash > 0.0) {
+                    let spark : f32 = saturate((1.0 as f32)
+                        - (q * ay * ay) / (SPRAY_SPARKLE_SIZE * SPRAY_SPARKLE_SIZE));
+                    c = c.plus(Vec3::splat(flash * spark * spark));
+                }
+                self.over(self.layer, px * 4, c, a);
+            }
+        }
+    }
+
+    // `layer` pixel at `at` with colour `c` of coverage `a` laid over it.
+    fn over(self, layer : f32[], at : i64, c : Vec3, a : f32) : void {
+        let keep : f32 = (1.0 as f32) - a;
+        layer[at] = layer[at] * keep + c.x * a;
+        layer[at + 1] = layer[at + 1] * keep + c.y * a;
+        layer[at + 2] = layer[at + 2] * keep + c.z * a;
+        layer[at + 3] = layer[at + 3] * keep + a;
+    }
+}

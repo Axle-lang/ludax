@@ -1,0 +1,340 @@
+// river — the simulation: a serpentine valley, an endless spring, a drain, and the streaks that show the flow.
+//
+// What this demonstrates is water finding its way downhill. The valley falls along x with a channel carved
+// along a meander; an infinite spring at the head and a drain at the foot keep a steady throughput. Nothing
+// tells the water where to go: the fluid world moves it from higher surface to lower by the pipe law, so it
+// runs down the channel, spreads over the flat bed, ponds in the bends and settles into a steady current
+// whose volume stops changing once the channel is wet. Three things make the demo checkable. The volume only
+// moves through the spring and the drain, so `volume - injected + drained` stays at the f64 rounding.
+// The wetting front reaches the foot later when gravity is weaker (the pipe flux accelerates under it) and
+// later when the bed drags harder, and later when the water is more viscous, so `RiverParams` lets the checks
+// run the same valley under other gravity, drag and viscosity. And at steady state the water leaves exactly as fast as it arrives.
+// The demo's spring does not run for ever: it opens and shuts on a fixed cycle (`openSeconds`, `shutSeconds`), so
+// the river dries out and the water comes back in a wave, again and again; a cycle with no shut time is the steady river.
+
+use fluidview::StreakField;
+use ludax::{
+    FluidGround, FluidOverflow, FluidRules, FluidStrategy, FluidSink, FluidSource, FluidWorld, cosD, sinD
+};
+
+/** Grid side of the valley, in columns. */
+pub const RV_GRID : i32 = 64;
+
+/** Length of one tick, seconds; the world's `dt`. */
+pub const RV_DT : f64 = 0.05;
+
+/** Midpoint of the grid, where the meander swings around. */
+const RV_HALF : f64 = 31.5;
+
+/** x of the last column, where the valley slope bottoms out. */
+const RV_LAST_X : f64 = 62.0;
+
+/** Height of the valley floor at the downstream edge, cells. */
+const RV_BASE : f64 = 4.0;
+
+/** Drop of the plain per column downstream, cells; steep enough that the channel's capacity matches the
+ * spring at a natural surface slope, so the flow needs no backwater lake to carry it. */
+const RV_SLOPE : f64 = 0.12;
+
+/** Amplitude of the channel meander, cells. */
+const RV_MEANDER : f64 = 6.0;
+
+/** Spatial frequency of the meander along x, radians a cell; gentler bends pool less between runs. */
+const RV_MEANDER_FREQ : f64 = 0.075;
+
+/** Phase of the meander, radians. */
+const RV_MEANDER_PHASE : f64 = 0.7;
+
+/** Depth the channel carves below the plain across its flat bed, cells. */
+const RV_CHAN_DEPTH : f64 = 1.6;
+
+/** Half-width of the channel's flat bed, cells: the water spreads across it instead of threading a V. */
+const RV_CHAN_FLAT : f64 = 2.5;
+
+/** Width of the bank falloff beyond the flat bed, cells. */
+const RV_CHAN_BANK : f64 = 1.8;
+
+/** Amplitude of the deterministic valley noise, cells. */
+const RV_NOISE : f64 = 0.16;
+
+/** The valley noise is two crossed sine trains and one diagonal one; these are their (arbitrary but fixed)
+ * spatial frequencies and phases. */
+const RV_NOISE_FX : f64 = 0.83;
+const RV_NOISE_FZ : f64 = 1.07;
+const RV_NOISE_FD : f64 = 0.51;
+const RV_NOISE_PX : f64 = 2.1;
+const RV_NOISE_PZ : f64 = 0.4;
+const RV_NOISE_PD : f64 = 1.7;
+
+/** Weight of the diagonal noise train against the crossed pair. */
+const RV_NOISE_DIAG : f64 = 0.5;
+
+/** Conductivity of the virtual pipes; with `dt` 0.05 this runs the pipe law at its halving cap, so the
+ * front advances at the speed the surface slope allows instead of crawling. */
+const RV_CONDUCTIVITY : f64 = 10.0;
+
+/** A column holds at most this above its ground; the surplus spills down the valley sides. */
+const RV_MAX_LEVEL : f64 = 1.4;
+
+/** Water the pipe law moves a tick below this stops being simulated; far under anything the eye or a check
+ * can see. */
+const RV_SLEEP : f64 = 0.000001;
+
+/** A centreline cell holding more water than this counts as wet for the front, cells. */
+const RV_FRONT_WET : f64 = 0.05;
+
+/** x of the source column, at the head of the valley. */
+pub const RV_SOURCE_X : i32 = 2;
+
+/** x of the drain column, at the foot. */
+pub const RV_SINK_X : i32 = 61;
+
+/** Throughput the source offers and the drain takes, volume a second. The pipe law carries about
+ * `k * slope * dt` a frontier a tick, so the rate is sized to what the channel's slope can sustain. */
+pub const RV_SOURCE_RATE : f64 = 1.2;
+
+/** Earth gravity, cells a second squared: the engine's own default, named here for the checks. */
+pub const RV_GRAVITY : f64 = 9.81;
+
+/** Bed drag per second: the engine's default. */
+pub const RV_DRAG : f64 = 2.0;
+
+/** How long the spring runs, then stays shut, in the pulsing demo, seconds: long enough for the wetting front
+ * to cross the valley while it runs, and for the channel to drain while it is shut. */
+pub const RV_PULSE_ON : f64 = 45.0;
+pub const RV_PULSE_OFF : f64 = 45.0;
+
+/** The world the valley is run under: the knobs that change how the water moves downhill and when it comes. */
+pub struct RiverParams {
+    /** Gravitational acceleration, cells a second squared. */
+    pub gravity : f64 = 9.81;
+
+    /** Bed drag per second: how fast moving water loses speed to the ground. */
+    pub drag : f64 = 2.0;
+
+    /** Viscosity, cells squared per second: how fast neighbouring streams share momentum. */
+    pub viscosity : f64 = 0.0;
+
+    /** Seconds the spring runs in each cycle; with `shutSeconds` at 0 the spring never stops. */
+    pub openSeconds : f64 = 0.0;
+
+    /** Seconds the spring stays shut in each cycle: the water thins out and drains, then comes back in a wave
+     * when the spring opens again. 0 keeps the spring open for good. */
+    pub shutSeconds : f64 = 0.0;
+}
+
+/** The valley ground: sloped plain, carved meander, deterministic noise; baked into the world once. */
+pub class RvTerrain : FluidGround {
+    /** z of the channel centreline under column `x`, for placing the source and the drain on it. */
+    pub fn centerZ(self, x : f64) : f64 {
+        return RV_HALF + RV_MEANDER * sinD(x * RV_MEANDER_FREQ + RV_MEANDER_PHASE);
+    }
+
+    /** How much the channel alone carves below the plain under column (`x`, `z`), cells: the full depth
+     * across the flat bed, then a smooth quadratic bank falloff. */
+    pub fn carveAt(self, x : i32, z : i32) : f64 {
+        let d : f64 = ((z as f64) - self.centerZ(x as f64)).abs();
+        let excess : f64 = d - RV_CHAN_FLAT;
+        if (excess <= 0.0) {
+            return RV_CHAN_DEPTH;
+        }
+        let q : f64 = 1.0 + (excess * excess) / (RV_CHAN_BANK * RV_CHAN_BANK);
+        return RV_CHAN_DEPTH / (q * q);
+    }
+
+    /** Height of the ground under column (`x`, `z`), cells. */
+    pub fn heightAt(self, x : i32, z : i32) : f64 {
+        let fx : f64 = x as f64;
+        let fz : f64 = z as f64;
+        let plain : f64 = RV_BASE + RV_SLOPE * (RV_LAST_X - fx);
+        let crossed : f64 = sinD(fx * RV_NOISE_FX + RV_NOISE_PX) * cosD(fz * RV_NOISE_FZ + RV_NOISE_PZ);
+        let diagonal : f64 = sinD((fx + fz) * RV_NOISE_FD + RV_NOISE_PD);
+        return plain - self.carveAt(x, z) + RV_NOISE * (crossed + RV_NOISE_DIAG * diagonal);
+    }
+}
+
+/** The river world: valley, spring, drain and streaks, advanced one tick at a time. */
+pub class RiverSim {
+    world        : FluidWorld;
+    terrain      : RvTerrain;
+    streaks      : StreakField;
+    prevInjected : f64 = 0.0;
+    prevDrained  : f64 = 0.0;
+    inflow       : f64 = 0.0;
+    outflow      : f64 = 0.0;
+    sourceZ      : i32 = 0;
+    sinkZ        : i32 = 0;
+    springId     : i32 = -1;
+    springOpen   : bool = false;
+    openTicks    : i64 = 0;
+    cycleTicks   : i64 = 0;
+
+    /** A dry valley with its spring and drain in place, under the gravity and drag of `p`. */
+    constructor(p : RiverParams) {
+        // Every field spelled out: a partial literal makes the compiler re-resolve the omitted defaults, and
+        // the `strategy` default does not survive that today.
+        let rules : FluidRules = FluidRules {
+            dt: RV_DT,
+            conductivity: RV_CONDUCTIVITY,
+            gravity: p.gravity,
+            drag: p.drag,
+            viscosity: p.viscosity,
+            maxLevel: RV_MAX_LEVEL,
+            overflow: FluidOverflow::Spill,
+            strategy: FluidStrategy::ActiveSet,
+            sleepThreshold: RV_SLEEP,
+        };
+        self.world = new FluidWorld(rules, RV_GRID, RV_GRID);
+        self.terrain = new RvTerrain();
+        self.world.sampleGround(self.terrain);
+        self.streaks = new StreakField();
+
+        self.sourceZ = self.terrain.centerZ(RV_SOURCE_X as f64) as i32;
+        self.sinkZ = self.terrain.centerZ(RV_SINK_X as f64) as i32;
+        self.world.addSink(FluidSink::at(RV_SINK_X, self.sinkZ, RV_SOURCE_RATE));
+
+        // A cycle is whole ticks, so the spring's schedule never reads a clock and never drifts.
+        if (p.shutSeconds > 0.0) {
+            self.openTicks = (p.openSeconds / RV_DT) as i64;
+            self.cycleTicks = ((p.openSeconds + p.shutSeconds) / RV_DT) as i64;
+        }
+        self.openSpring();
+    }
+
+    /** Advances one tick: the spring's schedule, the world, the flow measures, the streaks. */
+    pub fn tick(mut self) : void {
+        self.followSchedule();
+        self.world.tick();
+        self.measure();
+        self.streaks.tick(self.world);
+    }
+
+    /** The world, for ground and level reads. */
+    pub fn worldRef(self) : FluidWorld {
+        return self.world;
+    }
+
+    /** The streaks riding the current. */
+    pub fn streakField(self) : StreakField {
+        return self.streaks;
+    }
+
+    /** Total volume in the world right now, cell units. */
+    pub fn volume(self) : f64 {
+        return self.world.totalVolume();
+    }
+
+    /** Volume the spring has injected since the start. */
+    pub fn injected(self) : f64 {
+        return self.world.injectedTotal();
+    }
+
+    /** Volume the drain has evacuated since the start. */
+    pub fn drained(self) : f64 {
+        return self.world.drainedTotal();
+    }
+
+    /** `volume - injected + drained`: zero up to rounding, because only the spring and the drain move water
+     * across the world's boundary. */
+    pub fn imbalance(self) : f64 {
+        return self.volume() - self.injected() + self.drained();
+    }
+
+    /** Ticks simulated so far. */
+    pub fn tickCount(self) : i64 {
+        return self.world.tickCount();
+    }
+
+    /** Simulated seconds so far. */
+    pub fn seconds(self) : f64 {
+        return (self.world.tickCount() as f64) * RV_DT;
+    }
+
+    /** What the spring delivered last tick, volume a second. */
+    pub fn inflow(self) : f64 {
+        return self.inflow;
+    }
+
+    /** What the drain took last tick, volume a second. */
+    pub fn outflow(self) : f64 {
+        return self.outflow;
+    }
+
+    /** The channel column farthest downstream with water in its centreline cell, or -1 when none is wet:
+     * where the wetting front has got to. */
+    pub fn frontX(self) : i32 {
+        let mut front : i32 = -1;
+        for (x of 0..RV_GRID) {
+            if (self.world.levelAt(x, self.terrain.centerZ(x as f64) as i32) > RV_FRONT_WET) {
+                front = x;
+            }
+        }
+        return front;
+    }
+
+    /** How many columns of the channel's centreline hold water: the length of river there is right now. */
+    pub fn wetColumns(self) : i32 {
+        let mut count : i32 = 0;
+        for (x of 0..RV_GRID) {
+            if (self.world.levelAt(x, self.terrain.centerZ(x as f64) as i32) > RV_FRONT_WET) {
+                count = count + 1;
+            }
+        }
+        return count;
+    }
+
+    /** Water surface (ground plus level) of the channel's centreline cell under column `x`, cells. */
+    pub fn surfaceAt(self, x : i32) : f64 {
+        let z : i32 = self.terrain.centerZ(x as f64) as i32;
+        return self.world.groundAt(x, z) + self.world.levelAt(x, z);
+    }
+
+    /** True while the spring is running (always, when the river is not pulsing). */
+    pub fn springRunning(self) : bool {
+        return self.springOpen;
+    }
+
+    // Opens the spring if it is shut.
+    fn openSpring(mut self) : void {
+        if (self.springOpen) {
+            return;
+        }
+        self.springId = self.world.addSource(FluidSource::infinite(
+            RV_SOURCE_X,
+            self.sourceZ,
+            RV_SOURCE_RATE
+        ));
+        self.springOpen = true;
+    }
+
+    // Shuts the spring if it runs.
+    fn shutSpring(mut self) : void {
+        if (!self.springOpen) {
+            return;
+        }
+        self.world.removeSource(self.springId);
+        self.springOpen = false;
+    }
+
+    // Opens or shuts the spring by where the tick count falls in the cycle; a steady river has no cycle.
+    fn followSchedule(mut self) : void {
+        if (self.cycleTicks <= 0) {
+            return;
+        }
+        if (self.world.tickCount() % self.cycleTicks < self.openTicks) {
+            self.openSpring();
+        } else {
+            self.shutSpring();
+        }
+    }
+
+    // What crossed the source and the drain last tick, in volume a second for the HUD.
+    fn measure(mut self) : void {
+        let injected : f64 = self.world.injectedTotal();
+        let drained : f64 = self.world.drainedTotal();
+        self.inflow = (injected - self.prevInjected) / RV_DT;
+        self.outflow = (drained - self.prevDrained) / RV_DT;
+        self.prevInjected = injected;
+        self.prevDrained = drained;
+    }
+}

@@ -1,0 +1,155 @@
+// demo_ground — the water that fell back and stayed: a thin sheet on the apron, puddles in its hollows, drips.
+//
+// The geyser's water does not vanish when it lands. Where it falls it wets the apron: a film a few hundredths of a
+// cell deep that spreads outward and flows downhill (and dries in tens of seconds), and, in the hollows of the
+// ground, puddles that outlast it (they drain in minutes). Each is a closed formula of the seconds since the
+// eruption, so a picture a minute after the jet shows what a picture five seconds after it shows, thinner. While
+// drops still fall, rings run out from pseudo-random impact points on the sheet, and the sheet's turbulence stirs its
+// ripples. The renderer sees all of this only as depth, foam, turbulence and velocity per column, which is exactly
+// what the engine will give it.
+
+use ludax::{max, saturate, smoothstep, sqrt};
+
+use crate::water::demo_geyser::{GEY_JET_FROM, GEY_JET_TO, GEY_POOL_R, GEY_VENT};
+use crate::water::noise::{waterExpNeg, waterHash};
+
+// The film and puddles appear once the first drops have landed, over this many seconds.
+const GRD_ONSET : f32 = 1.5;
+const GRD_RISE : f32 = 3.5;
+
+// How long the film and the puddles last, seconds (the time they have fallen to 1/e of their depth).
+const GRD_FILM_LIFE : f32 = 24.0;
+const GRD_PUDDLE_LIFE : f32 = 45.0;
+
+// The share of a puddle that outlasts the eruption's rain at once, and how deep it stands, cells.
+const GRD_PUDDLE_FLOOR : f32 = 0.4;
+const GRD_PUDDLE_DEPTH : f32 = 0.7;
+
+// How deep the film is, cells, and how much its depth varies with the ground's noise.
+const GRD_FILM_DEPTH : f32 = 0.035;
+const GRD_FILM_VARY : f32 = 0.6;
+
+// How far the sheet has reached when the rain ends, and how fast it spread; the ring where it stops.
+const GRD_REACH_FROM : f32 = 5.0;
+const GRD_REACH_SPAN : f32 = 19.0;
+
+// Impact rings: how many points drip, the period of a ring, how fast it expands, and its height and sharpness.
+const GRD_DRIPS : i32 = 48;
+const GRD_DRIP_PERIOD : f32 = 1.9;
+const GRD_DRIP_SPEED : f32 = 1.7;
+const GRD_DRIP_HEIGHT : f32 = 0.014;
+const GRD_DRIP_SHARP : f32 = 14.0;
+const GRD_DRIP_SEED : i32 = 211;
+
+// The speed the sheet runs outward at, cells a second, for a film and for a puddle.
+const GRD_FLOW : f32 = 0.55;
+
+// The hollows: the noise value under which ground holds puddles, and the value of the deepest hollow.
+const GRD_HOLLOW_HIGH : f32 = 0.5;
+const GRD_HOLLOW_LOW : f32 = 0.25;
+
+/** How far the eruption and its aftermath have got, as the shares each part of the ground's water is on. */
+pub struct GroundState {
+    /** Seconds into the cycle. */
+    pub t : f32 = 0.0;
+
+    /** How much the rain of landing drops falls now, 0 to 1. */
+    pub rain : f32 = 0.0;
+
+    /** How much of the thin film is left, 0 to 1. */
+    pub film : f32 = 0.0;
+
+    /** How much of the puddles is left, 0 to 1. */
+    pub puddles : f32 = 0.0;
+
+    /** How far from the vent the sheet has spread, cells. */
+    pub reach : f32 = 0.0;
+}
+
+/** What lies over the ground at one column. */
+pub struct GroundWater {
+    /** Depth of water, cells. */
+    pub depth : f32 = 0.0;
+
+    /** Surface velocity along x and z, cells a second. */
+    pub vx : f32 = 0.0;
+    pub vz : f32 = 0.0;
+
+    /** Foam of the splashes. */
+    pub foam : f32 = 0.0;
+
+    /** Turbulence of the falling rain. */
+    pub turbulence : f32 = 0.0;
+}
+
+/** The water on the geyser's apron. */
+pub class GeyserGround {
+    /** The state of the ground's water at second `t` of the cycle. */
+    pub static fn state(t : f32) : GroundState {
+        let one : f32 = 1.0;
+        let rise : f32 = smoothstep(GEY_JET_FROM + GRD_ONSET, GEY_JET_FROM + GRD_ONSET + GRD_RISE, t);
+        let since : f32 = max(t - GEY_JET_TO - (3.0 as f32), 0.0);
+        let rain : f32 = smoothstep(GEY_JET_FROM + (1.5 as f32), GEY_JET_FROM + (3.0 as f32), t)
+            * (one - smoothstep(GEY_JET_TO + one, GEY_JET_TO + (6.0 as f32), t));
+        return GroundState {
+            t: t,
+            rain: rain,
+            film: rise * waterExpNeg(since / GRD_FILM_LIFE),
+            puddles: rise
+                * (GRD_PUDDLE_FLOOR
+                    + ((1.0 as f32) - GRD_PUDDLE_FLOOR) * waterExpNeg(since / GRD_PUDDLE_LIFE)),
+            reach: GRD_REACH_FROM
+                + GRD_REACH_SPAN * smoothstep(GEY_JET_FROM + (1.5 as f32), GEY_JET_TO + (12.0 as f32), t),
+        };
+    }
+
+    /** The water at column centre (`px`, `pz`), `r` from the vent, over ground whose hollow noise is `noise`. */
+    pub static fn water(state : GroundState, px : f32, pz : f32, r : f32, noise : f32) : GroundWater {
+        let inner : f32 = smoothstep(GEY_POOL_R + (1.5 as f32), GEY_POOL_R + (3.5 as f32), r);
+        let mask : f32 = smoothstep(state.reach + (2.0 as f32), state.reach - (4.0 as f32), r) * inner;
+        if (mask <= 0.0) {
+            return GroundWater {};
+        }
+        let hollow : f32 = smoothstep(GRD_HOLLOW_HIGH, GRD_HOLLOW_LOW, noise);
+        let film : f32 = GRD_FILM_DEPTH * state.film
+            * ((1.0 as f32) - GRD_FILM_VARY + GRD_FILM_VARY * noise * (2.0 as f32));
+        let puddle : f32 = GRD_PUDDLE_DEPTH * hollow * state.puddles;
+        let depth : f32 = mask * (film + puddle);
+
+        let rings : f32 = GeyserGround::rings(state, px, pz) * saturate(depth * (30.0 as f32));
+        let inv : f32 = (1.0 as f32) / max(r, 0.3);
+        let speed : f32 = GRD_FLOW * mask * ((0.2 as f32) + state.film)
+            * ((1.0 as f32) - hollow * (0.8 as f32));
+        let splash : f32 = state.rain * mask * saturate(depth * (12.0 as f32));
+        return GroundWater {
+            depth: depth + rings,
+            vx: (px - GEY_VENT) * inv * speed,
+            vz: (pz - GEY_VENT) * inv * speed,
+            foam: saturate(splash * (0.35 as f32) + saturate(rings * (25.0 as f32)) * state.rain),
+            turbulence: saturate(splash * (0.7 as f32) + state.film * mask * (0.15 as f32)),
+        };
+    }
+
+    // The height of the impact rings at (px, pz): each drip point sends out rings that thin as they widen.
+    static fn rings(state : GroundState, px : f32, pz : f32) : f32 {
+        let active : f32 = state.rain + (0.08 as f32) * state.puddles;
+        if (active <= 0.0) {
+            return 0.0;
+        }
+        let mut sum : f32 = 0.0;
+        for (j of 0..GRD_DRIPS) {
+            let angle : f32 = waterHash(j, 1, 0, GRD_DRIP_SEED) * (6.2831855 as f32);
+            let range : f32 = GEY_POOL_R + (2.0 as f32)
+                + state.reach * waterHash(j, 2, 0, GRD_DRIP_SEED) * (0.9 as f32);
+            let cx : f32 = GEY_VENT + range * ludax::cos(angle);
+            let cz : f32 = GEY_VENT + range * ludax::sin(angle);
+            let phase : f32 = state.t / GRD_DRIP_PERIOD + waterHash(j, 3, 0, GRD_DRIP_SEED);
+            let age : f32 = (phase - (phase as i32 as f32));
+            let dx : f32 = px - cx;
+            let dz : f32 = pz - cz;
+            let gap : f32 = sqrt(dx * dx + dz * dz) - age * GRD_DRIP_PERIOD * GRD_DRIP_SPEED;
+            sum = sum + waterExpNeg(gap * gap * GRD_DRIP_SHARP) * ((1.0 as f32) - age);
+        }
+        return sum * GRD_DRIP_HEIGHT * active;
+    }
+}

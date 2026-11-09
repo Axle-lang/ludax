@@ -1,0 +1,662 @@
+// water_shade — the colour of the river's and the lake's surface at a point.
+//
+// A point of water is shaded from what the window says (depth, surface velocity, foam, turbulence) and what a pixel
+// adds on top:
+//
+//   normal      the window surface's smooth normal, tilted by ripples that are advected by the surface velocity:
+//               four octaves of value noise in the flow's own frame, stretched along the flow, each sampled in two
+//               phases a half period apart and cross-faded so the pattern travels with the water without
+//               stretching; octaves fade out when the pixel outgrows their wavelength; the pool's rings travel with
+//               the gravity of the physics; viscosity damps the fine octaves
+//   body        Fresnel reflection of the sky, the sun's GGX glint, and a traced reflection of the terrain
+//               (mountains standing in the lake); refraction through Beer-Lambert absorption down to the bed,
+//               the bed lit by the sun with a caustic net where the water is shallow
+//   foam        a lace of bubbles whose coverage follows the window's foam, the bank's contact line and the
+//               turbulence, feathered by the pixel footprint so it never speckles
+//
+// `cover` is how much of the pixel the water owns: it ramps from zero at the wet edge, so the bank is a soft
+// line and not a stair-step, and the ground shows through the rest. The lake is a flat plane over terrain whose
+// depth is the plane minus the ground.
+
+use ludax::{abs, clamp, max, min, saturate, smoothstep, sqrt, Vec2, Vec3, PI};
+
+use crate::water::ground_shade::{GroundShader, VistaSpot};
+use crate::water::noise::{waterFloor, waterCell2, waterExpNeg, waterFbm2, waterValue2Slope};
+use crate::water::relief::Relief;
+use crate::water::sky::WaterSky;
+use crate::water::vista_look::{VistaLook, WaterSurfaceLook};
+use crate::water::water_window::{WaterWindow, WindowSpot};
+
+// Refractive index of water, and the reflectance of the surface at normal incidence.
+const WSHADE_INDEX : f32 = 1.333;
+const WSHADE_F0 : f32 = 0.02;
+
+// The ripple octaves: finest wavelength (metres), ratio, count, the slope of the calmest water and what turbulence adds.
+const WSHADE_WAVE : f32 = 0.33;
+const WSHADE_RATIO : f32 = 2.6;
+const WSHADE_OCTAVES : i32 = 4;
+const WSHADE_CALM : f32 = 0.028;
+const WSHADE_CHOP : f32 = 0.26;
+
+// A ripple pattern repeats in this many seconds, and travels this share of the water's speed.
+const WSHADE_PERIOD : f32 = 1.9;
+const WSHADE_DRIFT : f32 = 0.85;
+
+// Ripples stretch along the flow by this much per metre a second of speed, up to a limit.
+const WSHADE_STRETCH : f32 = 0.45;
+const WSHADE_STRETCH_MAX : f32 = 3.5;
+
+// The pool's rings: wavelength, slope, and the radii inside which there are none and beyond which they have faded.
+const WSHADE_RING_WAVE : f32 = 3.4;
+const WSHADE_RING_SLOPE : f32 = 0.07;
+const WSHADE_RING_INNER : f32 = 16.0;
+const WSHADE_RING_OUTER : f32 = 150.0;
+
+// A pixel footprint (metres) above which the window is read bilinearly: the cells are smaller than a pixel there.
+const WSHADE_SMOOTH_FAR : f32 = 4.0;
+
+// The fall's glassy part (share of its height from the lip), how much of it the cliff shows through, and how white the film is at the foot.
+const WSHADE_GLASS : f32 = 0.3;
+const WSHADE_GLASS_CLEAR : f32 = 0.5;
+const WSHADE_AERATE : f32 = 0.55;
+
+// The foam rings: where they start and fade out (metres from the impact), how fast they move and how far apart they are.
+const WSHADE_RING_FOAM_FROM : f32 = 14.0;
+const WSHADE_RING_FOAM_TO : f32 = 90.0;
+const WSHADE_RING_FOAM_SPEED : f32 = 4.5;
+const WSHADE_RING_FOAM_GAP : f32 = 11.0;
+
+// Depth over which the wet edge fades from ground to water, metres.
+const WSHADE_EDGE_LOW : f32 = 0.004;
+const WSHADE_EDGE_HIGH : f32 = 0.06;
+
+// A surface this much a wall (see `steepness`) is shaded as a sheet sliding down a face; its streaks are this wide
+// (metres), this many times longer than wide, and tilt the normal this much; the speed it slides at when the engine says less
+// (a sheet on a cliff always falls). Flat water turns into wall between the two normal heights.
+const WSHADE_FACE : f32 = 0.5;
+const WSHADE_WALL_LOW : f32 = 0.55;
+const WSHADE_WALL_HIGH : f32 = 0.85;
+const WSHADE_STREAK : f32 = 0.22;
+const WSHADE_LENGTHEN : f32 = 9.0;
+const WSHADE_FACE_SLOPE : f32 = 0.05;
+const WSHADE_FALL_SPEED : f32 = 8.0;
+const WSHADE_FOAM_LENGTHEN : f32 = 4.0;
+const WSHADE_WALL_BED : f32 = 0.4;
+
+// A film of water thinner than the first of these (metres) carries no foam but its rim; the foam is full from the second.
+const WSHADE_FILM_LOW : f32 = 0.03;
+const WSHADE_FILM_HIGH : f32 = 0.3;
+
+// Dye (the engine's passive tracer): its colour is the look's, as bright as a base plus a share of the water's own brightness,
+// and it covers the water by this much at full concentration.
+const WSHADE_DYE_BASE : f32 = 0.06;
+const WSHADE_DYE_LIT : f32 = 0.5;
+const WSHADE_DYE_OPACITY : f32 = 0.85;
+
+// How much of a bubble plume's turquoise-white replaces the water body under the surface.
+const WSHADE_BUBBLES : f32 = 0.7;
+
+// Foam never covers more than this share of a point: some of the water always shows through the lace.
+const WSHADE_FOAM_CAP : f32 = 0.85;
+
+// The foam: albedo, and the depth under which the bank's contact line shows, metres.
+const WSHADE_FOAM : f32 = 0.82;
+
+// The light over the bed: how much of the overhead sky reaches it, and the sun's share under the surface.
+const WSHADE_BED_AMBIENT : f32 = 0.8;
+
+// The lowest a ray's slope may be before the path through water is capped, so a grazing ray is not infinitely long.
+const WSHADE_MIN_DOWN : f32 = 0.12;
+
+// A reflected ray that points lower than this over the horizon is lifted to it, so no ray looks under the world.
+const WSHADE_HORIZON : f32 = 0.02;
+
+// How far a reflected ray looks for the terrain, metres.
+const WSHADE_REFLECT_REACH : f32 = 5000.0;
+
+// Noise seeds.
+const WSHADE_SEED_RIPPLE : i32 = 401;
+const WSHADE_SEED_FOAM : i32 = 409;
+const WSHADE_SEED_CAUSTIC : i32 = 419;
+const WSHADE_SEED_BED : i32 = 421;
+
+/** Which body of water a point belongs to. */
+pub enum SurfaceKind : i8 {
+    /** The river and the pool, from the water window. */
+    River,
+
+    /** The lake's flat plane. */
+    Lake,
+}
+
+/** A point of water to shade. */
+pub struct SurfaceSpot {
+    /** Where, from where, how big a pixel and when. */
+    pub at : VistaSpot = VistaSpot {};
+
+    /** Which body. */
+    pub kind : SurfaceKind = SurfaceKind::River;
+}
+
+/** What the shader answers. */
+pub struct SurfaceShot {
+    /** Radiance leaving the surface toward the eye. */
+    pub colour : Vec3 = Vec3 { x: (0.0 as f32), y: (0.0 as f32), z: (0.0 as f32) };
+
+    /** How much of the pixel the water covers, 0 to 1. */
+    pub cover : f32 = (1.0 as f32);
+}
+
+// What the window and the geometry say of the point.
+struct SurfaceFacts {
+    depth      : f32;
+    flowX      : f32;
+    flowZ      : f32;
+    foam       : f32;
+    turbulence : f32;
+    dye        : f32;
+    normal     : Vec3;
+
+    // How far down a fall the point is, 0 at the lip to 1 at the foot (0.5 where the scene has no fall).
+    fall : f32 = (0.5 as f32);
+}
+
+/** The water surface shader. */
+pub class SurfaceShader {
+    relief : Shared<Relief>;
+    window : Shared<WaterWindow>;
+    sky    : Shared<WaterSky>;
+    ground : Shared<GroundShader>;
+
+    /** A shader over the landscape, lit by `sky`, reflecting the terrain through `ground`. */
+    constructor(
+        relief : Shared<Relief>,
+        window : Shared<WaterWindow>,
+        sky : Shared<WaterSky>,
+        ground : Shared<GroundShader>
+    ) {
+        self.relief = relief;
+        self.window = window;
+        self.sky = sky;
+        self.ground = ground;
+    }
+
+    // Depth, flow, foam, turbulence and the geometric normal at the spot.
+    fn facts(self, spot : SurfaceSpot) : SurfaceFacts {
+        let p : Vec3 = spot.at.point;
+        if (spot.kind == SurfaceKind::Lake) {
+            let depth : f32 = max(self.relief.lakeLevel - self.relief.grid.heightAt(p.x, p.z), (0.0 as f32));
+            return SurfaceFacts {
+                depth: depth,
+                flowX: 0.0,
+                flowZ: 0.0,
+                foam: 0.0,
+                turbulence: 0.04,
+                dye: 0.0,
+                normal: Vec3::unitY(),
+            };
+        }
+        if (spot.at.footprint > WSHADE_SMOOTH_FAR) {
+            let far : WindowSpot = self.window.at(p.x, p.z);
+            return SurfaceFacts {
+                depth: far.depth,
+                flowX: far.vx,
+                flowZ: far.vz,
+                foam: far.foam,
+                turbulence: far.turbulence,
+                dye: far.dye,
+                normal: self.window.top.normalAt(p.x, p.z),
+            };
+        }
+        let w : WindowSpot = self.window.smooth(p.x, p.z);
+        return SurfaceFacts {
+            depth: w.depth,
+            flowX: w.vx,
+            flowZ: w.vz,
+            foam: w.foam,
+            turbulence: w.turbulence,
+            dye: w.dye,
+            normal: Vec3 {
+                x: (0.0 as f32) - w.slopeX,
+                y: (1.0 as f32),
+                z: (0.0 as f32) - w.slopeZ,
+            }.normalized(),
+        };
+    }
+
+    /** The water at `spot` under `look`. */
+    pub fn shade(self, spot : SurfaceSpot, look : VistaLook) : SurfaceShot {
+        let mut f : SurfaceFacts = self.facts(spot);
+        f.fall = SurfaceShader::fallen(spot.at.point.y, look);
+        let at : VistaSpot = spot.at;
+        let p : Vec3 = at.point;
+        let sl : WaterSurfaceLook = look.surface;
+        let lake : bool = spot.kind == SurfaceKind::Lake;
+
+        let slope : Vec3 = self.ripples(p, f, at, look).plus(self.rings(p, at, look));
+        let tilted : Vec3 = Vec3 {
+            x: f.normal.x - slope.x,
+            y: f.normal.y,
+            z: f.normal.z - slope.z,
+        }.normalized();
+        let toEye : Vec3 = at.view.negated();
+        let n : Vec3 = SurfaceShader::facing(tilted, toEye);
+        let nv : f32 = max(n.dot(toEye), (0.03 as f32));
+        let fresnel : f32 = SurfaceShader::fresnel(nv);
+        let sun : f32 = self.relief.sunAt(p.x, p.z);
+
+        let mut seen : Vec3 = self.refracted(p, at.view, n, nv, f, look, lake, sun, at.time, at.footprint);
+        if (f.dye > (0.0 as f32)) {
+            let glow : f32 = WSHADE_DYE_BASE + WSHADE_DYE_LIT * (seen.x + seen.y + seen.z);
+            seen = seen.lerp(sl.dye.scale(glow), saturate(f.dye * WSHADE_DYE_OPACITY));
+        }
+        let bubbles : f32 = saturate(f.foam * f.turbulence * (1.6 as f32))
+            * smoothstep((0.3 as f32), (1.2 as f32), f.depth);
+        if (bubbles > (0.0 as f32)) {
+            let glow : Vec3 = self.sky.ambient(Vec3::unitY()).plus(self.sky.direct(Vec3::unitY()).scale(sun));
+            seen = seen.lerp(
+                glow.times(Vec3 { x: (0.45 as f32), y: (0.9 as f32), z: (0.85 as f32) }),
+                bubbles * WSHADE_BUBBLES
+            );
+        }
+        let mirror : Vec3 = self.reflected(p, at.view, n, f, look, at.footprint);
+        let glint : Vec3 = self.glint(n, toEye, f.turbulence, sl.glintRoughness, at.footprint, sun);
+        let mut colour : Vec3 = seen.scale((1.0 as f32) - fresnel).plus(mirror.scale(fresnel)).plus(glint);
+
+        let foam : f32 = self.foamShare(p, f, at, look);
+        if (foam > (0.0 as f32)) {
+            colour = colour.lerp(self.foamColour(n, sun, p, at.time), foam);
+        }
+        let mut cover : f32 = (1.0 as f32);
+        if (!lake) {
+            cover = smoothstep(WSHADE_EDGE_LOW, WSHADE_EDGE_HIGH, f.depth);
+            let wall : f32 = SurfaceShader::steepness(f.normal);
+            let glass : f32 = (1.0 as f32) - smoothstep((0.0 as f32), WSHADE_GLASS, f.fall);
+            let white : f32 = wall * smoothstep((0.3 as f32), (1.0 as f32), f.fall) * WSHADE_AERATE;
+            colour = colour.lerp(self.foamColour(n, sun, p, at.time), white);
+            let rim : f32 = wall * ((1.0 as f32) - smoothstep((0.0 as f32), (0.05 as f32), f.fall));
+            colour = colour.plus(self.sky.view(n).scale(rim * (0.6 as f32)));
+            cover = cover * ((1.0 as f32) - wall * glass * WSHADE_GLASS_CLEAR * ((1.0 as f32) - rim));
+        }
+        return SurfaceShot { colour: colour, cover: cover };
+    }
+
+    // How far down the fall a height is: 0 at the crest, 1 at the foot; 0.5 when the look has no fall.
+    static fn fallen(y : f32, look : VistaLook) : f32 {
+        let top : f32 = look.drops.fallTop;
+        let foot : f32 = look.drops.fallFoot;
+        if (top <= foot) {
+            return (0.5 as f32);
+        }
+        return saturate((top - y) / (top - foot));
+    }
+
+    // A normal that faces the eye: a ripple may tilt it past grazing, which the eye never sees.
+    static fn facing(n : Vec3, toEye : Vec3) : Vec3 {
+        let d : f32 = n.dot(toEye);
+        if (d >= (0.03 as f32)) {
+            return n;
+        }
+        return n.plus(toEye.scale((0.03 as f32) - d)).normalized();
+    }
+
+    // Schlick's reflectance at the cosine `nv`.
+    static fn fresnel(nv : f32) : f32 {
+        let m : f32 = (1.0 as f32) - nv;
+        let m2 : f32 = m * m;
+        return WSHADE_F0 + ((1.0 as f32) - WSHADE_F0) * m2 * m2 * m;
+    }
+
+    // The slope (dh/dx, 0, dh/dz) the ripples add: flow-aligned octaves, two phases cross-faded.
+    fn ripples(self, p : Vec3, f : SurfaceFacts, at : VistaSpot, look : VistaLook) : Vec3 {
+        let steep : f32 = SurfaceShader::steepness(f.normal);
+        if (steep > WSHADE_FACE) {
+            return self.faceRipples(p, f, at, look);
+        }
+        return self.flatRipples(p, f, at, look);
+    }
+
+    // How much of a vertical face the surface is, 0 on flat water to 1 on a wall (the water sliding down a cliff).
+    static fn steepness(n : Vec3) : f32 {
+        return (1.0 as f32) - smoothstep(WSHADE_WALL_LOW, WSHADE_WALL_HIGH, n.y);
+    }
+
+    // The coordinates of a point on a vertical face: along the face horizontally, and down it (the pattern slides with the speed).
+    static fn faceAt(p : Vec3, n : Vec3, speed : f32, time : f32) : Vec2 {
+        return Vec2 { x: p.x * (0.8 as f32) + p.z * (0.6 as f32), y: p.y + speed * time };
+    }
+
+    // Ripples on a sheet sliding down a face: fine, nearly parallel vertical streaks, small in amplitude and stretched
+    // with the fall; no wandering, so the sheet reads as a smooth glassy fall with streaks and not as marble.
+    fn faceRipples(self, p : Vec3, f : SurfaceFacts, at : VistaSpot, look : VistaLook) : Vec3 {
+        let speed : f32 = sqrt(f.flowX * f.flowX + f.flowZ * f.flowZ + WSHADE_FALL_SPEED * WSHADE_FALL_SPEED);
+        let c : Vec2 = SurfaceShader::faceAt(p, f.normal, speed, at.time);
+        let fade : f32 = (1.0 as f32)
+            - smoothstep(WSHADE_STREAK * (0.3 as f32), WSHADE_STREAK * (1.2 as f32), at.footprint);
+        let a : Vec3 = waterValue2Slope(
+            c.x / WSHADE_STREAK,
+            c.y / (WSHADE_STREAK * WSHADE_LENGTHEN),
+            WSHADE_SEED_RIPPLE + 41
+        );
+        let b : Vec3 = waterValue2Slope(
+            c.x / (WSHADE_STREAK * (2.7 as f32)),
+            c.y / (WSHADE_STREAK * (2.7 as f32) * WSHADE_LENGTHEN),
+            WSHADE_SEED_RIPPLE + 43
+        );
+        let ribs : f32 = (0.15 as f32) + (1.85 as f32) * smoothstep((0.0 as f32), (0.8 as f32), f.fall);
+        let across : f32 = (a.y / WSHADE_STREAK + (0.5 as f32) * b.y / (WSHADE_STREAK * (2.7 as f32)))
+            * WSHADE_FACE_SLOPE
+            * ribs
+            * look.surface.ripples
+            * fade;
+        let facing : f32 = ludax::max(abs(f.normal.x) + abs(f.normal.z), (0.01 as f32));
+        return Vec3 {
+            x: across * abs(f.normal.z) / facing,
+            y: (0.0 as f32),
+            z: across * abs(f.normal.x) / facing,
+        };
+    }
+
+    fn flatRipples(self, p : Vec3, f : SurfaceFacts, at : VistaSpot, look : VistaLook) : Vec3 {
+        let speed : f32 = sqrt(f.flowX * f.flowX + f.flowZ * f.flowZ);
+        let mut dx : f32 = (0.0 as f32);
+        let mut dz : f32 = (1.0 as f32);
+        if (speed > (0.05 as f32)) {
+            dx = f.flowX / speed;
+            dz = f.flowZ / speed;
+        }
+        let along : f32 = p.x * dx + p.z * dz;
+        let across : f32 = (0.0 as f32) - p.x * dz + p.z * dx;
+        let stretch : f32 = (1.0 as f32) + min(speed * WSHADE_STRETCH, WSHADE_STRETCH_MAX);
+        let cycle : f32 = at.time / WSHADE_PERIOD;
+        let ph0 : f32 = cycle - (cycle as i32 as f32);
+        let ph1 : f32 = ph0 + (0.5 as f32) - ((ph0 + (0.5 as f32)) as i32 as f32);
+        let w0 : f32 = (1.0 as f32) - abs((2.0 as f32) * ph0 - (1.0 as f32));
+        let w1 : f32 = (1.0 as f32) - w0;
+        let travel : f32 = speed * WSHADE_PERIOD * WSHADE_DRIFT;
+        let slopeGain : f32 = look.surface.ripples * (WSHADE_CALM + WSHADE_CHOP * f.turbulence);
+        let mut sa : f32 = (0.0 as f32);
+        let mut sc : f32 = (0.0 as f32);
+        let mut wave : f32 = WSHADE_WAVE;
+        let mut gain : f32 = slopeGain;
+        for (o of 0..WSHADE_OCTAVES) {
+            let fade : f32 = (1.0 as f32)
+                - smoothstep(wave * (0.3 as f32), wave * (1.1 as f32), at.footprint);
+            let damp : f32 = (1.0 as f32) / ((1.0 as f32) + look.physics.viscosity * (4.0 as f32) / wave);
+            if (fade > (0.0 as f32)) {
+                let seed : i32 = WSHADE_SEED_RIPPLE + o * 11;
+                let s0 : Vec3 = waterValue2Slope(
+                    (along - travel * ph0) / (wave * stretch),
+                    across / wave,
+                    seed
+                );
+                let s1 : Vec3 = waterValue2Slope(
+                    (along - travel * ph1) / (wave * stretch),
+                    across / wave,
+                    seed
+                );
+                let k : f32 = gain * fade * damp;
+                sa = sa + k * (s0.y * w0 + s1.y * w1) / stretch;
+                sc = sc + k * (s0.z * w0 + s1.z * w1);
+            }
+            wave = wave * WSHADE_RATIO;
+            gain = gain * (0.8 as f32);
+        }
+        return Vec3 { x: sa * dx - sc * dz, y: (0.0 as f32), z: sa * dz + sc * dx };
+    }
+
+    // The pool's expanding rings: a wave train whose speed follows the gravity of the physics.
+    fn rings(self, p : Vec3, at : VistaSpot, look : VistaLook) : Vec3 {
+        let ox : f32 = p.x - look.surface.ringX;
+        let oz : f32 = p.z - look.surface.ringZ;
+        let r : f32 = sqrt(ox * ox + oz * oz);
+        let reach : f32 = smoothstep(WSHADE_RING_INNER, WSHADE_RING_INNER + (8.0 as f32), r)
+            * ((1.0 as f32) - smoothstep(WSHADE_RING_OUTER * (0.4 as f32), WSHADE_RING_OUTER, r));
+        if (reach <= (0.0 as f32) || look.surface.rings <= (0.0 as f32)) {
+            return Vec3::zero();
+        }
+        let k : f32 = (2.0 as f32) * PI / WSHADE_RING_WAVE;
+        let omega : f32 = sqrt(look.physics.gravity * k);
+        let fade : f32 = (1.0 as f32)
+            - smoothstep(WSHADE_RING_WAVE * (0.3 as f32), WSHADE_RING_WAVE * (1.1 as f32), at.footprint);
+        let damp : f32 = (1.0 as f32)
+            / ((1.0 as f32) + look.physics.viscosity * (4.0 as f32) / WSHADE_RING_WAVE);
+        let phase : f32 = k * r - omega * at.time;
+        let s : f32 = WSHADE_RING_SLOPE * look.surface.rings * reach * fade * damp
+            * sqrt(WSHADE_RING_INNER / max(r, (1.0 as f32)));
+        let radial : f32 = s * ludax::cos(phase);
+        return Vec3 {
+            x: radial * ox / max(r, (0.1 as f32)),
+            y: (0.0 as f32),
+            z: radial * oz / max(r, (0.1 as f32)),
+        };
+    }
+
+    // What lies under the surface: the bed seen through Beer-Lambert absorption, plus the light the water scatters.
+    fn refracted(
+        self,
+        p : Vec3,
+        view : Vec3,
+        n : Vec3,
+        nv : f32,
+        f : SurfaceFacts,
+        look : VistaLook,
+        lake : bool,
+        sun : f32,
+        time : f32,
+        footprint : f32
+    ) : Vec3 {
+        let eta : f32 = (1.0 as f32) / WSHADE_INDEX;
+        let k : f32 = max((1.0 as f32) - eta * eta * ((1.0 as f32) - nv * nv), (0.0 as f32));
+        let rd : Vec3 = view.scale(eta).plus(n.scale(eta * nv - sqrt(k)));
+        let path : f32 = f.depth / max((0.0 as f32) - rd.y, WSHADE_MIN_DOWN);
+        let sl : WaterSurfaceLook = look.surface;
+        let silt : Vec3 = Vec3 { x: (0.9 as f32), y: (0.55 as f32), z: (0.35 as f32) };
+        let mudBody : Vec3 = Vec3 { x: (0.10 as f32), y: (0.085 as f32), z: (0.05 as f32) };
+        let mut sigma : Vec3 = sl.absorption.lerp(silt, sl.silt);
+        let mut body : Vec3 = sl.body.lerp(mudBody, sl.silt);
+        if (lake) {
+            sigma = sl.lakeAbsorption;
+            body = sl.lakeBody;
+        }
+        let through : Vec3 = Vec3 {
+            x: waterExpNeg(sigma.x * path),
+            y: waterExpNeg(sigma.y * path),
+            z: waterExpNeg(sigma.z * path),
+        };
+        let sunY : f32 = max(self.sky.sunDir.y, (0.05 as f32));
+        let down : f32 = f.depth / sunY;
+        let sunThrough : Vec3 = Vec3 {
+            x: waterExpNeg(sigma.x * down),
+            y: waterExpNeg(sigma.y * down),
+            z: waterExpNeg(sigma.z * down),
+        };
+        let open : f32 = self.relief.openAt(p.x, p.z);
+        let ambient : Vec3 = self.sky.ambient(Vec3::unitY()).scale(open * WSHADE_BED_AMBIENT);
+        let sunLight : Vec3 = self.sky.sunIrr.scale(sunY * sun / PI);
+
+        let bp : Vec3 = p.plus(rd.scale(path));
+        let shallow : f32 = smoothstep((4.0 as f32), (0.2 as f32), f.depth) * sl.caustics;
+        let wall : f32 = SurfaceShader::steepness(f.normal);
+        let net : f32 = self.caustics(bp, time, footprint) * ((1.0 as f32) - wall);
+        let bedLight : Vec3 = sunLight
+            .times(sunThrough)
+            .scale((1.0 as f32) + shallow * net)
+            .plus(ambient.times(through));
+        let bed : Vec3 = self.bedAlbedo(bp).lerp(self.ground.look.rockGrey.scale(WSHADE_WALL_BED), wall);
+        let seen : Vec3 = bed.times(bedLight).times(through);
+        let scatter : Vec3 = body
+            .times(sunLight.scale((0.5 as f32)).plus(ambient))
+            .times(Vec3 {
+                x: (1.0 as f32) - through.x,
+                y: (1.0 as f32) - through.y,
+                z: (1.0 as f32) - through.z,
+            });
+        return seen.plus(scatter);
+    }
+
+    // The bed's colour: gravel and sand in patches, darker with a green film where it is deep.
+    fn bedAlbedo(self, p : Vec3) : Vec3 {
+        let patch : f32 = waterFbm2(p.x * (0.5 as f32), p.z * (0.5 as f32), 3, WSHADE_SEED_BED);
+        let stone : Vec3 = self.ground.look.gravel.lerp(
+            self.ground.look.sand,
+            smoothstep((0.35 as f32), (0.65 as f32), patch)
+        );
+        let grain : f32 = (0.85 as f32)
+            + (0.3 as f32) * waterFbm2(p.x * (3.1 as f32), p.z * (3.1 as f32), 2, WSHADE_SEED_BED + 3);
+        return stone.scale(grain);
+    }
+
+    // The caustic net on the bed: where two drifting cellular patterns agree, light piles up in lines.
+    fn caustics(self, p : Vec3, time : f32, footprint : f32) : f32 {
+        let blur : f32 = smoothstep((0.35 as f32), (1.6 as f32), footprint);
+        if (blur >= (1.0 as f32)) {
+            return (0.0 as f32);
+        }
+        let a : f32 = waterCell2(
+            p.x * (0.9 as f32) + time * (0.13 as f32),
+            p.z * (0.9 as f32) - time * (0.1 as f32),
+            WSHADE_SEED_CAUSTIC
+        );
+        let b : f32 = waterCell2(
+            p.x * (1.3 as f32) - time * (0.11 as f32),
+            p.z * (1.3 as f32) + time * (0.09 as f32),
+            WSHADE_SEED_CAUSTIC + 1
+        );
+        let line : f32 = saturate((1.0 as f32) - (3.2 as f32) * abs(a - b));
+        return (line * line * (0.8 as f32) - (0.25 as f32)) * ((1.0 as f32) - blur);
+    }
+
+    // The sky and the terrain as the surface mirrors them.
+    fn reflected(
+        self,
+        p : Vec3,
+        view : Vec3,
+        n : Vec3,
+        f : SurfaceFacts,
+        look : VistaLook,
+        footprint : f32
+    ) : Vec3 {
+        let mut r : Vec3 = view.minus(n.scale((2.0 as f32) * view.dot(n)));
+        if (r.y < WSHADE_HORIZON) {
+            r = Vec3 { x: r.x, y: WSHADE_HORIZON, z: r.z }.normalized();
+        }
+        let rough : f32 = saturate(f.turbulence * (0.6 as f32) + footprint * (0.02 as f32));
+        let sharp : Vec3 = self.sky.view(r);
+        let sky : Vec3 = sharp.lerp(self.sky.prefiltered(r, rough), saturate(rough * (3.0 as f32)));
+        if (!look.surface.reflectTerrain || r.y > (0.85 as f32)) {
+            return sky;
+        }
+        let from : Vec3 = p.plus(n.scale((0.15 as f32)));
+        let t : f32 = self.relief.grid.march(from, r, (0.2 as f32), WSHADE_REFLECT_REACH);
+        if (t < (0.0 as f32)) {
+            return sky;
+        }
+        let hit : Vec3 = from.plus(r.scale(t));
+        let land : Vec3 = self.ground.cheap(VistaSpot {
+            point: hit,
+            view: r,
+            footprint: (1.0 as f32),
+            time: (0.0 as f32),
+        });
+        let air : f32 = (1.0 as f32) - waterExpNeg(t * (0.00012 as f32));
+        return land.lerp(self.sky.haze(r), saturate(air * (1.5 as f32)));
+    }
+
+    // The sun's glint: GGX with the roughness of the water's own turbulence and of the pixel's footprint.
+    fn glint(self, n : Vec3, toEye : Vec3, turbulence : f32, base : f32, footprint : f32, sun : f32) : Vec3 {
+        let l : Vec3 = self.sky.sunDir;
+        let nl : f32 = n.dot(l);
+        if (nl <= (0.0 as f32) || sun <= (0.0 as f32)) {
+            return Vec3::zero();
+        }
+        let h : Vec3 = l.plus(toEye).normalized();
+        let a : f32 = clamp(
+            base + (0.22 as f32) * turbulence + footprint * (0.012 as f32),
+            (0.02 as f32),
+            (0.6 as f32)
+        );
+        let a2 : f32 = a * a;
+        let nh : f32 = max(n.dot(h), (0.0 as f32));
+        let d : f32 = nh * nh * (a2 - (1.0 as f32)) + (1.0 as f32);
+        let ndf : f32 = a2 / (PI * d * d);
+        let vh : f32 = max(toEye.dot(h), (0.0 as f32));
+        let m : f32 = (1.0 as f32) - vh;
+        let fr : f32 = WSHADE_F0 + ((1.0 as f32) - WSHADE_F0) * m * m * m * m * m;
+        let nv : f32 = max(n.dot(toEye), (0.05 as f32));
+        let spec : f32 = ndf * fr * (0.25 as f32) / max(nl * nv, (0.05 as f32)) * nl;
+        return self.sky.sunIrr.scale(spec * sun);
+    }
+
+    // Foam in the rings that spread from the impact: bands a ring spacing apart that move outward and thin with distance.
+    fn ringFoam(self, p : Vec3, time : f32, look : VistaLook) : f32 {
+        if (look.surface.rings <= (0.0 as f32)) {
+            return (0.0 as f32);
+        }
+        let ox : f32 = p.x - look.surface.ringX;
+        let oz : f32 = p.z - look.surface.ringZ;
+        let r : f32 = sqrt(ox * ox + oz * oz);
+        let reach : f32 = smoothstep(WSHADE_RING_FOAM_FROM, WSHADE_RING_FOAM_FROM * (1.6 as f32), r)
+            * ((1.0 as f32) - smoothstep(WSHADE_RING_FOAM_TO * (0.4 as f32), WSHADE_RING_FOAM_TO, r));
+        if (reach <= (0.0 as f32)) {
+            return (0.0 as f32);
+        }
+        let phase : f32 = (r - WSHADE_RING_FOAM_SPEED * time) / WSHADE_RING_FOAM_GAP;
+        let frac : f32 = phase - (waterFloor(phase) as f32);
+        let band : f32 = smoothstep((0.0 as f32), (0.1 as f32), frac)
+            * ((1.0 as f32) - smoothstep((0.1 as f32), (0.4 as f32), frac));
+        return band * reach * (0.6 as f32);
+    }
+
+    // How much of the point is foam: the window's foam, the bank's line and the turbulence, as a lace of bubbles.
+    fn foamShare(self, p : Vec3, f : SurfaceFacts, at : VistaSpot, look : VistaLook) : f32 {
+        let sl : WaterSurfaceLook = look.surface;
+        let speed : f32 = sqrt(f.flowX * f.flowX + f.flowZ * f.flowZ);
+        let bank : f32 = ((1.0 as f32) - smoothstep(sl.contactFoam * (0.1 as f32), sl.contactFoam, f.depth))
+            * (0.55 as f32);
+        let deep : f32 = smoothstep(WSHADE_FILM_LOW, WSHADE_FILM_HIGH, f.depth);
+        let wall : f32 = SurfaceShader::steepness(f.normal);
+        let aerated : f32 = (1.0 as f32)
+            + wall * (smoothstep((0.12 as f32), (0.7 as f32), f.fall) - (1.0 as f32));
+        let amount : f32 = saturate(f.foam * sl.foamCoverage * deep * aerated + bank * aerated
+            + self.ringFoam(p, at.time, look) * deep);
+        if (amount <= (0.01 as f32)) {
+            return (0.0 as f32);
+        }
+        let shift : f32 = at.time * speed * (0.9 as f32);
+        let mut tx : f32 = p.x - shift * f.flowX / max(speed, (0.05 as f32));
+        let mut tz : f32 = p.z - shift * f.flowZ / max(speed, (0.05 as f32));
+        let stretchX : f32 = (1.0 as f32);
+        let mut stretchZ : f32 = (1.0 as f32);
+        if (SurfaceShader::steepness(f.normal) > WSHADE_FACE) {
+            let c : Vec2 = SurfaceShader::faceAt(p, f.normal, ludax::max(speed, WSHADE_FALL_SPEED), at.time);
+            tx = c.x;
+            tz = c.y;
+            stretchZ = (1.0 as f32) / WSHADE_FOAM_LENGTHEN;
+        }
+        let bubbles : f32 = (1.0 as f32)
+            - min(
+                waterCell2(tx * (2.7 as f32) * stretchX, tz * (2.7 as f32) * stretchZ, WSHADE_SEED_FOAM),
+                (1.0 as f32)
+            );
+        let froth : f32 = waterFbm2(
+            tx * (0.9 as f32) * stretchX,
+            tz * (0.9 as f32) * stretchZ,
+            4,
+            WSHADE_SEED_FOAM + 5
+        );
+        let lace : f32 = (0.55 as f32) * bubbles + (0.45 as f32) * froth;
+        let soft : f32 = (0.1 as f32) + min(at.footprint * (0.12 as f32), (0.3 as f32));
+        let edge : f32 = (0.95 as f32) - amount * (0.7 as f32);
+        return smoothstep(edge - soft, edge + soft, lace) * smoothstep((0.0 as f32), (0.2 as f32), amount)
+            * WSHADE_FOAM_CAP;
+    }
+
+    // The foam's own colour: bright, lit by the sun and the sky, with the lace's shading.
+    fn foamColour(self, n : Vec3, sun : f32, p : Vec3, time : f32) : Vec3 {
+        let light : Vec3 = self.sky.direct(n).scale(sun).plus(self.sky.ambient(n).scale((0.9 as f32)));
+        let shade : f32 = (0.78 as f32)
+            + (0.3 as f32) * waterFbm2(p.x * (2.3 as f32), p.z * (2.3 as f32), 2, WSHADE_SEED_FOAM + 9);
+        return light.scale(WSHADE_FOAM * shade);
+    }
+}

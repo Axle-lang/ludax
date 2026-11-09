@@ -1,0 +1,435 @@
+// vista_frame — one vista picture: the stages the pool runs, and the samples they accumulate.
+//
+// A frame is a fixed sequence of stages, each a loop over rows or tiles that the pool cuts into chunks whose
+// boundaries depend on the counts alone, and every chunk writes only the pixels or tiles it owns, so one thread
+// and twenty-three give the same bits:
+//
+//   SkyBake, GroundLight   tables the pixels read: the sky's radiance grid and the terrain's baked sun and sky
+//                          visibility (only when the time of day moved)
+//   Trace      a primary ray per pixel against the ground, the lake plane and the water window's surface through
+//              the pyramids; shades what it meets, thickens it with aerial perspective, writes radiance and depth
+//   Project    every drop to the screen (a capsule: two end points, a radius, a colour)
+//   Splat      the drops, a tile a job, order-independently into a layer, tested against the depth
+//   Resolve    scene under the drops, folded into the running mean of the samples of a still picture
+//   Bright, Display   the bloom's first level and the pack to pixels (`post`)
+//
+// The sample of frame `n` of a still picture is jittered inside its pixel by the n-th point of the R2 sequence (the
+// first sample is the pixel's centre): the running mean is an exact box filter of the points seen, which
+// antialiases glints, foam lace and drop edges with no random number.
+
+use ludax::{max, min, saturate, Vec3, RangeKernel};
+
+use crate::water::camera::WaterCamera;
+use crate::water::crown_volume::CrownVolume;
+use crate::water::drop_splat::DropSplat;
+use crate::water::drop_store::DropStore;
+use crate::water::ground_shade::{GroundShader, VistaSpot};
+use crate::water::marker_layer::MarkerLayer;
+use crate::water::noise::{waterExpNeg, waterHighI, waterPick};
+use crate::water::plants::{PlantField, PlantHit};
+use crate::water::post::WaterPost;
+use crate::water::relief::Relief;
+use crate::water::sky::WaterSky;
+use crate::water::undergrowth::{UnderHit, UndergrowthField};
+use crate::water::vista_look::VistaLook;
+use crate::water::water_shade::{SurfaceKind, SurfaceShader, SurfaceShot, SurfaceSpot};
+use crate::water::water_window::WaterWindow;
+
+// The R2 sequence: the two fractions that generate it.
+const VFRAME_R2_X : f32 = 0.7548776662;
+const VFRAME_R2_Y : f32 = 0.5698402910;
+
+// How far a primary ray looks, metres, and the depth a sky pixel is given so every drop is in front of it.
+const VFRAME_FAR : f32 = 12000.0;
+const VFRAME_SKY_DEPTH : f32 = 1000000.0;
+
+// Water shallower than this is shaded as ground, metres.
+const VFRAME_DRY : f32 = 0.002;
+
+// A ray starts this far from the eye, metres.
+const VFRAME_NEAR : f32 = 0.05;
+
+// Channels beyond this are a numeric accident: the sample is discarded.
+const VFRAME_LIMIT : f32 = 100000000.0;
+
+// The metres of tolerance by which the window's surface may sit under the terrain's before the terrain wins.
+const VFRAME_WINDOW_BIAS : f32 = 0.05;
+
+/** What the pool is working on. */
+pub enum VistaStage : i8 {
+    /** Bake the sky's radiance grid. */
+    SkyBake,
+
+    /** Bake the terrain's sun and sky visibility. */
+    GroundLight,
+
+    /** Trace one sample per pixel. */
+    Trace,
+
+    /** Project the drops to the screen. */
+    Project,
+
+    /** Splat the drops, one tile a job. */
+    Splat,
+
+    /** Compose the sample and fold it into the mean. */
+    Resolve,
+
+    /** Pick the bright light for the bloom. */
+    Bright,
+
+    /** Tone map and pack to pixels. */
+    Display,
+}
+
+/** The picture being drawn and the kernel that draws it. */
+pub class VistaFrame : RangeKernel {
+    /** Picture width and height, pixels. */
+    pub w : i32;
+    pub h : i32;
+
+    /** What `runRange` does next. */
+    pub stage : VistaStage = VistaStage::Trace;
+
+    /** Hands the ground and the trees the look's materials: call it whenever `look` changed. */
+    pub fn adopt(mut self) : void {
+        self.ground.look = self.look.ground;
+        self.plants.look = self.look.ground;
+        self.under.look = self.look.ground;
+    }
+
+    /** The camera of the sample being drawn. */
+    pub cam : WaterCamera = WaterCamera {};
+
+    /** The look of the frame. */
+    pub look : VistaLook = VistaLook {};
+
+    /** The sample's number: 0 is the first of a picture. */
+    pub index : i32 = 0;
+
+    /** Simulation seconds. */
+    pub time : f32 = (0.0 as f32);
+
+    /** The running mean of the samples: what `post` shows. */
+    pub hdr : f32[];
+
+    /** The sky. */
+    pub sky : Shared<WaterSky>;
+
+    /** The drops. */
+    pub drops : DropSplat;
+
+    /** The aerated crown at the foot of the fall. */
+    pub crown : CrownVolume;
+
+    /** The display stage. */
+    pub post : WaterPost;
+
+    markers : Shared<MarkerLayer>;
+    relief  : Shared<Relief>;
+    window  : Shared<WaterWindow>;
+    ground  : Shared<GroundShader>;
+    plants  : PlantField;
+    under   : UndergrowthField;
+    surface : SurfaceShader;
+    scene   : f32[];
+    depth   : f32[];
+
+    /** A frame of `w` by `h` pixels over a landscape, shown at `scale` times that size, drawing the drops of `store`. */
+    constructor(
+        relief : Shared<Relief>,
+        window : Shared<WaterWindow>,
+        sky : Shared<WaterSky>,
+        markers : Shared<MarkerLayer>,
+        store : Shared<DropStore>,
+        w : i32,
+        h : i32,
+        scale : i32
+    ) {
+        self.markers = markers;
+        self.relief = relief;
+        self.window = window;
+        self.w = w;
+        self.h = h;
+        let n : i64 = (w as i64) * h;
+        self.hdr = new f32[n * 3];
+        self.scene = new f32[n * 3];
+        self.depth = new f32[n];
+        for (i of 0..(n * 3)) {
+            self.hdr[i] = (0.0 as f32);
+        }
+        self.sky = sky;
+        self.ground = share new GroundShader(relief, window, self.sky);
+        self.plants = new PlantField(relief, self.sky);
+        self.under = new UndergrowthField(relief, window, self.sky);
+        self.surface = new SurfaceShader(relief, window, self.sky, self.ground);
+        self.drops = new DropSplat(store, w, h);
+        self.crown = new CrownVolume();
+        self.post = new WaterPost(w, h, scale);
+    }
+
+    /** Rows or tiles the current stage has. */
+    pub fn rows(self) : i32 {
+        return match self.stage {
+            VistaStage::SkyBake => self.sky.rows(),
+            VistaStage::GroundLight => self.relief.lightRows(),
+            VistaStage::Project => self.drops.projectChunks(),
+            VistaStage::Splat => self.drops.tiles(),
+            VistaStage::Bright => self.post.brightRowCount(),
+            _ => self.h,
+        };
+    }
+
+    /** Draws the flow markers and their trails over the finished picture (when it is shown at its own size). */
+    pub fn drawMarkers(mut self) : void {
+        if (self.post.scale == 1 && self.markers.count > 0) {
+            self.markers.draw(self.post.out, self.w, self.h, self.cam, self.depth);
+        }
+    }
+
+    /** Does rows `begin` up to `end` of whatever `stage` names. */
+    pub fn runRange(mut self, begin : i32, end : i32) : void {
+        match self.stage {
+            VistaStage::SkyBake => self.sky.bakeRows(begin, end),
+            VistaStage::GroundLight => self.relief.bakeLight(self.sky.sunDir, begin, end),
+            VistaStage::Trace => self.trace(begin, end),
+            VistaStage::Project => self.drops.projectRange(begin, end, self.cam, self.look.drops, self.sky),
+            VistaStage::Splat => self.splatTiles(begin, end),
+            VistaStage::Resolve => self.resolve(begin, end),
+            VistaStage::Bright => self.post.brightRows(self.hdr, begin, end),
+            VistaStage::Display => self.post.composeRows(
+                self.hdr,
+                self.look.post,
+                !self.look.modules.post,
+                begin,
+                end
+            ),
+        }
+    }
+
+    fn splatTiles(mut self, begin : i32, end : i32) : void {
+        for (tile of begin..end) {
+            self.drops.splatTile(self.drops.tileAt(tile), self.depth);
+        }
+    }
+
+    // The sub-pixel position of sample `n`: the n-th R2 point, the pixel's centre for the first.
+    fn jitterOf(self, n : i32) : Vec3 {
+        let a : f32 = (n as f32) * VFRAME_R2_X + (0.5 as f32);
+        let b : f32 = (n as f32) * VFRAME_R2_Y + (0.5 as f32);
+        return Vec3 { x: a - (a as i32 as f32), y: b - (b as i32 as f32), z: (0.0 as f32) };
+    }
+
+    /** The jitter of this sample's rays in pixels from the pixel's centre. */
+    pub fn jitter(self) : Vec3 {
+        let j : Vec3 = self.jitterOf(self.index);
+        return Vec3 { x: j.x - (0.5 as f32), y: j.y - (0.5 as f32), z: (0.0 as f32) };
+    }
+
+    fn trace(mut self, begin : i32, end : i32) : void {
+        let jitter : Vec3 = self.jitterOf(self.index);
+        for (y of begin..end) {
+            for (x of 0..self.w) {
+                self.tracePixel(x, y, jitter);
+            }
+        }
+    }
+
+    // One primary ray: the nearest of the ground, the lake plane and the river's surface, shaded and hazed.
+    fn tracePixel(mut self, x : i32, y : i32, jitter : Vec3) : void {
+        let i : i64 = ((y * self.w) + x) as i64;
+        let dir : Vec3 = self.cam.ray((x as f32) + jitter.x, (y as f32) + jitter.y);
+        let eye : Vec3 = self.cam.eye;
+        let spread : f32 = self.cam.footprint((1.0 as f32));
+        let mut colour : Vec3 = Vec3::zero();
+        let mut depth : f32 = VFRAME_SKY_DEPTH;
+
+        let ground : f32 = self.groundHit(eye, dir);
+        let mut t : f32 = ground;
+        let mut kind : SurfaceKind = SurfaceKind::River;
+        let mut water : bool = false;
+        if (self.look.modules.surface) {
+            let reach : f32 = self.relief.lakeHit(eye, dir, ground);
+            if (reach >= (0.0 as f32)) {
+                t = reach;
+                kind = SurfaceKind::Lake;
+                water = true;
+            }
+            let river : f32 = self.riverHit(eye, dir, ground);
+            if (river >= (0.0 as f32) && (t < (0.0 as f32) || river < t)) {
+                t = river;
+                kind = SurfaceKind::River;
+                water = true;
+            }
+        }
+
+        let mut tree : PlantHit = PlantHit {};
+        if (self.look.modules.ground) {
+            let reach : f32 = waterPick(t >= (0.0 as f32), t, VFRAME_FAR);
+            tree = self.plants.hit(eye, dir, reach, self.time, spread);
+            if (tree.t >= (0.0 as f32)) {
+                t = tree.t;
+                water = false;
+            }
+            let low : UnderHit = self.under.hit(
+                eye,
+                dir,
+                waterPick(t >= (0.0 as f32), t, VFRAME_FAR),
+                spread
+            );
+            if (low.t >= (0.0 as f32)) {
+                tree = PlantHit { t: low.t, colour: low.colour };
+                t = low.t;
+                water = false;
+            }
+        }
+
+        if (t >= (0.0 as f32)) {
+            depth = t;
+            let p : Vec3 = eye.plus(dir.scale(t));
+            let spot : VistaSpot = VistaSpot {
+                point: p,
+                view: dir,
+                footprint: spread * t,
+                time: self.time,
+                distance: t,
+            };
+            if (tree.t >= (0.0 as f32)) {
+                colour = tree.colour;
+            } else if (water) {
+                colour = self.shadeWater(spot, kind);
+            } else {
+                colour = self.shadeGround(spot);
+            }
+            colour = self.crown.over(colour, eye, dir, t, self.time, spread * t);
+            colour = self.hazed(colour, t, eye, dir);
+        } else {
+            colour = self.skyAt(dir);
+            colour = self.crown.over(colour, eye, dir, VFRAME_FAR, self.time, spread * VFRAME_FAR);
+        }
+        self.store(i, colour, depth);
+    }
+
+    // The distance to the terrain along the ray, or negative for none.
+    fn groundHit(self, eye : Vec3, dir : Vec3) : f32 {
+        if (!self.look.modules.ground) {
+            return -(1.0 as f32);
+        }
+        return self.relief.grid.march(eye, dir, VFRAME_NEAR, VFRAME_FAR);
+    }
+
+    // The distance to the window's water surface, where it is deeper than a film, and not behind the ground.
+    fn riverHit(self, eye : Vec3, dir : Vec3, ground : f32) : f32 {
+        let mut limit : f32 = VFRAME_FAR;
+        if (ground >= (0.0 as f32)) {
+            limit = ground + VFRAME_WINDOW_BIAS;
+        }
+        let t : f32 = self.window.top.march(eye, dir, VFRAME_NEAR, limit);
+        if (t < (0.0 as f32)) {
+            return -(1.0 as f32);
+        }
+        let p : Vec3 = eye.plus(dir.scale(t));
+        if (self.window.smooth(p.x, p.z).depth < VFRAME_DRY) {
+            return -(1.0 as f32);
+        }
+        return t;
+    }
+
+    fn shadeGround(self, spot : VistaSpot) : Vec3 {
+        return self.ground.shade(spot);
+    }
+
+    fn shadeWater(self, spot : VistaSpot, kind : SurfaceKind) : Vec3 {
+        let shot : SurfaceShot = self.surface.shade(SurfaceSpot { at: spot, kind: kind }, self.look);
+        if (shot.cover >= (1.0 as f32)) {
+            return shot.colour;
+        }
+        let under : Vec3 = self.ground.shade(spot);
+        return under.lerp(shot.colour, shot.cover);
+    }
+
+    // What the eye sees along a ray that meets nothing: the sky, or the haze of the horizon below it.
+    fn skyAt(self, dir : Vec3) : Vec3 {
+        return self.sky.view(dir);
+    }
+
+    // `c` seen through the air along `t` metres: aerial perspective that thins with height.
+    fn hazed(self, c : Vec3, t : f32, eye : Vec3, dir : Vec3) : Vec3 {
+        if (!self.look.modules.haze) {
+            return c;
+        }
+        let air : Vec3 = self.look.haze.extinction;
+        let scale : f32 = self.look.haze.scaleHeight;
+        let low : f32 = eye.y;
+        let high : f32 = eye.y + dir.y * t;
+        let path : f32 = VistaFrame::airPath(low, high, t, scale);
+        let through : Vec3 = Vec3 {
+            x: waterExpNeg(air.x * path),
+            y: waterExpNeg(air.y * path),
+            z: waterExpNeg(air.z * path),
+        };
+        let glow : Vec3 = self.sky.haze(dir).scale(self.look.haze.gain);
+        return c
+            .times(through)
+            .plus(glow.times(Vec3 {
+                x: (1.0 as f32) - through.x,
+                y: (1.0 as f32) - through.y,
+                z: (1.0 as f32) - through.z,
+            }));
+    }
+
+    // The air's density integrated along a segment of length `t` from height `low` to `high`, in metres of
+    // sea-level air: the density falls off exponentially with the height over `scale`.
+    static fn airPath(low : f32, high : f32, t : f32, scale : f32) : f32 {
+        let a : f32 = waterExpNeg(max(low, (0.0 as f32)) / scale);
+        let b : f32 = waterExpNeg(max(high, (0.0 as f32)) / scale);
+        let rise : f32 = high - low;
+        if (rise < (0.5 as f32) && rise > -(0.5 as f32)) {
+            return t * (a + b) * (0.5 as f32);
+        }
+        return t * scale * (a - b) / rise;
+    }
+
+    fn store(mut self, i : i64, colour : Vec3, depth : f32) : void {
+        self.scene[i * 3] = colour.x;
+        self.scene[i * 3 + 1] = colour.y;
+        self.scene[i * 3 + 2] = colour.z;
+        self.depth[i] = depth;
+    }
+
+    // Composes rows: the scene under the drops layer, folded into the running mean.
+    fn resolve(mut self, begin : i32, end : i32) : void {
+        let weight : f32 = (1.0 as f32) / ((self.index + 1) as f32);
+        for (y of begin..end) {
+            for (x of 0..self.w) {
+                let i : i64 = ((y * self.w) + x) as i64;
+                let c : Vec3 = self.compose(i);
+                for (k of 0..3) {
+                    let v : f32 = VistaFrame::channel(c, k);
+                    self.hdr[i * 3 + k] = self.hdr[i * 3 + k] + (v - self.hdr[i * 3 + k]) * weight;
+                }
+            }
+        }
+    }
+
+    static fn channel(c : Vec3, k : i32) : f32 {
+        if (k == 0) {
+            return c.x;
+        }
+        if (k == 1) {
+            return c.y;
+        }
+        return c.z;
+    }
+
+    // The sample of pixel `i`: scene then the drops over it; zero if it came out as nonsense.
+    fn compose(self, i : i64) : Vec3 {
+        let scene : Vec3 = Vec3 { x: self.scene[i * 3], y: self.scene[i * 3 + 1], z: self.scene[i * 3 + 2] };
+        let over : Vec3 = self.drops.over(i, scene);
+        if (!(over.maxComponent() < VFRAME_LIMIT) || over.x < (0.0 as f32) || over.y < (0.0 as f32)
+            || over.z < (0.0 as f32)) {
+            return Vec3::zero();
+        }
+        return over;
+    }
+}

@@ -1,0 +1,311 @@
+// terrain_materials — what the ground is made of and how wet it is, decided from its shape, its height and its distance to water.
+//
+// Each cell gets one material and one wetness.
+//
+// In the hills the material follows the rules a field geologist uses, with smooth masks, not thresholds on single noises:
+// forest has a density that falls with altitude (to nothing at the tree line) and on steep ground and rises with
+// moisture (a slow wet-and-dry noise, and the nearness of water); a cell is forest where a smooth fractal noise is
+// below that density, so the edge is a ragged, continuous front and not a blob. Above the tree line is meadow, then a
+// rocky belt of scree where it is steep, then bare rock; steep ground is rock at any height; the rubble under the
+// escarpment's cap rock is scree.
+//
+// On the floodplain the ground is farmed: a rotated grid of blocks, each meadow, field or woodlot by a hash of its address,
+// with riparian woodland in a band along the river and mud on the banks; the river's bed and bars are gravel, the
+// tributaries' fans and channels gravel too. Lake and pond shores and beds are mud.
+//
+// Wetness (0 dry to 255 under water) is 255 in the channel, the lake and the end lake, falls over the banks and shores,
+// and is a little higher on the floodplain. The pass is a row loop and every cell reads only the grids, so it is chunked
+// like the others.
+
+use ludax::{abs, saturate, smoothstep, sqrt};
+
+use crate::terrain::hydro_terrain::{
+    HYDRO_FIELD, HYDRO_FOREST, HYDRO_GRASS, HYDRO_GRAVEL, HYDRO_MUD, HYDRO_ROCK, HYDRO_SCREE
+};
+use crate::terrain::terrain_hydrology::TerrainHydrology;
+use crate::terrain::terrain_meander::RiverLine;
+use crate::terrain::terrain_noise::{terrainFbm, terrainFloor, terrainNoise};
+use crate::terrain::terrain_plan::TerrainPlan;
+use crate::terrain::terrain_valley::RiverField;
+
+// Slopes (rise over run) from which ground is rock outright, from which it is scree, and the forest's steepest.
+const MATERIAL_ROCK_SLOPE : f32 = 0.95;
+const MATERIAL_SCREE_SLOPE : f32 = 0.62;
+const MATERIAL_FOREST_SLOPE : f32 = 0.6;
+
+// Altitude lines, as shares of the mountains' height above the reservoir: where the forest starts to thin, where it is gone,
+// where the rocky belt starts and where the rock is bare.
+const MATERIAL_THIN_LINE : f32 = 0.2;
+const MATERIAL_TREE_LINE : f32 = 0.44;
+const MATERIAL_BELT_LINE : f32 = 0.5;
+const MATERIAL_ROCK_LINE : f32 = 0.68;
+
+// Scales (metres) of the forest's front, of the slow moisture noise, and the share of the density the moisture moves.
+const MATERIAL_FRONT : f32 = 150.0;
+const MATERIAL_DAMP : f32 = 700.0;
+const MATERIAL_DAMP_SHARE : f32 = 0.35;
+const MATERIAL_SEED : i32 = 601;
+
+// The farmed blocks: their size along and across, metres, their turn from north, and the shares that are field and woodlot.
+const MATERIAL_BLOCK_A : f32 = 120.0;
+const MATERIAL_BLOCK_B : f32 = 75.0;
+const MATERIAL_TURN_COS : f32 = 0.9689;
+const MATERIAL_TURN_SIN : f32 = 0.2474;
+const MATERIAL_FIELD_SHARE : f32 = 0.5;
+const MATERIAL_WOOD_SHARE : f32 = 0.17;
+
+// How far from water mud reaches, in channel half widths, the riparian band's width, and the shore's width round the lake.
+const MATERIAL_BANK : f32 = 2.4;
+const MATERIAL_RIPARIAN : f32 = 9.0;
+const MATERIAL_SHORE : f32 = 10.0;
+
+/** The material pass. */
+pub class TerrainMaterials {
+    /** Fills rows `begin` up to `end` of `material` and `wet` (`width` columns). */
+    pub static fn rows(
+        plan : TerrainPlan,
+        line : RiverLine,
+        field : RiverField,
+        old : RiverLine,
+        oldField : RiverField,
+        bed : f32[],
+        mask : u8[],
+        trib : u8[],
+        material : u8[],
+        wet : u8[],
+        width : i32,
+        begin : i32,
+        end : i32
+    ) : void {
+        for (j of begin..end) {
+            for (i of 0..width) {
+                let c : i64 = ((j as i64) * (width as i64)) + (i as i64);
+                let x : f32 = ((i as f32) + 0.5 as f32) * plan.cell;
+                let z : f32 = ((j as f32) + 0.5 as f32) * plan.cell;
+                let slope : f32 = TerrainMaterials::slope(plan, bed, width, i, j);
+                let water : i32 = TerrainMaterials::water(
+                    plan,
+                    line,
+                    field,
+                    old,
+                    oldField,
+                    bed,
+                    mask,
+                    trib,
+                    x,
+                    z,
+                    c
+                );
+                let reach : f32 = TerrainMaterials::riverReach(line, field, c);
+                material[c] = TerrainMaterials::pick(plan, bed[c], slope, water, reach, x, z);
+                wet[c] = TerrainMaterials::dampness(plan, water, x, z);
+            }
+        }
+    }
+
+    // Rise over run from the four neighbours (the border reads itself).
+    static fn slope(plan : TerrainPlan, bed : f32[], width : i32, i : i32, j : i32) : f32 {
+        let w : i64 = width as i64;
+        let c : i64 = (j as i64) * w + (i as i64);
+        let mut east : i64 = c;
+        let mut west : i64 = c;
+        let mut south : i64 = c;
+        let mut north : i64 = c;
+        if (i + 1 < width) {
+            east = c + 1;
+        }
+        if (i > 0) {
+            west = c - 1;
+        }
+        if (j + 1 < width) {
+            south = c + w;
+        }
+        if (j > 0) {
+            north = c - w;
+        }
+        let dx : f32 = (bed[east] - bed[west]) / (2.0 as f32 * plan.cell);
+        let dz : f32 = (bed[south] - bed[north]) / (2.0 as f32 * plan.cell);
+        return sqrt(dx * dx + dz * dz);
+    }
+
+    // Distance from the live river's banks in metres (large when it is far).
+    static fn riverReach(line : RiverLine, field : RiverField, c : i64) : f32 {
+        let near : f32 = field.along[c];
+        if (near < 0.0 as f32) {
+            return 100000.0 as f32;
+        }
+        return abs(field.distance[c]) - line.at(near).width * 0.5 as f32;
+    }
+
+    // A water code for the cell: 0 dry, 1 shore or bank, 2 under water, 3 river bed or bar, 4 tributary fan or channel.
+    static fn water(
+        plan : TerrainPlan,
+        line : RiverLine,
+        field : RiverField,
+        old : RiverLine,
+        oldField : RiverField,
+        bed : f32[],
+        mask : u8[],
+        trib : u8[],
+        x : f32,
+        z : f32,
+        c : i64
+    ) : i32 {
+        if (mask[c] != (0 as u8) || bed[c] < plan.level) {
+            return 2;
+        }
+        let near : f32 = field.along[c];
+        if (near >= 0.0 as f32) {
+            let half : f32 = line.at(near).width * 0.5 as f32;
+            let dist : f32 = abs(field.distance[c]);
+            if (dist < half) {
+                return 3;
+            }
+            if (dist < half * MATERIAL_BANK) {
+                return 1;
+            }
+        }
+        if (trib[c] != (0 as u8)) {
+            return 4;
+        }
+        let scar : i32 = TerrainMaterials::scar(plan, line, field, old, oldField, bed[c], c);
+        if (scar > 0) {
+            return scar;
+        }
+        let r : f32 = plan.lakeRadius(x, z);
+        if (r < 1.0 as f32 + MATERIAL_SHORE / plan.lakeA && z < plan.notchZ) {
+            return 1;
+        }
+        return 0;
+    }
+
+    // 2 inside a pond of the abandoned channel (under its water), 1 in the swale along it, else 0.
+    static fn scar(
+        plan : TerrainPlan,
+        line : RiverLine,
+        field : RiverField,
+        old : RiverLine,
+        oldField : RiverField,
+        height : f32,
+        c : i64
+    ) : i32 {
+        let at : f32 = oldField.along[c];
+        if (at < 0.0 as f32 || abs(oldField.distance[c]) > old.at(at).width * 0.4 as f32) {
+            return 0;
+        }
+        if (field.along[c] >= 0.0 as f32 && abs(field.distance[c]) < line.at(field.along[c]).width) {
+            return 0;
+        }
+        for (k of 0..old.pondCount) {
+            if (at >= old.pondFrom[k as i64] as f32 && at < old.pondTo[k as i64] as f32
+                && height < TerrainHydrology::pondLevel(old, k)) {
+                return 2;
+            }
+        }
+        return 1;
+    }
+
+    static fn pick(
+        plan : TerrainPlan,
+        height : f32,
+        slope : f32,
+        water : i32,
+        reach : f32,
+        x : f32,
+        z : f32
+    ) : u8 {
+        if (water == 3 || water == 4) {
+            return HYDRO_GRAVEL;
+        }
+        if (water == 2 || water == 1) {
+            return HYDRO_MUD;
+        }
+        let dz : f32 = z - plan.crestZ(x);
+        let talus : bool = dz > plan.capRun * 0.5 as f32 && dz < plan.faceRun() + 30.0 as f32
+            && plan.cliffAt(x) > 8.0 as f32;
+        if (slope > MATERIAL_ROCK_SLOPE) {
+            return HYDRO_ROCK;
+        }
+        if (talus) {
+            return HYDRO_SCREE;
+        }
+        let plain : f32 = plan.floodWeight(x, z);
+        if (plain > 0.6 as f32) {
+            return TerrainMaterials::farmed(plan, reach, x, z);
+        }
+        return TerrainMaterials::hills(plan, height, slope, reach, x, z);
+    }
+
+    // The hills: forest by a smooth density, meadow, scree belt, bare rock.
+    static fn hills(plan : TerrainPlan, height : f32, slope : f32, reach : f32, x : f32, z : f32) : u8 {
+        let seed : i32 = plan.seed + MATERIAL_SEED;
+        let above : f32 = (height - plan.lakeLevel) / plan.params.mountainHeight;
+        if (above > MATERIAL_ROCK_LINE) {
+            return HYDRO_ROCK;
+        }
+        if (above > MATERIAL_BELT_LINE && slope > 0.3 as f32) {
+            return HYDRO_SCREE;
+        }
+        if (slope > MATERIAL_SCREE_SLOPE) {
+            return HYDRO_SCREE;
+        }
+        let damp : f32 = 0.5 as f32
+            + 0.5 as f32 * terrainFbm(x / MATERIAL_DAMP, z / MATERIAL_DAMP, seed + 1, 3);
+        let near : f32 = 1.0 as f32 - smoothstep(0.0 as f32, 120.0 as f32, reach);
+        let moist : f32 = saturate(damp * MATERIAL_DAMP_SHARE * 2.0 as f32 + near * 0.5 as f32
+            + (1.0 as f32 - MATERIAL_DAMP_SHARE) * 0.3 as f32);
+        let high : f32 = 1.0 as f32 - smoothstep(MATERIAL_THIN_LINE, MATERIAL_TREE_LINE, above);
+        let steep : f32 = 1.0 as f32 - smoothstep(0.35 as f32, MATERIAL_FOREST_SLOPE, slope);
+        let density : f32 = saturate(high * steep * (0.45 as f32 + 0.75 as f32 * moist));
+        let front : f32 = 0.5 as f32
+            + 0.5 as f32 * terrainFbm(x / MATERIAL_FRONT, z / MATERIAL_FRONT, seed + 2, 4);
+        if (front < density) {
+            return HYDRO_FOREST;
+        }
+        return HYDRO_GRASS;
+    }
+
+    // The floodplain: riparian woodland by the river, else blocks of meadow, field and woodlot.
+    static fn farmed(plan : TerrainPlan, reach : f32, x : f32, z : f32) : u8 {
+        let seed : i32 = plan.seed + MATERIAL_SEED;
+        if (reach > 1.5 as f32 * plan.params.riverWidth
+            && reach < MATERIAL_RIPARIAN * plan.params.riverWidth * 0.5 as f32) {
+            let patch : f32 = terrainNoise(x / 40.0 as f32, z / 40.0 as f32, seed + 3);
+            if (patch > -0.15 as f32) {
+                return HYDRO_FOREST;
+            }
+        }
+        let u : f32 = (x * MATERIAL_TURN_COS + z * MATERIAL_TURN_SIN) / MATERIAL_BLOCK_A;
+        let v : f32 = (z * MATERIAL_TURN_COS - x * MATERIAL_TURN_SIN) / MATERIAL_BLOCK_B;
+        let id : f32 = TerrainMaterials::hash01(terrainFloor(u), terrainFloor(v), seed);
+        if (id < MATERIAL_FIELD_SHARE) {
+            return HYDRO_FIELD;
+        }
+        if (id < MATERIAL_FIELD_SHARE + MATERIAL_WOOD_SHARE) {
+            return HYDRO_FOREST;
+        }
+        return HYDRO_GRASS;
+    }
+
+    // A number in [0, 1) from a block address.
+    static fn hash01(i : i32, j : i32, seed : i32) : f32 {
+        let mut h : u32 = (i as u32) * 374761393 + (j as u32) * 668265263 + (seed as u32) * 1274126177;
+        h = (h ^ (h >>> 13)) * 1103515245;
+        h = h ^ (h >>> 16);
+        return ((h & 65535) as f32) / 65536.0 as f32;
+    }
+
+    static fn dampness(plan : TerrainPlan, water : i32, x : f32, z : f32) : u8 {
+        if (water == 2 || water == 3) {
+            return 255;
+        }
+        if (water == 1) {
+            return 200;
+        }
+        if (water == 4) {
+            return 120;
+        }
+        let plain : f32 = plan.floodWeight(x, z);
+        return (60.0 as f32 * plain) as u8;
+    }
+}

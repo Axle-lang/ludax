@@ -1,0 +1,271 @@
+// terrain_tributary — side streams that cross the floodplain to the river, with the fans of gravel they spread where they leave the hills.
+//
+// The erosion pass has already drawn the drainage of the hills (`recv`, `area`). Where a big gully reaches the edge of the
+// floodplain, its stream does not stop there: it spreads the gravel it carried into a fan, and then runs across the plain
+// in a shallow channel to join the river. This pass finds the biggest such gullies (by drainage area, apart from each other,
+// away from the reservoir and the cliff), lays a gently winding path from each mouth to the nearest point of the river,
+// raises the fan (a wedge of deposit that falls off with distance and with angle from the path) and cuts the channel
+// (a shallow trough, narrower than the river) into the floodplain's `surface`; the river's own channel is cut afterwards, so
+// the two meet at the confluence. A mask records what was touched (1 fan, 2 channel) for the materials.
+//
+// The paths are made of a few dozen points and the cuts are loops over the cells around them, serial and in a fixed order.
+
+use ludax::{sin, smoothstep, sqrt};
+
+use crate::terrain::hydro_parts::{HydroSpot, HydroTributary, RiverPoint};
+use crate::terrain::terrain_meander::RiverLine;
+use crate::terrain::terrain_plan::TerrainPlan;
+
+/** Most tributaries that are made. */
+pub const TRIBUTARY_MAX : i32 = 4;
+
+// Smallest catchment, in cells, that counts; how far apart (metres) two mouths must be; how near the reservoir (in lake
+// radii) and the cliff (metres south of the crest) a mouth may not be; the farthest a mouth may be from the river.
+const TRIBUTARY_MIN_AREA : f32 = 250.0;
+const TRIBUTARY_APART : f32 = 380.0;
+const TRIBUTARY_LAKE : f32 = 2.4;
+const TRIBUTARY_CLIFF : f32 = 220.0;
+const TRIBUTARY_REACH : f32 = 700.0;
+
+// The path: points, how far it wanders sideways (metres), and its channel's half width and depth (metres).
+const TRIBUTARY_POINTS : i32 = 28;
+const TRIBUTARY_WANDER : f32 = 16.0;
+const TRIBUTARY_HALF : f32 = 3.2;
+const TRIBUTARY_DEPTH : f32 = 0.9;
+
+// The fan: radius, how high it stands at the mouth, and the cosine of its half angle (about 55 degrees).
+const TRIBUTARY_FAN : f32 = 120.0;
+const TRIBUTARY_FAN_HEIGHT : f32 = 1.7;
+const TRIBUTARY_FAN_COS : f32 = 0.57;
+
+/** The tributaries of a landscape. */
+pub class TerrainTributary {
+    /**
+     * Picks the tributaries from the drainage and cuts them into `surface`; marks `mask` (1 fan, 2 channel). Writes their
+     * records to the front of `found` (room for `TRIBUTARY_MAX`), with discharges at `runoff` cubic metres a second per
+     * cell of catchment, and returns how many there are.
+     */
+    pub static fn make(
+        plan : TerrainPlan,
+        line : RiverLine,
+        recv : i32[],
+        area : f32[],
+        soft : f32[],
+        surface : f32[],
+        mask : u8[],
+        width : i32,
+        runoff : f32,
+        found : HydroTributary[]
+    ) : i32 {
+        let mut count : i32 = 0;
+        for (k of 0..TRIBUTARY_MAX) {
+            let c : i64 = TerrainTributary::mouth(plan, recv, area, soft, width, found, count);
+            if (c < 0) {
+                break;
+            }
+            found[count as i64] = TerrainTributary::route(
+                plan,
+                line,
+                surface,
+                mask,
+                width,
+                c,
+                area[c],
+                runoff
+            );
+            count = count + 1;
+        }
+        return count;
+    }
+
+    // The next best mouth: a hill cell draining onto the plain, big, clear of the lake and the cliff and of the first
+    // `count` mouths; -1 when there is none.
+    static fn mouth(
+        plan : TerrainPlan,
+        recv : i32[],
+        area : f32[],
+        soft : f32[],
+        width : i32,
+        found : HydroTributary[],
+        count : i32
+    ) : i64 {
+        let cells : i64 = (width as i64) * (width as i64);
+        let mut best : i64 = -1;
+        let mut most : f32 = TRIBUTARY_MIN_AREA;
+        for (c of 0..cells) {
+            let r : i64 = recv[c] as i64;
+            if (r < 0 || area[c] <= most || soft[c] <= 0.5 as f32 || soft[r] > 0.5 as f32) {
+                continue;
+            }
+            let x : f32 = (((c % (width as i64)) as f32) + 0.5 as f32) * plan.cell;
+            let z : f32 = (((c / (width as i64)) as f32) + 0.5 as f32) * plan.cell;
+            if (z < plan.notchZ + TRIBUTARY_CLIFF || z > plan.endZ
+                || plan.lakeRadius(x, z) < TRIBUTARY_LAKE) {
+                continue;
+            }
+            if (TerrainTributary::crowded(found, count, x, z)) {
+                continue;
+            }
+            best = c;
+            most = area[c];
+        }
+        return best;
+    }
+
+    static fn crowded(found : HydroTributary[], count : i32, x : f32, z : f32) : bool {
+        for (i of 0..count) {
+            let dx : f32 = found[i as i64].mouth.x - x;
+            let dz : f32 = found[i as i64].mouth.z - z;
+            if (dx * dx + dz * dz < TRIBUTARY_APART * TRIBUTARY_APART) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Lays the path from mouth cell `c` to the river, raises the fan, cuts the channel; returns the record.
+    static fn route(
+        plan : TerrainPlan,
+        line : RiverLine,
+        surface : f32[],
+        mask : u8[],
+        width : i32,
+        c : i64,
+        drained : f32,
+        runoff : f32
+    ) : HydroTributary {
+        let mx : f32 = (((c % (width as i64)) as f32) + 0.5 as f32) * plan.cell;
+        let mz : f32 = (((c / (width as i64)) as f32) + 0.5 as f32) * plan.cell;
+        let join : RiverPoint = line.points[TerrainTributary::nearest(line, mx, mz) as i64];
+        let mut record : HydroTributary = HydroTributary {};
+        record.mouth = HydroSpot { x: mx, z: mz, height: surface[c] };
+        record.confluence = HydroSpot { x: join.x, z: join.z, height: join.bankHeight };
+        record.catchment = drained * plan.cell * plan.cell;
+        record.discharge = drained * runoff;
+
+        let dx : f32 = join.x - mx;
+        let dz : f32 = join.z - mz;
+        let length : f32 = sqrt(dx * dx + dz * dz);
+        if (length < 1.0 as f32 || length > TRIBUTARY_REACH) {
+            return record;
+        }
+        let ux : f32 = dx / length;
+        let uz : f32 = dz / length;
+        TerrainTributary::fan(plan, surface, mask, width, mx, mz, ux, uz);
+        TerrainTributary::channel(plan, surface, mask, width, mx, mz, ux, uz, length, c);
+        return record;
+    }
+
+    // The index of the river point nearest to (x, z).
+    static fn nearest(line : RiverLine, x : f32, z : f32) : i32 {
+        let mut best : i32 = 0;
+        let mut least : f32 = 1000000000.0 as f32;
+        for (i of 0..line.count) {
+            let dx : f32 = line.points[i as i64].x - x;
+            let dz : f32 = line.points[i as i64].z - z;
+            let d : f32 = dx * dx + dz * dz;
+            if (d < least) {
+                least = d;
+                best = i;
+            }
+        }
+        return best;
+    }
+
+    // A wedge of deposit around the mouth, pointing along (ux, uz).
+    static fn fan(
+        plan : TerrainPlan,
+        surface : f32[],
+        mask : u8[],
+        width : i32,
+        mx : f32,
+        mz : f32,
+        ux : f32,
+        uz : f32
+    ) : void {
+        let span : i32 = (TRIBUTARY_FAN / plan.cell) as i32 + 1;
+        let ci : i32 = (mx / plan.cell) as i32;
+        let cj : i32 = (mz / plan.cell) as i32;
+        for (j of max2(cj - span, 0)..min2(cj + span + 1, width)) {
+            for (i of max2(ci - span, 0)..min2(ci + span + 1, width)) {
+                let x : f32 = ((i as f32) + 0.5 as f32) * plan.cell - mx;
+                let z : f32 = ((j as f32) + 0.5 as f32) * plan.cell - mz;
+                let dist : f32 = sqrt(x * x + z * z);
+                if (dist >= TRIBUTARY_FAN || dist < 0.001 as f32) {
+                    continue;
+                }
+                let along : f32 = (x * ux + z * uz) / dist;
+                let spread : f32 = smoothstep(TRIBUTARY_FAN_COS, 0.9 as f32, along);
+                let fall : f32 = 1.0 as f32 - dist / TRIBUTARY_FAN;
+                let rise : f32 = TRIBUTARY_FAN_HEIGHT * spread * fall * fall;
+                if (rise > 0.01 as f32) {
+                    let k : i64 = (j as i64) * (width as i64) + (i as i64);
+                    surface[k] = surface[k] + rise;
+                    mask[k] = 1;
+                }
+            }
+        }
+    }
+
+    // The channel from the mouth along (ux, uz) for `length` metres, winding a little, cut into the surface.
+    static fn channel(
+        plan : TerrainPlan,
+        surface : f32[],
+        mask : u8[],
+        width : i32,
+        mx : f32,
+        mz : f32,
+        ux : f32,
+        uz : f32,
+        length : f32,
+        key : i64
+    ) : void {
+        let phase : f32 = ((key % 97) as f32) * 0.13 as f32;
+        let span : i32 = (TRIBUTARY_HALF / plan.cell) as i32 + 2;
+        for (k of 0..(TRIBUTARY_POINTS * 3)) {
+            let t : f32 = (k as f32) / ((TRIBUTARY_POINTS * 3) as f32);
+            let wiggle : f32 = TRIBUTARY_WANDER * sin(t * 6.2831853 as f32 * 1.3 as f32 + phase)
+                * sin(t * 3.1415927 as f32);
+            let x : f32 = mx + ux * length * t - uz * wiggle;
+            let z : f32 = mz + uz * length * t + ux * wiggle;
+            let ci : i32 = (x / plan.cell) as i32;
+            let cj : i32 = (z / plan.cell) as i32;
+            for (j of max2(cj - span, 0)..min2(cj + span + 1, width)) {
+                for (i of max2(ci - span, 0)..min2(ci + span + 1, width)) {
+                    let ex : f32 = ((i as f32) + 0.5 as f32) * plan.cell - x;
+                    let ez : f32 = ((j as f32) + 0.5 as f32) * plan.cell - z;
+                    let d : f32 = sqrt(ex * ex + ez * ez) / TRIBUTARY_HALF;
+                    if (d >= 1.0 as f32) {
+                        continue;
+                    }
+                    let index : i64 = (j as i64) * (width as i64) + (i as i64);
+                    let cut : f32 = TRIBUTARY_DEPTH * (1.0 as f32 - d * d);
+                    surface[index] = surface[index] - cut * TerrainTributary::once(mask, index);
+                    mask[index] = 2;
+                }
+            }
+        }
+    }
+
+    // 1 the first time a cell is cut, so a cell met by several points of the path is lowered once; 0 after.
+    static fn once(mask : u8[], index : i64) : f32 {
+        if (mask[index] == (2 as u8)) {
+            return 0.0 as f32;
+        }
+        return 1.0 as f32;
+    }
+}
+
+fn max2(a : i32, b : i32) : i32 {
+    if (a > b) {
+        return a;
+    }
+    return b;
+}
+
+fn min2(a : i32, b : i32) : i32 {
+    if (a < b) {
+        return a;
+    }
+    return b;
+}

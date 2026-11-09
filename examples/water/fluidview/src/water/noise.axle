@@ -1,0 +1,241 @@
+// noise — hashed lattice noise and the one exponential the water renderer calls per sample.
+//
+// Everything the water looks like at a scale finer than the engine's heightfield (capillary ripples, the lace of
+// foam, the grain of sand) is a pure function of a position and an integer seed, so a
+// picture is the same on every run and on every thread. Value noise is used rather than gradient noise because
+// it is cheaper, and its derivative comes out of the same lookups, which is what a ripple's normal needs.
+// `waterExpNeg` is a polynomial with squarings, not a libm call: determinism, and several times cheaper than the
+// engine's exact `lightExp2` that a march calls a hundred times a pixel.
+
+use ludax::{hashMix, sqrt, Vec3};
+
+// 2^-24: turns the 24 hash bits kept into a fraction in [0, 1).
+const WN_INV_24 : f32 = 0.000000059604645;
+
+/** Optical depths beyond this transmit nothing visible (e^-16 is 1e-7), so `waterExpNeg` answers 0 there. */
+pub const WN_EXP_LIMIT : f32 = 16.0;
+
+// The squarings of `waterExpNeg`: e^-x = (e^(-x/16))^16 and x / 16 is at most 1, where a cubic is exact to 1e-4.
+const WN_EXP_SIXTEENTH : f32 = 0.0625;
+const WN_EXP_QUADRATIC : f32 = 0.5;
+const WN_EXP_CUBIC : f32 = 0.16666667;
+
+// How far a feature point of the cellular noise may sit from its cell's corner, 0 to 1.
+const WN_CELL_JITTER : f32 = 0.9;
+
+// Multipliers that decorrelate the lattice axes before mixing.
+const WN_PRIME_X : i64 = 73856093;
+const WN_PRIME_Y : i64 = 19349663;
+const WN_PRIME_Z : i64 = 83492791;
+const WN_PRIME_SEED : i64 = 2654435761;
+
+// The shift that keeps the top 24 bits of the 64-bit mix.
+const WN_KEEP_SHIFT : i64 = 40;
+
+// The octave frequency ratio of the fractal sums: not exactly 2 so the lattices of successive octaves never align.
+const WN_LACUNARITY : f32 = 2.03;
+
+/** A uniform number in [0, 1) for the lattice point (`x`, `y`, `z`) under `seed`. */
+pub fn waterHash(x : i32, y : i32, z : i32, seed : i32) : f32 {
+    let mut h : i64 = (x as i64) * WN_PRIME_X;
+    h = h ^ ((y as i64) * WN_PRIME_Y);
+    h = h ^ ((z as i64) * WN_PRIME_Z);
+    h = h ^ ((seed as i64) * WN_PRIME_SEED);
+    return ((hashMix(h) >>> WN_KEEP_SHIFT) as i32) as f32 * WN_INV_24;
+}
+
+/** The lattice cell containing `v`: rounds toward minus infinity. */
+pub fn waterFloor(v : f32) : i32 {
+    let t : i32 = v as i32;
+    if ((t as f32) > v) {
+        return t - 1;
+    }
+    return t;
+}
+
+/** e raised to minus `x` for `x >= 0`; 0 past `WN_EXP_LIMIT`. Accurate to about 1e-4 relative. */
+pub fn waterExpNeg(x : f32) : f32 {
+    if (x >= WN_EXP_LIMIT) {
+        return 0.0;
+    }
+    let s : f32 = (0.0 as f32) - x * WN_EXP_SIXTEENTH;
+    let one : f32 = 1.0;
+    let mut e : f32 = one + s * (one + s * (WN_EXP_QUADRATIC + s * WN_EXP_CUBIC));
+    e = e * e;
+    e = e * e;
+    e = e * e;
+    return e * e;
+}
+
+// The smooth ease of a lattice fraction, and its slope.
+fn wnFade(t : f32) : f32 {
+    return t * t * ((3.0 as f32) - (2.0 as f32) * t);
+}
+
+fn wnFadeSlope(t : f32) : f32 {
+    return (6.0 as f32) * t * ((1.0 as f32) - t);
+}
+
+/** Smooth value noise on the xz plane, in [0, 1). */
+pub fn waterValue2(x : f32, z : f32, seed : i32) : f32 {
+    let ix : i32 = waterFloor(x);
+    let iz : i32 = waterFloor(z);
+    let a : f32 = waterHash(ix, 0, iz, seed);
+    let b : f32 = waterHash(ix + 1, 0, iz, seed);
+    let c : f32 = waterHash(ix, 0, iz + 1, seed);
+    let d : f32 = waterHash(ix + 1, 0, iz + 1, seed);
+    return waterBlend2(x - ix as f32, z - iz as f32, a, b, c, d);
+}
+
+/**
+ * The smooth blend of the four lattice values `a` (here), `b` (next in x), `c` (next in z) and `d` (both) at the
+ * fractions (`tx`, `tz`) of the cell: the interpolation half of `waterValue2`, for callers that keep the lattice in a table.
+ */
+pub fn waterBlend2(tx : f32, tz : f32, a : f32, b : f32, c : f32, d : f32) : f32 {
+    let fx : f32 = wnFade(tx);
+    let fz : f32 = wnFade(tz);
+    let top : f32 = a + (b - a) * fx;
+    let bottom : f32 = c + (d - c) * fx;
+    return top + (bottom - top) * fz;
+}
+
+/** Value noise and its slope: x is the value in [0, 1), y and z the derivatives along x and z of the plane. */
+pub fn waterValue2Slope(x : f32, z : f32, seed : i32) : Vec3 {
+    let ix : i32 = waterFloor(x);
+    let iz : i32 = waterFloor(z);
+    let tx : f32 = x - ix as f32;
+    let tz : f32 = z - iz as f32;
+    let fx : f32 = wnFade(tx);
+    let fz : f32 = wnFade(tz);
+    let a : f32 = waterHash(ix, 0, iz, seed);
+    let b : f32 = waterHash(ix + 1, 0, iz, seed);
+    let c : f32 = waterHash(ix, 0, iz + 1, seed);
+    let d : f32 = waterHash(ix + 1, 0, iz + 1, seed);
+    let top : f32 = a + (b - a) * fx;
+    let bottom : f32 = c + (d - c) * fx;
+    let dx : f32 = ((b - a) * (1.0 as f32 - fz) + (d - c) * fz) * wnFadeSlope(tx);
+    let dz : f32 = (bottom - top) * wnFadeSlope(tz);
+    return Vec3 { x: top + (bottom - top) * fz, y: dx, z: dz };
+}
+
+/** Fractal value noise on the xz plane: `octaves` layers, each finer and weaker; in [0, 1). */
+pub fn waterFbm2(x : f32, z : f32, octaves : i32, seed : i32) : f32 {
+    let mut sum : f32 = 0.0;
+    let mut amp : f32 = 0.5;
+    let mut norm : f32 = 0.0;
+    let mut fx : f32 = x;
+    let mut fz : f32 = z;
+    for (o of 0..octaves) {
+        sum = sum + amp * waterValue2(fx, fz, seed + o * 31);
+        norm = norm + amp;
+        amp = amp * (0.5 as f32);
+        fx = fx * WN_LACUNARITY;
+        fz = fz * WN_LACUNARITY;
+    }
+    return sum / norm;
+}
+
+/** Smooth value noise in space, in [0, 1). */
+pub fn waterValue3(p : Vec3, seed : i32) : f32 {
+    let ix : i32 = waterFloor(p.x);
+    let iy : i32 = waterFloor(p.y);
+    let iz : i32 = waterFloor(p.z);
+    let fx : f32 = wnFade(p.x - ix as f32);
+    let fy : f32 = wnFade(p.y - iy as f32);
+    let fz : f32 = wnFade(p.z - iz as f32);
+    let a : f32 = waterHash(ix, iy, iz, seed);
+    let b : f32 = waterHash(ix + 1, iy, iz, seed);
+    let c : f32 = waterHash(ix, iy + 1, iz, seed);
+    let d : f32 = waterHash(ix + 1, iy + 1, iz, seed);
+    let e : f32 = waterHash(ix, iy, iz + 1, seed);
+    let f : f32 = waterHash(ix + 1, iy, iz + 1, seed);
+    let g : f32 = waterHash(ix, iy + 1, iz + 1, seed);
+    let h : f32 = waterHash(ix + 1, iy + 1, iz + 1, seed);
+    let near : f32 = (a + (b - a) * fx) + ((c + (d - c) * fx) - (a + (b - a) * fx)) * fy;
+    let far : f32 = (e + (f - e) * fx) + ((g + (h - g) * fx) - (e + (f - e) * fx)) * fy;
+    return near + (far - near) * fz;
+}
+
+/** Fractal value noise in space: `octaves` layers; in [0, 1). */
+pub fn waterFbm3(p : Vec3, octaves : i32, seed : i32) : f32 {
+    let mut sum : f32 = 0.0;
+    let mut amp : f32 = 0.5;
+    let mut norm : f32 = 0.0;
+    let mut q : Vec3 = p;
+    for (o of 0..octaves) {
+        sum = sum + amp * waterValue3(q, seed + o * 31);
+        norm = norm + amp;
+        amp = amp * (0.5 as f32);
+        q = q.scale(WN_LACUNARITY);
+    }
+    return sum / norm;
+}
+
+/**
+ * Distance to the nearest of a jittered feature point per cell of the xz plane (cellular noise), in cells: 0 at a
+ * point and about 0.5 to 1 between them. Its smooth-minimum look is what foam bubbles and lace are made of.
+ */
+pub fn waterCell2(x : f32, z : f32, seed : i32) : f32 {
+    let ix : i32 = waterFloor(x);
+    let iz : i32 = waterFloor(z);
+    let fx : f32 = x - ix as f32;
+    let fz : f32 = z - iz as f32;
+    let mut best : f32 = 4.0;
+    for (j of -1..2) {
+        for (i of -1..2) {
+            let px : f32 = (i as f32) + waterHash(ix + i, 1, iz + j, seed) * WN_CELL_JITTER - fx;
+            let pz : f32 = (j as f32) + waterHash(ix + i, 2, iz + j, seed) * WN_CELL_JITTER - fz;
+            let d : f32 = px * px + pz * pz;
+            if (d < best) {
+                best = d;
+            }
+        }
+    }
+    return sqrt(best);
+}
+
+/** `a` when `yes`, else `b`: Axle has no conditional expression. */
+pub fn waterPick(yes : bool, a : f32, b : f32) : f32 {
+    if (yes) {
+        return a;
+    }
+    return b;
+}
+
+/** `a` when `yes`, else `b`, for integers. */
+pub fn waterPickI(yes : bool, a : i32, b : i32) : i32 {
+    if (yes) {
+        return a;
+    }
+    return b;
+}
+
+/** The smaller of two integers; ludax keeps its own private. */
+pub fn waterLowI(a : i32, b : i32) : i32 {
+    return waterPickI(a < b, a, b);
+}
+
+/** The larger of two integers. */
+pub fn waterHighI(a : i32, b : i32) : i32 {
+    return waterPickI(a > b, a, b);
+}
+
+/**
+ * Billowy noise in space: `octaves` layers of the folded value noise `|2 v - 1|`, which rounds into lobes with creases
+ * between them, the shape of cumulus; in [0, 1).
+ */
+pub fn waterBillow3(p : Vec3, octaves : i32, seed : i32) : f32 {
+    let mut sum : f32 = 0.0;
+    let mut amp : f32 = 0.5;
+    let mut norm : f32 = 0.0;
+    let mut q : Vec3 = p;
+    for (o of 0..octaves) {
+        let v : f32 = waterValue3(q, seed + o * 31);
+        let folded : f32 = (2.0 as f32) * v - (1.0 as f32);
+        sum = sum + amp * waterPick(folded < 0.0, 0.0 - folded, folded);
+        norm = norm + amp;
+        amp = amp * (0.5 as f32);
+        q = q.scale(WN_LACUNARITY);
+    }
+    return sum / norm;
+}

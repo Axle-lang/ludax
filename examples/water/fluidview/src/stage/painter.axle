@@ -1,0 +1,297 @@
+// painter — the software rasterizer the fluid demos draw through.
+//
+// Everything a frame shows — terrain tops, step walls, water surfaces, droplets, streaks — is pushed
+// as a screen-space convex quad tagged with a view depth; `flush` sorts the quads far to near and fills each
+// with a scanline. The sort is a counting sort over a fixed number of depth buckets, so ordering ten
+// thousand quads costs two linear passes and no comparisons; ties inside one bucket keep push order, which
+// is what makes the placement deterministic. Quads whose depth range collapses to a point all land in one
+// bucket and keep push order rather than dividing by zero.
+//
+// Alpha is a straight mix toward the quad colour at fill time: far things are drawn first, so a translucent
+// drop correctly veils whatever was already under it, and opaque quads skip the mix entirely — the
+// span fill writes runs, the blended fill mixes pixel by pixel. The painter owns no pixels: it writes
+// through the `i32[]` the caller hands it (the internal buffer of `Screen`), clipped against its width and
+// height by the scanline bounds.
+
+use ludax::{max, min};
+use smalt::Color;
+
+use crate::stage::camera::{Proj, ScreenQuad};
+
+/** Capacity of the quad pool: a 64 x 64 terrain with walls, the subdivided water sheet and particles. */
+pub const PAINTER_QUAD_ROOM : i32 = 90000;
+
+/** Depth buckets of the counting sort; more buckets, fewer painter mix-ups between neighbours. */
+pub const PAINTER_BUCKETS : i32 = 1024;
+
+/** Alpha denominator of every quad; a quad's alpha is a numerator over this, and this much means opaque. */
+pub const PAINTER_ALPHA_DEN : i32 = 256;
+
+/** Sentinel an edge scan returns when the scanline does not cross it. */
+const PAINTER_FAR_X : f32 = 1000000.0;
+
+/** The four screen corners of one quad, gathered so the scanline helpers stay short. */
+struct PainterCorners {
+    ax : f32 = 0.0 as f32;
+    ay : f32 = 0.0 as f32;
+    bx : f32 = 0.0 as f32;
+    by : f32 = 0.0 as f32;
+    cx : f32 = 0.0 as f32;
+    cy : f32 = 0.0 as f32;
+    dx : f32 = 0.0 as f32;
+    dy : f32 = 0.0 as f32;
+}
+
+/** The left and right ends of one scanline row, and how many edges contributed. */
+struct PainterSpan {
+    left  : f32 = 0.0 as f32;
+    right : f32 = 0.0 as f32;
+    count : i32 = 0;
+}
+
+/** A pool of depth-sorted convex quads, filled into a caller-owned pixel buffer. */
+pub class Painter {
+    xs           : f32[];
+    ys           : f32[];
+    depth        : f32[];
+    color        : i32[];
+    alpha        : i32[];
+    count        : i32 = 0;
+    order        : i32[];
+    bucketCount  : i32[];
+    bucketStart  : i32[];
+    bucketCursor : i32[];
+
+    /** An empty pool. */
+    constructor() {
+        self.xs = new f32[(PAINTER_QUAD_ROOM * 4) as i64];
+        self.ys = new f32[(PAINTER_QUAD_ROOM * 4) as i64];
+        self.depth = new f32[PAINTER_QUAD_ROOM as i64];
+        self.color = new i32[PAINTER_QUAD_ROOM as i64];
+        self.alpha = new i32[PAINTER_QUAD_ROOM as i64];
+        self.order = new i32[PAINTER_QUAD_ROOM as i64];
+        self.bucketCount = new i32[PAINTER_BUCKETS as i64];
+        self.bucketStart = new i32[PAINTER_BUCKETS as i64];
+        self.bucketCursor = new i32[PAINTER_BUCKETS as i64];
+    }
+
+    /** How many quads are waiting in the pool. */
+    pub fn quadCount(self) : i32 {
+        return self.count;
+    }
+
+    /** Empties the pool; call once per frame before the scene pushes. */
+    pub fn reset(mut self) : void {
+        self.count = 0;
+    }
+
+    /**
+     * Pushes one projected convex face with its packed colour and an alpha numerator over
+     * `PAINTER_ALPHA_DEN`; the face's mean depth is its sort key. A full pool drops the quad: better a
+     * missing hill than a corrupt frame.
+     */
+    pub fn pushQuad(mut self, q : ScreenQuad, color : i32, alpha : i32) : void {
+        if (self.count >= PAINTER_QUAD_ROOM) {
+            return;
+        }
+        let i : i64 = self.count as i64;
+        let k : i64 = i * 4;
+        self.xs[k] = q.a.sx;
+        self.ys[k] = q.a.sy;
+        self.xs[k + 1] = q.b.sx;
+        self.ys[k + 1] = q.b.sy;
+        self.xs[k + 2] = q.c.sx;
+        self.ys[k + 2] = q.c.sy;
+        self.xs[k + 3] = q.d.sx;
+        self.ys[k + 3] = q.d.sy;
+        self.depth[i] = q.depth;
+        self.color[i] = color;
+        self.alpha[i] = alpha;
+        self.count = self.count + 1;
+    }
+
+    /** Pushes a square billboard `half` pixels from the projected point to each side: droplets. */
+    pub fn pushBillboard(mut self, at : Proj, half : f32, color : i32, alpha : i32) : void {
+        let left : f32 = at.sx - half;
+        let right : f32 = at.sx + half;
+        let top : f32 = at.sy - half;
+        let bottom : f32 = at.sy + half;
+        let q : ScreenQuad = ScreenQuad {
+            a: Proj { sx: left, sy: top, depth: at.depth, ok: true },
+            b: Proj { sx: right, sy: top, depth: at.depth, ok: true },
+            c: Proj { sx: right, sy: bottom, depth: at.depth, ok: true },
+            d: Proj { sx: left, sy: bottom, depth: at.depth, ok: true },
+            depth: at.depth,
+            ok: true,
+        };
+        self.pushQuad(q, color, alpha);
+    }
+
+    /** Sorts the pool far to near and fills every quad into `px`, a `w` x `h` row-major word buffer. */
+    pub fn flush(mut self, px : i32[], w : i32, h : i32) : void {
+        let n : i32 = self.count;
+        if (n == 0) {
+            return;
+        }
+        let mut dMin : f32 = self.depth[0];
+        let mut dMax : f32 = dMin;
+        for (k of 0..n) {
+            let d : f32 = self.depth[k as i64];
+            if (d < dMin) {
+                dMin = d;
+            }
+            if (d > dMax) {
+                dMax = d;
+            }
+        }
+        let range : f32 = dMax - dMin;
+        let mut inv : f32 = 0.0 as f32;
+        if (range > 0.0001 as f32) {
+            inv = (PAINTER_BUCKETS - 1) as f32 / range;
+        }
+        for (b of 0..PAINTER_BUCKETS) {
+            self.bucketCount[b as i64] = 0;
+        }
+        for (k of 0..n) {
+            let b : i32 = Painter::bucketOf(self, dMin, inv, self.depth[k as i64]);
+            self.bucketCount[b as i64] = self.bucketCount[b as i64] + 1;
+        }
+        let mut total : i32 = 0;
+        for (b of 0..PAINTER_BUCKETS) {
+            self.bucketStart[b as i64] = total;
+            self.bucketCursor[b as i64] = total;
+            total = total + self.bucketCount[b as i64];
+        }
+        for (k of 0..n) {
+            let b : i32 = Painter::bucketOf(self, dMin, inv, self.depth[k as i64]);
+            let slot : i64 = self.bucketCursor[b as i64] as i64;
+            self.order[slot] = k;
+            self.bucketCursor[b as i64] = self.bucketCursor[b as i64] + 1;
+        }
+        // Far buckets first: the painter paints the distance, then lets the near cover it.
+        for (bi of 0..PAINTER_BUCKETS) {
+            let b : i32 = PAINTER_BUCKETS - 1 - bi;
+            let begin : i32 = self.bucketStart[b as i64];
+            let end : i32 = begin + self.bucketCount[b as i64];
+            for (i of begin..end) {
+                Painter::fillOne(self, px, w, h, self.order[i as i64]);
+            }
+        }
+        self.count = 0;
+    }
+
+    // The bucket depth `d` lands in, from the frame's depth range computed by `flush`.
+    static fn bucketOf(p : Painter, dMin : f32, inv : f32, d : f32) : i32 {
+        if (inv <= 0.0 as f32) {
+            return 0;
+        }
+        let b : i32 = ((d - dMin) * inv) as i32;
+        if (b >= PAINTER_BUCKETS) {
+            return PAINTER_BUCKETS - 1;
+        }
+        return b;
+    }
+
+    // Reads quad `k` out of the pool and scanline-fills it.
+    static fn fillOne(p : Painter, px : i32[], w : i32, h : i32, k : i32) : void {
+        let i : i64 = k as i64;
+        let q : i64 = i * 4;
+        let c : PainterCorners = PainterCorners {
+            ax: p.xs[q],
+            ay: p.ys[q],
+            bx: p.xs[q + 1],
+            by: p.ys[q + 1],
+            cx: p.xs[q + 2],
+            cy: p.ys[q + 2],
+            dx: p.xs[q + 3],
+            dy: p.ys[q + 3],
+        };
+        let color : i32 = p.color[i];
+        let alpha : i32 = p.alpha[i];
+        let yLo : f32 = min(min(c.ay, c.by), min(c.cy, c.dy));
+        let yHi : f32 = max(max(c.ay, c.by), max(c.cy, c.dy));
+        let mut y0 : i32 = yLo as i32;
+        let mut y1 : i32 = (yHi as i32) + 1;
+        if (y0 < 0) {
+            y0 = 0;
+        }
+        if (y1 > h) {
+            y1 = h;
+        }
+        for (y of y0..y1) {
+            Painter::fillRow(px, w, y, c, color, alpha);
+        }
+    }
+
+    // One row of the quad: where the scanline crosses the four edges, then the span between them.
+    static fn fillRow(px : i32[], w : i32, y : i32, c : PainterCorners, color : i32, alpha : i32) : void {
+        let yf : f32 = y as f32;
+        let xa : f32 = Painter::edgeX(c.ax, c.ay, c.bx, c.by, yf);
+        let xb : f32 = Painter::edgeX(c.bx, c.by, c.cx, c.cy, yf);
+        let xc : f32 = Painter::edgeX(c.cx, c.cy, c.dx, c.dy, yf);
+        let xd : f32 = Painter::edgeX(c.dx, c.dy, c.ax, c.ay, yf);
+        let mut sp : PainterSpan = PainterSpan {};
+        sp = Painter::spanAdd(sp, xa);
+        sp = Painter::spanAdd(sp, xb);
+        sp = Painter::spanAdd(sp, xc);
+        sp = Painter::spanAdd(sp, xd);
+        // A convex quad crosses every interior row exactly twice; fewer crossings is a degenerate edge.
+        if (sp.count < 2) {
+            return;
+        }
+        let mut x0 : i32 = sp.left as i32;
+        let mut x1 : i32 = (sp.right as i32) + 1;
+        if (x0 < 0) {
+            x0 = 0;
+        }
+        if (x1 > w) {
+            x1 = w;
+        }
+        if (x1 <= x0) {
+            return;
+        }
+        let row : i64 = (y * w) as i64;
+        if (alpha >= PAINTER_ALPHA_DEN) {
+            for (x of x0..x1) {
+                px[row + (x as i64)] = color;
+            }
+            return;
+        }
+        if (alpha <= 0) {
+            return;
+        }
+        for (x of x0..x1) {
+            let at : i64 = row + (x as i64);
+            px[at] = Color::mix(px[at], color, alpha, PAINTER_ALPHA_DEN);
+        }
+    }
+
+    // Widens the span to include an edge crossing; the sentinel never contributes.
+    static fn spanAdd(sp : PainterSpan, x : f32) : PainterSpan {
+        if (x == PAINTER_FAR_X) {
+            return sp;
+        }
+        if (sp.count == 0) {
+            return PainterSpan { left: x, right: x, count: 1 };
+        }
+        return PainterSpan {
+            left: min(sp.left, x),
+            right: max(sp.right, x),
+            count: sp.count + 1,
+        };
+    }
+
+    // The x where scanline `y` crosses the edge, half-open on the y interval so a shared vertex counts
+    // exactly once; `PAINTER_FAR_X` when the edge misses the row, including horizontal edges.
+    static fn edgeX(ax : f32, ay : f32, bx : f32, by : f32, y : f32) : f32 {
+        let lo : f32 = min(ay, by);
+        let hi : f32 = max(ay, by);
+        if (y < lo || y >= hi) {
+            return PAINTER_FAR_X;
+        }
+        let d : f32 = by - ay;
+        // The guard above already refused the flat edge, so `d` is never zero here.
+        let t : f32 = (y - ay) / d;
+        return ax + t * (bx - ax);
+    }
+}

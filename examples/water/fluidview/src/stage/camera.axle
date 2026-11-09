@@ -1,0 +1,193 @@
+// camera — the orbital eye over a fluid world and its perspective projection.
+//
+// A hand-rolled projection, not smalt's device: the fluid demos draw painter-sorted quads straight into a
+// pixel buffer, and all they need from a camera is "where does this world point land on screen, and how far
+// is it". The camera orbits a target at `yaw`, `pitch` and `dist`; the basis is rebuilt once per frame by
+// `refresh` and `project` is a handful of multiplies, so the few ten-thousand projections a frame stay
+// cheap. Pitch is clamped away from the pole, where the up vector the basis is built from would collapse.
+// Angles and distances are f32 on purpose: this is rendering arithmetic, camera-relative, not world state.
+
+use ludax::{cos, sin, tan, Vec3};
+
+/** Vertical field of view of the demo cameras, in radians. */
+pub const CAM_FOV : f32 = 0.9;
+
+/** Depth nearer than this (view units) is refused: a quad whose corner crosses it is dropped whole. */
+pub const CAM_NEAR : f32 = 0.5;
+
+/** Steepest camera pitch, in radians, just short of the pole the basis degenerates at. */
+pub const CAM_PITCH_MAX : f32 = 1.35;
+
+/** Flattest camera pitch, in radians: a shallow look that never sinks into the ground plane. */
+pub const CAM_PITCH_MIN : f32 = 0.12;
+
+/** One projected point: screen position, view depth, and whether it is in front of the camera at all. */
+pub struct Proj {
+    /** Screen x, pixels. */
+    pub sx : f32 = 0.0 as f32;
+
+    /** Screen y, pixels. */
+    pub sy : f32 = 0.0 as f32;
+
+    /** View-space depth along the view axis; larger is farther. */
+    pub depth : f32 = 0.0 as f32;
+
+    /** False at or behind the near plane; the screen values are then meaningless. */
+    pub ok : bool = false;
+}
+
+/** Four projected corners of a convex face, in order around its perimeter, and their mean depth. */
+pub struct ScreenQuad {
+    /** First corner. */
+    pub a : Proj = Proj {};
+
+    /** Second corner. */
+    pub b : Proj = Proj {};
+
+    /** Third corner. */
+    pub c : Proj = Proj {};
+
+    /** Fourth corner. */
+    pub d : Proj = Proj {};
+
+    /** Mean view depth of the corners: what the painter sorts by and the fog reads. */
+    pub depth : f32 = 0.0 as f32;
+
+    /** False when any corner is at or behind the near plane; the face is then dropped whole. */
+    pub ok : bool = false;
+}
+
+/** Where an orbit camera looks from: the point it circles, how far out, and the two angles. */
+pub struct CamOrbit {
+    /** The point the eye looks at and circles. */
+    pub target : Vec3 = Vec3 { x: 0.0, y: 0.0, z: 0.0 };
+
+    /** Orbit radius, view units. */
+    pub dist : f32 = 50.0 as f32;
+
+    /** Heading around the target, radians. */
+    pub yaw : f32 = 0.0 as f32;
+
+    /** Elevation above the horizon, radians; larger looks more from above. */
+    pub pitch : f32 = 0.5 as f32;
+}
+
+/** An eye orbiting a target: `yaw` and `pitch` set the direction, `dist` the radius. */
+pub class OrbitCam {
+    /** Heading around the target, radians. */
+    pub yaw : f32;
+
+    /** Elevation above the horizon, radians; larger looks more from above. */
+    pub pitch : f32;
+
+    /** Orbit radius, view units. */
+    pub dist : f32;
+
+    target : Vec3;
+    dir    : Vec3;
+    rightX : f32 = 0.0 as f32;
+    rightZ : f32 = 0.0 as f32;
+    upX    : f32 = 0.0 as f32;
+    upY    : f32 = 0.0 as f32;
+    upZ    : f32 = 0.0 as f32;
+    focal  : f32 = 0.0 as f32;
+    halfW  : f32 = 0.0 as f32;
+    halfH  : f32 = 0.0 as f32;
+
+    /** A camera at the given orbit. */
+    constructor(o : CamOrbit) {
+        self.target = o.target;
+        self.dir = Vec3::unitY();
+        self.dist = o.dist;
+        self.yaw = o.yaw;
+        self.pitch = o.pitch;
+    }
+
+    /** Rebuilds the view basis for a picture `w` x `h`; call once per frame before projecting. */
+    pub fn refresh(mut self, w : i32, h : i32) : void {
+        let mut p : f32 = self.pitch;
+        if (p > CAM_PITCH_MAX) {
+            p = CAM_PITCH_MAX;
+        }
+        if (p < CAM_PITCH_MIN) {
+            p = CAM_PITCH_MIN;
+        }
+        let cy : f32 = cos(self.yaw);
+        let sy : f32 = sin(self.yaw);
+        let cp : f32 = cos(p);
+        let sp : f32 = sin(p);
+
+        // The unit vector from the target toward the eye.
+        self.dir = Vec3::make(cp * cy, sp, cp * sy);
+
+        // right = cross(forward, up) with forward = -dir and up = +y; unit as it stands. up = cross(right,
+        // forward) is unit because right and forward are orthonormal, and pitch is clamped away from the
+        // pole where it would collapse.
+        let d : Vec3 = self.dir;
+        self.rightX = d.z;
+        self.rightZ = (0.0 as f32) - d.x;
+        self.upX = (0.0 as f32) - d.x * d.y;
+        self.upY = d.x * d.x + d.z * d.z;
+        self.upZ = (0.0 as f32) - d.z * d.y;
+
+        self.halfW = (w as f32) * (0.5 as f32);
+        self.halfH = (h as f32) * (0.5 as f32);
+        self.focal = self.halfH / tan(CAM_FOV * (0.5 as f32));
+    }
+
+    /** Turns the eye by `dyaw` and `dpitch` radians. */
+    pub fn turn(mut self, dyaw : f32, dpitch : f32) : void {
+        self.yaw = self.yaw + dyaw;
+        self.pitch = self.pitch + dpitch;
+    }
+
+    /** Multiplies the orbit radius by `factor`, keeping it within `lo` and `hi`. */
+    pub fn zoom(mut self, factor : f32, lo : f32, hi : f32) : void {
+        let mut d : f32 = self.dist * factor;
+        if (d < lo) {
+            d = lo;
+        }
+        if (d > hi) {
+            d = hi;
+        }
+        self.dist = d;
+    }
+
+    /** The eye's world position: the target held out along the orbit direction. */
+    pub fn eye(self) : Vec3 {
+        return self.target.plus(self.dir.scale(self.dist));
+    }
+
+    /** Focal length in pixels a point at unit depth projects through; billboard sizes divide by it. */
+    pub fn focalLen(self) : f32 {
+        return self.focal;
+    }
+
+    /** Projects a world point; `ok` false at or behind the near plane. */
+    pub fn project(self, at : Vec3) : Proj {
+        let r : Vec3 = at.minus(self.target);
+
+        // Depth along the forward axis (the view looks along -dir): the orbit radius minus the share of the
+        // offset that points back at the eye.
+        let vz : f32 = self.dist - r.dot(self.dir);
+        if (vz < CAM_NEAR) {
+            return Proj { ok: false };
+        }
+
+        let vx : f32 = r.x * self.rightX + r.z * self.rightZ;
+        let vy : f32 = r.x * self.upX + r.y * self.upY + r.z * self.upZ;
+        let k : f32 = self.focal / vz;
+        return Proj { ok: true, sx: self.halfW + vx * k, sy: self.halfH - vy * k, depth: vz };
+    }
+
+    /** Projects the four corners of a face; `ok` false when any of them is behind the near plane. */
+    pub fn projectQuad(self, a : Vec3, b : Vec3, c : Vec3, d : Vec3) : ScreenQuad {
+        let pa : Proj = self.project(a);
+        let pb : Proj = self.project(b);
+        let pc : Proj = self.project(c);
+        let pd : Proj = self.project(d);
+        let ok : bool = pa.ok && pb.ok && pc.ok && pd.ok;
+        let depth : f32 = (pa.depth + pb.depth + pc.depth + pd.depth) * (0.25 as f32);
+        return ScreenQuad { a: pa, b: pb, c: pc, d: pd, depth: depth, ok: ok };
+    }
+}

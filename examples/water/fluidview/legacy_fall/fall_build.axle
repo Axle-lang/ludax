@@ -1,0 +1,222 @@
+// fall_build — fills the demo terrain and water window from the formulas of `fall_world`, on a job pool.
+//
+// The build is a few passes over rows, each pass reading only what an earlier pass finished: the heights of the
+// terrain, their pyramid, the material masks (which need slopes, hence the heights), and the columns of the water
+// window with the pyramid of its surface. A row is owned by one chunk and written by no other, so the result is
+// the same on every thread count. `FallScene` runs the whole sequence once on construction; nothing is allocated
+// afterwards.
+
+use ludax::{abs, clamp, max, min, saturate, smoothstep, sqrt, Vec3, JobPool, RangeKernel};
+
+use crate::water::fall_world::{FallRiver, FallWorld, FW_CENTRE, FW_LIP, FW_POOL_R, FW_POOL_Z};
+use crate::water::height_grid::HeightGrid;
+use crate::water::noise::waterExpNeg;
+use crate::water::relief::Relief;
+use crate::water::water_window::WaterWindow;
+
+/** Terrain lattice: points a side and metres between them. */
+pub const FALL_TERRAIN : i32 = 2048;
+pub const FALL_TERRAIN_CELL : f32 = 1.5;
+
+/** Water window: columns across and along, metres between them, and its corner. */
+pub const FALL_WINDOW_W : i32 = 1024;
+pub const FALL_WINDOW_D : i32 = 2048;
+pub const FALL_WINDOW_CELL : f32 = 1.0;
+pub const FALL_WINDOW_X : f32 = 1024.0;
+pub const FALL_WINDOW_Z : f32 = 880.0;
+
+// Rows of a build pass one pool job covers.
+const FALL_ROWS_PER_JOB : i32 = 8;
+
+// How the river runs: speed is a discharge over the depth, within bounds, metres a second.
+const FALL_DISCHARGE : f32 = 2.2;
+const FALL_DEPTH_SOFT : f32 = 0.6;
+const FALL_SPEED_MIN : f32 = 0.5;
+const FALL_SPEED_MAX : f32 = 3.6;
+
+// The spillway's speed at its start and at the lip, metres a second.
+const FALL_SPILL_SLOW : f32 = 1.5;
+const FALL_SPILL_FAST : f32 = 5.0;
+
+// The foam: the impact zone's core and edge, and how far the plume carries downstream, metres.
+const FALL_IMPACT_CORE : f32 = 4.0;
+const FALL_IMPACT_EDGE : f32 = 20.0;
+const FALL_PLUME_REACH : f32 = 120.0;
+
+// The pool's outflow speed at its centre, metres a second.
+const FALL_POOL_OUTFLOW : f32 = 1.4;
+
+enum FallPass : i8 {
+    Heights,
+    TerrainPyramid,
+    Masks,
+    Window,
+    WindowPyramid,
+}
+
+/** The kernel that runs the build passes. */
+pub class FallBuild : RangeKernel {
+    /** The terrain being filled. */
+    pub relief : Shared<Relief>;
+
+    /** The window being filled. */
+    pub window : Shared<WaterWindow>;
+
+    pass : FallPass = FallPass::Heights;
+
+    /** A build of `relief` and `window`. */
+    constructor(relief : Shared<Relief>, window : Shared<WaterWindow>) {
+        self.relief = relief;
+        self.window = window;
+    }
+
+    fn rows(self) : i32 {
+        return match self.pass {
+            FallPass::Heights => self.relief.grid.d,
+            FallPass::TerrainPyramid => self.relief.grid.d,
+            FallPass::Masks => self.relief.grid.d,
+            FallPass::Window => self.window.d,
+            FallPass::WindowPyramid => self.window.d,
+        };
+    }
+
+    /** Does rows `begin` up to `end` of the current pass. */
+    pub fn runRange(mut self, begin : i32, end : i32) : void {
+        match self.pass {
+            FallPass::Heights => self.heights(begin, end),
+            FallPass::TerrainPyramid => self.relief.grid.buildRows(begin, end),
+            FallPass::Masks => self.masks(begin, end),
+            FallPass::Window => self.columns(begin, end),
+            FallPass::WindowPyramid => self.window.top.buildRows(begin, end),
+        }
+    }
+
+    fn heights(mut self, begin : i32, end : i32) : void {
+        let g : Shared<HeightGrid> = self.relief.grid;
+        for (j of begin..end) {
+            let z : f32 = g.originZ + (j as f32) * g.cell;
+            for (i of 0..g.w) {
+                let x : f32 = g.originX + (i as f32) * g.cell;
+                g.heights[((j * g.w) + i) as i64] = FallWorld::height(x, z);
+            }
+        }
+    }
+
+    fn masks(mut self, begin : i32, end : i32) : void {
+        let g : Shared<HeightGrid> = self.relief.grid;
+        for (j of begin..end) {
+            let z : f32 = g.originZ + (j as f32) * g.cell;
+            for (i of 0..g.w) {
+                let x : f32 = g.originX + (i as f32) * g.cell;
+                let h : f32 = g.heights[((j * g.w) + i) as i64];
+                let s : Vec3 = g.slopeAt(x, z);
+                let slope : f32 = sqrt(s.x * s.x + s.z * s.z);
+                let rock : f32 = FallWorld::rock(h, slope);
+                let forest : f32 = FallWorld::forest(x, z, h, slope);
+                let river : FallRiver = FallWorld::river(x, z);
+                let bank : f32 = smoothstep(1.7, 0.9, abs(river.across));
+                let bed : f32 = bank * smoothstep(FW_LIP + 10.0, FW_LIP + 60.0, z);
+                let meadow : f32 = saturate(1.0 - rock) * (1.0 - smoothstep(520.0, 700.0, h));
+                self.relief.setMasks(i, j, rock, forest, meadow, bed);
+            }
+        }
+    }
+
+    fn columns(mut self, begin : i32, end : i32) : void {
+        let w : Shared<WaterWindow> = self.window;
+        for (j of begin..end) {
+            let z : f32 = w.originZ + (j as f32) * w.cell;
+            for (i of 0..w.w) {
+                let x : f32 = w.originX + (i as f32) * w.cell;
+                FallBuild::column(w, i, j, x, z);
+            }
+        }
+    }
+
+    // The velocity of the water at a column: down the channel, faster over the lip, outward from the pool.
+    static fn flowAt(river : FallRiver, depth : f32, x : f32, z : f32) : Vec3 {
+        if (z < FW_LIP + 14.0) {
+            let speed : f32 = FALL_SPILL_SLOW + (FALL_SPILL_FAST - FALL_SPILL_SLOW) * smoothstep(930.0, FW_LIP, z);
+            return Vec3 { x: 0.0, y: 0.0, z: speed };
+        }
+        let speed : f32 = clamp(FALL_DISCHARGE / (depth + FALL_DEPTH_SOFT), FALL_SPEED_MIN, FALL_SPEED_MAX);
+        let channel : Vec3 = Vec3 { x: river.flowX, y: 0.0, z: river.flowZ }.scale(speed);
+        let dx : f32 = x - FW_CENTRE;
+        let dz : f32 = z - FW_POOL_Z;
+        let r : f32 = sqrt(dx * dx + dz * dz);
+        let inPool : f32 = smoothstep(FW_POOL_R, FW_POOL_R * 0.55, r);
+        let push : f32 = FALL_POOL_OUTFLOW * (1.0 - min(r / FW_POOL_R, 1.0)) / max(r, 1.0);
+        return channel.lerp(Vec3 { x: dx, y: 0.0, z: dz }.scale(push), inPool);
+    }
+
+    // One window column: bed, water level, flow, foam, turbulence and the moisture of the ground around.
+    static fn column(w : Shared<WaterWindow>, i : i32, j : i32, x : f32, z : f32) : void {
+        let bed : f32 = FallWorld::height(x, z);
+        let level : f32 = FallWorld::waterLevel(x, z);
+        let depth : f32 = max(level - bed, 0.0);
+        let river : FallRiver = FallWorld::river(x, z);
+        let dx : f32 = x - FW_CENTRE;
+        let dz : f32 = z - FW_POOL_Z;
+        let r : f32 = sqrt(dx * dx + dz * dz);
+        let flow : Vec3 = FallBuild::flowAt(river, depth, x, z);
+        let impact : f32 = smoothstep(FALL_IMPACT_EDGE, FALL_IMPACT_CORE, r);
+        let downstream : f32 = waterExpNeg(max(z - FW_POOL_Z, 0.0) / FALL_PLUME_REACH);
+        let riffle : f32 = smoothstep(0.7, 0.95, river.riffle);
+        let carried : f32 = 0.5 * downstream * smoothstep(0.0, 0.2, depth);
+        let foam : f32 = saturate(impact + carried + 0.4 * riffle);
+        let turbulence : f32 = saturate(max(impact, 0.18 + 0.55 * riffle + 0.35 * downstream));
+        let near : f32 = smoothstep(2.8, 1.1, abs(river.across)) * smoothstep(FW_LIP + 12.0, FW_LIP + 40.0, z);
+        let moist : f32 = max(near, smoothstep(FW_POOL_R * 1.6, FW_POOL_R, r));
+        let spill : f32 = FallBuild::spillMoist(x, z);
+        w.set(i, j, bed, level, flow, foam, turbulence, max(moist, spill));
+    }
+
+    // Moisture around the spillway and the lip, where the ground is always wet.
+    static fn spillMoist(x : f32, z : f32) : f32 {
+        if (z > FW_LIP + 14.0) {
+            return 0.0;
+        }
+        return smoothstep(70.0, 30.0, abs(x - FW_CENTRE)) * smoothstep(860.0, 900.0, z);
+    }
+}
+
+/** The demo landscape: the terrain and the water window the build filled. */
+pub class FallScene {
+    /** The terrain. */
+    pub relief : Shared<Relief>;
+
+    /** The water window. */
+    pub window : Shared<WaterWindow>;
+
+    /** Builds the landscape on `workers` threads. */
+    constructor(workers : i32) {
+        self.relief = share new Relief(FALL_TERRAIN, FALL_TERRAIN, FALL_TERRAIN_CELL, 0.0, 0.0);
+        self.window = share new WaterWindow(
+            FALL_WINDOW_W,
+            FALL_WINDOW_D,
+            FALL_WINDOW_CELL,
+            FALL_WINDOW_X,
+            FALL_WINDOW_Z
+        );
+        let build : FallBuild = new FallBuild(self.relief, self.window);
+        let mut pool : JobPool = new JobPool(workers, build);
+        FallScene::pass(build, pool, FallPass::Heights);
+        self.relief.grid.prepare();
+        FallScene::pass(build, pool, FallPass::TerrainPyramid);
+        self.relief.grid.buildUpper();
+        FallScene::pass(build, pool, FallPass::Masks);
+        FallScene::pass(build, pool, FallPass::Window);
+        self.window.top.prepare();
+        FallScene::pass(build, pool, FallPass::WindowPyramid);
+        self.window.top.buildUpper();
+        pool.shutdown();
+    }
+
+    static fn pass(mut build : FallBuild, mut pool : JobPool, which : FallPass) : void {
+        build.pass = which;
+        let rows : i32 = build.rows();
+        if (!pool.run(rows, FALL_ROWS_PER_JOB)) {
+            build.runRange(0, rows);
+        }
+    }
+}

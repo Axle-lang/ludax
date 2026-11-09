@@ -1,0 +1,365 @@
+// plant_shapes — the shapes of a tree: a conifer's tiers of cones, a broadleaf's trunk and cluster of leaf lobes.
+//
+// Each function answers one question: where does the ray first meet this tree, and what is the surface there (its
+// normal facing the ray, how high on the tree, whether it is the inside of a crown or bark). Nothing here knows the
+// lattice the trees stand on or how they are lit (`plants`). A conifer is eight overlapping cones whose lower rims are
+// scalloped by angular noise and whose boughs have gaps; a broadleaf tree is a trunk and five ellipsoid lobes that are
+// alpha-tested with clumped noise, the more so near the silhouette, and at close range with leaf-sized cut-outs, so the
+// edge is ragged and the light comes through. All of a tree's numbers derive from its `id` by `plantSpread`, which is
+// a fraction and a multiply, so a ray that tests thirty trees pays for none of their hashes.
+
+use ludax::{abs, cos, max, min, saturate, sin, sqrt, Vec3};
+
+use crate::water::ground_noise::{groundCells, groundFade, GroundCell};
+use crate::water::noise::{waterValue2, waterValue3};
+
+/** A direction component smaller than this counts as zero. */
+pub(crate) const PLANT_EPS : f32 = 0.0001;
+
+/** Noise seed of the leaves. */
+pub(crate) const PLANT_SEED_LEAF : i32 = 807;
+
+/** The size of a broadleaf leaf, metres, which is drawn as cut-outs while a pixel is smaller than a fraction of it. */
+pub(crate) const PLANT_LEAF : f32 = 0.14;
+
+// Conifers: the noise seed of the boughs, the tiers, the height of one as a share of the crown, and the clear trunk as a
+// share of the tree. Broadleaf trees: the lobes of a canopy.
+const PLANT_SEED_BOUGH : i32 = 811;
+const PLANT_TIERS : i32 = 8;
+const PLANT_TIER_HEIGHT : f32 = 0.3;
+const PLANT_CLEAR : f32 = 0.1;
+const PLANT_LOBES : i32 = 5;
+
+// One tree of the lattice.
+pub(crate) struct Tree {
+    pub(crate) real   : bool = false;
+    pub(crate) x      : f32 = (0.0 as f32);
+    pub(crate) z      : f32 = (0.0 as f32);
+    pub(crate) base   : f32 = (0.0 as f32);
+    pub(crate) height : f32 = (0.0 as f32);
+    pub(crate) radius : f32 = (0.0 as f32);
+    pub(crate) id     : f32 = (0.0 as f32);
+    pub(crate) broad  : f32 = (0.0 as f32);
+    pub(crate) sway   : f32 = (0.0 as f32);
+    pub(crate) spread : f32 = (0.0 as f32);
+}
+
+// A surface met: the distance, the unit normal facing the ray, how high on the tree it is (0 low, 1 high), whether it
+// is the inside of a crown, and whether it is bark.
+pub(crate) struct Strike {
+    pub(crate) t     : f32 = -(1.0 as f32);
+    pub(crate) n     : Vec3 = Vec3 { x: (0.0 as f32), y: (1.0 as f32), z: (0.0 as f32) };
+    pub(crate) up    : f32 = (0.0 as f32);
+    pub(crate) inner : bool = false;
+    pub(crate) wood  : bool = false;
+}
+
+// One lobe of a broadleaf canopy: an ellipsoid.
+struct Lobe {
+    centre : Vec3 = Vec3 { x: (0.0 as f32), y: (0.0 as f32), z: (0.0 as f32) };
+    rx     : f32 = (1.0 as f32);
+    ry     : f32 = (1.0 as f32);
+}
+
+// A cone tier of a conifer: where its floor is, how tall and wide, and how far it leans in the wind.
+struct Tier {
+    index : i32 = 0;
+    floor : f32 = (0.0 as f32);
+    tall  : f32 = (1.0 as f32);
+    width : f32 = (1.0 as f32);
+    lean  : f32 = (0.0 as f32);
+}
+
+/**
+ * A number in 0 to 1 that is fixed for an `id` and different for each `salt`: the fraction of `id` times a constant,
+ * so a tree's attributes cost no hash of their own.
+ */
+pub(crate) fn plantSpread(id : f32, salt : i32) : f32 {
+    let v : f32 = id * ((7.13 as f32) + (salt as f32) * (4.71 as f32)) + (salt as f32) * (0.318 as f32);
+    return v - (v as i32 as f32);
+}
+
+/** The shapes of trees. */
+pub(crate) class PlantShape {
+    // The nearest of a conifer's tiers.
+    pub(crate) static fn conifer(tree : Tree, eye : Vec3, dir : Vec3, limit : f32) : Strike {
+        let clear : f32 = tree.height * PLANT_CLEAR;
+        let span : f32 = tree.height - clear;
+        let tall : f32 = span * PLANT_TIER_HEIGHT;
+        let mut best : Strike = PlantShape::trunk(tree, eye, dir, limit, tree.height * (0.4 as f32));
+        let mut reach : f32 = limit;
+        if (best.t >= (0.0 as f32)) {
+            reach = best.t;
+        }
+        for (i of 0..PLANT_TIERS) {
+            let f : f32 = (i as f32) / ((PLANT_TIERS - 1) as f32);
+            let tier : Tier = Tier {
+                index: i,
+                floor: tree.base + clear + (span - tall) * f,
+                tall: tall,
+                width: tree.radius * ((1.0 as f32) - (0.84 as f32) * f),
+                lean: tree.sway * f * f,
+            };
+            let s : Strike = PlantShape::cone(tree, tier, eye, dir, reach);
+            if (s.t >= (0.0 as f32)) {
+                best = s;
+                reach = s.t;
+            }
+        }
+        return best;
+    }
+
+    // One tier: a cone with its apex at `floor + tall` and its rim `width` wide at the floor, and its underside.
+    static fn cone(tree : Tree, tier : Tier, eye : Vec3, dir : Vec3, limit : f32) : Strike {
+        let k : f32 = tier.width / tier.tall;
+        let k2 : f32 = k * k;
+        let ox : f32 = eye.x - (tree.x + tier.lean);
+        let oy : f32 = eye.y - (tier.floor + tier.tall);
+        let oz : f32 = eye.z - tree.z;
+        let a : f32 = dir.x * dir.x + dir.z * dir.z - k2 * dir.y * dir.y;
+        let b : f32 = (ox * dir.x + oz * dir.z - k2 * oy * dir.y) * (2.0 as f32);
+        let c : f32 = ox * ox + oz * oz - k2 * oy * oy;
+        let mut best : Strike = Strike {};
+        let mut reach : f32 = limit;
+        let disc : f32 = b * b - (4.0 as f32) * a * c;
+        if (abs(a) > PLANT_EPS && disc >= (0.0 as f32)) {
+            let root : f32 = sqrt(disc);
+            let r0 : f32 = (-b - root) / ((2.0 as f32) * a);
+            let r1 : f32 = (-b + root) / ((2.0 as f32) * a);
+            let outer : Strike = PlantShape::rim(tree, tier, eye, dir, min(r0, r1), false);
+            if (outer.t >= (0.0 as f32) && outer.t < reach) {
+                best = outer;
+                reach = outer.t;
+            } else {
+                let inner : Strike = PlantShape::rim(tree, tier, eye, dir, max(r0, r1), true);
+                if (inner.t >= (0.0 as f32) && inner.t < reach) {
+                    best = inner;
+                    reach = inner.t;
+                }
+            }
+        }
+        return best;
+    }
+
+    // The tier's cone surface at distance `t` if it lies inside the tier and is not worn away by the scalloped rim and
+    // the gaps between boughs.
+    static fn rim(tree : Tree, tier : Tier, eye : Vec3, dir : Vec3, t : f32, inner : bool) : Strike {
+        if (t <= (0.0 as f32)) {
+            return Strike {};
+        }
+        let p : Vec3 = eye.plus(dir.scale(t));
+        let rise : f32 = (p.y - tier.floor) / tier.tall;
+        if (rise < (0.0 as f32) || rise > (1.0 as f32)) {
+            return Strike {};
+        }
+        let ux : f32 = p.x - (tree.x + tier.lean);
+        let uz : f32 = p.z - tree.z;
+        let len : f32 = max(sqrt(ux * ux + uz * uz), PLANT_EPS);
+        let scallop : f32 = waterValue2(
+            ux / len * (2.2 as f32) + (tier.index as f32) * (5.3 as f32),
+            uz / len * (2.2 as f32) + tree.id * (9.0 as f32),
+            PLANT_SEED_BOUGH
+        );
+        let fine : f32 = waterValue3(p.scale((2.6 as f32)), PLANT_SEED_BOUGH + 3);
+        if (rise < scallop * (0.7 as f32) || fine < (0.3 as f32) * ((1.0 as f32) - rise)) {
+            return Strike {};
+        }
+        let slant : f32 = tier.width / tier.tall;
+        let mut n : Vec3 = Vec3 { x: ux / len, y: slant, z: uz / len }.normalized();
+        if (inner) {
+            n = n.scale(-(1.0 as f32));
+        }
+        return Strike {
+            t: t,
+            n: n,
+            up: saturate((p.y - tree.base) / tree.height) * (0.6 as f32) + saturate(rise) * (0.4 as f32),
+            inner: inner,
+        };
+    }
+
+    // A broadleaf tree: the trunk and the leaf canopy.
+    pub(crate) static fn broad(tree : Tree, eye : Vec3, dir : Vec3, limit : f32) : Strike {
+        let trunk : Strike = PlantShape::trunk(tree, eye, dir, limit, tree.height * (0.45 as f32));
+        let mut best : Strike = trunk;
+        let mut reach : f32 = limit;
+        if (trunk.t >= (0.0 as f32)) {
+            reach = trunk.t;
+        }
+        let canopy : Strike = PlantShape::canopy(tree, eye, dir, reach);
+        if (canopy.t >= (0.0 as f32)) {
+            best = canopy;
+        }
+        return best;
+    }
+
+    // The trunk of a tree: a vertical cylinder from the ground up `rise` metres.
+    static fn trunk(tree : Tree, eye : Vec3, dir : Vec3, limit : f32, rise : f32) : Strike {
+        let girth : f32 = (0.08 as f32) + tree.radius * (0.03 as f32);
+        let a : f32 = dir.x * dir.x + dir.z * dir.z;
+        let ox : f32 = eye.x - tree.x;
+        let oz : f32 = eye.z - tree.z;
+        let b : f32 = (ox * dir.x + oz * dir.z) * (2.0 as f32);
+        let c : f32 = ox * ox + oz * oz - girth * girth;
+        let disc : f32 = b * b - (4.0 as f32) * a * c;
+        if (a <= PLANT_EPS || disc < (0.0 as f32)) {
+            return Strike {};
+        }
+        let t : f32 = (-b - sqrt(disc)) / ((2.0 as f32) * a);
+        let y : f32 = eye.y + dir.y * t;
+        if (t <= (0.0 as f32) || t >= limit || y <= tree.base || y >= tree.base + rise) {
+            return Strike {};
+        }
+        let hx : f32 = eye.x + dir.x * t - tree.x;
+        let hz : f32 = eye.z + dir.z * t - tree.z;
+        return Strike {
+            t: t,
+            n: Vec3 { x: hx / girth, y: (0.0 as f32), z: hz / girth },
+            up: (y - tree.base) / tree.height,
+            wood: true,
+        };
+    }
+
+    // The leaf canopy: a cluster of ellipsoid lobes, each alpha-tested with clumped noise that thins toward its silhouette.
+    static fn canopy(tree : Tree, eye : Vec3, dir : Vec3, limit : f32) : Strike {
+        let ry : f32 = tree.height * (0.34 as f32);
+        let heart : Vec3 = Vec3 {
+            x: tree.x + tree.sway * (0.6 as f32),
+            y: tree.base + tree.height * (0.62 as f32),
+            z: tree.z,
+        };
+        let mut best : Strike = Strike {};
+        let mut reach : f32 = limit;
+        for (i of 0..PLANT_LOBES) {
+            let lobe : Lobe = PlantShape::lobe(tree, i, heart, tree.radius, ry);
+            let s : Strike = PlantShape::ellipsoid(
+                tree,
+                lobe,
+                eye,
+                dir,
+                reach,
+                heart.y - ry,
+                ry * (2.0 as f32)
+            );
+            if (s.t >= (0.0 as f32)) {
+                best = s;
+                reach = s.t;
+            }
+        }
+        return best;
+    }
+
+    // Lobe `i` of the canopy whose heart is `heart` and whose full radii are `rx` and `ry`: the first is the big middle
+    // one, the others sit around it at hashed angles, heights and sizes.
+    static fn lobe(tree : Tree, i : i32, heart : Vec3, rx : f32, ry : f32) : Lobe {
+        if (i == 0) {
+            return Lobe { centre: heart, rx: rx * (0.82 as f32), ry: ry * (0.85 as f32) };
+        }
+        let angle : f32 = ((i - 1) as f32) * (6.2831853 as f32) / ((PLANT_LOBES - 1) as f32)
+            + plantSpread(tree.id, 10 + i) * (1.5 as f32);
+        let out : f32 = rx * ((0.5 as f32) + (0.3 as f32) * plantSpread(tree.id, 20 + i));
+        let lift : f32 = ry * (plantSpread(tree.id, 30 + i) - (0.35 as f32)) * (0.8 as f32);
+        let size : f32 = (0.55 as f32) + (0.25 as f32) * plantSpread(tree.id, 40 + i);
+        return Lobe {
+            centre: Vec3 { x: heart.x + cos(angle) * out, y: heart.y + lift, z: heart.z + sin(angle) * out },
+            rx: rx * size,
+            ry: ry * size * (1.1 as f32),
+        };
+    }
+
+    // The surface of one lobe along the ray, if a leaf is there; `low` and `span` place it in the whole canopy.
+    static fn ellipsoid(
+        tree : Tree,
+        lobe : Lobe,
+        eye : Vec3,
+        dir : Vec3,
+        limit : f32,
+        low : f32,
+        span : f32
+    ) : Strike {
+        let o : Vec3 = Vec3 {
+            x: (eye.x - lobe.centre.x) / lobe.rx,
+            y: (eye.y - lobe.centre.y) / lobe.ry,
+            z: (eye.z - lobe.centre.z) / lobe.rx,
+        };
+        let d : Vec3 = Vec3 { x: dir.x / lobe.rx, y: dir.y / lobe.ry, z: dir.z / lobe.rx };
+        let a : f32 = d.dot(d);
+        let b : f32 = (2.0 as f32) * o.dot(d);
+        let c : f32 = o.dot(o) - (1.0 as f32);
+        let disc : f32 = b * b - (4.0 as f32) * a * c;
+        if (disc < (0.0 as f32) || a < PLANT_EPS) {
+            return Strike {};
+        }
+        let root : f32 = sqrt(disc);
+        let front : Strike = PlantShape::leaf(
+            tree,
+            eye,
+            dir,
+            (-b - root) / ((2.0 as f32) * a),
+            lobe,
+            false,
+            low,
+            span
+        );
+        if (front.t >= (0.0 as f32) && front.t < limit) {
+            return front;
+        }
+        let back : Strike = PlantShape::leaf(
+            tree,
+            eye,
+            dir,
+            (-b + root) / ((2.0 as f32) * a),
+            lobe,
+            true,
+            low,
+            span
+        );
+        if (back.t >= (0.0 as f32) && back.t < limit) {
+            return back;
+        }
+        return Strike {};
+    }
+
+    // The lobe's surface at `t` if a leaf is there.
+    static fn leaf(
+        tree : Tree,
+        eye : Vec3,
+        dir : Vec3,
+        t : f32,
+        lobe : Lobe,
+        inner : bool,
+        low : f32,
+        span : f32
+    ) : Strike {
+        if (t <= (0.0 as f32)) {
+            return Strike {};
+        }
+        let p : Vec3 = eye.plus(dir.scale(t));
+        let out : Vec3 = Vec3 {
+            x: (p.x - lobe.centre.x) / (lobe.rx * lobe.rx),
+            y: (p.y - lobe.centre.y) / (lobe.ry * lobe.ry),
+            z: (p.z - lobe.centre.z) / (lobe.rx * lobe.rx),
+        }.normalized();
+        let graze : f32 = (1.0 as f32) - abs(out.dot(dir));
+        let seed : Vec3 = Vec3 { x: tree.id * (53.0 as f32), y: (0.0 as f32), z: tree.id * (29.0 as f32) };
+        let clump : f32 = waterValue3(p.plus(seed).scale((0.8 as f32)), PLANT_SEED_LEAF);
+        let fine : f32 = waterValue3(p.plus(seed).scale((3.4 as f32)), PLANT_SEED_LEAF + 5);
+        let near : f32 = groundFade(PLANT_LEAF, tree.spread * t, 0.12, 0.7);
+        let mut cover : f32 = clump * (0.6 as f32) + fine * (0.4 as f32);
+        if (near > (0.0 as f32)) {
+            let blade : GroundCell = groundCells(
+                p.x / PLANT_LEAF,
+                p.y / PLANT_LEAF + p.z / PLANT_LEAF * (0.7 as f32),
+                PLANT_SEED_LEAF
+            );
+            cover = cover - near * (blade.dist - (0.3 as f32)) * (0.9 as f32);
+        }
+        if (cover < (0.3 as f32) + (0.3 as f32) * graze * graze) {
+            return Strike {};
+        }
+        let mut n : Vec3 = out;
+        if (inner) {
+            n = n.scale(-(1.0 as f32));
+        }
+        return Strike { t: t, n: n, up: saturate((p.y - low) / span), inner: inner };
+    }
+}

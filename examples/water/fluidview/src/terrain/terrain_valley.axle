@@ -1,0 +1,297 @@
+// terrain_valley — the floodplain, the river's channel and the plunge pool, cut into the eroded ground.
+//
+// Three things happen to the cells near the river, in this order.
+//
+// First the river is rasterised: for every segment of the centreline, the cells within reach get the signed distance
+// to the nearest segment (positive on the river's left) and its position along the line, as a fractional point index.
+// Everything below reads those two numbers and the interpolated point; nothing searches again.
+//
+// Then the floodplain. Its surface is the valley floor (a plain falling by the river's slope), tilted up a little toward
+// the hills, with a few decimetres of swell, and the hills are blended into it over `floodBlend` with their foot
+// terraced: slopes of a few metres' rise are snapped to steps, as the river's old floors leave them. Close to the river
+// the surface is pulled to the bank height of the nearest point plus a low natural levee, so the channel's edge meets
+// the plain without a step.
+//
+// Last the channel. Its cross-section is asymmetric where the river bends, as a real one is: the deepest water sits
+// toward the outside (the cutbank), which is steep, and the inside shoals gently into a point bar. At a straight
+// reach it is symmetric. The profile is normalised so that at the centreline the bed is exactly the point's `bedHeight`,
+// which is what makes the long profile strictly descending, and zero at the banks, which is what makes the channel
+// lie below its banks everywhere. The plunge pool is a round hollow at the start of the line, deeper than the
+// channel by `plungePoolDepth`.
+
+use ludax::{abs, max, min, saturate, smoothstep, sqrt};
+
+use crate::terrain::hydro_parts::RiverPoint;
+use crate::terrain::terrain_channel::TerrainChannel;
+use crate::terrain::terrain_meander::{RiverLine, MEANDER_POND_EDGE};
+use crate::terrain::terrain_noise::terrainNoise;
+use crate::terrain::terrain_plan::TerrainPlan;
+
+// Marker of a cell the river has not reached.
+const VALLEY_FAR : f32 = 1000000.0;
+
+// How far from the centreline, in channel widths, the river's own surface blending reaches, and where it starts.
+const VALLEY_REACH : f32 = 4.0;
+const VALLEY_NEAR_FROM : f32 = 1.2;
+
+// The natural levee: its height above the bank, metres, and how wide it is, in half widths.
+const VALLEY_LEVEE : f32 = 0.3;
+const VALLEY_LEVEE_SPAN : f32 = 1.2;
+
+// The floodplain's surface: the rise toward the hills across the plain, metres, and the swell's size and scale.
+const VALLEY_TILT : f32 = 1.5;
+const VALLEY_SWELL : f32 = 0.3;
+const VALLEY_SWELL_SCALE : f32 = 90.0;
+const VALLEY_SEED_SWELL : i32 = 503;
+
+// Terraces: the step between treads, metres, how much of the hills' foot they claim, and the rise beyond which they stop.
+const VALLEY_TREAD : f32 = 2.6;
+const VALLEY_TERRACE : f32 = 0.92;
+const VALLEY_TERRACE_TOP : f32 = 32.0;
+
+// The scar of an abandoned channel: how deep it is where it is only a swale, metres, how much narrower than the live channel,
+// how far from the live river it must stay clear (metres beyond the two half widths), and the floodplain weight it needs.
+const VALLEY_SCAR_DEPTH : f32 = 0.45;
+const VALLEY_SCAR_NARROW : f32 = 0.8;
+const VALLEY_SCAR_CLEAR : f32 = 6.0;
+const VALLEY_SCAR_FROM : f32 = 0.6;
+
+/** What the river rasterisation knows of each cell: how far the nearest river segment is and where along the river. */
+pub class RiverField {
+    /** Signed distance to the nearest centreline segment, metres, positive on the left; `VALLEY_FAR` when none is near. */
+    pub distance : f32[];
+
+    /** Fractional point index of the nearest centreline position, or -1. */
+    pub along : f32[];
+
+    /** A field for `count` cells, everything far. */
+    constructor(count : i64) {
+        self.distance = new f32[count];
+        self.along = new f32[count];
+        for (c of 0..count) {
+            self.distance[c] = VALLEY_FAR;
+            self.along[c] = -1.0 as f32;
+        }
+    }
+}
+
+/** The valley's cuts. */
+pub class TerrainValley {
+    /** Rasterises `line` into `field` for a grid of `width` columns. */
+    pub static fn raster(plan : TerrainPlan, line : RiverLine, field : RiverField, width : i32) : void {
+        let reach : f32 = plan.params.riverWidth * VALLEY_REACH;
+        for (i of 0..(line.count - 1)) {
+            let a : RiverPoint = line.points[i as i64];
+            let b : RiverPoint = line.points[(i + 1) as i64];
+            let lo : i32 = ((min(a.x, b.x) - reach) / plan.cell) as i32 - 1;
+            let hi : i32 = ((max(a.x, b.x) + reach) / plan.cell) as i32 + 1;
+            let top : i32 = ((min(a.z, b.z) - reach) / plan.cell) as i32 - 1;
+            let bottom : i32 = ((max(a.z, b.z) + reach) / plan.cell) as i32 + 1;
+            for (j of valleyMax(top, 0)..valleyMin(bottom, width - 1)) {
+                for (k of valleyMax(lo, 0)..valleyMin(hi, width - 1)) {
+                    TerrainValley::offer(plan, a, b, i, k, j, width, field);
+                }
+            }
+        }
+    }
+
+    // Records segment `i` (from `a` to `b`) as the nearest one of cell (k, j) when it is.
+    static fn offer(
+        plan : TerrainPlan,
+        a : RiverPoint,
+        b : RiverPoint,
+        i : i32,
+        k : i32,
+        j : i32,
+        width : i32,
+        mut field : RiverField
+    ) : void {
+        let px : f32 = ((k as f32) + 0.5 as f32) * plan.cell;
+        let pz : f32 = ((j as f32) + 0.5 as f32) * plan.cell;
+        let dx : f32 = b.x - a.x;
+        let dz : f32 = b.z - a.z;
+        let ox : f32 = px - a.x;
+        let oz : f32 = pz - a.z;
+        let len2 : f32 = dx * dx + dz * dz;
+        let mut t : f32 = 0.0 as f32;
+        if (len2 > 0.000001 as f32) {
+            t = saturate((ox * dx + oz * dz) / len2);
+        }
+        let ex : f32 = ox - dx * t;
+        let ez : f32 = oz - dz * t;
+        let dist : f32 = sqrt(ex * ex + ez * ez);
+        let c : i64 = ((j as i64) * (width as i64)) + (k as i64);
+        if (dist >= abs(field.distance[c])) {
+            return;
+        }
+        let cross : f32 = dx * oz - dz * ox;
+        let mut signed : f32 = dist;
+        if (cross > 0.0 as f32) {
+            signed = 0.0 as f32 - dist;
+        }
+        field.distance[c] = signed;
+        field.along[c] = (i as f32) + t;
+    }
+
+    /** Rewrites rows `begin` up to `end` of `surface` with the floodplain (terraces, levees, scars, the pull to the banks) over the hills in `bed`. */
+    pub static fn floodplainRows(
+        plan : TerrainPlan,
+        line : RiverLine,
+        field : RiverField,
+        old : RiverLine,
+        oldField : RiverField,
+        bed : f32[],
+        surface : f32[],
+        width : i32,
+        begin : i32,
+        end : i32
+    ) : void {
+        for (j of begin..end) {
+            let z : f32 = ((j as f32) + 0.5 as f32) * plan.cell;
+            for (i of 0..width) {
+                let x : f32 = ((i as f32) + 0.5 as f32) * plan.cell;
+                let c : i64 = ((j as i64) * (width as i64)) + (i as i64);
+                surface[c] = TerrainValley::floodplain(plan, line, field, old, oldField, bed[c], x, z, c);
+            }
+        }
+    }
+
+    /** Writes rows `begin` up to `end` of `bed`: the `surface` with the channel, the pool and the bar cut into it. */
+    pub static fn channelRows(
+        plan : TerrainPlan,
+        line : RiverLine,
+        field : RiverField,
+        bed : f32[],
+        surface : f32[],
+        width : i32,
+        begin : i32,
+        end : i32
+    ) : void {
+        for (j of begin..end) {
+            let z : f32 = ((j as f32) + 0.5 as f32) * plan.cell;
+            for (i of 0..width) {
+                let x : f32 = ((i as f32) + 0.5 as f32) * plan.cell;
+                let c : i64 = ((j as i64) * (width as i64)) + (i as i64);
+                bed[c] = TerrainChannel::carve(
+                    plan,
+                    line.points,
+                    line.count,
+                    surface[c],
+                    x,
+                    z,
+                    field.along[c]
+                );
+            }
+        }
+    }
+
+    // The height of the cell at (x, z) whose eroded height is `hill`, before the channel is cut: floodplain, scar, bank pull.
+    static fn floodplain(
+        plan : TerrainPlan,
+        line : RiverLine,
+        field : RiverField,
+        old : RiverLine,
+        oldField : RiverField,
+        hill : f32,
+        x : f32,
+        z : f32,
+        c : i64
+    ) : f32 {
+        let weight : f32 = plan.floodWeight(x, z);
+        let near : f32 = field.along[c];
+        let mut height : f32 = hill;
+        if (weight > 0.0 as f32) {
+            height = TerrainValley::plain(plan, hill, x, z, weight);
+        }
+        if (weight > VALLEY_SCAR_FROM) {
+            height = TerrainValley::scar(line, field, old, oldField, height, c);
+        }
+        if (near < 0.0 as f32 || weight <= 0.0 as f32) {
+            return height;
+        }
+
+        let p : RiverPoint = line.at(near);
+        let dist : f32 = abs(field.distance[c]);
+        let half : f32 = p.width * 0.5 as f32;
+        let pull : f32 = 1.0 as f32 - smoothstep(half * VALLEY_NEAR_FROM, half * VALLEY_REACH, dist);
+        let levee : f32 = VALLEY_LEVEE
+            * (1.0 as f32 - smoothstep(0.0 as f32, half * VALLEY_LEVEE_SPAN, dist - half));
+        return height + (p.bankHeight + levee * saturate(dist / half - 0.5 as f32) - height) * pull;
+    }
+
+    // `height` with the abandoned channel cut into it: a shallow swale, deepening to flat-floored ponds (oxbow hollows).
+    static fn scar(
+        line : RiverLine,
+        field : RiverField,
+        old : RiverLine,
+        oldField : RiverField,
+        height : f32,
+        c : i64
+    ) : f32 {
+        let at : f32 = oldField.along[c];
+        if (at < 0.0 as f32) {
+            return height;
+        }
+        let q : RiverPoint = old.at(at);
+        let half : f32 = q.width * 0.5 as f32 * VALLEY_SCAR_NARROW;
+        if (abs(oldField.distance[c]) >= half) {
+            return height;
+        }
+        if (field.along[c] >= 0.0 as f32) {
+            let live : RiverPoint = line.at(field.along[c]);
+            if (abs(field.distance[c]) < (live.width * 0.5 as f32) + half + VALLEY_SCAR_CLEAR) {
+                return height;
+            }
+        }
+        let mut depth : f32 = VALLEY_SCAR_DEPTH;
+        for (k of 0..old.pondCount) {
+            let from : f32 = old.pondFrom[k as i64] as f32;
+            let to : f32 = old.pondTo[k as i64] as f32;
+            if (at < from || at >= to) {
+                continue;
+            }
+            let edge : f32 = MEANDER_POND_EDGE as f32;
+            let taper : f32 = smoothstep(from, from + edge, at)
+                * (1.0 as f32 - smoothstep(to - edge, to, at));
+            depth = max(depth, (q.bankHeight - old.pondBed[k as i64]) * taper);
+        }
+        let across : f32 = TerrainChannel::outside(q, oldField.distance[c]);
+        return height - depth * TerrainChannel::section(across / half, q.curvature, q.width);
+    }
+
+    // The floodplain's own surface at (x, z), blended with the hills `hill` by `weight` (1 on the plain).
+    static fn plain(plan : TerrainPlan, hill : f32, x : f32, z : f32, weight : f32) : f32 {
+        let lateral : f32 = saturate(plan.lateral(x, z) / plan.floodHalf);
+        let swell : f32 = VALLEY_SWELL
+            * terrainNoise(x / VALLEY_SWELL_SCALE, z / VALLEY_SWELL_SCALE, plan.seed + VALLEY_SEED_SWELL);
+        let surface : f32 = plan.floor(z) + VALLEY_TILT * lateral * lateral + swell;
+        let rise : f32 = hill - surface;
+        let mut shaped : f32 = rise;
+        if (rise > 0.0 as f32) {
+            let claim : f32 = VALLEY_TERRACE
+                * (1.0 as f32 - smoothstep(VALLEY_TERRACE_TOP * 0.45 as f32, VALLEY_TERRACE_TOP, rise));
+            shaped = rise + (VALLEY_TREAD * valleyTerraced(rise / VALLEY_TREAD) - rise) * claim;
+        }
+        return surface + shaped * (1.0 as f32 - weight);
+    }
+}
+
+// A rise in treads, snapped to steps with a short smooth riser between them.
+fn valleyTerraced(t : f32) : f32 {
+    let whole : f32 = (t as i32) as f32;
+    return whole + smoothstep(0.78 as f32, 1.0 as f32, t - whole);
+}
+
+fn valleyMax(a : i32, b : i32) : i32 {
+    if (a > b) {
+        return a;
+    }
+    return b;
+}
+
+fn valleyMin(a : i32, b : i32) : i32 {
+    if (a < b) {
+        return a;
+    }
+    return b;
+}

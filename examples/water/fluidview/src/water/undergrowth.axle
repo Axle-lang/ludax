@@ -1,0 +1,530 @@
+// undergrowth — what grows and lies on the ground within sight: grass tufts, reeds, bushes and boulders.
+//
+// The same idea as the trees (`plants`), at human scale: a lattice of 1.8 m cells, at most one instance in each, whose
+// kind, place and size are hashes of the cell and whose existence follows a small map of weights the terrain's
+// material masks give (meadow gives tufts, mud and wet ground give reeds, a forest's edge gives bushes, scree and bare
+// rock give boulders). A ray walks the cells out to the undergrowth range and tests the one instance of each; every
+// instance is an ellipsoid, and what makes it a tuft or a reed is the alpha test: blades are streaks of noise around
+// its axis that fray toward the tip, a bush is clumped leaf noise, a boulder is solid and takes its colour from the
+// ground's own rock. Instances stay inside their cell, so no cell looks at its neighbours.
+
+use ludax::{abs, atan2, cos, max, min, saturate, sin, smoothstep, sqrt, Vec3, PI};
+
+use crate::water::ground_noise::groundFade;
+use crate::water::ground_rock::GroundRock;
+use crate::water::ground_site::{GroundPatch, GroundSite};
+use crate::water::noise::{waterFloor, waterHash, waterPick, waterValue2, waterValue3};
+use crate::water::relief::{
+    Relief, RELIEF_BED, RELIEF_CHANNELS, RELIEF_FIELD, RELIEF_FOREST, RELIEF_MEADOW, RELIEF_MUD, RELIEF_ROCK,
+    RELIEF_SCREE
+};
+use crate::water::sky::WaterSky;
+use crate::water::vista_look::GroundLook;
+use crate::water::water_window::WaterWindow;
+
+/** How far from the eye, metres, undergrowth is drawn as shapes. */
+pub const UNDER_RANGE : f32 = 70.0;
+
+// The lattice: metres a cell, and the share of it an instance's centre keeps clear of the cell's edge.
+const UNDER_CELL : f32 = 1.8;
+const UNDER_MARGIN : f32 = 0.3;
+
+// The most cells a ray walks, and the lowest weight (of 255) that holds an instance.
+const UNDER_STEPS : i32 = 60;
+const UNDER_MIN : i32 = 8;
+
+// Beyond any distance a ray can reach, and a direction component counted as zero.
+const UNDER_FAR : f32 = 1000000.0;
+const UNDER_EPS : f32 = 0.0001;
+
+// The deepest water, metres, a reed stands in and any other plant, which stands on a bank.
+const UNDER_WADE : f32 = 0.6;
+const UNDER_DAMP : f32 = 0.03;
+
+// The tallest instance, metres, and how far the ground may rise inside a cell.
+const UNDER_TALLEST : f32 = 2.4;
+const UNDER_SLOPE : f32 = 2.5;
+
+// Seeds.
+const UNDER_SEED : i32 = 901;
+const UNDER_SEED_BLADE : i32 = 907;
+const UNDER_SEED_LEAF : i32 = 911;
+
+// The kinds, as the channel of the weight map they read.
+const UNDER_GRASS : i32 = 0;
+const UNDER_REED : i32 = 1;
+const UNDER_BUSH : i32 = 2;
+const UNDER_ROCK : i32 = 3;
+
+// The weight map has this many bytes a texel: one per kind.
+const UNDER_KINDS : i32 = 4;
+
+// The least slope that stops tufts and reeds (rise over run), and the slope at which a boulder is most likely.
+const UNDER_STEEP : f32 = 0.7;
+
+/** What a ray found of the undergrowth. */
+pub struct UnderHit {
+    /** Distance along the ray, or negative for none. */
+    pub t : f32 = -(1.0 as f32);
+
+    /** Radiance leaving the instance toward the eye, before haze. */
+    pub colour : Vec3 = Vec3 { x: (0.0 as f32), y: (0.0 as f32), z: (0.0 as f32) };
+}
+
+// One instance of the lattice.
+struct SmallThing {
+    real : bool = false;
+    kind : i32 = 0;
+    x    : f32 = (0.0 as f32);
+    z    : f32 = (0.0 as f32);
+    base : f32 = (0.0 as f32);
+    rx   : f32 = (0.0 as f32);
+    ry   : f32 = (0.0 as f32);
+    id   : f32 = (0.0 as f32);
+}
+
+// A surface met: distance, the unit normal facing the ray, how high on the instance it is (0 foot, 1 top).
+struct SmallStrike {
+    t  : f32 = -(1.0 as f32);
+    n  : Vec3 = Vec3 { x: (0.0 as f32), y: (1.0 as f32), z: (0.0 as f32) };
+    up : f32 = (0.0 as f32);
+}
+
+// The two distances at which a ray meets a solid, near below far; far below near for none.
+struct SmallSpan {
+    near : f32 = (1.0 as f32);
+    far  : f32 = (0.0 as f32);
+}
+
+/** The grass, reeds, bushes and boulders of a landscape. */
+pub class UndergrowthField {
+    relief : Shared<Relief>;
+    window : Shared<WaterWindow>;
+    sky    : Shared<WaterSky>;
+
+    /** The materials: greens, rock tones, the broadleaf palette. */
+    pub look : GroundLook = GroundLook {};
+
+    weights : u8[];
+
+    /** The field of `relief`, drowned where `window` has water deeper than a plant stands in, lit by `sky`; builds the weight map, so make it once per renderer. */
+    constructor(relief : Shared<Relief>, window : Shared<WaterWindow>, sky : Shared<WaterSky>) {
+        self.relief = relief;
+        self.window = window;
+        self.sky = sky;
+        self.weights = new u8[(relief.grid.w as i64) * relief.grid.d * (UNDER_KINDS as i64)];
+        UndergrowthField::fill(relief, self.weights);
+    }
+
+    // The weight map: for each texel how much of each kind the terrain's masks and slope allow.
+    static fn fill(relief : Shared<Relief>, mut weights : u8[]) : void {
+        let w : i32 = relief.grid.w;
+        let d : i32 = relief.grid.d;
+        let step : i64 = RELIEF_CHANNELS as i64;
+        for (j of 0..d) {
+            for (i of 0..w) {
+                let at : i64 = ((j * w) + i) as i64;
+                let x : f32 = relief.grid.originX + (i as f32) * relief.grid.cell;
+                let z : f32 = relief.grid.originZ + (j as f32) * relief.grid.cell;
+                let n : Vec3 = relief.grid.normalAt(x, z);
+                let slope : f32 = sqrt(saturate((1.0 as f32) - n.y * n.y)) / max(n.y, (0.05 as f32));
+                let calm : f32 = (1.0 as f32) - smoothstep((0.3 as f32), UNDER_STEEP, slope);
+                let meadow : f32 = UndergrowthField::mask(relief, at * step, RELIEF_MEADOW);
+                let field : f32 = UndergrowthField::mask(relief, at * step, RELIEF_FIELD);
+                let forest : f32 = UndergrowthField::mask(relief, at * step, RELIEF_FOREST);
+                let mud : f32 = UndergrowthField::mask(relief, at * step, RELIEF_MUD);
+                let bed : f32 = UndergrowthField::mask(relief, at * step, RELIEF_BED);
+                let scree : f32 = UndergrowthField::mask(relief, at * step, RELIEF_SCREE);
+                let rock : f32 = UndergrowthField::mask(relief, at * step, RELIEF_ROCK);
+                let edge : f32 = forest * ((1.0 as f32) - forest) * (4.0 as f32);
+                let at4 : i64 = at * (UNDER_KINDS as i64);
+                weights[at4 + (UNDER_GRASS as i64)] = UndergrowthField::byte(meadow * (1.0 as f32 - forest)
+                    * calm);
+                weights[at4 + (UNDER_REED as i64)] = UndergrowthField::byte(mud * calm * (0.9 as f32));
+                weights[at4 + (UNDER_BUSH as i64)] = UndergrowthField::byte((edge * (0.5 as f32)
+                    + meadow * (0.02 as f32))
+                    * calm);
+                weights[at4 + (UNDER_ROCK as i64)] = UndergrowthField::byte(max(
+                    scree * (0.6 as f32),
+                    max(rock * (0.25 as f32) * calm, (bed + mud) * (0.1 as f32))
+                ));
+            }
+        }
+    }
+
+    // Mask `channel` of the interleaved masks at byte offset `base`, 0 to 1.
+    static fn mask(relief : Shared<Relief>, base : i64, channel : i32) : f32 {
+        return (relief.masks[base + (channel as i64)] as f32) / (255.0 as f32);
+    }
+
+    // A value in 0 to 1 as a byte.
+    static fn byte(v : f32) : u8 {
+        return (saturate(v) * (255.0 as f32) + (0.5 as f32)) as u8;
+    }
+
+    /** The first instance the ray (`eye`, unit `dir`) meets before `limit`, shaded; `t` is negative for none. */
+    pub fn hit(self, eye : Vec3, dir : Vec3, limit : f32, spread : f32) : UnderHit {
+        let top : f32 = self.relief.grid.high + UNDER_TALLEST;
+        let mut t0 : f32 = (0.0 as f32);
+        let mut t1 : f32 = min(limit, UNDER_RANGE);
+        if (eye.y > top) {
+            if (dir.y >= -UNDER_EPS) {
+                return UnderHit {};
+            }
+            t0 = (top - eye.y) / dir.y;
+        }
+        if (dir.y > UNDER_EPS) {
+            t1 = min(t1, (top - eye.y) / dir.y);
+        }
+        if (t0 >= t1) {
+            return UnderHit {};
+        }
+
+        let start : Vec3 = eye.plus(dir.scale(t0));
+        let mut ix : i32 = waterFloor(start.x / UNDER_CELL);
+        let mut iz : i32 = waterFloor(start.z / UNDER_CELL);
+        let mut stepX : i32 = 1;
+        let mut stepZ : i32 = 1;
+        let mut gapX : f32 = ((ix + 1) as f32) * UNDER_CELL - start.x;
+        let mut gapZ : f32 = ((iz + 1) as f32) * UNDER_CELL - start.z;
+        if (dir.x < (0.0 as f32)) {
+            stepX = -1;
+            gapX = start.x - (ix as f32) * UNDER_CELL;
+        }
+        if (dir.z < (0.0 as f32)) {
+            stepZ = -1;
+            gapZ = start.z - (iz as f32) * UNDER_CELL;
+        }
+        let mut deltaX : f32 = UNDER_FAR;
+        let mut deltaZ : f32 = UNDER_FAR;
+        let mut nextX : f32 = UNDER_FAR;
+        let mut nextZ : f32 = UNDER_FAR;
+        if (abs(dir.x) > UNDER_EPS) {
+            deltaX = UNDER_CELL / abs(dir.x);
+            nextX = t0 + gapX / abs(dir.x);
+        }
+        if (abs(dir.z) > UNDER_EPS) {
+            deltaZ = UNDER_CELL / abs(dir.z);
+            nextZ = t0 + gapZ / abs(dir.z);
+        }
+
+        let mut best : SmallStrike = SmallStrike {};
+        let mut bestThing : SmallThing = SmallThing {};
+        let mut bestT : f32 = t1;
+        let mut found : bool = false;
+        for (k of 0..UNDER_STEPS) {
+            let cellEnd : f32 = min(nextX, nextZ);
+            if (!self.above(ix, iz, eye, dir, cellEnd)) {
+                let thing : SmallThing = self.thingAt(ix, iz);
+                if (thing.real) {
+                    let s : SmallStrike = self.strike(thing, eye, dir, bestT, spread);
+                    if (s.t >= (0.0 as f32)) {
+                        best = s;
+                        bestThing = thing;
+                        bestT = s.t;
+                        found = true;
+                    }
+                }
+            }
+            if ((found && bestT <= cellEnd) || cellEnd >= t1) {
+                break;
+            }
+            if (nextX < nextZ) {
+                ix = ix + stepX;
+                nextX = nextX + deltaX;
+            } else {
+                iz = iz + stepZ;
+                nextZ = nextZ + deltaZ;
+            }
+        }
+        if (!found) {
+            return UnderHit {};
+        }
+        return UnderHit { t: bestT, colour: self.paint(bestThing, best, eye, dir, spread) };
+    }
+
+    // Whether the ray at distance `t` is too far over the ground of cell (`ix`, `iz`) to touch an instance there.
+    fn above(self, ix : i32, iz : i32, eye : Vec3, dir : Vec3, t : f32) : bool {
+        let cx : f32 = ((ix as f32) + (0.5 as f32)) * UNDER_CELL;
+        let cz : f32 = ((iz as f32) + (0.5 as f32)) * UNDER_CELL;
+        let slack : f32 = abs(dir.y) * UNDER_CELL * (2.0 as f32)
+            / max(sqrt(dir.x * dir.x + dir.z * dir.z), (0.05 as f32));
+        return eye.y + dir.y * t - slack
+            > self.relief.grid.ceilingAt(cx, cz, 1) + UNDER_TALLEST + UNDER_SLOPE;
+    }
+
+    // The weight, 0 to 255, of `kind` at the texel nearest (`x`, `z`).
+    fn weightAt(self, kind : i32, x : f32, z : f32) : i32 {
+        let i : i32 = waterFloor((x - self.relief.grid.originX) / self.relief.grid.cell + (0.5 as f32));
+        let j : i32 = waterFloor((z - self.relief.grid.originZ) / self.relief.grid.cell + (0.5 as f32));
+        if (i < 0 || j < 0 || i >= self.relief.grid.w || j >= self.relief.grid.d) {
+            return 0;
+        }
+        return self.weights[(((j * self.relief.grid.w) + i) as i64) * (UNDER_KINDS as i64)
+            + (kind as i64)] as i32;
+    }
+
+    // A number in 0 to 1 that is fixed for an `id` and different for each `salt`.
+    static fn spread(id : f32, salt : i32) : f32 {
+        let v : f32 = id * ((7.13 as f32) + (salt as f32) * (4.71 as f32)) + (salt as f32) * (0.318 as f32);
+        return v - (v as i32 as f32);
+    }
+
+    // The instance of cell (`ix`, `iz`), if it has one: the kind is drawn in proportion to the cell's weights.
+    fn thingAt(self, ix : i32, iz : i32) : SmallThing {
+        let cx : f32 = ((ix as f32) + (0.5 as f32)) * UNDER_CELL;
+        let cz : f32 = ((iz as f32) + (0.5 as f32)) * UNDER_CELL;
+        let grass : i32 = self.weightAt(UNDER_GRASS, cx, cz);
+        let reed : i32 = self.weightAt(UNDER_REED, cx, cz);
+        let bush : i32 = self.weightAt(UNDER_BUSH, cx, cz);
+        let rock : i32 = self.weightAt(UNDER_ROCK, cx, cz);
+        let total : i32 = grass + reed + bush + rock;
+        if (total < UNDER_MIN) {
+            return SmallThing {};
+        }
+        let id : f32 = waterHash(ix, 7, iz, UNDER_SEED);
+        let patch : f32 = smoothstep(
+            (0.3 as f32),
+            (0.6 as f32),
+            waterValue2(cx * (0.17 as f32), cz * (0.17 as f32), UNDER_SEED + 5)
+        );
+        let density : f32 = (max(
+            max((grass as f32), (reed as f32) * patch),
+            max((bush as f32) * patch, (rock as f32))
+        ))
+            / (255.0 as f32);
+        if (UndergrowthField::spread(id, 1) > density) {
+            return SmallThing {};
+        }
+
+        let pick : f32 = UndergrowthField::spread(id, 2) * (total as f32);
+        let mut kind : i32 = UNDER_ROCK;
+        if (pick < (grass as f32)) {
+            kind = UNDER_GRASS;
+        } else if (pick < ((grass + reed) as f32)) {
+            kind = UNDER_REED;
+        } else if (pick < ((grass + reed + bush) as f32)) {
+            kind = UNDER_BUSH;
+        }
+        let room : f32 = (1.0 as f32) - (2.0 as f32) * UNDER_MARGIN;
+        let x : f32 = ((ix as f32) + UNDER_MARGIN + room * UndergrowthField::spread(id, 3)) * UNDER_CELL;
+        let z : f32 = ((iz as f32) + UNDER_MARGIN + room * UndergrowthField::spread(id, 4)) * UNDER_CELL;
+        let size : f32 = (0.7 as f32) + (0.6 as f32) * UndergrowthField::spread(id, 5);
+        if (kind != UNDER_ROCK && self.drowned(kind, x, z)) {
+            return SmallThing {};
+        }
+        let mut thing : SmallThing = SmallThing {
+            real: true,
+            kind: kind,
+            x: x,
+            z: z,
+            base: self.relief.grid.heightAt(x, z),
+            rx: (0.24 as f32) * size,
+            ry: (0.34 as f32) * size,
+            id: id,
+        };
+        if (kind == UNDER_REED) {
+            thing.rx = (0.3 as f32) * size;
+            thing.ry = (1.5 as f32) * size;
+        } else if (kind == UNDER_BUSH) {
+            thing.rx = (0.75 as f32) * size;
+            thing.ry = (0.6 as f32) * size;
+        } else if (kind == UNDER_ROCK) {
+            thing.rx = (0.35 as f32) * size * ((0.6 as f32) + (0.8 as f32) * UndergrowthField::spread(id, 6));
+            thing.ry = thing.rx * ((0.5 as f32) + (0.4 as f32) * UndergrowthField::spread(id, 7));
+        }
+        return thing;
+    }
+
+    // Whether the water at (`x`, `z`) is deeper than a plant of `kind` stands in: reeds wade, nothing else does.
+    fn drowned(self, kind : i32, x : f32, z : f32) : bool {
+        if (!self.window.covers(x, z)) {
+            return false;
+        }
+        let wade : f32 = waterPick(kind == UNDER_REED, UNDER_WADE, UNDER_DAMP);
+        return self.window.at(x, z).depth > wade;
+    }
+
+    // The two distances at which the ray meets the instance's ellipsoid, which sits on the ground with its centre one
+    // vertical radius up.
+    fn solid(thing : SmallThing, eye : Vec3, dir : Vec3) : SmallSpan {
+        let o : Vec3 = Vec3 {
+            x: (eye.x - thing.x) / thing.rx,
+            y: (eye.y - thing.base - thing.ry * (0.8 as f32)) / thing.ry,
+            z: (eye.z - thing.z) / thing.rx,
+        };
+        let d : Vec3 = Vec3 { x: dir.x / thing.rx, y: dir.y / thing.ry, z: dir.z / thing.rx };
+        let a : f32 = d.dot(d);
+        let b : f32 = (2.0 as f32) * o.dot(d);
+        let disc : f32 = b * b - (4.0 as f32) * a * (o.dot(o) - (1.0 as f32));
+        if (disc < (0.0 as f32) || a < UNDER_EPS) {
+            return SmallSpan {};
+        }
+        let root : f32 = sqrt(disc);
+        return SmallSpan { near: (-b - root) / ((2.0 as f32) * a), far: (-b + root) / ((2.0 as f32) * a) };
+    }
+
+    // The surface of `thing` met by the ray before `limit`, after the instance's alpha test.
+    fn strike(self, thing : SmallThing, eye : Vec3, dir : Vec3, limit : f32, spread : f32) : SmallStrike {
+        let span : SmallSpan = UndergrowthField::solid(thing, eye, dir);
+        if (span.far < span.near || span.far <= (0.0 as f32) || span.near >= limit) {
+            return SmallStrike {};
+        }
+        let front : SmallStrike = self.surface(thing, eye, dir, span.near, limit, spread, false);
+        if (front.t >= (0.0 as f32)) {
+            return front;
+        }
+        if (thing.kind == UNDER_ROCK) {
+            return SmallStrike {};
+        }
+        return self.surface(thing, eye, dir, span.far, limit, spread, true);
+    }
+
+    // The point at distance `t` as a surface of `thing`: its normal, and none when a gap in the blades or leaves is there.
+    fn surface(
+        self,
+        thing : SmallThing,
+        eye : Vec3,
+        dir : Vec3,
+        t : f32,
+        limit : f32,
+        spread : f32,
+        inside : bool
+    ) : SmallStrike {
+        if (t <= (0.0 as f32) || t >= limit) {
+            return SmallStrike {};
+        }
+        let p : Vec3 = eye.plus(dir.scale(t));
+        let centre : Vec3 = Vec3 { x: thing.x, y: thing.base + thing.ry * (0.8 as f32), z: thing.z };
+        let out : Vec3 = Vec3 {
+            x: (p.x - centre.x) / (thing.rx * thing.rx),
+            y: (p.y - centre.y) / (thing.ry * thing.ry),
+            z: (p.z - centre.z) / (thing.rx * thing.rx),
+        }.normalized();
+        let up : f32 = saturate((p.y - thing.base) / (thing.ry * (1.8 as f32)));
+        if (p.y < thing.base) {
+            return SmallStrike {};
+        }
+        if (thing.kind == UNDER_ROCK) {
+            return SmallStrike { t: t, n: out, up: up };
+        }
+        if (!self.present(thing, p, centre, up, out, dir, spread * t)) {
+            return SmallStrike {};
+        }
+        let mut n : Vec3 = out;
+        if (inside) {
+            n = out.scale(-(1.0 as f32));
+        }
+        return SmallStrike { t: t, n: n, up: up };
+    }
+
+    // Whether a blade or a leaf is at `p`: grass and reeds are streaks around the axis that fray with height, a bush is
+    // clumped leaf noise that thins at its silhouette.
+    fn present(
+        self,
+        thing : SmallThing,
+        p : Vec3,
+        centre : Vec3,
+        up : f32,
+        out : Vec3,
+        dir : Vec3,
+        footprint : f32
+    ) : bool {
+        if (thing.kind == UNDER_BUSH) {
+            let graze : f32 = (1.0 as f32) - abs(out.dot(dir));
+            let seed : Vec3 = Vec3 {
+                x: thing.id * (31.0 as f32),
+                y: (0.0 as f32),
+                z: thing.id * (17.0 as f32),
+            };
+            let clump : f32 = waterValue3(p.plus(seed).scale((2.6 as f32)), UNDER_SEED_LEAF);
+            let fine : f32 = waterValue3(p.plus(seed).scale((9.0 as f32)), UNDER_SEED_LEAF + 3);
+            let leaf : f32 = waterValue3(p.plus(seed).scale((26.0 as f32)), UNDER_SEED_LEAF + 7);
+            let near : f32 = groundFade((0.05 as f32), footprint, 0.3, 1.5);
+            return clump * (0.5 as f32) + fine * (0.3 as f32) + leaf * (0.2 as f32) * near
+                > (0.45 as f32) + (0.25 as f32) * graze * graze;
+        }
+        let angle : f32 = atan2(p.z - centre.z, p.x - centre.x);
+        let sharp : f32 = groundFade((0.02 as f32), footprint, 0.5, 3.0);
+        let count : f32 = (2.5 as f32) + (4.5 as f32) * sharp;
+        let streak : f32 = waterValue2(
+            angle * count + thing.id * (40.0 as f32),
+            up * (1.5 as f32),
+            UNDER_SEED_BLADE
+        );
+        let fray : f32 = (0.2 as f32) + (0.65 as f32) * up;
+        return streak > fray;
+    }
+
+    // The radiance of the instance: its albedo, the sun with the terrain's shadow, the sky with occlusion that deepens toward
+    // the foot, and what a thin blade or leaf lets through.
+    fn paint(self, thing : SmallThing, strike : SmallStrike, eye : Vec3, dir : Vec3, spread : f32) : Vec3 {
+        let p : Vec3 = eye.plus(dir.scale(strike.t));
+        let shadow : f32 = self.relief.sunAt(thing.x, thing.z);
+        let open : f32 = self.relief.openAt(thing.x, thing.z);
+        let albedo : Vec3 = self.albedo(thing, strike, p, spread * strike.t);
+        let sun : Vec3 = self.sky.sunDir;
+        let occlusion : f32 = (0.3 as f32) + (0.7 as f32) * smoothstep((0.0 as f32), (0.8 as f32), strike.up);
+        let rough : Vec3 = Vec3 {
+            x: waterValue3(p.scale((7.0 as f32)), UNDER_SEED_LEAF + 17) - (0.5 as f32),
+            y: waterValue3(p.scale((7.0 as f32)), UNDER_SEED_LEAF + 19) - (0.5 as f32),
+            z: waterValue3(p.scale((7.0 as f32)), UNDER_SEED_LEAF + 23) - (0.5 as f32),
+        };
+        let bumpy : f32 = waterPick(thing.kind == UNDER_ROCK, (1.6 as f32), (0.3 as f32));
+        let facing : Vec3 = strike.n.plus(rough.scale(bumpy)).normalized();
+        let wrap : f32 = saturate((facing.dot(sun) + (0.25 as f32)) / (1.25 as f32));
+        let direct : Vec3 = self.sky.sunIrr.scale(wrap * shadow * ((0.5 as f32) + (0.5 as f32) * occlusion)
+            / PI);
+        let ambient : Vec3 = self.sky.ambient(facing).scale(open * occlusion);
+        let through : f32 = waterPick(
+            thing.kind == UNDER_ROCK,
+            (0.0 as f32),
+            saturate(-facing.dot(sun)) * shadow * (0.3 as f32)
+        );
+        let glow : Vec3 = self.sky.sunIrr
+            .scale(through / PI)
+            .times(Vec3 { x: (1.0 as f32), y: (1.4 as f32), z: (0.5 as f32) });
+        return albedo.times(direct.plus(ambient).plus(glow));
+    }
+
+    // The albedo of the instance at `p`.
+    fn albedo(self, thing : SmallThing, strike : SmallStrike, p : Vec3, footprint : f32) : Vec3 {
+        let tone : f32 = (0.75 as f32) + (0.5 as f32) * UndergrowthField::spread(thing.id, 9);
+        if (thing.kind == UNDER_ROCK) {
+            let site : GroundSite = GroundSite {
+                p: p,
+                n: strike.n,
+                slope: (1.5 as f32),
+                footprint: footprint,
+                damp: (1.0 as f32) - smoothstep((0.0 as f32), (0.5 as f32), strike.up),
+            };
+            let stone : GroundPatch = GroundRock::patch(site, self.look);
+            let grit : f32 = (0.6 as f32)
+                + (0.7 as f32) * waterValue3(p.scale((3.0 as f32)), UNDER_SEED_LEAF + 13);
+            let mossy : f32 = smoothstep((0.65 as f32), (0.95 as f32), strike.n.y)
+                * UndergrowthField::spread(thing.id, 11);
+            return stone.albedo
+                .scale((0.5 as f32) * grit)
+                .lerp(self.look.moss.scale((2.5 as f32)), mossy * (0.7 as f32));
+        }
+        if (thing.kind == UNDER_BUSH) {
+            let warm : f32 = UndergrowthField::spread(thing.id, 12);
+            return self.look.broadleaf
+                .scale((2.4 as f32) * tone)
+                .lerp(self.look.dryGrass.scale((1.2 as f32)), warm * (0.35 as f32));
+        }
+        let dry : f32 = UndergrowthField::spread(thing.id, 13);
+        let blade : Vec3 = self.look.grass.scale((1.5 as f32) * tone);
+        let tip : f32 = smoothstep((0.4 as f32), (1.0 as f32), strike.up);
+        if (thing.kind == UNDER_REED) {
+            return blade.lerp(
+                self.look.dryGrass.scale((1.6 as f32)),
+                (0.3 as f32) + dry * (0.5 as f32) + tip * (0.3 as f32)
+            );
+        }
+        return blade.lerp(
+            self.look.dryGrass.scale((1.3 as f32)),
+            dry * (0.5 as f32) * tip + tip * (0.2 as f32)
+        );
+    }
+}

@@ -1,0 +1,146 @@
+// check — the numbers a HydroTerrain is judged by, printed, and the claims asserted.
+//
+// `--check` generates the terrain the options describe and asserts what the brief of the landscape promises: it is
+// consistent for water (the library's own check), the river's sinuosity is within a few percent of the request and at
+// least 1.4 for the default, the escarpment has its drop, the reservoir keeps water (volume from the flood fill is
+// positive and its surface and spill level agree with the plan), the same seed gives the same grid to the bit with one
+// thread and with four, and a different seed gives a different one. Each failed claim counts one; the exit status is the
+// count.
+
+use fluidview::{HydroInflow, HydroPuddle, HydroReport, HydroTerrain, HydroTributary};
+use ludax::{abs, hashCombine};
+
+use crate::options::TerrainOptions;
+
+// The share of the drop the face must carry in four metres, the steepest metre it must have (the engine reads a fall where
+// adjacent one-metre cells differ by 1.5 m), and the tributaries a default landscape has.
+const CHECK_FACE_SHARE : f32 = 0.85;
+const CHECK_METRE_DROP : f32 = 1.5;
+const CHECK_TRIBUTARIES : i32 = 2;
+
+// The sinuosity a default landscape must reach, and how far a measured fall may be under the request, metres.
+const CHECK_MIN_SINUOSITY : f32 = 1.4;
+const CHECK_FALL_SLACK : f32 = 3.0;
+
+/** The assertions of `--check`. */
+pub class TerrainCheck {
+    /** Runs every claim against `t` (made from `o`) and returns how many failed. */
+    pub static fn run(o : TerrainOptions, t : HydroTerrain) : i32 {
+        let r : HydroReport = t.report();
+        TerrainCheck::print(t, r);
+
+        let mut failed : i32 = 0;
+        failed = failed + TerrainCheck::claim("consistent for water: ${r.problem}", r.passed);
+        let fast : bool = o.params.sinuosity < CHECK_MIN_SINUOSITY || r.sinuosity >= CHECK_MIN_SINUOSITY;
+        failed = failed
+            + TerrainCheck::claim("sinuosity ${r.sinuosity} at least ${CHECK_MIN_SINUOSITY}", fast);
+        let asked : f32 = o.params.escarpmentHeight;
+        failed = failed
+            + TerrainCheck::claim("fall ${r.fall} m of ${asked} m", abs(r.fall - asked) < CHECK_FALL_SLACK);
+        failed = failed + TerrainCheck::claim("lake holds ${r.lakeVolume} m3", r.lakeVolume > 0.0);
+        let level : f32 = t.lake.level;
+        let lip : f32 = t.escarpment.lip.height;
+        failed = failed
+            + TerrainCheck::claim(
+                "spill ${r.spillLevel} at the lip ${lip} and the lake ${level}",
+                abs(r.spillLevel - lip) < 0.02 && abs(r.spillLevel - level) < 0.02
+            );
+        failed = failed
+            + TerrainCheck::claim(
+                "the face carries ${r.faceShare} of the drop in four metres (steepest metre ${r.metreDrop} m, steepest cell ${r.cellDrop} m)",
+                r.faceShare >= CHECK_FACE_SHARE && r.metreDrop >= CHECK_METRE_DROP
+            );
+        failed = failed
+            + TerrainCheck::claim("no unintended basin in the hills (${r.pits} pit cells)", r.pits == 0);
+        failed = failed
+            + TerrainCheck::claim(
+                "${t.tributaryCount} tributaries reach the river",
+                t.tributaryCount >= CHECK_TRIBUTARIES
+            );
+        failed = failed
+            + TerrainCheck::claim("bedAt agrees with the grid at cell centres", TerrainCheck::fineAgrees(t));
+        failed = failed + TerrainCheck::determinism(o, t);
+        return failed;
+    }
+
+    static fn claim(what : string, ok : bool) : i32 {
+        if (ok) {
+            println("  ok    ${what}");
+            return 0;
+        }
+        println("  FAIL  ${what}");
+        return 1;
+    }
+
+    static fn print(t : HydroTerrain, r : HydroReport) : void {
+        let low : f32 = t.lowest();
+        let high : f32 = t.highest();
+        println("heights ${low} .. ${high} m, relief ${high - low} m");
+        println("river ${t.riverCount} points, ${r.riverLength} m long, sinuosity ${r.sinuosity}, bed slope ${r.riverSlope} m/m, worst step ${r.worstRise} m");
+        println("lake level ${t.lake.level} m, ${t.lake.cells} cells, ${t.lake.area} m2, volume ${r.lakeVolume} m3");
+        println("escarpment crest ${t.escarpment.crestHeight} m, foot ${t.escarpment.footHeight} m, measured fall ${r.fall} m, face run ${t.escarpment.faceRun} m");
+        for (k of 0..t.puddleCount) {
+            let h : HydroPuddle = t.puddles[k as i64];
+            println("puddle ${k} at (${h.at.x}, ${h.at.z}) level ${h.level} m holds ${h.volume} m3");
+        }
+        for (k of 0..t.tributaryCount) {
+            let g : HydroTributary = t.tributaries[k as i64];
+            println("tributary ${k} from (${g.mouth.x}, ${g.mouth.z}) to (${g.confluence.x}, ${g.confluence.z}) drains ${g.catchment} m2, ${g.discharge} m3/s");
+        }
+        println("lip at (${t.escarpment.lip.x}, ${t.escarpment.lip.z}) h ${t.escarpment.lip.height}; plan lake level ${t.plan.lakeLevel} notch z ${t.plan.notchZ}");
+        println("pits ${t.pitCount}, river sinuosity ${r.sinuosity}");
+        println("pool ${t.pool.center.height} m deep bed, radius ${t.pool.radius} m; end of river at z ${t.outflow.at.z} m, shore row ${t.outflow.shoreRow}");
+        for (i of 0..t.inflowCount) {
+            let s : HydroInflow = t.inflows[i as i64];
+            println("inflow ${i} at (${s.at.x}, ${s.at.z}) ${s.discharge} m3/s");
+        }
+    }
+
+    // bedAt at the centres of a spread of cells equals the stored grid there, within a centimetre.
+    static fn fineAgrees(t : HydroTerrain) : bool {
+        let mut worst : f32 = 0.0 as f32;
+        for (k of 0..400) {
+            let i : i32 = 3 + (k * 37) % (t.width - 6);
+            let j : i32 = 3 + (k * 91) % (t.depth - 6);
+            let x : f32 = ((i as f32) + 0.5 as f32) * t.cellSize;
+            let z : f32 = ((j as f32) + 0.5 as f32) * t.cellSize;
+            worst = ludax::max(worst, abs(t.bedAt(x, z) - t.cellHeight(i, j)));
+        }
+        println("bedAt differs from the grid by at most ${worst} m at cell centres");
+        return worst < 0.01 as f32;
+    }
+
+    // A hash of every height's bits: equal grids have equal hashes, and a different seed does not.
+    static fn fingerprint(t : HydroTerrain) : i64 {
+        let n : i64 = (t.width as i64) * (t.depth as i64);
+        let mut h : i64 = 1469598103934665603;
+        for (i of 0..n) {
+            h = hashCombine(h, (t.bed[i] * 1000.0 as f32) as i64);
+        }
+        return h;
+    }
+
+    static fn determinism(o : TerrainOptions, t : HydroTerrain) : i32 {
+        let first : i64 = TerrainCheck::fingerprint(t);
+        let one : HydroTerrain = HydroTerrain::generate(o.seed, o.params, 1);
+        let many : HydroTerrain = HydroTerrain::generate(o.seed, o.params, 4);
+        let other : HydroTerrain = HydroTerrain::generate(o.seed + 1, o.params, 4);
+        let mut failed : i32 = 0;
+        failed = failed
+            + TerrainCheck::claim(
+                "one thread and four give the same grid",
+                TerrainCheck::fingerprint(one) == TerrainCheck::fingerprint(many)
+            );
+        failed = failed
+            + TerrainCheck::claim(
+                "the grid is the one these options make",
+                TerrainCheck::fingerprint(many) == first
+            );
+        failed = failed
+            + TerrainCheck::claim(
+                "another seed is another landscape",
+                TerrainCheck::fingerprint(other) != first
+            );
+        return failed;
+    }
+}

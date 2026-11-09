@@ -1,0 +1,266 @@
+// terrain_hydrology — what the water of the finished ground does: the records a fluid engine reads.
+//
+// The relief, erosion and river passes make a grid; this pass reads it back and writes down the facts, measured from the
+// grid and not copied from the plan: the reservoir's basin, spill level, lip and volume (by flood fill, see
+// `terrain_lake`), the escarpment's crest, drop and lip, the plunge pool, the river's points, the end of the river, and the
+// streams that feed the lake.
+//
+// The streams come from the drainage the erosion pass already computed: of the cells just outside the basin whose water
+// flows into it, the ones with the largest drainage area are where the gullies of the cirque deliver their water. Their
+// discharge is not a guess either: in a steady state the river below carries all of it, so it is the river's own
+// discharge by Manning's formula for its cross-section and slope, shared between the streams in proportion to their
+// catchments.
+
+use ludax::{max, min, sqrt};
+
+use crate::terrain::hydro_parts::{HydroInflow, HydroPuddle, HydroSpot, RiverPoint};
+use crate::terrain::hydro_terrain::HydroTerrain;
+use crate::terrain::terrain_lake::{LakeFill, TerrainLake};
+use crate::terrain::terrain_meander::RiverLine;
+use crate::terrain::terrain_plan::TerrainPlan;
+use crate::terrain::terrain_valley::RiverField;
+
+// Manning's roughness of a natural gravel channel, and the share of a rectangle's area the channel's section fills.
+const HYDROLOGY_MANNING : f32 = 0.035;
+const HYDROLOGY_SECTION : f32 = 0.75;
+
+// Streams reported at most, and how far apart (metres) two of them must be to count as two.
+const HYDROLOGY_STREAMS : i32 = 2;
+const HYDROLOGY_APART : f32 = 160.0;
+
+// How far under the floodplain at its lower end a pond's water stands, metres.
+const HYDROLOGY_POND_FREEBOARD : f32 = 0.15;
+
+// Spacing of the crest line's spots, in cells.
+const HYDROLOGY_CREST_STEP : i32 = 4;
+
+/** Writes the water description of a terrain. */
+pub class TerrainHydrology {
+    /** Fills the records of `t` from its grid, `line`, and the drainage (`recv`, `area`) of the last erosion round. */
+    pub static fn describe(
+        plan : TerrainPlan,
+        t : HydroTerrain,
+        line : RiverLine,
+        old : RiverLine,
+        oldField : RiverField,
+        recv : i32[],
+        area : f32[]
+    ) : void {
+        let n : i64 = (t.width as i64) * (t.depth as i64);
+        let queue : i32[] = new i32[n];
+        TerrainHydrology::river(t, line);
+        TerrainHydrology::lake(plan, t, queue);
+        TerrainHydrology::escarpment(plan, t);
+        TerrainHydrology::pool(plan, t, line);
+        TerrainHydrology::outflow(plan, t, line);
+        TerrainHydrology::streams(plan, t, line, recv, area);
+        TerrainHydrology::puddles(t, old, oldField);
+    }
+
+    /** The height a pond of `old` fills to before it spills: a little under the lower of the floodplain at its two ends. */
+    pub static fn pondLevel(old : RiverLine, k : i32) : f32 {
+        let a : RiverPoint = old.points[old.pondFrom[k as i64] as i64];
+        let b : RiverPoint = old.points[old.pondTo[k as i64] as i64];
+        return min(a.bankHeight, b.bankHeight) - HYDROLOGY_POND_FREEBOARD;
+    }
+
+    // The ponds of the abandoned channel: deepest point, level and the water they hold, summed over their cells.
+    static fn puddles(t : HydroTerrain, old : RiverLine, oldField : RiverField) : void {
+        t.puddles = new HydroPuddle[(old.pondCount + 1) as i64];
+        t.puddleCount = old.pondCount;
+        let n : i64 = (t.width as i64) * (t.depth as i64);
+        for (k of 0..old.pondCount) {
+            let level : f32 = TerrainHydrology::pondLevel(old, k);
+            let mut volume : f32 = 0.0 as f32;
+            let mut deepest : i64 = -1;
+            for (c of 0..n) {
+                let at : f32 = oldField.along[c];
+                if (at < old.pondFrom[k as i64] as f32 || at >= old.pondTo[k as i64] as f32
+                    || t.bed[c] >= level) {
+                    continue;
+                }
+                volume = volume + (level - t.bed[c]);
+                if (deepest < 0 || t.bed[c] < t.bed[deepest]) {
+                    deepest = c;
+                }
+            }
+            let mut at : HydroSpot = HydroSpot {};
+            if (deepest >= 0) {
+                at = TerrainLake::spot(t.bed, t.width, t.cellSize, deepest);
+            }
+            t.puddles[k as i64] = HydroPuddle {
+                at: at,
+                level: level,
+                volume: volume * t.cellSize * t.cellSize,
+            };
+        }
+    }
+
+    static fn river(mut t : HydroTerrain, line : RiverLine) : void {
+        t.river = new RiverPoint[line.count as i64];
+        for (i of 0..line.count) {
+            t.river[i as i64] = line.points[i as i64];
+        }
+        t.riverCount = line.count;
+    }
+
+    static fn lake(plan : TerrainPlan, mut t : HydroTerrain, queue : i32[]) : void {
+        let start : i64 = (TerrainHydrology::row(t, plan.lakeZ) as i64) * (t.width as i64)
+            + (TerrainHydrology::column(t, plan.lakeX) as i64);
+        let sink : f32 = plan.lakeLevel - max(plan.cliff * 0.5 as f32, plan.params.lakeDepth + 2.0 as f32);
+        let spill : f32 = TerrainLake::spillLevel(
+            t.bed,
+            t.lakeMask,
+            queue,
+            t.width,
+            start,
+            plan.lakeLevel,
+            sink
+        );
+
+        let closed : f32 = spill - 0.001 as f32;
+        let basin : LakeFill = TerrainLake::fill(t.bed, t.lakeMask, queue, t.width, start, closed, sink);
+        t.lake.level = spill;
+        t.lake.cells = basin.cells as i32;
+        t.lake.volume = TerrainLake::volume(t.bed, queue, basin.cells, spill, t.cellSize);
+        t.lake.area = (basin.cells as f32) * t.cellSize * t.cellSize;
+        t.lake.center = TerrainLake::spot(t.bed, t.width, t.cellSize, start);
+
+        // The lip is the lowest cell of the closed basin's rim: the sill the water leaves over.
+        let lip : i64 = TerrainLake::lowestRim(t.bed, t.lakeMask, queue, t.width, basin.cells, spill);
+        t.lake.spill = TerrainLake::spot(t.bed, t.width, t.cellSize, lip);
+    }
+
+    static fn escarpment(plan : TerrainPlan, mut t : HydroTerrain) : void {
+        let lip : HydroSpot = t.lake.spill;
+        t.escarpment.lip = lip;
+        t.escarpment.crestHeight = lip.height;
+        t.escarpment.footHeight = plan.floorFoot;
+        t.escarpment.fall = lip.height - plan.floorFoot;
+        t.escarpment.lipWidth = plan.params.lipNotchWidth;
+        t.escarpment.faceRun = plan.faceRun();
+
+        let count : i32 = t.width / HYDROLOGY_CREST_STEP;
+        t.crest = new HydroSpot[count as i64];
+        for (i of 0..count) {
+            let x : f32 = ((i * HYDROLOGY_CREST_STEP) as f32 + 0.5 as f32) * t.cellSize;
+            let z : f32 = plan.crestZ(x);
+            t.crest[i as i64] = HydroSpot { x: x, z: z, height: t.heightAt(x, z - t.cellSize) };
+        }
+        t.crestCount = count;
+    }
+
+    static fn pool(plan : TerrainPlan, mut t : HydroTerrain, line : RiverLine) : void {
+        let start : RiverPoint = line.points[0];
+        t.pool.center = HydroSpot { x: start.x, z: start.z, height: t.heightAt(start.x, start.z) };
+        t.pool.radius = plan.params.plungePoolRadius;
+        t.pool.level = start.bankHeight;
+        t.pool.depth = start.bankHeight - t.pool.center.height;
+    }
+
+    static fn outflow(plan : TerrainPlan, mut t : HydroTerrain, line : RiverLine) : void {
+        let end : RiverPoint = line.points[(line.count - 1) as i64];
+        t.outflow.at = HydroSpot { x: end.x, z: end.z, height: t.heightAt(end.x, end.z) };
+        t.outflow.level = plan.level;
+        let mut shore : i32 = line.count - 1;
+        for (i of 0..line.count) {
+            if (line.points[i as i64].bedHeight < plan.level) {
+                shore = i;
+                break;
+            }
+        }
+        t.outflow.shoreRow = TerrainHydrology::row(t, line.points[shore as i64].z);
+    }
+
+    // Manning's discharge of the river, cubic metres a second.
+    static fn discharge(plan : TerrainPlan, line : RiverLine) : f32 {
+        let width : f32 = plan.params.riverWidth;
+        let depth : f32 = plan.params.riverDepth;
+        let section : f32 = width * depth * HYDROLOGY_SECTION;
+        let radius : f32 = section / (width + 2.0 as f32 * depth);
+        let slope : f32 = plan.params.riverSlope / max(line.sinuosity(), 1.0 as f32);
+        return section * cubeRoot(radius) * cubeRoot(radius) * sqrt(slope) / HYDROLOGY_MANNING;
+    }
+
+    static fn streams(
+        plan : TerrainPlan,
+        t : HydroTerrain,
+        line : RiverLine,
+        recv : i32[],
+        area : f32[]
+    ) : void {
+        t.inflows = new HydroInflow[HYDROLOGY_STREAMS as i64];
+        t.inflowCount = 0;
+        let total : f32 = TerrainHydrology::discharge(plan, line);
+        let mut catchment : f32 = 0.0 as f32;
+        for (pick of 0..HYDROLOGY_STREAMS) {
+            let c : i64 = TerrainHydrology::entry(t, recv, area, pick);
+            if (c < 0) {
+                break;
+            }
+            t.inflows[pick as i64] = HydroInflow {
+                at: TerrainLake::spot(t.bed, t.width, t.cellSize, c),
+                discharge: area[c],
+            };
+            catchment = catchment + area[c];
+            t.inflowCount = pick + 1;
+        }
+        for (i of 0..t.inflowCount) {
+            t.inflows[i as i64].discharge = total * t.inflows[i as i64].discharge / catchment;
+        }
+    }
+
+    // The `pick`-th best cell outside the basin whose water flows into it, by drainage area, at least `HYDROLOGY_APART`
+    // from the better ones; -1 when there is none.
+    static fn entry(t : HydroTerrain, recv : i32[], area : f32[], pick : i32) : i64 {
+        let n : i64 = (t.width as i64) * (t.depth as i64);
+        let mut best : i64 = -1;
+        let mut most : f32 = 0.0 as f32;
+        for (c of 0..n) {
+            let r : i64 = recv[c] as i64;
+            if (r < 0 || t.lakeMask[c] != (0 as u8) || t.lakeMask[r] == (0 as u8) || area[c] <= most) {
+                continue;
+            }
+            if (TerrainHydrology::crowded(t, c, pick)) {
+                continue;
+            }
+            best = c;
+            most = area[c];
+        }
+        return best;
+    }
+
+    // True when cell `c` is within `HYDROLOGY_APART` of one of the first `pick` streams.
+    static fn crowded(t : HydroTerrain, c : i64, pick : i32) : bool {
+        let here : HydroSpot = TerrainLake::spot(t.bed, t.width, t.cellSize, c);
+        for (i of 0..pick) {
+            let other : HydroSpot = t.inflows[i as i64].at;
+            let dx : f32 = here.x - other.x;
+            let dz : f32 = here.z - other.z;
+            if (dx * dx + dz * dz < HYDROLOGY_APART * HYDROLOGY_APART) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    static fn column(t : HydroTerrain, x : f32) : i32 {
+        return t.clampColumn((x / t.cellSize) as i32);
+    }
+
+    static fn row(t : HydroTerrain, z : f32) : i32 {
+        return t.clampRow((z / t.cellSize) as i32);
+    }
+}
+
+// The real cube root of a positive number, by Newton's iteration from a fixed start.
+fn cubeRoot(v : f32) : f32 {
+    if (v <= 0.0 as f32) {
+        return 0.0;
+    }
+    let mut r : f32 = max(v, 1.0 as f32);
+    for (i of 0..40) {
+        r = (2.0 as f32 * r + v / (r * r)) / 3.0 as f32;
+    }
+    return r;
+}

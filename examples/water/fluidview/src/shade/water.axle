@@ -1,0 +1,356 @@
+// water — the water of a fluid world as one lit, rippling sheet.
+//
+// A column's level is a number; a pool has to read as a body of water. The corners between columns carry the
+// mean of their neighbours' surfaces, so adjacent columns join into a smooth sheet instead of a checkerboard
+// of flat quads, and each column is split 2 x 2 with every facet shaded by its own normal: the height
+// gradient plus two travelling ripple trains, sky reflection by Fresnel and a sun glint. That trio is what
+// makes a surface read as water. A film too thin for the sheet (it would lift over the dips of a noisy
+// plain and leave quads floating) hugs its own ground as a flat tile instead. The sheet is a pure read of
+// the world; the corner heights are scratch space the class keeps so a frame allocates nothing.
+
+use ludax::{lerp, lightPow, saturate, sin, FluidWorld, Vec3};
+use smalt::Color;
+
+use crate::shade::brush::{BRUSH_SUN_X, BRUSH_SUN_Y, BRUSH_SUN_Z};
+use crate::shade::brush::{brushBlend, brushLit, brushPack, Brush, Look};
+use crate::stage::painter::PAINTER_ALPHA_DEN;
+use crate::stage::screen::SC_CLEAR;
+
+/** Water below this level is not drawn, cells. */
+const WATER_MIN : f64 = 0.02;
+
+/** Shortest facet normal or view vector the divisions by their length may see. */
+const WATER_NORMAL_MIN : f32 = 0.3;
+
+/** Amplitude of the ripple trains on the normal. */
+const WATER_RIPPLE_A : f32 = 0.05;
+
+/** Spatial frequency of the first ripple train along x and z, radians a cell. */
+const WATER_RIPPLE_F1 : f32 = 1.2;
+
+/** Spatial frequency of the second ripple train along z, radians a cell. */
+const WATER_RIPPLE_F2 : f32 = 1.9;
+
+/** Speed of the first ripple train, radians a second. */
+const WATER_RIPPLE_W1 : f32 = 1.9;
+
+/** Speed of the second ripple train, radians a second. */
+const WATER_RIPPLE_W2 : f32 = 2.6;
+
+/** Sharpness of the sun's glint. */
+const WATER_SPEC_POW : f32 = 28.0;
+
+/** Brightness of the sun's glint, 0 to 1. */
+const WATER_SPEC : f32 = 0.9;
+
+/** Fresnel reflectance of water at normal incidence. */
+const WATER_F0 : f32 = 0.03;
+
+/** The sky straight up, which grazing reflections fade toward from the horizon colour. */
+const WATER_SKY_ZENITH : i32 = 0x2c3d55;
+
+/** How strongly the Fresnel term pulls the reflected sky into the facet colour before the cap. */
+const WATER_FRESNEL_GAIN : f32 = 1.6;
+
+/** The most of the reflected sky a facet mixes in, so a grazing pool never reads as a grey mirror. */
+const WATER_SKY_MIX_MAX : f32 = 0.55;
+
+/** A facet of deep water is this wide, cells: the column is cut in two each way. */
+const WATER_FACET : f32 = 0.5;
+
+/** The second ripple train of the normal's z-axis is this share of the first one's amplitude. */
+const WATER_RIPPLE_Z_SHARE : f32 = 0.7;
+
+/** The cross ripple (along z, bent by x) has this share of the amplitude, and this extra frequency along x. */
+const WATER_RIPPLE_CROSS_SHARE : f32 = 0.6;
+const WATER_RIPPLE_CROSS_X : f32 = 1.4;
+
+/** The reflected sky's blend: the least of the zenith colour at the horizon, and what the reflection height adds. */
+const WATER_SKY_BASE : f32 = 0.45;
+const WATER_SKY_RISE : f32 = 0.55;
+
+/** How colour and opacity follow depth. */
+pub struct WaterStyle {
+    /** Albedo of water a hair deep. */
+    pub shallow : Color = Color { r: 0.3, g: 0.75, b: 0.85 };
+
+    /** Albedo of water `deepLevel` or more deep. */
+    pub deep : Color = Color { r: 0.04, g: 0.22, b: 0.55 };
+
+    /** Depth at which water counts as fully deep, cells. */
+    pub deepLevel : f32 = 1.0;
+
+    /** Alpha numerator of the shallowest water; deep water goes to opaque. */
+    pub alphaLow : i32 = 205;
+
+    /** A level under this is a flat film on its own ground rather than part of the sheet, cells. */
+    pub sheetMin : f64 = 0.08;
+
+    /** Light multiplier of the flat film, which has no normal to shade by. */
+    pub filmLit : f32 = 0.95;
+}
+
+/** The four corner heights of one column's sheet, and how deep and how opaque it is. */
+struct WaterCell {
+    x     : f32 = 0.0;
+    z     : f32 = 0.0;
+    c00   : f32 = 0.0;
+    c10   : f32 = 0.0;
+    c01   : f32 = 0.0;
+    c11   : f32 = 0.0;
+    tint  : f32 = 0.0;
+    alpha : i32 = 0;
+}
+
+/** What a facet's shading needs beyond its own corners: where the eye is and what time the ripples show. */
+struct WaterLight {
+    eye  : Vec3 = Vec3 { x: 0.0, y: 0.0, z: 0.0 };
+    time : f32 = 0.0;
+}
+
+/** Draws the water of a world of fixed size. */
+pub class WaterSheet {
+    corners : f32[];
+    side    : i32;
+
+    /** A sheet for worlds of `width` x `depth` columns. */
+    constructor(width : i32, depth : i32) {
+        self.side = width + 1;
+        self.corners = new f32[((width + 1) * (depth + 1)) as i64];
+    }
+
+    /** Pushes the water of `world` through `b`; `time` is simulation seconds, which drives the ripples. */
+    pub fn draw(mut self, b : Brush, world : FluidWorld, style : WaterStyle, time : f32) : void {
+        self.smooth(world);
+        let light : WaterLight = WaterLight { eye: b.cam.eye(), time: time };
+
+        for (z of 0..world.depth()) {
+            for (x of 0..world.width()) {
+                let level : f64 = world.levelAt(x, z);
+                if (level < WATER_MIN) {
+                    continue;
+                }
+                let cell : WaterCell = self.cell(world, style, x, z);
+                if (level < style.sheetMin) {
+                    WaterSheet::film(b, world, style, cell, x, z);
+                    continue;
+                }
+                WaterSheet::facets(b, style, cell, light);
+            }
+        }
+    }
+
+    // The four facets a column of deep water is drawn as, each a half-cell square, so the ripples have
+    // something to bend across.
+    static fn facets(b : Brush, style : WaterStyle, cell : WaterCell, light : WaterLight) : void {
+        for (j of 0..2) {
+            for (i of 0..2) {
+                let u : f32 = (i as f32) * WATER_FACET;
+                let v : f32 = (j as f32) * WATER_FACET;
+                WaterSheet::facet(b, style, cell, Vec3::make(u, 0.0, v), light);
+            }
+        }
+    }
+
+    // Every corner takes the mean surface of the columns that share it.
+    fn smooth(mut self, world : FluidWorld) : void {
+        for (cz of 0..(world.depth() + 1)) {
+            for (cx of 0..self.side) {
+                self.corners[(cz * self.side + cx) as i64] = WaterSheet::corner(world, cx, cz);
+            }
+        }
+    }
+
+    // The height of the corner between four columns: the mean of their surfaces (dry ones count as their
+    // ground). The floor keeps it above every sharing column's ground: a smoothed corner that dipped under a
+    // neighbour's terrain would let the terrain paint over the water in patches.
+    static fn corner(world : FluidWorld, cx : i32, cz : i32) : f32 {
+        let mut sum : f32 = 0.0;
+        let mut n : i32 = 0;
+        let mut floor : f32 = -1000.0;
+        for (dz of 0..2) {
+            for (dx of 0..2) {
+                let x : i32 = cx - dx;
+                let z : i32 = cz - dz;
+                if (x < 0 || x >= world.width() || z < 0 || z >= world.depth()) {
+                    continue;
+                }
+                let g : f32 = world.groundAt(x, z) as f32;
+                sum = sum + g;
+                if (world.levelAt(x, z) >= WATER_MIN) {
+                    sum = sum + (world.levelAt(x, z) as f32);
+                }
+                if (g > floor) {
+                    floor = g;
+                }
+                n = n + 1;
+            }
+        }
+
+        let mean : f32 = sum / (n as f32);
+        if (floor > mean) {
+            return floor;
+        }
+        return mean;
+    }
+
+    // The corner heights, depth tint and opacity of column (`x`, `z`) from the smoothed sheet.
+    fn cell(self, world : FluidWorld, style : WaterStyle, x : i32, z : i32) : WaterCell {
+        let at : i64 = (z * self.side + x) as i64;
+        let c00 : f32 = self.corners[at];
+        let c10 : f32 = self.corners[at + 1];
+        let c01 : f32 = self.corners[at + (self.side as i64)];
+        let c11 : f32 = self.corners[at + (self.side as i64) + 1];
+
+        // The tint reads the mean surface of the corners: the raw level of a thin film checkers with the
+        // ground noise, and the checker would show through the colour.
+        let mean : f32 = (c00 + c10 + c01 + c11) * (0.25 as f32);
+        let t : f32 = saturate((mean - (world.groundAt(x, z) as f32)) / style.deepLevel);
+        let alpha : i32 = style.alphaLow + (((PAINTER_ALPHA_DEN - style.alphaLow) as f32) * t) as i32;
+        return WaterCell {
+            x: x as f32,
+            z: z as f32,
+            c00: c00,
+            c10: c10,
+            c01: c01,
+            c11: c11,
+            tint: t,
+            alpha: alpha,
+        };
+    }
+
+    // A film hugs its own ground, tinted by the sheet's mean depth.
+    static fn film(
+        b : Brush,
+        world : FluidWorld,
+        style : WaterStyle,
+        cell : WaterCell,
+        x : i32,
+        z : i32
+    ) : void {
+        let top : f32 = (world.groundAt(x, z) + world.levelAt(x, z)) as f32;
+        let albedo : Color = brushBlend(style.shallow, style.deep, cell.tint);
+        let look : Look = Look {
+            albedo: brushPack(albedo),
+            lit: style.filmLit as f64,
+            alpha: cell.alpha,
+        };
+        b.top(x, z, top, look);
+    }
+
+    // The facet of a column whose near corner is (`at.x`, `at.z`) cells into it; heights come from the bilinear
+    // surface of the cell, whose midpoints are exactly the means of the corner pairs.
+    static fn facet(b : Brush, style : WaterStyle, cell : WaterCell, at : Vec3, light : WaterLight) : void {
+        let half : f32 = 0.5;
+        let a : Vec3 = WaterSheet::lift(cell, at.x, at.z);
+        let bb : Vec3 = WaterSheet::lift(cell, at.x + half, at.z);
+        let c : Vec3 = WaterSheet::lift(cell, at.x + half, at.z + half);
+        let d : Vec3 = WaterSheet::lift(cell, at.x, at.z + half);
+        let look : Look = WaterSheet::shade(style, cell, a, bb, c, d, light);
+        if (look.alpha > 0) {
+            b.quad(a, bb, c, d, look);
+        }
+    }
+
+    // The point (`u`, `v`) cells into the column, at the cell's bilinear height.
+    static fn lift(cell : WaterCell, u : f32, v : f32) : Vec3 {
+        let north : f32 = lerp(cell.c00, cell.c10, u);
+        let south : f32 = lerp(cell.c01, cell.c11, u);
+        return Vec3::make(cell.x + u, lerp(north, south, v), cell.z + v);
+    }
+
+    // The colour of a facet: the depth tint lit by the sun, mixed toward the reflected sky by Fresnel, with
+    // the sun's glint added on top; the alpha closes toward opaque as the view goes grazing. A facet seen
+    // from inside its own centre (no view vector) is left out with alpha 0.
+    static fn shade(
+        style : WaterStyle,
+        cell : WaterCell,
+        a : Vec3,
+        b : Vec3,
+        c : Vec3,
+        d : Vec3,
+        light : WaterLight
+    ) : Look {
+        let at : Vec3 = a.plus(b).plus(c).plus(d).scale(0.25 as f32);
+        let n : Vec3 = WaterSheet::normal(a, b, d, at, light.time);
+        let view : Vec3 = light.eye.minus(at);
+        let vlen : f32 = view.length();
+        if (vlen < WATER_NORMAL_MIN) {
+            return Look { alpha: 0 };
+        }
+        let v : Vec3 = view.scale((1.0 as f32) / vlen);
+
+        let ct : f32 = saturate(n.dot(v));
+        let grazing : f32 = (1.0 as f32) - ct;
+        let g2 : f32 = grazing * grazing;
+        let fres : f32 = WATER_F0 + ((1.0 as f32) - WATER_F0) * g2 * g2 * grazing;
+
+        let sky : i32 = WaterSheet::sky(n, v, ct);
+        let sun : f32 = saturate(n.x * BRUSH_SUN_X + n.y * BRUSH_SUN_Y + n.z * BRUSH_SUN_Z);
+        let lit : f64 = brushLit(sun);
+        let base : i32 = brushPack(brushBlend(style.shallow, style.deep, cell.tint).scaled(lit));
+        let mut skyMix : f32 = fres * WATER_FRESNEL_GAIN;
+        if (skyMix > WATER_SKY_MIX_MAX) {
+            skyMix = WATER_SKY_MIX_MAX;
+        }
+        let mixed : i32 = Color::mix(
+            base,
+            sky,
+            (skyMix * (PAINTER_ALPHA_DEN as f32)) as i32,
+            PAINTER_ALPHA_DEN
+        );
+
+        let glint : f32 = WaterSheet::glint(n);
+        let alpha : i32 = cell.alpha + (((PAINTER_ALPHA_DEN - cell.alpha) as f32) * fres) as i32;
+        return Look { albedo: WaterSheet::addGlint(mixed, glint), lit: 1.0, alpha: alpha };
+    }
+
+    // The facet normal from two of its edges, flipped up, with the two ripple trains riding on it.
+    static fn normal(a : Vec3, b : Vec3, d : Vec3, at : Vec3, time : f32) : Vec3 {
+        let mut n : Vec3 = b.minus(a).cross(d.minus(a));
+        if (n.y < 0.0) {
+            n = n.negated();
+        }
+        let amp : f32 = WATER_RIPPLE_A;
+        let ripple : f32 = sin(at.x * WATER_RIPPLE_F1 + time * WATER_RIPPLE_W1) * amp
+            + sin(at.z * WATER_RIPPLE_F2 - time * WATER_RIPPLE_W2) * (amp * WATER_RIPPLE_Z_SHARE);
+        let cross : f32 = at.z * WATER_RIPPLE_F1 + at.x * WATER_RIPPLE_CROSS_X + time * WATER_RIPPLE_W2;
+        let ripple2 : f32 = sin(cross) * (amp * WATER_RIPPLE_CROSS_SHARE);
+        let rippled : Vec3 = Vec3::make(n.x + ripple, n.y, n.z + ripple2);
+
+        let mut len : f32 = rippled.length();
+        if (len < WATER_NORMAL_MIN) {
+            len = WATER_NORMAL_MIN;
+        }
+        return rippled.scale((1.0 as f32) / len);
+    }
+
+    // The reflected sky: the direction's height picks between the clear horizon and the deeper zenith.
+    static fn sky(n : Vec3, v : Vec3, ct : f32) : i32 {
+        let reflY : f32 = saturate((2.0 as f32) * ct * n.y - v.y);
+        let k : f32 = saturate(WATER_SKY_BASE + reflY * WATER_SKY_RISE);
+        return Color::mix(
+            SC_CLEAR,
+            WATER_SKY_ZENITH,
+            (k * (PAINTER_ALPHA_DEN as f32)) as i32,
+            PAINTER_ALPHA_DEN
+        );
+    }
+
+    // The sun's specular glint on the facet, 0 to `WATER_SPEC`.
+    static fn glint(n : Vec3) : f32 {
+        let h : Vec3 = Vec3::make(n.x + BRUSH_SUN_X, n.y + BRUSH_SUN_Y, n.z + BRUSH_SUN_Z);
+        let hlen : f32 = h.length();
+        return WATER_SPEC * lightPow(saturate(n.dot(h) / hlen), WATER_SPEC_POW);
+    }
+
+    // The colour with `glint` added to every channel, saturating.
+    static fn addGlint(c : i32, glint : f32) : i32 {
+        let add : i32 = (glint * (255.0 as f32)) as i32;
+        return Color::packBytes(
+            Color::clamp8(Color::red(c) + add),
+            Color::clamp8(Color::green(c) + add),
+            Color::clamp8(Color::blue(c) + add)
+        );
+    }
+}

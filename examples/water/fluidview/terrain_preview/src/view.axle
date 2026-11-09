@@ -1,0 +1,175 @@
+// view — a perspective picture of a HydroTerrain, drawn the way old flight simulators drew heightfields.
+//
+// For every screen column a ray walks away from the camera over the map in steps that grow with the distance; at
+// each step the ground's height is projected to a screen row, and whatever lies higher on the screen than anything
+// nearer is painted. It needs no mesh and draws a 4 km valley in a few milliseconds a column, which is all a preview
+// asks of it. Water is the colour of the lake, the river bed and the end lake, drawn at the water's own level; haze
+// and a gradient sky give the depth cues the eye wants when judging whether mountains look tall.
+
+use fluidview::HydroTerrain;
+use ludax::{cos, saturate, sin};
+use smalt::{Bmp, Surface};
+
+use crate::shading::{Shading, Tint};
+
+const VIEW_WIDTH : i32 = 1280;
+const VIEW_HEIGHT : i32 = 640;
+
+// Half the horizontal field of view as a tangent (about 38 degrees), and how far a ray reaches, metres.
+const VIEW_TAN_HALF : f32 = 0.78;
+
+// Step of a ray: a floor and a share of the distance, so near ground is sampled finely and far ground cheaply.
+const VIEW_STEP_MIN : f32 = 1.5;
+const VIEW_STEP_SHARE : f32 = 0.0035;
+
+// Haze: the distance at which it takes about two thirds of the colour.
+const VIEW_HAZE : f32 = 5200.0;
+
+/** Where a perspective picture is taken from and how far it sees. */
+pub struct ViewShot {
+    /** Camera east coordinate, metres. */
+    pub x : f32 = 0.0;
+
+    /** Camera south coordinate, metres. */
+    pub z : f32 = 0.0;
+
+    /** Turn from looking north, radians. */
+    pub yaw : f32 = 0.0;
+
+    /** Tilt down, radians. */
+    pub pitch : f32 = 0.0;
+
+    /** Height above the ground, metres. */
+    pub height : f32 = 100.0;
+
+    /** How far it sees, metres. */
+    pub reach : f32 = 6500.0;
+
+    /** True to take heights with `bedAt` and sample finely: the close views of the fall and the channel. */
+    pub fine : bool = false;
+
+    /** The default view: from the south end, looking up the valley. */
+    pub static fn valley(t : HydroTerrain, yaw : f32, pitch : f32, height : f32) : ViewShot {
+        return ViewShot {
+            x: t.worldWidth() * 0.5 as f32,
+            z: t.worldDepth() * 0.97 as f32,
+            yaw: yaw,
+            pitch: pitch,
+            height: height,
+        };
+    }
+
+    /** A close view of the fall from `back` metres downstream of the lip, `height` above the ground, looking at the face. */
+    pub static fn fall(t : HydroTerrain, back : f32, height : f32, yaw : f32) : ViewShot {
+        return ViewShot {
+            x: t.escarpment.lip.x,
+            z: t.escarpment.lip.z + back,
+            yaw: yaw,
+            pitch: -0.05,
+            height: height,
+            reach: back * 3.0 as f32,
+            fine: true,
+        };
+    }
+}
+
+/** The perspective pictures. */
+pub class PerspectiveView {
+    /** Draws `t` as `shot` says; false when the file cannot be written. */
+    pub static fn save(t : HydroTerrain, path : string, shot : ViewShot) : bool {
+        let surface : Surface = new Surface(VIEW_WIDTH, VIEW_HEIGHT);
+        let pixels : i32[] = surface.pixels();
+        PerspectiveView::sky(pixels);
+
+        let camY : f32 = t.heightAt(shot.x, shot.z) + shot.height;
+        let focal : f32 = ((VIEW_WIDTH as f32) * 0.5 as f32) / VIEW_TAN_HALF;
+        let horizon : f32 = ((VIEW_HEIGHT as f32) * 0.5 as f32) - ludax::tan(shot.pitch) * focal;
+        let fx : f32 = sin(shot.yaw);
+        let fz : f32 = 0.0 as f32 - cos(shot.yaw);
+
+        for (c of 0..VIEW_WIDTH) {
+            let u : f32 = (((c as f32) / (VIEW_WIDTH as f32)) * 2.0 as f32 - 1.0 as f32) * VIEW_TAN_HALF;
+            let dx : f32 = fx + (0.0 as f32 - fz) * u;
+            let dz : f32 = fz + fx * u;
+            PerspectiveView::column(t, pixels, c, shot, camY, dx, dz, focal, horizon);
+        }
+
+        let ok : bool = Bmp::write(path, surface.frame());
+        surface.close();
+        return ok;
+    }
+
+    static fn column(
+        t : HydroTerrain,
+        pixels : i32[],
+        c : i32,
+        shot : ViewShot,
+        camY : f32,
+        dx : f32,
+        dz : f32,
+        focal : f32,
+        horizon : f32
+    ) : void {
+        let mut top : i32 = VIEW_HEIGHT;
+        let mut s : f32 = 6.0 as f32;
+        while (s < shot.reach && top > 0) {
+            let x : f32 = shot.x + dx * s;
+            let z : f32 = shot.z + dz * s;
+            if (x < 0.0 as f32 || z < 0.0 as f32 || x >= t.worldWidth() || z >= t.worldDepth()) {
+                s = s + PerspectiveView::step(shot, s);
+                continue;
+            }
+            let mut ground : f32 = t.heightAt(x, z);
+            if (shot.fine) {
+                ground = t.bedAt(x, z);
+            }
+            let mut tint : Tint = Shading::ground(t, x, z);
+            if (t.isLakeAt(x, z)) {
+                tint = Shading::water(ground, t.lake.level, 0.9 as f32);
+                ground = t.lake.level;
+            } else if (ground < t.params.outflowLevel) {
+                tint = Shading::water(ground, t.params.outflowLevel, 0.9 as f32);
+                ground = t.params.outflowLevel;
+            } else if (t.wetnessAt(x, z) > (250 as u8)) {
+                tint = Shading::water(ground, ground + 1.6 as f32, 0.9 as f32);
+                ground = ground + 0.6 as f32;
+            }
+
+            let row : i32 = (horizon + ((camY - ground) / s) * focal) as i32;
+            if (row < top) {
+                let haze : f32 = saturate(s / VIEW_HAZE);
+                let fogged : i32 = tint.mixed(Tint::rgb(176.0, 198.0, 224.0), haze * haze).pack();
+                let mut from : i32 = row;
+                if (from < 0) {
+                    from = 0;
+                }
+                for (y of from..top) {
+                    pixels[((y as i64) * (VIEW_WIDTH as i64)) + (c as i64)] = fogged;
+                }
+                top = from;
+            }
+            s = s + PerspectiveView::step(shot, s);
+        }
+    }
+
+    // The step of a ray at distance s: fine for the close views.
+    static fn step(shot : ViewShot, s : f32) : f32 {
+        if (shot.fine) {
+            return 0.35 as f32 + s * 0.0012 as f32;
+        }
+        return VIEW_STEP_MIN + s * VIEW_STEP_SHARE;
+    }
+
+    // A vertical gradient: deep blue overhead, pale at the horizon.
+    static fn sky(pixels : i32[]) : void {
+        let high : Tint = Tint::rgb(70.0, 112.0, 186.0);
+        let low : Tint = Tint::rgb(190.0, 208.0, 228.0);
+        for (y of 0..VIEW_HEIGHT) {
+            let t : f32 = (y as f32) / (VIEW_HEIGHT as f32);
+            let colour : i32 = high.mixed(low, saturate(t * 1.6 as f32)).pack();
+            for (x of 0..VIEW_WIDTH) {
+                pixels[((y as i64) * (VIEW_WIDTH as i64)) + (x as i64)] = colour;
+            }
+        }
+    }
+}

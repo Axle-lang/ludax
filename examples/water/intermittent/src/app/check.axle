@@ -1,0 +1,161 @@
+// check — what the intermittent must show, as numbers: a steady spring that comes out in bursts, by itself.
+//
+// The claims are the ones that would fail first if the fluid were wrong. The volume balances against the spring
+// and the drain. The siphon primes over and over with nothing on a timer, and the interval is steady from
+// one cycle to the next. The pool stands flat when it primes, so the volume it holds is the one its geometry
+// predicts for a flat surface at the crest, and the time it took to refill is that volume less what the
+// bowl held when the siphon broke, divided by the spring's rate: a prediction made without the engine and held
+// against it. The siphon empties the bowl much faster than the spring filled it, and the flow at the valley's
+// foot is a burst followed by a dry stretch while the spring never changed.
+
+use fluidview::Verdict;
+use ludax::{maxD, minD};
+
+use crate::sim::intermittent::{
+    InPhase, InTerrain, IntermittentSim, IN_DEPTH_OFF, IN_DEPTH_ON, IN_DT, IN_SPRING_RATE
+};
+
+/** Primings a run waits for; the first is from an empty bowl and is left out of the steady comparisons. */
+const IN_CHECK_PRIMINGS : i32 = 6;
+
+/** Ticks a run gives up after if the siphon has not primed enough times. */
+const IN_CHECK_LIMIT : i32 = 30000;
+
+/** Largest imbalance the volume bookkeeping may show, cell units. */
+const IN_BALANCE_TOL : f64 = 0.000000001;
+
+/** Cycle periods agree within this fraction. */
+const IN_PERIOD_TOL : f64 = 0.03;
+
+/** The pool's predicted storage and refill time agree within this fraction. */
+const IN_PREDICT_TOL : f64 = 0.04;
+
+/** The pool's surface is flat within this many cells when the siphon primes. */
+const IN_FLAT_TOL : f64 = 0.15;
+
+/** A burst empties the pool at least this many times faster than the spring filled it. */
+const IN_BURST_RATIO : f64 = 4.0;
+
+/** The valley's peak outflow is at least this many times the spring's rate. */
+const IN_PEAK_RATIO : f64 = 1.5;
+
+/** Its quietest outflow after the transient is at most this fraction of the spring's rate. */
+const IN_QUIET_FRACTION : f64 = 0.1;
+
+/** What one run measured. */
+struct InRun {
+    maxImbalance : f64 = 0.0;
+    peak         : f64 = 0.0;
+    quiet        : f64 = 1000000.0;
+    flat         : f64 = 0.0;
+    stored       : f64 = 0.0;
+    low          : f64 = 0.0;
+}
+
+/** The intermittent's self-check. */
+pub class IntermittentCheck {
+    /** Runs every claim and answers how many failed. */
+    pub static fn run() : i32 {
+        let v : Verdict = new Verdict();
+        let sim : IntermittentSim = new IntermittentSim();
+        let run : InRun = IntermittentCheck::measure(sim);
+        v.claim(
+            "the siphon keeps priming",
+            sim.primings() >= IN_CHECK_PRIMINGS,
+            "${sim.primings()} primings in ${sim.tickCount()} ticks, no timer"
+        );
+        IntermittentCheck::balance(v, run);
+        IntermittentCheck::period(v, sim);
+        IntermittentCheck::prediction(v, sim, run);
+        IntermittentCheck::burst(v, sim, run);
+        v.summary("intermittent");
+        return v.failures();
+    }
+
+    // Runs until the siphon has primed enough times, recording what the claims need along the way. The pool is
+    // sampled before the tick that primes or breaks the siphon, which is the state that decided it.
+    static fn measure(sim : IntermittentSim) : InRun {
+        let mut run : InRun = InRun {};
+        while (sim.primings() < IN_CHECK_PRIMINGS && (sim.tickCount() as i32) < IN_CHECK_LIMIT) {
+            if (sim.phase() == InPhase::Filling && sim.poolDepth() >= IN_DEPTH_ON) {
+                run.flat = maxD(run.flat, sim.poolSpread());
+                run.stored = sim.poolVolume();
+            }
+            if (sim.phase() == InPhase::Draining && sim.poolDepth() <= IN_DEPTH_OFF) {
+                run.low = sim.poolVolume();
+            }
+            sim.tick();
+            run.maxImbalance = maxD(run.maxImbalance, sim.imbalance().abs());
+            if (sim.primings() > 1) {
+                run.peak = maxD(run.peak, sim.outflow());
+                run.quiet = minD(run.quiet, sim.outflow());
+            }
+        }
+        return run;
+    }
+
+    static fn balance(v : Verdict, run : InRun) : void {
+        let worst : f64 = run.maxImbalance;
+        v.claim(
+            "volume is conserved",
+            worst < IN_BALANCE_TOL,
+            "volume - injected + drained never left ${worst}"
+        );
+    }
+
+    // The interval between primings, cycle to cycle, after the first (empty-start) one.
+    static fn period(v : Verdict, sim : IntermittentSim) : void {
+        let mut shortest : i64 = 1000000;
+        let mut longest : i64 = 0;
+        for (i of 2..sim.primings()) {
+            let gap : i64 = sim.primedAt(i) - sim.primedAt(i - 1);
+            if (gap < shortest) {
+                shortest = gap;
+            }
+            if (gap > longest) {
+                longest = gap;
+            }
+        }
+        let spread : f64 = ((longest - shortest) as f64) / (longest as f64);
+        let seconds : f64 = (shortest as f64) * IN_DT;
+        v.claim(
+            "the period is steady",
+            longest > 0 && spread <= IN_PERIOD_TOL,
+            "cycles of ${shortest}..${longest} ticks (${seconds} s), spread ${spread}"
+        );
+    }
+
+    // The crest volume a flat pool must hold, and the refill time that volume implies.
+    static fn prediction(v : Verdict, sim : IntermittentSim, run : InRun) : void {
+        let ground : InTerrain = sim.groundRef();
+        let want : f64 = ground.storageAt(ground.floorHeight() + IN_DEPTH_ON);
+        v.near("the pool at the crest holds its geometry's volume", run.stored / want, 1.0, IN_PREDICT_TOL);
+        let flat : f64 = run.flat;
+        v.claim("the pool stands flat", flat <= IN_FLAT_TOL, "surface spread ${flat} cells at the crest");
+
+        let last : i32 = sim.primings() - 1;
+        let refill : f64 = ((sim.primedAt(last) - sim.brokeAt(last - 1)) as f64) * IN_DT;
+        let predicted : f64 = (run.stored - run.low) / IN_SPRING_RATE;
+        v.near("refill time is volume over spring rate", refill / predicted, 1.0, IN_PREDICT_TOL);
+    }
+
+    // The siphon is a burst: fast to empty, and the valley sees it as a rush between dry stretches.
+    static fn burst(v : Verdict, sim : IntermittentSim, run : InRun) : void {
+        let last : i32 = sim.primings() - 1;
+        let drain : f64 = ((sim.brokeAt(last - 1) - sim.primedAt(last - 1)) as f64) * IN_DT;
+        let fill : f64 = ((sim.primedAt(last) - sim.brokeAt(last - 1)) as f64) * IN_DT;
+        v.claim(
+            "the bowl empties much faster than it fills",
+            fill >= IN_BURST_RATIO * drain,
+            "${drain} s to drain, ${fill} s to fill"
+        );
+
+        let peak : f64 = run.peak;
+        let quiet : f64 = run.quiet;
+        v.claim(
+            "the valley sees bursts, not the spring's flow",
+            peak >= IN_PEAK_RATIO * IN_SPRING_RATE && quiet <= IN_QUIET_FRACTION * IN_SPRING_RATE,
+            "outflow ranged ${quiet}..${peak} while the spring ran ${IN_SPRING_RATE}"
+        );
+    }
+}

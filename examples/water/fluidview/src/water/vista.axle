@@ -1,0 +1,236 @@
+// vista — the waterfall renderer a scene author calls: one landscape, one camera and a moment in, a picture out.
+//
+// `render` runs one sample of the picture through the stages of `vista_frame` on a job pool. When the camera or the
+// moment is not the one the last call drew (or `fresh`), the accumulated picture restarts: the drops are written
+// for the moment and projected for the camera and sorted into tiles once, and the sky and the terrain's baked light
+// are redone if the time of day moved. When nothing moved, each call adds one jittered sample to the running mean,
+// so a still scene refines toward the antialiased picture; `quality` coarsens the picture while it moves (see
+// `VistaRenderer::fastest`). The exposure is metered after every sample. Nothing here reads a clock for its result:
+// the stage timings are measured and kept for the caller's `--prof`; the pixels depend on the landscape, the
+// camera, the moment, the look and the sample number alone, never on the number of threads.
+
+use ludax::{nanosToMillis, nowNanos, JobPool, Vec3};
+
+use crate::water::camera::WaterCamera;
+use crate::water::drop_store::DropStore;
+use crate::water::landscape::WaterLandscape;
+use crate::water::sky::WSKY_ROWS_PER_JOB;
+use crate::water::vista_frame::{VistaFrame, VistaStage};
+use crate::water::vista_look::{CrownLook, VistaLook};
+
+// Rows or chunks of a stage one pool job covers.
+const VISTA_ROWS_PER_JOB : i32 = 2;
+const VISTA_LIGHT_ROWS_PER_JOB : i32 = 4;
+
+/** The profile's slots: the milliseconds the last sample took in all, and in each phase of it. */
+pub const VISTA_STAGES : i32 = 8;
+
+/** The names of the profile's slots, in order. */
+pub const VISTA_STAGE_NAMES : string = "total prepare emit project+bin trace splat resolve display";
+
+/** The vista renderer. */
+pub class VistaRenderer {
+    /** The picture's size, pixels, and the size of the words `pixels` holds. */
+    pub width     : i32;
+    pub height    : i32;
+    pub outWidth  : i32;
+    pub outHeight : i32;
+
+    /** Milliseconds each stage took in the last `render`, indexed like `VISTA_STAGE_NAMES`. */
+    pub spent : f64[];
+
+    /** Samples the current picture has accumulated. */
+    pub samples : i32 = 0;
+
+    /** The look; change it, then render with `fresh`. */
+    pub look : VistaLook = VistaLook {};
+
+    /** Drops the last picture drew, and drops its tile lists could not hold. */
+    pub drawn   : i32 = 0;
+    pub refused : i32 = 0;
+
+    landscape : Shared<WaterLandscape>;
+    store     : Shared<DropStore>;
+    frame     : VistaFrame;
+    pool      : JobPool;
+    last      : WaterCamera = WaterCamera {};
+    lastTime  : f32 = -(1000000.0 as f32);
+
+    /** A renderer of `landscape` and the drops in `store` into pictures `width` by `height` (multiples of 16), `scale` times larger on show. */
+    constructor(
+        landscape : Shared<WaterLandscape>,
+        store : Shared<DropStore>,
+        width : i32,
+        height : i32,
+        scale : i32,
+        workers : i32
+    ) {
+        self.width = width;
+        self.height = height;
+        self.outWidth = width * scale;
+        self.outHeight = height * scale;
+        self.landscape = landscape;
+        self.store = store;
+        self.frame = new VistaFrame(
+            landscape.relief,
+            landscape.window,
+            landscape.sky,
+            landscape.markers,
+            self.store,
+            width,
+            height,
+            scale
+        );
+        self.pool = new JobPool(workers, self.frame);
+        self.spent = new f64[VISTA_STAGES as i64];
+        for (i of 0..VISTA_STAGES) {
+            self.spent[i as i64] = (0.0 as f32);
+        }
+    }
+
+    /** Stops the worker threads. */
+    pub fn close(mut self) : void {
+        self.pool.shutdown();
+    }
+
+    /** How many threads work on a picture. */
+    pub fn threads(self) : i32 {
+        return self.pool.workerCount();
+    }
+
+    /** The words of the finished picture, `outWidth` by `outHeight`. */
+    pub fn pixels(self) : i32[] {
+        return self.frame.post.out;
+    }
+
+    /** The mean radiance before display around pixel (`x`, `y`): a probe of the exposure. */
+    pub fn radianceAt(self, x : i32, y : i32) : Vec3 {
+        let at : i64 = (((y * self.width) + x) * 3) as i64;
+        return Vec3 { x: self.frame.hdr[at], y: self.frame.hdr[at + 1], z: self.frame.hdr[at + 2] };
+    }
+
+    /** One line about the exposure and the sky, for the profile. */
+    pub fn describe(self) : string {
+        let exposure : f32 = self.frame.post.exposure;
+        let sun : f32 = self.frame.sky.sunIrr.maxComponent();
+        let elevation : f32 = self.frame.sky.sunDir.y;
+        let drawn : i32 = self.drawn;
+        let refused : i32 = self.refused;
+        return "exposure ${exposure} sunIrradiance ${sun} sunHeight ${elevation} drops ${drawn} refused ${refused}";
+    }
+
+    // Runs `stage` over its rows in chunks of `grain`; the caller's thread does it all if the pool is gone.
+    fn run(mut self, stage : VistaStage, grain : i32) : void {
+        self.frame.stage = stage;
+        let rows : i32 = self.frame.rows();
+        if (rows <= 0) {
+            return;
+        }
+        if (!self.pool.run(rows, grain)) {
+            self.frame.runRange(0, rows);
+        }
+    }
+
+    // Closes the interval that began at `began` into profile slot `slot` and answers the time now.
+    fn lap(mut self, slot : i32, began : i64) : i64 {
+        let now : i64 = nowNanos();
+        self.spent[slot as i64] = nanosToMillis(now - began);
+        return now;
+    }
+
+    // True when two cameras see the same picture.
+    static fn same(a : WaterCamera, b : WaterCamera) : bool {
+        return a.eye.distanceSquared(b.eye) == (0.0 as f32)
+            && a.forward.distanceSquared(b.forward) == (0.0 as f32);
+    }
+
+    /**
+     * Draws one sample of the landscape seen from `cam` at second `time`. `fresh` restarts the picture (a new look);
+     * a moved camera or a new moment restarts it too.
+     */
+    pub fn render(mut self, cam : WaterCamera, time : f32, fresh : bool) : void {
+        let begin : i64 = nowNanos();
+        let mut t : i64 = begin;
+        let restart : bool = fresh || self.samples == 0 || time != self.lastTime
+            || !VistaRenderer::same(cam, self.last);
+        self.last = cam;
+        self.lastTime = time;
+        if (restart) {
+            self.samples = 0;
+        }
+        self.frame.cam = cam;
+        self.frame.look = self.look;
+        self.frame.adopt();
+        self.frame.time = time;
+        self.frame.sky.drift = time * self.look.sky.cloudDrift;
+        self.frame.index = self.samples;
+
+        for (i of 1..5) {
+            self.spent[i as i64] = (0.0 as f32);
+        }
+        if (restart) {
+            self.prepare();
+            t = self.lap(1, t);
+            self.drops(t);
+            t = nowNanos();
+        }
+        self.run(VistaStage::Trace, VISTA_ROWS_PER_JOB);
+        t = self.lap(4, t);
+
+        self.frame.drops.jitterX = self.frame.jitter().x;
+        self.frame.drops.jitterY = self.frame.jitter().y;
+        self.run(VistaStage::Splat, 1);
+        t = self.lap(5, t);
+        self.run(VistaStage::Resolve, VISTA_ROWS_PER_JOB);
+        t = self.lap(6, t);
+        self.display(restart);
+        self.lap(7, t);
+        self.samples = self.samples + 1;
+        self.lap(0, begin);
+    }
+
+    // The sky, redone when the time of day moved, and the terrain's baked light with it.
+    fn prepare(mut self) : void {
+        let look : VistaLook = self.look;
+        self.frame.sky.configure(look.sky, look.modules.sky);
+        if (look.sky.dayTime != self.landscape.skyDay || look.sky.tilt != self.landscape.skyTilt
+            || look.sky.gain != self.landscape.skyGain) {
+            self.landscape.skyDay = look.sky.dayTime;
+            self.landscape.skyTilt = look.sky.tilt;
+            self.landscape.skyGain = look.sky.gain;
+            self.run(VistaStage::SkyBake, WSKY_ROWS_PER_JOB);
+            self.frame.sky.finish();
+        }
+        let sun : Vec3 = self.frame.sky.sunDir;
+        if (self.look.modules.ground && self.landscape.relief.needsBake(sun)) {
+            self.run(VistaStage::GroundLight, VISTA_LIGHT_ROWS_PER_JOB);
+            self.landscape.relief.markBaked(sun);
+        }
+    }
+
+    // Projects the drops of the store for the camera and sorts them into tiles; the store is the caller's to fill.
+    fn drops(mut self, began : i64) : void {
+        let count : i32 = self.store.count;
+        if (!self.look.modules.spray) {
+            self.store.count = 0;
+        }
+        let mut crown : CrownLook = self.look.crown;
+        crown.enabled = crown.enabled && self.look.modules.spray;
+        self.frame.crown.build(self.store, self.landscape.window, crown, self.frame.sky);
+        self.run(VistaStage::Project, 1);
+        self.frame.drops.bin();
+        self.store.count = count;
+        self.lap(3, began);
+        self.drawn = self.frame.drops.drawn;
+        self.refused = self.frame.drops.refused;
+    }
+
+    // Meters the exposure and runs the bloom and the pack.
+    fn display(mut self, restart : bool) : void {
+        self.frame.post.meter(self.frame.hdr, self.look.post, restart);
+        self.run(VistaStage::Bright, VISTA_ROWS_PER_JOB);
+        self.frame.post.reduce();
+        self.run(VistaStage::Display, VISTA_ROWS_PER_JOB);
+        self.frame.drawMarkers();
+    }
+}

@@ -1,0 +1,359 @@
+// post — from radiance to pixels: exposure, bloom, vignette, tone curve, sRGB, dither.
+//
+// The renderer's picture is scene radiance, linear and unbounded: the sun's disc is a hundred thousand times the
+// lit ground. An eye adapts, so the exposure follows the geometric mean of the picture's luminance (the sun and
+// the brightest foam clipped first, or they would darken everything), eased toward it between frames so a still
+// picture is exact and a moving one does not pump. Light above the display's white is not thrown away: it is
+// blurred at four scales and added back as bloom, which is how the sun and a glinting wave read as bright when the
+// monitor cannot be. Ludax's tone curve and sRGB transfer do the last step, through two small tables built from
+// those very functions (both are smooth, so interpolating a table is exact to under one 8-bit code, and a table
+// lookup is much cheaper than a power function 500 000 times a frame).
+//
+// The stages that touch every pixel are row ranges for the job pool (`brightRows`, `composeRows`); the coarser
+// bloom levels are a few thousand pixels and are reduced on the calling thread (`reduce`), in a fixed order, so
+// the picture does not depend on the thread count. `WaterModules.post` off shows the radiance clipped at 1.
+
+use ludax::{lightExp2, lightLog2, lightSrgbEncode, lightToneCurve, max, min, saturate, Vec3, LIGHT_TONE_KNEE};
+use smalt::Color;
+
+use crate::water::look::PostLook;
+use crate::water::noise::{waterFloor, waterHash, waterPickI};
+
+// The exposure that puts the geometric mean of the picture's luminance at this share of white, and how much of the
+// picture's dimness the exposure makes up for (a power: 1 would match the key exactly).
+const POST_KEY : f32 = 0.27;
+const POST_FOLLOW : f32 = 0.85;
+
+// The exposure's bounds, and how fast it eases toward its target per metered frame (a share of the log distance).
+const POST_EXPOSURE_MIN : f32 = 0.0005;
+const POST_EXPOSURE_MAX : f32 = 40.0;
+const POST_EASE : f32 = 0.35;
+
+// Luminance above this multiple of the mean is not counted by the meter: the sun must not set the exposure.
+const POST_METER_CEILING : f32 = 12.0;
+
+// The floor of a metered luminance, so a black pixel does not drag the mean to minus infinity.
+const POST_METER_FLOOR : f32 = 0.00002;
+
+// Entries of each lookup table, and the largest exposed channel the tone table covers.
+const POST_TABLE : i32 = 4096;
+const POST_TONE_MAX : f32 = 40.0;
+const POST_TONE_MIN : f32 = 0.0001;
+
+// Rec. 709 luminance weights.
+const POST_LUMA_R : f32 = 0.2126;
+const POST_LUMA_G : f32 = 0.7152;
+const POST_LUMA_B : f32 = 0.0722;
+
+// The exposed brightness where light starts to bloom, and the most of it that blooms.
+const POST_BLOOM_FROM : f32 = 1.4;
+const POST_BLOOM_CEILING : f32 = 8.0;
+
+// The weights of the bloom's levels, from half resolution to a sixteenth, and the overall gain.
+const POST_W1 : f32 = 0.9;
+const POST_W2 : f32 = 0.8;
+const POST_W3 : f32 = 0.65;
+const POST_W4 : f32 = 0.5;
+const POST_BLOOM_GAIN : f32 = 0.32;
+
+// A little contrast: highlights lose saturation, a lerp away from grey above this knee.
+const POST_DESAT_KNEE : f32 = 0.85;
+const POST_DESAT : f32 = 0.55;
+
+// The seed of the dither.
+const POST_DITHER : i32 = 977;
+
+// The meter reads every this many pixels along each axis.
+const POST_METER_STRIDE : i32 = 3;
+
+/** The display stage for a picture of `w` by `h`, shown at `scale` times that size. */
+pub class WaterPost {
+    w : i32;
+    h : i32;
+
+    /** How many output pixels each render pixel becomes. */
+    pub scale : i32;
+
+    /** The exposure the picture is shown with. */
+    pub exposure : f32 = 0.6;
+
+    lv1  : f32[];
+    lv2  : f32[];
+    lv3  : f32[];
+    lv4  : f32[];
+    tmp  : f32[];
+    tone : f32[];
+    code : f32[];
+
+    /** The words of the finished picture, `w * scale` by `h * scale`. */
+    pub out : i32[];
+
+    /** A stage for `w` by `h` pictures (both multiples of 16) shown at `scale` times that size. */
+    constructor(w : i32, h : i32, scale : i32) {
+        self.w = w;
+        self.h = h;
+        self.scale = scale;
+        self.lv1 = new f32[((w / 2) as i64) * (h / 2) * 3];
+        self.lv2 = new f32[((w / 4) as i64) * (h / 4) * 3];
+        self.lv3 = new f32[((w / 8) as i64) * (h / 8) * 3];
+        self.lv4 = new f32[((w / 16) as i64) * (h / 16) * 3];
+        self.tmp = new f32[((w / 2) as i64) * (h / 2) * 3];
+        self.out = new i32[(w as i64) * scale * h * scale];
+        self.tone = new f32[(POST_TABLE + 1) as i64];
+        self.code = new f32[(POST_TABLE + 1) as i64];
+
+        // The tone table is T(m) / m over the largest channel m, so a colour is scaled by one lookup; the code
+        // table is the sRGB transfer indexed by the square root of the linear value, which spends its entries
+        // where the transfer is steep (near black).
+        for (i of 0..(POST_TABLE + 1)) {
+            let m : f32 = ((i as f32) / (POST_TABLE as f32)) * POST_TONE_MAX;
+            let mut gain : f32 = 1.0;
+            if (m > POST_TONE_MIN) {
+                gain = lightToneCurve(m, LIGHT_TONE_KNEE) / m;
+            }
+            self.tone[i as i64] = gain;
+            let root : f32 = (i as f32) / (POST_TABLE as f32);
+            self.code[i as i64] = lightSrgbEncode(root * root);
+        }
+    }
+
+    /** Moves the exposure toward what `hdr` asks for; `instant` jumps there (a still picture, the first frame). */
+    pub fn meter(mut self, hdr : f32[], look : PostLook, instant : bool) : void {
+        if (look.exposureLock > (0.0 as f32)) {
+            self.exposure = look.exposureLock;
+            return;
+        }
+        let mut sum : f32 = 0.0;
+        let mut n : i32 = 0;
+        let mut ceiling : f32 = POST_EXPOSURE_MAX;
+        for (pass of 0..2) {
+            sum = 0.0;
+            n = 0;
+            let mut y : i32 = 1;
+            while (y < self.h) {
+                let mut x : i32 = 1;
+                while (x < self.w) {
+                    let at : i64 = (((y * self.w) + x) * 3) as i64;
+                    let lum : f32 = POST_LUMA_R * hdr[at] + POST_LUMA_G * hdr[at + 1]
+                        + POST_LUMA_B * hdr[at + 2];
+                    sum = sum + lightLog2(max(min(lum, ceiling), POST_METER_FLOOR));
+                    n = n + 1;
+                    x = x + POST_METER_STRIDE;
+                }
+                y = y + POST_METER_STRIDE;
+            }
+            // The second pass clips what is far above the first pass's mean.
+            ceiling = lightExp2(sum / (max(n, 1) as f32)) * POST_METER_CEILING;
+        }
+        let mean : f32 = lightExp2(sum / (max(n, 1) as f32));
+        let mut want : f32 = ludax::lightPow(POST_KEY / mean, POST_FOLLOW);
+        want = min(max(want, POST_EXPOSURE_MIN), POST_EXPOSURE_MAX) * lightExp2(look.exposureBias);
+        if (instant) {
+            self.exposure = want;
+            return;
+        }
+        let current : f32 = lightLog2(self.exposure);
+        self.exposure = lightExp2(current + (lightLog2(want) - current) * POST_EASE);
+    }
+
+    /** Rows of the half-size level, for the pool. */
+    pub fn brightRowCount(self) : i32 {
+        return self.h / 2;
+    }
+
+    // The bright part of the exposed radiance of render pixel (x, y).
+    fn bright(self, hdr : f32[], x : i32, y : i32) : Vec3 {
+        let at : i64 = (((y * self.w) + x) * 3) as i64;
+        let e : Vec3 = Vec3 { x: hdr[at], y: hdr[at + 1], z: hdr[at + 2] }.scale(self.exposure);
+        let m : f32 = e.maxComponent();
+        if (m <= POST_BLOOM_FROM) {
+            return Vec3::zero();
+        }
+        let kept : f32 = min(m - POST_BLOOM_FROM, POST_BLOOM_CEILING);
+        return e.scale(kept / m);
+    }
+
+    /** Picks the light above white and halves the picture: rows `begin` up to `end` of the first level. */
+    pub fn brightRows(mut self, hdr : f32[], begin : i32, end : i32) : void {
+        let half : i32 = self.w / 2;
+        let quarter : f32 = 0.25;
+        for (y of begin..end) {
+            for (x of 0..half) {
+                let sum : Vec3 = self
+                    .bright(hdr, x * 2, y * 2)
+                    .plus(self.bright(hdr, x * 2 + 1, y * 2))
+                    .plus(self.bright(hdr, x * 2, y * 2 + 1))
+                    .plus(self.bright(hdr, x * 2 + 1, y * 2 + 1));
+                self.put(self.lv1, ((y * half) + x) as i64, sum.scale(quarter));
+            }
+        }
+    }
+
+    fn put(self, level : f32[], i : i64, c : Vec3) : void {
+        level[i * 3] = c.x;
+        level[i * 3 + 1] = c.y;
+        level[i * 3 + 2] = c.z;
+    }
+
+    fn get(self, level : f32[], i : i64) : Vec3 {
+        return Vec3 { x: level[i * 3], y: level[i * 3 + 1], z: level[i * 3 + 2] };
+    }
+
+    /** Blurs the first level and builds the coarser ones; call once, on one thread, after every bright row. */
+    pub fn reduce(mut self) : void {
+        self.blur(self.lv1, self.w / 2, self.h / 2);
+        self.shrink(self.lv1, self.w / 2, self.h / 2, self.lv2);
+        self.blur(self.lv2, self.w / 4, self.h / 4);
+        self.shrink(self.lv2, self.w / 4, self.h / 4, self.lv3);
+        self.blur(self.lv3, self.w / 8, self.h / 8);
+        self.shrink(self.lv3, self.w / 8, self.h / 8, self.lv4);
+        self.blur(self.lv4, self.w / 16, self.h / 16);
+    }
+
+    // A separable [1 2 1] / 4 blur of a level in place, through the scratch picture.
+    fn blur(mut self, level : f32[], w : i32, h : i32) : void {
+        let quarter : f32 = 0.25;
+        let half : f32 = 0.5;
+        for (y of 0..h) {
+            for (x of 0..w) {
+                let l : i32 = waterPickI(x > 0, x - 1, x);
+                let r : i32 = waterPickI(x < w - 1, x + 1, x);
+                let c : Vec3 = self
+                    .get(level, ((y * w) + x) as i64)
+                    .scale(half)
+                    .plus(self.get(level, ((y * w) + l) as i64).scale(quarter))
+                    .plus(self.get(level, ((y * w) + r) as i64).scale(quarter));
+                self.put(self.tmp, ((y * w) + x) as i64, c);
+            }
+        }
+        for (y of 0..h) {
+            for (x of 0..w) {
+                let u : i32 = waterPickI(y > 0, y - 1, y);
+                let d : i32 = waterPickI(y < h - 1, y + 1, y);
+                let c : Vec3 = self
+                    .get(self.tmp, ((y * w) + x) as i64)
+                    .scale(half)
+                    .plus(self.get(self.tmp, ((u * w) + x) as i64).scale(quarter))
+                    .plus(self.get(self.tmp, ((d * w) + x) as i64).scale(quarter));
+                self.put(level, ((y * w) + x) as i64, c);
+            }
+        }
+    }
+
+    // Halves a level of `w` by `h` into `coarse` by averaging blocks of four.
+    fn shrink(self, level : f32[], w : i32, h : i32, coarse : f32[]) : void {
+        let quarter : f32 = 0.25;
+        let cw : i32 = w / 2;
+        for (y of 0..(h / 2)) {
+            for (x of 0..cw) {
+                let sum : Vec3 = self
+                    .get(level, ((y * 2 * w) + x * 2) as i64)
+                    .plus(self.get(level, ((y * 2 * w) + x * 2 + 1) as i64))
+                    .plus(self.get(level, (((y * 2 + 1) * w) + x * 2) as i64))
+                    .plus(self.get(level, (((y * 2 + 1) * w) + x * 2 + 1) as i64));
+                self.put(coarse, ((y * cw) + x) as i64, sum.scale(quarter));
+            }
+        }
+    }
+
+    // The bilinear read of a level of `w` by `h` at render-pixel position (x, y), `shift` levels below the picture.
+    fn level(self, data : f32[], w : i32, h : i32, x : f32, y : f32, size : f32) : Vec3 {
+        let half : f32 = 0.5;
+        let fx : f32 = x / size - half;
+        let fy : f32 = y / size - half;
+        let x0 : i32 = waterFloor(fx);
+        let y0 : i32 = waterFloor(fy);
+        let tx : f32 = fx - (x0 as f32);
+        let ty : f32 = fy - (y0 as f32);
+        let xa : i32 = waterPickI(x0 < 0, 0, x0);
+        let ya : i32 = waterPickI(y0 < 0, 0, y0);
+        let xb : i32 = waterPickI(x0 + 1 >= w, w - 1, x0 + 1);
+        let yb : i32 = waterPickI(y0 + 1 >= h, h - 1, y0 + 1);
+        let top : Vec3 = self
+            .get(data, ((ya * w) + xa) as i64)
+            .lerp(self.get(data, ((ya * w) + xb) as i64), tx);
+        let bottom : Vec3 = self
+            .get(data, ((yb * w) + xa) as i64)
+            .lerp(self.get(data, ((yb * w) + xb) as i64), tx);
+        return top.lerp(bottom, ty);
+    }
+
+    // The bloom at render pixel (x, y): the four levels, weighted.
+    fn bloom(self, x : f32, y : f32) : Vec3 {
+        let a : Vec3 = self.level(self.lv1, self.w / 2, self.h / 2, x, y, 2.0).scale(POST_W1);
+        let b : Vec3 = self.level(self.lv2, self.w / 4, self.h / 4, x, y, 4.0).scale(POST_W2);
+        let c : Vec3 = self.level(self.lv3, self.w / 8, self.h / 8, x, y, 8.0).scale(POST_W3);
+        let d : Vec3 = self.level(self.lv4, self.w / 16, self.h / 16, x, y, 16.0).scale(POST_W4);
+        return a.plus(b).plus(c).plus(d).scale(POST_BLOOM_GAIN);
+    }
+
+    // The display code (0..255) of one linear channel through the sRGB table.
+    fn encode(self, v : f32, dither : f32) : i32 {
+        let root : f32 = ludax::sqrt(saturate(v));
+        let at : f32 = root * (POST_TABLE as f32);
+        let i : i32 = at as i32;
+        let j : i32 = waterPickI(i < POST_TABLE, i + 1, i);
+        let t : f32 = at - (i as f32);
+        let value : f32 = self.code[i as i64] + (self.code[j as i64] - self.code[i as i64]) * t;
+        let c : i32 = (value * (255.0 as f32) + dither) as i32;
+        if (c < 0) {
+            return 0;
+        }
+        if (c > 255) {
+            return 255;
+        }
+        return c;
+    }
+
+    /** The display colour of render pixel (`x`, `y`) of `hdr`, before the sRGB code. */
+    fn shade(self, hdr : f32[], x : i32, y : i32, look : PostLook, plain : bool) : Vec3 {
+        let at : i64 = (((y * self.w) + x) * 3) as i64;
+        let raw : Vec3 = Vec3 { x: hdr[at], y: hdr[at + 1], z: hdr[at + 2] };
+        if (plain) {
+            return raw;
+        }
+        let half : f32 = 0.5;
+        let mut e : Vec3 = raw.scale(self.exposure);
+        e = e.plus(self.bloom((x as f32) + half, (y as f32) + half).scale(look.bloom));
+
+        // The vignette darkens the corners.
+        let nx : f32 = ((x as f32) + half) / (self.w as f32) - half;
+        let ny : f32 = ((y as f32) + half) / (self.h as f32) - half;
+        e = e.scale((1.0 as f32) - look.vignette * (nx * nx + ny * ny));
+
+        let m : f32 = e.maxComponent();
+        if (m <= 0.0) {
+            return Vec3::zero();
+        }
+        let index : f32 = min(m / POST_TONE_MAX, 1.0) * (POST_TABLE as f32);
+        let gain : f32 = self.tone[index as i64];
+        let mut c : Vec3 = e.scale(gain);
+
+        // Highlights lose saturation as film does: toward the colour's luminance as it nears white.
+        let lum : f32 = POST_LUMA_R * c.x + POST_LUMA_G * c.y + POST_LUMA_B * c.z;
+        let over : f32 = saturate((c.maxComponent() - POST_DESAT_KNEE) / ((1.0 as f32) - POST_DESAT_KNEE));
+        c = c.lerp(Vec3::splat(lum), over * POST_DESAT);
+        return c;
+    }
+
+    /** Writes render rows `begin` up to `end` as display words, each pixel `scale` times over. */
+    pub fn composeRows(mut self, hdr : f32[], look : PostLook, plain : bool, begin : i32, end : i32) : void {
+        let outW : i32 = self.w * self.scale;
+        for (y of begin..end) {
+            for (x of 0..self.w) {
+                let c : Vec3 = self.shade(hdr, x, y, look, plain);
+                let dither : f32 = waterHash(x, y, 0, POST_DITHER) - (0.5 as f32);
+                let word : i32 = Color::packBytes(
+                    self.encode(c.x, dither),
+                    self.encode(c.y, dither),
+                    self.encode(c.z, dither)
+                );
+                for (sy of 0..self.scale) {
+                    for (sx of 0..self.scale) {
+                        self.out[(((y * self.scale + sy) * outW) + x * self.scale + sx) as i64] = word;
+                    }
+                }
+            }
+        }
+    }
+}

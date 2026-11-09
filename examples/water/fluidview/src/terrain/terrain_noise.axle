@@ -1,0 +1,141 @@
+// terrain_noise — deterministic gradient noise and the fractal sums the landscape is built from.
+//
+// Everything here is a pure function of its arguments: a lattice hash picks one of eight gradients per corner, a
+// quintic fade blends them, and no table, clock or libm call is involved, so a seed gives the same ground on every
+// machine. The two fractal sums are the ones mountains need: `terrainFbm` (smooth rolling hills and the domain warp
+// that stops ridges running along the grid) and `terrainRidged` (a multifractal of folded noise: sharp crests,
+// broad valleys, each octave weighted by the ridge below it so detail gathers on the crests and the valleys stay
+// smooth, which is how a real range looks).
+//
+// Every octave is rotated and offset against the last: without that the lattice axes show as straight ridges.
+
+use ludax::{abs, lerp, min, saturate};
+
+// The rotation between octaves (a 3-4-5 triangle: exact in f32), and the frequency step.
+const NOISE_ROT_COS : f32 = 0.8;
+const NOISE_ROT_SIN : f32 = 0.6;
+const NOISE_LACUNARITY : f32 = 2.03;
+
+// The unit of a diagonal gradient, and what scales the sum of gradients up to about [-1, 1].
+const NOISE_DIAGONAL : f32 = 0.70710678;
+const NOISE_RANGE : f32 = 1.45;
+
+// The offset added to the coordinates of each octave, so no two octaves share a lattice origin.
+const NOISE_SHIFT : f32 = 31.7;
+
+// Octave gain of the ridged sum, and the weight a ridge gives the next octave.
+const NOISE_RIDGE_GAIN : f32 = 0.46;
+
+// How far into a noise's range the fold reaches: under 1 keeps the broad valleys from going flat.
+const NOISE_FOLD : f32 = 0.85;
+const NOISE_RIDGE_WEIGHT : f32 = 2.0;
+
+// What a typical ridged sum reaches before it is stretched to the unit: the crest of the sum is rarely 1.
+const NOISE_RIDGE_STRETCH : f32 = 1.0;
+
+fn noiseHash(ix : i32, iz : i32, seed : i32) : u32 {
+    let mut h : u32 = (ix as u32) * 374761393 + (iz as u32) * 668265263 + (seed as u32) * 1274126177;
+    h = (h ^ (h >>> 13)) * 1103515245;
+    return h ^ (h >>> 16);
+}
+
+fn noiseGradient(h : u32, dx : f32, dz : f32) : f32 {
+    let pick : i32 = (h & 7) as i32;
+    return match pick {
+        0 => dx,
+        1 => -dx,
+        2 => dz,
+        3 => -dz,
+        4 => (dx + dz) * NOISE_DIAGONAL,
+        5 => (dx - dz) * NOISE_DIAGONAL,
+        6 => (dz - dx) * NOISE_DIAGONAL,
+        _ => -(dx + dz) * NOISE_DIAGONAL,
+    };
+}
+
+fn noiseFade(t : f32) : f32 {
+    return t * t * t * (t * (t * 6.0 as f32 - 15.0 as f32) + 10.0 as f32);
+}
+
+/** The largest whole number not above `v`, as an `i32`. */
+pub fn terrainFloor(v : f32) : i32 {
+    let t : i32 = v as i32;
+    if ((t as f32) > v) {
+        return t - 1;
+    }
+    return t;
+}
+
+/** Gradient noise at (x, z): smooth, about uniform in [-1, 1], zero at the lattice points, one lattice cell per unit. */
+pub fn terrainNoise(x : f32, z : f32, seed : i32) : f32 {
+    let ix : i32 = terrainFloor(x);
+    let iz : i32 = terrainFloor(z);
+    let fx : f32 = x - (ix as f32);
+    let fz : f32 = z - (iz as f32);
+
+    let n00 : f32 = noiseGradient(noiseHash(ix, iz, seed), fx, fz);
+    let n10 : f32 = noiseGradient(noiseHash(ix + 1, iz, seed), fx - 1.0 as f32, fz);
+    let n01 : f32 = noiseGradient(noiseHash(ix, iz + 1, seed), fx, fz - 1.0 as f32);
+    let n11 : f32 = noiseGradient(noiseHash(ix + 1, iz + 1, seed), fx - 1.0 as f32, fz - 1.0 as f32);
+
+    let u : f32 = noiseFade(fx);
+    let v : f32 = noiseFade(fz);
+    let top : f32 = lerp(n00, n10, u);
+    let bottom : f32 = lerp(n01, n11, u);
+    return lerp(top, bottom, v) * NOISE_RANGE;
+}
+
+/** Fractal Brownian motion: `octaves` noises of halving amplitude, about [-1, 1], one cycle per unit at the base. */
+pub fn terrainFbm(x : f32, z : f32, seed : i32, octaves : i32) : f32 {
+    let mut px : f32 = x;
+    let mut pz : f32 = z;
+    let mut amp : f32 = 0.5 as f32;
+    let mut sum : f32 = 0.0 as f32;
+    let mut norm : f32 = 0.0 as f32;
+    for (o of 0..octaves) {
+        sum = sum + terrainNoise(px, pz, seed + o) * amp;
+        norm = norm + amp;
+        amp = amp * 0.5 as f32;
+        let rx : f32 = (px * NOISE_ROT_COS - pz * NOISE_ROT_SIN) * NOISE_LACUNARITY + NOISE_SHIFT;
+        let rz : f32 = (px * NOISE_ROT_SIN + pz * NOISE_ROT_COS) * NOISE_LACUNARITY - NOISE_SHIFT;
+        px = rx;
+        pz = rz;
+    }
+    return sum / norm;
+}
+
+/**
+ * Ridged multifractal in [0, 1], one cycle per unit at the base: crests at 1, valleys near 0. `sharpness` in
+ * [0, 1] narrows the crests (0 rounds them into hills, 1 makes them arêtes).
+ */
+pub fn terrainRidged(x : f32, z : f32, seed : i32, octaves : i32, sharpness : f32) : f32 {
+    let power : f32 = 1.0 as f32 + sharpness * 1.6 as f32;
+    let mut px : f32 = x;
+    let mut pz : f32 = z;
+    let mut amp : f32 = 1.0 as f32;
+    let mut weight : f32 = 1.0 as f32;
+    let mut sum : f32 = 0.0 as f32;
+    let mut norm : f32 = 0.0 as f32;
+    for (o of 0..octaves) {
+        let fold : f32 = 1.0 as f32 - min(1.0 as f32, abs(terrainNoise(px, pz, seed + o)) * NOISE_FOLD);
+        let ridge : f32 = noisePower(fold, power);
+        sum = sum + ridge * weight * amp;
+        norm = norm + amp;
+        weight = saturate(ridge * NOISE_RIDGE_WEIGHT);
+        amp = amp * NOISE_RIDGE_GAIN;
+        let rx : f32 = (px * NOISE_ROT_COS - pz * NOISE_ROT_SIN) * NOISE_LACUNARITY + NOISE_SHIFT;
+        let rz : f32 = (px * NOISE_ROT_SIN + pz * NOISE_ROT_COS) * NOISE_LACUNARITY - NOISE_SHIFT;
+        px = rx;
+        pz = rz;
+    }
+    return saturate(sum / norm * NOISE_RIDGE_STRETCH);
+}
+
+// v to a power between 1 and 2.6 without libm: blend of v, v squared and v cubed.
+fn noisePower(v : f32, power : f32) : f32 {
+    let sq : f32 = v * v;
+    if (power < 2.0 as f32) {
+        return lerp(v, sq, power - 1.0 as f32);
+    }
+    return lerp(sq, sq * v, power - 2.0 as f32);
+}

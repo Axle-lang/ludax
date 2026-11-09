@@ -1,0 +1,460 @@
+// crown_volume — the white aerated crown at the foot of a fall, drawn as a volume the engine's water fills.
+//
+// Where a fall lands the water is not a surface: it is a churning mass of air and water that rises a few metres and
+// thins into spray. The engine says where: its particles near the impact (a landing throws spray up and out) and
+// its foam and turbulence on the pool. Each picture the volume bins both into a small grid of density above the pool
+// (`build`: serial, a few thousand particles and a few thousand columns), blurs it a little, and every pixel whose ray
+// crosses the box marches through it (`over`) and takes the light of the aerated water on the way:
+//
+//   shape      the grid's smooth density is eroded by billowy and fractal noise that rises with the water, so the mass
+//              has a cauliflower outline of bubbles and lace and no smooth blob; thin edges break up first
+//   light      white, lit from above by the sky and by the sun with one shadow tap toward it, brightest at the top,
+//              a turquoise inside where the water is still dense, with a silver rim where it is backlit
+//   cost       a pixel outside the box pays a ray-box test; inside, empty cells are skipped by one trilinear read
+//
+// The grid is `u8`-small on purpose (f32 here: 64 x 32 x 64 cells), allocated once; nothing allocates per picture.
+
+use ludax::{abs, clamp, max, min, saturate, smoothstep, sqrt, Vec3};
+
+use crate::water::drop_store::{DropStore, DROP_FROTH};
+use crate::water::noise::{waterBillow3, waterExpNeg, waterFbm3, waterHighI, waterLowI, waterPick};
+use crate::water::sky::WaterSky;
+use crate::water::vista_look::CrownLook;
+use crate::water::water_window::{WaterWindow, WindowSpot};
+
+// Cells of the grid along x, z and y.
+const CROWN_NX : i32 = 64;
+const CROWN_NZ : i32 = 64;
+const CROWN_NY : i32 = 32;
+
+// Density a particle adds in all (shared among the eight cells around it), and a column's own aerated water adds at the surface
+// and the height (metres) over which it thins.
+const CROWN_DROP : f32 = 1.5;
+
+// A froth parcel's weight against a drop's, and how many of its drawn radii its blob spreads over.
+const CROWN_FROTH : f32 = 3.0;
+const CROWN_FROTH_SPREAD : f32 = 1.2;
+
+// A drop's blob: its standard deviation at the water, cells, and the growth of it per cell of height.
+const CROWN_BLOB : f32 = 0.75;
+const CROWN_BLOB_GROWTH : f32 = 0.05;
+const CROWN_FOAM_PEAK : f32 = 0.5;
+
+// The grid's floor lies this far under the pool's surface, so the mass never ends in a flat bottom above the water, metres.
+const CROWN_SINK : f32 = 2.5;
+const CROWN_FOAM_HEIGHT : f32 = 1.6;
+
+// A drop higher than this over the pool's level adds to the volume only by a share that falls to nothing here, metres.
+const CROWN_TOP : f32 = 22.0;
+
+// The plume's shape: only drops this high over the pool count (metres), the spread of the drops scaled to the plume's half length
+// and half width, the mean height scaled to its height, and the plume's least and greatest size, metres.
+
+// Cells at the box's border over which the density fades to zero.
+const CROWN_RIM : f32 = 5.0;
+
+// The march: the most steps of a ray, the shortest and longest step, metres, and the opacity at which it stops.
+const CROWN_STEPS : i32 = 22;
+const CROWN_STEP_MIN : f32 = 0.35;
+const CROWN_STEP_MAX : f32 = 2.0;
+const CROWN_OPAQUE : f32 = 0.015;
+
+// Noise: wavelength of the billows and of the fine lace, metres, the speed the pattern rises at, and the seed.
+const CROWN_BILLOW : f32 = 2.6;
+const CROWN_LACE : f32 = 0.55;
+const CROWN_RISE : f32 = 2.4;
+const CROWN_SEED : i32 = 811;
+
+// How hard the noise erodes the density: 0 smooth, 1 only the noise's peaks stay.
+const CROWN_ERODE : f32 = 1.25;
+
+// Width of the soft edge between water and air in the eroded density, and the wavelength of the smallest bubbles, metres.
+const CROWN_EDGE : f32 = 0.3;
+const CROWN_BUBBLE : f32 = 0.2;
+
+// The one step toward the sun the shadow is read over, metres.
+const CROWN_SHADOW_STEP : f32 = 2.0;
+
+// The least light of a shadowed bit of the crown: the bubbles scatter the light on round the corner.
+const CROWN_SHADOW_FLOOR : f32 = 0.3;
+
+// Light: how much of the sky's overhead light the volume shows, the sun's share, and the sun's forward lobe.
+const CROWN_AMBIENT : f32 = 2.4;
+const CROWN_SUN : f32 = 1.8;
+const CROWN_FORWARD : f32 = 2.2;
+
+/** The crown. */
+pub class CrownVolume {
+    /** Whether the last `build` made a volume to draw. */
+    pub live : bool = false;
+
+    density  : f32[];
+    scratch  : f32[];
+    look     : CrownLook = CrownLook {};
+    cell     : f32 = (1.0 as f32);
+    x0       : f32 = (0.0 as f32);
+    z0       : f32 = (0.0 as f32);
+    sunDir   : Vec3 = Vec3 { x: (0.0 as f32), y: (1.0 as f32), z: (0.0 as f32) };
+    sunIrr   : Vec3 = Vec3::zero();
+    skyLight : Vec3 = Vec3::zero();
+    sunLight : Vec3 = Vec3::zero();
+
+    /** An empty crown. */
+    constructor() {
+        let n : i64 = (CROWN_NX as i64) * CROWN_NZ * CROWN_NY;
+        self.density = new f32[n];
+        self.scratch = new f32[n];
+    }
+
+    // The grid's index of cell (`i`, `j`, `k`): x, height, z.
+    fn at(i : i32, j : i32, k : i32) : i64 {
+        return ((((j * CROWN_NZ) + k) * CROWN_NX) + i) as i64;
+    }
+
+    /** Fills the grid from the drops of `store` and the foam of `window` over the pool `look` names. */
+    pub fn build(
+        mut self,
+        store : Shared<DropStore>,
+        window : Shared<WaterWindow>,
+        look : CrownLook,
+        sky : Shared<WaterSky>
+    ) : void {
+        self.live = look.enabled;
+        if (!look.enabled) {
+            return;
+        }
+        self.look = look;
+        self.look.level = look.level - CROWN_SINK;
+        self.sunDir = sky.sunDir;
+        self.sunIrr = sky.sunIrr;
+        self.skyLight = sky.ambient(Vec3::unitY()).scale(CROWN_AMBIENT);
+        self.sunLight = sky.direct(Vec3::unitY()).scale(CROWN_SUN);
+        self.cell = (2.0 as f32) * look.reach / (CROWN_NX as f32);
+        self.x0 = look.x - look.reach;
+        self.z0 = look.z - look.reach;
+        let n : i64 = (CROWN_NX as i64) * CROWN_NZ * CROWN_NY;
+        for (c of 0..n) {
+            self.density[c] = (0.0 as f32);
+        }
+        self.binDrops(store);
+        self.binFoam(window);
+        self.smoothOut();
+    }
+
+    // Each drop in the box adds a soft gaussian blob of its weight: tight near the water, wider and thinner higher up, where the
+    // spray has spread and dissolves into single droplets.
+    fn binDrops(mut self, store : Shared<DropStore>) : void {
+        let inv : f32 = (1.0 as f32) / self.cell;
+        for (d of 0..(store.count as i64)) {
+            let u : f32 = (store.positions[d * 3] + store.shiftX - self.x0) * inv - (0.5 as f32);
+            let v : f32 = (store.positions[d * 3 + 1] - self.look.level) * inv - (0.5 as f32);
+            let w : f32 = (store.positions[d * 3 + 2] + store.shiftZ - self.z0) * inv - (0.5 as f32);
+            if (u < (1.0 as f32) || w < (1.0 as f32) || v < (1.0 as f32)) {
+                continue;
+            }
+            if (u >= ((CROWN_NX - 2) as f32) || w >= ((CROWN_NZ - 2) as f32)
+                || v >= ((CROWN_NY - 2) as f32)) {
+                continue;
+            }
+            let high : f32 = v * self.cell;
+            let mut spread : f32 = CROWN_BLOB + CROWN_BLOB_GROWTH * high * inv;
+            let mut share : f32 = CROWN_DROP;
+            if (store.kinds[d] == DROP_FROTH) {
+                spread = max(CROWN_BLOB, store.radii[d] * inv * CROWN_FROTH_SPREAD);
+                share = CROWN_FROTH * store.fade[d];
+            }
+            let weight : f32 = share * smoothstep(CROWN_TOP, CROWN_TOP * (0.5 as f32), high)
+                / (spread * spread * spread);
+            self.blob(u, v, w, spread, weight);
+        }
+    }
+
+    // A gaussian of standard deviation `spread` cells over the 27 cells around (`u`, `v`, `w`), its weight in all `amount`.
+    fn blob(mut self, u : f32, v : f32, w : f32, spread : f32, amount : f32) : void {
+        let i : i32 = (u + (0.5 as f32)) as i32;
+        let j : i32 = (v + (0.5 as f32)) as i32;
+        let k : i32 = (w + (0.5 as f32)) as i32;
+        let falloff : f32 = (0.0 as f32) - (0.5 as f32) / (spread * spread);
+        let mut sum : f32 = (0.0 as f32);
+        for (dk of -1..2) {
+            for (dj of -1..2) {
+                for (di of -1..2) {
+                    let x : f32 = ((i + di) as f32) - u;
+                    let y : f32 = ((j + dj) as f32) - v;
+                    let z : f32 = ((k + dk) as f32) - w;
+                    sum = sum + waterExpNeg((0.0 as f32) - falloff * (x * x + y * y + z * z));
+                }
+            }
+        }
+        let scale : f32 = amount / max(sum, (0.001 as f32));
+        for (dk of -1..2) {
+            for (dj of -1..2) {
+                for (di of -1..2) {
+                    let x : f32 = ((i + di) as f32) - u;
+                    let y : f32 = ((j + dj) as f32) - v;
+                    let z : f32 = ((k + dk) as f32) - w;
+                    let at : i64 = CrownVolume::at(i + di, j + dj, k + dk);
+                    self.density[at] = self.density[at]
+                        + scale * waterExpNeg((0.0 as f32) - falloff * (x * x + y * y + z * z));
+                }
+            }
+        }
+    }
+
+    // The pool's own aerated water: each column's foam and turbulence, thinning upward from the surface.
+    fn binFoam(mut self, window : Shared<WaterWindow>) : void {
+        for (k of 0..CROWN_NZ) {
+            for (i of 0..CROWN_NX) {
+                let x : f32 = self.x0 + ((i as f32) + (0.5 as f32)) * self.cell;
+                let z : f32 = self.z0 + ((k as f32) + (0.5 as f32)) * self.cell;
+                let s : WindowSpot = window.at(x, z);
+                let deep : f32 = smoothstep((0.2 as f32), (1.0 as f32), s.depth);
+                let aeration : f32 = deep * saturate(s.foam * s.turbulence * (1.4 as f32));
+                if (aeration <= (0.01 as f32)) {
+                    continue;
+                }
+                for (j of 0..CROWN_NY) {
+                    let h : f32 = ((j as f32) + (0.5 as f32)) * self.cell;
+                    let up : f32 = waterExpNeg(h / CROWN_FOAM_HEIGHT);
+                    if (up < (0.02 as f32)) {
+                        break;
+                    }
+                    let at : i64 = CrownVolume::at(i, j, k);
+                    self.density[at] = self.density[at] + aeration * up * CROWN_FOAM_PEAK;
+                }
+            }
+        }
+    }
+
+    // A box blur along each axis, then the fade to nothing at the box's rim.
+    fn smoothOut(mut self) : void {
+        self.blur(1, 0, 0);
+        self.blur(0, 1, 0);
+        self.blur(0, 0, 1);
+        for (j of 0..CROWN_NY) {
+            for (k of 0..CROWN_NZ) {
+                for (i of 0..CROWN_NX) {
+                    let edge : f32 = min(
+                        min((i as f32), ((CROWN_NX - 1 - i) as f32)),
+                        min((k as f32), ((CROWN_NZ - 1 - k) as f32))
+                    );
+                    let top : f32 = ((CROWN_NY - 1 - j) as f32);
+                    let fade : f32 = saturate(min(edge, top) / CROWN_RIM);
+                    let at : i64 = CrownVolume::at(i, j, k);
+                    self.density[at] = self.density[at] * fade;
+                }
+            }
+        }
+    }
+
+    // One pass of the three-tap box blur along the axis (`dx`, `dy`, `dz`).
+    fn blur(mut self, dx : i32, dy : i32, dz : i32) : void {
+        for (j of 0..CROWN_NY) {
+            for (k of 0..CROWN_NZ) {
+                for (i of 0..CROWN_NX) {
+                    let a : i64 = CrownVolume::at(
+                        waterHighI(i - dx, 0),
+                        waterHighI(j - dy, 0),
+                        waterHighI(k - dz, 0)
+                    );
+                    let b : i64 = CrownVolume::at(i, j, k);
+                    let c : i64 = CrownVolume::at(
+                        waterLowI(i + dx, CROWN_NX - 1),
+                        waterLowI(j + dy, CROWN_NY - 1),
+                        waterLowI(k + dz, CROWN_NZ - 1)
+                    );
+                    self.scratch[b] = (self.density[a] + self.density[b] * (2.0 as f32) + self.density[c])
+                        * (0.25 as f32);
+                }
+            }
+        }
+        let n : i64 = (CROWN_NX as i64) * CROWN_NZ * CROWN_NY;
+        for (c of 0..n) {
+            self.density[c] = self.scratch[c];
+        }
+    }
+
+    // The density at the cell coordinates (`u`, `v`, `w`), trilinear; zero outside.
+    fn sample(self, u : f32, v : f32, w : f32) : f32 {
+        if (u < (0.0 as f32) || v < (0.0 as f32) || w < (0.0 as f32)) {
+            return (0.0 as f32);
+        }
+        if (u >= ((CROWN_NX - 1) as f32) || v >= ((CROWN_NY - 1) as f32) || w >= ((CROWN_NZ - 1) as f32)) {
+            return (0.0 as f32);
+        }
+        let i : i32 = u as i32;
+        let j : i32 = v as i32;
+        let k : i32 = w as i32;
+        let fu : f32 = u - (i as f32);
+        let fv : f32 = v - (j as f32);
+        let fw : f32 = w - (k as f32);
+        let a : i64 = CrownVolume::at(i, j, k);
+        let row : i64 = CROWN_NX as i64;
+        let layer : i64 = row * CROWN_NZ;
+        let n00 : f32 = self.density[a] + (self.density[a + 1] - self.density[a]) * fu;
+        let n10 : f32 = self.density[a + row] + (self.density[a + row + 1] - self.density[a + row]) * fu;
+        let n01 : f32 = self.density[a + layer]
+            + (self.density[a + layer + 1] - self.density[a + layer]) * fu;
+        let n11 : f32 = self.density[a + layer + row]
+            + (self.density[a + layer + row + 1] - self.density[a + layer + row]) * fu;
+        let low : f32 = n00 + (n10 - n00) * fw;
+        let high : f32 = n01 + (n11 - n01) * fw;
+        return low + (high - low) * fv;
+    }
+
+    // The distances at which the ray enters and leaves the box, entry above exit for a miss.
+    fn clip(self, eye : Vec3, dir : Vec3) : Vec3 {
+        let reach : f32 = self.look.reach;
+        let top : f32 = self.look.level + (CROWN_NY as f32) * self.cell;
+        let mut near : f32 = (0.0 as f32);
+        let mut far : f32 = (1000000.0 as f32);
+        let lows : Vec3 = Vec3 { x: self.look.x - reach, y: self.look.level, z: self.look.z - reach };
+        let highs : Vec3 = Vec3 { x: self.look.x + reach, y: top, z: self.look.z + reach };
+        for (axis of 0..3) {
+            let o : f32 = CrownVolume::axis(eye, axis);
+            let d : f32 = CrownVolume::axis(dir, axis);
+            let lo : f32 = CrownVolume::axis(lows, axis);
+            let hi : f32 = CrownVolume::axis(highs, axis);
+            if (abs(d) < (0.000001 as f32)) {
+                if (o < lo || o > hi) {
+                    return Vec3 { x: (1.0 as f32), y: (0.0 as f32), z: (0.0 as f32) };
+                }
+                continue;
+            }
+            let t0 : f32 = (lo - o) / d;
+            let t1 : f32 = (hi - o) / d;
+            near = max(near, min(t0, t1));
+            far = min(far, max(t0, t1));
+        }
+        return Vec3 { x: near, y: far, z: (0.0 as f32) };
+    }
+
+    static fn axis(v : Vec3, a : i32) : f32 {
+        if (a == 0) {
+            return v.x;
+        }
+        if (a == 1) {
+            return v.y;
+        }
+        return v.z;
+    }
+
+    // The light left at `p` after the grid's mass between it and the sun: three taps toward the sun.
+    fn shadowAt(self, p : Vec3, toSun : Vec3) : f32 {
+        let inv : f32 = (1.0 as f32) / self.cell;
+        let mut optical : f32 = (0.0 as f32);
+        let mut reach : f32 = CROWN_SHADOW_STEP * (0.5 as f32);
+        for (k of 0..3) {
+            let q : Vec3 = p.plus(toSun.scale(reach));
+            optical = optical
+                + self.sample(
+                    (q.x - self.x0) * inv - (0.5 as f32),
+                    (q.y - self.look.level) * inv - (0.5 as f32),
+                    (q.z - self.z0) * inv - (0.5 as f32)
+                )
+                    * reach;
+            reach = reach * (2.0 as f32);
+        }
+        return waterExpNeg(optical * self.look.sigma * (0.1 as f32));
+    }
+
+    // The density at a world point with the noise's erosion: the grid's mass cut into billows and lace.
+    fn dense(self, p : Vec3, time : f32, fine : bool) : f32 {
+        let inv : f32 = (1.0 as f32) / self.cell;
+        let base : f32 = self.sample(
+            (p.x - self.x0) * inv - (0.5 as f32),
+            (p.y - self.look.level) * inv - (0.5 as f32),
+            (p.z - self.z0) * inv - (0.5 as f32)
+        );
+        let mass : f32 = base;
+        if (mass < (0.02 as f32)) {
+            return (0.0 as f32);
+        }
+        let lift : f32 = time * CROWN_RISE;
+        let q : Vec3 = Vec3 { x: p.x, y: p.y - lift, z: p.z };
+        let mut carve : f32 = waterBillow3(q.scale((1.0 as f32) / CROWN_BILLOW), 2, CROWN_SEED);
+        if (fine) {
+            let froth : f32 = waterFbm3(q.scale((1.0 as f32) / CROWN_LACE), 3, CROWN_SEED + 7);
+            let bubbles : f32 = waterFbm3(
+                Vec3 { x: q.x, y: q.y - lift * (0.6 as f32), z: q.z }.scale((1.0 as f32) / CROWN_BUBBLE),
+                2,
+                CROWN_SEED + 13
+            );
+            carve = (0.45 as f32) * carve + (0.35 as f32) * froth + (0.2 as f32) * bubbles;
+        }
+        let lumps : f32 = (0.5 as f32)
+            + (1.1 as f32)
+                * waterBillow3(p.scale((1.0 as f32) / (CROWN_BILLOW * (2.5 as f32))), 2, CROWN_SEED + 21);
+        let cut : f32 = mass * (1.6 as f32) * lumps - CROWN_ERODE * ((1.0 as f32) - carve);
+        return smoothstep((0.0 as f32), CROWN_EDGE, cut) * min(mass * (2.0 as f32), (1.0 as f32));
+    }
+
+    /**
+     * `behind` seen through the crown along the ray from `eye` along `dir`, up to `reach` metres (the first surface
+     * the ray meets): the volume's light over it. `footprint` is the pixel's size at the crown, for the level of detail.
+     */
+    pub fn over(
+        self,
+        behind : Vec3,
+        eye : Vec3,
+        dir : Vec3,
+        reach : f32,
+        time : f32,
+        footprint : f32
+    ) : Vec3 {
+        if (!self.live) {
+            return behind;
+        }
+        let span : Vec3 = self.clip(eye, dir);
+        let near : f32 = span.x;
+        let far : f32 = min(span.y, reach);
+        if (far <= near) {
+            return behind;
+        }
+        let step : f32 = clamp(
+            (far - near) / (CROWN_STEPS as f32),
+            max(CROWN_STEP_MIN, footprint),
+            max(CROWN_STEP_MAX, footprint)
+        );
+        let fine : bool = footprint < (0.45 as f32);
+        let sunY : Vec3 = self.sunDir;
+        let skyLight : Vec3 = self.skyLight;
+        let sunLight : Vec3 = self.sunLight;
+        let silver : f32 = max(dir.dot(sunY), (0.0 as f32));
+        let forward : Vec3 = self.sunIrr.scale(CROWN_FORWARD * silver * silver * silver * silver
+            / (3.14159 as f32));
+        let turquoise : Vec3 = Vec3 { x: (0.6 as f32), y: (0.85 as f32), z: (0.9 as f32) };
+        let mut seen : Vec3 = Vec3::zero();
+        let mut open : f32 = (1.0 as f32);
+        let mut t : f32 = near + step * (0.5 as f32);
+        for (s of 0..CROWN_STEPS) {
+            if (t >= far || open < CROWN_OPAQUE) {
+                break;
+            }
+            let p : Vec3 = eye.plus(dir.scale(t));
+            let d : f32 = self.dense(p, time, fine);
+            if (d > (0.0 as f32)) {
+                let thick : f32 = d * self.look.sigma * step;
+                let take : f32 = (1.0 as f32) - waterExpNeg(thick);
+                let mut shadow : f32 = (0.7 as f32);
+                shadow = max(self.shadowAt(p, sunY), CROWN_SHADOW_FLOOR);
+                let height : f32 = saturate((p.y - self.look.level)
+                    / (self.cell * (CROWN_NY as f32) * (0.5 as f32)));
+                let tint : Vec3 = turquoise.lerp(
+                    Vec3::splat((1.0 as f32)),
+                    saturate((0.4 as f32) + shadow * (0.6 as f32))
+                );
+                let lit : Vec3 = skyLight
+                    .scale((0.55 as f32) + (0.45 as f32) * height)
+                    .plus(sunLight.scale(shadow))
+                    .plus(forward.scale(shadow))
+                    .times(tint)
+                    .scale((0.6 as f32) + (0.6 as f32) * d);
+                seen = seen.plus(lit.scale(open * take));
+                open = open * ((1.0 as f32) - take);
+            }
+            t = t + step;
+        }
+        return behind.scale(open).plus(seen);
+    }
+}

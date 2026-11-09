@@ -1,0 +1,306 @@
+// frame — one picture: the stages the job pool runs, and the samples they accumulate.
+//
+// A frame is a fixed sequence of stages, each a loop over rows or tiles that the pool cuts into chunks (see
+// `kernel`: the cut depends on the counts alone, never on the threads), and every chunk writes only the pixels it
+// owns, so the picture is the same on one thread and on twenty-three:
+//
+//   SkyBake, FieldLight, DropLight   the tables the pixels will read (only when the scene changed)
+//   Trace      a primary ray per pixel against the water or the ground, shaded and hazed: writes the scene
+//              radiance and the depth the drops are tested against
+//   Splat      the drops, a tile a job, into one layer
+//   Resolve    scene and drops composed into one sample, and averaged into the running mean of the samples of a
+//              still picture
+//   Bright, Display   the bloom's first level and the pack to pixels (`post`)
+//
+// The sample of frame `n` of a still picture is jittered inside its pixel by the n-th point of the R2 sequence (the
+// first sample is the pixel's centre), which is what antialiases the water's glints and the edges of the drops
+// without a single random number: the running mean is an exact box filter of the points seen so far.
+
+use ludax::{max, min, saturate, Vec3, RangeKernel};
+
+use crate::water::camera::WaterCamera;
+use crate::water::drop_shadow::DropShadow;
+use crate::water::field::WaterField;
+use crate::water::look::WaterLook;
+use crate::water::march::{HeightMarch, MarchHit, MarchRay, MarchTarget, MARCH_FAR};
+use crate::water::noise::{waterExpNeg, waterHash, waterHighI};
+use crate::water::post::WaterPost;
+use crate::water::sky::WaterSky;
+use crate::water::spray::WaterSpray;
+use crate::water::surface::{WaterSpot, WaterSurface};
+use crate::water::terrain::{GroundSpot, WaterTerrain};
+
+// The R2 sequence: the two fractions that generate it.
+const FRAME_R2_X : f32 = 0.7548776662;
+const FRAME_R2_Y : f32 = 0.5698402910;
+
+// Ground whose water is shallower than this is shaded as ground.
+const FRAME_DRY : f32 = 0.004;
+
+// The depth a sky pixel is given, so every drop is in front of it.
+const FRAME_SKY_DEPTH : f32 = 1000000.0;
+
+// Channels beyond this are not light but a numeric accident (a divide that slipped): the sample is discarded.
+const FRAME_LIMIT : f32 = 100000000.0;
+
+/** What the pool is working on. */
+pub enum FrameStage : i8 {
+    /** Bake the sky's radiance grid. */
+    SkyBake,
+
+    /** Bake the field's lightmap (shadow and occlusion of the bed). */
+    FieldLight,
+
+    /** Bake the optical depths of the drops' own shadow grid. */
+    DropLight,
+
+    /** Trace one sample per pixel. */
+    Trace,
+
+    /** Composite the drops, one tile a job. */
+    Splat,
+
+    /** Compose the sample and fold it into the mean. */
+    Resolve,
+
+    /** Pick the bright light for the bloom. */
+    Bright,
+
+    /** Tone map and pack to pixels. */
+    Display,
+}
+
+/** The picture being drawn and the kernel that draws it. */
+pub class WaterFrame : RangeKernel {
+    /** Picture width, pixels. */
+    pub w : i32;
+
+    /** Picture height, pixels. */
+    pub h : i32;
+
+    /** What `runRange` does next. */
+    pub stage : FrameStage = FrameStage::Trace;
+
+    /** The camera of the sample being drawn. */
+    pub cam : WaterCamera = WaterCamera {};
+
+    /** The look of the frame. */
+    pub look : WaterLook = WaterLook {};
+
+    /** The sample's number: 0 is the first of a picture. */
+    pub index : i32 = 0;
+
+    /** Simulation seconds. */
+    pub time : f32 = 0.0;
+
+    /** The running mean of the samples of the picture: what `post` shows. */
+    pub hdr : f32[];
+
+    /** The sky. */
+    pub sky : Shared<WaterSky>;
+
+    /** The water's shader. */
+    pub surface : WaterSurface;
+
+    /** The shadow the column of drops casts on itself: a coarse grid of their density, never marched. */
+    pub shadow : DropShadow;
+
+    /** The drops. */
+    pub spray : WaterSpray;
+
+    /** The display stage. */
+    pub post : WaterPost;
+
+    field : Shared<WaterField>;
+
+    // Per pixel: scene radiance (3) and the opaque depth the spray is tested against.
+    scene : f32[];
+
+    /** A frame of `w` by `h` pixels over `field`, shown at `scale` times that size, holding `drops` at most. */
+    constructor(field : Shared<WaterField>, w : i32, h : i32, scale : i32, drops : i32) {
+        self.field = field;
+        self.w = w;
+        self.h = h;
+        let n : i64 = (w as i64) * h;
+        self.hdr = new f32[n * 3];
+        self.scene = new f32[n * 3];
+        for (i of 0..(n * 3)) {
+            self.hdr[i] = 0.0;
+        }
+        self.sky = share new WaterSky();
+        let ground : WaterTerrain = new WaterTerrain(field, self.sky, self.look.terrain, true);
+        self.surface = new WaterSurface(field, self.sky, ground, self.look.surface, self.look.physics);
+        self.shadow = new DropShadow();
+        self.spray = new WaterSpray(w, h, drops);
+        self.post = new WaterPost(w, h, scale);
+    }
+
+    /** Rows or tiles the current stage has. */
+    pub fn rows(self) : i32 {
+        return match self.stage {
+            FrameStage::SkyBake => self.sky.rows(),
+            FrameStage::FieldLight => self.field.lightRows(),
+            FrameStage::DropLight => self.shadow.lightRows(),
+            FrameStage::Splat => self.spray.tiles(),
+            FrameStage::Bright => self.post.brightRowCount(),
+            _ => self.h,
+        };
+    }
+
+    /** Does rows `begin` up to `end` of whatever `stage` names. */
+    pub fn runRange(mut self, begin : i32, end : i32) : void {
+        match self.stage {
+            FrameStage::SkyBake => self.sky.bakeRows(begin, end),
+            FrameStage::FieldLight => self.field.bakeLight(begin, end, self.sky.sunDir),
+            FrameStage::DropLight => self.shadow.bakeLight(begin, end),
+            FrameStage::Trace => self.trace(begin, end),
+            FrameStage::Splat => self.splatTiles(begin, end),
+            FrameStage::Resolve => self.resolve(begin, end),
+            FrameStage::Bright => self.post.brightRows(self.hdr, begin, end),
+            FrameStage::Display => self.post.composeRows(
+                self.hdr,
+                self.look.post,
+                !self.look.modules.post,
+                begin,
+                end
+            ),
+        }
+    }
+
+    fn splatTiles(mut self, begin : i32, end : i32) : void {
+        for (tile of begin..end) {
+            self.spray.splatTile(tile);
+        }
+    }
+
+    // The sub-pixel position of sample `n`: the n-th R2 point, the pixel's centre for the first.
+    fn jitterOf(self, n : i32) : Vec3 {
+        let a : f32 = (n as f32) * FRAME_R2_X + (0.5 as f32);
+        let b : f32 = (n as f32) * FRAME_R2_Y + (0.5 as f32);
+        return Vec3 { x: a - (a as i32 as f32), y: b - (b as i32 as f32), z: 0.0 };
+    }
+
+    /** The offset in pixels the spray's splats are shifted by this sample, from the centre. */
+    pub fn splatOffset(self) : Vec3 {
+        let j : Vec3 = self.jitterOf(self.index);
+        return Vec3 { x: j.x - (0.5 as f32), y: j.y - (0.5 as f32), z: 0.0 };
+    }
+
+    // Traces rows `begin` up to `end`.
+    fn trace(mut self, begin : i32, end : i32) : void {
+        let jitter : Vec3 = self.jitterOf(self.index);
+        for (y of begin..end) {
+            for (x of 0..self.w) {
+                self.tracePixel(x, y, jitter);
+            }
+        }
+    }
+
+    // One primary ray: the surface it meets.
+    fn tracePixel(mut self, x : i32, y : i32, jitter : Vec3) : void {
+        let i : i64 = ((y * self.w) + x) as i64;
+        let dir : Vec3 = self.cam.ray((x as f32) + jitter.x, (y as f32) + jitter.y);
+        let spread : f32 = self.cam.footprint(1.0);
+
+        let mut colour : Vec3 = Vec3::zero();
+        let mut depth : f32 = FRAME_SKY_DEPTH;
+        let ray : MarchRay = MarchRay {
+            origin: self.cam.eye,
+            dir: dir,
+            from: 0.0,
+            to: MARCH_FAR,
+            spread: spread,
+        };
+        let target : MarchTarget = self.target();
+        let hit : MarchHit = HeightMarch::first(self.field, target, ray);
+        if (hit.hit) {
+            depth = hit.t;
+            colour = self.surfaceColour(ray, hit.t, target, dir, spread);
+        } else {
+            colour = self.sky.view(dir);
+        }
+
+        self.store(i, colour, depth);
+    }
+
+    // What the primary ray's hit looks like: ground or water, then dissolved into the haze by distance.
+    fn surfaceColour(self, ray : MarchRay, t : f32, target : MarchTarget, dir : Vec3, spread : f32) : Vec3 {
+        let p : Vec3 = HeightMarch::at(ray, t);
+        let footprint : f32 = spread * t;
+        let depth : f32 = self.field.surfaceHeight(p.x, p.z) - self.field.bedHeight(p.x, p.z);
+        let mut c : Vec3 = Vec3::zero();
+        if (target == MarchTarget::Surface && depth > FRAME_DRY) {
+            c = self.surface.shade(WaterSpot { point: p, view: dir, footprint: footprint, time: self.time });
+        } else {
+            c = self.surface.terrain.shade(GroundSpot { point: p, view: dir, footprint: footprint });
+        }
+        return self.hazed(c, t, dir);
+    }
+
+    // `c` seen through `t` cells of air: it takes on the colour of the horizon.
+    fn hazed(self, c : Vec3, t : f32, dir : Vec3) : Vec3 {
+        let distance : f32 = self.look.sky.hazeDistance;
+        if (distance <= 0.0) {
+            return c;
+        }
+        let share : f32 = (1.0 as f32) - waterExpNeg(t / distance);
+        return c.lerp(self.sky.haze(dir).scale(self.look.sky.hazeGain), share);
+    }
+
+    // The surface the primary ray is marched against: the water's top, or the bare ground without the surface module.
+    fn target(self) : MarchTarget {
+        if (self.look.modules.surface) {
+            return MarchTarget::Surface;
+        }
+        return MarchTarget::Bed;
+    }
+
+    fn store(mut self, i : i64, colour : Vec3, depth : f32) : void {
+        self.scene[i * 3] = colour.x;
+        self.scene[i * 3 + 1] = colour.y;
+        self.scene[i * 3 + 2] = colour.z;
+        self.spray.sceneDepth[i] = depth;
+    }
+
+    // Composes rows: the scene with the drops over it, folded into the running mean.
+    fn resolve(mut self, begin : i32, end : i32) : void {
+        let weight : f32 = (1.0 as f32) / ((self.index + 1) as f32);
+        for (y of begin..end) {
+            for (x of 0..self.w) {
+                let i : i64 = ((y * self.w) + x) as i64;
+                let c : Vec3 = self.compose(i);
+                for (k of 0..3) {
+                    let v : f32 = WaterFrame::channel(c, k);
+                    self.hdr[i * 3 + k] = self.hdr[i * 3 + k] + (v - self.hdr[i * 3 + k]) * weight;
+                }
+            }
+        }
+    }
+
+    // Channel `k` (0 red, 1 green, 2 blue) of `c`.
+    static fn channel(c : Vec3, k : i32) : f32 {
+        if (k == 0) {
+            return c.x;
+        }
+        if (k == 1) {
+            return c.y;
+        }
+        return c.z;
+    }
+
+    // The sample of pixel `i`: the scene with the drops over it; zero if it came out as nonsense.
+    fn compose(self, i : i64) : Vec3 {
+        let scene : Vec3 = Vec3 { x: self.scene[i * 3], y: self.scene[i * 3 + 1], z: self.scene[i * 3 + 2] };
+        let b : i64 = i * 4;
+        let drops : Vec3 = Vec3 {
+            x: self.spray.layer[b],
+            y: self.spray.layer[b + 1],
+            z: self.spray.layer[b + 2],
+        };
+        let c : Vec3 = scene.scale(1.0 - self.spray.layer[b + 3]).plus(drops);
+        if (!(c.maxComponent() < FRAME_LIMIT) || c.x < 0.0 || c.y < 0.0 || c.z < 0.0) {
+            return Vec3::zero();
+        }
+        return c;
+    }
+}

@@ -1,0 +1,253 @@
+// check — what the river must show, as numbers: water that is conserved, runs downhill and settles.
+//
+// A flowing river is easy to draw and hard to get right, so the claims here are the ones that would fail
+// first if the fluid were wrong. The volume balances against the spring and the drain; the wetting front
+// reaches the foot; once it has, the water leaves as fast as it arrives and the volume stops changing; the
+// surface of the channel falls from head to foot; the same valley under a quarter of the gravity is reached
+// later (the flux accelerates under gravity); and under eight times the bed drag it is reached later still
+// than under the default (the bed takes speed from the water). The two experiments run whole fresh rivers
+// and compare their front arrival times, which share a terrain and differ only in the parameter.
+
+use fluidview::Verdict;
+
+use crate::sim::river::{
+    RiverParams, RiverSim, RV_DRAG, RV_DT, RV_GRAVITY, RV_PULSE_OFF, RV_PULSE_ON, RV_SINK_X, RV_SOURCE_RATE
+};
+
+/** Ticks a check run lasts: long past the wetting transient. */
+const RV_CHECK_TICKS : i32 = 4000;
+
+/** The front counts as arrived when it is within this many columns of the drain. */
+const RV_ARRIVE_GAP : i32 = 3;
+
+/** Ticks before the end the steady-state volume is compared against. */
+const RV_STEADY_WINDOW : i32 = 1000;
+
+/** Largest imbalance the volume bookkeeping may show, cell units: f64 rounding over thousands of ticks. */
+const RV_BALANCE_TOL : f64 = 0.000000001;
+
+/** Inflow and outflow at steady state agree within this fraction of the spring's rate. */
+const RV_STEADY_FLOW_TOL : f64 = 0.03;
+
+/** The volume at steady state moves by less than this fraction over the steady window. */
+const RV_STEADY_VOLUME_TOL : f64 = 0.01;
+
+/** The channel's surface at the head stands at least this far above the foot's, cells. */
+const RV_FALL_MIN : f64 = 3.0;
+
+/** Columns the head and foot readings sit inside the spring and the drain. */
+const RV_READ_X0 : i32 = 8;
+const RV_READ_X1 : i32 = 54;
+
+/** Gravity divisor of the weak-gravity experiment. */
+const RV_WEAK_DIVISOR : f64 = 4.0;
+
+/** Viscosity of the thick-water experiment, cells squared per second: honey-like next to the default 0. */
+const RV_THICK_VISCOSITY : f64 = 3.0;
+
+/** Drag multiplier of the sticky-bed experiment. */
+const RV_STICKY_FACTOR : f64 = 8.0;
+
+/** The pulsing river must be at least this many columns long while the spring runs, and no more than this
+ * many while it has been shut for a whole cycle. */
+const RV_WET_LONG : i32 = 20;
+const RV_WET_DRY : i32 = 3;
+
+/** The river's length after two runs of the spring agrees within this many columns. */
+const RV_WET_REPEAT : i32 = 3;
+
+/** What one run measured. */
+struct RvRun {
+    maxImbalance : f64 = 0.0;
+    arrival      : i32 = -1;
+    volumeBefore : f64 = 0.0;
+    volumeAfter  : f64 = 0.0;
+    inflow       : f64 = 0.0;
+    outflow      : f64 = 0.0;
+    fall         : f64 = 0.0;
+}
+
+/** The river's self-check. */
+pub class RiverCheck {
+    /** Runs every claim and answers how many failed. */
+    pub static fn run() : i32 {
+        let v : Verdict = new Verdict();
+        let base : RvRun = RiverCheck::measure(RiverParams {});
+        RiverCheck::balance(v, base);
+        RiverCheck::steady(v, base);
+        RiverCheck::downhill(v, base);
+        RiverCheck::gravity(v, base);
+        RiverCheck::drag(v, base);
+        RiverCheck::viscosity(v, base);
+        RiverCheck::pulses(v);
+        v.summary("river");
+        return v.failures();
+    }
+
+    // Runs one river and records what the claims need.
+    static fn measure(p : RiverParams) : RvRun {
+        let sim : RiverSim = new RiverSim(p);
+        let mut run : RvRun = RvRun {};
+        for (t of 0..RV_CHECK_TICKS) {
+            sim.tick();
+            let off : f64 = sim.imbalance().abs();
+            if (off > run.maxImbalance) {
+                run.maxImbalance = off;
+            }
+            if (run.arrival < 0 && sim.frontX() >= RV_SINK_X - RV_ARRIVE_GAP) {
+                run.arrival = t + 1;
+            }
+            if (t + 1 == RV_CHECK_TICKS - RV_STEADY_WINDOW) {
+                run.volumeBefore = sim.volume();
+            }
+        }
+        run.volumeAfter = sim.volume();
+        run.inflow = sim.inflow();
+        run.outflow = sim.outflow();
+        run.fall = sim.surfaceAt(RV_READ_X0) - sim.surfaceAt(RV_READ_X1);
+        return run;
+    }
+
+    static fn balance(v : Verdict, run : RvRun) : void {
+        let worst : f64 = run.maxImbalance;
+        v.claim(
+            "volume is conserved",
+            worst < RV_BALANCE_TOL,
+            "volume - injected + drained never left ${worst} in ${RV_CHECK_TICKS} ticks"
+        );
+    }
+
+    static fn steady(v : Verdict, run : RvRun) : void {
+        let arrival : i32 = run.arrival;
+        let seconds : f64 = (arrival as f64) * RV_DT;
+        v.claim(
+            "the front reaches the foot",
+            arrival > 0,
+            "within ${RV_ARRIVE_GAP} columns of the drain after ${arrival} ticks (${seconds} s)"
+        );
+
+        let gap : f64 = (run.inflow - run.outflow).abs();
+        let inflow : f64 = run.inflow;
+        let outflow : f64 = run.outflow;
+        v.claim(
+            "inflow meets outflow at steady state",
+            gap <= RV_STEADY_FLOW_TOL * RV_SOURCE_RATE,
+            "${inflow} in, ${outflow} out, spring ${RV_SOURCE_RATE}"
+        );
+
+        let drift : f64 = (run.volumeAfter - run.volumeBefore).abs();
+        let volume : f64 = run.volumeAfter;
+        v.claim(
+            "volume stops changing",
+            drift <= RV_STEADY_VOLUME_TOL * volume,
+            "moved ${drift} of ${volume} over the last ${RV_STEADY_WINDOW} ticks"
+        );
+    }
+
+    static fn downhill(v : Verdict, run : RvRun) : void {
+        let fall : f64 = run.fall;
+        v.claim(
+            "the surface falls downstream",
+            fall >= RV_FALL_MIN,
+            "${fall} cells between column ${RV_READ_X0} and column ${RV_READ_X1}"
+        );
+    }
+
+    static fn gravity(v : Verdict, base : RvRun) : void {
+        let weak : RvRun = RiverCheck::measure(RiverParams {
+            gravity: RV_GRAVITY / RV_WEAK_DIVISOR,
+            drag: RV_DRAG,
+            viscosity: 0.0,
+        });
+        let strong : i32 = base.arrival;
+        let slow : i32 = weak.arrival;
+        v.claim(
+            "weaker gravity is slower",
+            strong > 0 && slow > strong,
+            "front arrives at ${strong} ticks under g, ${slow} under g/${RV_WEAK_DIVISOR}"
+        );
+    }
+
+    static fn drag(v : Verdict, base : RvRun) : void {
+        let sticky : RvRun = RiverCheck::measure(RiverParams {
+            gravity: RV_GRAVITY,
+            drag: RV_DRAG * RV_STICKY_FACTOR,
+            viscosity: 0.0,
+        });
+        let free : i32 = base.arrival;
+        let slow : i32 = sticky.arrival;
+        v.claim(
+            "a stickier bed is slower",
+            free > 0 && slow > free,
+            "front arrives at ${free} ticks at drag ${RV_DRAG}, ${slow} at drag ${RV_DRAG * RV_STICKY_FACTOR}"
+        );
+    }
+
+    // A spring that opens and shuts: the river dries when it is shut, and the same river comes back when it
+    // opens again, with the volume still balanced against the spring and the drain over the whole run.
+    static fn pulses(v : Verdict) : void {
+        let sim : RiverSim = new RiverSim(RiverParams {
+            gravity: RV_GRAVITY,
+            drag: RV_DRAG,
+            viscosity: 0.0,
+            openSeconds: RV_PULSE_ON,
+            shutSeconds: RV_PULSE_OFF,
+        });
+        let openTicks : i32 = (RV_PULSE_ON / RV_DT) as i32;
+        let cycleTicks : i32 = ((RV_PULSE_ON + RV_PULSE_OFF) / RV_DT) as i32;
+        let mut worst : f64 = 0.0;
+        let mut firstRun : i32 = 0;
+        let mut dried : i32 = 0;
+        for (t of 0..(cycleTicks + openTicks)) {
+            sim.tick();
+            let off : f64 = sim.imbalance().abs();
+            if (off > worst) {
+                worst = off;
+            }
+            if (t + 1 == openTicks) {
+                firstRun = sim.wetColumns();
+            }
+            if (t + 1 == cycleTicks) {
+                dried = sim.wetColumns();
+            }
+        }
+        let secondRun : i32 = sim.wetColumns();
+        v.claim(
+            "the river runs while the spring is open",
+            firstRun >= RV_WET_LONG,
+            "${firstRun} columns of the channel are wet after ${RV_PULSE_ON} s of spring"
+        );
+        v.claim(
+            "the river dries when the spring is shut",
+            dried <= RV_WET_DRY,
+            "${dried} columns are still wet after ${RV_PULSE_OFF} s shut"
+        );
+        let gap : i32 = (secondRun - firstRun).abs();
+        v.claim(
+            "the water comes back when the spring opens again",
+            secondRun >= RV_WET_LONG && gap <= RV_WET_REPEAT,
+            "${secondRun} columns wet after the second opening, ${firstRun} after the first"
+        );
+        v.claim(
+            "volume stays balanced through the pulses",
+            worst < RV_BALANCE_TOL,
+            "volume - injected + drained never left ${worst} over ${cycleTicks + openTicks} ticks"
+        );
+    }
+
+    static fn viscosity(v : Verdict, base : RvRun) : void {
+        let p : RiverParams = RiverParams {
+            gravity: RV_GRAVITY,
+            drag: RV_DRAG,
+            viscosity: RV_THICK_VISCOSITY,
+        };
+        let thick : RvRun = RiverCheck::measure(p);
+        let thin : i32 = base.arrival;
+        let slow : i32 = thick.arrival;
+        v.claim(
+            "thicker water is slower",
+            thin > 0 && slow > thin,
+            "front arrives at ${thin} ticks at viscosity 0, ${slow} at viscosity ${RV_THICK_VISCOSITY}"
+        );
+    }
+}

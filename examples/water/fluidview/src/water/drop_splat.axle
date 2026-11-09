@@ -1,0 +1,511 @@
+// drop_splat — hundreds of thousands of drops onto the picture: projected, binned by tile, splatted in order.
+//
+// Each drop is drawn as a motion-blurred capsule: the segment its centre sweeps while the shutter is open, fattened
+// by its radius, which is what a drop falling at 30 m/s looks like in a photograph. Three stages, all deterministic
+// and independent of the thread count:
+//
+//   project   per drop, by chunks on the pool: the capsule's two end points on the screen, its radius in pixels,
+//             its colour (thick water blue-green, broken water white, lit by the sun from behind with a
+//             Henyey-Greenstein lobe) and its opacity; the 16 pixel tiles its box touches, as `u16` bounds
+//   bin       a counting sort of the drops by tile, serial and stable: `i32` offsets, entries in drop order
+//   splat     per tile, by tiles on the pool: the tile's drops in order, each into the pixels it covers
+//
+// A drop smaller than a pixel is drawn one pixel wide with its coverage scaled by the area ratio, so the energy of
+// a spray of tiny drops survives. The layer is accumulated order-independently (weighted blended transparency: the
+// colour is the opacity-and-depth weighted mean, the opacity is one minus the product of transmittances), and a
+// drop behind the opaque scene at a pixel does not draw there. Within a tile the entries run in drop order, so the
+// floating-point sums are the same whoever runs the tile.
+
+use ludax::{max, min, saturate, smoothstep, sqrt, Vec3, PI};
+
+use crate::water::camera::{Landing, WaterCamera};
+use crate::water::drop_store::{DropStore, DROP_LIQUID, DROP_SPRAY};
+use crate::water::noise::{waterFloor, waterHash, waterPick};
+use crate::water::sky::WaterSky;
+use crate::water::vista_look::DropLook;
+
+/** Pixels on a side of a tile. */
+pub const SPLAT_TILE : i32 = 16;
+
+/** Drops one projection chunk covers. */
+pub const SPLAT_CHUNK : i32 = 4096;
+
+// The longest a drop's streak is drawn, pixels: a fast drop close to the camera would otherwise be a stick across
+// the picture. A streak's opacity is spread over its length, so a longer blur is a fainter one.
+const SPLAT_MAX_STREAK : f32 = 5.0;
+
+// Drops higher than this over a fall's crest (metres) fade out completely over the next stretch: the spray a landing throws up
+// has no business being drawn across the sky.
+const SPLAT_ALTITUDE : f32 = 12.0;
+const SPLAT_ALTITUDE_FADE : f32 = 40.0;
+
+// The widest a drop's radius is drawn, pixels.
+const SPLAT_MAX_RADIUS : f32 = 14.0;
+
+// Spray streaks are denser water than the sheet: their opacity is the sheet's times this.
+const SPLAT_SPRAY_GAIN : f32 = 2.4;
+
+// Entries a tile list may hold per drop, on average, before the later drops are not drawn.
+const SPLAT_ENTRIES_PER_DROP : i32 = 3;
+
+// The weight of a drop in the order-independent mean: nearer drops count for more.
+const SPLAT_WEIGHT_RANGE : f32 = 150.0;
+const SPLAT_WEIGHT_FLOOR : f32 = 0.5;
+
+// Classes of tile cost the splat order sorts by: the bits of a tile's entry count, 0 to 31.
+const SPLAT_CLASSES : i32 = 33;
+
+// A drop at least this many pixels wide is lit as a sphere: where its glint sits (in radii from the centre, toward the sun's corner),
+// how quickly it falls off, and how bright it is.
+const SPLAT_LENS_PIXELS : f32 = 3.0;
+const SPLAT_GLINT_AT : f32 = 0.35;
+const SPLAT_GLINT_SIZE : f32 = 3.0;
+const SPLAT_GLINT : f32 = 0.8;
+
+// The seed of the per-stream tone.
+const SPLAT_SEED : i32 = 709;
+
+// Marks a culled drop in `tileX0`.
+const SPLAT_CULLED : u16 = 65535;
+
+// Drops whose opacity falls below this are not drawn.
+const SPLAT_MIN_ALPHA : f32 = 0.004;
+
+// Water seen through a drop is behind the scene by at most this many metres before the scene hides it.
+const SPLAT_DEPTH_BIAS : f32 = 0.0;
+
+// The thickness a liquid drop has to be (metres of radius) to read as the thick part of the sheet, and the speed
+// at which the sheet has broken up into white water.
+const SPLAT_THICK_RADIUS : f32 = 0.25;
+const SPLAT_BREAK_SLOW : f32 = 6.0;
+const SPLAT_BREAK_FAST : f32 = 26.0;
+
+// Where in a fall (0 at the lip, 1 at the foot) the sheet starts to turn white and where it is white all through.
+const SPLAT_AERATE_FROM : f32 = 0.2;
+const SPLAT_AERATE_TO : f32 = 0.8;
+
+// The ambient share of the sky's overhead light a drop shows, and the base of the sun's isotropic share.
+const SPLAT_AMBIENT : f32 = 0.85;
+const SPLAT_SUN_BASE : f32 = 0.04;
+
+/** The splatter. */
+pub class DropSplat {
+    /** The picture's size, pixels, and its size in tiles. */
+    pub w      : i32;
+    pub h      : i32;
+    pub tilesX : i32;
+    pub tilesY : i32;
+
+    /** Offset in pixels of this sample's jitter from the pixel centre. */
+    pub jitterX : f32 = (0.0 as f32);
+    pub jitterY : f32 = (0.0 as f32);
+
+    /** Drops the serial binning could not hold in the last frame. */
+    pub refused : i32 = 0;
+
+    /** Drops that reached the screen in the last frame. */
+    pub drawn : i32 = 0;
+
+    /** The drops. */
+    pub store : Shared<DropStore>;
+
+    /** The finished layer: premultiplied colour and opacity, four floats a pixel. */
+    pub layer : f32[];
+
+    // Per drop: the capsule's end points, the radius, depth, opacity, colour, mode and the tile bounds.
+    x0     : f32[];
+    y0     : f32[];
+    x1     : f32[];
+    y1     : f32[];
+    radius : f32[];
+    depth  : f32[];
+    alpha  : f32[];
+    colour : f32[];
+    tileX0 : u16[];
+    tileY0 : u16[];
+    tileX1 : u16[];
+    tileY1 : u16[];
+
+    // The binned lists: entries sorted by tile, the offset of each tile's first, and a cursor to fill them.
+    entries : i32[];
+    start   : i32[];
+    cursor  : i32[];
+    order   : i32[];
+    accum   : f32[];
+
+    /** A splatter of `store` for pictures `w` by `h` (multiples of the tile). */
+    constructor(store : Shared<DropStore>, w : i32, h : i32) {
+        self.store = store;
+        self.w = w;
+        self.h = h;
+        self.tilesX = w / SPLAT_TILE;
+        self.tilesY = h / SPLAT_TILE;
+        let n : i64 = store.capacity as i64;
+        self.x0 = new f32[n];
+        self.y0 = new f32[n];
+        self.x1 = new f32[n];
+        self.y1 = new f32[n];
+        self.radius = new f32[n];
+        self.depth = new f32[n];
+        self.alpha = new f32[n];
+        self.colour = new f32[n * 3];
+        self.tileX0 = new u16[n];
+        self.tileY0 = new u16[n];
+        self.tileX1 = new u16[n];
+        self.tileY1 = new u16[n];
+        self.entries = new i32[n * (SPLAT_ENTRIES_PER_DROP as i64)];
+        let tiles : i64 = (self.tilesX as i64) * self.tilesY;
+        self.start = new i32[tiles + 1];
+        self.cursor = new i32[tiles];
+        self.order = new i32[tiles];
+        let pixels : i64 = (w as i64) * h;
+        self.layer = new f32[pixels * 4];
+        self.accum = new f32[pixels * 5];
+    }
+
+    /** Tiles in the picture. */
+    pub fn tiles(self) : i32 {
+        return self.tilesX * self.tilesY;
+    }
+
+    /** Chunks of drops the projection has. */
+    pub fn projectChunks(self) : i32 {
+        return (self.store.count + SPLAT_CHUNK - 1) / SPLAT_CHUNK;
+    }
+
+    /** Projects the drops of chunks `begin` up to `end`. */
+    pub fn projectRange(
+        mut self,
+        begin : i32,
+        end : i32,
+        cam : WaterCamera,
+        look : DropLook,
+        sky : Shared<WaterSky>
+    ) : void {
+        let last : i32 = min((end * SPLAT_CHUNK) as f32, self.store.count as f32) as i32;
+        for (d of (begin * SPLAT_CHUNK)..last) {
+            self.project(d, cam, look, sky);
+        }
+    }
+
+    // One drop to the screen.
+    fn project(mut self, d : i32, cam : WaterCamera, look : DropLook, sky : Shared<WaterSky>) : void {
+        let k : i64 = d as i64;
+        self.tileX0[k] = SPLAT_CULLED;
+        let p : Vec3 = Vec3 {
+            x: self.store.positions[k * 3] + self.store.shiftX,
+            y: self.store.positions[k * 3 + 1],
+            z: self.store.positions[k * 3 + 2] + self.store.shiftZ,
+        };
+        let v : Vec3 = Vec3 {
+            x: self.store.velocities[k * 3],
+            y: self.store.velocities[k * 3 + 1],
+            z: self.store.velocities[k * 3 + 2],
+        };
+        let kind : u8 = self.store.kinds[k];
+        if (kind != DROP_LIQUID && kind != DROP_SPRAY) {
+            return;
+        }
+        let half : f32 = look.shutter * (0.5 as f32);
+        let a : Landing = cam.project(p.minus(v.scale(half)));
+        let b : Landing = cam.project(p.plus(v.scale(half)));
+        if (!a.ok || !b.ok) {
+            return;
+        }
+
+        let depth : f32 = (a.depth + b.depth) * (0.5 as f32);
+        let mut reach : f32 = self.store.radii[k] * look.sizeGain;
+        if (kind == DROP_LIQUID && look.sheetRadius > reach) {
+            reach = look.sheetRadius;
+        }
+        let truePx : f32 = cam.pixelsAt(reach, depth);
+        let mut r : f32 = max(truePx, look.minPixels);
+        r = min(r, SPLAT_MAX_RADIUS);
+        let mx : f32 = (a.x + b.x) * (0.5 as f32);
+        let my : f32 = (a.y + b.y) * (0.5 as f32);
+        let length : f32 = sqrt((b.x - a.x) * (b.x - a.x) + (b.y - a.y) * (b.y - a.y));
+        let mut keep : f32 = (1.0 as f32);
+        if (length > SPLAT_MAX_STREAK) {
+            keep = SPLAT_MAX_STREAK / length;
+        }
+        let ax : f32 = mx + (a.x - mx) * keep;
+        let ay : f32 = my + (a.y - my) * keep;
+        let bx : f32 = mx + (b.x - mx) * keep;
+        let by : f32 = my + (b.y - my) * keep;
+        let smear : f32 = (2.0 as f32) * r / ((2.0 as f32) * r + length * keep);
+        let share : f32 = min((truePx / r) * (truePx / r), (1.0 as f32));
+        let reachPx : f32 = r + (1.0 as f32);
+        let minX : f32 = min(ax, bx) - reachPx;
+        let maxX : f32 = max(ax, bx) + reachPx;
+        let minY : f32 = min(ay, by) - reachPx;
+        let maxY : f32 = max(ay, by) + reachPx;
+        if (maxX < (0.0 as f32) || maxY < (0.0 as f32) || minX >= (self.w as f32)
+            || minY >= (self.h as f32)) {
+            return;
+        }
+
+        let mut opacity : f32 = look.opacity;
+        if (kind == DROP_LIQUID && look.sheetOpacity > (0.0 as f32)) {
+            opacity = look.sheetOpacity;
+        }
+        if (kind == DROP_SPRAY) {
+            opacity = opacity * SPLAT_SPRAY_GAIN;
+        }
+        let mut high : f32 = (1.0 as f32);
+        if (look.fallTop > look.fallFoot) {
+            high = (1.0 as f32)
+                - smoothstep(look.fallTop + SPLAT_ALTITUDE, look.fallTop + SPLAT_ALTITUDE_FADE, p.y);
+        }
+        let alpha : f32 = opacity * share * smear * high;
+        if (alpha < SPLAT_MIN_ALPHA) {
+            return;
+        }
+        let colour : Vec3 = DropSplat::shadeDrop(p, v, kind, self.store.radii[k], cam.eye, look, sky);
+        self.x0[k] = ax;
+        self.y0[k] = ay;
+        self.x1[k] = bx;
+        self.y1[k] = by;
+        self.radius[k] = r;
+        self.depth[k] = depth;
+        self.alpha[k] = alpha;
+        self.colour[k * 3] = colour.x;
+        self.colour[k * 3 + 1] = colour.y;
+        self.colour[k * 3 + 2] = colour.z;
+        let tile : f32 = SPLAT_TILE as f32;
+        self.tileX0[k] = (max(minX, (0.0 as f32)) / tile) as u16;
+        self.tileY0[k] = (max(minY, (0.0 as f32)) / tile) as u16;
+        self.tileX1[k] = (min(maxX, (self.w - 1) as f32) / tile) as u16;
+        self.tileY1[k] = (min(maxY, (self.h - 1) as f32) / tile) as u16;
+    }
+
+    // The radiance of a drop: thick water blue-green and broken water white, the sun scattering forward through it.
+    static fn shadeDrop(
+        p : Vec3,
+        v : Vec3,
+        kind : u8,
+        radius : f32,
+        eye : Vec3,
+        look : DropLook,
+        sky : Shared<WaterSky>
+    ) : Vec3 {
+        let view : Vec3 = p.minus(eye).normalized();
+        let g : f32 = look.forward;
+        let denom : f32 = (1.0 as f32) + g * g - (2.0 as f32) * g * view.dot(sky.sunDir);
+        let lobe : f32 = ((1.0 as f32) - g * g) / ((4.0 as f32) * PI * denom * sqrt(denom));
+        let light : Vec3 = sky
+            .ambient(Vec3::unitY())
+            .scale(SPLAT_AMBIENT)
+            .plus(sky.sunIrr.scale(SPLAT_SUN_BASE + look.glow * lobe));
+        let speed : f32 = v.length();
+        let broken : f32 = smoothstep(SPLAT_BREAK_SLOW, SPLAT_BREAK_FAST, speed);
+        let thick : f32 = smoothstep(SPLAT_THICK_RADIUS * (0.25 as f32), SPLAT_THICK_RADIUS, radius);
+        let mut aeration : f32 = max(broken * (0.9 as f32), (1.0 as f32) - thick);
+        if (kind == DROP_SPRAY) {
+            aeration = (1.0 as f32);
+        }
+        if (look.fallTop > look.fallFoot) {
+            let fallen : f32 = saturate((look.fallTop - p.y) / (look.fallTop - look.fallFoot));
+            aeration = max(aeration, smoothstep(SPLAT_AERATE_FROM, SPLAT_AERATE_TO, fallen));
+        }
+        let tint : Vec3 = look.thick.lerp(Vec3::splat((1.0 as f32)), aeration);
+        let stream : f32 = (0.7 as f32)
+            + (0.6 as f32) * waterHash(waterFloor(p.x * (0.58 as f32)), 3, 0, SPLAT_SEED);
+        return light.times(tint).scale(stream);
+    }
+
+    /** Sorts the projected drops into their tiles; serial and stable. Call between `Project` and `Splat`. */
+    pub fn bin(mut self) : void {
+        let tiles : i32 = self.tiles();
+        for (t of 0..(tiles + 1)) {
+            self.start[t as i64] = 0;
+        }
+        let room : i32 = self.entries.length as i32;
+        let mut total : i32 = 0;
+        let mut drawn : i32 = 0;
+        let mut refused : i32 = 0;
+        for (d of 0..self.store.count) {
+            let k : i64 = d as i64;
+            if (self.tileX0[k] == SPLAT_CULLED) {
+                continue;
+            }
+            let span : i32 = (((self.tileX1[k] - self.tileX0[k]) as i32) + 1)
+                * (((self.tileY1[k] - self.tileY0[k]) as i32) + 1);
+            if (total + span > room) {
+                self.tileX0[k] = SPLAT_CULLED;
+                refused = refused + 1;
+                continue;
+            }
+            total = total + span;
+            drawn = drawn + 1;
+            for (ty of (self.tileY0[k] as i32)..((self.tileY1[k] as i32) + 1)) {
+                for (tx of (self.tileX0[k] as i32)..((self.tileX1[k] as i32) + 1)) {
+                    let t : i64 = (ty * self.tilesX + tx) as i64;
+                    self.start[t + 1] = self.start[t + 1] + 1;
+                }
+            }
+        }
+        for (t of 0..tiles) {
+            self.start[(t + 1) as i64] = self.start[(t + 1) as i64] + self.start[t as i64];
+            self.cursor[t as i64] = self.start[t as i64];
+        }
+        for (d of 0..self.store.count) {
+            let k : i64 = d as i64;
+            if (self.tileX0[k] == SPLAT_CULLED) {
+                continue;
+            }
+            for (ty of (self.tileY0[k] as i32)..((self.tileY1[k] as i32) + 1)) {
+                for (tx of (self.tileX0[k] as i32)..((self.tileX1[k] as i32) + 1)) {
+                    let t : i64 = (ty * self.tilesX + tx) as i64;
+                    self.entries[self.cursor[t] as i64] = d;
+                    self.cursor[t] = self.cursor[t] + 1;
+                }
+            }
+        }
+        self.sortTiles();
+        self.drawn = drawn;
+        self.refused = refused;
+    }
+
+    // Orders the tiles from the most drops to the fewest, in powers of two (stable inside a class), so the pool starts
+    // the costly tiles first and the cheap ones fill the tail. Each tile is still written by one job alone.
+    fn sortTiles(mut self) : void {
+        let tiles : i32 = self.tiles();
+        let mut at : i32 = 0;
+        for (rank of 0..SPLAT_CLASSES) {
+            for (t of 0..tiles) {
+                let count : i32 = self.start[(t + 1) as i64] - self.start[t as i64];
+                if (DropSplat::classOf(count) == rank) {
+                    self.order[at as i64] = t;
+                    at = at + 1;
+                }
+            }
+        }
+    }
+
+    // 0 for the busiest tiles: SPLAT_CLASSES minus one less than the number of bits of `count`.
+    static fn classOf(count : i32) : i32 {
+        let mut bits : i32 = 0;
+        let mut rest : i32 = count;
+        while (rest > 0) {
+            bits = bits + 1;
+            rest = rest / 2;
+        }
+        return SPLAT_CLASSES - 1 - bits;
+    }
+
+    /** The tile the `k`-th splat job draws: busiest first. */
+    pub fn tileAt(self, k : i32) : i32 {
+        return self.order[k as i64];
+    }
+
+    /** Draws the drops of tile `tile` and writes the layer of every pixel of it; `sceneDepth` hides drops behind the scene. */
+    pub fn splatTile(mut self, tile : i32, sceneDepth : f32[]) : void {
+        let tx : i32 = tile % self.tilesX;
+        let ty : i32 = tile / self.tilesX;
+        let px0 : i32 = tx * SPLAT_TILE;
+        let py0 : i32 = ty * SPLAT_TILE;
+        for (y of py0..(py0 + SPLAT_TILE)) {
+            for (x of px0..(px0 + SPLAT_TILE)) {
+                let a : i64 = (((y * self.w) + x) as i64) * 5;
+                self.accum[a] = (0.0 as f32);
+                self.accum[a + 1] = (0.0 as f32);
+                self.accum[a + 2] = (0.0 as f32);
+                self.accum[a + 3] = (0.0 as f32);
+                self.accum[a + 4] = (1.0 as f32);
+            }
+        }
+        for (e of (self.start[tile as i64] as i64)..(self.start[(tile + 1) as i64] as i64)) {
+            self.splat(self.entries[e] as i64, px0, py0, sceneDepth);
+        }
+        self.finish(px0, py0);
+    }
+
+    // One drop into the pixels of the tile at (`px0`, `py0`) it covers.
+    fn splat(mut self, k : i64, px0 : i32, py0 : i32, sceneDepth : f32[]) : void {
+        let r : f32 = self.radius[k];
+        let ax : f32 = self.x0[k];
+        let ay : f32 = self.y0[k];
+        let bx : f32 = self.x1[k];
+        let by : f32 = self.y1[k];
+        let reach : f32 = r + (1.0 as f32);
+        let lowX : i32 = max((px0 as f32), min(ax, bx) - reach) as i32;
+        let highX : i32 = min((px0 + SPLAT_TILE) as f32, max(ax, bx) + reach + (1.0 as f32)) as i32;
+        let lowY : i32 = max((py0 as f32), min(ay, by) - reach) as i32;
+        let highY : i32 = min((py0 + SPLAT_TILE) as f32, max(ay, by) + reach + (1.0 as f32)) as i32;
+        let abx : f32 = bx - ax;
+        let aby : f32 = by - ay;
+        let len2 : f32 = max(abx * abx + aby * aby, (0.000001 as f32));
+        let weight : f32 = (1.0 as f32)
+            / (SPLAT_WEIGHT_FLOOR
+                + (self.depth[k] / SPLAT_WEIGHT_RANGE) * (self.depth[k] / SPLAT_WEIGHT_RANGE));
+        let cr : f32 = self.colour[k * 3];
+        let cg : f32 = self.colour[k * 3 + 1];
+        let cb : f32 = self.colour[k * 3 + 2];
+        for (y of lowY..highY) {
+            let sy : f32 = (y as f32) + (0.5 as f32) + self.jitterY;
+            for (x of lowX..highX) {
+                let i : i64 = ((y * self.w) + x) as i64;
+                if (self.depth[k] > sceneDepth[i] + SPLAT_DEPTH_BIAS) {
+                    continue;
+                }
+                let sx : f32 = (x as f32) + (0.5 as f32) + self.jitterX;
+                let t : f32 = saturate(((sx - ax) * abx + (sy - ay) * aby) / len2);
+                let dx : f32 = sx - (ax + abx * t);
+                let dy : f32 = sy - (ay + aby * t);
+                let dist : f32 = sqrt(dx * dx + dy * dy);
+                let cover : f32 = saturate(r + (0.5 as f32) - dist);
+                let a : f32 = cover * self.alpha[k];
+                if (a < SPLAT_MIN_ALPHA) {
+                    continue;
+                }
+                let m : i64 = i * 5;
+                let aw : f32 = a * weight;
+                let lens : f32 = DropSplat::lens(r, dist, sx - (ax + abx * t), sy - (ay + aby * t));
+                self.accum[m] = self.accum[m] + cr * aw * lens;
+                self.accum[m + 1] = self.accum[m + 1] + cg * aw * lens;
+                self.accum[m + 2] = self.accum[m + 2] + cb * aw * lens;
+                self.accum[m + 3] = self.accum[m + 3] + aw;
+                self.accum[m + 4] = self.accum[m + 4] * ((1.0 as f32) - a);
+            }
+        }
+    }
+
+    // The lighting of a drop big enough to show as a sphere (`SPLAT_LENS_PIXELS` wide on the picture): darker toward its rim, with a
+    // bright glint toward the light's corner; 1 for a drop smaller than that, which is only a dot.
+    static fn lens(r : f32, dist : f32, dx : f32, dy : f32) : f32 {
+        if (r < SPLAT_LENS_PIXELS) {
+            return (1.0 as f32);
+        }
+        let q : f32 = min(dist / r, (1.0 as f32));
+        let gx : f32 = dx / r + SPLAT_GLINT_AT;
+        let gy : f32 = dy / r + SPLAT_GLINT_AT;
+        let glint : f32 = saturate((1.0 as f32) - sqrt(gx * gx + gy * gy) * SPLAT_GLINT_SIZE);
+        return (0.7 as f32) + (0.45 as f32) * q * q + SPLAT_GLINT * glint;
+    }
+
+    // Writes the layer of the tile's pixels from the accumulators.
+    fn finish(mut self, px0 : i32, py0 : i32) : void {
+        for (y of py0..(py0 + SPLAT_TILE)) {
+            for (x of px0..(px0 + SPLAT_TILE)) {
+                let i : i64 = ((y * self.w) + x) as i64;
+                let m : i64 = i * 5;
+                let cover : f32 = (1.0 as f32) - self.accum[m + 4];
+                let mut scale : f32 = (0.0 as f32);
+                if (self.accum[m + 3] > (0.0 as f32)) {
+                    scale = cover / self.accum[m + 3];
+                }
+                self.layer[i * 4] = self.accum[m] * scale;
+                self.layer[i * 4 + 1] = self.accum[m + 1] * scale;
+                self.layer[i * 4 + 2] = self.accum[m + 2] * scale;
+                self.layer[i * 4 + 3] = cover;
+            }
+        }
+    }
+
+    /** The scene colour `scene` at pixel `i` with the layer over it. */
+    pub fn over(self, i : i64, scene : Vec3) : Vec3 {
+        let cover : f32 = self.layer[i * 4 + 3];
+        let c : Vec3 = Vec3 { x: self.layer[i * 4], y: self.layer[i * 4 + 1], z: self.layer[i * 4 + 2] };
+        return scene.scale((1.0 as f32) - cover).plus(c);
+    }
+}

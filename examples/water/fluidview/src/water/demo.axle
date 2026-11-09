@@ -1,0 +1,131 @@
+// demo — analytic water scenes: a heightfield of waves and foam, and synthetic drops, with no simulation behind them.
+//
+// The renderer is judged by looking at it, and a look needs water that is in the state a look is made for: a geyser
+// mid-eruption, a surf line breaking on a beach. The engine's simulations take seconds to reach those states and
+// change as the engine does, so these scenes are written down instead: every column and every drop is a closed
+// formula of the time and the physics, which makes them cheap to evaluate each frame, identical from run to run,
+// and a test of the renderer that does not depend on the simulation. Drops are ballistic: each has a phase offset
+// from a hash and its position at time `t` is `p0 + v t - g t^2 / 2` with the scene's own gravity, so a lower
+// gravity gives a higher, slower jet with no other change, and viscosity damps the ripples the formulas draw.
+//
+// `WaterDemo::fill` writes one frame of a scene into a `WaterScene`; `--demo geyser|shore` of the demo program
+// and the fluid examples' own demos use it the same way.
+
+use ludax::{cos, saturate, sin, smoothstep, sqrt, Vec3, TAU};
+
+use crate::stage::camera::CamOrbit;
+use crate::water::demo_geyser::GeyserDemo;
+use crate::water::field::FieldColumn;
+use crate::water::look::WaterLook;
+use crate::water::noise::{waterExpNeg, waterFbm2, waterHash};
+use crate::water::particles::{WaterDrop, WaterKind};
+use crate::water::scene::WaterScene;
+
+/** The grid every demo scene uses, columns a side. */
+pub const DEMO_GRID : i32 = 64;
+
+/** Which analytic scene to write. */
+pub enum DemoKind : i8 {
+    /** A sinter basin with a pool and a geyser mid-eruption. */
+    Geyser,
+
+    /** A sloping beach with a breaking wave and a foam line. */
+    Shore,
+}
+
+/** Analytic scenes. */
+pub class WaterDemo {
+    /** The camera that frames `kind`. */
+    pub static fn orbit(kind : DemoKind) : CamOrbit {
+        return match kind {
+            DemoKind::Geyser => CamOrbit {
+                target: Vec3 { x: 32.0, y: 13.0, z: 32.0 },
+                dist: 44.0,
+                yaw: 0.9,
+                pitch: 0.1,
+            },
+            DemoKind::Shore => CamOrbit {
+                target: Vec3 { x: 32.0, y: 0.0, z: 36.0 },
+                dist: 44.0,
+                yaw: 2.2,
+                pitch: 0.32,
+            },
+        };
+    }
+
+    /** The look that suits `kind`, starting from `look` (whose physics and module flags are kept). */
+    pub static fn look(kind : DemoKind, look : WaterLook) : WaterLook {
+        let mut l : WaterLook = look;
+        if (kind == DemoKind::Geyser) {
+            l.surface.absorption = Vec3 { x: 0.55, y: 0.26, z: 0.08 };
+            l.terrain.farHills = 16.0;
+            l.terrain.bandAmount = 0.9;
+            l.surface.body = Vec3 { x: 0.006, y: 0.05, z: 0.10 };
+        } else {
+            l.terrain.sinter = Vec3 { x: 0.74, y: 0.68, z: 0.55 };
+            l.terrain.sand = Vec3 { x: 0.78, y: 0.70, z: 0.55 };
+            l.surface.absorption = Vec3 { x: 0.42, y: 0.075, z: 0.045 };
+            l.surface.body = Vec3 { x: 0.02, y: 0.10, z: 0.10 };
+            l.terrain.grassAmount = 0.0;
+            l.terrain.farGround = 3.0;
+            l.terrain.farHills = 10.0;
+        }
+        return l;
+    }
+
+    /** Writes the frame of `kind` at simulation second `time` into `scene`. */
+    pub static fn fill(scene : Shared<WaterScene>, kind : DemoKind, time : f32) : void {
+        scene.time = time as f64;
+        scene.particles.clear();
+        if (kind == DemoKind::Geyser) {
+            GeyserDemo::fill(scene, time);
+        } else {
+            WaterDemo::beach(scene, time);
+        }
+    }
+
+    // A beach seen from the sea: a sloping bed, long swell, a breaking crest with foam and a thin shore line.
+    static fn beach(scene : Shared<WaterScene>, time : f32) : void {
+        let g : f32 = scene.look.physics.gravity;
+        let damp : f32 = (1.0 as f32) / ((1.0 as f32) + scene.look.physics.viscosity * (0.2 as f32));
+        let speed : f32 = sqrt(g / (9.81 as f32));
+        for (z of 0..DEMO_GRID) {
+            for (x of 0..DEMO_GRID) {
+                let px : f32 = (x as f32) + (0.5 as f32);
+                let pz : f32 = (z as f32) + (0.5 as f32);
+                let bed : f32 = (1.4 as f32) - pz * (0.052 as f32)
+                    + (0.08 as f32) * waterFbm2(px * (0.3 as f32), pz * (0.3 as f32), 3, 5)
+                    + (0.12 as f32) * sin(px * (0.35 as f32));
+                let level : f32 = 0.0;
+
+                // Swell trains toward the shore (+z), the breaking crest travelling with the wave speed.
+                let phase : f32 = pz * (0.34 as f32) - time * (1.25 as f32) * speed
+                    + (0.4 as f32) * sin(px * (0.21 as f32));
+                let crestPos : f32 = phase - (phase / TAU) as i32 as f32 * TAU;
+                let swell : f32 = (0.30 as f32) * sin(phase) * damp
+                    + (0.12 as f32)
+                        * sin(phase * (2.3 as f32) + px * (0.5 as f32) + time * (1.1 as f32) * speed)
+                        * damp;
+                let sea : f32 = ludax::max(level - bed, 0.0);
+                let breaking : f32 = smoothstep(2.4, 0.5, sea) * smoothstep(0.0, 0.45, sea);
+                let crest : f32 = ludax::max(sin(phase - (0.6 as f32)), 0.0);
+                let shoreline : f32 = smoothstep(0.55, 0.0, sea) * smoothstep(0.0, 0.05, sea);
+                let foam : f32 = saturate(breaking * crest * crest * (1.5 as f32)
+                    + shoreline * ((0.55 as f32) + (0.35 as f32) * sin(phase * (1.5 as f32))));
+                let height : f32 = swell * saturate(sea * (0.9 as f32))
+                    * ((1.0 as f32) + (0.8 as f32) * breaking);
+                let flow : f32 = (0.9 as f32) * breaking;
+                let turb : f32 = saturate(breaking * ((0.4 as f32) + crest) + shoreline * (0.7 as f32));
+
+                scene.field.put(x, z, FieldColumn {
+                    bed: bed,
+                    depth: ludax::max(sea + height, 0.0) * saturate(sea * (20.0 as f32) + (0.0 as f32)),
+                    foam: foam,
+                    turbulence: turb,
+                    vx: 0.0,
+                    vz: flow,
+                });
+            }
+        }
+    }
+}

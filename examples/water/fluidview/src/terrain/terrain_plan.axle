@@ -1,0 +1,312 @@
+// terrain_plan — the layout of the valley: every height and place the passes must agree on, derived once.
+//
+// A landscape is built by independent passes (relief, erosion, river, lake, materials) that never call each other.
+// What they share is this plan: where the valley axis runs, where the escarpment crest lies, how high the reservoir
+// stands, what the valley floor's height is at each distance down the valley, and the shape of the cliff. The
+// heights are derived from the water's needs and not chosen one by one: the river bank at the downstream lake sits
+// a little above the lake's surface, the floor rises by `riverSlope` per metre going upstream to the foot of the
+// fall, and the reservoir stands exactly `escarpmentHeight` above that foot. That is what makes the result
+// consistent for water however the parameters are changed.
+//
+// The plan is immutable after construction and its methods are pure, so every thread may read it.
+
+use ludax::{abs, max, min, saturate, smoothstep, sqrt};
+
+use crate::terrain::terrain_noise::{terrainFbm, terrainFloor, terrainNoise};
+use crate::terrain::terrain_params::TerrainParams;
+
+/** Fraction of the cliff's height that the vertical cap rock takes; the rest is the talus slope below it. */
+pub const PLAN_CAP_SHARE : f32 = 0.88;
+
+/** Run of the rubble pile at the foot per metre of its height: a slope of about 33 degrees. */
+const PLAN_TALUS_RUN : f32 = 1.5;
+
+// Where the crest lies along the depth, how far down the river's end is, and where the end lake's slope starts.
+const PLAN_CREST_AT : f32 = 0.36;
+const PLAN_END_AT : f32 = 0.90;
+
+// How far the crest wanders, metres, and over what distance; how far the valley axis wanders and over what distance.
+const PLAN_CREST_WANDER : f32 = 85.0;
+const PLAN_CREST_SCALE : f32 = 1100.0;
+
+// The crest wanders freely only beyond this many lake radii (full from the second) from the notch.
+const PLAN_CREST_FREE_FROM : f32 = 1.0;
+const PLAN_CREST_FREE_TO : f32 = 1.9;
+const PLAN_AXIS_WANDER : f32 = 190.0;
+const PLAN_AXIS_SCALE : f32 = 1100.0;
+
+// The crest is a horseshoe: it recedes upstream by this many metres at the notch, over this half width; its small
+// ledges are this big (metres) and this long, and its blocks (the vertical joints of the cap rock) step this far.
+const PLAN_ARC_DEPTH : f32 = 45.0;
+const PLAN_ARC_RADIUS : f32 = 260.0;
+const PLAN_LEDGE : f32 = 4.0;
+const PLAN_LEDGE_SCALE : f32 = 55.0;
+const PLAN_JOINT : f32 = 3.0;
+const PLAN_JOINT_SCALE : f32 = 38.0;
+
+// Height of the shore bench above the reservoir level, metres.
+const PLAN_SHORE_RISE : f32 = 30.0;
+
+// Shape of the reservoir: z radius over x radius, and the share of the radius the shore's noise may move.
+const PLAN_LAKE_SQUASH : f32 = 0.78;
+const PLAN_LAKE_NOISE : f32 = 0.16;
+const PLAN_LAKE_NOISE_SCALE : f32 = 520.0;
+
+// Noise seeds of the plan's own fields, away from the other passes'.
+const PLAN_SEED_CREST : i32 = 301;
+const PLAN_SEED_AXIS : i32 = 331;
+const PLAN_SEED_LAKE : i32 = 353;
+const PLAN_SEED_EDGE : i32 = 379;
+
+// How far the floodplain's edge wanders from a straight line, metres, over what distance, and how much its width
+// breathes along the valley as a share of the half width.
+const PLAN_EDGE_WANDER : f32 = 120.0;
+const PLAN_EDGE_SCALE : f32 = 380.0;
+const PLAN_EDGE_BREATHE : f32 = 0.25;
+const PLAN_EDGE_LENGTH : f32 = 1100.0;
+
+// The end lake's bed lies this far below its surface, metres.
+const PLAN_END_BASIN : f32 = 5.0;
+
+/** The derived layout of one landscape. */
+pub struct TerrainPlan {
+    /** Side of the world, metres. */
+    pub size : f32 = 0.0;
+
+    /** Side of a cell, metres. */
+    pub cell : f32 = 0.0;
+
+    /** The seed everything derives from. */
+    pub seed : i32 = 0;
+
+    /** Datum: the surface of the downstream lake. */
+    pub level : f32 = 0.0;
+
+    /** Height of the escarpment, metres. */
+    pub cliff : f32 = 0.0;
+
+    /** Horizontal run of the vertical cap rock, metres. */
+    pub capRun : f32 = 0.0;
+
+    /** Horizontal run of the talus under it, metres. */
+    pub talusRun : f32 = 0.0;
+
+    /** x of the valley axis at the crest: where the river leaves the lake. */
+    pub axisX0 : f32 = 0.0;
+
+    /** z of the crest at the notch. */
+    pub notchZ : f32 = 0.0;
+
+    /** Half the width of the flat floodplain, metres. */
+    pub floodHalf : f32 = 0.0;
+
+    /** Distance over which the floodplain gives way to the hillsides, metres. */
+    pub floodBlend : f32 = 0.0;
+
+    /** z where the end lake's bed starts to fall away. */
+    pub endZ : f32 = 0.0;
+
+    /** Height of the river's bank tops at `endZ`. */
+    pub floorEnd : f32 = 0.0;
+
+    /** Height of the valley floor at the foot of the fall. */
+    pub floorFoot : f32 = 0.0;
+
+    /** Height of the reservoir's surface: the spill level. */
+    pub lakeLevel : f32 = 0.0;
+
+    /** x radius of the reservoir, metres. */
+    pub lakeA : f32 = 0.0;
+
+    /** z radius of the reservoir, metres. */
+    pub lakeB : f32 = 0.0;
+
+    /** x of the reservoir's middle. */
+    pub lakeX : f32 = 0.0;
+
+    /** z of the reservoir's middle. */
+    pub lakeZ : f32 = 0.0;
+
+    /** The parameters it came from. */
+    pub params : TerrainParams = TerrainParams {};
+
+    /** The layout for `params` and `seed`. */
+    pub static fn make(params : TerrainParams, seed : i32) : TerrainPlan {
+        let size : f32 = params.worldSize;
+        let cell : f32 = params.cellSize;
+        let level : f32 = params.outflowLevel;
+        let cliff : f32 = params.escarpmentHeight;
+        let axisX0 : f32 = size * 0.5 as f32;
+
+        let sharp : f32 = saturate(params.escarpmentSharpness);
+        let capRise : f32 = cliff * PLAN_CAP_SHARE;
+        let capRun : f32 = max(cell * 0.9 as f32, capRise * (1.0 as f32 - sharp) * 0.8 as f32);
+        let talusRun : f32 = cliff * (1.0 as f32 - PLAN_CAP_SHARE) * PLAN_TALUS_RUN;
+
+        let notchZ : f32 = size * PLAN_CREST_AT;
+        let endZ : f32 = size * PLAN_END_AT;
+        let footZ : f32 = notchZ + capRun + talusRun;
+        let floorEnd : f32 = level + params.riverDepth * 0.8 as f32;
+        let floorFoot : f32 = floorEnd + params.riverSlope * (endZ - footZ);
+
+        let area : f32 = max(params.lakeArea, 10000.0 as f32);
+        let lakeA : f32 = sqrt(area / (3.14159265 as f32 * PLAN_LAKE_SQUASH));
+        let lakeB : f32 = lakeA * PLAN_LAKE_SQUASH;
+        return TerrainPlan {
+            size: size,
+            cell: cell,
+            seed: seed,
+            level: level,
+            cliff: cliff,
+            capRun: capRun,
+            talusRun: talusRun,
+            axisX0: axisX0,
+            notchZ: notchZ,
+            floodHalf: params.floodplainWidth * 0.5 as f32,
+            floodBlend: max(160.0 as f32, params.floodplainWidth * 0.3 as f32),
+            endZ: endZ,
+            floorEnd: floorEnd,
+            floorFoot: floorFoot,
+            lakeLevel: floorFoot + cliff,
+            lakeA: lakeA,
+            lakeB: lakeB,
+            lakeX: axisX0,
+            lakeZ: notchZ - lakeB * 0.985 as f32,
+            params: params,
+        };
+    }
+
+    /** z of the foot of the cliff at the notch. */
+    pub fn footZ(self) : f32 {
+        return self.notchZ + self.capRun + self.talusRun;
+    }
+
+    /** Horizontal run of the whole face, metres. */
+    pub fn faceRun(self) : f32 {
+        return self.capRun + self.talusRun;
+    }
+
+    // How far the crest lies from its mean line at east coordinate x.
+    static fn crestAt(seed : i32, x : f32) : f32 {
+        return PLAN_CREST_WANDER * terrainFbm(x / PLAN_CREST_SCALE, 0.37 as f32, seed + PLAN_SEED_CREST, 3);
+    }
+
+    /** z of the crest of the escarpment at east coordinate x: a horseshoe with ledges and joints, straight at the notch. */
+    pub fn crestZ(self, x : f32) : f32 {
+        let lateral : f32 = abs(x - self.axisX0);
+        // The crest is straight along the reservoir's south shore, so the lake touches it only at the notch.
+        let free : f32 = smoothstep(
+            self.lakeA * PLAN_CREST_FREE_FROM,
+            self.lakeA * PLAN_CREST_FREE_TO,
+            lateral
+        );
+        let arc : f32 = PLAN_ARC_DEPTH * smoothstep(0.0 as f32, PLAN_ARC_RADIUS, lateral);
+        let wn : f32 = self.params.lipNotchWidth;
+        let rough : f32 = smoothstep(wn * 0.8 as f32, wn * 3.0 as f32, lateral);
+        let seed : i32 = self.seed + PLAN_SEED_CREST;
+        let ledge : f32 = PLAN_LEDGE * terrainFbm(x / PLAN_LEDGE_SCALE, 0.61 as f32, seed + 5, 3);
+        let block : f32 = (terrainFloor(terrainNoise(x / PLAN_JOINT_SCALE, 0.23 as f32, seed + 9)
+            * 2.5 as f32) as f32)
+            / 2.5 as f32;
+        return self.size * PLAN_CREST_AT + arc + TerrainPlan::crestAt(self.seed, x) * free
+            + (PLAN_LEDGE + PLAN_JOINT + ledge + PLAN_JOINT * block) * rough;
+    }
+
+    /** x of the valley axis at south coordinate z. */
+    pub fn axisX(self, z : f32) : f32 {
+        let wander : f32 = PLAN_AXIS_WANDER
+            * terrainFbm(0.41 as f32, z / PLAN_AXIS_SCALE, self.seed + PLAN_SEED_AXIS, 3);
+        return self.axisX0 + wander * smoothstep(self.notchZ, self.notchZ + 600.0 as f32, z);
+    }
+
+    /** Height of the valley floor (the river's bank tops) at south coordinate z, below the foot of the fall. */
+    pub fn floor(self, z : f32) : f32 {
+        let foot : f32 = self.footZ();
+        if (z <= foot) {
+            return self.floorFoot;
+        }
+        if (z <= self.endZ) {
+            return self.floorFoot + (self.floorEnd - self.floorFoot) * (z - foot) / (self.endZ - foot);
+        }
+        let run : f32 = max(self.size - self.endZ, 1.0 as f32);
+        let t : f32 = smoothstep(0.0 as f32, run, z - self.endZ);
+        return self.floorEnd + (self.level - PLAN_END_BASIN - self.floorEnd) * t;
+    }
+
+    /** How much of the escarpment's height is still left at distance `u` south of the crest: 1 on top, 0 at the foot. */
+    pub fn faceLeft(self, u : f32) : f32 {
+        if (u <= 0.0 as f32) {
+            return 1.0 as f32;
+        }
+        if (u >= self.capRun + self.talusRun) {
+            return 0.0 as f32;
+        }
+        if (u < self.capRun) {
+            return 1.0 as f32 - PLAN_CAP_SHARE * u / self.capRun;
+        }
+        let t : f32 = (u - self.capRun) / self.talusRun;
+        let rest : f32 = 1.0 as f32 - t;
+        return (1.0 as f32 - PLAN_CAP_SHARE) * rest * rest;
+    }
+
+    /** How far the cliff reaches into the valley's sides: its height at east coordinate x, fading into the hills. */
+    pub fn cliffAt(self, x : f32) : f32 {
+        let lateral : f32 = abs(x - self.axisX0);
+        let reach : f32 = self.floodHalf * 1.1 as f32;
+        return self.cliff * (1.0 as f32 - smoothstep(reach, reach + 700.0 as f32, lateral));
+    }
+
+    /** The ground without mountains: the floor, the escarpment's step, the reservoir's level above it. */
+    pub fn base(self, x : f32, z : f32) : f32 {
+        let u : f32 = z - self.crestZ(x);
+        return self.floor(z) + self.cliffAt(x) * self.faceLeft(u);
+    }
+
+    /** Distance from the reservoir's middle in radii: 1 at the shore, with a noisy shoreline, never below 0. */
+    pub fn lakeRadius(self, x : f32, z : f32) : f32 {
+        let dx : f32 = (x - self.lakeX) / self.lakeA;
+        let dz : f32 = (z - self.lakeZ) / self.lakeB;
+        let r : f32 = sqrt(dx * dx + dz * dz);
+        let shape : f32 = terrainFbm(
+            x / PLAN_LAKE_NOISE_SCALE,
+            z / PLAN_LAKE_NOISE_SCALE,
+            self.seed + PLAN_SEED_LAKE,
+            3
+        );
+        let south : f32 = 1.0 as f32 - smoothstep(0.55 as f32, 0.95 as f32, dz);
+        return r * (1.0 as f32 + PLAN_LAKE_NOISE * shape * south);
+    }
+
+    /** Height of the shore bench above the reservoir's surface at lake radius `r`, metres. */
+    pub fn shoreRise(self, r : f32) : f32 {
+        let t : f32 = smoothstep(1.0 as f32, 1.5 as f32, r);
+        return PLAN_SHORE_RISE * t * t;
+    }
+
+    /** Weight of the lowland (1 south of the foot of the face, 0 on and above it) at (x, z). */
+    pub fn lowland(self, x : f32, z : f32) : f32 {
+        let foot : f32 = self.crestZ(x) + self.faceRun();
+        return smoothstep(foot - 10.0 as f32, foot + 40.0 as f32, z);
+    }
+
+    /** Distance from the valley axis at (x, z), metres, bent so the floodplain's edge wanders and its width breathes. */
+    pub fn lateral(self, x : f32, z : f32) : f32 {
+        let seed : i32 = self.seed + PLAN_SEED_EDGE;
+        let wander : f32 = PLAN_EDGE_WANDER * terrainFbm(x / PLAN_EDGE_SCALE, z / PLAN_EDGE_SCALE, seed, 3);
+        let breathe : f32 = self.floodHalf * PLAN_EDGE_BREATHE
+            * terrainNoise(z / PLAN_EDGE_LENGTH, 0.7 as f32, seed + 1);
+        return abs(x - self.axisX(z)) - wander - breathe;
+    }
+
+    /** How much of the floodplain (1 on the flat, 0 on the hills, a ramp between) lies at (x, z). */
+    pub fn floodWeight(self, x : f32, z : f32) : f32 {
+        let lateral : f32 = self.lateral(x, z);
+        let across : f32 = 1.0 as f32 - smoothstep(self.floodHalf, self.floodHalf + self.floodBlend, lateral);
+        return across * self.lowland(x, z);
+    }
+
+    /** Noise for the plan's callers: one cycle per `scale` metres, in [-1, 1]. */
+    pub fn wobble(self, x : f32, z : f32, scale : f32, salt : i32) : f32 {
+        return terrainNoise(x / scale, z / scale, self.seed + salt);
+    }
+}

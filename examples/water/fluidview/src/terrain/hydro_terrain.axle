@@ -1,0 +1,373 @@
+// hydro_terrain — a mountain valley with a reservoir, a waterfall and a meandering river, as a height grid.
+//
+// This is the ground the water demos stand on, modelled as a continuous surface, not voxels: one `f32` height per
+// cell in a flat array (`bed`), plus one `u8` per cell for the material and one for the wetness hint, and a
+// description of the water on it (`river`, `lake`, `escarpment`, `pool`, `inflows`, `outflow`, `puddles`).
+// Heights are `f32` and not 16-bit steps because the lowland river falls about one centimetre a cell: a 5 cm step
+// would turn its bed into a staircase of 20-cell terraces, which a shallow-water solver would take for dams.
+//
+// Convention: one unit is a metre; sample (i, j) is the ground at the CENTRE of cell (i, j), whose world position
+// is ((i + 0.5) * cellSize, (j + 0.5) * cellSize); x is east (the column index), z is south (the row index), and the
+// river flows toward +z. `heightAt` interpolates those samples bilinearly, so the surface is continuous.
+// `bedAsF32` is the grid in the order `FluidWorld.setBed(heights, width, depth, cellSize)` takes it: row by row,
+// `heights[j * width + i]`.
+//
+// The generator (`HydroTerrain::generate`) lives in `terrain_generate`; this file only owns the data and the
+// questions asked of it, so a scene can build a terrain by hand (a test plane) as well.
+
+use ludax::Vec3;
+
+use crate::terrain::hydro_check::HydroCheck;
+use crate::terrain::hydro_parts::{
+    HydroEscarpment, HydroInflow, HydroLake, HydroOutflow, HydroPool, HydroPuddle, HydroReport, HydroSpot,
+    HydroTributary, RiverPoint
+};
+use crate::terrain::terrain_generate::TerrainGenerator;
+use crate::terrain::terrain_params::TerrainParams;
+use crate::terrain::terrain_plan::TerrainPlan;
+use crate::terrain::terrain_sample::TerrainSample;
+
+/** Material of a cell: bare rock. */
+pub const HYDRO_ROCK : u8 = 0;
+
+/** Material of a cell: loose stones below cliffs and on steep slopes. */
+pub const HYDRO_SCREE : u8 = 1;
+
+/** Material of a cell: grass and meadow. */
+pub const HYDRO_GRASS : u8 = 2;
+
+/** Material of a cell: forest. */
+pub const HYDRO_FOREST : u8 = 3;
+
+/** Material of a cell: sand and gravel of the river bed and its bars. */
+pub const HYDRO_GRAVEL : u8 = 4;
+
+/** Material of a cell: wet mud of the shores and the banks. */
+pub const HYDRO_MUD : u8 = 5;
+
+/** Material of a cell: ploughed field or crop on the floodplain. */
+pub const HYDRO_FIELD : u8 = 6;
+
+/** The ground and the water description of one generated landscape. Read-only after generation. */
+pub class HydroTerrain {
+    /** Columns of the grid (cells along x). */
+    pub width : i32;
+
+    /** Rows of the grid (cells along z). */
+    pub depth : i32;
+
+    /** Side of a cell, metres. */
+    pub cellSize : f32;
+
+    /** The seed it was generated from. */
+    pub seed : i32 = 0;
+
+    /** The parameters it was generated from. */
+    pub params : TerrainParams = TerrainParams {};
+
+    /** Height of the ground at each cell centre, metres, `bed[j * width + i]`. */
+    pub bed : f32[];
+
+    /** Material of each cell, one of the `HYDRO_*` codes, same order as `bed`. */
+    pub material : u8[];
+
+    /** How wet the ground is, 0 dry to 255 under water or mud, same order as `bed`. */
+    pub wetness : u8[];
+
+    /** 1 where the cell is below the reservoir's level and part of its basin, else 0; same order as `bed`. */
+    pub lakeMask : u8[];
+
+    /** The river's centreline, from the plunge pool to the downstream lake. */
+    pub river : RiverPoint[];
+
+    /** How many points of `river` are valid. */
+    pub riverCount : i32 = 0;
+
+    /** The reservoir. */
+    pub lake : HydroLake = HydroLake {};
+
+    /** The escarpment's drop and its lip. */
+    pub escarpment : HydroEscarpment = HydroEscarpment {};
+
+    /** The crest line of the escarpment, west to east, one spot a few cells apart. */
+    pub crest : HydroSpot[];
+
+    /** How many spots of `crest` are valid. */
+    pub crestCount : i32 = 0;
+
+    /** The plunge pool at the foot of the fall. */
+    pub pool : HydroPool = HydroPool {};
+
+    /** The side streams that join the river across the floodplain. */
+    pub tributaries : HydroTributary[];
+
+    /** How many entries of `tributaries` are valid. */
+    pub tributaryCount : i32 = 0;
+
+    /** Cells of the hills with no lower neighbour after generation: unintended basins (zero when the fill succeeded). */
+    pub pitCount : i32 = 0;
+
+    /** The generator's layout, for `bedAt`; meaningful only when `analytic`. */
+    pub plan : TerrainPlan = TerrainPlan {};
+
+    /** The ground before the channel, pool and bar were cut into it, same order as `bed`; for `bedAt`. */
+    pub surface : f32[];
+
+    /** Fractional index of the nearest river point of each cell, or -1 when the river is far; for `bedAt`. */
+    pub riverAlong : f32[];
+
+    /** True when `plan`, `surface` and `riverAlong` describe this terrain, so `bedAt` can rebuild the ground at any resolution. */
+    pub analytic : bool = false;
+
+    /** The streams that feed the lake. */
+    pub inflows : HydroInflow[];
+
+    /** How many entries of `inflows` are valid. */
+    pub inflowCount : i32 = 0;
+
+    /** Where the water leaves the world. */
+    pub outflow : HydroOutflow = HydroOutflow {};
+
+    /** Hollows that hold water on their own. */
+    pub puddles : HydroPuddle[];
+
+    /** How many entries of `puddles` are valid. */
+    pub puddleCount : i32 = 0;
+
+    /** A flat terrain of `width` by `depth` cells at height `level`: the blank a generator fills. */
+    constructor(width : i32, depth : i32, cellSize : f32, level : f32) {
+        self.width = width;
+        self.depth = depth;
+        self.cellSize = cellSize;
+        let n : i64 = (width as i64) * (depth as i64);
+        self.bed = new f32[n];
+        self.material = new u8[n];
+        self.wetness = new u8[n];
+        self.lakeMask = new u8[n];
+        for (i of 0..n) {
+            self.bed[i] = level;
+            self.material[i] = HYDRO_GRASS;
+            self.wetness[i] = 0;
+            self.lakeMask[i] = 0;
+        }
+        self.surface = new f32[1];
+        self.riverAlong = new f32[1];
+        self.tributaries = new HydroTributary[1];
+        self.river = new RiverPoint[1];
+        self.crest = new HydroSpot[1];
+        self.inflows = new HydroInflow[1];
+        self.puddles = new HydroPuddle[1];
+    }
+
+    /**
+     * Generates the landscape `params` describes from `seed`. The same seed and parameters give the same grid
+     * to the last bit, with any `workers` (the heavy passes are cut into fixed chunks, see `kernel`); `workers`
+     * of 0 or 1 runs on the calling thread's pool of one.
+     */
+    pub static fn generate(seed : i32, params : TerrainParams, workers : i32) : HydroTerrain {
+        return TerrainGenerator::run(seed, params, workers);
+    }
+
+    /** Index of cell (i, j) in the grids; the caller keeps i and j inside. */
+    pub fn cell(self, i : i32, j : i32) : i64 {
+        return ((j as i64) * (self.width as i64)) + (i as i64);
+    }
+
+    /** Width of the world, metres. */
+    pub fn worldWidth(self) : f32 {
+        return (self.width as f32) * self.cellSize;
+    }
+
+    /** Depth of the world, metres. */
+    pub fn worldDepth(self) : f32 {
+        return (self.depth as f32) * self.cellSize;
+    }
+
+    /** Ground height at cell (i, j), clamped to the grid. */
+    pub fn cellHeight(self, i : i32, j : i32) : f32 {
+        return self.bed[self.cell(self.clampColumn(i), self.clampRow(j))];
+    }
+
+    /** Ground height at world position (x, z), bilinear between cell centres, clamped at the edges. */
+    pub fn heightAt(self, x : f32, z : f32) : f32 {
+        let gx : f32 = hydroClamp(x / self.cellSize - (0.5 as f32), 0.0, (self.width - 1) as f32);
+        let gz : f32 = hydroClamp(z / self.cellSize - (0.5 as f32), 0.0, (self.depth - 1) as f32);
+        let mut i : i32 = gx as i32;
+        let mut j : i32 = gz as i32;
+        if (i > self.width - 2) {
+            i = self.width - 2;
+        }
+        if (j > self.depth - 2) {
+            j = self.depth - 2;
+        }
+        if (i < 0) {
+            i = 0;
+        }
+        if (j < 0) {
+            j = 0;
+        }
+        let fx : f32 = gx - (i as f32);
+        let fz : f32 = gz - (j as f32);
+        let a : f32 = self.cellHeight(i, j);
+        let b : f32 = self.cellHeight(i + 1, j);
+        let c : f32 = self.cellHeight(i, j + 1);
+        let d : f32 = self.cellHeight(i + 1, j + 1);
+        let top : f32 = a + (b - a) * fx;
+        let bottom : f32 = c + (d - c) * fx;
+        return top + (bottom - top) * fz;
+    }
+
+    /**
+     * The ground height at (x, z) rebuilt from its parts, so a finer grid than the terrain's keeps the cliff and the channel:
+     * the cap rock stays vertical and the river's profile stays smooth. Equal to `heightAt` at cell centres to rounding;
+     * for a terrain with no generator it is `heightAt`.
+     */
+    pub fn bedAt(self, x : f32, z : f32) : f32 {
+        return TerrainSample::bedAt(self, x, z);
+    }
+
+    /**
+     * A copy of the ground over the rectangle with corner (x, z), `columns` by `rows` cells of side `cell` metres, row by row,
+     * each height taken at the cell's centre with `bedAt`: the bed for a finer water grid than the terrain's.
+     */
+    pub fn bedPatch(self, x : f32, z : f32, columns : i32, rows : i32, cell : f32) : f32[] {
+        let mut out : f32[] = new f32[(columns as i64) * (rows as i64)];
+        for (j of 0..rows) {
+            for (i of 0..columns) {
+                let px : f32 = x + ((i as f32) + 0.5 as f32) * cell;
+                let pz : f32 = z + ((j as f32) + 0.5 as f32) * cell;
+                out[((j as i64) * (columns as i64)) + (i as i64)] = self.bedAt(px, pz);
+            }
+        }
+        return out;
+    }
+
+    /** Unit surface normal (y up) at world position (x, z), from central differences one cell apart. */
+    pub fn normalAt(self, x : f32, z : f32) : Vec3 {
+        let h : f32 = self.cellSize;
+        let dx : f32 = (self.heightAt(x + h, z) - self.heightAt(x - h, z)) / (h * (2.0 as f32));
+        let dz : f32 = (self.heightAt(x, z + h) - self.heightAt(x, z - h)) / (h * (2.0 as f32));
+        return Vec3::make(-dx, 1.0, -dz).normalized();
+    }
+
+    /** Steepness at (x, z): rise over run (1 is 45 degrees), never negative. */
+    pub fn slopeAt(self, x : f32, z : f32) : f32 {
+        let n : Vec3 = self.normalAt(x, z);
+        let up : f32 = n.y;
+        if (up < 0.0001) {
+            return 10000.0;
+        }
+        let side : f32 = ludax::sqrt(n.x * n.x + n.z * n.z);
+        return side / up;
+    }
+
+    /** The material code (`HYDRO_*`) of the cell holding (x, z). */
+    pub fn materialAt(self, x : f32, z : f32) : u8 {
+        return self.material[self.nearestCell(x, z)];
+    }
+
+    /** The wetness hint, 0 to 255, of the cell holding (x, z). */
+    pub fn wetnessAt(self, x : f32, z : f32) : u8 {
+        return self.wetness[self.nearestCell(x, z)];
+    }
+
+    /** True when (x, z) is inside the reservoir basin below its level. */
+    pub fn isLakeAt(self, x : f32, z : f32) : bool {
+        return self.lakeMask[self.nearestCell(x, z)] != (0 as u8);
+    }
+
+    /** A copy of the heights, row by row, for `FluidWorld.setBed(heights, width, depth, cellSize)`. */
+    pub fn bedAsF32(self) : f32[] {
+        let n : i64 = (self.width as i64) * (self.depth as i64);
+        let mut out : f32[] = new f32[n];
+        for (i of 0..n) {
+            out[i] = self.bed[i];
+        }
+        return out;
+    }
+
+    /** The lowest ground of the grid, metres. */
+    pub fn lowest(self) : f32 {
+        let n : i64 = (self.width as i64) * (self.depth as i64);
+        let mut low : f32 = self.bed[0];
+        for (i of 0..n) {
+            if (self.bed[i] < low) {
+                low = self.bed[i];
+            }
+        }
+        return low;
+    }
+
+    /** The highest ground of the grid, metres. */
+    pub fn highest(self) : f32 {
+        let n : i64 = (self.width as i64) * (self.depth as i64);
+        let mut high : f32 = self.bed[0];
+        for (i of 0..n) {
+            if (self.bed[i] > high) {
+                high = self.bed[i];
+            }
+        }
+        return high;
+    }
+
+    /**
+     * Whether water set on this ground behaves: every river point descends toward the outflow, the lake basin
+     * is closed except at its spill point, the escarpment has its drop, the channel lies below its banks and
+     * no height is not-a-number. `report().problem` names the first thing that failed.
+     */
+    pub fn isConsistentForWater(self) : bool {
+        let r : HydroReport = HydroCheck::report(self);
+        return r.passed;
+    }
+
+    /** The full account of the consistency check: what was measured and the first problem found. */
+    pub fn report(self) : HydroReport {
+        return HydroCheck::report(self);
+    }
+
+    /** Column index of the cell holding x, clamped. */
+    pub fn clampColumn(self, i : i32) : i32 {
+        if (i < 0) {
+            return 0;
+        }
+        if (i >= self.width) {
+            return self.width - 1;
+        }
+        return i;
+    }
+
+    /** Row index of the cell holding z, clamped. */
+    pub fn clampRow(self, j : i32) : i32 {
+        if (j < 0) {
+            return 0;
+        }
+        if (j >= self.depth) {
+            return self.depth - 1;
+        }
+        return j;
+    }
+
+    fn nearestCell(self, x : f32, z : f32) : i64 {
+        let i : i32 = self.clampColumn(hydroFloor(x / self.cellSize));
+        let j : i32 = self.clampRow(hydroFloor(z / self.cellSize));
+        return self.cell(i, j);
+    }
+}
+
+fn hydroClamp(v : f32, lo : f32, hi : f32) : f32 {
+    if (v < lo) {
+        return lo;
+    }
+    if (v > hi) {
+        return hi;
+    }
+    return v;
+}
+
+fn hydroFloor(v : f32) : i32 {
+    let t : i32 = v as i32;
+    if ((t as f32) > v) {
+        return t - 1;
+    }
+    return t;
+}

@@ -1,0 +1,249 @@
+// terrain_channel — the river's channel, its plunge pool and the bar below it, as functions of position.
+//
+// Everything that is cut below the floodplain is evaluated here, analytically, from the centreline points and a surface
+// height, at any position: the generator calls it at the centre of every cell, and `bedAt` calls it at a point of a
+// finer grid, so a 1 m water grid built from `bedAt` sees the same smooth channel the 4 m grid was sampled from, and not
+// the cell-scale bumps of resampling a carved grid.
+//
+// The cross-section is asymmetric where the river bends (the deepest water sits toward the outside, the cutbank is steep
+// and the inside shoals into a point bar) and is normalised so that at the centreline the bed is exactly the point's
+// `bedHeight`, which is what keeps the long profile strictly descending, and zero at the banks, which is what keeps the
+// channel below them. The outer half is deepened at bends (a pool) and the centreline is left alone (so a crossing is a
+// riffle by comparison, the bed there being the bare reference).
+//
+// The plunge pool is a hollow longer downstream than upstream, deepest at the foot of the vertical face (where the fall
+// lands), with a shallow bar a little downstream of it, as the plunge pools of real falls have.
+
+use ludax::{abs, max, min, saturate, smoothstep, sqrt};
+
+use crate::terrain::hydro_parts::RiverPoint;
+use crate::terrain::terrain_plan::TerrainPlan;
+
+/** Marker of a position the river has not reached. */
+pub const CHANNEL_FAR : f32 = 1000000.0;
+
+// How many segments either side of the hint a refinement looks at.
+const CHANNEL_SEARCH : i32 = 8;
+
+// The cross-section: how far the deepest water sits toward the outside at the sharpest bend (share of the half width), the
+// curvature radius, in widths, at which a bend counts as sharp, the exponents of the bank sides, and the extra depth the
+// outer half gets at a sharp bend (a share of the depth).
+const CHANNEL_THALWEG : f32 = 0.42;
+const CHANNEL_SHARP_RADIUS : f32 = 6.0;
+const CHANNEL_BANK_STRAIGHT : f32 = 3.5;
+const CHANNEL_BANK_INSIDE : f32 = 1.5;
+const CHANNEL_BANK_OUTSIDE : f32 = 6.0;
+const CHANNEL_POOL_EXTRA : f32 = 0.45;
+
+// The plunge pool: its length downstream relative to the radius and the metres it reaches upstream (it stops at the foot of the vertical face), and its bar: height, metres, where it
+// starts, peaks and ends (in pool radii downstream).
+const CHANNEL_POOL_DOWN : f32 = 1.7;
+const CHANNEL_POOL_BACK : f32 = 6.0;
+const CHANNEL_BAR_HEIGHT : f32 = 0.55;
+const CHANNEL_BAR_FROM : f32 = 0.95;
+const CHANNEL_BAR_PEAK : f32 = 1.2;
+const CHANNEL_BAR_TO : f32 = 1.9;
+
+/** Where the nearest centreline position of a point is. */
+pub struct RiverHit {
+    /** Signed distance to it, metres, positive on the river's left. */
+    pub distance : f32 = 1000000.0;
+
+    /** Its fractional point index, or -1 when there is none. */
+    pub along : f32 = -1.0;
+}
+
+/** The point at fractional index `at` of `points` (`count` of them), attributes interpolated; the direction is not renormalised. */
+pub fn riverLerp(points : RiverPoint[], count : i32, at : f32) : RiverPoint {
+    let last : i32 = count - 1;
+    let mut clamped : f32 = at;
+    if (clamped < 0.0 as f32) {
+        clamped = 0.0 as f32;
+    }
+    if (clamped > (last as f32)) {
+        clamped = last as f32;
+    }
+    let mut i : i32 = clamped as i32;
+    if (i >= last) {
+        i = last - 1;
+    }
+    let t : f32 = clamped - (i as f32);
+    let a : RiverPoint = points[i as i64];
+    let b : RiverPoint = points[(i + 1) as i64];
+    let u : f32 = 1.0 as f32 - t;
+    return RiverPoint {
+        x: a.x * u + b.x * t,
+        z: a.z * u + b.z * t,
+        arc: a.arc * u + b.arc * t,
+        dirX: a.dirX * u + b.dirX * t,
+        dirZ: a.dirZ * u + b.dirZ * t,
+        curvature: a.curvature * u + b.curvature * t,
+        width: a.width * u + b.width * t,
+        depth: a.depth * u + b.depth * t,
+        bankHeight: a.bankHeight * u + b.bankHeight * t,
+        bedHeight: a.bedHeight * u + b.bedHeight * t,
+    };
+}
+
+/** The channel's functions. */
+pub class TerrainChannel {
+    /** The nearest centreline position to (x, z), searched around fractional index `hint` (a negative hint finds nothing). */
+    pub static fn nearest(points : RiverPoint[], count : i32, hint : f32, x : f32, z : f32) : RiverHit {
+        let mut hit : RiverHit = RiverHit {};
+        if (hint < 0.0 as f32) {
+            return hit;
+        }
+        let mid : i32 = hint as i32;
+        let mut from : i32 = mid - CHANNEL_SEARCH;
+        let mut to : i32 = mid + CHANNEL_SEARCH;
+        if (from < 0) {
+            from = 0;
+        }
+        if (to > count - 2) {
+            to = count - 2;
+        }
+        for (i of from..(to + 1)) {
+            let a : RiverPoint = points[i as i64];
+            let b : RiverPoint = points[(i + 1) as i64];
+            let dx : f32 = b.x - a.x;
+            let dz : f32 = b.z - a.z;
+            let ox : f32 = x - a.x;
+            let oz : f32 = z - a.z;
+            let len2 : f32 = dx * dx + dz * dz;
+            let mut t : f32 = 0.0 as f32;
+            if (len2 > 0.000001 as f32) {
+                t = saturate((ox * dx + oz * dz) / len2);
+            }
+            let ex : f32 = ox - dx * t;
+            let ez : f32 = oz - dz * t;
+            let dist : f32 = sqrt(ex * ex + ez * ez);
+            if (dist >= abs(hit.distance)) {
+                continue;
+            }
+            hit.distance = dist;
+            if (dx * oz - dz * ox > 0.0 as f32) {
+                hit.distance = 0.0 as f32 - dist;
+            }
+            hit.along = (i as f32) + t;
+        }
+        return hit;
+    }
+
+    /**
+     * The ground at (x, z) once the channel, the pool and the bar are cut into `surface` (the floodplain's height there).
+     * `hint` is any fractional point index near the position, or negative when the river is far.
+     */
+    pub static fn carve(
+        plan : TerrainPlan,
+        points : RiverPoint[],
+        count : i32,
+        surface : f32,
+        x : f32,
+        z : f32,
+        hint : f32
+    ) : f32 {
+        let start : RiverPoint = points[0];
+        let mut height : f32 = surface;
+        let mut bar : f32 = 0.0 as f32;
+        let mut floor : f32 = 0.0 as f32;
+        // The channel begins at the first point; north of it is the foot of the cliff, which the pool alone may cut.
+        if (hint >= 0.0 as f32 && z >= start.z) {
+            let hit : RiverHit = TerrainChannel::nearest(points, count, hint, x, z);
+            let p : RiverPoint = riverLerp(points, count, hit.along);
+            let half : f32 = p.width * 0.5 as f32;
+            if (hit.along >= 0.0 as f32 && abs(hit.distance) < half) {
+                let across : f32 = TerrainChannel::outside(p, hit.distance);
+                let share : f32 = TerrainChannel::section(across / half, p.curvature, p.width);
+                height = min(height, p.bankHeight - p.depth * share);
+                bar = TerrainChannel::bar(plan, start, x, z);
+                floor = p.bedHeight;
+            }
+        }
+        height = min(height, TerrainChannel::pool(plan, start, x, z));
+        if (bar > 0.0 as f32) {
+            height = max(height, min(surface - 0.3 as f32, floor + bar));
+        }
+        return height;
+    }
+
+    // The height of the plunge pool's floor at (x, z), or a very high number outside it.
+    static fn pool(plan : TerrainPlan, start : RiverPoint, x : f32, z : f32) : f32 {
+        let radius : f32 = plan.params.plungePoolRadius;
+        let rho2 : f32 = TerrainChannel::reach(start, x, z, radius);
+        if (rho2 >= 1.0 as f32) {
+            return CHANNEL_FAR;
+        }
+        let open : f32 = 1.0 as f32 - rho2;
+        return start.bankHeight - (start.depth + plan.params.plungePoolDepth) * open * sqrt(open);
+    }
+
+    // The bar's height above the bed at (x, z): zero except in a band a little downstream of the pool.
+    static fn bar(plan : TerrainPlan, start : RiverPoint, x : f32, z : f32) : f32 {
+        let rho : f32 = sqrt(TerrainChannel::reach(start, x, z, plan.params.plungePoolRadius));
+        let rise : f32 = smoothstep(CHANNEL_BAR_FROM, CHANNEL_BAR_PEAK, rho);
+        let fall : f32 = 1.0 as f32 - smoothstep(CHANNEL_BAR_PEAK, CHANNEL_BAR_TO, rho);
+        if (z < start.z) {
+            return 0.0 as f32;
+        }
+        return CHANNEL_BAR_HEIGHT * rise * fall;
+    }
+
+    // The squared distance from the pool's middle in pool radii: longer downstream than upstream.
+    static fn reach(start : RiverPoint, x : f32, z : f32, radius : f32) : f32 {
+        let dx : f32 = (x - start.x) / radius;
+        let mut dz : f32 = (z - start.z) / CHANNEL_POOL_BACK;
+        if (z > start.z) {
+            dz = (z - start.z) / (radius * CHANNEL_POOL_DOWN);
+        }
+        return dx * dx + dz * dz;
+    }
+
+    /** Distance of a point to the outside of the bend: positive toward the outer bank, negative toward the inner one. */
+    pub static fn outside(p : RiverPoint, signed : f32) : f32 {
+        if (p.curvature > 0.0 as f32) {
+            return 0.0 as f32 - signed;
+        }
+        return signed;
+    }
+
+    /** The share of the channel depth below the bank at lateral position `across` half widths toward the outside (-1 to 1). */
+    pub static fn section(across : f32, curvature : f32, width : f32) : f32 {
+        if (across <= -1.0 as f32 || across >= 1.0 as f32) {
+            return 0.0 as f32;
+        }
+        let bend : f32 = saturate(abs(curvature) * width * CHANNEL_SHARP_RADIUS);
+        let shift : f32 = CHANNEL_THALWEG * bend;
+        let inner : f32 = CHANNEL_BANK_STRAIGHT + (CHANNEL_BANK_INSIDE - CHANNEL_BANK_STRAIGHT) * bend;
+        let outer : f32 = CHANNEL_BANK_STRAIGHT + (CHANNEL_BANK_OUTSIDE - CHANNEL_BANK_STRAIGHT) * bend;
+        let here : f32 = TerrainChannel::wall(across, shift, inner, outer);
+        let middle : f32 = TerrainChannel::wall(0.0 as f32, shift, inner, outer);
+        let pool : f32 = 1.0 as f32 + CHANNEL_POOL_EXTRA * bend * smoothstep(0.0 as f32, 0.6 as f32, across);
+        return here / middle * pool;
+    }
+
+    // The raw profile: 1 at the thalweg `shift`, falling to 0 at the banks with exponent `inner` on the inside, `outer` outside.
+    static fn wall(across : f32, shift : f32, inner : f32, outer : f32) : f32 {
+        if (across >= shift) {
+            let a : f32 = (across - shift) / (1.0 as f32 - shift);
+            return 1.0 as f32 - channelPower(a, outer);
+        }
+        let a : f32 = (shift - across) / (1.0 as f32 + shift);
+        return 1.0 as f32 - channelPower(a, inner);
+    }
+}
+
+// a to a power between 1.5 and 6 without libm, by blending the nearest whole powers.
+fn channelPower(a : f32, e : f32) : f32 {
+    let a2 : f32 = a * a;
+    let a3 : f32 = a2 * a;
+    let a4 : f32 = a2 * a2;
+    let a6 : f32 = a3 * a3;
+    if (e < 3.0 as f32) {
+        let a15 : f32 = a * sqrt(a);
+        return a15 + (a3 - a15) * saturate((e - 1.5 as f32) / 1.5 as f32);
+    }
+    if (e < 4.0 as f32) {
+        return a3 + (a4 - a3) * (e - 3.0 as f32);
+    }
+    return a4 + (a6 - a4) * saturate((e - 4.0 as f32) / 2.0 as f32);
+}

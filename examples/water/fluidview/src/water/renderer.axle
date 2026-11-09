@@ -1,0 +1,245 @@
+// renderer — the water renderer a scene author calls: one scene and one camera in, a picture out.
+//
+// `render` runs one sample of the picture through the stages of `frame` on a job pool. When the scene or the
+// camera is not the one the last call drew (`fresh`, or a moved camera) the accumulated picture restarts and the
+// tables the pixels read are rebuilt (the field's slopes and lightmap, the drops' shadow grid); when
+// nothing moved, each call adds one more jittered sample to the running mean, so a still scene refines toward the
+// antialiased picture. The exposure is metered after every sample, immediately for a restarted picture and eased
+// for a moving one. Nothing here reads a clock for its result: the stage timings are measured and kept for the
+// caller's `--prof`, and the pixels depend on the scene, the camera and the sample number alone.
+
+use ludax::{max, nowNanos, nanosToMillis, JobPool, Vec3, PI};
+
+use crate::stage::camera::CamOrbit;
+use crate::water::camera::WaterCamera;
+use crate::water::field::WaterField;
+use crate::water::frame::{FrameStage, WaterFrame};
+use crate::water::look::WaterLook;
+use crate::water::scene::WaterScene;
+use crate::water::sky::WSKY_ROWS_PER_JOB;
+
+/** Rows of a pixel stage one pool job covers. */
+const RENDER_ROWS_PER_JOB : i32 = 4;
+
+/** Slabs of the drops' shadow bake one job covers. */
+const RENDER_SLABS_PER_JOB : i32 = 2;
+
+/** Rows of the field's lightmap one job covers. */
+const RENDER_LIGHT_ROWS_PER_JOB : i32 = 4;
+
+/** The profile's slots: the milliseconds the last sample took in all, and in each phase of it. */
+pub const RENDER_STAGES : i32 = 6;
+
+/** The names of the profile's slots, in order. */
+pub const RENDER_STAGE_NAMES : string = "total prepare trace drops compose display";
+
+/** The water renderer. */
+pub class WaterRenderer {
+    /** The picture's width, pixels. */
+    pub width : i32;
+
+    /** The picture's height, pixels. */
+    pub height : i32;
+
+    /** The size of the words `pixels` holds: the picture times the output scale. */
+    pub outWidth : i32;
+
+    /** The size of the words `pixels` holds. */
+    pub outHeight : i32;
+
+    /** Milliseconds each stage took in the last `render`, indexed like `RENDER_STAGE_NAMES`. */
+    pub spent : f64[];
+
+    /** Samples the current picture has accumulated. */
+    pub samples : i32 = 0;
+
+    scene   : Shared<WaterScene>;
+    frame   : WaterFrame;
+    pool    : JobPool;
+    last    : WaterCamera = WaterCamera {};
+    skyDay  : f64 = -1.0;
+    skyTilt : f32 = -1.0;
+    skyGain : f32 = -1.0;
+
+    /** A renderer of `scene` into pictures `width` by `height` (multiples of 16), shown `scale` times larger. */
+    constructor(scene : Shared<WaterScene>, width : i32, height : i32, scale : i32, workers : i32) {
+        self.scene = scene;
+        self.width = width;
+        self.height = height;
+        self.outWidth = width * scale;
+        self.outHeight = height * scale;
+        self.frame = new WaterFrame(scene.field, width, height, scale, scene.particles.capacity);
+        self.pool = new JobPool(workers, self.frame);
+        self.spent = new f64[RENDER_STAGES as i64];
+        for (i of 0..RENDER_STAGES) {
+            self.spent[i as i64] = 0.0;
+        }
+    }
+
+    /** Stops the worker threads. */
+    pub fn close(mut self) : void {
+        self.pool.shutdown();
+    }
+
+    /** How many threads work on a picture. */
+    pub fn threads(self) : i32 {
+        return self.pool.workerCount();
+    }
+
+    /** The mean radiance of the (2 `radius` + 1) square of pixels around (`x`, `y`) of the picture, before display. */
+    pub fn probe(self, x : i32, y : i32, radius : i32) : Vec3 {
+        let mut sum : Vec3 = Vec3::zero();
+        let mut n : i32 = 0;
+        for (j of (y - radius)..(y + radius + 1)) {
+            for (i of (x - radius)..(x + radius + 1)) {
+                if (i < 0 || j < 0 || i >= self.width || j >= self.height) {
+                    continue;
+                }
+                let at : i64 = (((j * self.width) + i) * 3) as i64;
+                sum = sum.plus(Vec3 {
+                    x: self.frame.hdr[at],
+                    y: self.frame.hdr[at + 1],
+                    z: self.frame.hdr[at + 2],
+                });
+                n = n + 1;
+            }
+        }
+        return sum.scale((1.0 as f32) / (max(n as f32, 1.0)));
+    }
+
+    /** The radiance of a perfectly white surface facing the sun: the level a white cloud should reach. */
+    pub fn whiteLevel(self) : f32 {
+        return self.frame.sky.sunIrr.maxComponent() / PI;
+    }
+
+    /** One line about the exposure and the sky, for the profile. */
+    pub fn describe(self) : string {
+        let exposure : f32 = self.frame.post.exposure;
+        let zenith : f32 = self.frame.sky.zenith.maxComponent();
+        let sun : f32 = self.frame.sky.sunIrr.maxComponent();
+        let elevation : f32 = self.frame.sky.sunDir.y;
+        return "exposure ${exposure} zenith ${zenith} sunIrradiance ${sun} sunHeight ${elevation}";
+    }
+
+    /** The words of the finished picture, `outWidth` by `outHeight`. */
+    pub fn pixels(self) : i32[] {
+        return self.frame.post.out;
+    }
+
+    // Runs `stage` over its rows in chunks of `grain`; the caller's thread does it all if the pool is gone.
+    fn run(mut self, stage : FrameStage, grain : i32) : void {
+        self.frame.stage = stage;
+        let rows : i32 = self.frame.rows();
+        if (!self.pool.run(rows, grain)) {
+            self.frame.runRange(0, rows);
+        }
+    }
+
+    // Closes the interval that began at `began` into profile slot `slot` and answers the time now.
+    fn lap(mut self, slot : i32, began : i64) : i64 {
+        let now : i64 = nowNanos();
+        self.spent[slot as i64] = nanosToMillis(now - began);
+        return now;
+    }
+
+    // The words after `began` that profile slot `slot` shows: zero for a sample that did not rebuild anything.
+    fn clearSlot(mut self, slot : i32) : void {
+        self.spent[slot as i64] = 0.0;
+    }
+
+    /**
+     * Draws one sample of `scene` seen from `orbit`. `fresh` says the scene changed since the last call (a
+     * simulation tick, a new look), which restarts the picture; a moved camera restarts it too.
+     */
+    pub fn render(mut self, orbit : CamOrbit, fresh : bool) : void {
+        let begin : i64 = nowNanos();
+        let mut t : i64 = begin;
+        let cam : WaterCamera = WaterCamera::orbit(orbit, self.width, self.height);
+        let restart : bool = fresh || self.samples == 0 || !WaterRenderer::same(cam, self.last);
+        self.last = cam;
+        if (restart) {
+            self.samples = 0;
+        }
+
+        self.frame.cam = cam;
+        self.frame.look = self.scene.look;
+        self.frame.time = self.scene.time as f32;
+        self.frame.sky.drift = (self.scene.time as f32) * self.scene.look.sky.cloudDrift;
+        self.frame.index = self.samples;
+        let look : WaterLook = self.scene.look;
+        self.clearSlot(1);
+        if (restart) {
+            self.prepare(look);
+            t = self.lap(1, t);
+        }
+
+        self.run(FrameStage::Trace, RENDER_ROWS_PER_JOB);
+        t = self.lap(2, t);
+
+        self.drops(look);
+        self.run(FrameStage::Splat, 1);
+        t = self.lap(3, t);
+        self.run(FrameStage::Resolve, RENDER_ROWS_PER_JOB);
+        t = self.lap(4, t);
+
+        self.display(look, restart);
+        self.lap(5, t);
+        self.samples = self.samples + 1;
+        self.lap(0, begin);
+    }
+
+    // True when two cameras see the same picture.
+    static fn same(a : WaterCamera, b : WaterCamera) : bool {
+        return a.eye.distanceSquared(b.eye) == 0.0 && a.forward.distanceSquared(b.forward) == 0.0;
+    }
+
+    // Everything a restart rebuilds: the field's derived arrays, the sky (when its time of day moved), the drops'
+    // shadow grid, and the lightmaps that need them. Order matters: the grid is lit by the sky it is built under.
+    fn prepare(mut self, look : WaterLook) : void {
+        self.scene.field.farGround = look.terrain.farGround;
+        self.scene.field.farHills = look.terrain.farHills;
+        self.scene.field.bake();
+        self.frame.surface.terrain.setLook(look.terrain, look.modules.terrain);
+        self.frame.surface.setLook(look.surface, look.physics);
+        self.frame.sky.configure(look.sky, look.modules.sky);
+        if (look.sky.dayTime != self.skyDay || look.sky.tilt != self.skyTilt
+            || look.sky.gain != self.skyGain) {
+            self.skyDay = look.sky.dayTime;
+            self.skyTilt = look.sky.tilt;
+            self.skyGain = look.sky.gain;
+            self.run(FrameStage::SkyBake, WSKY_ROWS_PER_JOB);
+            self.frame.sky.finish();
+        }
+        self.frame.shadow.filled = false;
+        if (look.modules.spray) {
+            self.frame.shadow.setSun(self.frame.sky.sunDir);
+            self.frame.shadow.build(self.scene.particles, look.spray.shadowDensity);
+        }
+        self.run(FrameStage::FieldLight, RENDER_LIGHT_ROWS_PER_JOB);
+        self.run(FrameStage::DropLight, RENDER_SLABS_PER_JOB);
+    }
+
+    // Projects, sorts and bins the drops for this sample's jitter.
+    fn drops(mut self, look : WaterLook) : void {
+        if (!look.modules.spray) {
+            self.frame.spray.clear();
+            return;
+        }
+        self.frame.spray.prepare(
+            self.scene.particles,
+            self.frame.cam,
+            look.spray,
+            self.frame.sky,
+            self.frame.shadow,
+            self.frame.splatOffset()
+        );
+    }
+
+    // Meters the exposure and runs the bloom and the pack.
+    fn display(mut self, look : WaterLook, restart : bool) : void {
+        self.frame.post.meter(self.frame.hdr, look.post, restart);
+        self.run(FrameStage::Bright, RENDER_ROWS_PER_JOB);
+        self.frame.post.reduce();
+        self.run(FrameStage::Display, RENDER_ROWS_PER_JOB);
+    }
+}

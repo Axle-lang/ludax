@@ -1,0 +1,299 @@
+// ground_soil — the loose and living ground: grass, farmland, gravel, scree, mud and the forest floor.
+//
+// Each material is a pure function of a `GroundSite`. They share a recipe that keeps them from looking like wallpaper:
+// a mean colour for the far view, patchy variation at three scales (tens of metres, metres, centimetres) so no
+// distance is flat, and detail that is fully drawn only while a pixel is smaller than it (`groundFade`) and averages
+// into the mean beyond, so nothing shimmers. Pebbles, chips and clods are cells with a dome (`groundCells`): the
+// cell id picks a colour and the offset to the cell's centre tilts the normal, which is what makes a gravel bar
+// look made of stones at one metre and a grey-brown sheet at a hundred.
+
+use ludax::{abs, max, min, saturate, smoothstep, sqrt, Vec3};
+
+use crate::water::ground_noise::{groundCells, groundFade, groundPlanes, groundSlope3, GroundCell};
+use crate::water::ground_site::{GroundPatch, GroundSite};
+use crate::water::noise::{waterFbm2, waterHash, waterValue2};
+use crate::water::vista_look::GroundLook;
+
+// Seeds.
+const GS_SEED_TINT : i32 = 501;
+const GS_SEED_BLADE : i32 = 503;
+const GS_SEED_FLOWER : i32 = 509;
+const GS_SEED_CROP : i32 = 521;
+const GS_SEED_PEBBLE : i32 = 523;
+const GS_SEED_CHIP : i32 = 541;
+const GS_SEED_MUD : i32 = 547;
+const GS_SEED_DUFF : i32 = 557;
+
+// Size of a farm field, metres, and the width of the hedge between two as a share of the cell.
+const GS_FIELD : f32 = 62.0;
+const GS_HEDGE : f32 = 0.035;
+
+// Spacing of crop rows, metres.
+const GS_ROWS : f32 = 0.7;
+
+// Gravel: the size of the pebbles and of the cobbles among them, metres.
+const GS_PEBBLE : f32 = 0.17;
+const GS_COBBLE : f32 = 0.8;
+
+// Scree: the size of the big and small chips, metres.
+const GS_CHIP : f32 = 0.9;
+const GS_CHIP_SMALL : f32 = 0.22;
+
+// A blade of grass and a flower: metres between the tufts and between the flowers.
+const GS_TUFT : f32 = 0.42;
+const GS_FLOWER : f32 = 0.36;
+
+/** Loose ground and ground cover. */
+pub class GroundSoil {
+    /** Grass; `dry` is 0 for lush and 1 for yellowed, and `flowers` is how many flowers it carries, 0 to 1. */
+    pub static fn grass(site : GroundSite, look : GroundLook, dry : f32, flowers : f32) : GroundPatch {
+        let p : Vec3 = site.p;
+        let big : f32 = waterFbm2(p.x * (0.012 as f32), p.z * (0.012 as f32), 3, GS_SEED_TINT);
+        let mid : f32 = waterFbm2(p.x * (0.11 as f32), p.z * (0.11 as f32), 3, GS_SEED_TINT + 5);
+        let yellow : f32 = saturate(dry + (big - (0.5 as f32)) * (1.3 as f32));
+        let mut albedo : Vec3 = look.grass.lerp(look.dryGrass, yellow);
+        albedo = albedo.scale((0.7 as f32) + (0.7 as f32) * big + (mid - (0.5 as f32)) * (0.35 as f32));
+
+        let mut tilt : Vec3 = Vec3::zero();
+        let mut open : f32 = (0.85 as f32);
+        if (site.fine) {
+            let tuft : GroundCell = groundCells(p.x / GS_TUFT, p.z / GS_TUFT, GS_SEED_BLADE);
+            let sheaf : f32 = saturate((1.0 as f32) - tuft.dist * (1.8 as f32));
+            let near : f32 = groundFade(GS_TUFT, site.footprint, 0.12, 0.9);
+            albedo = albedo.scale((1.0 as f32) + (sheaf - (0.4 as f32)) * (0.55 as f32) * near);
+            open = (0.6 as f32) + (0.4 as f32) * sheaf * near + (1.0 as f32 - near) * (0.2 as f32);
+            tilt = Vec3 { x: -tuft.dx * sheaf, y: (0.0 as f32), z: -tuft.dz * sheaf }.scale((0.35 as f32)
+                * near);
+            albedo = albedo.scale(GroundSoil::turf(p, site.footprint));
+            albedo = GroundSoil::flower(site, look, albedo, flowers);
+        }
+        return GroundPatch { albedo: albedo, tilt: tilt, gloss: (0.0 as f32), open: open };
+    }
+
+    // Brightness of a ground cover seen from above at three scales: clumps of a third of a metre, blades a few centimetres
+    // wide and the grain of single stalks; each is drawn only while a pixel is narrower than it.
+    static fn turf(p : Vec3, footprint : f32) : f32 {
+        let clump : f32 = waterValue2(p.x * (3.0 as f32), p.z * (3.0 as f32), GS_SEED_BLADE + 4);
+        let blade : f32 = waterValue2(p.x * (16.0 as f32), p.z * (16.0 as f32), GS_SEED_BLADE + 2);
+        let stalk : f32 = waterValue2(p.x * (52.0 as f32), p.z * (52.0 as f32), GS_SEED_BLADE + 6);
+        let c : f32 = (clump - (0.5 as f32)) * (0.5 as f32) * groundFade((0.33 as f32), footprint, 0.1, 0.8);
+        let b : f32 = (blade - (0.5 as f32)) * (0.5 as f32) * groundFade((0.06 as f32), footprint, 0.2, 1.2);
+        let s : f32 = (stalk - (0.5 as f32)) * (0.45 as f32) * groundFade((0.02 as f32), footprint, 0.3, 1.5);
+        return (1.0 as f32) + c + b + s;
+    }
+
+    // A sparse scatter of small flowers in three colours, drawn only near; far away the meadow keeps its green.
+    static fn flower(site : GroundSite, look : GroundLook, albedo : Vec3, amount : f32) : Vec3 {
+        let near : f32 = groundFade(GS_FLOWER, site.footprint, 0.06, 0.4);
+        if (amount <= (0.0 as f32) || near <= (0.0 as f32)) {
+            return albedo;
+        }
+        let cell : GroundCell = groundCells(site.p.x / GS_FLOWER, site.p.z / GS_FLOWER, GS_SEED_FLOWER);
+        let patch : f32 = waterValue2(site.p.x * (0.05 as f32), site.p.z * (0.05 as f32), GS_SEED_FLOWER + 3);
+        let present : f32 = smoothstep(
+            (1.0 as f32) - amount * patch,
+            (1.0 as f32) - amount * patch * (0.8 as f32),
+            cell.id
+        );
+        let petal : f32 = smoothstep((0.14 as f32), (0.08 as f32), cell.dist);
+        let hue : Vec3 = look.flowerWhite
+            .lerp(look.flowerYellow, smoothstep((0.3 as f32), (0.5 as f32), cell.id))
+            .lerp(look.flowerViolet, smoothstep((0.65 as f32), (0.8 as f32), cell.id));
+        return albedo.lerp(hue, present * petal * near);
+    }
+
+    /** Farmland: patches of crop, stubble and ploughed soil, rows at close range, a hedge between fields. */
+    pub static fn field(site : GroundSite, look : GroundLook) : GroundPatch {
+        let p : Vec3 = site.p;
+        let warpX : f32 = (waterFbm2(p.x * (0.012 as f32), p.z * (0.012 as f32), 4, GS_SEED_CROP)
+            - (0.5 as f32))
+            * (95.0 as f32);
+        let warpZ : f32 = (waterFbm2(p.x * (0.012 as f32), p.z * (0.012 as f32), 4, GS_SEED_CROP + 4)
+            - (0.5 as f32))
+            * (95.0 as f32);
+        let cell : GroundCell = groundCells(
+            (p.x + warpX) / GS_FIELD,
+            (p.z + warpZ) / GS_FIELD,
+            GS_SEED_CROP + 8
+        );
+        let kind : f32 = cell.id;
+        let mut albedo : Vec3 = look.plough.lerp(look.crop, smoothstep((0.12 as f32), (0.3 as f32), kind));
+        albedo = albedo.lerp(look.wheat, smoothstep((0.42 as f32), (0.6 as f32), kind));
+        albedo = albedo.lerp(look.hay, smoothstep((0.8 as f32), (0.92 as f32), kind));
+        let tint : f32 = waterFbm2(p.x * (0.03 as f32), p.z * (0.03 as f32), 3, GS_SEED_CROP + 12);
+        albedo = albedo.scale((0.72 as f32) + (0.6 as f32) * tint);
+
+        let angle : f32 = cell.id * (6.0 as f32) * (1.5 as f32);
+        let across : f32 = p.x * ludax::cos(angle) + p.z * ludax::sin(angle);
+        let phase : f32 = across / GS_ROWS;
+        let furrow : f32 = (0.5 as f32) + (0.5 as f32) * ludax::sin(phase * (6.2831853 as f32));
+        let near : f32 = groundFade(GS_ROWS, site.footprint, 0.1, 0.5);
+        albedo = albedo.scale(GroundSoil::turf(p, site.footprint));
+        let tilled : f32 = (1.0 as f32) - smoothstep((0.4 as f32), (0.6 as f32), kind * (1.0 as f32));
+        let rowed : f32 = (0.35 as f32)
+            + (0.65 as f32) * waterValue2(p.x * (0.04 as f32), p.z * (0.04 as f32), GS_SEED_CROP + 30);
+        albedo = albedo.scale((1.0 as f32)
+            - (0.2 as f32) * rowed * (1.0 as f32 - furrow) * near * ((0.5 as f32) + tilled));
+        let tilt : Vec3 = Vec3 {
+            x: ludax::cos(angle + (1.5707963 as f32)),
+            y: (0.0 as f32),
+            z: ludax::sin(angle + (1.5707963 as f32)),
+        }.scale(ludax::cos(phase * (6.2831853 as f32)) * (0.12 as f32) * near);
+
+        let gap : f32 = cell.second - cell.dist;
+        let hedge : f32 = smoothstep(GS_HEDGE, GS_HEDGE * (0.3 as f32), gap)
+            * ((0.5 as f32) + waterValue2(p.x * (0.5 as f32), p.z * (0.5 as f32), GS_SEED_CROP + 20));
+        albedo = albedo.lerp(look.hedge.scale((0.8 as f32) + (0.5 as f32) * tint), saturate(hedge));
+        return GroundPatch {
+            albedo: albedo,
+            tilt: tilt,
+            gloss: (0.0 as f32),
+            open: (1.0 as f32) - hedge * (0.3 as f32),
+        };
+    }
+
+    /** River gravel and sand: pebbles and cobbles in many colours in a sandy matrix; `wet` darkens and shines. */
+    pub static fn gravel(site : GroundSite, look : GroundLook, wet : f32) : GroundPatch {
+        let p : Vec3 = site.p;
+        let sandy : f32 = waterFbm2(p.x * (0.05 as f32), p.z * (0.05 as f32), 3, GS_SEED_PEBBLE);
+        let matrix : Vec3 = look.gravel.lerp(look.sand, smoothstep((0.4 as f32), (0.65 as f32), sandy));
+        let mean : Vec3 = matrix.scale((0.7 as f32)
+            + (0.6 as f32) * waterFbm2(p.x * (0.4 as f32), p.z * (0.4 as f32), 2, GS_SEED_PEBBLE + 5));
+        if (!site.fine) {
+            return GroundPatch {
+                albedo: mean,
+                tilt: Vec3::zero(),
+                gloss: wet * (0.4 as f32),
+                open: (1.0 as f32),
+            };
+        }
+        let near : f32 = groundFade(GS_PEBBLE, site.footprint, 0.15, 1.2);
+        let pebble : GroundCell = groundCells(p.x / GS_PEBBLE, p.z / GS_PEBBLE, GS_SEED_PEBBLE + 9);
+        let cobble : GroundCell = groundCells(p.x / GS_COBBLE, p.z / GS_COBBLE, GS_SEED_PEBBLE + 21);
+        let dome : f32 = saturate((1.0 as f32) - pebble.dist * (2.1 as f32));
+        let stone : Vec3 = GroundSoil::stoneColour(look, pebble.id);
+        let big : f32 = smoothstep((0.34 as f32), (0.2 as f32), cobble.dist)
+            * smoothstep((0.55 as f32), (0.75 as f32), cobble.id);
+        let bigStone : Vec3 = GroundSoil::stoneColour(
+            look,
+            cobble.id * (1.7 as f32) - (cobble.id * (1.7 as f32) as i32 as f32)
+        );
+        let mut albedo : Vec3 = matrix.lerp(stone, smoothstep((0.04 as f32), (0.2 as f32), dome) * near);
+        albedo = albedo.lerp(bigStone, big * groundFade(GS_COBBLE, site.footprint, 0.05, 0.6));
+        albedo = albedo.lerp(mean, (1.0 as f32) - near).scale((0.8 as f32) + (0.4 as f32) * dome * near);
+        let tilt : Vec3 = Vec3 { x: -pebble.dx * dome, y: (0.0 as f32), z: -pebble.dz * dome }
+            .scale((0.5 as f32) * near)
+            .plus(Vec3 { x: -cobble.dx * big, y: (0.0 as f32), z: -cobble.dz * big }.scale((0.18 as f32)));
+        let wetness : f32 = wet * (0.55 as f32);
+        albedo = albedo.scale((1.0 as f32) - wetness);
+        return GroundPatch {
+            albedo: albedo,
+            tilt: tilt,
+            gloss: wet * (0.6 as f32),
+            open: (0.55 as f32) + (0.45 as f32) * dome * near + (1.0 as f32 - near) * (0.45 as f32),
+        };
+    }
+
+    // A river stone's colour: pale limestone, grey granite, brown sandstone, dark basalt, by its id.
+    static fn stoneColour(look : GroundLook, id : f32) : Vec3 {
+        let pale : Vec3 = look.sand.scale((1.25 as f32));
+        let grey : Vec3 = look.rockGrey.scale((1.1 as f32));
+        let brown : Vec3 = look.rockWarm.scale((0.9 as f32));
+        let dark : Vec3 = look.rockDark.scale((0.9 as f32));
+        let a : Vec3 = pale.lerp(grey, smoothstep((0.2 as f32), (0.3 as f32), id));
+        let b : Vec3 = a.lerp(brown, smoothstep((0.5 as f32), (0.6 as f32), id));
+        return b.lerp(dark, smoothstep((0.8 as f32), (0.9 as f32), id));
+    }
+
+    /** Loose rock below a cliff or on a steep hillside: angular chips of two sizes in the rock's own colours. */
+    pub static fn scree(site : GroundSite, look : GroundLook) : GroundPatch {
+        let p : Vec3 = site.p;
+        let planes : Vec3 = groundPlanes(site.n);
+        let streak : f32 = waterFbm2(
+            p.x * (0.08 as f32) + p.z * (0.03 as f32),
+            p.z * (0.02 as f32),
+            3,
+            GS_SEED_CHIP
+        );
+        let mean : Vec3 = look.rockGrey
+            .lerp(look.rockWarm, smoothstep((0.4 as f32), (0.7 as f32), streak))
+            .scale((0.85 as f32) + (0.4 as f32) * streak);
+        if (!site.fine) {
+            return GroundPatch { albedo: mean, tilt: Vec3::zero(), gloss: (0.0 as f32), open: (1.0 as f32) };
+        }
+        let big : GroundCell = groundCells(p.x / GS_CHIP, p.z / GS_CHIP, GS_SEED_CHIP + 3);
+        let small : GroundCell = groundCells(p.x / GS_CHIP_SMALL, p.z / GS_CHIP_SMALL, GS_SEED_CHIP + 7);
+        let nearBig : f32 = groundFade(GS_CHIP, site.footprint, 0.08, 0.7);
+        let nearSmall : f32 = groundFade(GS_CHIP_SMALL, site.footprint, 0.15, 1.0);
+        let domeBig : f32 = saturate((1.0 as f32) - big.dist * (1.7 as f32));
+        let domeSmall : f32 = saturate((1.0 as f32) - small.dist * (2.0 as f32));
+        let chip : Vec3 = GroundSoil::stoneColour(look, big.id).lerp(mean, (0.4 as f32));
+        let small2 : Vec3 = GroundSoil::stoneColour(look, small.id).lerp(mean, (0.5 as f32));
+        let mut albedo : Vec3 = mean.lerp(small2, nearSmall * (0.8 as f32));
+        albedo = albedo.lerp(chip, smoothstep((0.1 as f32), (0.3 as f32), domeBig) * nearBig);
+        let shadow : f32 = (0.55 as f32)
+            + (0.45 as f32)
+                * smoothstep(
+                    (0.0 as f32),
+                    (0.5 as f32),
+                    domeBig * nearBig + domeSmall * nearSmall * (0.6 as f32)
+                );
+        albedo = albedo.scale(shadow);
+        let tilt : Vec3 = Vec3 { x: -big.dx * domeBig, y: (0.0 as f32), z: -big.dz * domeBig }
+            .scale((0.45 as f32) * nearBig)
+            .plus(Vec3 {
+                x: -small.dx * domeSmall,
+                y: (0.0 as f32),
+                z: -small.dz * domeSmall,
+            }.scale((0.3 as f32) * nearSmall))
+            .plus(groundSlope3(p, (0.05 as f32), planes, GS_SEED_CHIP + 11).scale((0.008 as f32)
+                * groundFade((0.05 as f32), site.footprint, 0.4, 1.4)));
+        return GroundPatch { albedo: albedo, tilt: tilt, gloss: (0.0 as f32), open: shadow };
+    }
+
+    /** Mud and silt: dark, smooth when wet, cracked into plates where it has dried. */
+    pub static fn mud(site : GroundSite, look : GroundLook) : GroundPatch {
+        let p : Vec3 = site.p;
+        let tone : f32 = waterFbm2(p.x * (0.07 as f32), p.z * (0.07 as f32), 3, GS_SEED_MUD);
+        let mut albedo : Vec3 = look.mud
+            .lerp(look.silt, smoothstep((0.35 as f32), (0.7 as f32), tone))
+            .scale((0.8 as f32) + (0.5 as f32) * tone);
+        let dryness : f32 = (1.0 as f32) - site.damp;
+        let mut tilt : Vec3 = Vec3::zero();
+        if (site.fine) {
+            let plates : GroundCell = groundCells(p.x / (0.35 as f32), p.z / (0.35 as f32), GS_SEED_MUD + 3);
+            let seam : f32 = smoothstep((0.12 as f32), (0.0 as f32), plates.second - plates.dist);
+            let near : f32 = groundFade((0.35 as f32), site.footprint, 0.1, 0.8);
+            albedo = albedo.scale((1.0 as f32) - seam * dryness * near * (0.6 as f32));
+            tilt = Vec3 { x: -plates.dx, y: (0.0 as f32), z: -plates.dz }.scale((0.1 as f32) * dryness
+                * near);
+        }
+        return GroundPatch {
+            albedo: albedo.scale((1.0 as f32) - site.damp * (0.3 as f32)),
+            tilt: tilt,
+            gloss: (0.2 as f32) + site.damp * (0.6 as f32),
+            open: (1.0 as f32),
+        };
+    }
+
+    /** The forest floor under conifers: needles, moss, roots and a few dead branches. */
+    pub static fn duff(site : GroundSite, look : GroundLook) : GroundPatch {
+        let p : Vec3 = site.p;
+        let tone : f32 = waterFbm2(p.x * (0.09 as f32), p.z * (0.09 as f32), 3, GS_SEED_DUFF);
+        let mossy : f32 = smoothstep(
+            (0.5 as f32),
+            (0.75 as f32),
+            waterFbm2(p.x * (0.17 as f32), p.z * (0.17 as f32), 3, GS_SEED_DUFF + 7)
+        );
+        let mut albedo : Vec3 = look.duff
+            .lerp(look.moss, mossy * (0.7 as f32))
+            .scale((0.7 as f32) + (0.7 as f32) * tone);
+        if (site.fine) {
+            let speck : f32 = waterValue2(p.x * (14.0 as f32), p.z * (14.0 as f32), GS_SEED_DUFF + 3);
+            albedo = albedo.scale((0.85 as f32)
+                + (speck - (0.5 as f32)) * (0.4 as f32)
+                    * groundFade((0.07 as f32), site.footprint, 0.3, 1.4));
+        }
+        return GroundPatch { albedo: albedo, tilt: Vec3::zero(), gloss: (0.0 as f32), open: (0.7 as f32) };
+    }
+}

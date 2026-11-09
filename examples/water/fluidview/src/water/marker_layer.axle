@@ -1,0 +1,222 @@
+// marker_layer - flow markers (floats) and their trails, drawn over the finished picture.
+//
+// A marker is a position the simulation owns: the renderer only draws it. The layer holds up to `MARKER_MAX` markers
+// (world metres, xyz, a state byte, a colour index) and, for each, a trail of recent positions (oldest first) that fades
+// with age. After the display stage has packed the picture, `draw` projects every marker, tests it against the scene's
+// depth (a float behind a hill or under the curtain is not drawn) and paints it into the packed words: a lit sphere in the
+// marker's colour with a white ring, and its trail as dots of falling opacity. It is serial and touches only the pixels
+// of a few markers, so it is deterministic and costs nothing next to a picture; the layer is shared by every renderer of a
+// landscape, whatever their size, and nothing allocates after the constructor.
+
+use ludax::{max, min, saturate, sqrt, Vec3};
+use smalt::Color;
+
+use crate::water::camera::{Landing, WaterCamera};
+
+/** The most markers a layer holds, and the most trail points of each. */
+pub const MARKER_MAX : i32 = 256;
+pub const MARKER_TRAIL : i32 = 48;
+
+/** The states a marker can be in (the bytes the layer holds): floating on the water, flying, stranded, or gone. */
+pub const MARKER_FLOATING : u8 = 0;
+pub const MARKER_AIRBORNE : u8 = 1;
+pub const MARKER_STRANDED : u8 = 2;
+pub const MARKER_GONE : u8 = 3;
+
+// The size of a marker: its radius in metres and the least it is drawn at in pixels; the ring's share of the radius.
+const MARKER_RADIUS : f32 = 0.7;
+const MARKER_MIN_PIXELS : f32 = 3.5;
+const MARKER_RING_FROM : f32 = 0.74;
+const MARKER_RING_TO : f32 = 0.9;
+
+// How much nearer than the scene a marker must be to show (metres), and the opacity and size of a trail's newest dot.
+const MARKER_BIAS : f32 = 0.6;
+const MARKER_TRAIL_ALPHA : f32 = 0.85;
+const MARKER_TRAIL_PIXELS : f32 = 1.6;
+
+// The palette: six colours that stand out from water, rock and foam.
+const MARKER_COLOURS : i32 = 6;
+
+/** The markers. */
+pub class MarkerLayer {
+    /** Markers in use. */
+    pub count : i32 = 0;
+
+    /** Metres added to every x and z: the grid's world origin. */
+    pub shiftX : f32 = (0.0 as f32);
+    pub shiftZ : f32 = (0.0 as f32);
+
+    /** World metres, xyz a marker (before the shift). */
+    pub positions : f32[];
+
+    /** A state byte a marker. */
+    pub states : u8[];
+
+    /** Trail points a marker holds now, and the points, oldest first, `MARKER_TRAIL` xyz a marker. */
+    pub trailCount : i32[];
+    pub trails     : f32[];
+
+    /** An empty layer. */
+    constructor() {
+        self.positions = new f32[(MARKER_MAX as i64) * 3];
+        self.states = new u8[MARKER_MAX as i64];
+        self.trailCount = new i32[MARKER_MAX as i64];
+        self.trails = new f32[(MARKER_MAX as i64) * (MARKER_TRAIL as i64) * 3];
+    }
+
+    /** The colour of marker `k`: a palette of six, packed. */
+    pub static fn colourOf(k : i32) : i32 {
+        let c : i32 = k % MARKER_COLOURS;
+        return match c {
+            0 => Color::packBytes(255, 60, 50),
+            1 => Color::packBytes(255, 205, 40),
+            2 => Color::packBytes(255, 70, 210),
+            3 => Color::packBytes(250, 250, 250),
+            4 => Color::packBytes(255, 130, 30),
+            _ => Color::packBytes(170, 90, 255),
+        };
+    }
+
+    /** Draws every marker and its trail into the packed picture `out` of `w` by `h` pixels seen by `cam`, against `depth`. */
+    pub fn draw(self, out : i32[], w : i32, h : i32, cam : WaterCamera, depth : f32[]) : void {
+        for (k of 0..self.count) {
+            if (self.states[k as i64] == MARKER_GONE) {
+                continue;
+            }
+            self.trail(k, out, w, h, cam, depth);
+        }
+        for (k of 0..self.count) {
+            if (self.states[k as i64] == MARKER_GONE) {
+                continue;
+            }
+            let b : i64 = (k as i64) * 3;
+            let at : Landing = cam.project(self.world(b));
+            if (at.ok) {
+                self.sphere(k, at, out, w, h, cam, depth);
+            }
+        }
+    }
+
+    // The world position of the point at float index `b` of `positions`.
+    fn world(self, b : i64) : Vec3 {
+        return Vec3 {
+            x: self.positions[b] + self.shiftX,
+            y: self.positions[b + 1],
+            z: self.positions[b + 2] + self.shiftZ,
+        };
+    }
+
+    // A marker as a lit sphere with a white ring.
+    fn sphere(
+        self,
+        k : i32,
+        at : Landing,
+        out : i32[],
+        w : i32,
+        h : i32,
+        cam : WaterCamera,
+        depth : f32[]
+    ) : void {
+        let r : f32 = max(cam.pixelsAt(MARKER_RADIUS, at.depth), MARKER_MIN_PIXELS);
+        let ink : i32 = MarkerLayer::colourOf(k);
+        let x0 : i32 = max((at.x - r - (1.0 as f32)), (0.0 as f32)) as i32;
+        let x1 : i32 = min((at.x + r + (1.0 as f32)), (w - 1) as f32) as i32;
+        let y0 : i32 = max((at.y - r - (1.0 as f32)), (0.0 as f32)) as i32;
+        let y1 : i32 = min((at.y + r + (1.0 as f32)), (h - 1) as f32) as i32;
+        for (y of y0..(y1 + 1)) {
+            for (x of x0..(x1 + 1)) {
+                let dx : f32 = ((x as f32) + (0.5 as f32) - at.x) / r;
+                let dy : f32 = ((y as f32) + (0.5 as f32) - at.y) / r;
+                let q : f32 = sqrt(dx * dx + dy * dy);
+                if (q > (1.0 as f32)) {
+                    continue;
+                }
+                let i : i64 = ((y * w) + x) as i64;
+                if (at.depth > depth[i] + MARKER_BIAS) {
+                    continue;
+                }
+                let shade : f32 = (0.55 as f32)
+                    + (0.45 as f32)
+                        * saturate((1.0 as f32) - (0.5 as f32) * (dx * (1.0 as f32) + dy * (1.0 as f32))
+                            - q * q * (0.5 as f32));
+                let ring : f32 = saturate((q - MARKER_RING_FROM) / (MARKER_RING_TO - MARKER_RING_FROM))
+                    * saturate(((1.0 as f32) - q) / ((1.0 as f32) - MARKER_RING_TO + (0.0001 as f32)));
+                out[i] = MarkerLayer::mix(
+                    MarkerLayer::lit(ink, shade),
+                    Color::packBytes(255, 255, 255),
+                    ring
+                );
+            }
+        }
+    }
+
+    // A marker's trail: dots from the oldest, faint and small, to the newest.
+    fn trail(self, k : i32, out : i32[], w : i32, h : i32, cam : WaterCamera, depth : f32[]) : void {
+        let n : i32 = self.trailCount[k as i64];
+        let ink : i32 = MarkerLayer::colourOf(k);
+        for (i of 0..n) {
+            let b : i64 = ((k as i64) * (MARKER_TRAIL as i64) + (i as i64)) * 3;
+            let at : Landing = cam.project(Vec3 {
+                x: self.trails[b] + self.shiftX,
+                y: self.trails[b + 1],
+                z: self.trails[b + 2] + self.shiftZ,
+            });
+            if (!at.ok) {
+                continue;
+            }
+            let age : f32 = (i as f32 + (1.0 as f32)) / ((n as f32) + (1.0 as f32));
+            let r : f32 = max(
+                cam.pixelsAt(MARKER_RADIUS * (0.3 as f32) * age, at.depth),
+                MARKER_TRAIL_PIXELS * age + (0.5 as f32)
+            );
+            let px : i32 = at.x as i32;
+            let py : i32 = at.y as i32;
+            if (px < 0 || py < 0 || px >= w || py >= h) {
+                continue;
+            }
+            let reach : i32 = r as i32 + 1;
+            for (y of max((py - reach) as f32, (0.0 as f32)) as i32..(min(
+                (py + reach) as f32,
+                (h - 1) as f32
+            ) as i32
+                + 1)) {
+                for (x of max((px - reach) as f32, (0.0 as f32)) as i32..(min(
+                    (px + reach) as f32,
+                    (w - 1) as f32
+                ) as i32
+                    + 1)) {
+                    let dx : f32 = (x as f32) + (0.5 as f32) - at.x;
+                    let dy : f32 = (y as f32) + (0.5 as f32) - at.y;
+                    if (dx * dx + dy * dy > r * r) {
+                        continue;
+                    }
+                    let p : i64 = ((y * w) + x) as i64;
+                    if (at.depth > depth[p] + MARKER_BIAS) {
+                        continue;
+                    }
+                    out[p] = MarkerLayer::mix(out[p], ink, MARKER_TRAIL_ALPHA * age * age);
+                }
+            }
+        }
+    }
+
+    // `ink` darkened or lightened by `shade` (1 unchanged).
+    static fn lit(ink : i32, shade : f32) : i32 {
+        let r : i32 = (Color::red(ink) as f32 * shade) as i32;
+        let g : i32 = (Color::green(ink) as f32 * shade) as i32;
+        let b : i32 = (Color::blue(ink) as f32 * shade) as i32;
+        return Color::packBytes(
+            min(r as f32, (255.0 as f32)) as i32,
+            min(g as f32, (255.0 as f32)) as i32,
+            min(b as f32, (255.0 as f32)) as i32
+        );
+    }
+
+    // `a` mixed toward `b` by `t`.
+    static fn mix(a : i32, b : i32, t : f32) : i32 {
+        let r : f32 = (Color::red(a) as f32) * ((1.0 as f32) - t) + (Color::red(b) as f32) * t;
+        let g : f32 = (Color::green(a) as f32) * ((1.0 as f32) - t) + (Color::green(b) as f32) * t;
+        let bl : f32 = (Color::blue(a) as f32) * ((1.0 as f32) - t) + (Color::blue(b) as f32) * t;
+        return Color::packBytes(r as i32, g as i32, bl as i32);
+    }
+}

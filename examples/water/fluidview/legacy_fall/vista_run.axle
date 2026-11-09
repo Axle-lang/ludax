@@ -1,0 +1,288 @@
+// vista_run — what the waterfall demo does with the command line and a `VistaRenderer`: build, draw, write, compare.
+//
+// Headless work lives here so a window and a script cannot disagree about an option: build the landscape once, apply
+// the command line to the look, pick the camera of a shot, draw `--samples` jittered samples and write a BMP; or a
+// film (`--film N --step S`), the long-time sheet (`--sheet`: 5, 15, 30 and 60 seconds, which is what shows that the
+// water keeps flowing and the river stays full), or the determinism check (`--check-threads`: the same picture at
+// one thread and at many, compared bit for bit, the exit status saying whether they agree).
+
+use ludax::{JobPool, Vec3};
+use smalt::{Bmp, Surface};
+
+use crate::app::options::{Cli, Options};
+use crate::app::water_sheet::ContactSheet;
+use crate::water::camera::WaterCamera;
+use crate::water::fall_build::FallScene;
+use crate::water::vista::{VistaRenderer, VISTA_STAGES, VISTA_STAGE_NAMES};
+use crate::water::vista_camera::{VistaCamera, VistaShot};
+use crate::water::vista_look::VistaLook;
+
+/** Default picture size, pixels. */
+pub const VRUN_WIDTH : i32 = 960;
+pub const VRUN_HEIGHT : i32 = 544;
+
+/** Drops of a default picture. */
+pub const VRUN_DROPS : i32 = 400000;
+
+// The moment of a default picture, seconds, and the default step of a film.
+const VRUN_MOMENT : f32 = 6.0;
+const VRUN_STEP : f32 = 0.5;
+
+// The columns of a contact sheet.
+const VRUN_COLUMNS : i32 = 4;
+
+// The moments of the long-time sheet, seconds.
+const VRUN_SHEET_TIMES : i32 = 4;
+
+/** The waterfall demo's headless driver. */
+pub class VistaRun {
+    /** `base` with the command line's overrides applied. */
+    pub static fn look(o : Options, base : VistaLook) : VistaLook {
+        let mut l : VistaLook = base;
+        if (Options::given(o.gravity)) {
+            l.physics.gravity = o.gravity as f32;
+        }
+        if (Options::given(o.viscosity)) {
+            l.physics.viscosity = o.viscosity as f32;
+        }
+        if (Options::given(o.daytime)) {
+            l.sky.dayTime = o.daytime;
+        }
+        if (Options::given(o.exposure)) {
+            l.post.exposureBias = o.exposure as f32;
+        }
+        if (Options::given(o.bloom)) {
+            l.post.bloom = o.bloom as f32;
+        }
+        if (Options::given(o.foam)) {
+            l.surface.foamCoverage = o.foam as f32;
+        }
+        if (Options::given(o.spraySize)) {
+            l.drops.sizeGain = o.spraySize as f32;
+        }
+        if (Options::given(o.silt)) {
+            l.surface.silt = o.silt as f32;
+        }
+        if (Options::given(o.shutter)) {
+            l.drops.shutter = o.shutter as f32;
+        }
+        l.modules.sky = l.modules.sky && !o.noSky;
+        l.modules.ground = l.modules.ground && !o.noTerrain;
+        l.modules.surface = l.modules.surface && !o.noSurface;
+        l.modules.spray = l.modules.spray && !o.noSpray;
+        l.modules.haze = l.modules.haze && !o.noHaze;
+        l.modules.post = l.modules.post && !o.noPost;
+        return l;
+    }
+
+    /** The shot the command line names. */
+    pub static fn shot(o : Options) : VistaShot {
+        if (o.shot == "pool") {
+            return VistaShot::Pool;
+        }
+        if (o.shot == "river") {
+            return VistaShot::River;
+        }
+        return VistaShot::Wide;
+    }
+
+    /** The moment the command line asks for, seconds. */
+    pub static fn moment(o : Options) : f32 {
+        if (Options::given(o.at)) {
+            return o.at as f32;
+        }
+        return VRUN_MOMENT;
+    }
+
+    // The width and the height a picture has.
+    static fn width(o : Options) : i32 {
+        if (o.width > 0) {
+            return o.width;
+        }
+        return VRUN_WIDTH;
+    }
+
+    static fn height(o : Options) : i32 {
+        if (o.height > 0) {
+            return o.height;
+        }
+        return VRUN_HEIGHT;
+    }
+
+    static fn threads(o : Options) : i32 {
+        if (o.threads > 0) {
+            return o.threads;
+        }
+        return JobPool::defaultWorkers();
+    }
+
+    static fn drops(o : Options) : i32 {
+        if (o.drops > 0) {
+            return o.drops;
+        }
+        return VRUN_DROPS;
+    }
+
+    // The camera of the shot at the position the command line gives.
+    static fn camera(o : Options) : WaterCamera {
+        let mut u : f32 = 0.0;
+        if (Options::given(o.along)) {
+            u = o.along as f32;
+        }
+        return VistaCamera::shot(VistaRun::shot(o), u, VistaRun::width(o), VistaRun::height(o));
+    }
+
+    // A renderer for the command line's size, look and thread count over `land`.
+    static fn renderer(o : Options, land : Shared<FallScene>, workers : i32) : VistaRenderer {
+        let r : VistaRenderer = new VistaRenderer(
+            land,
+            VistaRun::width(o),
+            VistaRun::height(o),
+            o.scale,
+            workers,
+            VistaRun::drops(o)
+        );
+        r.look = VistaRun::look(o, VistaLook {});
+        return r;
+    }
+
+    // Draws `samples` samples (at least one) of the moment from `cam`, the first restarting the picture.
+    static fn draw(r : VistaRenderer, cam : WaterCamera, time : f32, samples : i32) : void {
+        r.render(cam, time, true);
+        for (i of 1..samples) {
+            r.render(cam, time, false);
+        }
+    }
+
+    /** Runs the headless job the command line names; the exit status. */
+    pub static fn run(o : Options) : i32 {
+        let land : Shared<FallScene> = share new FallScene(VistaRun::threads(o));
+        if (o.checkThreads) {
+            return VistaRun::compare(o, land);
+        }
+        if (o.sheet) {
+            return VistaRun::sheet(o, land);
+        }
+        if (o.film > 0) {
+            return VistaRun::film(o, land);
+        }
+        return VistaRun::picture(o, land);
+    }
+
+    static fn picture(o : Options, land : Shared<FallScene>) : i32 {
+        let r : VistaRenderer = VistaRun::renderer(o, land, VistaRun::threads(o));
+        defer r.close();
+        VistaRun::draw(r, VistaRun::camera(o), VistaRun::moment(o), o.samples);
+        if (o.prof) {
+            VistaRun::profile(r);
+        }
+        if (VistaRun::save(r, o.frame)) {
+            return 0;
+        }
+        return 1;
+    }
+
+    // N frames a fixed step apart, each a numbered BMP, and the contact sheet of them all.
+    static fn film(o : Options, land : Shared<FallScene>) : i32 {
+        let r : VistaRenderer = VistaRun::renderer(o, land, VistaRun::threads(o));
+        defer r.close();
+        let sheet : ContactSheet = new ContactSheet(o.film, VRUN_COLUMNS, r.outWidth, r.outHeight);
+        defer sheet.close();
+        let mut step : f32 = VRUN_STEP;
+        if (Options::given(o.step)) {
+            step = o.step as f32;
+        }
+        let cam : WaterCamera = VistaRun::camera(o);
+        let mut ok : bool = true;
+        for (i of 0..o.film) {
+            VistaRun::draw(r, cam, VistaRun::moment(o) + (i as f32) * step, o.samples);
+            ok = VistaRun::save(r, Cli::beside(o.frame, "_${i}")) && ok;
+            sheet.addPixels(i, r.pixels(), r.outWidth);
+        }
+        ok = sheet.save(Cli::beside(o.frame, "_sheet")) && ok;
+        if (ok) {
+            return 0;
+        }
+        return 1;
+    }
+
+    // The scene at 5, 15, 30 and 60 seconds on one sheet: the fall and the river must look alive and unchanged in kind.
+    static fn sheet(o : Options, land : Shared<FallScene>) : i32 {
+        let r : VistaRenderer = VistaRun::renderer(o, land, VistaRun::threads(o));
+        defer r.close();
+        let sheet : ContactSheet = new ContactSheet(VRUN_SHEET_TIMES, 2, r.outWidth, r.outHeight);
+        defer sheet.close();
+        let cam : WaterCamera = VistaRun::camera(o);
+        for (i of 0..VRUN_SHEET_TIMES) {
+            VistaRun::draw(r, cam, VistaRun::sheetTime(i), o.samples);
+            sheet.addPixels(i, r.pixels(), r.outWidth);
+        }
+        if (sheet.save(Cli::beside(o.frame, "_times"))) {
+            return 0;
+        }
+        return 1;
+    }
+
+    static fn sheetTime(i : i32) : f32 {
+        return match i {
+            0 => 5.0,
+            1 => 15.0,
+            2 => 30.0,
+            _ => 60.0,
+        };
+    }
+
+    // The same picture at one thread and at many: equal to the bit, or the exit status counts the words that differ.
+    static fn compare(o : Options, land : Shared<FallScene>) : i32 {
+        let many : i32 = VistaRun::threads(o);
+        let a : VistaRenderer = VistaRun::renderer(o, land, 1);
+        defer a.close();
+        let b : VistaRenderer = VistaRun::renderer(o, land, many);
+        defer b.close();
+        let cam : WaterCamera = VistaRun::camera(o);
+        VistaRun::draw(a, cam, VistaRun::moment(o), o.samples);
+        VistaRun::draw(b, cam, VistaRun::moment(o), o.samples);
+        let pa : i32[] = a.pixels();
+        let pb : i32[] = b.pixels();
+        let mut different : i32 = 0;
+        for (i of 0..((a.outWidth as i64) * a.outHeight)) {
+            if (pa[i] != pb[i]) {
+                different = different + 1;
+            }
+        }
+        println("check-threads: 1 thread vs ${many} threads: ${different} differing pixels");
+        if (o.prof) {
+            VistaRun::profile(a);
+            VistaRun::profile(b);
+        }
+        return different;
+    }
+
+    /** Writes the renderer's picture to a BMP; false when the file could not be written. */
+    pub static fn save(r : VistaRenderer, path : string) : bool {
+        let surface = new Surface(r.outWidth, r.outHeight);
+        let mut px : i32[] = surface.pixels();
+        let src : i32[] = r.pixels();
+        for (i of 0..((r.outWidth as i64) * r.outHeight)) {
+            px[i] = src[i];
+        }
+        let ok : bool = Bmp::write(path, surface.frame());
+        surface.close();
+        if (ok) {
+            println("wrote ${path} (${r.samples} samples, ${r.outWidth}x${r.outHeight})");
+        }
+        return ok;
+    }
+
+    /** Prints the milliseconds each stage of the last sample took. */
+    pub static fn profile(r : VistaRenderer) : void {
+        println("last sample, milliseconds: ${VISTA_STAGE_NAMES}");
+        let mut line : string = "";
+        for (i of 0..VISTA_STAGES) {
+            let ms : f64 = r.spent[i as i64];
+            line = "${line} ${ms}";
+        }
+        println(line);
+        println("threads ${r.threads()}  ${r.describe()}");
+    }
+}

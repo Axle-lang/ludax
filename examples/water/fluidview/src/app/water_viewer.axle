@@ -1,0 +1,245 @@
+// water_viewer — the window the water renderer's demos run in: events, orbit controls, pacing, HUD and screenshot.
+//
+// A demo's session is its own loop (`while view.pump()`: tick the simulation once, fill the scene, `draw`, then the
+// HUD, then `present`); what is the same for all of them lives here. One simulation tick runs per frame, so
+// simulation time is ticks times the demo's `dt` and nothing reads a wall clock; the pacer's delta only moves the
+// camera, the one thing allowed to depend on real time. A frame in which neither the scene nor the camera changed
+// (the simulation is paused and nobody touches the mouse) is not a new picture: the renderer then adds one more
+// jittered sample to the accumulated one, so a held scene refines instead of shimmering.
+
+use smalt::{Bmp, Surface, Window, WindowDesc};
+use smalt::{
+    Clock, Event, EventKind, Events, Frame, FramePacer, MouseButton, Platform, PlatformError, Scancode
+};
+
+use crate::stage::camera::CamOrbit;
+use crate::stage::hud::Hud;
+use crate::water::renderer::WaterRenderer;
+
+/** Frames a second the pacer aims at. */
+const WVIEW_FRAME_RATE : i32 = 60;
+
+/** Radians of orbit a second of held arrow buys. */
+const WVIEW_TURN : f32 = 1.2;
+
+/** Fraction of the orbit radius a second of +/- zoom moves. */
+const WVIEW_ZOOM : f32 = 1.8;
+
+/** Radians of orbit one mouse pixel buys while dragging. */
+const WVIEW_MOUSE_TURN : f32 = 0.006;
+
+/** Fraction of the orbit radius one wheel notch zooms. */
+const WVIEW_WHEEL_ZOOM : f32 = 0.18;
+
+/** Nearest and farthest the orbit radius may get, cells. */
+const WVIEW_DIST_MIN : f32 = 1.0;
+const WVIEW_DIST_MAX : f32 = 6000.0;
+
+/** What a demo tells the viewer about its window. */
+pub struct WaterViewerDesc {
+    /** The window title. */
+    pub title : string = "";
+
+    /** The file F12 writes the current picture to. */
+    pub shot : string = "";
+
+    /** Where the camera starts. */
+    pub orbit : CamOrbit = CamOrbit {};
+}
+
+// The toggles the event handler and the frame loop both see.
+class WaterViewerState {
+    pub running : bool = true;
+    pub paused  : bool = false;
+    pub shot    : bool = false;
+}
+
+/** An open window showing a `WaterRenderer`'s picture, with a HUD over it. */
+pub class WaterViewer {
+    /** Text drawing for the HUD, onto `frame()`. */
+    pub hud : Hud;
+
+    /** The camera: the viewer's controls move it, and the demo passes it to the renderer. */
+    pub orbit : CamOrbit;
+
+    platform : Platform;
+    win      : Window;
+    clock    : Clock;
+    events   : Events;
+    pacer    : FramePacer;
+    state    : WaterViewerState;
+    surface  : Surface;
+    shot     : string;
+    moved    : bool = false;
+    elapsed  : f32 = 0.0;
+
+    /** Opens a window of `width` by `height` pixels; the caller closes the viewer with `defer`. */
+    constructor(d : WaterViewerDesc, width : i32, height : i32) ! PlatformError {
+        self.platform = new Platform();
+        self.win = self.platform.open(WindowDesc { title: d.title, w: width, h: height });
+        self.clock = new Clock();
+        self.events = new Events();
+        self.pacer = new FramePacer(WVIEW_FRAME_RATE);
+        self.state = new WaterViewerState();
+        self.surface = new Surface(width, height);
+        self.hud = new Hud();
+        self.orbit = d.orbit;
+        self.shot = d.shot;
+    }
+
+    /** Waits for the next frame, drains the events and moves the camera by what is held; false once the window should close. */
+    pub fn pump(mut self) : bool {
+        let dt : f64 = self.pacer.tick(self.clock);
+        self.events.pump(self.win, self.clock);
+        self.moved = false;
+        self.elapsed = dt as f32;
+        while (self.events.hasNext()) {
+            self.handle(self.events.next());
+        }
+        self.steer(dt as f32);
+        return self.state.running && self.win.isOpen();
+    }
+
+    /** Real seconds the last frame took: a demo advances its simulation by it, so the water moves at its own speed. */
+    pub fn seconds(self) : f32 {
+        return self.elapsed;
+    }
+
+    /** Whether the player holds the simulation. */
+    pub fn paused(self) : bool {
+        return self.state.paused;
+    }
+
+    /** True while `key` is held down. */
+    pub fn held(self, key : Scancode) : bool {
+        return self.events.isKeyDown(key);
+    }
+
+    /** True when the camera moved this frame: the picture must restart. */
+    pub fn moved(self) : bool {
+        return self.moved;
+    }
+
+    /** False while the window is minimised: nothing is worth drawing then. */
+    pub fn visible(self) : bool {
+        return !self.win.minimised();
+    }
+
+    /** Copies the renderer's picture to the window's surface, ready for the HUD. */
+    pub fn fill(mut self, r : WaterRenderer) : void {
+        let mut px : i32[] = self.surface.pixels();
+        let src : i32[] = r.pixels();
+        for (i of 0..((r.outWidth as i64) * r.outHeight)) {
+            px[i] = src[i];
+        }
+    }
+
+    /** Copies `count` words of a picture to the window's surface, scaled up by pixel repeat by `zoom` along each axis. */
+    pub fn fillPixels(mut self, src : i32[], width : i32, height : i32, zoom : i32) : void {
+        let mut px : i32[] = self.surface.pixels();
+        let outW : i32 = width * zoom;
+        for (y of 0..(height * zoom)) {
+            for (x of 0..outW) {
+                px[((y * outW) + x) as i64] = src[(((y / zoom) * width) + (x / zoom)) as i64];
+            }
+        }
+    }
+
+    /** The surface as a drawing frame, for the HUD. */
+    pub fn frame(self) : Frame {
+        return self.surface.frame();
+    }
+
+    /** Puts the finished picture on the window, and writes it to the screenshot file when F12 asked for it. */
+    pub fn present(mut self) : void {
+        self.surface.present(self.win);
+        if (self.state.shot) {
+            self.state.shot = false;
+            if (Bmp::write(self.shot, self.surface.frame())) {
+                println("wrote ${self.shot}");
+            }
+        }
+    }
+
+    /** Closes the surface, the input and the window, in the reverse of the order they opened. */
+    pub fn close(self) : void {
+        self.hud.close();
+        self.surface.close();
+        self.events.close();
+        self.clock.close();
+        self.win.close();
+        self.platform.close();
+    }
+
+    // One event: quit, pause, the screenshot. Held keys are read as state, not events.
+    fn handle(mut self, e : Event) : void {
+        if (e.kind == EventKind::Quit) {
+            self.state.running = false;
+            return;
+        }
+        if (e.kind != EventKind::KeyDown || e.repeat) {
+            return;
+        }
+        if (e.scancode == Scancode::Escape) {
+            self.state.running = false;
+        } else if (e.scancode == Scancode::P) {
+            self.state.paused = !self.state.paused;
+        } else if (e.scancode == Scancode::F12) {
+            self.state.shot = true;
+        }
+    }
+
+    // Turns the orbit by `dyaw` and `dpitch` and notes that the camera moved.
+    fn turn(mut self, dyaw : f32, dpitch : f32) : void {
+        self.orbit.yaw = self.orbit.yaw + dyaw;
+        self.orbit.pitch = self.orbit.pitch + dpitch;
+        self.moved = true;
+    }
+
+    // Multiplies the orbit radius by `factor`, within the viewer's limits.
+    fn zoom(mut self, factor : f32) : void {
+        let mut d : f32 = self.orbit.dist * factor;
+        if (d < WVIEW_DIST_MIN) {
+            d = WVIEW_DIST_MIN;
+        }
+        if (d > WVIEW_DIST_MAX) {
+            d = WVIEW_DIST_MAX;
+        }
+        self.orbit.dist = d;
+        self.moved = true;
+    }
+
+    // The held orbit controls: arrows turn, +/- and the wheel zoom, a held left button drags.
+    fn steer(mut self, dt : f32) : void {
+        let one : f32 = 1.0;
+        if (self.events.isKeyDown(Scancode::Left)) {
+            self.turn(-WVIEW_TURN * dt, 0.0);
+        }
+        if (self.events.isKeyDown(Scancode::Right)) {
+            self.turn(WVIEW_TURN * dt, 0.0);
+        }
+        if (self.events.isKeyDown(Scancode::Up)) {
+            self.turn(0.0, WVIEW_TURN * dt);
+        }
+        if (self.events.isKeyDown(Scancode::Down)) {
+            self.turn(0.0, -WVIEW_TURN * dt);
+        }
+        if (self.events.isKeyDown(Scancode::Equals)) {
+            self.zoom(one - WVIEW_ZOOM * dt);
+        }
+        if (self.events.isKeyDown(Scancode::Minus)) {
+            self.zoom(one + WVIEW_ZOOM * dt);
+        }
+        if (self.events.isButtonDown(MouseButton::Left)) {
+            let dyaw : f32 = (self.events.mouseDX() as f32) * WVIEW_MOUSE_TURN;
+            let dpitch : f32 = (self.events.mouseDY() as f32) * WVIEW_MOUSE_TURN;
+            if (dyaw != 0.0 || dpitch != 0.0) {
+                self.turn(dyaw, dpitch);
+            }
+        }
+        let wheel : i32 = self.events.mouseWheel();
+        if (wheel != 0) {
+            self.zoom(one - (wheel as f32) * WVIEW_WHEEL_ZOOM);
+        }
+    }
+}

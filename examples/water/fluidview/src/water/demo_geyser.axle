@@ -1,0 +1,241 @@
+// demo_geyser — an analytic eruption: the dome, the jet that rises, the water that falls back, the rings it makes.
+//
+// One cycle is written as a closed formula of the time. A dome of water swells over the vent, bursts into a jet
+// (launched drop by drop, each at its own launch time with a speed that follows the eruption's strength, so the
+// column climbs, thickens, then thins), the drops fly ballistic under the scene's own gravity and land back in the
+// pool, and where they land the surface carries rings of waves and a band of foam that spreads. The column is
+// water: tens of thousands of fine drops and thousands of larger liquid blobs in a dense core, streaked by their
+// velocity. Because the drops are ballistic, a lower gravity makes a higher, slower, wider jet and a longer cycle with
+// no other change, which is how the physics shows in the picture.
+
+use ludax::{cos, max, saturate, sin, smoothstep, sqrt, Vec3, TAU};
+
+use crate::water::demo_ground::{GeyserGround, GroundState, GroundWater};
+use crate::water::field::FieldColumn;
+use crate::water::noise::{waterExpNeg, waterFbm2, waterHash};
+use crate::water::particles::{WaterDrop, WaterKind};
+use crate::water::scene::WaterScene;
+
+// The grid the basin is written on, columns a side.
+const GEY_GRID : i32 = 64;
+
+// Where the vent is, the radius and the depth of the pool.
+/** The vent's column coordinate, along both axes. */
+pub const GEY_VENT : f32 = 32.0;
+
+/** The radius of the pool, cells. */
+pub const GEY_POOL_R : f32 = 9.0;
+const GEY_POOL_DEPTH : f32 = 3.4;
+
+// The cycle: the dome starts to swell, the jet starts and stops launching, seconds into the cycle.
+const GEY_DOME : f32 = 0.4;
+
+/** The second of the cycle the jet starts launching at. */
+pub const GEY_JET_FROM : f32 = 1.4;
+
+/** The second of the cycle the jet stops launching at. */
+pub const GEY_JET_TO : f32 = 5.0;
+
+// Seconds of aftermath the cycle keeps after the last drop has landed: the film and the puddles drying.
+const GEY_AFTER : f32 = 75.0;
+
+// The jet: launch speed, half-angle of the cone (the core is narrower), radius of the vent.
+const GEY_SPEED : f32 = 21.0;
+const GEY_CONE : f32 = 0.17;
+const GEY_CORE_CONE : f32 = 0.05;
+const GEY_VENT_R : f32 = 0.8;
+
+// The numbers of fine drops, of liquid blobs in the wide column, of liquid blobs in the core.
+const GEY_SPRAY : i32 = 300000;
+const GEY_LIQUID : i32 = 9000;
+const GEY_CORE : i32 = 8000;
+
+// The speed the rings of the surface travel at, and their wavelength, cells.
+const GEY_RING_SPEED : f32 = 3.4;
+const GEY_RING_LENGTH : f32 = 2.2;
+
+// The sizes of drops: many tiny ones and a few large (the cube of a uniform number), and of liquid blobs.
+const GEY_DROP_MIN : f32 = 0.02;
+const GEY_DROP_SPAN : f32 = 0.12;
+const GEY_BLOB_MIN : f32 = 0.10;
+const GEY_BLOB_SPAN : f32 = 0.24;
+
+// The apron: its slope away from the pool (rise per cell, beyond this many cells) and the scale of its hollows.
+const GEY_APRON_SLOPE : f32 = 0.025;
+const GEY_APRON_FROM : f32 = 11.0;
+const GEY_HOLLOW_SCALE : f32 = 0.16;
+
+// Seeds of the per-drop hashes.
+const GEY_SEED : i32 = 91;
+
+// Keeps the fraction of a flight finite for a drop thrown with no speed.
+const GEY_EPS : f32 = 0.001;
+
+/** The geyser of the demo program. */
+pub class GeyserDemo {
+    /** Seconds one cycle lasts under `gravity`: the jet, the flight of its highest drop, and the aftermath. */
+    pub static fn cycle(gravity : f32) : f32 {
+        return GEY_JET_TO + (2.0 as f32) * GEY_SPEED / gravity + GEY_AFTER;
+    }
+
+    // How strong the eruption is for a drop launched at second `t` of the cycle: 0 outside, ramping up then thinning.
+    static fn strength(t : f32) : f32 {
+        if (t < GEY_JET_FROM || t > GEY_JET_TO) {
+            return 0.0;
+        }
+        let up : f32 = smoothstep(GEY_JET_FROM, GEY_JET_FROM + (0.9 as f32), t);
+        let down : f32 = (1.0 as f32) - (0.75 as f32) * smoothstep(GEY_JET_TO - (1.6 as f32), GEY_JET_TO, t);
+        return up * down;
+    }
+
+    /** Writes the frame at `time` seconds (the cycle repeats) into `scene`. */
+    pub static fn fill(scene : Shared<WaterScene>, time : f32) : void {
+        let g : f32 = scene.look.physics.gravity;
+        let cycle : f32 = GeyserDemo::cycle(g);
+        let t : f32 = time - ((time / cycle) as i32 as f32) * cycle;
+        scene.particles.clear();
+        GeyserDemo::basin(scene, t);
+        for (k of 0..GEY_SPRAY) {
+            GeyserDemo::fling(scene, k, t, g, WaterKind::Spray, GEY_CONE);
+        }
+        for (k of 0..GEY_LIQUID) {
+            GeyserDemo::fling(scene, k + GEY_SPRAY, t, g, WaterKind::Liquid, GEY_CONE);
+        }
+        for (k of 0..GEY_CORE) {
+            GeyserDemo::fling(scene, k + GEY_SPRAY + GEY_LIQUID, t, g, WaterKind::Liquid, GEY_CORE_CONE);
+        }
+    }
+
+    // The ground, the pool, the dome over the vent, the rings and the foam: how much each is on at second `t`.
+    static fn basin(scene : Shared<WaterScene>, t : f32) : void {
+        let damp : f32 = (1.0 as f32) / ((1.0 as f32) + scene.look.physics.viscosity * (0.2 as f32));
+        let one : f32 = 1.0;
+        let active : f32 = smoothstep(GEY_JET_FROM, GEY_JET_FROM + one, t)
+            * (one - smoothstep(GEY_JET_TO + one, GEY_JET_TO + (4.0 as f32), t));
+        let dome : f32 = smoothstep(GEY_DOME, GEY_JET_FROM, t)
+            * (one - smoothstep(GEY_JET_FROM, GEY_JET_FROM + (0.7 as f32), t));
+        let rain : f32 = smoothstep(GEY_JET_FROM + (1.5 as f32), GEY_JET_FROM + (3.0 as f32), t)
+            * (one - smoothstep(GEY_JET_TO + one, GEY_JET_TO + (5.0 as f32), t));
+        let ground : GroundState = GeyserGround::state(t);
+        for (z of 0..GEY_GRID) {
+            for (x of 0..GEY_GRID) {
+                scene.field.put(x, z, GeyserDemo::column(x, z, t, damp, active, dome, rain, ground));
+            }
+        }
+    }
+
+    // The bed of the basin at distance `r` from the vent, over ground whose hollow noise is `noise`: a bowl, a raised
+    // rim, and a broad apron of hollows that slopes gently away.
+    static fn bed(noise : f32, r : f32) : f32 {
+        let one : f32 = 1.0;
+        let rise : f32 = smoothstep(GEY_POOL_R - (1.5 as f32), GEY_POOL_R + (2.5 as f32), r);
+        let rim : f32 = (0.55 as f32) * smoothstep(GEY_POOL_R - (0.5 as f32), GEY_POOL_R + one, r)
+            * (one - smoothstep(GEY_POOL_R + one, GEY_POOL_R + (6.0 as f32), r));
+        let apron : f32 = (0.7 as f32) * noise - GEY_APRON_SLOPE * max(r - GEY_APRON_FROM, 0.0);
+        let bowl : f32 = (0.0 as f32)
+            - GEY_POOL_DEPTH * (one - rise) * (one - r * r / (GEY_POOL_R * GEY_POOL_R * (2.0 as f32)));
+        return bowl + rim + apron * rise;
+    }
+
+    // One column of the basin.
+    static fn column(
+        x : i32,
+        z : i32,
+        t : f32,
+        damp : f32,
+        active : f32,
+        dome : f32,
+        rain : f32,
+        ground : GroundState
+    ) : FieldColumn {
+        let one : f32 = 1.0;
+        let px : f32 = (x as f32) + (0.5 as f32);
+        let pz : f32 = (z as f32) + (0.5 as f32);
+        let dx : f32 = px - GEY_VENT;
+        let dz : f32 = pz - GEY_VENT;
+        let r : f32 = sqrt(dx * dx + dz * dz);
+        let noise : f32 = waterFbm2(px * GEY_HOLLOW_SCALE, pz * GEY_HOLLOW_SCALE, 3, 7);
+        let bed : f32 = GeyserDemo::bed(noise, r);
+        let sheet : GroundWater = GeyserGround::water(ground, px, pz, r, noise);
+
+        let pool : f32 = smoothstep(0.0, 0.5, GEY_POOL_R + (1.5 as f32) - r);
+        let depth : f32 = max((0.0 as f32) - bed, 0.0) * pool;
+
+        // The dome swelling over the vent, the rings the jet's roots send out, and the ring where the water lands.
+        let bulge : f32 = (1.8 as f32) * dome * waterExpNeg(r * r / (5.0 as f32));
+        let front : f32 = (t - GEY_JET_FROM) * GEY_RING_SPEED * (0.6 as f32);
+        let ring : f32 = (0.16 as f32) * active * sin(TAU * (r / GEY_RING_LENGTH - t * (1.4 as f32)))
+            * waterExpNeg(r / (7.0 as f32));
+        let landed : f32 = (0.22 as f32) * saturate((t - GEY_JET_FROM - (1.2 as f32)) * (2.0 as f32))
+            * waterExpNeg((r - front) * (r - front) / (2.5 as f32))
+            * rain;
+
+        let swirl : f32 = (0.5 as f32) + (0.4 as f32) * sin(t * (3.0 as f32) + r);
+        let foamCore : f32 = waterExpNeg(r * r / (14.0 as f32)) * swirl * active;
+        let band : f32 = saturate((r - (1.5 as f32)) * (0.5 as f32)) * (one - smoothstep(3.0, GEY_POOL_R, r));
+        let foamRain : f32 = rain * band
+            * ((0.45 as f32) + (0.35 as f32) * sin(r * (2.0 as f32) - t * (4.0 as f32)));
+        let shore : f32 = smoothstep(0.35, 0.0, depth) * saturate(depth * (8.0 as f32));
+        let foam : f32 = saturate((foamCore + foamRain) * saturate(depth * (2.0 as f32))
+            + shore * (0.5 as f32)
+            + sheet.foam);
+        let turb : f32 = saturate(waterExpNeg(r * r / (40.0 as f32)) * ((0.4 as f32) + active * (0.8 as f32))
+            + rain * (0.5 as f32) * pool
+            + sheet.turbulence);
+        let flow : f32 = (0.9 as f32) * waterExpNeg(r / (6.0 as f32)) * ((0.3 as f32) + active);
+        let inv : f32 = one / max(r, 0.3);
+        let wave : f32 = (bulge + (ring + landed) * damp) * saturate(depth * (4.0 as f32));
+
+        return FieldColumn {
+            bed: bed,
+            depth: depth + wave + bulge * pool + sheet.depth,
+            foam: foam,
+            turbulence: turb,
+            vx: dx * inv * flow + sheet.vx,
+            vz: dz * inv * flow + sheet.vz,
+        };
+    }
+
+    // One drop of the jet: launched at a time drawn from its hash, flying ballistic until it falls back to the pool.
+    static fn fling(
+        scene : Shared<WaterScene>,
+        k : i32,
+        t : f32,
+        g : f32,
+        kind : WaterKind,
+        cone : f32
+    ) : void {
+        let launch : f32 = GEY_JET_FROM + (GEY_JET_TO - GEY_JET_FROM) * waterHash(k, 1, 0, GEY_SEED);
+        let power : f32 = GeyserDemo::strength(launch);
+        let age : f32 = t - launch;
+        if (power <= 0.0 || age < 0.0) {
+            return;
+        }
+        let jitter : f32 = (0.5 as f32) + (0.5 as f32) * waterHash(k, 2, 0, GEY_SEED);
+        let speed : f32 = GEY_SPEED * ((0.45 as f32) + (0.55 as f32) * power) * jitter;
+        let tilt : f32 = cone * waterHash(k, 3, 0, GEY_SEED);
+        let turn : f32 = TAU * waterHash(k, 4, 0, GEY_SEED);
+        let spin : f32 = waterHash(k, 5, 0, GEY_SEED);
+        let vx : f32 = speed * sin(tilt) * cos(turn);
+        let vz : f32 = speed * sin(tilt) * sin(turn);
+        let vy : f32 = speed * cos(tilt);
+        let height : f32 = vy * age - (0.5 as f32) * g * age * age;
+        if (height < 0.0) {
+            return;
+        }
+        let x0 : f32 = GEY_VENT + GEY_VENT_R * sqrt(spin) * cos(turn + (1.3 as f32));
+        let z0 : f32 = GEY_VENT + GEY_VENT_R * sqrt(spin) * sin(turn + (1.3 as f32));
+        let size : f32 = waterHash(k, 6, 0, GEY_SEED);
+        let mut radius : f32 = GEY_DROP_MIN + GEY_DROP_SPAN * size * size * size;
+        if (kind == WaterKind::Liquid) {
+            radius = GEY_BLOB_MIN + GEY_BLOB_SPAN * size * size;
+        }
+        scene.particles.add(WaterDrop {
+            position: Vec3 { x: x0 + vx * age, y: height, z: z0 + vz * age },
+            velocity: Vec3 { x: vx, y: vy - g * age, z: vz },
+            radius: radius,
+            kind: kind,
+            age: age / ((2.0 as f32) * vy / g + GEY_EPS),
+        });
+    }
+}

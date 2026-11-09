@@ -1,0 +1,252 @@
+// streaks — the current made visible: ink that is born where water crosses a frontier and drifts downhill.
+//
+// The levels of a `FluidWorld` do not show which way the water moves. Each tick the world lists the
+// frontiers that carried water (`flowAt` and `flowCount`, read-only data it rebuilds per tick); a streak is
+// seeded on every sufficiently wet one, pointing the way the water crossed. It then drifts down the local
+// surface gradient, the same "water seeks the lowest surface" law the engine integrates, at a pace that
+// grows with the slope, and dies where the water has gone or after a fixed life. The pool is a ring: the
+// cursor overwrites the oldest slot, so it recycles itself and a busy river costs a fixed amount. Nothing
+// reads a wall clock and nothing is random, so the same run replays bit for bit.
+
+use ludax::{saturate, FluidFlow, FluidWorld, Vec3};
+
+use crate::shade::brush::{Brush, Look};
+use crate::stage::camera::{Proj, ScreenQuad};
+
+/** Streak pool size; the cursor overwrites the oldest, so the pool recycles itself. */
+pub const STREAK_MAX : i32 = 220;
+
+/** Ticks a streak lives. */
+pub const STREAK_LIFE : i32 = 60;
+
+/** A frontier quieter than this seeds no streak, volume a tick. */
+const STREAK_MIN_VOL : f64 = 0.004;
+
+/** A streak dies where the water is thinner than this, cells. */
+const STREAK_MIN_DEPTH : f64 = 0.03;
+
+/** Streak speed per unit of surface gradient, cells a tick. */
+const STREAK_PACE : f64 = 2.2;
+
+/** Slowest a streak drifts, cells a tick: still water still creeps. */
+const STREAK_SPEED_MIN : f64 = 0.03;
+
+/** Fastest a streak drifts, cells a tick. */
+const STREAK_SPEED_MAX : f64 = 0.4;
+
+/** A surface gradient shorter than this has no direction; the streak keeps the one it has. */
+const STREAK_GRADIENT_MIN : f64 = 0.000001;
+
+/** Streak albedo: pale, so it reads as foam on any depth of water. */
+const STREAK_RGB : i32 = 0xd8ecf5;
+
+/** Alpha of a streak at mid-life. */
+const STREAK_ALPHA : i32 = 235;
+
+/** Half-width of a streak on screen, internal pixels. */
+const STREAK_WIDTH : f32 = 2.6;
+
+/** Streak length at the pool's weakest seed, cells. */
+const STREAK_LEN_MIN : f32 = 0.5;
+
+/** Streak length at the strongest, cells. */
+const STREAK_LEN_MAX : f32 = 1.6;
+
+/** Cells of length per unit of seed strength, between the min and the max. */
+const STREAK_LEN_GAIN : f32 = 8.0;
+
+/** How far a streak rides above the water surface, cells. */
+const STREAK_LIFT : f32 = 0.02;
+
+/** The fade `t(1-t)` peaks at a quarter; this scales it back to 1 at mid-life. */
+const STREAK_FADE_PEAK : f32 = 4.0;
+
+/** A streak shorter than this on screen, in pixels, has no direction worth drawing. */
+const STREAK_SPAN_MIN : f32 = 0.5;
+
+/** One streak: position, unit direction, the flow strength that seeded it, and its age. */
+pub struct Streak {
+    /** World x. */
+    pub x : f32 = 0.0;
+
+    /** World z. */
+    pub z : f32 = 0.0;
+
+    /** Direction x, unit length, along the local surface fall. */
+    pub dx : f32 = 0.0;
+
+    /** Direction z, unit length. */
+    pub dz : f32 = 0.0;
+
+    /** Volume a tick of the flow that seeded it, cell units: length and brightness on screen. */
+    pub strength : f32 = 0.0;
+
+    /** Ticks since seed; `STREAK_LIFE` or more means the slot is free. */
+    pub age : i32 = 60;
+}
+
+/** The ring of streaks over one world. */
+pub class StreakField {
+    slots  : Streak[];
+    cursor : i32 = 0;
+
+    /** An empty field: every slot is free. */
+    constructor() {
+        self.slots = new Streak[STREAK_MAX as i64];
+        for (i of 0..STREAK_MAX) {
+            self.slots[i as i64] = Streak {};
+        }
+    }
+
+    /** Seeds on the frontiers `world` just carried water over, then moves every live streak one tick. */
+    pub fn tick(mut self, world : FluidWorld) : void {
+        for (k of 0..world.flowCount()) {
+            self.seed(world.flowAt(k));
+        }
+        for (i of 0..STREAK_MAX) {
+            self.drift(world, i as i64);
+        }
+    }
+
+    /** How many slots hold a live streak. */
+    pub fn alive(self) : i32 {
+        let mut n : i32 = 0;
+        for (i of 0..STREAK_MAX) {
+            if (self.slots[i as i64].age < STREAK_LIFE) {
+                n = n + 1;
+            }
+        }
+        return n;
+    }
+
+    /** Pushes every live streak through `b`, riding on the surface of `world`. */
+    pub fn draw(self, b : Brush, world : FluidWorld) : void {
+        for (i of 0..STREAK_MAX) {
+            let s : Streak = self.slots[i as i64];
+            if (s.age >= STREAK_LIFE) {
+                continue;
+            }
+            StreakField::paint(b, world, s);
+        }
+    }
+
+    // One streak at the middle of the frontier, pointing the way the water crossed it.
+    fn seed(mut self, f : FluidFlow) : void {
+        if (f.volume < STREAK_MIN_VOL) {
+            return;
+        }
+        let half : f32 = 0.5;
+        let dx : f32 = (f.x1 - f.x0) as f32;
+        let dz : f32 = (f.z1 - f.z0) as f32;
+        self.slots[self.cursor as i64] = Streak {
+            x: (f.x0 as f32) + half + dx * half,
+            z: (f.z0 as f32) + half + dz * half,
+            dx: dx,
+            dz: dz,
+            strength: f.volume as f32,
+            age: 0,
+        };
+        self.cursor = (self.cursor + 1) % STREAK_MAX;
+    }
+
+    // Drifts one live streak down the local surface gradient and kills it where the water has left.
+    fn drift(mut self, world : FluidWorld, slot : i64) : void {
+        let mut s : Streak = self.slots[slot];
+        if (s.age >= STREAK_LIFE) {
+            return;
+        }
+        let cx : i32 = StreakField::cell(s.x, world.width());
+        let cz : i32 = StreakField::cell(s.z, world.depth());
+        if (world.levelAt(cx, cz) < STREAK_MIN_DEPTH) {
+            s.age = STREAK_LIFE;
+            self.slots[slot] = s;
+            return;
+        }
+
+        // The surface gradient points uphill; the streak goes the other way.
+        let gx : f64 = StreakField::surface(world, cx + 1, cz) - StreakField::surface(world, cx - 1, cz);
+        let gz : f64 = StreakField::surface(world, cx, cz + 1) - StreakField::surface(world, cx, cz - 1);
+        let g : f64 = (gx * gx + gz * gz).sqrt();
+        if (g > STREAK_GRADIENT_MIN) {
+            s.dx = ((0.0 - gx) / g) as f32;
+            s.dz = ((0.0 - gz) / g) as f32;
+        }
+
+        let mut speed : f64 = STREAK_PACE * g;
+        if (speed < STREAK_SPEED_MIN) {
+            speed = STREAK_SPEED_MIN;
+        }
+        if (speed > STREAK_SPEED_MAX) {
+            speed = STREAK_SPEED_MAX;
+        }
+        s.x = s.x + s.dx * (speed as f32);
+        s.z = s.z + s.dz * (speed as f32);
+        s.age = s.age + 1;
+        self.slots[slot] = s;
+    }
+
+    // The column a coordinate falls in, clamped into the grid.
+    static fn cell(v : f32, size : i32) : i32 {
+        let i : i32 = v as i32;
+        if (i < 0) {
+            return 0;
+        }
+        if (i >= size) {
+            return size - 1;
+        }
+        return i;
+    }
+
+    // Ground plus level at a column, clamped into the grid: what a streak drifts on.
+    static fn surface(world : FluidWorld, x : i32, z : i32) : f64 {
+        let cx : i32 = StreakField::cell(x as f32, world.width());
+        let cz : i32 = StreakField::cell(z as f32, world.depth());
+        return world.groundAt(cx, cz) + world.levelAt(cx, cz);
+    }
+
+    // One streak as an elongated quad on the surface, faded in and out over its life; brighter and longer
+    // where more volume crossed.
+    static fn paint(b : Brush, world : FluidWorld, s : Streak) : void {
+        let t : f32 = (s.age as f32) / (STREAK_LIFE as f32);
+        let fade : f32 = t * ((1.0 as f32) - t) * STREAK_FADE_PEAK;
+        let alpha : i32 = ((STREAK_ALPHA as f32) * fade) as i32;
+        if (alpha <= 0) {
+            return;
+        }
+        let mut len : f32 = STREAK_LEN_MIN + s.strength * STREAK_LEN_GAIN;
+        if (len > STREAK_LEN_MAX) {
+            len = STREAK_LEN_MAX;
+        }
+        let half : f32 = len * (0.5 as f32);
+        let cx : i32 = StreakField::cell(s.x, world.width());
+        let cz : i32 = StreakField::cell(s.z, world.depth());
+        let y : f32 = (world.groundAt(cx, cz) + world.levelAt(cx, cz)) as f32 + STREAK_LIFT;
+
+        let tail : Proj = b.cam.project(Vec3::make(s.x - s.dx * half, y, s.z - s.dz * half));
+        let head : Proj = b.cam.project(Vec3::make(s.x + s.dx * half, y, s.z + s.dz * half));
+        if (!tail.ok || !head.ok) {
+            return;
+        }
+
+        // Perpendicular in screen space: the streak keeps its pixel width at any depth.
+        let ex : f32 = head.sx - tail.sx;
+        let ey : f32 = head.sy - tail.sy;
+        let span : f32 = (ex * ex + ey * ey).sqrt();
+        if (span < STREAK_SPAN_MIN) {
+            return;
+        }
+        let k : f32 = STREAK_WIDTH / span;
+        let px : f32 = (0.0 as f32) - ey * k;
+        let py : f32 = ex * k;
+        let depth : f32 = (tail.depth + head.depth) * (0.5 as f32);
+        let q : ScreenQuad = ScreenQuad {
+            a: Proj { sx: tail.sx + px, sy: tail.sy + py, depth: depth, ok: true },
+            b: Proj { sx: tail.sx - px, sy: tail.sy - py, depth: depth, ok: true },
+            c: Proj { sx: head.sx - px, sy: head.sy - py, depth: depth, ok: true },
+            d: Proj { sx: head.sx + px, sy: head.sy + py, depth: depth, ok: true },
+            depth: depth,
+            ok: true,
+        };
+        b.painter.pushQuad(q, b.fogged(Look { albedo: STREAK_RGB }, depth), alpha);
+    }
+}

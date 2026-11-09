@@ -1,0 +1,361 @@
+// surface — the colour of the water's surface at a point: ripples, reflection, refraction, foam.
+//
+// The engine's surface is a heightfield a cell wide; what makes it read as water is everything below that scale,
+// so the normal is the field's smooth slope plus capillary ripples (octaves of noise advected by the surface
+// velocity, stronger where the engine says the water is turbulent, weaker in viscous water, slower in low
+// gravity). The colour is then the physics of a dielectric: Fresnel splits the light between the reflected sky
+// (and the sun's glints, GGX, which sparkle on the ripples and are the strongest cue that this is water) and the
+// light that enters. What enters is the bed seen through a refracted ray, attenuated per channel by Beer-Lambert
+// absorption along the path (red goes first: turquoise in the shallows, blue in the depth) plus the light the
+// water body scatters back, plus a glow where thin convex crests let the sun through. Foam, from the engine's
+// field with a procedural lace, is opaque white, lit like snow, brighter and rougher the thicker it is, and it
+// covers the glints. The shore gets a contact line of foam where the depth tends to zero.
+//
+// Every secondary ray is a `march` of the same field. The class holds references and params, no state.
+
+use ludax::{abs, cos, lerp, max, saturate, sin, sqrt, Vec3, PI};
+
+use crate::water::field::{Quad4, WaterField};
+use crate::water::foam::{FoamCover, FoamSpot, WaterFoam};
+use crate::water::look::{SurfaceLook, WaterPhysics, WATER_G_EARTH};
+use crate::water::march::{HeightMarch, MarchHit, MarchRay, MarchTarget};
+use crate::water::noise::{waterExpNeg, waterValue2Slope};
+use crate::water::sky::WaterSky;
+use crate::water::terrain::{GroundSpot, WaterTerrain};
+
+// Reflectance of water at normal incidence; the exponent of the Schlick grazing term.
+const SURF_F0 : f32 = 0.02;
+
+// Octaves of capillary ripple: the lowest frequency in cycles per cell, the ratio between octaves, the steepest
+// slope the first one adds, and how much each next one adds relative to it.
+const SURF_RIPPLE_OCTAVES : i32 = 5;
+const SURF_RIPPLE_BASE : f32 = 0.8;
+const SURF_RIPPLE_RATIO : f32 = 2.15;
+const SURF_RIPPLE_SLOPE : f32 = 0.07;
+const SURF_RIPPLE_FALLOFF : f32 = 0.82;
+
+// How much of the ripple slope even glass-calm water has, and what full turbulence adds to it.
+const SURF_CALM : f32 = 0.45;
+const SURF_CHOP : f32 = 2.2;
+
+// Seconds a flow phase of the ripples lasts, the wind drift every ripple gets in cells a second, and a noise
+// wavelength under this many pixels (it would alias) fades out.
+const SURF_PHASE : f32 = 2.0;
+const SURF_DRIFT : f32 = 0.25;
+const SURF_PIXELS_PER_CYCLE : f32 = 2.4;
+
+// How much a unit of viscosity damps an octave of frequency f: 1 / (1 + viscosity * f^2 * this).
+const SURF_VISCOUS_DAMP : f32 = 0.06;
+
+// Seed and rotation (radians) between successive ripple octaves, so their grids never line up.
+const SURF_SEED : i32 = 53;
+const SURF_TURN : f32 = 0.9;
+
+// Marching limits of the secondary rays: how far down a refracted ray looks for the bed, how far a reflected one
+// for ground, and how far above the surface they start.
+const SURF_BED_REACH : f32 = 60.0;
+const SURF_MIRROR_REACH : f32 = 400.0;
+const SURF_LIFT : f32 = 0.03;
+
+// The least cosine of the view to the normal: ripples must not turn a normal away from the eye.
+const SURF_FACING_MIN : f32 = 0.02;
+
+// Share of a water body's depth-scattering that survives per cell of path, and how far a slanted sun is taken to
+// travel to a bed point at depth, as a multiple of the vertical depth.
+const SURF_SUN_PATH : f32 = 1.2;
+
+// Brightness of the foam albedo before the look's brightness, and the foam's share of the ambient it takes.
+const SURF_FOAM_ALBEDO : f32 = 0.9;
+
+// The crest glow: how convex a point must be, per unit of curvature, for the sun to show through.
+const SURF_CREST_GAIN : f32 = 1.4;
+
+// The colour of light that has crossed a crest: a bright turquoise.
+const SURF_CREST_R : f32 = 0.10;
+const SURF_CREST_G : f32 = 0.55;
+const SURF_CREST_B : f32 = 0.45;
+
+/** Where on the water a shading is asked for. */
+pub struct WaterSpot {
+    /** The point on the surface. */
+    pub point : Vec3;
+
+    /** Unit direction from the eye to the point. */
+    pub view : Vec3;
+
+    /** World size of one pixel at the point. */
+    pub footprint : f32 = 0.01;
+
+    /** Simulation seconds: the ripples and the foam move with it. */
+    pub time : f32 = 0.0;
+}
+
+/** Shades water. */
+pub class WaterSurface {
+    field : Shared<WaterField>;
+    sky   : Shared<WaterSky>;
+
+    /** The ground this water covers, shaded by the same module that paints the dry land. */
+    pub terrain : WaterTerrain;
+    look        : SurfaceLook;
+    physics     : WaterPhysics;
+
+    /** A shader over `field` lit by `sky`, seeing the ground through `terrain`. */
+    constructor(
+        field : Shared<WaterField>,
+        sky : Shared<WaterSky>,
+        own terrain : WaterTerrain,
+        look : SurfaceLook,
+        physics : WaterPhysics
+    ) {
+        self.field = field;
+        self.sky = sky;
+        self.terrain = terrain;
+        self.look = look;
+        self.physics = physics;
+    }
+
+    /** Points the shader at the params of a new frame. */
+    pub fn setLook(mut self, look : SurfaceLook, physics : WaterPhysics) : void {
+        self.look = look;
+        self.physics = physics;
+    }
+
+    // The slope the ripples add at (x, z): a sum of octaves, each the gradient of value noise carried by the
+    // flow in two phases that are blended so the pattern flows without stretching.
+    fn ripples(self, spot : WaterSpot, flow : Quad4) : Vec3 {
+        let x : f32 = spot.point.x;
+        let z : f32 = spot.point.z;
+        let speed : f32 = sqrt(self.physics.gravity / WATER_G_EARTH);
+        let t : f32 = spot.time * speed;
+        let phase : f32 = t / SURF_PHASE;
+        let a : f32 = phase - (phase as i32 as f32);
+        let mut b : f32 = a + (0.5 as f32);
+        if (b >= 1.0) {
+            b = b - (1.0 as f32);
+        }
+        let weightA : f32 = (1.0 as f32) - abs((1.0 as f32) - (2.0 as f32) * a);
+        let strength : f32 = self.look.ripples * (SURF_CALM + SURF_CHOP * saturate(flow.c));
+
+        let mut sum : Vec3 = Vec3::zero();
+        let mut freq : f32 = SURF_RIPPLE_BASE;
+        let mut slope : f32 = SURF_RIPPLE_SLOPE;
+        for (o of 0..SURF_RIPPLE_OCTAVES) {
+            let seen : f32 = saturate((1.0 as f32) - freq * spot.footprint * SURF_PIXELS_PER_CYCLE);
+            let damp : f32 = (1.0 as f32)
+                / ((1.0 as f32) + self.physics.viscosity * freq * freq * SURF_VISCOUS_DAMP);
+            if (seen > 0.0) {
+                let angle : f32 = (o as f32) * SURF_TURN;
+                let dx : f32 = cos(angle);
+                let dz : f32 = sin(angle);
+                // Gravity waves of this frequency travel at sqrt(g / 2 pi f); the flow carries them besides.
+                let drift : f32 = SURF_DRIFT + sqrt(self.physics.gravity / (freq * (6.2831855 as f32)));
+                let ax : f32 = flow.a * (0.7 as f32) + dx * drift;
+                let az : f32 = flow.b * (0.7 as f32) + dz * drift;
+                let ga : Vec3 = waterValue2Slope(
+                    (x - ax * a * SURF_PHASE) * freq,
+                    (z - az * a * SURF_PHASE) * freq,
+                    SURF_SEED + o
+                );
+                let gb : Vec3 = waterValue2Slope(
+                    (x - ax * b * SURF_PHASE) * freq,
+                    (z - az * b * SURF_PHASE) * freq,
+                    SURF_SEED + o
+                );
+                let g : Vec3 = gb.lerp(ga, weightA);
+                let k : f32 = (slope / freq) * freq * strength * seen * damp * (2.0 as f32);
+                sum = sum.plus(Vec3 { x: g.y * k, y: 0.0, z: g.z * k });
+            }
+            freq = freq * SURF_RIPPLE_RATIO;
+            slope = slope * SURF_RIPPLE_FALLOFF;
+        }
+        return sum;
+    }
+
+    // The unit normal of the surface at the spot: the field's slope, then the ripples; never turned from the eye.
+    fn normal(self, spot : WaterSpot, top : Quad4, flow : Quad4) : Vec3 {
+        let ripple : Vec3 = self.ripples(spot, flow);
+        let n : Vec3 = Vec3 { x: -top.b - ripple.x, y: 1.0, z: -top.c - ripple.z }.normalized();
+        let facing : f32 = spot.view.negated().dot(n);
+        if (facing >= SURF_FACING_MIN) {
+            return n;
+        }
+        return n.plus(spot.view.scale(SURF_FACING_MIN - facing)).normalized();
+    }
+
+    // The GGX specular of the sun on a surface of normal `n`, as the radiance toward the eye.
+    fn glint(self, n : Vec3, v : Vec3, sun : Vec3, alpha : f32) : Vec3 {
+        let nl : f32 = n.dot(sun);
+        let nv : f32 = saturate(n.dot(v));
+        if (nl <= 0.0 || nv <= 0.0) {
+            return Vec3::zero();
+        }
+        let h : Vec3 = sun.plus(v).normalized();
+        let nh : f32 = saturate(n.dot(h));
+        let vh : f32 = saturate(v.dot(h));
+        let a2 : f32 = alpha * alpha;
+        let d : f32 = nh * nh * (a2 - (1.0 as f32)) + (1.0 as f32);
+        let dist : f32 = a2 / (PI * d * d);
+        let vis : f32 = (0.5 as f32)
+            / (nl * sqrt(nv * nv * ((1.0 as f32) - a2) + a2) + nv * sqrt(nl * nl * ((1.0 as f32) - a2) + a2));
+        let fresnel : f32 = WaterSurface::schlick(vh);
+        return self.sky.sunIrr.scale(dist * vis * fresnel * nl);
+    }
+
+    // Schlick's Fresnel reflectance at a view cosine.
+    static fn schlick(cosine : f32) : f32 {
+        let g : f32 = (1.0 as f32) - saturate(cosine);
+        let g2 : f32 = g * g;
+        return SURF_F0 + ((1.0 as f32) - SURF_F0) * g2 * g2 * g;
+    }
+
+    // What a reflected ray sees: the ground or the foam of far water if it meets the surface, the sky otherwise.
+    fn mirror(self, spot : WaterSpot, n : Vec3, roughness : f32) : Vec3 {
+        let mut r : Vec3 = spot.view.reflect(n);
+        if (r.y < 0.02) {
+            r = Vec3 { x: r.x, y: (0.02 as f32) - r.y * (0.5 as f32), z: r.z }.normalized();
+        }
+        let sky : Vec3 = self.sky.cloudsOver(self.sky.prefiltered(r, roughness), r);
+        if (!self.look.reflectedTerrain) {
+            return sky;
+        }
+        let ray : MarchRay = MarchRay {
+            origin: spot.point.plus(Vec3::unitY().scale(SURF_LIFT)).plus(r.scale(SURF_LIFT)),
+            dir: r,
+            from: 0.0,
+            to: SURF_MIRROR_REACH,
+            spread: spot.footprint,
+        };
+        let hit : MarchHit = HeightMarch::first(self.field, MarchTarget::Surface, ray);
+        if (!hit.hit) {
+            return sky;
+        }
+        let at : Vec3 = HeightMarch::at(ray, hit.t);
+        let seen : Vec3 = self.terrain.shade(GroundSpot {
+            point: at,
+            view: r,
+            footprint: spot.footprint * ((1.0 as f32) + hit.t * (0.05 as f32)),
+            wet: 1.0,
+        });
+        return seen.lerp(sky, (1.0 as f32) - waterExpNeg(hit.t * (0.01 as f32)));
+    }
+
+    // The light that enters: the bed through the refracted ray, absorbed along its path, plus the body's scatter.
+    fn refracted(self, spot : WaterSpot, n : Vec3, depth : f32) : Vec3 {
+        let eta : f32 = (1.0 as f32) / self.look.refractiveIndex;
+        let d : Vec3 = WaterSurface::refract(spot.view, n, eta);
+        let ray : MarchRay = MarchRay {
+            origin: spot.point.minus(Vec3::unitY().scale(SURF_LIFT)),
+            dir: d,
+            from: 0.0,
+            to: SURF_BED_REACH,
+            spread: spot.footprint,
+        };
+        let hit : MarchHit = HeightMarch::first(self.field, MarchTarget::Bed, ray);
+        let path : f32 = hit.t;
+
+        let up : Vec3 = Vec3::unitY();
+        let light : Vec3 = self.sky.direct(up).plus(self.sky.ambient(up));
+        let tau : Vec3 = self.look.absorption.scale(path);
+        let through : Vec3 = Vec3 { x: waterExpNeg(tau.x), y: waterExpNeg(tau.y), z: waterExpNeg(tau.z) };
+        let scatter : Vec3 = self.look.body.times(light).times(Vec3::splat(1.0).minus(through));
+        if (!hit.hit) {
+            return scatter;
+        }
+
+        let bed : Vec3 = HeightMarch::at(ray, hit.t);
+        let sunPath : f32 = self.field.surfaceHeight(bed.x, bed.z) - bed.y;
+        let lightTau : Vec3 = self.look.absorption.scale(max(sunPath, 0.0) * SURF_SUN_PATH);
+        let lightThrough : Vec3 = Vec3 {
+            x: waterExpNeg(lightTau.x),
+            y: waterExpNeg(lightTau.y),
+            z: waterExpNeg(lightTau.z),
+        };
+        let ground : Vec3 = self.terrain.shade(GroundSpot {
+            point: bed,
+            view: d,
+            footprint: spot.footprint,
+            wet: 1.0,
+        });
+        return ground.times(lightThrough).times(through).plus(scatter);
+    }
+
+    // Snell's law: the direction a ray `d` takes entering a medium across normal `n`, `eta` the ratio of indices.
+    static fn refract(d : Vec3, n : Vec3, eta : f32) : Vec3 {
+        let c : f32 = -d.dot(n);
+        let k : f32 = (1.0 as f32) - eta * eta * ((1.0 as f32) - c * c);
+        if (k <= 0.0) {
+            return d.reflect(n);
+        }
+        return d.scale(eta).plus(n.scale(eta * c - sqrt(k))).normalized();
+    }
+
+    /** The radiance leaving the water surface at `spot` toward the eye, before haze. */
+    pub fn shade(self, spot : WaterSpot) : Vec3 {
+        let p : Vec3 = spot.point;
+        let top : Quad4 = self.field.surfaceAt(p.x, p.z);
+        let flow : Quad4 = self.field.flowAt(p.x, p.z);
+        let depth : f32 = max(top.a - self.field.bedHeight(p.x, p.z), 0.0);
+
+        let foamSpot : FoamSpot = FoamSpot {
+            x: p.x,
+            z: p.z,
+            vx: flow.a,
+            vz: flow.b,
+            time: spot.time,
+            footprint: spot.footprint,
+            viscosity: self.physics.viscosity,
+        };
+        let amount : f32 = saturate(top.d * self.look.foamCoverage);
+        let foam : FoamCover = WaterFoam::merge(
+            WaterFoam::cover(foamSpot, amount),
+            WaterFoam::contact(foamSpot, depth, self.look.contactFoam)
+        );
+
+        let n : Vec3 = self.normal(spot, top, flow);
+        let cosine : f32 = saturate(spot.view.negated().dot(n));
+        let fresnel : f32 = WaterSurface::schlick(cosine);
+        let rough : f32 = max(self.look.glintRoughness, foam.thick * foam.mask * (0.6 as f32));
+
+        let reflected : Vec3 = self.mirror(spot, n, rough * (2.0 as f32));
+        let entered : Vec3 = self.refracted(spot, n, depth);
+        let sun : Vec3 = self.sky.sunDir;
+        let sunShare : f32 = self.field.lightAt(p.x, p.z).a;
+        let glints : Vec3 = self
+            .glint(n, spot.view.negated(), sun, max(rough, 0.01))
+            .scale(sunShare * ((1.0 as f32) - foam.mask));
+
+        let covered : f32 = foam.mask * foam.thick;
+        let mut out : Vec3 = entered
+            .scale((1.0 as f32) - fresnel)
+            .plus(reflected.scale(fresnel * ((1.0 as f32) - covered)))
+            .plus(glints);
+        out = out.plus(self.crest(spot, flow, n));
+        if (foam.mask > 0.0) {
+            out = out.lerp(
+                self.foamColour(n, foam, sunShare),
+                foam.mask * saturate((0.55 as f32) + foam.thick)
+            );
+        }
+        return out;
+    }
+
+    // The sun's light through a thin convex crest, toward an eye on the far side of the sun.
+    fn crest(self, spot : WaterSpot, flow : Quad4, n : Vec3) : Vec3 {
+        let convex : f32 = saturate(flow.d * SURF_CREST_GAIN);
+        if (convex <= 0.0) {
+            return Vec3::zero();
+        }
+        let toward : f32 = saturate(spot.view.dot(self.sky.sunDir) * (0.5 as f32) + (0.5 as f32));
+        let glow : f32 = convex * toward * toward * toward * self.look.subsurface;
+        let tint : Vec3 = Vec3 { x: SURF_CREST_R, y: SURF_CREST_G, z: SURF_CREST_B };
+        return tint.times(self.sky.sunIrr).scale(glow / PI * saturate(n.y));
+    }
+
+    // Foam lit like snow: white albedo under the sun and the dome, shaded in the creases of its lace.
+    fn foamColour(self, n : Vec3, foam : FoamCover, sunShare : f32) : Vec3 {
+        let lit : Vec3 = self.sky.direct(n).scale(sunShare).plus(self.sky.ambient(n));
+        let tone : f32 = lerp(0.62, 1.0, foam.lace) * lerp(0.8, 1.0, foam.thick);
+        return lit.scale(SURF_FOAM_ALBEDO * self.look.foamBrightness * tone);
+    }
+}

@@ -1,0 +1,359 @@
+// terrain_generate — runs the passes that make a HydroTerrain, in order, on a fixed-chunk job pool.
+//
+// The order is the geology: raw relief (valley, cliff, reservoir, mountains), erosion of the hillsides, the river and
+// its floodplain, the pool and apron at the foot of the fall, then the derived descriptions (lake basin, materials,
+// inflows). The heavy per-cell passes are row loops cut into chunks of `TERRAIN_GRAIN` rows by `kernel`'s rule, which
+// depends on the grid alone, and every chunk writes only its own rows, so one worker and twenty give the same bytes.
+// The serial passes (river tracing, flow accumulation, flood fills) are fast sweeps whose order is arithmetic.
+//
+// One pool is bound to one kernel for its life (see `pool`), so the kernel is a dispatcher: a `job` field says which
+// pass its `runRange` runs, and the generator sets it before each `run`.
+
+use ludax::{runSerial, JobPool, RangeKernel};
+
+use crate::terrain::hydro_parts::{HydroSpot, HydroTributary};
+use crate::terrain::hydro_terrain::HydroTerrain;
+use crate::terrain::terrain_erosion::TerrainErosion;
+use crate::terrain::terrain_fill::TerrainFill;
+use crate::terrain::terrain_hydrology::TerrainHydrology;
+use crate::terrain::terrain_materials::TerrainMaterials;
+use crate::terrain::terrain_meander::{RiverLine, TerrainMeander};
+use crate::terrain::terrain_params::TerrainParams;
+use crate::terrain::terrain_plan::TerrainPlan;
+use crate::terrain::terrain_relief::TerrainRelief;
+use crate::terrain::terrain_tributary::{TerrainTributary, TRIBUTARY_MAX};
+use crate::terrain::terrain_valley::{RiverField, TerrainValley};
+
+/** Rows per chunk of a row pass. */
+const TERRAIN_GRAIN : i32 = 8;
+
+/** Rounds of incision, and the creep passes after each. */
+const TERRAIN_ROUNDS : i32 = 6;
+const TERRAIN_CREEPS : i32 = 2;
+
+/** The pass a `TerrainJobs` runs next. */
+pub enum TerrainJob : i8 {
+    /** Raw relief into the bed. */
+    Relief,
+
+    /** The erodibility of each cell. */
+    Soft,
+
+    /** The steepest-descent neighbour of each cell. */
+    Receivers,
+
+    /** Thermal creep from the bed into the scratch grid. */
+    Creep,
+
+    /** Copy the scratch grid back into the bed. */
+    Settle,
+
+    /** The floodplain, before the channel is cut. */
+    Floodplain,
+
+    /** The channel, pool and bar cut into the floodplain. */
+    Channel,
+
+    /** The material and wetness of each cell. */
+    Materials,
+}
+
+/** The row passes, dispatched by `job`. */
+pub class TerrainJobs : RangeKernel {
+    /** Which pass `runRange` does. */
+    pub job : TerrainJob = TerrainJob::Relief;
+
+    /** The layout. */
+    pub plan : TerrainPlan;
+
+    /** Columns of the grid. */
+    pub width : i32;
+
+    /** The ground being made. */
+    pub bed : f32[];
+
+    /** Scratch heights, for the passes that read the bed while writing a new one. */
+    pub scratch : f32[];
+
+    /** How erodible each cell is, 0 to 1. */
+    pub soft : f32[];
+
+    /** The steepest-descent neighbour of each cell, or -1. */
+    pub recv : i32[];
+
+    /** The cells from sources to outlets. */
+    pub order : i32[];
+
+    /** Cells draining through each cell, itself included. */
+    pub area : f32[];
+
+    /** Scratch counts of donors. */
+    pub donors : i32[];
+
+    /** The ground before the channel is cut into it. */
+    pub surface : f32[];
+
+    /** Buckets of the pit filler. */
+    pub heads : i32[];
+
+    /** Links of the pit filler's buckets. */
+    pub links : i32[];
+
+    /** Visited marks of the pit filler. */
+    pub seen : u8[];
+
+    /** What the tributaries touched: 1 fan, 2 channel. */
+    pub trib : u8[];
+
+    /** The reservoir's basin, 1 inside. */
+    pub mask : u8[];
+
+    /** The material of each cell. */
+    pub material : u8[];
+
+    /** The wetness of each cell. */
+    pub wet : u8[];
+
+    /** The river's centreline. */
+    pub line : RiverLine;
+
+    /** The river's distance field. */
+    pub field : RiverField;
+
+    /** The abandoned channel and the ponds on it. */
+    pub old : RiverLine;
+
+    /** The abandoned channel's distance field. */
+    pub oldField : RiverField;
+
+    /** A kernel for `plan` over a grid of `width` columns. */
+    constructor(plan : TerrainPlan, width : i32) {
+        self.plan = plan;
+        self.width = width;
+        let n : i64 = (width as i64) * (width as i64);
+        self.bed = new f32[n];
+        self.scratch = new f32[n];
+        self.soft = new f32[n];
+        self.recv = new i32[n];
+        self.order = new i32[n];
+        self.area = new f32[n];
+        self.donors = new i32[n];
+        self.surface = new f32[n];
+        self.heads = new i32[262144];
+        self.links = new i32[n];
+        self.seen = new u8[n];
+        self.trib = new u8[n];
+        self.mask = new u8[n];
+        self.material = new u8[n];
+        self.wet = new u8[n];
+        self.line = new RiverLine(TerrainMeander::room(plan));
+        self.field = new RiverField(n);
+        self.old = new RiverLine(TerrainMeander::room(plan));
+        self.oldField = new RiverField(n);
+    }
+
+    fn settle(mut self, begin : i32, end : i32) : void {
+        let from : i64 = (begin as i64) * (self.width as i64);
+        let to : i64 = (end as i64) * (self.width as i64);
+        for (c of from..to) {
+            self.bed[c] = self.scratch[c];
+        }
+    }
+
+    /** Runs the pass `job` names over rows `begin` up to `end`. */
+    pub fn runRange(mut self, begin : i32, end : i32) : void {
+        match self.job {
+            TerrainJob::Relief => TerrainRelief::rows(self.plan, self.bed, self.width, begin, end),
+            TerrainJob::Soft => TerrainErosion::softRows(self.plan, self.soft, self.width, begin, end),
+            TerrainJob::Receivers => TerrainErosion::receiverRows(
+                self.bed,
+                self.recv,
+                self.width,
+                self.width,
+                begin,
+                end
+            ),
+            TerrainJob::Creep => TerrainErosion::creepRows(
+                self.plan,
+                self.bed,
+                self.scratch,
+                self.soft,
+                self.width,
+                self.width,
+                begin,
+                end
+            ),
+            TerrainJob::Settle => self.settle(begin, end),
+            TerrainJob::Floodplain => TerrainValley::floodplainRows(
+                self.plan,
+                self.line,
+                self.field,
+                self.old,
+                self.oldField,
+                self.bed,
+                self.surface,
+                self.width,
+                begin,
+                end
+            ),
+            TerrainJob::Channel => TerrainValley::channelRows(
+                self.plan,
+                self.line,
+                self.field,
+                self.bed,
+                self.surface,
+                self.width,
+                begin,
+                end
+            ),
+            TerrainJob::Materials => TerrainMaterials::rows(
+                self.plan,
+                self.line,
+                self.field,
+                self.old,
+                self.oldField,
+                self.bed,
+                self.mask,
+                self.trib,
+                self.material,
+                self.wet,
+                self.width,
+                begin,
+                end
+            ),
+        }
+    }
+}
+
+/** Builds terrains. */
+pub class TerrainGenerator {
+    /** Generates the landscape of `params` from `seed` with `workers` threads (the bytes do not depend on it). */
+    pub static fn run(seed : i32, params : TerrainParams, workers : i32) : HydroTerrain {
+        let plan : TerrainPlan = TerrainPlan::make(params, seed);
+        let n : i32 = (params.worldSize / params.cellSize) as i32;
+        let mut t : HydroTerrain = new HydroTerrain(n, n, params.cellSize, params.outflowLevel);
+        t.seed = seed;
+        t.params = params;
+
+        let mut jobs : TerrainJobs = new TerrainJobs(plan, n);
+        let pool : JobPool = new JobPool(workers, jobs);
+        TerrainGenerator::pass(jobs, pool, workers, TerrainJob::Relief, n);
+        TerrainGenerator::erode(jobs, pool, workers, n);
+        TerrainMeander::fit(plan, jobs.line);
+        TerrainValley::raster(plan, jobs.line, jobs.field, n);
+        TerrainMeander::scar(plan, jobs.line, jobs.old);
+        TerrainValley::raster(plan, jobs.old, jobs.oldField, n);
+        TerrainGenerator::pass(jobs, pool, workers, TerrainJob::Floodplain, n);
+        let found : HydroTributary[] = new HydroTributary[TRIBUTARY_MAX as i64];
+        let made : i32 = TerrainTributary::make(
+            plan,
+            jobs.line,
+            jobs.recv,
+            jobs.area,
+            jobs.soft,
+            jobs.surface,
+            jobs.trib,
+            n,
+            1.0 as f32,
+            found
+        );
+        TerrainFill::run(jobs.surface, jobs.soft, n, n, jobs.heads, jobs.links, jobs.seen);
+        TerrainGenerator::pass(jobs, pool, workers, TerrainJob::Channel, n);
+
+        let cells : i64 = (n as i64) * (n as i64);
+        for (i of 0..cells) {
+            t.bed[i] = jobs.bed[i];
+        }
+        TerrainHydrology::describe(plan, t, jobs.line, jobs.old, jobs.oldField, jobs.recv, jobs.area);
+        TerrainGenerator::tributaries(t, found, made, jobs.area);
+        for (i of 0..cells) {
+            jobs.mask[i] = t.lakeMask[i];
+        }
+        TerrainGenerator::pass(jobs, pool, workers, TerrainJob::Materials, n);
+        pool.shutdown();
+        TerrainGenerator::finish(plan, t, jobs);
+        return t;
+    }
+
+    // The tributaries get the lake streams' runoff per cell of catchment times their own cells (`found` holds cells).
+    static fn tributaries(t : HydroTerrain, found : HydroTributary[], made : i32, area : f32[]) : void {
+        let mut runoff : f32 = 0.0 as f32;
+        if (t.inflowCount > 0) {
+            let spot : HydroSpot = t.inflows[0].at;
+            let c : i64 = t.cell(
+                t.clampColumn((spot.x / t.cellSize) as i32),
+                t.clampRow((spot.z / t.cellSize) as i32)
+            );
+            runoff = t.inflows[0].discharge / area[c];
+        }
+        t.tributaries = new HydroTributary[(made + 1) as i64];
+        for (i of 0..made) {
+            let mut one : HydroTributary = found[i as i64];
+            one.discharge = one.discharge * runoff;
+            t.tributaries[i as i64] = one;
+        }
+        t.tributaryCount = made;
+    }
+
+    // Copies the rest of the results into `t`: materials, wetness, and what `bedAt` needs.
+    static fn finish(plan : TerrainPlan, t : HydroTerrain, jobs : TerrainJobs) : void {
+        let cells : i64 = (t.width as i64) * (t.depth as i64);
+        t.material = new u8[cells];
+        t.wetness = new u8[cells];
+        t.surface = new f32[cells];
+        t.riverAlong = new f32[cells];
+        for (i of 0..cells) {
+            t.material[i] = jobs.material[i];
+            t.wetness[i] = jobs.wet[i];
+            t.surface[i] = jobs.surface[i];
+            t.riverAlong[i] = jobs.field.along[i];
+        }
+        t.plan = plan;
+        t.analytic = true;
+        t.pitCount = TerrainFill::pits(t.bed, jobs.soft, jobs.field.along, t.width, t.depth);
+    }
+
+    // Soften the hillsides: incision along the drainage, then creep, a few rounds.
+    static fn erode(jobs : TerrainJobs, pool : JobPool, workers : i32, n : i32) : void {
+        TerrainGenerator::pass(jobs, pool, workers, TerrainJob::Soft, n);
+        TerrainFill::run(jobs.bed, jobs.soft, n, n, jobs.heads, jobs.links, jobs.seen);
+        let count : i64 = (n as i64) * (n as i64);
+        for (round of 0..TERRAIN_ROUNDS) {
+            TerrainGenerator::pass(jobs, pool, workers, TerrainJob::Receivers, n);
+            let ordered : i64 = TerrainErosion::accumulate(
+                jobs.recv,
+                jobs.order,
+                jobs.area,
+                jobs.donors,
+                count
+            );
+            TerrainErosion::incise(
+                jobs.plan,
+                jobs.bed,
+                jobs.recv,
+                jobs.order,
+                jobs.area,
+                jobs.soft,
+                n,
+                ordered
+            );
+            for (creep of 0..TERRAIN_CREEPS) {
+                TerrainGenerator::pass(jobs, pool, workers, TerrainJob::Creep, n);
+                TerrainGenerator::pass(jobs, pool, workers, TerrainJob::Settle, n);
+            }
+        }
+        TerrainFill::run(jobs.bed, jobs.soft, n, n, jobs.heads, jobs.links, jobs.seen);
+        TerrainGenerator::pass(jobs, pool, workers, TerrainJob::Receivers, n);
+        TerrainErosion::accumulate(jobs.recv, jobs.order, jobs.area, jobs.donors, count);
+    }
+
+    // One row pass over the whole grid: on the pool when there are workers to speak of, else on this thread.
+    static fn pass(jobs : TerrainJobs, pool : JobPool, workers : i32, job : TerrainJob, rows : i32) : void {
+        jobs.job = job;
+        if (workers > 1) {
+            pool.run(rows, TERRAIN_GRAIN);
+            return;
+        }
+        runSerial(jobs, rows, TERRAIN_GRAIN);
+    }
+}

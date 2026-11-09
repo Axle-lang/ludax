@@ -1,0 +1,245 @@
+// terrain_erosion — stream-power incision and thermal creep, which turn noise into drainage and slopes.
+//
+// Raw noise has the right silhouette but no logic: nothing flows anywhere. Two passes give it some.
+//
+// Incision follows the stream-power law, erosion rate proportional to the square root of the drainage area times the
+// slope, solved implicitly (Braun and Willett): each cell is lowered toward its steepest-descent neighbour by
+// `F = K * sqrt(area) / distance`, taking the neighbour's new height first, so a cell never drops below the water it
+// drains into and no pit is created. Visiting the cells from the outlets upward is a topological order of the
+// drainage graph, found by counting donors (Kahn), not by sorting heights: it is exact, linear and the same on every
+// machine. Where many cells drain together the incision is strong, so gullies deepen into valleys that run
+// to the floodplain, and the divides between them stay sharp.
+//
+// Thermal creep moves rock from over-steep cells to their lower neighbours, pair by pair (a gain for one cell is the
+// other's loss, so it conserves mass), which rounds the crests and fills the gullies' feet with scree.
+//
+// `soft` in [0, 1] is how erodible a cell is: zero on the floodplain, around the reservoir and its rim (the spill point
+// must stay where the relief put it) and 0.04 in the cap rock band of the escarpment, one on the hillsides. Both passes
+// scale by it, which is what keeps the waterfall a cliff while the hills around it soften.
+
+use ludax::{sqrt, smoothstep};
+
+use crate::terrain::terrain_plan::TerrainPlan;
+
+// Erodibility of the cap rock band relative to the hillsides, and how far above and below the crest the band reaches.
+const EROSION_CAP_SOFT : f32 = 0.04;
+const EROSION_CAP_ABOVE : f32 = 40.0;
+const EROSION_CAP_BELOW : f32 = 15.0;
+
+// The reservoir's surroundings, in lake radii, are left alone up to the first and eroded fully from the second.
+const EROSION_LAKE_FROM : f32 = 1.3;
+const EROSION_LAKE_TO : f32 = 1.9;
+
+// Incision constant per unit of strength, and the largest fraction of the way to the receiver a cell may go in one pass.
+const EROSION_K : f32 = 0.004;
+const EROSION_F_MAX : f32 = 3.0;
+
+// Thermal creep: the stable slope (tangent of about 36 degrees), and the share of an excess a pair exchanges.
+const EROSION_TALUS : f32 = 0.73;
+const EROSION_EXCHANGE : f32 = 0.09;
+
+/** Column offset of neighbour `k` of a cell: 0 to 3 are east, west, south, north; 4 to 7 the diagonals. */
+pub fn terrainStepX(k : i32) : i32 {
+    return match k {
+        0 => 1,
+        1 => -1,
+        2 => 0,
+        3 => 0,
+        4 => 1,
+        5 => 1,
+        6 => -1,
+        _ => -1,
+    };
+}
+
+/** Row offset of neighbour `k` of a cell (see `terrainStepX`). */
+pub fn terrainStepZ(k : i32) : i32 {
+    return match k {
+        0 => 0,
+        1 => 0,
+        2 => 1,
+        3 => -1,
+        4 => 1,
+        5 => -1,
+        6 => 1,
+        _ => -1,
+    };
+}
+
+/** The erosion passes. */
+pub class TerrainErosion {
+    /** Fills rows `begin` up to `end` of `soft` with the erodibility of each cell. */
+    pub static fn softRows(plan : TerrainPlan, soft : f32[], width : i32, begin : i32, end : i32) : void {
+        for (j of begin..end) {
+            let z : f32 = ((j as f32) + 0.5 as f32) * plan.cell;
+            for (i of 0..width) {
+                let x : f32 = ((i as f32) + 0.5 as f32) * plan.cell;
+                let flat : f32 = 1.0 as f32 - plan.floodWeight(x, z);
+                let lake : f32 = smoothstep(EROSION_LAKE_FROM, EROSION_LAKE_TO, plan.lakeRadius(x, z));
+                let dz : f32 = z - plan.crestZ(x);
+                let inBand : f32 = smoothstep(
+                    0.0 as f32 - EROSION_CAP_ABOVE,
+                    0.0 as f32 - EROSION_CAP_ABOVE * 0.25 as f32,
+                    dz
+                )
+                    * (1.0 as f32 - smoothstep(plan.capRun, plan.capRun + EROSION_CAP_BELOW, dz));
+                let along : f32 = inBand * plan.cliffAt(x) / plan.cliff;
+                let band : f32 = 1.0 as f32 - (1.0 as f32 - EROSION_CAP_SOFT) * along;
+                soft[((j as i64) * (width as i64)) + (i as i64)] = flat * lake * band;
+            }
+        }
+    }
+
+    /** Steepest-descent neighbour of each cell of rows `begin` up to `end` into `recv`, or -1 when it has none (a pit or the border). */
+    pub static fn receiverRows(
+        bed : f32[],
+        recv : i32[],
+        width : i32,
+        depth : i32,
+        begin : i32,
+        end : i32
+    ) : void {
+        for (j of begin..end) {
+            for (i of 0..width) {
+                let c : i64 = ((j as i64) * (width as i64)) + (i as i64);
+                recv[c] = TerrainErosion::lowest(bed, width, depth, i, j);
+            }
+        }
+    }
+
+    // The neighbour with the steepest fall below (i, j), or -1.
+    static fn lowest(bed : f32[], width : i32, depth : i32, i : i32, j : i32) : i32 {
+        if (i == 0 || j == 0 || i == width - 1 || j == depth - 1) {
+            return -1;
+        }
+        let here : f32 = bed[((j as i64) * (width as i64)) + (i as i64)];
+        let mut best : f32 = 0.0 as f32;
+        let mut pick : i32 = -1;
+        for (k of 0..8) {
+            let n : i32 = (j + terrainStepZ(k)) * width + i + terrainStepX(k);
+            let mut fall : f32 = here - bed[n as i64];
+            if (k >= 4) {
+                fall = fall * 0.7071068 as f32;
+            }
+            if (fall > best) {
+                best = fall;
+                pick = n;
+            }
+        }
+        return pick;
+    }
+
+    /**
+     * Orders the cells from sources to outlets in `order` and sums the drainage area, in cells, of each into `area`.
+     * `donors` is scratch of the same size. Returns how many cells were ordered (all of them: descents are strict).
+     */
+    pub static fn accumulate(recv : i32[], order : i32[], area : f32[], donors : i32[], count : i64) : i64 {
+        for (c of 0..count) {
+            donors[c] = 0;
+            area[c] = 1.0 as f32;
+        }
+        for (c of 0..count) {
+            if (recv[c] >= 0) {
+                donors[recv[c] as i64] = donors[recv[c] as i64] + 1;
+            }
+        }
+        let mut tail : i64 = 0;
+        for (c of 0..count) {
+            if (donors[c] == 0) {
+                order[tail] = c as i32;
+                tail = tail + 1;
+            }
+        }
+        let mut head : i64 = 0;
+        while (head < tail) {
+            let c : i64 = order[head] as i64;
+            head = head + 1;
+            let r : i64 = recv[c] as i64;
+            if (r < 0) {
+                continue;
+            }
+            area[r] = area[r] + area[c];
+            donors[r] = donors[r] - 1;
+            if (donors[r] == 0) {
+                order[tail] = r as i32;
+                tail = tail + 1;
+            }
+        }
+        return tail;
+    }
+
+    /** Lowers each cell toward its receiver in proportion to its drainage, outlets first, `strength` in 0..1 times `passes`' share. */
+    pub static fn incise(
+        plan : TerrainPlan,
+        bed : f32[],
+        recv : i32[],
+        order : i32[],
+        area : f32[],
+        soft : f32[],
+        width : i32,
+        ordered : i64
+    ) : void {
+        let k : f32 = EROSION_K * plan.params.erosionStrength;
+        let mut at : i64 = ordered - 1;
+        while (at >= 0) {
+            let c : i64 = order[at] as i64;
+            at = at - 1;
+            let r : i64 = recv[c] as i64;
+            if (r < 0 || soft[c] <= 0.0 as f32) {
+                continue;
+            }
+            let gap : i64 = c - r;
+            let mut reach : f32 = plan.cell;
+            if (gap != 1 && gap != -1 && gap != (width as i64) && gap != -(width as i64)) {
+                reach = plan.cell * 1.4142135 as f32;
+            }
+            let mut f : f32 = k * soft[c] * sqrt(area[c]) * plan.cell / reach;
+            if (f > EROSION_F_MAX) {
+                f = EROSION_F_MAX;
+            }
+            bed[c] = (bed[c] + f * bed[r]) / (1.0 as f32 + f);
+        }
+    }
+
+    /** Thermal creep over rows `begin` up to `end`: reads `bed`, writes the result to `out`. */
+    pub static fn creepRows(
+        plan : TerrainPlan,
+        bed : f32[],
+        out : f32[],
+        soft : f32[],
+        width : i32,
+        depth : i32,
+        begin : i32,
+        end : i32
+    ) : void {
+        for (j of begin..end) {
+            for (i of 0..width) {
+                let c : i64 = ((j as i64) * (width as i64)) + (i as i64);
+                if (i == 0 || j == 0 || i == width - 1 || j == depth - 1) {
+                    out[c] = bed[c];
+                    continue;
+                }
+                let mut gain : f32 = 0.0 as f32;
+                for (k of 0..8) {
+                    let n : i64 = (((j + terrainStepZ(k)) * width + i + terrainStepX(k)) as i64);
+                    let mut run : f32 = plan.cell;
+                    if (k >= 4) {
+                        run = plan.cell * 1.4142135 as f32;
+                    }
+                    let mobility : f32 = 0.5 as f32 * (soft[c] + soft[n]);
+                    if (mobility <= 0.001 as f32) {
+                        continue;
+                    }
+                    let allowed : f32 = EROSION_TALUS * run / mobility;
+                    let diff : f32 = bed[n] - bed[c];
+                    if (diff > allowed) {
+                        gain = gain + (diff - allowed) * mobility;
+                    } else if (diff < 0.0 as f32 - allowed) {
+                        gain = gain + (diff + allowed) * mobility;
+                    }
+                }
+                out[c] = bed[c] + gain * EROSION_EXCHANGE;
+            }
+        }
+    }
+}

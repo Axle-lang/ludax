@@ -1,0 +1,403 @@
+// terrain_meander — the river's centreline: a sine-generated meander curve, fitted to the sinuosity asked for.
+//
+// A real river's planform is well described by the sine-generated curve of Langbein and Leopold: the direction
+// of the channel, measured from the valley axis, swings as a sine of the distance along the channel,
+// `heading(s) = theta0 * sin(2 pi s / L)`. That is the smoothest curve for a given arc length, which is why rivers
+// have it, and it has the two properties the demos need: it is a function of arc length (no self crossing for
+// theta0 below about two radians) and its sinuosity is a function of the swing alone (about 1.31 at a swing of 1 radian,
+// 1.49 at 1.2, 1.61 at 1.3, 2 at 1.5). A third harmonic leans the loops downstream (the skew of Kinoshita's curve), and
+// slow noise on the wavelength and the swing keeps two bends from being twins, so the river reads as wandering and
+// not as drawn.
+//
+// The swing is not solved from a formula: the curve is traced, its sinuosity measured (arc length over the straight
+// distance between its ends) and the swing found by bisection, so the answer is within a percent of the request
+// whatever the noise and the gentle steering back toward the valley axis do. The channel starts straight for a few
+// dozen metres (the outflow of the plunge pool), then the swing ramps up over most of a wavelength.
+//
+// The heights along the river are given here too: the bank tops follow the valley floor but never rise going
+// downstream (a running minimum), falling at least a little every step, and the bed is the bank minus the depth, so the
+// bed strictly descends from the pool to the end lake however the curve loops back on itself.
+
+use ludax::{abs, clamp, cos, max, saturate, sin, smoothstep, sqrt};
+
+use crate::terrain::hydro_parts::RiverPoint;
+use crate::terrain::terrain_channel::riverLerp;
+use crate::terrain::terrain_noise::terrainNoise;
+use crate::terrain::terrain_plan::TerrainPlan;
+
+// Distance between points, in cells.
+const MEANDER_STEP : f32 = 0.75;
+
+// The river starts this far (metres) south of the foot of the vertical face: where the fall lands, the pool's deepest point.
+const MEANDER_FALL_LANDS : f32 = 5.0;
+
+// The channel runs straight this far, metres, then the swing ramps up over this share of an arc wavelength.
+const MEANDER_STRAIGHT : f32 = 60.0;
+const MEANDER_RAMP : f32 = 0.7;
+
+// Noise on the wavelength and on the swing, as shares, and the scales they vary over, in arc wavelengths.
+const MEANDER_WAVE_NOISE : f32 = 0.38;
+const MEANDER_SWING_NOISE : f32 = 0.5;
+
+// Tighter loops: how much more the swing grows where a slow noise peaks, over how many arc wavelengths it varies.
+const MEANDER_TIGHT : f32 = 0.45;
+const MEANDER_TIGHT_SCALE : f32 = 1.1;
+const MEANDER_SEED_TIGHT : i32 = 7;
+
+// Smoothing of the long profile and the curvature: half window in points and passes (a moving average of a falling
+// series falls, so it never breaks the descent), the depth the bed keeps at a crossing (a riffle) as a share of the full depth.
+const MEANDER_SMOOTH : i32 = 14;
+const MEANDER_SMOOTH_PASSES : i32 = 3;
+const MEANDER_RIFFLE : f32 = 0.78;
+const MEANDER_NOISE_SCALE : f32 = 1.9;
+
+// The third harmonic: its share of the swing and its phase, radians.
+const MEANDER_SKEW : f32 = 0.12;
+const MEANDER_SKEW_PHASE : f32 = 0.9;
+
+// The steering back to the valley axis: strength in radians, and the lateral distance, as a share of the half floodplain,
+// at which it is full.
+const MEANDER_STEER : f32 = 0.5;
+const MEANDER_BELT : f32 = 0.42;
+
+// The river ends this share of the world's depth down, inside the end lake.
+const MEANDER_END : f32 = 0.985;
+
+// The fall of the bank per metre of channel at least, as a share of the valley's slope.
+const MEANDER_MIN_FALL : f32 = 0.25;
+
+// The swings the fit searches between, radians (0.3 is nearly straight, 2.0 is on the verge of crossing itself), and how
+// many halvings of that range it makes: the sinuosity grows with the swing, so bisection finds it.
+const MEANDER_SWING_MIN : f32 = 0.3;
+const MEANDER_SWING_MAX : f32 = 2.0;
+const MEANDER_FITS : i32 = 14;
+
+// The abandoned channel: its swing relative to the live river's, the salt that makes its noise another noise, and the
+// ponds (oxbow hollows) along it: at most so many, this long in points, this deep, this far apart in points, and how
+// far from the live channel, in channel widths, their ends must lie.
+const MEANDER_OLD_SWING : f32 = 1.07;
+const MEANDER_OLD_SALT : i32 = 97;
+pub const MEANDER_PONDS : i32 = 4;
+const MEANDER_POND_LENGTH : i32 = 64;
+const MEANDER_POND_DEPTH : f32 = 1.9;
+const MEANDER_POND_APART : i32 = 220;
+const MEANDER_POND_CLEAR : f32 = 3.2;
+pub const MEANDER_POND_EDGE : i32 = 8;
+
+// Seeds of the curve's noise.
+const MEANDER_SEED_WAVE : i32 = 401;
+const MEANDER_SEED_SWING : i32 = 433;
+const MEANDER_SEED_WIDTH : i32 = 467;
+
+/** The river's points, with the room for them. */
+pub class RiverLine {
+    /** The points from the pool to the end lake. */
+    pub points : RiverPoint[];
+
+    /** How many points are valid. */
+    pub count : i32 = 0;
+
+    /** The swing, radians, the fit settled on. */
+    pub swing : f32 = 0.0;
+
+    /** First point index of each pond (an oxbow hollow along an abandoned channel). */
+    pub pondFrom : i32[];
+
+    /** One past the last point index of each pond. */
+    pub pondTo : i32[];
+
+    /** Height of the flat floor of each pond, metres. */
+    pub pondBed : f32[];
+
+    /** How many ponds there are. */
+    pub pondCount : i32 = 0;
+
+    /** A line with room for `room` points. */
+    constructor(room : i32) {
+        self.points = new RiverPoint[room as i64];
+        self.pondFrom = new i32[MEANDER_PONDS as i64];
+        self.pondTo = new i32[MEANDER_PONDS as i64];
+        self.pondBed = new f32[MEANDER_PONDS as i64];
+    }
+
+    /** Arc length of the whole river, metres. */
+    pub fn length(self) : f32 {
+        if (self.count == 0) {
+            return 0.0;
+        }
+        return self.points[(self.count - 1) as i64].arc;
+    }
+
+    /** Straight distance from the first point to the last, metres. */
+    pub fn chord(self) : f32 {
+        if (self.count == 0) {
+            return 0.0;
+        }
+        let a : RiverPoint = self.points[0];
+        let b : RiverPoint = self.points[(self.count - 1) as i64];
+        let dx : f32 = b.x - a.x;
+        let dz : f32 = b.z - a.z;
+        return sqrt(dx * dx + dz * dz);
+    }
+
+    /** Arc length over straight distance. */
+    pub fn sinuosity(self) : f32 {
+        let chord : f32 = self.chord();
+        if (chord < 1.0 as f32) {
+            return 1.0;
+        }
+        return self.length() / chord;
+    }
+
+    /** The point at fractional index `at`, attributes interpolated (the direction is not renormalised). */
+    pub fn at(self, at : f32) : RiverPoint {
+        return riverLerp(self.points, self.count, at);
+    }
+}
+
+/** The river's planform and long profile. */
+pub class TerrainMeander {
+    /** How many points a line for `plan` can need at most: the world's depth at four times the sinuosity of an average. */
+    pub static fn room(plan : TerrainPlan) : i32 {
+        let step : f32 = plan.cell * MEANDER_STEP;
+        return ((plan.size / step) * 4.0 as f32) as i32 + 64;
+    }
+
+    /** z of the middle of the plunge pool, which is where the river starts. */
+    pub static fn startZ(plan : TerrainPlan) : f32 {
+        return plan.notchZ + plan.capRun + MEANDER_FALL_LANDS;
+    }
+
+    /** Fills `line` with the river of `plan`, fitted to the sinuosity requested. */
+    pub static fn fit(plan : TerrainPlan, line : RiverLine) : void {
+        let target : f32 = max(plan.params.sinuosity, 1.0 as f32);
+        let mut lo : f32 = MEANDER_SWING_MIN;
+        let mut hi : f32 = MEANDER_SWING_MAX;
+        let mut best : f32 = 1.0 as f32;
+        let mut miss : f32 = 1000000.0 as f32;
+        for (round of 0..MEANDER_FITS) {
+            let swing : f32 = (lo + hi) * 0.5 as f32;
+            TerrainMeander::trace(plan, swing, line, 0);
+            let got : f32 = line.sinuosity();
+            if (abs(got - target) < miss) {
+                miss = abs(got - target);
+                best = swing;
+            }
+            if (got < target) {
+                lo = swing;
+            } else {
+                hi = swing;
+            }
+        }
+        TerrainMeander::trace(plan, best, line, 0);
+        line.swing = best;
+        TerrainMeander::profile(plan, line);
+    }
+
+    /** Fills `old` with an abandoned channel of the river `line` (another curve in the same belt) and picks its ponds. */
+    pub static fn scar(plan : TerrainPlan, line : RiverLine, mut old : RiverLine) : void {
+        TerrainMeander::trace(plan, line.swing * MEANDER_OLD_SWING, old, MEANDER_OLD_SALT);
+        TerrainMeander::profile(plan, old);
+        old.pondCount = 0;
+        let mut taken : i32 = -MEANDER_POND_APART;
+        let reach : f32 = plan.params.riverWidth * MEANDER_POND_CLEAR;
+        let mut at : i32 = MEANDER_POND_APART;
+        while (at < old.count - MEANDER_POND_LENGTH && old.pondCount < MEANDER_PONDS) {
+            at = at + 1;
+            let half : i32 = MEANDER_POND_LENGTH / 2;
+            let sharp : bool = ludax::abs(old.points[at as i64].curvature)
+                > ludax::abs(old.points[(at - 1) as i64].curvature)
+                && ludax::abs(old.points[at as i64].curvature)
+                    >= ludax::abs(old.points[(at + 1) as i64].curvature)
+                && ludax::abs(old.points[at as i64].curvature) > 0.004 as f32;
+            if (!sharp || at - taken < MEANDER_POND_APART) {
+                continue;
+            }
+            let a : RiverPoint = old.points[(at - half) as i64];
+            let b : RiverPoint = old.points[at as i64];
+            let c : RiverPoint = old.points[(at + half) as i64];
+            if (TerrainMeander::clearance(line, a.x, a.z) < reach
+                || TerrainMeander::clearance(line, b.x, b.z) < reach
+                || TerrainMeander::clearance(line, c.x, c.z) < reach) {
+                continue;
+            }
+            let k : i64 = old.pondCount as i64;
+            old.pondFrom[k] = at - half;
+            old.pondTo[k] = at + half;
+            old.pondBed[k] = ludax::min(a.bankHeight, c.bankHeight) - MEANDER_POND_DEPTH;
+            old.pondCount = old.pondCount + 1;
+            taken = at;
+        }
+    }
+
+    // The distance from (x, z) to the nearest point of `line`, metres.
+    static fn clearance(line : RiverLine, x : f32, z : f32) : f32 {
+        let mut best : f32 = 1000000.0 as f32;
+        for (i of 0..line.count) {
+            let dx : f32 = line.points[i as i64].x - x;
+            let dz : f32 = line.points[i as i64].z - z;
+            best = ludax::min(best, dx * dx + dz * dz);
+        }
+        return sqrt(best);
+    }
+
+    // Traces the planform for a swing of `swing` radians: the points, their direction and curvature.
+    static fn trace(plan : TerrainPlan, swing : f32, mut line : RiverLine, salt : i32) : void {
+        let step : f32 = plan.cell * MEANDER_STEP;
+        let wave : f32 = plan.params.meanderWavelength * max(plan.params.sinuosity, 1.0 as f32);
+        let room : i32 = TerrainMeander::room(plan);
+        let belt : f32 = plan.floodHalf * MEANDER_BELT;
+        let endZ : f32 = plan.size * MEANDER_END;
+
+        let mut x : f32 = plan.axisX0;
+        let mut z : f32 = TerrainMeander::startZ(plan);
+        let mut phase : f32 = (salt as f32) * 0.021 as f32;
+        let mut n : i32 = 0;
+        while (z < endZ && n < room - 1) {
+            let s : f32 = (n as f32) * step;
+            let rate : f32 = 1.0 as f32
+                + MEANDER_WAVE_NOISE
+                    * meanderNoise(s / (wave * MEANDER_NOISE_SCALE), plan.seed + MEANDER_SEED_WAVE + salt);
+            let power : f32 = swing
+                * (1.0 as f32
+                    + MEANDER_SWING_NOISE
+                        * meanderNoise(
+                            s / (wave * MEANDER_NOISE_SCALE) + 11.0 as f32,
+                            plan.seed + MEANDER_SEED_SWING + salt
+                        ));
+            let tight : f32 = 1.0 as f32
+                + MEANDER_TIGHT
+                    * smoothstep(
+                        0.3 as f32,
+                        0.75 as f32,
+                        meanderNoise(
+                            s / (wave * MEANDER_TIGHT_SCALE) + 23.0 as f32,
+                            plan.seed + MEANDER_SEED_TIGHT + salt
+                        )
+                    );
+            let ramp : f32 = smoothstep(0.0 as f32, wave * MEANDER_RAMP, s - MEANDER_STRAIGHT);
+            phase = phase + 6.2831853 as f32 * step / (wave * rate);
+
+            let lean : f32 = sin(phase) + MEANDER_SKEW * sin(3.0 as f32 * phase + MEANDER_SKEW_PHASE);
+            let off : f32 = clamp((x - plan.axisX(z)) / belt, -1.0 as f32, 1.0 as f32);
+            let heading : f32 = ramp * power * tight * lean - MEANDER_STEER * off * ramp;
+
+            let width : f32 = plan.params.riverWidth
+                * (1.0 as f32
+                    + 0.1 as f32 * meanderNoise(s / 140.0 as f32, plan.seed + MEANDER_SEED_WIDTH + salt));
+            line.points[n as i64] = RiverPoint {
+                x: x,
+                z: z,
+                arc: s,
+                dirX: sin(heading),
+                dirZ: cos(heading),
+                width: width,
+                depth: plan.params.riverDepth,
+            };
+            x = x + sin(heading) * step;
+            z = z + cos(heading) * step;
+            n = n + 1;
+        }
+        line.count = n;
+        TerrainMeander::curvature(line, step);
+    }
+
+    // The signed curvature of every point, from the turn of the direction across its neighbours.
+    static fn curvature(mut line : RiverLine, step : f32) : void {
+        for (i of 1..(line.count - 1)) {
+            let a : RiverPoint = line.points[(i - 1) as i64];
+            let b : RiverPoint = line.points[(i + 1) as i64];
+            let turn : f32 = b.dirX * a.dirZ - b.dirZ * a.dirX;
+            line.points[i as i64].curvature = turn / (2.0 as f32 * step);
+        }
+        line.points[0].curvature = 0.0;
+        line.points[(line.count - 1) as i64].curvature = line.points[(line.count - 2) as i64].curvature;
+        let mut series : f32[] = new f32[line.count as i64];
+        for (i of 0..line.count) {
+            series[i as i64] = line.points[i as i64].curvature;
+        }
+        meanderSmooth(series, line.count, 4, 2);
+        for (i of 0..line.count) {
+            line.points[i as i64].curvature = series[i as i64];
+        }
+    }
+
+    // The bank and bed heights. The bank is the valley floor under a running minimum that falls a little every step; the
+    // bed is the bank less a depth that is full at bends and shallower at crossings (riffles), again under a running
+    // minimum; both are then smoothed, which keeps them falling and removes the kinks of the minimum.
+    static fn profile(plan : TerrainPlan, mut line : RiverLine) : void {
+        let step : f32 = plan.cell * MEANDER_STEP;
+        let fall : f32 = step * plan.params.riverSlope * MEANDER_MIN_FALL;
+        let n : i32 = line.count;
+        let mut bank : f32[] = new f32[n as i64];
+        let mut bed : f32[] = new f32[n as i64];
+        let mut level : f32 = plan.floor(line.points[0].z);
+        for (i of 0..n) {
+            let floor : f32 = plan.floor(line.points[i as i64].z);
+            if (i > 0 && floor > level - fall) {
+                level = level - fall;
+            } else {
+                level = floor;
+            }
+            bank[i as i64] = level;
+        }
+        meanderSmooth(bank, n, MEANDER_SMOOTH, MEANDER_SMOOTH_PASSES);
+
+        let mut bends : f32[] = new f32[n as i64];
+        for (i of 0..n) {
+            let p : RiverPoint = line.points[i as i64];
+            bends[i as i64] = saturate(abs(p.curvature) * p.width * 6.0 as f32);
+        }
+        meanderSmooth(bends, n, MEANDER_SMOOTH, 2);
+        for (i of 0..n) {
+            let p : RiverPoint = line.points[i as i64];
+            let depth : f32 = p.depth * (MEANDER_RIFFLE + (1.0 as f32 - MEANDER_RIFFLE) * bends[i as i64]);
+            let mut low : f32 = bank[i as i64] - depth;
+            if (i > 0 && low > bed[(i - 1) as i64] - fall) {
+                low = bed[(i - 1) as i64] - fall;
+            }
+            bed[i as i64] = low;
+        }
+        meanderSmooth(bed, n, MEANDER_SMOOTH, MEANDER_SMOOTH_PASSES);
+
+        for (i of 0..n) {
+            let p : RiverPoint = line.points[i as i64];
+            let mut low : f32 = bed[i as i64];
+            if (low > bank[i as i64] - p.depth * 0.5 as f32) {
+                low = bank[i as i64] - p.depth * 0.5 as f32;
+            }
+            line.points[i as i64].bankHeight = bank[i as i64];
+            line.points[i as i64].bedHeight = low;
+            line.points[i as i64].depth = bank[i as i64] - low;
+        }
+    }
+}
+
+// A moving average of `count` values over a half window of `radius`, `passes` times (the ends keep their neighbourhood).
+fn meanderSmooth(values : f32[], count : i32, radius : i32, passes : i32) : void {
+    let mut scratch : f32[] = new f32[count as i64];
+    for (pass of 0..passes) {
+        for (i of 0..count) {
+            let mut from : i32 = i - radius;
+            let mut to : i32 = i + radius;
+            if (from < 0) {
+                from = 0;
+            }
+            if (to > count - 1) {
+                to = count - 1;
+            }
+            let mut sum : f32 = 0.0 as f32;
+            for (k of from..(to + 1)) {
+                sum = sum + values[k as i64];
+            }
+            scratch[i as i64] = sum / ((to - from + 1) as f32);
+        }
+        for (i of 0..count) {
+            values[i as i64] = scratch[i as i64];
+        }
+    }
+}
+
+fn meanderNoise(t : f32, seed : i32) : f32 {
+    return terrainNoise(t, 0.37 as f32, seed);
+}

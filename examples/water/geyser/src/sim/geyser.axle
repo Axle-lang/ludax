@@ -1,0 +1,196 @@
+// geyser — the simulation: a pool over a pressure chamber that erupts by itself and rains back into the pool.
+//
+// What this demonstrates is pressure turning into height. A drain at the pool's bottom feeds a hidden chamber
+// (`GeyserChamber`): the water it takes leaves the fluid world and builds pressure. When the head reaches
+// the burst value the vent opens and the chamber throws its water out at Torricelli's speed, as droplets
+// (`GeyserSpray`) that fly ballistically under the gravity the world flows by and pour themselves back into
+// the pool when they land. The jet is as high as the head that drives it and sinks as the chamber empties;
+// the vent shuts at the closing head and the chamber recharges. Nothing is on a timer: the cycle is the
+// chamber's own relaxation between the spring's supply and the vent's discharge.
+//
+// The water is accounted for in three places and only moves between them: in the fluid world, in the
+// chamber, and on droplets in flight. The only water that enters the system is the spring's, so
+// `volume + chamber + in flight - injected` is zero to the f64 rounding, which is the conservation the demo
+// reports. Nothing reads a wall clock and every random number comes from one `Pcg32`.
+
+use ludax::{FluidOverflow, FluidRules, FluidStrategy, FluidSink, FluidSource, FluidWorld};
+
+use crate::sim::chamber::GeyserChamber;
+use crate::sim::spray::{GeyserSpray, GxVent};
+use crate::sim::terrain::{GxTerrain, GY_VENT_X, GY_VENT_Z};
+
+/** Grid side of the crater world, in columns. */
+pub const GY_GRID : i32 = 64;
+
+/** Length of one tick, seconds; the world's `dt` and the integrator's. */
+pub const GY_DT : f64 = 0.05;
+
+/** The flow's drag: how fast moving water loses speed to the ground, per second. */
+const GY_DRAG : f64 = 2.0;
+
+/** Gravity, cells a second squared: the world's flow, the droplets' flight and the chamber's exit speed all
+ * use this one number, so a Moon setting would slow the columns, the spray and the jet together. */
+pub const GY_GRAVITY : f64 = 9.81;
+
+/** Conductivity of the virtual pipes; 1 keeps the pool's motion sedate enough to watch. */
+const GY_CONDUCTIVITY : f64 = 1.0;
+
+/** A column holds at most this above its ground; the surplus spills over the rim. */
+const GY_MAX_LEVEL : f64 = 1.2;
+
+/** Water the pipe law moves a tick below this stops being simulated. */
+const GY_SLEEP : f64 = 0.000001;
+
+/** What the spring delivers to the pool, volume a second. A little more than the chamber draws, so the pool
+ * never starves and the surplus slowly raises it toward the rim. */
+pub const GY_SPRING_RATE : f64 = 8.0;
+
+/** What the chamber's intake can draw from the pool, volume a second: the recharge rate. It is below the
+ * vent's discharge at the closing head, so the eruption ends instead of settling into a fountain. */
+pub const GY_INTAKE_RATE : f64 = 6.0;
+
+/** Radius of the 5 x 5 mouth the spring feeds and the intake draws through: a point would build a cone while
+ * charging and dig a well while drawing. */
+const GY_MOUTH : i32 = 2;
+
+/** Seed of the one generator the droplets and bubbles draw from. */
+const GY_SEED : u64 = 0x9e3779b9;
+
+/** The vent counts as submerged past this water depth, and the plume then shows its bubbles. */
+const GY_SUBMERGED : f64 = 0.6;
+
+/** The geyser world: pool, chamber, spray, advanced one tick at a time. */
+pub class GeyserSim {
+    world         : FluidWorld;
+    terrain       : GxTerrain;
+    chamber       : GeyserChamber;
+    spray         : GeyserSpray;
+    prevDrained   : f64 = 0.0;
+    lastDischarge : f64 = 0.0;
+    lastSpeed     : f64 = 0.0;
+
+    /** A dry crater with the spring running and the chamber empty. */
+    constructor() {
+        // Every field spelled out: a partial literal makes the compiler re-resolve the omitted defaults, and
+        // the `strategy` default does not survive that today.
+        let rules : FluidRules = FluidRules {
+            dt: GY_DT,
+            conductivity: GY_CONDUCTIVITY,
+            drag: GY_DRAG,
+            gravity: GY_GRAVITY,
+            maxLevel: GY_MAX_LEVEL,
+            overflow: FluidOverflow::Spill,
+            strategy: FluidStrategy::ActiveSet,
+            sleepThreshold: GY_SLEEP,
+        };
+        self.world = new FluidWorld(rules, GY_GRID, GY_GRID);
+        self.terrain = new GxTerrain();
+        self.world.sampleGround(self.terrain);
+        self.chamber = new GeyserChamber(GY_GRAVITY);
+        self.spray = new GeyserSpray(
+            GxVent { x: GY_VENT_X, z: GY_VENT_Z, gravity: GY_GRAVITY, dt: GY_DT },
+            GY_SEED
+        );
+
+        let spring : i32 = self.world.addSource(FluidSource::infinite(GY_VENT_X, GY_VENT_Z, GY_SPRING_RATE));
+        self.world.sourceRadius(spring, GY_MOUTH);
+        let intake : i32 = self.world.addSink(FluidSink::at(GY_VENT_X, GY_VENT_Z, GY_INTAKE_RATE));
+        self.world.sinkRadius(intake, GY_MOUTH);
+    }
+
+    /** Advances one tick: the world, the chamber, the droplets. */
+    pub fn tick(mut self) : void {
+        self.world.tick();
+
+        // What the intake drew from the pool this tick is what the chamber received.
+        let drained : f64 = self.world.drainedTotal();
+        self.chamber.charge(drained - self.prevDrained);
+        self.prevDrained = drained;
+
+        // The vent throws at the speed the pressure had before the water left.
+        let speed : f64 = self.chamber.exitSpeed();
+        let discharge : f64 = self.chamber.step(GY_DT);
+        self.lastDischarge = discharge;
+        self.lastSpeed = 0.0;
+        if (discharge > 0.0) {
+            self.lastSpeed = speed;
+        }
+
+        let surface : f32 = self.ventSurface();
+        self.spray.launch(self.world, discharge, speed, surface);
+        if (self.chamber.isVenting() && self.world.levelAt(GY_VENT_X, GY_VENT_Z) > GY_SUBMERGED) {
+            self.spray.bubble(surface);
+        }
+        self.spray.advance(self.world, self.chamber.isVenting(), self.seconds() as f32);
+    }
+
+    /** The world, for ground and level reads. */
+    pub fn worldRef(self) : FluidWorld {
+        return self.world;
+    }
+
+    /** The spray, for drawing and for measuring the jet. */
+    pub fn sprayRef(self) : GeyserSpray {
+        return self.spray;
+    }
+
+    /** The pressure chamber. */
+    pub fn chamberRef(self) : GeyserChamber {
+        return self.chamber;
+    }
+
+    /** Water in the fluid world, cell units. */
+    pub fn volume(self) : f64 {
+        return self.world.totalVolume();
+    }
+
+    /** Volume the spring has injected since the start. */
+    pub fn injected(self) : f64 {
+        return self.world.injectedTotal();
+    }
+
+    /** `volume + chamber + in flight - injected`: zero up to rounding, because the only water that enters the
+     * system is the spring's and the three places it can be are all counted. */
+    pub fn imbalance(self) : f64 {
+        return self.world.totalVolume() + self.chamber.volume() + self.spray.volumeInFlight()
+            - self.world.injectedTotal();
+    }
+
+    /** Ticks simulated so far. */
+    pub fn tickCount(self) : i64 {
+        return self.world.tickCount();
+    }
+
+    /** Simulated seconds so far. */
+    pub fn seconds(self) : f64 {
+        return (self.world.tickCount() as f64) * GY_DT;
+    }
+
+    /** Volume the vent threw last tick, cell units. */
+    pub fn discharge(self) : f64 {
+        return self.lastDischarge;
+    }
+
+    /** The speed the vent threw at last tick, cells a second; zero while the vent is shut. */
+    pub fn jetSpeed(self) : f64 {
+        return self.lastSpeed;
+    }
+
+    /** The jet's height in theory, cells: what a droplet leaving at `jetSpeed` rises to, `v^2 / 2g`. */
+    pub fn jetHeight(self) : f64 {
+        return self.lastSpeed * self.lastSpeed / (2.0 * GY_GRAVITY);
+    }
+
+    /** The phase's name, as the HUD shows it. */
+    pub fn phaseName(self) : string {
+        if (self.chamber.isVenting()) {
+            return "ERUPTION";
+        }
+        return "CHARGING";
+    }
+
+    /** Ground plus level at the vent, cells: where the droplets leave from. */
+    pub fn ventSurface(self) : f32 {
+        return (self.world.groundAt(GY_VENT_X, GY_VENT_Z) + self.world.levelAt(GY_VENT_X, GY_VENT_Z)) as f32;
+    }
+}

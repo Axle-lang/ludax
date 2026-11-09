@@ -1,0 +1,200 @@
+// fall_drops — the demo's waterfall as drops: the curtain over the lip, the plume where it lands, and the mist.
+//
+// The engine's overfall model turns the discharge at a cliff lip into a falling curtain of particles; until that
+// world drives the renderer, the demo writes the same kind of data from closed formulas. Every drop is a pure
+// function of its index, the time and the gravity: a hash gives it a phase in its life, and its position is the
+// ballistic arc from where it starts, so the picture is identical on every run and every thread count, and a lower
+// gravity gives a slower, longer fall without any other change. The curtain starts as a sheet of large drops that
+// share the lip's width in streams, thins and breaks into small fast streaks as it falls (the size follows a
+// power-law distribution, many small and few large); the plume is thrown up where the curtain lands; the mist is a
+// few thousand large soft puffs rising and drifting from the base. The writer fills the store by chunks of drops.
+
+use ludax::{sqrt, Vec3, TAU};
+
+use crate::water::drop_store::{DropStore, DROP_LIQUID, DROP_MIST, DROP_SPRAY};
+use crate::water::fall_world::{FallWorld, FW_CENTRE, FW_LAKE, FW_LIP, FW_POOL_Z};
+use crate::water::noise::{waterExpNeg, waterHash};
+
+/** Drops one writing chunk covers. */
+pub const FALLDROPS_CHUNK : i32 = 4096;
+
+// The shares of the store: the curtain takes the rest after the plume and the mist.
+const FALLDROPS_PLUME_SHARE : f32 = 0.27;
+const FALLDROPS_MIST_MAX : i32 = 6000;
+
+// The curtain: the lip's width, height of the water leaving it, the speed it leaves with and the sway.
+const FALLDROPS_WIDTH : f32 = 66.0;
+const FALLDROPS_LIP_Y : f32 = 119.9;
+const FALLDROPS_OUT : f32 = 4.4;
+const FALLDROPS_STREAM : f32 = 1.7;
+
+// A drop's radius: the smallest, the power of the distribution, the largest, and the sheet's own drop size.
+const FALLDROPS_R_MIN : f32 = 0.05;
+const FALLDROPS_R_MAX : f32 = 0.42;
+const FALLDROPS_SHEET : f32 = 0.34;
+
+// The plume: where the curtain lands (z), the lifetime scale and the upward speeds.
+const FALLDROPS_LAND_Z : f32 = 1057.0;
+const FALLDROPS_PLUME_UP : f32 = 7.0;
+const FALLDROPS_PLUME_UP_VAR : f32 = 17.0;
+const FALLDROPS_PLUME_OUT : f32 = 8.5;
+
+// The mist: its life in seconds, how fast it rises and drifts, and how big its puffs start and grow to.
+const FALLDROPS_MIST_LIFE : f32 = 9.0;
+const FALLDROPS_MIST_RISE : f32 = 2.4;
+const FALLDROPS_MIST_DRIFT : f32 = 1.2;
+const FALLDROPS_MIST_R0 : f32 = 1.6;
+const FALLDROPS_MIST_GROW : f32 = 0.55;
+
+// Hash seeds.
+const FALLDROPS_SEED : i32 = 601;
+
+/** The analytic waterfall's drops. */
+pub class FallDrops {
+    /** Drops of the curtain, of the plume and of the mist in the store. */
+    pub curtain : i32;
+    pub plume : i32;
+    pub mist : i32;
+
+    /** A fall that fills `capacity` drops. */
+    constructor(capacity : i32) {
+        self.mist = ludax_lowest(FALLDROPS_MIST_MAX, capacity / 25);
+        self.plume = (((capacity - self.mist) as f32) * FALLDROPS_PLUME_SHARE) as i32;
+        self.curtain = capacity - self.mist - self.plume;
+    }
+
+    /** Drops in all. */
+    pub fn total(self) : i32 {
+        return self.curtain + self.plume + self.mist;
+    }
+
+    /** Chunks of drops to write. */
+    pub fn chunks(self) : i32 {
+        return (self.total() + FALLDROPS_CHUNK - 1) / FALLDROPS_CHUNK;
+    }
+
+    /** Writes the drops of chunks `begin` up to `end` for second `time` under `gravity` into `store`. */
+    pub fn fill(self, store : Shared<DropStore>, begin : i32, end : i32, time : f32, gravity : f32) : void {
+        let last : i32 = ludax_lowest(end * FALLDROPS_CHUNK, self.total());
+        for (i of (begin * FALLDROPS_CHUNK)..last) {
+            if (i < self.curtain) {
+                FallDrops::curtainDrop(store, i, time, gravity);
+            } else if (i < self.curtain + self.plume) {
+                FallDrops::plumeDrop(store, i, time, gravity);
+            } else {
+                FallDrops::mistPuff(store, i, time);
+            }
+        }
+    }
+
+    // A hash of the drop and a slot.
+    static fn roll(i : i32, slot : i32) : f32 {
+        return waterHash(i, slot, 0, FALLDROPS_SEED);
+    }
+
+    // A drop radius from the power-law distribution: many small, few large.
+    static fn radiusOf(u : f32) : f32 {
+        let r : f32 = FALLDROPS_R_MIN / sqrt(ludax::max(u, 0.0001));
+        return ludax::min(r, FALLDROPS_R_MAX);
+    }
+
+    static fn put(store : Shared<DropStore>, i : i32, p : Vec3, v : Vec3, r : f32, kind : u8) : void {
+        let k : i64 = i as i64;
+        store.positions[k * 3] = p.x;
+        store.positions[k * 3 + 1] = p.y;
+        store.positions[k * 3 + 2] = p.z;
+        store.velocities[k * 3] = v.x;
+        store.velocities[k * 3 + 1] = v.y;
+        store.velocities[k * 3 + 2] = v.z;
+        store.radii[k] = r;
+        store.kinds[k] = kind;
+    }
+
+    // A drop of the curtain: leaves the lip in a stream and falls; the sheet thins and breaks as it goes.
+    static fn curtainDrop(store : Shared<DropStore>, i : i32, time : f32, g : f32) : void {
+        let height : f32 = FALLDROPS_LIP_Y - FallWorld::level(FALLDROPS_LAND_Z);
+        let span : f32 = sqrt(2.0 * height / g);
+        let cycle : f32 = time / span + FallDrops::roll(i, 0);
+        let life : f32 = cycle - (cycle as i32 as f32);
+        let tau : f32 = life * span;
+        let age : f32 = life;
+
+        let tri : f32 = FallDrops::roll(i, 1) + FallDrops::roll(i, 2) - 1.0;
+        let lateral : f32 = tri * FALLDROPS_WIDTH * 0.5;
+        let stream : f32 = (((lateral / FALLDROPS_STREAM) as i32) as f32 + 0.5) * FALLDROPS_STREAM;
+        let sx : f32 = lateral + (stream - lateral) * 0.55 * (1.0 - age * 0.5);
+        let out : f32 = FALLDROPS_OUT * (0.85 + 0.3 * FallDrops::roll(i, 3));
+        let thick : f32 = (FallDrops::roll(i, 4) - 0.5) * (0.5 + 2.2 * age);
+        let sway : f32 = (FallDrops::roll(i, 5) - 0.5) * 1.4 * age;
+
+        let p : Vec3 = Vec3 {
+            x: FW_CENTRE + sx + sway * 0.5,
+            y: FALLDROPS_LIP_Y - 0.5 * g * tau * tau,
+            z: FW_LIP + 3.0 + out * tau + thick,
+        };
+        let v : Vec3 = Vec3 { x: sway * 0.8, y: 0.0 - g * tau, z: out };
+        let pareto : f32 = FallDrops::radiusOf(FallDrops::roll(i, 6));
+        let broken : f32 = ludax::smoothstep(0.05, 0.55, age);
+        let r : f32 = FALLDROPS_SHEET + (pareto - FALLDROPS_SHEET) * broken;
+        let mut kind : u8 = DROP_LIQUID;
+        if (r < 0.14) {
+            kind = DROP_SPRAY;
+        }
+        FallDrops::put(store, i, p, v, r, kind);
+    }
+
+    // A drop thrown up where the curtain lands, following its own ballistic arc from the pool's surface.
+    static fn plumeDrop(store : Shared<DropStore>, i : i32, time : f32, g : f32) : void {
+        let up : f32 = FALLDROPS_PLUME_UP + FALLDROPS_PLUME_UP_VAR * FallDrops::roll(i, 0) * FallDrops::roll(i, 1);
+        let flight : f32 = 2.0 * up / g;
+        let cycle : f32 = time / flight + FallDrops::roll(i, 2);
+        let life : f32 = cycle - (cycle as i32 as f32);
+        let tau : f32 = life * flight;
+        let angle : f32 = FallDrops::roll(i, 3) * TAU;
+        let across : f32 = FallDrops::roll(i, 4) - 0.5;
+        let speed : f32 = FALLDROPS_PLUME_OUT * FallDrops::roll(i, 5);
+        let ox : f32 = FW_CENTRE + across * 44.0;
+        let oz : f32 = FALLDROPS_LAND_Z + (FallDrops::roll(i, 7) - 0.5) * 9.0;
+        let level : f32 = FallWorld::level(FW_POOL_Z) + 0.3;
+        let v : Vec3 = Vec3 { x: ludax::cos(angle) * speed, y: up - g * tau, z: ludax::sin(angle) * speed };
+        let p : Vec3 = Vec3 {
+            x: ox + ludax::cos(angle) * speed * tau,
+            y: level + up * tau - 0.5 * g * tau * tau,
+            z: oz + ludax::sin(angle) * speed * tau,
+        };
+        let r : f32 = FallDrops::radiusOf(FallDrops::roll(i, 6)) * 0.8;
+        let mut kind : u8 = DROP_SPRAY;
+        if (r > 0.2) {
+            kind = DROP_LIQUID;
+        }
+        FallDrops::put(store, i, p, v, r, kind);
+    }
+
+    // A puff of mist: rises from the base of the fall, drifting and growing.
+    static fn mistPuff(store : Shared<DropStore>, i : i32, time : f32) : void {
+        let cycle : f32 = time / FALLDROPS_MIST_LIFE + FallDrops::roll(i, 0);
+        let life : f32 = cycle - (cycle as i32 as f32);
+        let tau : f32 = life * FALLDROPS_MIST_LIFE;
+        let ox : f32 = FW_CENTRE + (FallDrops::roll(i, 1) - 0.5) * 50.0;
+        let oz : f32 = FALLDROPS_LAND_Z + (FallDrops::roll(i, 2) - 0.5) * 14.0;
+        let level : f32 = FallWorld::level(FW_POOL_Z) + 1.0;
+        let rise : f32 = FALLDROPS_MIST_RISE * (0.6 + 0.8 * FallDrops::roll(i, 3));
+        let p : Vec3 = Vec3 {
+            x: ox + FALLDROPS_MIST_DRIFT * tau,
+            y: level + rise * tau,
+            z: oz + 0.6 * tau * (FallDrops::roll(i, 4) - 0.5) * 4.0,
+        };
+        let v : Vec3 = Vec3 { x: FALLDROPS_MIST_DRIFT, y: rise, z: 0.0 };
+        let fade : f32 = waterExpNeg(life * 3.0) * (1.0 - life);
+        let r : f32 = (FALLDROPS_MIST_R0 + FALLDROPS_MIST_GROW * tau) * (0.5 + 0.5 * fade + 0.3);
+        FallDrops::put(store, i, p, v, r, DROP_MIST);
+    }
+}
+
+// The smaller of two integers.
+fn ludax_lowest(a : i32, b : i32) : i32 {
+    if (a < b) {
+        return a;
+    }
+    return b;
+}

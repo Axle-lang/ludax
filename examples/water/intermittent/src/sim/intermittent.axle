@@ -1,0 +1,448 @@
+// intermittent — the simulation: a reservoir that fills steadily and empties in bursts, with nothing on a timer.
+//
+// What this demonstrates is how steady inflow becomes intermittent outflow. A spring feeds a bowl at a constant
+// rate. The bowl's outlet is a dosing siphon: it primes when the pool reaches the crest, drains the pool
+// through a trench toward the valley at a rate no spring could match, and breaks when the level falls to the
+// inlet, after which the pool refills and the cycle repeats. The siphon is modelled as a gate in the ground,
+// the one cell on the rim that is raised to the terrace while the siphon is broken and lowered to the trench
+// floor while it is primed, set from the pool's own depth with hysteresis (`IN_DEPTH_ON` to prime,
+// `IN_DEPTH_OFF` to break). Everything else is the fluid world's: the water crosses the rim and runs down
+// the trench and the channel by the pipe law, and the volume only moves through the spring and the drain
+// at the foot, so `volume - injected + drained` stays at the f64 rounding.
+//
+// The period is not designed, it follows. While the siphon is broken nothing leaves the bowl, so the time
+// to refill is the volume the pool holds between the two depths divided by the spring's rate, and the pool
+// holds a flat surface, so that volume is a sum over the bowl's ground that `IntermittentSim` can compute
+// independently (`storageAt`). The checks hold the engine to that prediction.
+
+use fluidview::StreakField;
+use ludax::{
+    FluidGround, FluidOverflow, FluidRules, FluidStrategy, FluidSink, FluidSource, FluidWorld, cosD, maxD,
+    minD, sinD
+};
+
+/** Grid side of the valley, in columns. */
+pub const IN_GRID : i32 = 64;
+
+/** Length of one tick, seconds; the world's `dt`. */
+pub const IN_DT : f64 = 0.05;
+
+/** Height of the terrace the bowl is cut into, cells. */
+const IN_TERRACE : f64 = 9.0;
+
+/** x of the bowl's centre, which is also where the spring rises. */
+pub const IN_BOWL_X : i32 = 11;
+
+/** z of the bowl's centre, and of the trench that leads from it. */
+pub const IN_BOWL_Z : i32 = 32;
+
+/** Radius of the bowl, cells: its rim meets the terrace here. */
+pub const IN_BOWL_R : f64 = 5.0;
+
+/** Height of the bowl's lowest point, cells. */
+const IN_FLOOR : f64 = 5.5;
+
+/** x of the gate on the rim: the cell whose ground the siphon lowers and raises. */
+pub const IN_GATE_X : i32 = 16;
+
+/** x of the first trench cell: inside the bowl's wall, where the pool is already deep. */
+const IN_TRENCH_X0 : i32 = 14;
+
+/** x of the last trench cell, at the terrace's edge; the valley begins just past it. */
+const IN_TRENCH_END : i32 = 22;
+
+/** Height of the trench floor and of the open gate, cells: the pool can drain down to it and no further,
+ * so no depth below `IN_SILL - IN_FLOOR` is reachable while it is open. */
+const IN_SILL : f64 = 6.3;
+
+/** Height of the valley floor at its head, cells; its channel is cut 1.6 below, under the sill, so water
+ * leaving the trench keeps running downhill. */
+const IN_VALLEY_TOP : f64 = 7.6;
+
+/** Drop of the valley per column downstream, cells. */
+const IN_SLOPE : f64 = 0.09;
+
+/** First column of the valley. */
+const IN_VALLEY_X : i32 = 23;
+
+/** Amplitude of the channel meander, cells. */
+const IN_MEANDER : f64 = 6.0;
+
+/** Spatial frequency of the meander along x, radians a cell. */
+const IN_MEANDER_FREQ : f64 = 0.075;
+
+/** Depth the channel carves below the valley floor across its flat bed, cells. */
+const IN_CHAN_DEPTH : f64 = 1.6;
+
+/** Half-width of the channel's flat bed, cells. */
+const IN_CHAN_FLAT : f64 = 2.5;
+
+/** Width of the bank falloff beyond the flat bed, cells. */
+const IN_CHAN_BANK : f64 = 1.8;
+
+/** Amplitude of the deterministic valley noise, cells. */
+const IN_NOISE : f64 = 0.12;
+
+/** Spatial frequencies and phases of the valley noise: two crossed sine trains. */
+const IN_NOISE_FX : f64 = 0.83;
+const IN_NOISE_FZ : f64 = 1.07;
+const IN_NOISE_PX : f64 = 2.1;
+const IN_NOISE_PZ : f64 = 0.4;
+
+/** Conductivity of the virtual pipes: the pace the surface slope moves water at. */
+const IN_CONDUCTIVITY : f64 = 10.0;
+
+/** The most water a column may hold, cells. Larger than any depth here, so the bowl is never capped and
+ * the pool is free to stand as deep as its rim allows. */
+const IN_MAX_LEVEL : f64 = 8.0;
+
+/** Water the pipe law moves a tick below this stops being simulated. */
+const IN_SLEEP : f64 = 0.000001;
+
+/** Bed drag per second. Low, so the trench and the throat pass a burst instead of throttling it: with the
+ * engine's default a one-cell-wide flat trench carries only about the spring's own flow. */
+const IN_DRAG : f64 = 0.3;
+
+/** What the spring delivers, volume a second: the one steady quantity of the demo. */
+pub const IN_SPRING_RATE : f64 = 2.0;
+
+/** What the drain at the foot can take, volume a second: more than the spring, so the valley empties
+ * between bursts, less than a burst's peak, so the channel visibly carries one. */
+pub const IN_DRAIN_RATE : f64 = 6.0;
+
+/** x of the drain column, at the valley's foot. */
+const IN_SINK_X : i32 = 61;
+
+/** The siphon primes when the pool at its centre is this deep, cells. */
+pub const IN_DEPTH_ON : f64 = 2.4;
+
+/** The siphon breaks when the pool at its centre has fallen to this deep, cells. Above the depth the pool
+ * would settle at with the gate open (the sill's 0.8 plus the head the spring's own flow needs to cross
+ * the trench), or the siphon would never break. */
+pub const IN_DEPTH_OFF : f64 = 1.2;
+
+/** A column holding more water than this counts as wet when judging the pool's surface, cells. */
+const IN_WET : f64 = 0.05;
+
+/** Slots of the opening and closing records; a run longer than this keeps the first ones. */
+const IN_RECORDS : i32 = 64;
+
+/** The siphon's two states. */
+pub enum InPhase : i8 {
+    /** Broken: the gate is raised, nothing leaves the bowl and the spring fills it. */
+    Filling = 0,
+
+    /** Primed: the gate is lowered and the pool drains through the trench. */
+    Draining = 1,
+}
+
+/** The ground: a terrace with a bowl and a trench cut into it, falling away into a meandering valley. */
+pub class InTerrain : FluidGround {
+    /** z of the channel centreline under column `x`; it passes through the trench's end. */
+    pub fn centerZ(self, x : f64) : f64 {
+        return (IN_BOWL_Z as f64) + IN_MEANDER * sinD(IN_MEANDER_FREQ * (x - (IN_VALLEY_X as f64)));
+    }
+
+    /** Height of the ground under column (`x`, `z`), cells, with the gate raised. */
+    pub fn heightAt(self, x : i32, z : i32) : f64 {
+        if (x < IN_VALLEY_X) {
+            return self.terraceAt(x, z);
+        }
+        return self.valleyAt(x, z);
+    }
+
+    /** The water the bowl holds when its flat surface stands at height `surface`, cell units: what a pool
+     * of that level must contain, whatever the engine did to fill it. */
+    pub fn storageAt(self, surface : f64) : f64 {
+        let mut sum : f64 = 0.0;
+        for (z of 0..IN_GRID) {
+            for (x of 0..IN_GRID) {
+                if (!self.inBowl(x, z)) {
+                    continue;
+                }
+                let depth : f64 = surface - self.heightAt(x, z);
+                if (depth > 0.0) {
+                    sum = sum + depth;
+                }
+            }
+        }
+        return sum;
+    }
+
+    /** Whether column (`x`, `z`) lies inside the bowl's rim. */
+    pub fn inBowl(self, x : i32, z : i32) : bool {
+        return self.radiusAt(x, z) < IN_BOWL_R;
+    }
+
+    /** Height of the bowl's lowest point, cells. */
+    pub fn floorHeight(self) : f64 {
+        return IN_FLOOR;
+    }
+
+    fn radiusAt(self, x : i32, z : i32) : f64 {
+        let dx : f64 = (x - IN_BOWL_X) as f64;
+        let dz : f64 = (z - IN_BOWL_Z) as f64;
+        return (dx * dx + dz * dz).sqrt();
+    }
+
+    // The terrace: flat, with the parabolic bowl cut into it. The trench runs from inside the bowl's wall to
+    // the terrace's edge, cut down to the sill wherever the bowl's own ground is higher, so the pool lies
+    // against the gate at full depth; the gate itself stands at the terrace height while the siphon is broken.
+    fn terraceAt(self, x : i32, z : i32) : f64 {
+        let r : f64 = self.radiusAt(x, z);
+        let mut h : f64 = IN_TERRACE;
+        if (r < IN_BOWL_R) {
+            let t : f64 = r / IN_BOWL_R;
+            h = IN_TERRACE - (IN_TERRACE - IN_FLOOR) * (1.0 - t * t);
+        }
+        let inTrench : bool = z >= IN_BOWL_Z - 1 && z <= IN_BOWL_Z + 1 && x >= IN_TRENCH_X0;
+        if (inTrench && x != IN_GATE_X && h > IN_SILL) {
+            return IN_SILL;
+        }
+        return h;
+    }
+
+    // The valley: a plain falling downstream with the channel carved along the meander.
+    fn valleyAt(self, x : i32, z : i32) : f64 {
+        let fx : f64 = x as f64;
+        let plain : f64 = IN_VALLEY_TOP - IN_SLOPE * (fx - (IN_VALLEY_X as f64));
+        let noise : f64 = IN_NOISE * sinD(fx * IN_NOISE_FX + IN_NOISE_PX)
+            * cosD((z as f64) * IN_NOISE_FZ + IN_NOISE_PZ);
+        return plain - self.carveAt(x, z) + noise;
+    }
+
+    // How much the channel carves below the plain: the full depth across the flat bed, then a quadratic bank.
+    fn carveAt(self, x : i32, z : i32) : f64 {
+        let d : f64 = ((z as f64) - self.centerZ(x as f64)).abs();
+        let excess : f64 = d - IN_CHAN_FLAT;
+        if (excess <= 0.0) {
+            return IN_CHAN_DEPTH;
+        }
+        let q : f64 = 1.0 + (excess * excess) / (IN_CHAN_BANK * IN_CHAN_BANK);
+        return IN_CHAN_DEPTH / (q * q);
+    }
+}
+
+/** The intermittent world: bowl, siphon, valley and streaks, advanced one tick at a time. */
+pub class IntermittentSim {
+    world       : FluidWorld;
+    terrain     : InTerrain;
+    streaks     : StreakField;
+    phase       : InPhase = InPhase::Filling;
+    phaseStart  : i64 = 0;
+    openings    : i32 = 0;
+    closings    : i32 = 0;
+    openTicks   : i64[];
+    closeTicks  : i64[];
+    prevDrained : f64 = 0.0;
+    outflow     : f64 = 0.0;
+
+    /** A dry valley with the spring running into the bowl and the siphon broken. */
+    constructor() {
+        // Every field spelled out: a partial literal makes the compiler re-resolve the omitted defaults, and
+        // the `strategy` default does not survive that today.
+        let rules : FluidRules = FluidRules {
+            dt: IN_DT,
+            conductivity: IN_CONDUCTIVITY,
+            drag: IN_DRAG,
+            maxLevel: IN_MAX_LEVEL,
+            overflow: FluidOverflow::Spill,
+            strategy: FluidStrategy::ActiveSet,
+            sleepThreshold: IN_SLEEP,
+        };
+        self.world = new FluidWorld(rules, IN_GRID, IN_GRID);
+        self.terrain = new InTerrain();
+        self.world.sampleGround(self.terrain);
+        self.streaks = new StreakField();
+        self.openTicks = new i64[IN_RECORDS as i64];
+        self.closeTicks = new i64[IN_RECORDS as i64];
+
+        let spring : i32 = self.world.addSource(FluidSource::infinite(IN_BOWL_X, IN_BOWL_Z, IN_SPRING_RATE));
+        self.world.sourceRadius(spring, 2);
+        let sinkZ : i32 = self.terrain.centerZ(IN_SINK_X as f64) as i32;
+        self.world.addSink(FluidSink::at(IN_SINK_X, sinkZ, IN_DRAIN_RATE));
+    }
+
+    /** Advances one tick: the siphon decides from the pool, then the world, the measures, the streaks. */
+    pub fn tick(mut self) : void {
+        self.decide();
+        self.world.tick();
+        self.measure();
+        self.streaks.tick(self.world);
+    }
+
+    /** The world, for ground and level reads. */
+    pub fn worldRef(self) : FluidWorld {
+        return self.world;
+    }
+
+    /** The streaks riding the current. */
+    pub fn streakField(self) : StreakField {
+        return self.streaks;
+    }
+
+    /** The ground, for the independent storage computation. */
+    pub fn groundRef(self) : InTerrain {
+        return self.terrain;
+    }
+
+    /** Total volume in the world right now, cell units. */
+    pub fn volume(self) : f64 {
+        return self.world.totalVolume();
+    }
+
+    /** Volume the spring has injected since the start. */
+    pub fn injected(self) : f64 {
+        return self.world.injectedTotal();
+    }
+
+    /** Volume the drain has evacuated since the start. */
+    pub fn drained(self) : f64 {
+        return self.world.drainedTotal();
+    }
+
+    /** `volume - injected + drained`: zero up to rounding. */
+    pub fn imbalance(self) : f64 {
+        return self.volume() - self.injected() + self.drained();
+    }
+
+    /** Ticks simulated so far. */
+    pub fn tickCount(self) : i64 {
+        return self.world.tickCount();
+    }
+
+    /** Simulated seconds so far. */
+    pub fn seconds(self) : f64 {
+        return (self.world.tickCount() as f64) * IN_DT;
+    }
+
+    /** The siphon's state. */
+    pub fn phase(self) : InPhase {
+        return self.phase;
+    }
+
+    /** The phase's name, as the HUD shows it. */
+    pub fn phaseName(self) : string {
+        return match self.phase {
+            InPhase::Filling => "FILLING",
+            InPhase::Draining => "SIPHONING",
+        };
+    }
+
+    /** Seconds spent in the current phase. */
+    pub fn phaseSeconds(self) : f64 {
+        return ((self.world.tickCount() - self.phaseStart) as f64) * IN_DT;
+    }
+
+    /** The water depth at the bowl's centre, cells: the quantity the siphon reads. */
+    pub fn poolDepth(self) : f64 {
+        return self.world.levelAt(IN_BOWL_X, IN_BOWL_Z);
+    }
+
+    /** The water in the bowl, cell units: every column inside the rim. */
+    pub fn poolVolume(self) : f64 {
+        let mut sum : f64 = 0.0;
+        for (z of 0..IN_GRID) {
+            for (x of 0..IN_GRID) {
+                if (self.terrain.inBowl(x, z)) {
+                    sum = sum + self.world.levelAt(x, z);
+                }
+            }
+        }
+        return sum;
+    }
+
+    /** The spread of the pool's surface (highest minus lowest ground-plus-level over its wet columns): a
+     * pool at rest is flat, so this is how far from rest it is. */
+    pub fn poolSpread(self) : f64 {
+        let mut low : f64 = 1000000.0;
+        let mut high : f64 = -1000000.0;
+        for (z of 0..IN_GRID) {
+            for (x of 0..IN_GRID) {
+                if (!self.terrain.inBowl(x, z) || self.world.levelAt(x, z) < IN_WET) {
+                    continue;
+                }
+                let surface : f64 = self.world.groundAt(x, z) + self.world.levelAt(x, z);
+                low = minD(low, surface);
+                high = maxD(high, surface);
+            }
+        }
+        return high - low;
+    }
+
+    /** How many times the siphon has primed. */
+    pub fn primings(self) : i32 {
+        return self.openings;
+    }
+
+    /** The tick the `i`-th priming happened at; `i` must be inside `0..primings()`. */
+    pub fn primedAt(self, i : i32) : i64 {
+        return self.openTicks[i as i64];
+    }
+
+    /** How many times the siphon has broken. */
+    pub fn breaks(self) : i32 {
+        return self.closings;
+    }
+
+    /** The tick the `i`-th break happened at; `i` must be inside `0..breaks()`. */
+    pub fn brokeAt(self, i : i32) : i64 {
+        return self.closeTicks[i as i64];
+    }
+
+    /** What the drain took last tick, volume a second: the valley's outflow. */
+    pub fn outflow(self) : f64 {
+        return self.outflow;
+    }
+
+    /** What the spring delivers, volume a second. */
+    pub fn inflow(self) : f64 {
+        return IN_SPRING_RATE;
+    }
+
+    // Primes the siphon at the crest depth and breaks it at the inlet depth, by moving the one gate cell.
+    fn decide(mut self) : void {
+        let depth : f64 = self.poolDepth();
+        let now : i64 = self.world.tickCount();
+        if (self.phase == InPhase::Filling && depth >= IN_DEPTH_ON) {
+            self.gate(IN_SILL);
+            self.phase = InPhase::Draining;
+            self.phaseStart = now;
+            self.record(true, now);
+        } else if (self.phase == InPhase::Draining && depth <= IN_DEPTH_OFF) {
+            self.gate(IN_TERRACE);
+            self.phase = InPhase::Filling;
+            self.phaseStart = now;
+            self.record(false, now);
+        }
+    }
+
+    // Sets the ground of the three gate cells across the trench's mouth.
+    fn gate(mut self, height : f64) : void {
+        for (dz of -1..2) {
+            self.world.setGround(IN_GATE_X, IN_BOWL_Z + dz, height);
+        }
+    }
+
+    // Notes when a priming or a break happened.
+    fn record(mut self, priming : bool, now : i64) : void {
+        if (priming && self.openings < IN_RECORDS) {
+            self.openTicks[self.openings as i64] = now;
+        }
+        if (!priming && self.closings < IN_RECORDS) {
+            self.closeTicks[self.closings as i64] = now;
+        }
+        if (priming) {
+            self.openings = self.openings + 1;
+        } else {
+            self.closings = self.closings + 1;
+        }
+    }
+
+    // What crossed the drain last tick, in volume a second.
+    fn measure(mut self) : void {
+        let drained : f64 = self.world.drainedTotal();
+        self.outflow = (drained - self.prevDrained) / IN_DT;
+        self.prevDrained = drained;
+    }
+}

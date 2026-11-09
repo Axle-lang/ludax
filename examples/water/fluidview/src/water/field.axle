@@ -1,0 +1,536 @@
+// field — a frame's worth of the world's water and ground, as arrays the renderer can sample a million times.
+//
+// The engine answers one column at a time through a method call; a ray marcher wants bilinear reads of four
+// numbers at once and a smooth normal. So the renderer works from this snapshot: for every column the bed height,
+// the surface height (bed plus depth), the foam, the turbulence and the surface velocity are copied in once a
+// frame (`put`), and `bake` derives what a flat sample cannot give: slopes by central differences (stored per
+// column and interpolated, so normals are continuous across cell edges and no stair-step shows), the curvature of
+// the surface (crests are convex), and how wet the ground is near water. A lightmap at twice the column
+// resolution holds the soft sun shadow and the ambient occlusion of the bed, baked for the sun of the frame.
+//
+// A column's value sits at its centre, (x + 0.5, z + 0.5), and queries outside the grid clamp to the nearest
+// column; the renderer decides what lies beyond. Nothing here knows the engine: `capture` copies a `FluidWorld`
+// in, the demo scenes write their own fields, and both end in the same `put`.
+
+use ludax::{abs, clamp, cos, max, min, saturate, sin, smoothstep, sqrt, Vec3, TAU};
+
+use crate::water::hill_table::HillTable;
+use crate::water::noise::waterValue2;
+
+/** The lightmap has this many texels per column along each axis. */
+pub const FIELD_LIGHT_SCALE : i32 = 2;
+
+// Steps of the shadow march, and the first and the growth of its step, in columns.
+const FIELD_SHADOW_STEPS : i32 = 28;
+const FIELD_SHADOW_FIRST : f32 = 0.35;
+const FIELD_SHADOW_GROWTH : f32 = 1.16;
+
+// How wide a shadow's edge is per unit of distance from the caster: the sun's disc and the sky, softened.
+const FIELD_PENUMBRA : f32 = 0.12;
+
+// The Lipschitz bound is the steepest difference between neighbours times this: bilinear slopes peak across diagonals.
+const FIELD_SLOPE_MARGIN : f32 = 1.25;
+
+// The ground below the casting ray by less than this is not in shadow yet, columns.
+const FIELD_SHADOW_BIAS : f32 = 0.08;
+
+// The ambient occlusion rings: how many directions, the radii in columns, and how steep a rise counts.
+const FIELD_AO_DIRECTIONS : i32 = 8;
+const FIELD_AO_NEAR : f32 = 1.0;
+const FIELD_AO_MID : f32 = 2.5;
+const FIELD_AO_FAR : f32 = 5.0;
+const FIELD_AO_RISE : f32 = 0.35;
+
+// The most ambient occlusion darkens a point, 0 to 1.
+const FIELD_AO_STRENGTH : f32 = 0.7;
+
+// Beyond the grid the heights blend from the edge column's to the far ground over this many columns.
+const FIELD_SKIRT : f32 = 10.0;
+
+// The hills beyond the grid: they start this far out and are full this far out, their noise has this wavelength
+// (cells) and mixes three octaves, the steepest slope per unit of height they add, and the highest they stand
+// as a share of their height.
+const FIELD_HILL_NEAR : f32 = 18.0;
+const FIELD_HILL_FAR : f32 = 150.0;
+const FIELD_HILL_SCALE : f32 = 0.011;
+const FIELD_HILL_MID_RATIO : f32 = 2.1;
+const FIELD_HILL_FINE_RATIO : f32 = 4.7;
+const FIELD_HILL_SLOPE : f32 = 0.045;
+const FIELD_HILL_TOP : f32 = 1.2;
+const FIELD_HILL_SEED : i32 = 101;
+const FIELD_HILL_SEA : f32 = 0.22;
+const FIELD_HILL_BROAD : f32 = 0.62;
+const FIELD_HILL_MID : f32 = 0.28;
+const FIELD_HILL_FINE : f32 = 0.10;
+
+// Ground within this many columns of water is damp, and water counts when it is deeper than the depth below.
+const FIELD_WET_REACH : i32 = 6;
+const FIELD_WET_DEPTH : f32 = 0.03;
+
+/** Four numbers read together: the channels of a bilinear sample. */
+pub struct Quad4 {
+    /** First channel. */
+    pub a : f32 = 0.0;
+
+    /** Second channel. */
+    pub b : f32 = 0.0;
+
+    /** Third channel. */
+    pub c : f32 = 0.0;
+
+    /** Fourth channel. */
+    pub d : f32 = 0.0;
+}
+
+/** Everything the world says about one column. */
+pub struct FieldColumn {
+    /** Height of the bed (the ground under the water), cells. */
+    pub bed : f32 = 0.0;
+
+    /** Depth of water over the bed, cells; zero on dry ground. */
+    pub depth : f32 = 0.0;
+
+    /** Foam on the surface, 0 (none) to 1 (solid). */
+    pub foam : f32 = 0.0;
+
+    /** Turbulence of the water, 0 (glass) to 1 (white water). */
+    pub turbulence : f32 = 0.0;
+
+    /** Surface velocity along x, cells a second. */
+    pub vx : f32 = 0.0;
+
+    /** Surface velocity along z, cells a second. */
+    pub vz : f32 = 0.0;
+}
+
+// Where a point falls in an array of columns: the corner to read, the offsets to its neighbours, the fractions.
+struct FieldCell {
+    at    : i64;
+    right : i64;
+    down  : i64;
+    fx    : f32;
+    fz    : f32;
+}
+
+/** The snapshot of one frame's water and ground. */
+pub class WaterField {
+    /** Columns along x. */
+    pub width : i32;
+
+    /** Columns along z. */
+    pub depth : i32;
+
+    // Four floats a column. surface: height, slope x, slope z, foam. bed: height, slope x, slope z, wetness.
+    // flow: velocity x, velocity z, turbulence, curvature.
+    surface : f32[];
+    bed     : f32[];
+    flow    : f32[];
+
+    // The depth of water as `put` stored it, one float a column: `bake` softens it into the surface every time, so
+    // baking twice is baking once.
+    raw : f32[];
+
+    // The far hills' lattice of hashes, built once.
+    hills : HillTable;
+
+    /** Height of the plain that stretches beyond the grid, cells. */
+    pub farGround : f32 = 0.0;
+
+    /** Height of the hills that rise out of that plain far from the grid, cells; 0 for a flat plain. */
+    pub farHills : f32 = 0.0;
+
+    /** An upper bound of the slope of the surface and of the bed anywhere, rise over run: what the marcher steps by. */
+    pub surfaceSlope : f32 = 0.0;
+    pub bedSlope     : f32 = 0.0;
+
+    /** The lowest and the highest height of the bed and the surface, inside the grid and in the skirt around it. */
+    pub lowest  : f32 = 0.0;
+    pub highest : f32 = 0.0;
+
+    // Two floats a lightmap texel: the sun's visibility (0 shadow, 1 sun) and the sky's visibility.
+    light  : f32[];
+    lightW : i32;
+    lightD : i32;
+
+    /** A field of `width` by `depth` columns, all dry at height zero. */
+    constructor(width : i32, depth : i32) {
+        self.width = width;
+        self.depth = depth;
+        let n : i64 = (width as i64) * depth;
+        self.surface = new f32[n * 4];
+        self.bed = new f32[n * 4];
+        self.flow = new f32[n * 4];
+        self.raw = new f32[n];
+        self.hills = new HillTable(
+            FIELD_HILL_SCALE,
+            FIELD_HILL_MID_RATIO,
+            FIELD_HILL_FINE_RATIO,
+            FIELD_HILL_SEED
+        );
+        self.lightW = width * FIELD_LIGHT_SCALE;
+        self.lightD = depth * FIELD_LIGHT_SCALE;
+        let texels : i64 = (self.lightW as i64) * self.lightD * 2;
+        self.light = new f32[texels];
+        for (i of 0..(n * 4)) {
+            self.surface[i] = 0.0;
+            self.bed[i] = 0.0;
+            self.flow[i] = 0.0;
+        }
+        for (i of 0..texels) {
+            self.light[i] = 1.0;
+        }
+    }
+
+    /** Stores what the world says about column (`x`, `z`); call `bake` after the last one. */
+    pub fn put(mut self, x : i32, z : i32, column : FieldColumn) : void {
+        let at : i64 = self.columnAt(x, z);
+        self.bed[at] = column.bed;
+        self.surface[at] = column.bed + column.depth;
+        self.raw[(at / 4)] = column.depth;
+        self.surface[at + 3] = column.foam;
+        self.flow[at] = column.vx;
+        self.flow[at + 1] = column.vz;
+        self.flow[at + 2] = column.turbulence;
+    }
+
+    /** Derives slopes, curvature and wetness from what `put` stored. */
+    pub fn bake(mut self) : void {
+        self.soften();
+        for (z of 0..self.depth) {
+            for (x of 0..self.width) {
+                self.bakeColumn(x, z);
+            }
+        }
+        for (z of 0..self.depth) {
+            for (x of 0..self.width) {
+                let at : i64 = self.columnAt(x, z);
+                self.bed[at + 3] = self.wetnessAt(x, z);
+            }
+        }
+        self.bound();
+    }
+
+    // Blurs the water's depth over the columns by one [1 2 1] pass each way, which turns the polygon a column-wide
+    // shoreline makes into a smooth curve: the surface is the bed plus the softened depth, so a pool's edge and its
+    // contact foam follow a curve instead of the grid. A column that has no water stays dry unless a neighbour has.
+    fn soften(mut self) : void {
+        let quarter : f32 = 0.25;
+        let half : f32 = 0.5;
+        for (z of 0..self.depth) {
+            for (x of 0..self.width) {
+                let l : f32 = self.raw[self.clampedAt(x - 1, z) / 4];
+                let r : f32 = self.raw[self.clampedAt(x + 1, z) / 4];
+                let u : f32 = self.raw[self.clampedAt(x, z - 1) / 4];
+                let d : f32 = self.raw[self.clampedAt(x, z + 1) / 4];
+                let c : f32 = self.raw[self.columnAt(x, z) / 4];
+                let blurred : f32 = c * half + (l + r + u + d) * quarter * half;
+                let at : i64 = self.columnAt(x, z);
+                self.surface[at] = self.bed[at] + max(blurred, 0.0);
+            }
+        }
+    }
+
+    // The slope bounds and the height range the marcher relies on.
+    fn bound(mut self) : void {
+        let mut lo : f32 = self.farGround;
+        let mut hi : f32 = self.farGround;
+        let mut ds : f32 = 0.0;
+        let mut db : f32 = 0.0;
+        for (z of 0..self.depth) {
+            for (x of 0..self.width) {
+                let at : i64 = self.columnAt(x, z);
+                lo = min(lo, self.bed[at]);
+                hi = max(hi, self.surface[at]);
+                ds = max(ds, self.step(self.surface, x, z));
+                db = max(db, self.step(self.bed, x, z));
+            }
+        }
+        self.lowest = lo;
+        self.highest = max(hi, self.farGround + self.farHills * FIELD_HILL_TOP);
+        let skirt : f32 = max(hi - self.farGround, self.farGround - lo) / FIELD_SKIRT
+            + self.farHills * FIELD_HILL_SLOPE;
+        self.surfaceSlope = max(ds, skirt) * FIELD_SLOPE_MARGIN;
+        self.bedSlope = max(db, skirt) * FIELD_SLOPE_MARGIN;
+    }
+
+    // The steepest neighbour difference of column (x, z) in `heights`, columns being one unit apart.
+    fn step(self, heights : f32[], x : i32, z : i32) : f32 {
+        let h : f32 = heights[self.columnAt(x, z)];
+        let dx : f32 = abs(heights[self.clampedAt(x + 1, z)] - h);
+        let dz : f32 = abs(heights[self.clampedAt(x, z + 1)] - h);
+        return sqrt(dx * dx + dz * dz);
+    }
+
+    fn columnAt(self, x : i32, z : i32) : i64 {
+        return (((z * self.width) + x) as i64) * 4;
+    }
+
+    // The column index clamped into the grid.
+    fn clampedAt(self, x : i32, z : i32) : i64 {
+        let mut ix : i32 = x;
+        let mut iz : i32 = z;
+        if (ix < 0) {
+            ix = 0;
+        }
+        if (iz < 0) {
+            iz = 0;
+        }
+        if (ix >= self.width) {
+            ix = self.width - 1;
+        }
+        if (iz >= self.depth) {
+            iz = self.depth - 1;
+        }
+        return self.columnAt(ix, iz);
+    }
+
+    // The slopes of the height in `heights` (channel 0 of a four-float array) at column (x, z), per column, and
+    // in z the discrete Laplacian: positive where the point sits above its neighbours.
+    fn slope(self, heights : f32[], x : i32, z : i32) : Vec3 {
+        let hx0 : f32 = heights[self.clampedAt(x - 1, z)];
+        let hx1 : f32 = heights[self.clampedAt(x + 1, z)];
+        let hz0 : f32 = heights[self.clampedAt(x, z - 1)];
+        let hz1 : f32 = heights[self.clampedAt(x, z + 1)];
+        let centre : f32 = heights[self.columnAt(x, z)];
+        let half : f32 = 0.5;
+        let four : f32 = 4.0;
+        return Vec3 {
+            x: (hx1 - hx0) * half,
+            y: (hz1 - hz0) * half,
+            z: centre * four - hx0 - hx1 - hz0 - hz1,
+        };
+    }
+
+    fn bakeColumn(mut self, x : i32, z : i32) : void {
+        let at : i64 = self.columnAt(x, z);
+        let top : Vec3 = self.slope(self.surface, x, z);
+        self.surface[at + 1] = top.x;
+        self.surface[at + 2] = top.y;
+        self.flow[at + 3] = top.z;
+        let ground : Vec3 = self.slope(self.bed, x, z);
+        self.bed[at + 1] = ground.x;
+        self.bed[at + 2] = ground.y;
+    }
+
+    // How damp the ground of column (x, z) is: 1 under water, falling to 0 `FIELD_WET_REACH` columns from it.
+    fn wetnessAt(self, x : i32, z : i32) : f32 {
+        let reach : f32 = FIELD_WET_REACH as f32;
+        let mut nearest : f32 = reach + (1.0 as f32);
+        for (dz of -FIELD_WET_REACH..(FIELD_WET_REACH + 1)) {
+            for (dx of -FIELD_WET_REACH..(FIELD_WET_REACH + 1)) {
+                let at : i64 = self.clampedAt(x + dx, z + dz);
+                if (self.surface[at] - self.bed[at] < FIELD_WET_DEPTH) {
+                    continue;
+                }
+                let d : f32 = sqrt((dx * dx + dz * dz) as f32);
+                if (d < nearest) {
+                    nearest = d;
+                }
+            }
+        }
+        return saturate((1.0 as f32) - nearest / (reach + (0.5 as f32)));
+    }
+
+    // Where the point (x, z) falls among the texels of an array `w` by `d` with `scale` texels a column and
+    // `floats` floats a texel.
+    fn cellIn(self, x : f32, z : f32, w : i32, d : i32, scale : i32, floats : i64) : FieldCell {
+        let s : f32 = scale as f32;
+        let half : f32 = 0.5;
+        let u : f32 = clamp(x * s - half, 0.0, (w - 1) as f32);
+        let v : f32 = clamp(z * s - half, 0.0, (d - 1) as f32);
+        let mut ix : i32 = u as i32;
+        let mut iz : i32 = v as i32;
+        let mut right : i64 = floats;
+        let mut down : i64 = (w as i64) * floats;
+        if (ix >= w - 1) {
+            ix = w - 1;
+            right = 0;
+        }
+        if (iz >= d - 1) {
+            iz = d - 1;
+            down = 0;
+        }
+        return FieldCell {
+            at: (((iz as i64) * w) + ix) * floats,
+            right: right,
+            down: down,
+            fx: u - (ix as f32),
+            fz: v - (iz as f32),
+        };
+    }
+
+    fn cell(self, x : f32, z : f32) : FieldCell {
+        return self.cellIn(x, z, self.width, self.depth, 1, 4);
+    }
+
+    // The bilinear blend of one channel at `cell`.
+    static fn blend(values : f32[], cell : FieldCell, channel : i64) : f32 {
+        let i : i64 = cell.at + channel;
+        let top : f32 = values[i] + (values[i + cell.right] - values[i]) * cell.fx;
+        let j : i64 = i + cell.down;
+        let bottom : f32 = values[j] + (values[j + cell.right] - values[j]) * cell.fx;
+        return top + (bottom - top) * cell.fz;
+    }
+
+    static fn blend4(values : f32[], cell : FieldCell) : Quad4 {
+        return Quad4 {
+            a: WaterField::blend(values, cell, 0),
+            b: WaterField::blend(values, cell, 1),
+            c: WaterField::blend(values, cell, 2),
+            d: WaterField::blend(values, cell, 3),
+        };
+    }
+
+    /** How far (`x`, `z`) lies beyond the grid, in columns; 0 inside. */
+    pub fn outside(self, x : f32, z : f32) : f32 {
+        let dx : f32 = max(max(0.0 - x, x - (self.width as f32)), 0.0);
+        let dz : f32 = max(max(0.0 - z, z - (self.depth as f32)), 0.0);
+        return sqrt(dx * dx + dz * dz);
+    }
+
+    // The weight of the far ground in the skirt: 0 inside the grid, 1 past the skirt.
+    fn skirt(self, x : f32, z : f32) : f32 {
+        let d : f32 = self.outside(x, z);
+        if (d <= 0.0) {
+            return 0.0;
+        }
+        return smoothstep(0.0, FIELD_SKIRT, d);
+    }
+
+    // The height of the far plain at (x, z): flat, or rolling hills that grow with the distance from the grid.
+    fn farHeight(self, x : f32, z : f32) : f32 {
+        if (self.farHills <= 0.0) {
+            return self.farGround;
+        }
+        let broad : f32 = self.hills.value(0, x, z);
+        let mid : f32 = self.hills.value(1, x, z);
+        let fine : f32 = self.hills.value(2, x, z);
+        let n : f32 = broad * FIELD_HILL_BROAD + mid * FIELD_HILL_MID + fine * FIELD_HILL_FINE;
+        let ramp : f32 = smoothstep(FIELD_HILL_NEAR, FIELD_HILL_FAR, self.outside(x, z));
+        return self.farGround + self.farHills * ramp * (n - FIELD_HILL_SEA) * 2.0;
+    }
+
+    // A height blended into the far plain by the skirt weight `w`.
+    fn skirted(self, inside : f32, w : f32, x : f32, z : f32) : f32 {
+        if (w <= 0.0) {
+            return inside;
+        }
+        return inside + (self.farHeight(x, z) - inside) * w;
+    }
+
+    // The sample `q` with its slopes blended into the far plain's by the skirt weight `w` at (x, z).
+    fn skirtedQuad(self, q : Quad4, w : f32, x : f32, z : f32) : Quad4 {
+        if (w <= 0.0) {
+            return q;
+        }
+        let step : f32 = 0.5;
+        let gx : f32 = self.farHeight(x + step, z) - self.farHeight(x - step, z);
+        let gz : f32 = self.farHeight(x, z + step) - self.farHeight(x, z - step);
+        let keep : f32 = (1.0 as f32) - w;
+        return Quad4 {
+            a: self.skirted(q.a, w, x, z),
+            b: q.b * keep + gx * w,
+            c: q.c * keep + gz * w,
+            d: q.d * keep,
+        };
+    }
+
+    /** The surface at (`x`, `z`): height, slope along x, slope along z, foam. */
+    pub fn surfaceAt(self, x : f32, z : f32) : Quad4 {
+        let q : Quad4 = WaterField::blend4(self.surface, self.cell(x, z));
+        return self.skirtedQuad(q, self.skirt(x, z), x, z);
+    }
+
+    /** The height of the surface at (`x`, `z`): the one channel the marcher needs in its inner loop. */
+    pub fn surfaceHeight(self, x : f32, z : f32) : f32 {
+        return self.skirted(WaterField::blend(self.surface, self.cell(x, z), 0), self.skirt(x, z), x, z);
+    }
+
+    /** The bed at (`x`, `z`): height, slope along x, slope along z, wetness. */
+    pub fn bedAt(self, x : f32, z : f32) : Quad4 {
+        let q : Quad4 = WaterField::blend4(self.bed, self.cell(x, z));
+        return self.skirtedQuad(q, self.skirt(x, z), x, z);
+    }
+
+    /** The height of the bed at (`x`, `z`). */
+    pub fn bedHeight(self, x : f32, z : f32) : f32 {
+        return self.skirted(WaterField::blend(self.bed, self.cell(x, z), 0), self.skirt(x, z), x, z);
+    }
+
+    /** The flow at (`x`, `z`): velocity along x, velocity along z, turbulence, curvature of the surface. */
+    pub fn flowAt(self, x : f32, z : f32) : Quad4 {
+        return WaterField::blend4(self.flow, self.cell(x, z));
+    }
+
+    /** The bed's sun visibility (a) and sky visibility (b) at (`x`, `z`). */
+    pub fn lightAt(self, x : f32, z : f32) : Quad4 {
+        let c : FieldCell = self.cellIn(x, z, self.lightW, self.lightD, FIELD_LIGHT_SCALE, 2);
+        let w : f32 = self.skirt(x, z);
+        let sun : f32 = WaterField::blend(self.light, c, 0);
+        let sky : f32 = WaterField::blend(self.light, c, 1);
+        return Quad4 { a: sun + ((1.0 as f32) - sun) * w, b: sky + ((1.0 as f32) - sky) * w };
+    }
+
+    /** Rows of the lightmap, for the job pool. */
+    pub fn lightRows(self) : i32 {
+        return self.lightD;
+    }
+
+    /** Bakes rows `begin` up to `end` of the lightmap for a sun in direction `sun` (unit, pointing at the sun). */
+    pub fn bakeLight(mut self, begin : i32, end : i32, sun : Vec3) : void {
+        let inv : f32 = (1.0 as f32) / (FIELD_LIGHT_SCALE as f32);
+        let half : f32 = 0.5;
+        for (row of begin..end) {
+            for (col of 0..self.lightW) {
+                let x : f32 = ((col as f32) + half) * inv;
+                let z : f32 = ((row as f32) + half) * inv;
+                let at : i64 = (((row as i64) * self.lightW) + col) * 2;
+                self.light[at] = self.sunVisibility(x, z, sun);
+                self.light[at + 1] = self.skyVisibility(x, z);
+            }
+        }
+    }
+
+    // The share of the sun a ground point sees: marched toward the sun over the bed, with a penumbra that
+    // widens with the distance to the caster.
+    fn sunVisibility(self, x : f32, z : f32, sun : Vec3) : f32 {
+        if (sun.y <= 0.0) {
+            return 0.0;
+        }
+        let h : f32 = self.bedHeight(x, z);
+        let mut vis : f32 = 1.0;
+        let mut t : f32 = FIELD_SHADOW_FIRST;
+        for (i of 0..FIELD_SHADOW_STEPS) {
+            let ray : f32 = h + sun.y * t;
+            let ground : f32 = self.bedHeight(x + sun.x * t, z + sun.z * t);
+            let open : f32 = (ray - ground - FIELD_SHADOW_BIAS) / (FIELD_PENUMBRA * t + FIELD_SHADOW_BIAS);
+            vis = min(vis, saturate(open));
+            t = t * FIELD_SHADOW_GROWTH;
+        }
+        return smoothstep(0.0, 1.0, vis);
+    }
+
+    // The share of the sky a ground point sees: how much the heights around it rise above its own plane.
+    fn skyVisibility(self, x : f32, z : f32) : f32 {
+        let h : f32 = self.bedHeight(x, z);
+        let turn : f32 = TAU / (FIELD_AO_DIRECTIONS as f32);
+        let mut blocked : f32 = 0.0;
+        for (k of 0..FIELD_AO_DIRECTIONS) {
+            let a : f32 = ((k as f32) + (0.5 as f32)) * turn;
+            let dx : f32 = cos(a);
+            let dz : f32 = sin(a);
+            blocked = blocked + self.rise(x, z, h, dx, dz, FIELD_AO_NEAR);
+            blocked = blocked + self.rise(x, z, h, dx, dz, FIELD_AO_MID);
+            blocked = blocked + self.rise(x, z, h, dx, dz, FIELD_AO_FAR);
+        }
+        let share : f32 = blocked / ((FIELD_AO_DIRECTIONS * 3) as f32);
+        return (1.0 as f32) - FIELD_AO_STRENGTH * saturate(share);
+    }
+
+    // How far the ground `r` columns along (dx, dz) stands above a plane rising `FIELD_AO_RISE` a column, as a
+    // share of r.
+    fn rise(self, x : f32, z : f32, h : f32, dx : f32, dz : f32, r : f32) : f32 {
+        let g : f32 = self.bedHeight(x + dx * r, z + dz * r);
+        return saturate((g - h - FIELD_AO_RISE * r) / r);
+    }
+}

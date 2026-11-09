@@ -1,0 +1,158 @@
+// march — where a ray first goes below a heightfield: the one intersection the ground and the water share.
+//
+// A height function that is bilinear between columns and has a known bound on its slope can be sphere-traced: at
+// height `g` over the surface and descending at `-dy` while the surface may rise `S` per unit of travel along the
+// ground, nothing is hit before `g / (S * horizontal - dy)` along the ray, so the step is that distance (with a
+// safety factor), large when the ray is high and shrinking as it closes in. That is cheaper than walking the grid
+// cell by cell and cannot miss a thin ridge the way a fixed step does. When the ray goes below the surface the
+// last interval is bisected, which puts the hit on the bilinear surface itself, not on a step boundary: this is
+// what keeps the picture free of stair-steps. One function marches either the water's surface or the bed under
+// it; the field's skirt makes both extend to a plain, so a ray that leaves the grid still ends somewhere.
+
+use ludax::{max, sqrt, Vec3};
+
+use crate::water::field::WaterField;
+
+/** The most steps a march takes before it gives up; a ray that long is grazing a plain and sees the haze. */
+const MARCH_STEPS : i32 = 160;
+
+/** How much of the safe step is taken: below 1 so the bound's margin is not spent. */
+const MARCH_SAFETY : f32 = 0.9;
+
+/** Halvings of the final interval. */
+const MARCH_REFINE : i32 = 7;
+
+/** The shortest a step is, as a share of the pixel's footprint, so a ray grazing the surface does not stall. */
+const MARCH_MIN_STEP : f32 = 0.25;
+
+/** The farthest a march looks, cells. */
+pub const MARCH_FAR : f32 = 2500.0;
+
+/** What to march against. */
+pub enum MarchTarget : i8 {
+    /** The top of the water, where there is water, and the ground where there is none. */
+    Surface,
+
+    /** The ground under the water. */
+    Bed,
+}
+
+/** A ray to march: where it starts, its unit direction, the distance range and the pixel's footprint. */
+pub struct MarchRay {
+    /** Start of the ray. */
+    pub origin : Vec3;
+
+    /** Unit direction. */
+    pub dir : Vec3;
+
+    /** First distance along the ray to look at. */
+    pub from : f32 = 0.0;
+
+    /** Last distance along the ray to look at. */
+    pub to : f32 = 2500.0;
+
+    /** World size of one pixel per unit of distance: the shortest step is this times the distance. */
+    pub spread : f32 = 0.001;
+}
+
+/** Where a march ended. */
+pub struct MarchHit {
+    /** True when the ray went below the surface. */
+    pub hit : bool = false;
+
+    /** Distance along the ray of the hit, or the last distance looked at. */
+    pub t : f32 = 0.0;
+}
+
+/** Heightfield intersection. */
+pub class HeightMarch {
+    // The height of the chosen surface.
+    static fn height(field : Shared<WaterField>, target : MarchTarget, x : f32, z : f32) : f32 {
+        return match target {
+            MarchTarget::Surface => field.surfaceHeight(x, z),
+            MarchTarget::Bed => field.bedHeight(x, z),
+        };
+    }
+
+    // The slope bound of the chosen surface.
+    static fn bound(field : Shared<WaterField>, target : MarchTarget) : f32 {
+        return match target {
+            MarchTarget::Surface => field.surfaceSlope,
+            MarchTarget::Bed => field.bedSlope,
+        };
+    }
+
+    /** The first point of `ray` that is below the `target` surface of `field`, refined onto the surface. */
+    pub static fn first(field : Shared<WaterField>, target : MarchTarget, ray : MarchRay) : MarchHit {
+        let o : Vec3 = ray.origin;
+        let d : Vec3 = ray.dir;
+        let reach : f32 = HeightMarch::bound(field, target);
+        let flat : f32 = sqrt(d.x * d.x + d.z * d.z);
+        let denomScale : f32 = reach * flat;
+
+        // A ray above everything and not heading down sees only the sky.
+        let top : f32 = field.highest;
+        let mut t : f32 = ray.from;
+        if (o.y + d.y * t > top) {
+            if (d.y >= 0.0) {
+                return MarchHit { hit: false, t: ray.to };
+            }
+            t = max(t, (top - o.y) / d.y);
+        }
+
+        let mut prev : f32 = t;
+        for (i of 0..MARCH_STEPS) {
+            if (t > ray.to) {
+                return MarchHit { hit: false, t: ray.to };
+            }
+            let gap : f32 = (o.y + d.y * t)
+                - HeightMarch::height(field, target, o.x + d.x * t, o.z + d.z * t);
+            if (gap <= 0.0) {
+                return HeightMarch::refine(field, target, ray, prev, t);
+            }
+            let closing : f32 = denomScale - d.y;
+            if (closing <= 0.0) {
+                return MarchHit { hit: false, t: ray.to };
+            }
+            prev = t;
+            t = t + max(gap / closing * MARCH_SAFETY, MARCH_MIN_STEP * ray.spread * t);
+        }
+        return MarchHit { hit: false, t: ray.to };
+    }
+
+    // Bisects the interval from `above` (over the surface) to `below` (under it).
+    static fn refine(
+        field : Shared<WaterField>,
+        target : MarchTarget,
+        ray : MarchRay,
+        above : f32,
+        below : f32
+    ) : MarchHit {
+        let o : Vec3 = ray.origin;
+        let d : Vec3 = ray.dir;
+        let mut lo : f32 = above;
+        let mut hi : f32 = below;
+        let half : f32 = 0.5;
+        for (i of 0..MARCH_REFINE) {
+            let mid : f32 = (lo + hi) * half;
+            let gap : f32 = (o.y + d.y * mid)
+                - HeightMarch::height(field, target, o.x + d.x * mid, o.z + d.z * mid);
+            if (gap > 0.0) {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        return MarchHit { hit: true, t: (lo + hi) * half };
+    }
+
+    /** True when `ray` meets the `target` surface at all: the shadow test, which needs no refinement. */
+    pub static fn blocked(field : Shared<WaterField>, target : MarchTarget, ray : MarchRay) : bool {
+        return HeightMarch::first(field, target, ray).hit;
+    }
+
+    /** The point `t` along `ray`. */
+    pub static fn at(ray : MarchRay, t : f32) : Vec3 {
+        return ray.origin.plus(ray.dir.scale(t));
+    }
+}
