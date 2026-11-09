@@ -1,0 +1,273 @@
+// profiler — scoped CPU timing, recorded into a preallocated ring of frames.
+//
+// Instrumented code brackets a region with `begin`/`end` (or `begin` plus `defer end`):
+//
+//     let token : i32 = profiler.begin(PHYSICS);
+//     defer profiler.end(token);
+//
+// Each frame, the main loop calls `beginFrame` and `endFrame`. Between them every `begin`/`end` pair becomes
+// a sample (scope id, depth, start, end) written into the current frame's slice of storage that was allocated
+// once at construction, so profiling never allocates and the history of the last N frames is always there.
+// `endFrame` folds the finished frame's samples into one line per scope name, sorted by cost, which is what a
+// profiler overlay or a log line shows.
+//
+// Cheap when off: with the profiler disabled `begin` is one boolean test and returns the token -1, and `end`
+// of that token is one comparison. Nothing else happens, and no clock is read.
+//
+// Time comes from `std::time::monotonicNanos`; the `...At` forms take the reading as an argument so a test
+// can drive the profiler with a clock of its own. Profiler data is for people: nothing in the simulation may
+// read it, as it differs from run to run.
+
+use crate::core::math::scalar::atLeastOne;
+use crate::core::profile::entry::ProfileEntry;
+use crate::core::time::clock::nowNanos;
+
+/** Deepest nesting of scopes tracked; a deeper scope is still timed but its parent attribution stops here. */
+const PROFILE_MAX_DEPTH : i32 = 64;
+
+/** Records scope timings per frame and summarises the last finished frame. */
+pub class Profiler {
+    // Sample storage: `frames` slices of `perFrame` samples, written in parallel arrays.
+    scopeIds  : i32[];
+    starts    : i64[];
+    ends      : i64[];
+    childTime : i64[];
+
+    // Open scopes of the frame in progress: the sample index at each depth.
+    openStack : i32[];
+    depth     : i32 = 0;
+
+    // Per frame in the ring.
+    sampleCounts : i32[];
+    frameLengths : i64[];
+
+    // Summary of the last finished frame, indexed by scope id, and the ids ordered by cost.
+    calls     : i32[];
+    inclusive : i64[];
+    selfTime  : i64[];
+    ranking   : i32[];
+    ranked    : i32 = 0;
+
+    frames     : i32 = 1;
+    perFrame   : i32 = 1;
+    scopes     : i32 = 1;
+    current    : i32 = 0;
+    frameStart : i64 = 0;
+    inFrame    : bool = false;
+    finished   : i32 = 0;
+    on         : bool = false;
+    lost       : i64 = 0;
+
+    /**
+     * A profiler that keeps `frames` frames of up to `samplesPerFrame` samples, for scope ids below `scopes`.
+     * It starts disabled; samples past the per-frame limit are counted in `droppedSamples`.
+     */
+    constructor(frames : i32, samplesPerFrame : i32, scopes : i32) {
+        self.frames = atLeastOne(frames);
+        self.perFrame = atLeastOne(samplesPerFrame);
+        self.scopes = atLeastOne(scopes);
+        let total : i64 = self.frames as i64 * self.perFrame as i64;
+        self.scopeIds = new i32[total];
+        self.starts = new i64[total];
+        self.ends = new i64[total];
+        self.childTime = new i64[total];
+        self.openStack = new i32[PROFILE_MAX_DEPTH as i64];
+        self.sampleCounts = new i32[self.frames as i64];
+        self.frameLengths = new i64[self.frames as i64];
+        self.calls = new i32[self.scopes as i64];
+        self.inclusive = new i64[self.scopes as i64];
+        self.selfTime = new i64[self.scopes as i64];
+        self.ranking = new i32[self.scopes as i64];
+        for (f of 0..self.frames) {
+            self.sampleCounts[f] = 0;
+            self.frameLengths[f] = 0;
+        }
+        for (i of 0..self.scopes) {
+            self.calls[i] = 0;
+            self.inclusive[i] = 0;
+            self.selfTime[i] = 0;
+            self.ranking[i] = 0;
+        }
+    }
+
+    /**
+     * Turns recording on or off; takes effect at the next `beginFrame`, so a frame is never half recorded.
+     */
+    pub fn setEnabled(mut self, enabled : bool) : void {
+        self.on = enabled;
+    }
+
+    /** Whether recording is on. */
+    pub fn enabled(self) : bool {
+        return self.on;
+    }
+
+    /** Starts a frame, read from the clock. */
+    pub fn beginFrame(mut self) : void {
+        self.beginFrameAt(nowNanos());
+    }
+
+    /** Starts a frame at the clock reading `now`; scopes left open by the previous frame are abandoned. */
+    pub fn beginFrameAt(mut self, now : i64) : void {
+        self.inFrame = false;
+        if (!self.on) {
+            return;
+        }
+        self.current = (self.current + 1) % self.frames;
+        self.sampleCounts[self.current] = 0;
+        self.depth = 0;
+        self.frameStart = now;
+        self.inFrame = true;
+    }
+
+    /**
+     * Opens a scope named by the id of `ProfileNames`; answers the token to hand to `end` (-1: not recorded).
+     */
+    pub fn begin(mut self, scope : i32) : i32 {
+        if (!self.inFrame) {
+            return -1;
+        }
+        return self.beginAt(scope, nowNanos());
+    }
+
+    /** Opens a scope at the clock reading `now`. */
+    pub fn beginAt(mut self, scope : i32, now : i64) : i32 {
+        if (!self.inFrame) {
+            return -1;
+        }
+        let used : i32 = self.sampleCounts[self.current];
+        if (used >= self.perFrame || scope < 0 || scope >= self.scopes) {
+            self.lost = self.lost + 1;
+            return -1;
+        }
+        let slot : i32 = self.current * self.perFrame + used;
+        self.scopeIds[slot] = scope;
+        self.starts[slot] = now;
+        self.ends[slot] = now;
+        self.childTime[slot] = 0;
+        self.sampleCounts[self.current] = used + 1;
+        if (self.depth < PROFILE_MAX_DEPTH) {
+            self.openStack[self.depth] = slot;
+        }
+        self.depth = self.depth + 1;
+        return slot;
+    }
+
+    /** Closes the scope opened with this token; scopes must close in the reverse order of opening. */
+    pub fn end(mut self, token : i32) : void {
+        if (token < 0) {
+            return;
+        }
+        self.endAt(token, nowNanos());
+    }
+
+    /** Closes the scope of `token` at the clock reading `now`. */
+    pub fn endAt(mut self, token : i32, now : i64) : void {
+        if (token < 0 || !self.inFrame) {
+            return;
+        }
+        self.ends[token] = now;
+        if (self.depth > 0) {
+            self.depth = self.depth - 1;
+        }
+        if (self.depth > 0 && self.depth <= PROFILE_MAX_DEPTH) {
+            let parent : i32 = self.openStack[self.depth - 1];
+            self.childTime[parent] = self.childTime[parent] + (now - self.starts[token]);
+        }
+    }
+
+    /** Finishes the frame, read from the clock, and summarises it. */
+    pub fn endFrame(mut self) : void {
+        self.endFrameAt(nowNanos());
+    }
+
+    /** Finishes the frame at the clock reading `now`: after this `entryCount` and `entry` describe it. */
+    pub fn endFrameAt(mut self, now : i64) : void {
+        if (!self.inFrame) {
+            return;
+        }
+        self.inFrame = false;
+        self.frameLengths[self.current] = now - self.frameStart;
+        self.finished = self.finished + 1;
+        self.summarise();
+    }
+
+    // Folds the finished frame's samples into per-scope totals and orders the scopes by inclusive time.
+    fn summarise(mut self) : void {
+        for (i of 0..self.scopes) {
+            self.calls[i] = 0;
+            self.inclusive[i] = 0;
+            self.selfTime[i] = 0;
+        }
+        let used : i32 = self.sampleCounts[self.current];
+        let base : i32 = self.current * self.perFrame;
+        for (k of 0..used) {
+            let slot : i32 = base + k;
+            let id : i32 = self.scopeIds[slot];
+            let length : i64 = self.ends[slot] - self.starts[slot];
+            self.calls[id] = self.calls[id] + 1;
+            self.inclusive[id] = self.inclusive[id] + length;
+            self.selfTime[id] = self.selfTime[id] + length - self.childTime[slot];
+        }
+        self.ranked = 0;
+        for (id of 0..self.scopes) {
+            if (self.calls[id] > 0) {
+                self.insertRanked(id);
+            }
+        }
+    }
+
+    // Places `id` into `ranking`, most expensive first; equal costs keep the lower id first, so the order is
+    // a function of the data alone.
+    fn insertRanked(mut self, id : i32) : void {
+        let mut at : i32 = self.ranked;
+        while (at > 0 && self.inclusive[self.ranking[at - 1]] < self.inclusive[id]) {
+            self.ranking[at] = self.ranking[at - 1];
+            at = at - 1;
+        }
+        self.ranking[at] = id;
+        self.ranked = self.ranked + 1;
+    }
+
+    /** How many distinct scopes ran in the last finished frame. */
+    pub fn entryCount(self) : i32 {
+        return self.ranked;
+    }
+
+    /** The `rank`-th costliest scope of the last finished frame (0 is the costliest). */
+    pub fn entry(self, rank : i32) : ProfileEntry {
+        let id : i32 = self.ranking[rank];
+        return ProfileEntry {
+            scope: id,
+            calls: self.calls[id],
+            inclusiveNanos: self.inclusive[id],
+            selfNanos: self.selfTime[id],
+        };
+    }
+
+    /** Length in nanoseconds of the last finished frame, or 0 before any. */
+    pub fn lastFrameNanos(self) : i64 {
+        if (self.finished == 0) {
+            return 0;
+        }
+        return self.frameLengths[self.current];
+    }
+
+    /** Length of the finished frame `ago` frames before the last one (0 is the last), or 0 if not kept. */
+    pub fn frameNanosAgo(self, ago : i32) : i64 {
+        if (ago < 0 || ago >= self.frames || ago >= self.finished) {
+            return 0;
+        }
+        return self.frameLengths[(self.current - ago + self.frames) % self.frames];
+    }
+
+    /** How many frames have been recorded since the profiler was created. */
+    pub fn framesRecorded(self) : i32 {
+        return self.finished;
+    }
+
+    /** Samples refused for lack of room (or for an unknown scope id) since the profiler was created. */
+    pub fn droppedSamples(self) : i64 {
+        return self.lost;
+    }
+}

@@ -1,0 +1,166 @@
+// pool — worker threads that run a kernel over index ranges.
+//
+// `JobPool` starts its workers once and parks them on a channel; a parallel loop (`run`) hands them a "go"
+// token each, they pull chunks of the loop from a shared atomic cursor until none are left, and report back
+// on a second channel. The caller blocks until every worker has reported, so when `run` returns all writes of
+// the kernel are visible to the caller (the channel hand-off orders them).
+//
+// Why tokens and an atomic cursor rather than one channel message per chunk: a channel operation costs about
+// 5 microseconds on the machine this was measured on and an atomic increment 6 nanoseconds, so the channel
+// carries one message per worker per loop and the atomic carries one claim per chunk.
+//
+// A pool is bound to one kernel for its life. Axle 0.18.3 stores a class in a trait-typed field badly (E0709)
+// and a worker thread's entry cannot be a generic function, so the kernel is handed to each worker thread at
+// start and not kept by the pool. The kernel's data is mutable between loops: set its inputs, call `run`,
+// read its outputs. To drive several kinds of work from one pool, make the kernel a dispatcher with a `mode`
+// field.
+//
+// Ordering contract: see `kernel`. Which worker runs which chunk, and in what order, is not defined; what
+// each chunk covers is.
+
+use std::concurrent::{AtomicI32, BoundedChannel, CountDownLatch, Thread};
+use std::lang::{IllegalStateException, InterruptedException};
+use std::sys::cpuCount;
+
+use crate::core::jobs::kernel::{RangeKernel, chunkBegin, chunkCount, chunkEnd};
+use crate::core::math::scalar::atLeastOne;
+
+/** Message to a worker that starts a loop. */
+const JOBS_GO : i32 = 1;
+
+/** Message to a worker that ends it. */
+const JOBS_STOP : i32 = -1;
+
+// State shared between the pool and its workers. The caller writes `total` and `grain` while every worker is
+// parked, then wakes them through the channel, which orders those writes before the workers' reads.
+class JobGate {
+    pub wake    : BoundedChannel;
+    pub report  : BoundedChannel;
+    pub cursor  : AtomicI32;
+    pub stopped : CountDownLatch;
+    pub total   : i32 = 0;
+    pub grain   : i32 = 1;
+
+    constructor(workers : i32) {
+        self.wake = new BoundedChannel(workers + 1);
+        self.report = new BoundedChannel(workers + 1);
+        self.cursor = new AtomicI32(0);
+        self.stopped = new CountDownLatch(workers);
+    }
+}
+
+// Claims chunks until the loop has none left.
+fn jobsDrain(gate : JobGate, kernel : RangeKernel) : void {
+    let chunks : i32 = chunkCount(gate.total, gate.grain);
+    let mut chunk : i32 = gate.cursor.incrementAndGet() - 1;
+    while (chunk < chunks) {
+        kernel.runRange(chunkBegin(chunk, gate.grain), chunkEnd(chunk, gate.total, gate.grain));
+        chunk = gate.cursor.incrementAndGet() - 1;
+    }
+}
+
+// The body of a worker thread: sleep on the channel, drain a loop when woken, report, repeat.
+fn jobsWorker(gate : JobGate, kernel : RangeKernel) : void {
+    try {
+        let mut message : i32 = gate.wake.receive();
+        while (message == JOBS_GO) {
+            jobsDrain(gate, kernel);
+            gate.report.send(1);
+            message = gate.wake.receive();
+        }
+    } catch e : InterruptedException {
+        // The channel was closed under the worker: the pool is gone, so leave quietly.
+    }
+    gate.stopped.countDown();
+}
+
+/** A fixed set of worker threads that run one kernel over index ranges. */
+pub class JobPool {
+    gate    : JobGate;
+    workers : i32 = 1;
+    running : bool = true;
+
+    /**
+     * Starts `workers` threads (at least one) that will run `kernel`. The kernel must stay alive until
+     * `shutdown` has returned. If the system refuses threads the pool has fewer workers, or none, in which
+     * case `run` answers false.
+     */
+    constructor(workers : i32, kernel : RangeKernel) {
+        let n : i32 = atLeastOne(workers);
+        self.gate = new JobGate(n);
+        let mut started : i32 = 0;
+        try {
+            for (i of 0..n) {
+                Thread::run(jobsWorker, self.gate, kernel);
+                started = started + 1;
+            }
+        } catch e : IllegalStateException {
+            // The system refused another thread: carry on with the workers that did start.
+        }
+        for (i of started..n) {
+            self.gate.stopped.countDown();
+        }
+        self.workers = started;
+        self.running = started > 0;
+    }
+
+    /** A sensible worker count for this machine: every hardware thread but the caller's own, at least one. */
+    pub static fn defaultWorkers() : i32 {
+        return atLeastOne(cpuCount() - 1);
+    }
+
+    /** How many worker threads are running. */
+    pub fn workerCount(self) : i32 {
+        return self.workers;
+    }
+
+    /**
+     * Runs the kernel over `[0, count)` in chunks of `grain` items and waits until every chunk is done.
+     * Answers false, having done nothing, when the pool has been shut down. Call it from one thread at a
+     * time.
+     */
+    pub fn run(mut self, count : i32, grain : i32) : bool {
+        let chunks : i32 = chunkCount(count, grain);
+        if (chunks == 0) {
+            return self.running;
+        }
+        if (!self.running) {
+            return false;
+        }
+        let mut helpers : i32 = self.workers;
+        if (chunks < helpers) {
+            helpers = chunks;
+        }
+        self.gate.total = count;
+        self.gate.grain = grain;
+        self.gate.cursor.set(0);
+        try {
+            for (i of 0..helpers) {
+                self.gate.wake.send(JOBS_GO);
+            }
+            for (i of 0..helpers) {
+                self.gate.report.receive();
+            }
+        } catch e : InterruptedException {
+            self.running = false;
+            return false;
+        }
+        return true;
+    }
+
+    /** Stops the workers and waits for them to leave; safe to call twice. */
+    pub fn shutdown(mut self) : void {
+        if (!self.running) {
+            return;
+        }
+        self.running = false;
+        try {
+            for (i of 0..self.workers) {
+                self.gate.wake.send(JOBS_STOP);
+            }
+            self.gate.stopped.waitFor();
+        } catch e : InterruptedException {
+            // Closed already: the workers are leaving by themselves.
+        }
+    }
+}
