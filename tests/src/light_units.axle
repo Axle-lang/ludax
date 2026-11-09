@@ -1,0 +1,159 @@
+// light_units — the scale of the scene, the exposure, and the deterministic exp2/log2/pow under them.
+//
+// The units are checked by converting a value and converting it back, and against the published anchors a
+// game names: sunlit white at its EV, an 800 lm bulb in candela, sunny-16. The exposure law is checked over a
+// sweep because "+1 EV halves the exposure" is a property of every EV, not of one. The deterministic
+// intrinsics are checked against the platform's exp/log/pow, with the budget set by f32 rounding.
+
+use ludax::{
+    Checks, Pcg32, LightUnits, LIGHT_SUN_LUX, lightExp2, lightLog2, lightPow, lightExp, PI_D
+};
+
+use crate::light_support::{LIGHT_TOL, LIGHT_TOL_COARSE, LIGHT_TOL_LOOSE, LIGHT_TOL_ULP, LightWorst};
+
+/** Checks of units, exposure and the maths intrinsics. */
+pub class LightUnitsSuite {
+    /** Runs every check of this suite. */
+    pub static fn run(c : Checks) : void {
+        LightUnitsSuite::units(c);
+        LightUnitsSuite::exposure(c);
+        LightUnitsSuite::intrinsics(c);
+    }
+
+    // The conversions and the physical anchors.
+    static fn units(c : Checks) : void {
+        c.near(
+            "sun scene irradiance is pi",
+            LightUnits::sunScene() as f64,
+            3.14159265358979,
+            LIGHT_TOL_ULP
+        );
+        c.near(
+            "sun lux converts to pi",
+            LightUnits::luxToScene(LIGHT_SUN_LUX) as f64,
+            3.14159265358979,
+            LIGHT_TOL_ULP
+        );
+        c.near(
+            "lux round trip",
+            LightUnits::sceneToLux(LightUnits::luxToScene(12345.0)) as f64,
+            12345.0,
+            0.01
+        );
+        c.near(
+            "sunlit white: radiance 1 from E/pi",
+            (LightUnits::luxToScene(LIGHT_SUN_LUX) / (PI_D as f32)) as f64,
+            1.0,
+            LIGHT_TOL
+        );
+        c.near(
+            "scene 1.0 is 31831 cd/m2",
+            LightUnits::sceneToLuminance(1.0) as f64,
+            31830.9886,
+            0.01
+        );
+        c.near(
+            "luminance round trip",
+            LightUnits::sceneToLuminance(LightUnits::luminanceToScene(250.0)) as f64,
+            250.0,
+            0.001
+        );
+        c.near(
+            "point lumens round trip",
+            LightUnits::candelaToLumensPoint(LightUnits::lumensToCandelaPoint(800.0)) as f64,
+            800.0,
+            0.001
+        );
+        c.near(
+            "800 lm bulb is 63.66 cd",
+            LightUnits::lumensToCandelaPoint(800.0) as f64,
+            63.6619772,
+            LIGHT_TOL_COARSE
+        );
+        c.near(
+            "spot lumens: a hemisphere cone is 2pi sr",
+            LightUnits::lumensToCandelaSpot(628.3185307, 0.0) as f64,
+            100.0,
+            0.001
+        );
+        c.near("closed cone gives 0", LightUnits::lumensToCandelaSpot(100.0, 1.0) as f64, 0.0, 0.0);
+        c.near(
+            "sunny 16: f/16 1/100 s ISO 100 is EV 14.64",
+            LightUnits::ev100OfCamera(16.0, 0.01, 100.0) as f64,
+            14.6439,
+            0.0005
+        );
+        c.near(
+            "ISO 200 lowers EV100 by one",
+            (LightUnits::ev100OfCamera(
+                16.0,
+                0.01,
+                200.0
+            )
+                - LightUnits::ev100OfCamera(16.0, 0.01, 100.0)) as f64,
+            -1.0,
+            LIGHT_TOL_LOOSE
+        );
+        c.near(
+            "sunlit white maps to 1 at its EV",
+            (LightUnits::exposure(LightUnits::ev100ForSunlitWhite())) as f64,
+            1.0,
+            LIGHT_TOL_LOOSE
+        );
+        c.near("sunlit white EV is 14.7", LightUnits::ev100ForSunlitWhite() as f64, 14.6951, 0.001);
+    }
+
+    // The exposure law across the EV range, and the metered average.
+    static fn exposure(c : Checks) : void {
+        let mut ev : f32 = -3.0;
+        let worst : LightWorst = new LightWorst();
+        while (ev < 20.0) {
+            let ratio : f64 = (LightUnits::exposure(ev) / LightUnits::exposure(ev + 1.0)) as f64;
+            worst.note(ratio - 2.0, "ev ${ev}");
+            ev = ev + (0.37 as f32);
+        }
+        worst.within(c, "+1 EV halves the exposure over -3..20 EV", LIGHT_TOL_LOOSE);
+        c.near(
+            "metered average lands at 12.5/(100*1.2)",
+            (LightUnits::exposure(LightUnits::ev100ForAverage(0.18)) * 0.18) as f64,
+            0.1041667,
+            LIGHT_TOL_COARSE
+        );
+        c.near("black frame answers EV 0", LightUnits::ev100ForAverage(0.0) as f64, 0.0, 0.0);
+    }
+
+    // exp2, log2 and pow against their identities over a seeded sweep; the budget is the f32 rounding of the
+    // result.
+    static fn intrinsics(c : Checks) : void {
+        let rng : Pcg32 = new Pcg32(7, 3);
+        let expRel : LightWorst = new LightWorst();
+        let roundTrip : LightWorst = new LightWorst();
+        let powRel : LightWorst = new LightWorst();
+        for (i of 0..2000) {
+            let x : f32 = rng.rangeF32(-30.0, 30.0);
+            let e : f32 = lightExp2(x);
+            let want : f64 = ((x as f64) * 0.6931471805599453).exp();
+            expRel.note((e as f64) / want - 1.0, "x=${x}");
+            roundTrip.note((lightLog2(e) - x) as f64, "x=${x}");
+            let base : f32 = rng.rangeF32(0.001, 50.0);
+            let power : f32 = rng.rangeF32(-3.0, 3.0);
+            let p : f32 = lightPow(base, power);
+            let ref : f64 = (base as f64).pow(power as f64);
+            powRel.note((p as f64) / ref - 1.0, "b=${base} y=${power}");
+        }
+        expRel.within(c, "lightExp2 vs f64 exp, relative", 0.0000002);
+        roundTrip.within(c, "lightLog2(lightExp2(x)) = x", 0.000005);
+        powRel.within(c, "lightPow vs f64 pow, relative", 0.0000005);
+        c.near("exp2(0) is 1", lightExp2(0.0) as f64, 1.0, 0.0);
+        c.near("exp2(10) is 1024", lightExp2(10.0) as f64, 1024.0, LIGHT_TOL_COARSE);
+        c.near("exp2(-3) is 1/8", lightExp2(-3.0) as f64, 0.125, LIGHT_TOL_ULP);
+        c.near("log2(8) is 3", lightLog2(8.0) as f64, 3.0, LIGHT_TOL);
+        c.near("log2(1) is 0", lightLog2(1.0) as f64, 0.0, 0.0);
+        c.near("pow(2, 0.5) is sqrt 2", lightPow(2.0, 0.5) as f64, 1.41421356, 0.0000002);
+        c.near("pow(x, 0) is 1", lightPow(5.0, 0.0) as f64, 1.0, 0.0);
+        c.near("pow of a negative base is 0", lightPow(-2.0, 2.0) as f64, 0.0, 0.0);
+        c.near("exp2 far below range is 0", lightExp2(-500.0) as f64, 0.0, 0.0);
+        c.near("log2 of zero is finite", lightLog2(0.0) as f64, -126.0, 0.0);
+        c.near("exp(1) is e", lightExp(1.0) as f64, 2.718281828, 0.0000005);
+    }
+}

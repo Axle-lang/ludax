@@ -1,0 +1,170 @@
+// light_brdf — GGX, Smith, Schlick, multiple scattering and diffuse (doc/LIGHTING_MATH.md §3), f32 with f64
+// twins.
+//
+// With alpha = roughness^2 and h = normalize(l + v):
+//   D(h) = alpha^2 / (pi ((n.h)^2 (alpha^2 - 1) + 1)^2)                        normalised: integral D
+//     (n.h) dwh = 1
+//   V    = 0.5 / ( n.l sqrt(n.v^2 (1 - alpha^2) + alpha^2) + n.v sqrt(n.l^2 (1 - alpha^2) + alpha^2) )
+//     (= G2 / (4 n.l n.v))
+//   F    = F0 + (1 - F0)(1 - v.h)^5,  F0 = lerp(0.04, baseColor, metallic)
+//   fs   = D V F, symmetric in (l, v); multiplied by the Kulla-Conty/Fdez-Aguera factor 1 + F0 (1/E(mu,
+//     alpha) - 1)
+//          where E is the directional albedo of D V (F = 1), tabulated in light_dfg by quadrature.
+//   fd   = (1 - metallic) baseColor (1 - Espec(v)) / pi   (Lambert), or the normalised Burley lobe times
+//     the same
+//          weights; Espec is the albedo of the compensated lobe, so fd + fs integrates to at most 1 per
+//            channel
+//          and to exactly baseColor-weighted 1 in a white furnace.
+//
+// FLOORS. alpha >= LIGHT_ALPHA_MIN (0.045, i.e. roughness 0.21): below it D is a spike that neither f32 nor a shadow
+// map can represent and a real light is never a point; n.v is floored at 1e-4. These floors are documented deviations,
+// constants below, and the f64 twins use the same ones so f32-vs-f64 compares like with like.
+//
+// ERROR BUDGET (asserted by the suite over a Pcg32 sweep): D, V, F f32 vs f64 relative error <= 4e-6.
+// Burley has no f64 twin; its energy is checked by quadrature instead. Subset rules: see light_math.axle.
+
+use crate::core::math::scalar::{PI, PI_D, max, maxD, min, minD, saturate, saturateD};
+use crate::core::math::trig::{sqrt, sqrtD};
+use crate::core::math::vec3::Vec3;
+use crate::render::light::light_material::{LightDiffuseModel};
+use crate::render::light::light_material::{LightMaterial, LightDfg, LightPrepared, LightBrdfTerms};
+
+/** The smallest GGX width alpha = roughness^2 the shading uses. */
+pub const LIGHT_ALPHA_MIN : f32 = 0.045;
+
+/** The smallest cosine between normal and view the BRDF is evaluated at. */
+pub const LIGHT_NV_MIN : f32 = 0.0001;
+
+/** F0 of a dielectric: the 4 % reflectance of glTF's default index of refraction 1.5. */
+pub const LIGHT_DIELECTRIC_F0 : f32 = 0.04;
+
+// Lower bound of the albedo E before it divides (a hole in the table must not blow the compensation up).
+const LBRDF_E_MIN : f32 = 0.001;
+
+// Lower bound of the Smith denominator before 0.5 / it, in f32 and in the f64 twin (a grazing pair of cosines).
+const LBRDF_SMITH_DEN_MIN : f32 = 0.000000001;
+const LBRDF_SMITH_DEN_MIN_D : f64 = 0.000000000001;
+
+// Burley's retro-reflection: the grazing diffuse level grows by this fraction of roughness, and the energy factor
+// 1 + roughness (1/1.51 - 1) keeps the lobe from gaining energy (Lagarde & de Rousiers 2014).
+const LBRDF_BURLEY_BIAS : f32 = 0.5;
+const LBRDF_BURLEY_NORM : f32 = 1.51;
+
+/** The GGX width for a perceptual roughness: roughness^2, floored at `LIGHT_ALPHA_MIN`. */
+pub fn lightAlpha(roughness : f32) : f32 {
+    return max(roughness * roughness, LIGHT_ALPHA_MIN);
+}
+
+/** The GGX normal distribution D at half-vector cosine `nh` for width `alpha`. */
+pub fn lightGgxD(nh : f32, alpha : f32) : f32 {
+    let a2 : f32 = alpha * alpha;
+    let t : f32 = nh * nh * (a2 - (1.0 as f32)) + (1.0 as f32);
+    return a2 / (PI * t * t);
+}
+
+/** The f64 twin of `lightGgxD`. */
+pub fn lightGgxDD(nh : f64, alpha : f64) : f64 {
+    let a2 : f64 = alpha * alpha;
+    let t : f64 = nh * nh * (a2 - 1.0) + 1.0;
+    return a2 / (PI_D * t * t);
+}
+
+/** The height-correlated Smith visibility V = G2 / (4 n.l n.v) for width `alpha`. */
+pub fn lightSmithV(nl : f32, nv : f32, alpha : f32) : f32 {
+    let a2 : f32 = alpha * alpha;
+    let gv : f32 = nl * sqrt(nv * nv * ((1.0 as f32) - a2) + a2);
+    let gl : f32 = nv * sqrt(nl * nl * ((1.0 as f32) - a2) + a2);
+    return (0.5 as f32) / max(gv + gl, LBRDF_SMITH_DEN_MIN);
+}
+
+/** The f64 twin of `lightSmithV`. */
+pub fn lightSmithVD(nl : f64, nv : f64, alpha : f64) : f64 {
+    let a2 : f64 = alpha * alpha;
+    let gv : f64 = nl * sqrtD(nv * nv * (1.0 - a2) + a2);
+    let gl : f64 = nv * sqrtD(nl * nl * (1.0 - a2) + a2);
+    return 0.5 / maxD(gv + gl, LBRDF_SMITH_DEN_MIN_D);
+}
+
+/** (1 - x)^5 by multiplications, x clamped to 0..1: the Schlick Fresnel weight. */
+pub fn lightFresnelWeight(vh : f32) : f32 {
+    let x : f32 = (1.0 as f32) - saturate(vh);
+    let x2 : f32 = x * x;
+    return x2 * x2 * x;
+}
+
+/** The f64 twin of `lightFresnelWeight`. */
+pub fn lightFresnelWeightD(vh : f64) : f64 {
+    let x : f64 = 1.0 - saturateD(vh);
+    let x2 : f64 = x * x;
+    return x2 * x2 * x;
+}
+
+/** Schlick's Fresnel: F0 + (1 - F0)(1 - v.h)^5 per channel. 1 at grazing, F0 at normal incidence. */
+pub fn lightFresnel(f0 : Vec3, vh : f32) : Vec3 {
+    let w : f32 = lightFresnelWeight(vh);
+    return f0.plus(Vec3::splat(1.0).minus(f0).scale(w));
+}
+
+// The normalised Burley/Disney retro-reflection factor (replaces 1/pi), after Lagarde & de Rousiers 2014.
+fn lbrdfBurley(nl : f32, nv : f32, lh : f32, roughness : f32) : f32 {
+    let energyBias : f32 = LBRDF_BURLEY_BIAS * roughness;
+    let energyFactor : f32 = (1.0 as f32) + roughness * ((1.0 as f32) / LBRDF_BURLEY_NORM - (1.0 as f32));
+    let fd90 : f32 = energyBias + (2.0 as f32) * lh * lh * roughness;
+    let lightScatter : f32 = (1.0 as f32) + (fd90 - (1.0 as f32)) * lightFresnelWeight(nl);
+    let viewScatter : f32 = (1.0 as f32) + (fd90 - (1.0 as f32)) * lightFresnelWeight(nv);
+    return lightScatter * viewScatter * energyFactor / PI;
+}
+
+/**
+ * Derives the per-view quantities of a material from the albedo table entry `dfg` of its roughness and `nv`: F0, the
+ * multiple-scattering compensation 1 + F0 (1/E - 1) with E = dfg.a + dfg.b, the albedo of the compensated lobe, and
+ * the diffuse albedo left over: baseColor (1 - metallic) (1 - specular albedo).
+ */
+pub fn lightPrepare(material : LightMaterial, dfg : LightDfg) : LightPrepared {
+    let dielectric : Vec3 = Vec3::splat(LIGHT_DIELECTRIC_F0);
+    let f0 : Vec3 = dielectric.lerp(material.baseColor, material.metallic);
+    let e : f32 = max(dfg.a + dfg.b, LBRDF_E_MIN);
+    let boost : f32 = (1.0 as f32) / e - (1.0 as f32);
+    let compensation : Vec3 = Vec3::splat(1.0).plus(f0.scale(boost));
+    let single : Vec3 = f0.scale(dfg.a).plus(Vec3::splat(dfg.b));
+    let albedo : Vec3 = single.times(compensation);
+    let left : Vec3 = Vec3::splat(1.0).minus(albedo);
+    let keep : Vec3 = left.componentMax(Vec3::zero());
+    return LightPrepared {
+        f0: f0,
+        diffuse: material.baseColor.scale((1.0 as f32) - material.metallic).times(keep),
+        alpha: lightAlpha(material.roughness),
+        roughness: material.roughness,
+        compensation: compensation,
+        specularAlbedo: albedo,
+        diffuseModel: material.diffuseModel,
+    };
+}
+
+/**
+ * The BRDF f = fd + fs for unit vectors n (normal), v (to the eye) and l (to the light), parts kept apart. Zero when l
+ * is below the horizon. It does not include the cosine n.l: that belongs to the irradiance.
+ */
+pub fn lightBrdf(p : LightPrepared, n : Vec3, v : Vec3, l : Vec3) : LightBrdfTerms {
+    let nl : f32 = n.dot(l);
+    if (nl <= 0.0) {
+        return LightBrdfTerms {};
+    }
+    let nv : f32 = max(n.dot(v), LIGHT_NV_MIN);
+    let h : Vec3 = l.plus(v).normalizedOr(n);
+    let nh : f32 = saturate(n.dot(h));
+    let vh : f32 = saturate(v.dot(h));
+    let spec : f32 = lightGgxD(nh, p.alpha) * lightSmithV(nl, nv, p.alpha);
+    let specular : Vec3 = lightFresnel(p.f0, vh).times(p.compensation).scale(spec);
+    let lobe : f32 = match p.diffuseModel {
+        LightDiffuseModel::Lambert => (1.0 as f32) / PI,
+        LightDiffuseModel::Burley => lbrdfBurley(nl, nv, vh, p.roughness),
+    };
+    return LightBrdfTerms { diffuse: p.diffuse.scale(lobe), specular: specular };
+}
+
+/** The scalar specular lobe D V F (F given) in f64, without compensation: the integrand of the albedo table. */
+pub fn lightSpecularScalarD(nl : f64, nv : f64, nh : f64, vh : f64, alpha : f64, f0 : f64) : f64 {
+    let w : f64 = lightFresnelWeightD(vh);
+    return lightGgxDD(nh, alpha) * lightSmithVD(nl, nv, alpha) * (f0 + (1.0 - f0) * w);
+}

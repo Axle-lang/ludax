@@ -1,0 +1,449 @@
+// light_sky — an analytic clear sky by single scattering with exact optical depth (doc/LIGHTING_MATH.md §5).
+//
+// The atmosphere is a sphere (radius R) with two exponential species: Rayleigh (scale height 8 km, beta_R(lambda) ~
+// lambda^-4, RGB 5.802, 13.558, 33.1 per megametre) and Mie (1.2 km, grey, g = 0.76, Cornette-Shanks phase). The
+// optical depth from a point at altitude h along a direction at zenith angle chi to infinity is
+//     tau = beta rho0 H exp(-h/H) Ch(X, chi),       X = (R + h) / H,
+// where the CHAPMAN FUNCTION  Ch(X, chi) = integral_0^inf exp(X - sqrt(X^2 + 2 X s cos chi + s^2)) ds  (s in scale
+// heights) is evaluated by Gauss-Legendre quadrature of that integral on panels that follow its decay, with no march
+// and no noise. For chi beyond a right angle the ray first descends; the exact identity
+//     Ch(X, chi) = 2 exp(X - X sin chi) Ch(X sin chi, pi/2) - Ch(X, pi - chi)
+// reduces it to the first case, and a ray whose lowest point is under the ground is blocked (transmittance
+// 0).
+//
+// The sun's light reaching a point is attenuated by the Chapman optical depth towards the sun; the scattering along a
+// view ray is integrated with a fixed Gauss-Legendre rule (32 nodes, cubic spacing). The sun's own colour at the viewer
+// is its transmittance, so sunsets redden by construction. The sun's top-of-atmosphere irradiance is normalised so that
+// the overhead sun delivers exactly the reference sun (scene irradiance pi in green): the sky, the sun disc and the
+// `LightSource` for the sun are one consistent model. The moon is the same model at 2.5e-6 of the sun's strength,
+// tinted, always opposite to the sun (a full moon).
+//
+// Checks (suite): Chapman against a million-step trapezoid, Ch(X,0) = 1, the secant law at small angles, the
+// right-angle asymptotic series, continuity across the identity; zenith bluer than horizon, sunset reddening monotone,
+// disc radiance integrates to the sun's irradiance, energy bounds, night. Differences from voxel-axle: its sky was a
+// three-colour gradient lerped by a daylight number; here the colour and the sun's tint follow from the same optical
+// depths. Not in the shading subset (it integrates); its results are baked into SH9 and into the sun and moon
+// `LightSource`s.
+
+use crate::core::math::scalar::{PI, PI_D, TAU_D, max, maxD, minD, saturate};
+use crate::core::math::trig::{sin, sinD, cosD, sqrtD, asinD};
+use crate::core::math::vec3::Vec3;
+use crate::render::light::light_math::lightExp2D;
+use crate::render::light::light_quadrature::LightGauss;
+use crate::render::light::light_sh::{LightEnvironment, LightSh9};
+use crate::render::light::light_shade::LightDirectAmbient;
+use crate::render::light::light_source::LightSource;
+use crate::render::light::light_units::LightUnits;
+
+// Planet and species (SI units), after Hillaire 2020 for the coefficients.
+const LSKY_PLANET : f64 = 6371000.0;
+const LSKY_HEIGHT_R : f64 = 8000.0;
+const LSKY_HEIGHT_M : f64 = 1200.0;
+const LSKY_RAYLEIGH_R : f64 = 0.000005802;
+const LSKY_RAYLEIGH_G : f64 = 0.000013558;
+const LSKY_RAYLEIGH_B : f64 = 0.0000331;
+const LSKY_MIE_SCATTER : f64 = 0.000003996;
+const LSKY_MIE_EXTINCT : f64 = 0.00000444;
+const LSKY_MIE_G : f64 = 0.76;
+const LSKY_TOP : f64 = 80000.0;
+const LSKY_LN2 : f64 = 0.69314718055994530942;
+const LSKY_INV_LN2 : f64 = 1.44269504088896340736;
+
+// The sun's angular radius (0.533 degrees diameter) and the moon's, in radians.
+const LSKY_SUN_RADIUS : f64 = 0.004650;
+const LSKY_MOON_RADIUS : f64 = 0.004540;
+
+// Moon strength relative to the sun, and the floor of starlight/airglow (scene radiance).
+const LSKY_MOON_RATIO : f64 = 0.0000025;
+const LSKY_STARLIGHT : f32 = 0.00000006;
+
+// How far the exponent of the Chapman integrand must fall before the integral is cut: e^-45 ~ 3e-20.
+const LSKY_CUT : f64 = 45.0;
+
+// The Chapman integral is split into this many panels (see `lskyPanelEdge`).
+const LSKY_PANELS : i32 = 5;
+
+// The order of the rule the sky owns for optical depths, and of the view-ray rule `skyRadiance` uses.
+const LSKY_RULE_ORDER : i32 = 16;
+const LSKY_VIEW_SAMPLES : i32 = 24;
+
+// What `atDayTime` assumes: an eye two metres above the ground, over ground that reflects a quarter of the light.
+const LSKY_DEFAULT_EYE : f64 = 2.0;
+const LSKY_DEFAULT_ALBEDO : f32 = 0.25;
+
+// The day starts at sunrise, a quarter of the way round (voxel-axle's convention).
+const LSKY_SUNRISE : f64 = 0.25;
+
+// The overhead transmittance that normalises the sun is kept above this, so a sky under a blocked sun cannot divide by 0.
+const LSKY_OVERHEAD_MIN : f32 = 0.000001;
+
+// A ground point is lit by the whole sky; the sky towards the horizon, where a flat ground sees most of it, stands for
+// it: the mirrored view direction keeps only this fraction of its elevation.
+const LSKY_GROUND_FLATTEN : f32 = 0.05;
+
+// One body of light seen along a view ray: the ray, the body, and what the integral needs of both.
+struct LskyView {
+    dir    : Vec3 = Vec3 {};
+    body   : Vec3 = Vec3 {};
+    top    : Vec3 = Vec3 {};
+    eye    : f64 = 0.0;
+    phaseR : f32 = 0.0;
+    phaseM : f32 = 0.0;
+    eyeTau : Vec3 = Vec3 {};
+}
+
+// The light one sample point of a view ray scatters towards the eye; `lit` is false when the ground shades it.
+struct LskyTerm {
+    lit      : bool = false;
+    radiance : Vec3 = Vec3 {};
+}
+
+// The cool tint of moonlight, and of starlight (scene colour ratios).
+fn lskyMoonTint() : Vec3 {
+    return Vec3::make(0.8, 0.9, 1.15);
+}
+
+fn lskyStarTint() : Vec3 {
+    return Vec3::make(0.8, 0.9, 1.2);
+}
+
+// The Rayleigh phase function at the cosine of the scattering angle.
+fn lskyPhaseR(cosTheta : f32) : f32 {
+    return (3.0 as f32) / ((16.0 as f32) * PI) * ((1.0 as f32) + cosTheta * cosTheta);
+}
+
+// The Cornette-Shanks phase function of Mie scattering (asymmetry `LSKY_MIE_G`).
+fn lskyPhaseM(cosTheta : f32) : f32 {
+    let g : f32 = LSKY_MIE_G as f32;
+    let denom : f32 = (1.0 as f32) + g * g - (2.0 as f32) * g * cosTheta;
+    let miePhaseScale : f32 = (3.0 as f32) / ((8.0 as f32) * PI) * ((1.0 as f32) - g * g);
+    let numerator : f32 = miePhaseScale * ((1.0 as f32) + cosTheta * cosTheta);
+    let denominator : f32 = ((2.0 as f32) + g * g) * denom * (denom.sqrt());
+    return numerator / denominator;
+}
+
+// The extinction per channel of rayleigh depth `dr` and mie depth `dm`.
+fn lskyExtinction(dr : f64, dm : f64) : Vec3 {
+    return Vec3::make(
+        (LSKY_RAYLEIGH_R * dr + LSKY_MIE_EXTINCT * dm) as f32,
+        (LSKY_RAYLEIGH_G * dr + LSKY_MIE_EXTINCT * dm) as f32,
+        (LSKY_RAYLEIGH_B * dr + LSKY_MIE_EXTINCT * dm) as f32
+    );
+}
+
+// The scattering coefficient per channel at densities `rhoR`, `rhoM`, with the two phase functions applied.
+fn lskyScatter(rhoR : f64, rhoM : f64, phaseR : f32, phaseM : f32) : Vec3 {
+    return Vec3::make(
+        (LSKY_RAYLEIGH_R * rhoR) as f32 * phaseR + (LSKY_MIE_SCATTER * rhoM) as f32 * phaseM,
+        (LSKY_RAYLEIGH_G * rhoR) as f32 * phaseR + (LSKY_MIE_SCATTER * rhoM) as f32 * phaseM,
+        (LSKY_RAYLEIGH_B * rhoR) as f32 * phaseR + (LSKY_MIE_SCATTER * rhoM) as f32 * phaseM
+    );
+}
+
+// The transmittance exp(-tau) per channel of an optical depth.
+fn lskyTransmit(tau : Vec3) : Vec3 {
+    return Vec3::make(
+        lightExp2D(-(tau.x as f64) * LSKY_INV_LN2) as f32,
+        lightExp2D(-(tau.y as f64) * LSKY_INV_LN2) as f32,
+        lightExp2D(-(tau.z as f64) * LSKY_INV_LN2) as f32
+    );
+}
+
+// The edges of the five integration panels, which follow the decay of the integrand towards its cut.
+fn lskyPanelEdge(i : i32, reach : f64) : f64 {
+    return match i {
+        0 => 0.0,
+        1 => reach / 64.0,
+        2 => reach / 16.0,
+        3 => reach / 4.0,
+        4 => reach / 2.0,
+        _ => reach,
+    };
+}
+
+/** The Chapman function Ch(X, chi) for the angle with cosine `cosChi` (chi up to a right angle) by quadrature. */
+fn lskyChapmanUp(rule : LightGauss, x : f64, cosChi : f64) : f64 {
+    let c : f64 = maxD(cosChi, 0.0);
+    let reach : f64 = 0.0 - x * c + sqrtD(x * x * c * c + 2.0 * LSKY_CUT * x + LSKY_CUT * LSKY_CUT);
+    let mut total : f64 = 0.0;
+    for (panel of 0..LSKY_PANELS) {
+        let lo : f64 = lskyPanelEdge(panel, reach);
+        let hi : f64 = lskyPanelEdge(panel + 1, reach);
+        for (i of 0..rule.order()) {
+            let s : f64 = rule.at(i, lo, hi);
+            let r : f64 = sqrtD(x * x + 2.0 * x * s * c + s * s);
+            total = total + rule.scaled(i, lo, hi) * lightExp2D((x - r) * LSKY_INV_LN2);
+        }
+    }
+    return total;
+}
+
+/**
+ * The Chapman function Ch(X, chi) for X = (R + h) / H and zenith angle chi, given as `sinChi` and `cosChi`. Ch is the
+ * optical depth towards space in units of the vertical optical depth at the point: 1 straight up, about 1/cos chi for
+ * a small angle, about sqrt(pi X / 2) at the horizon, and e^(X(1 - sin chi))-large below it. A ray that dips below the
+ * ground (X sin chi < xGround for chi past a right angle) answers -1: it never reaches space.
+ */
+pub fn lightChapman(rule : LightGauss, x : f64, sinChi : f64, cosChi : f64, xGround : f64) : f64 {
+    if (cosChi >= 0.0) {
+        return lskyChapmanUp(rule, x, cosChi);
+    }
+    let lowest : f64 = x * sinChi;
+    if (lowest < xGround) {
+        return -1.0;
+    }
+
+    // Down past the horizon: twice the depth to the lowest point of the ray, less the depth from the eye back up.
+    let toLowest : f64 = 2.0 * lightExp2D((x - lowest) * LSKY_INV_LN2) * lskyChapmanUp(rule, lowest, 0.0);
+    let backUp : f64 = lskyChapmanUp(rule, x, 0.0 - cosChi);
+    return toLowest - backUp;
+}
+
+/** The sky and the bodies in it for one sun direction; an environment, a sun and a moon. */
+pub class LightSky : LightEnvironment {
+    rule          : LightGauss;
+    sun           : Vec3;
+    eyeHeight     : f64;
+    groundAlbedo  : f32;
+    topIrradiance : f32;
+    discs         : bool;
+
+    /**
+     * A sky with the sun in the unit direction `sunDirection` (towards the sun), seen by an eye `eyeHeight` metres
+     * above sea level over ground of albedo `groundAlbedo`.
+     */
+    constructor(sunDirection : Vec3, eyeHeight : f64, groundAlbedo : f32) {
+        self.rule = new LightGauss(LSKY_RULE_ORDER);
+        self.sun = sunDirection.normalizedOr(Vec3::unitY());
+        self.eyeHeight = eyeHeight;
+        self.groundAlbedo = groundAlbedo;
+        self.topIrradiance = 0.0;
+        self.discs = true;
+        let overhead : Vec3 = self.transmittanceToward(Vec3::unitY());
+        self.topIrradiance = LightUnits::sunScene() / max(overhead.y, LSKY_OVERHEAD_MIN);
+    }
+
+    /**
+     * The sky at a time of day in [0, 1) as voxel-axle counts it (0.25 sunrise, 0.5 noon, 0.75 sunset), the sun tilted
+     * out of the east-west plane by `tilt` (a z component before normalising).
+     */
+    pub static fn atDayTime(dayTime : f64, tilt : f32) : LightSky {
+        let angle : f64 = (dayTime - LSKY_SUNRISE) * TAU_D;
+        let dir : Vec3 = Vec3::make(cosD(angle) as f32, sinD(angle) as f32, tilt);
+        return new LightSky(dir, LSKY_DEFAULT_EYE, LSKY_DEFAULT_ALBEDO);
+    }
+
+    /** Unit vector towards the sun. */
+    pub fn sunDirection(self) : Vec3 {
+        return self.sun;
+    }
+
+    /** Unit vector towards the moon: opposite the sun. */
+    pub fn moonDirection(self) : Vec3 {
+        return self.sun.negated();
+    }
+
+    // Optical depth towards space per channel from the eye along the unit direction, in the model's own units; the
+    // transmittance is exp(-tau). Negative on any channel means the ray is blocked by the ground.
+    fn opticalDepthFrom(self, altitude : f64, dir : Vec3) : Vec3 {
+        return self.opticalDepthAt(altitude, Vec3::unitY(), dir);
+    }
+
+    /** The transmittance from the eye to space along `dir` per channel (0 when the ground is in the way). */
+    pub fn transmittanceToward(self, dir : Vec3) : Vec3 {
+        let tau : Vec3 = self.opticalDepthFrom(self.eyeHeight, dir);
+        if (tau.x < 0.0) {
+            return Vec3::zero();
+        }
+        return lskyTransmit(tau);
+    }
+
+    /** The sun's irradiance on a surface facing it at the eye, per channel in scene units (reddened by the air). */
+    pub fn sunIrradiance(self) : Vec3 {
+        return self.transmittanceToward(self.sun).scale(self.topIrradiance);
+    }
+
+    /** The moon's irradiance likewise: the sun's model at 2.5e-6 and a cool tint. */
+    pub fn moonIrradiance(self) : Vec3 {
+        let strength : f32 = self.topIrradiance * (LSKY_MOON_RATIO as f32);
+        return self.transmittanceToward(self.moonDirection()).times(lskyMoonTint()).scale(strength);
+    }
+
+    /** The sun as a directional light: colour is the normalised tint, strength its illuminance, size 0.533 degrees. */
+    pub fn sunLight(self) : LightSource {
+        return self.bodyLight(self.sunIrradiance(), self.sun.negated(), LSKY_SUN_RADIUS);
+    }
+
+    /** The moon as a directional light. */
+    pub fn moonLight(self) : LightSource {
+        return self.bodyLight(self.moonIrradiance(), self.moonDirection().negated(), LSKY_MOON_RADIUS);
+    }
+
+    fn bodyLight(self, irradiance : Vec3, travel : Vec3, radius : f64) : LightSource {
+        let peak : f32 = irradiance.maxComponent();
+        let mut tint : Vec3 = Vec3::splat(1.0);
+        if (peak > 0.0) {
+            tint = irradiance.scale((1.0 as f32) / peak);
+        }
+        return LightSource::directional(tint, LightUnits::sceneToLux(peak), travel, (radius * 2.0) as f32);
+    }
+
+    // The single-scattered radiance of one body of top irradiance `top` (per channel) towards `dir` (dir.y >= 0).
+    fn scattered(self, dir : Vec3, body : Vec3, top : Vec3, samples : i32) : Vec3 {
+        let eye : f64 = LSKY_PLANET + self.eyeHeight;
+        // Distance along dir to the top of the atmosphere: |(0,eye,0) + s dir| = R + top.
+        let rt : f64 = LSKY_PLANET + LSKY_TOP;
+        let b : f64 = eye * (dir.y as f64);
+        let reach : f64 = 0.0 - b + sqrtD(b * b + rt * rt - eye * eye);
+        let cosTheta : f32 = dir.dot(body);
+        let view : LskyView = LskyView {
+            dir: dir,
+            body: body,
+            top: top,
+            eye: eye,
+            phaseR: lskyPhaseR(cosTheta),
+            phaseM: lskyPhaseM(cosTheta),
+            eyeTau: self.opticalDepthFrom(self.eyeHeight, dir),
+        };
+
+        let rule : LightGauss = new LightGauss(samples);
+        let mut sum : Vec3 = Vec3::zero();
+        for (i of 0..samples) {
+            // Cubic spacing packs the samples where the air is thick, near the eye.
+            let t : f64 = rule.at(i, 0.0, 1.0);
+            let s : f64 = reach * t * t * t;
+            let ds : f64 = rule.scaled(i, 0.0, 1.0) * reach * 3.0 * t * t;
+            let term : LskyTerm = self.scatterAt(view, s);
+            if (term.lit) {
+                sum = sum.plus(term.radiance.scale(ds as f32));
+            }
+        }
+        return sum;
+    }
+
+    // What the point at distance `s` along the view ray scatters towards the eye: the body's light reaching it, the
+    // scattering there and the loss on the way to the eye.
+    fn scatterAt(self, view : LskyView, s : f64) : LskyTerm {
+        let px : f64 = s * (view.dir.x as f64);
+        let py : f64 = view.eye + s * (view.dir.y as f64);
+        let pz : f64 = s * (view.dir.z as f64);
+        let r : f64 = sqrtD(px * px + py * py + pz * pz);
+        let altitude : f64 = r - LSKY_PLANET;
+        let up : Vec3 = Vec3::make((px / r) as f32, (py / r) as f32, (pz / r) as f32);
+        let bodyTau : Vec3 = self.opticalDepthAt(altitude, up, view.body);
+        if (!(bodyTau.x >= 0.0)) {
+            return LskyTerm {};
+        }
+
+        let viewTau : Vec3 = self.opticalDepthAt(altitude, up, view.dir);
+        let rhoR : f64 = lightExp2D(0.0 - altitude / LSKY_HEIGHT_R * LSKY_INV_LN2);
+        let rhoM : f64 = lightExp2D(0.0 - altitude / LSKY_HEIGHT_M * LSKY_INV_LN2);
+        let scatter : Vec3 = lskyScatter(rhoR, rhoM, view.phaseR, view.phaseM);
+        let total : Vec3 = bodyTau.plus(view.eyeTau.minus(viewTau));
+        return LskyTerm { lit: true, radiance: view.top.times(scatter).times(lskyTransmit(total)) };
+    }
+
+    // Optical depth to space from a point at `altitude` whose local vertical is `up`, along the world
+    // direction `dir`.
+    fn opticalDepthAt(self, altitude : f64, up : Vec3, dir : Vec3) : Vec3 {
+        let cosChi : f64 = up.dot(dir) as f64;
+        let sinChi : f64 = sqrtD(maxD(1.0 - cosChi * cosChi, 0.0));
+        let xr : f64 = (LSKY_PLANET + altitude) / LSKY_HEIGHT_R;
+        let xm : f64 = (LSKY_PLANET + altitude) / LSKY_HEIGHT_M;
+        let cr : f64 = lightChapman(self.rule, xr, sinChi, cosChi, LSKY_PLANET / LSKY_HEIGHT_R);
+        let cm : f64 = lightChapman(self.rule, xm, sinChi, cosChi, LSKY_PLANET / LSKY_HEIGHT_M);
+        if (cr < 0.0 || cm < 0.0) {
+            return Vec3::splat(-1.0);
+        }
+
+        let densityR : f64 = lightExp2D(0.0 - altitude / LSKY_HEIGHT_R * LSKY_INV_LN2);
+        let densityM : f64 = lightExp2D(0.0 - altitude / LSKY_HEIGHT_M * LSKY_INV_LN2);
+        let dr : f64 = LSKY_HEIGHT_R * densityR * cr;
+        let dm : f64 = LSKY_HEIGHT_M * densityM * cm;
+        return lskyExtinction(dr, dm);
+    }
+
+    /**
+     * The sky's own radiance towards `dir` without the sun and moon discs: sun and moon single scattering plus
+     * starlight above the horizon, and a Lambertian ground of the constructor's albedo below it (lit by the sun and by
+     * the sky at the mirrored direction). `samples` is the order of the view-ray rule (16..48).
+     */
+    pub fn skyRadianceWith(self, dir : Vec3, samples : i32) : Vec3 {
+        if (dir.y < 0.0) {
+            return self.groundRadiance(dir, samples);
+        }
+        let day : Vec3 = self.scattered(dir, self.sun, Vec3::splat(self.topIrradiance), samples);
+        let moonTop : Vec3 = lskyMoonTint().scale(self.topIrradiance * (LSKY_MOON_RATIO as f32));
+        let night : Vec3 = self.scattered(dir, self.moonDirection(), moonTop, samples);
+        let stars : Vec3 = lskyStarTint().scale(LSKY_STARLIGHT);
+        return day.plus(night).plus(stars);
+    }
+
+    // The radiance of the Lambertian ground seen along the downward `dir`: the sun on it plus the sky at the flattened
+    // mirror of the view, spread by the ground's albedo.
+    fn groundRadiance(self, dir : Vec3, samples : i32) : Vec3 {
+        let mirrored : Vec3 = Vec3::make(dir.x, -dir.y * LSKY_GROUND_FLATTEN, dir.z).normalized();
+        let sky : Vec3 = self.skyRadianceWith(mirrored, samples);
+        let sunOnGround : Vec3 = self.sunIrradiance().scale(max(self.sun.y, 0.0));
+        return sunOnGround.plus(sky.scale(PI)).scale(self.groundAlbedo / PI);
+    }
+
+    /** `skyRadianceWith` at the default order 24. */
+    pub fn skyRadiance(self, dir : Vec3) : Vec3 {
+        return self.skyRadianceWith(dir, LSKY_VIEW_SAMPLES);
+    }
+
+    /**
+     * The radiance the eye sees towards `dir`: the sky, plus the sun's and the moon's discs. A disc's radiance is its
+     * irradiance divided by pi sin^2(angular radius), so integrating it over the disc returns the irradiance.
+     */
+    pub fn radiance(self, dir : Vec3) : Vec3 {
+        let mut result : Vec3 = self.skyRadiance(dir);
+        if (!self.discs) {
+            return result;
+        }
+        if (LightSky::inDisc(dir, self.sun, LSKY_SUN_RADIUS)) {
+            let sunDisc : Vec3 = self.sunIrradiance().scale(LightSky::discScale(LSKY_SUN_RADIUS));
+            result = result.plus(sunDisc);
+        }
+        if (LightSky::inDisc(dir, self.moonDirection(), LSKY_MOON_RADIUS)) {
+            let moonDisc : Vec3 = self.moonIrradiance().scale(LightSky::discScale(LSKY_MOON_RADIUS));
+            result = result.plus(moonDisc);
+        }
+        return result;
+    }
+
+    // True when `dir` points into the disc of angular `radius` around `axis`.
+    static fn inDisc(dir : Vec3, axis : Vec3, radius : f64) : bool {
+        return (dir.dot(axis) as f64) >= cosD(radius);
+    }
+
+    // The factor from a disc's irradiance to its radiance: 1 / (pi sin^2 radius), so integrating the radiance over the
+    // disc returns the irradiance.
+    static fn discScale(radius : f64) : f32 {
+        let s : f64 = sinD(radius);
+        return (1.0 / (PI_D * s * s)) as f32;
+    }
+
+    /**
+     * The sky dome's SH9 (without the discs: they are lights), by `bands` Gauss-Legendre bands. Builds a second sky of
+     * the same sun with the discs switched off, because a trait object cannot be a view of `self`.
+     */
+    pub fn ambient(self, bands : i32) : LightSh9 {
+        let mut dome : LightSky = new LightSky(self.sun, self.eyeHeight, self.groundAlbedo);
+        dome.discs = false;
+        return LightSh9::project(dome, bands);
+    }
+
+    /**
+     * Voxel's `FaceLight` in RGB for a white Lambertian surface of normal `n`: direct = the sun's and moon's
+     * irradiance times max(0, n.l) / pi (the radiance the surface shows), ambient = the dome's SH9 cosine
+     * convolution `dome.irradiance(n)`.
+     */
+    pub fn faceLight(self, n : Vec3, dome : LightSh9) : LightDirectAmbient {
+        let sunLit : Vec3 = self.sunIrradiance().scale(max(n.dot(self.sun), 0.0));
+        let moonLit : Vec3 = self.moonIrradiance().scale(max(n.dot(self.moonDirection()), 0.0));
+        let direct : Vec3 = sunLit.plus(moonLit).scale((1.0 as f32) / PI);
+        return LightDirectAmbient { direct: direct, ambient: dome.irradiance(n) };
+    }
+}

@@ -1,0 +1,196 @@
+// light_source — the kinds of light and the data of one light.
+//
+// A light is plain data: where it is, which way it points, how bright (already in scene units, see light_units), how
+// far it reaches, and which surfaces it may touch. The shading code reads these fields and never owns a light, so a
+// `LightingScene` can hold them in a flat `Vec<LightSource>` and a GPU buffer can mirror the layout.
+//
+// Differences from voxel-axle: one sky body (sun or moon) became any number of lights of four kinds; every light
+// carries layer masks and an object exclusion, so "this torch does not light the player's hands" is data, not a special
+// case in a shader.
+
+use crate::core::math::scalar::{PI, max};
+use crate::core::math::trig::cos;
+use crate::core::math::vec3::Vec3;
+use crate::render::light::light_units::LightUnits;
+
+/** Every layer: the default include mask, and a surface on all layers. */
+pub const LIGHT_LAYERS_ALL : u32 = 4294967295;
+
+/** The kinds of light. Matched exhaustively wherever the kind changes the maths. */
+pub enum LightKind : i8 {
+    /** Parallel rays from far away (the sun, the moon); its angular diameter makes the penumbra. */
+    Directional = 0,
+    /** A sphere of light: inverse-square falloff, a finite radius (no singularity) and a smooth range. */
+    Point = 1,
+    /** A point light inside a cone with a smooth edge. */
+    Spot = 2,
+    /** A small one-sided emitting disc: a lit window, a screen, an emissive voxel face. */
+    Emissive = 3,
+}
+
+/** How a light's shadow is found. Chosen per light; the shading code only receives the resulting factor. */
+pub enum LightShadowMode : i8 {
+    /** The light casts no shadow. */
+    None = 0,
+    /** Visibility baked into a field (voxel ray visibility, a lightmap). */
+    Baked = 1,
+    /** A shadow map. */
+    Map = 2,
+    /** A ray traced at shading time (the CPU reference, the voxel DDA). */
+    Ray = 3,
+}
+
+/** One light. Build it with `directional`, `point`, `spot` or `emissive`; those fill every field consistently. */
+pub struct LightSource {
+    /** Which kind of light this is. */
+    pub kind : LightKind = LightKind::Point;
+
+    /** Linear RGB tint, brightness-free: (1, 1, 1) is white. */
+    pub color : Vec3 = Vec3 { x: 1.0, y: 1.0, z: 1.0 };
+
+    /**
+     * Strength in scene units: irradiance for a directional light, intensity for a point or spot light,
+     * radiance for an emissive one. Set through the constructors from lux, candela or cd/m^2.
+     */
+    pub intensity : f32 = 0.0;
+
+    /** Position in the shading space (unused by a directional light). */
+    pub position : Vec3 = Vec3 {};
+
+    /** Unit direction the light travels in (a directional or spot light), or the emitter's normal (emissive). */
+    pub direction : Vec3 = Vec3 { x: 0.0, y: -1.0, z: 0.0 };
+
+    /** Distance at which the smooth window reaches exactly 0; 0 means unlimited. */
+    pub range : f32 = 0.0;
+
+    /** Radius of the sphere (point, spot) or disc (emissive) in world units: no light is brighter than at it. */
+    pub radius : f32 = 0.0;
+
+    /** Angular diameter of a directional light in radians: the sun is about 0.0093. */
+    pub angularDiameter : f32 = 0.0;
+
+    /** Cosine of the spot's inner half-angle: full strength inside it. */
+    pub cosInner : f32 = 1.0;
+
+    /** Cosine of the spot's outer half-angle: no light outside it. */
+    pub cosOuter : f32 = 1.0;
+
+    /** How the shadow is found. */
+    pub shadowMode : LightShadowMode = LightShadowMode::None;
+
+    /** Surfaces whose layer shares a bit with this mask are lit. */
+    pub includeLayers : u32 = 4294967295;
+
+    /** Surfaces whose layer shares a bit with this mask are never lit, even when included. */
+    pub excludeLayers : u32 = 0;
+
+    /** The id of one object this light never lights, or -1 for none. */
+    pub excludeObject : i32 = -1;
+
+    /** True for a light that never moves, so a bake may keep its result. */
+    pub isStatic : bool = false;
+
+    /** A directional light of `lux` illuminance travelling along `direction`, with an angular diameter in radians. */
+    pub static fn directional(
+        color : Vec3,
+        lux : f32,
+        direction : Vec3,
+        angularDiameter : f32
+    ) : LightSource {
+        return LightSource {
+            kind: LightKind::Directional,
+            color: color,
+            intensity: LightUnits::luxToScene(lux),
+            direction: direction.normalizedOr(Vec3::make(0.0, -1.0, 0.0)),
+            angularDiameter: max(angularDiameter, 0.0),
+        };
+    }
+
+    /** A point light of `candela` at `position`, a sphere of `radius`, reaching `range` (0 = unlimited). */
+    pub static fn point(
+        color : Vec3,
+        candela : f32,
+        position : Vec3,
+        radius : f32,
+        range : f32
+    ) : LightSource {
+        return LightSource {
+            kind: LightKind::Point,
+            color: color,
+            intensity: LightUnits::candelaToScene(candela),
+            position: position,
+            radius: max(radius, 0.0),
+            range: max(range, 0.0),
+        };
+    }
+
+    /**
+     * A spot light of `candela` at `position` pointing along `direction`. Full strength inside `innerAngle`,
+     * nothing beyond `outerAngle` (both half-angles in radians, outer clamped to at least inner).
+     */
+    pub static fn spot(
+        color : Vec3,
+        candela : f32,
+        position : Vec3,
+        direction : Vec3,
+        innerAngle : f32,
+        outerAngle : f32,
+        radius : f32,
+        range : f32
+    ) : LightSource {
+        let outer : f32 = max(outerAngle, innerAngle);
+        return LightSource {
+            kind: LightKind::Spot,
+            color: color,
+            intensity: LightUnits::candelaToScene(candela),
+            position: position,
+            direction: direction.normalizedOr(Vec3::make(0.0, -1.0, 0.0)),
+            radius: max(radius, 0.0),
+            range: max(range, 0.0),
+            cosInner: lightCosClamped(innerAngle),
+            cosOuter: lightCosClamped(outer),
+        };
+    }
+
+    /** An emitting disc of `luminance` cd/m^2 and `radius` at `position`, facing `normal`, reaching `range`. */
+    pub static fn emissive(
+        color : Vec3,
+        luminance : f32,
+        position : Vec3,
+        normal : Vec3,
+        radius : f32,
+        range : f32
+    ) : LightSource {
+        return LightSource {
+            kind: LightKind::Emissive,
+            color: color,
+            intensity: LightUnits::luminanceToScene(luminance),
+            position: position,
+            direction: normal.normalizedOr(Vec3::make(0.0, 1.0, 0.0)),
+            radius: max(radius, 0.0),
+            range: max(range, 0.0),
+        };
+    }
+
+    /** The area of an emissive disc, pi r^2. */
+    pub fn emitterArea(self) : f32 {
+        return PI * self.radius * self.radius;
+    }
+
+    /** True when this light may light a surface on `layer` that is the object `objectId`. */
+    pub fn mayLight(self, layer : u32, objectId : i32) : bool {
+        return (self.includeLayers & layer) != 0 && (self.excludeLayers & layer) == 0
+            && objectId != self.excludeObject;
+    }
+}
+
+// The cosine of a half-angle limited to the open range where it is a cone: 0..pi.
+fn lightCosClamped(angle : f32) : f32 {
+    if (angle <= 0.0) {
+        return 1.0;
+    }
+    if (angle >= PI) {
+        return -1.0;
+    }
+    return cos(angle);
+}
