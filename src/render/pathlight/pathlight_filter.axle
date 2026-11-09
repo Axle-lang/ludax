@@ -1,0 +1,179 @@
+// pathlight_filter — the edge-avoiding spatial filter, one pixel at a time.
+//
+// A pixel with few samples in its history is noisy, so it is replaced by a weighted mean of its 3 x 3 neighbours
+// taken at a stride of 1, 2 and then 4 pixels (three rounds, the a-trous scheme: a wide kernel for the price of
+// three small ones). A neighbour counts only if it lies on the same surface plane, within a distance that grows
+// with the pixel's own distance from the eye, and its light is close to the centre's in brightness and in
+// colour, measured in units of the pixel's own variance. Edges, sky, water and mirrors (a negative surface id)
+// are never filtered: their light is not smooth over a plane. The function reads buffers and returns a colour;
+// where the frame stores it, and which rows a thread draws, are the frame's business, so the result cannot
+// depend on either.
+
+use crate::core::math::scalar::max;
+use crate::core::math::vec3::Vec3;
+use crate::render::pathlight::pathlight_pixels::{pixelAt, pixelLuma};
+
+/** A pixel with this many samples in its history is smooth enough to skip the filter. */
+pub const FILTER_SMOOTH : f32 = 24.0;
+
+/** How many rounds the filter makes: strides 1, 2 and 4. */
+pub const FILTER_ROUNDS : i32 = 3;
+
+// Weights of the kernel: the centre pixel, its axis neighbours and its diagonals.
+const FILTER_CENTRE : f32 = 4.0;
+const FILTER_AXIS : f32 = 2.0;
+const FILTER_DIAGONAL : f32 = 1.0;
+
+// How far a neighbour may be in cells: a floor plus a share of the pixel's distance from the eye.
+const FILTER_REACH : f32 = 0.12;
+const FILTER_REACH_SLOPE : f32 = 0.012;
+
+// With no history, a neighbour's light may differ by this much of the pixel's own brightness (plus this floor).
+const FILTER_NO_HISTORY : f32 = 0.6;
+const FILTER_FLOOR : f32 = 0.1;
+
+// With history, the filter trusts the measured variance, but never below this floor.
+const FILTER_SIGMA : f32 = 0.02;
+const FILTER_HISTORY : f32 = 4.0;
+
+// How many samples a pixel needs before the filter trusts its variance instead of a fixed tolerance.
+const FILTER_TRUST : f32 = 4.0;
+
+// How strongly the filter weighs what a neighbour's colour is, not just how bright it is: a colour difference
+// of this share of the centre's brightness (plus the tolerance floor) halves its weight. Luma alone mixes a
+// red wall with a green one of the same brightness.
+const FILTER_CHROMA : f32 = 0.35;
+
+/** The pictures one round of the filter reads, and where in the three rounds it is. */
+pub struct FilterPlane {
+    /** Picture width in pixels. */
+    pub w : i32;
+
+    /** Picture height in pixels. */
+    pub h : i32;
+
+    /** Which round, 0 to `FILTER_ROUNDS - 1`; the stride is `1 << round`. */
+    pub round : i32;
+
+    /** The eye, which turns a pixel's distance into the reach of its neighbourhood. */
+    pub eye : Vec3;
+
+    /** World position of what each pixel hit. */
+    pub pos : f32[];
+
+    /** The temporal stage's blended light, which round 0 reads. */
+    pub blended : f32[];
+
+    /** The light the rounds after the first read: the previous round's output, in `cur` (round 1). */
+    pub cur : f32[];
+
+    /** The previous round's output in round 2, see `cur`. */
+    pub alb : f32[];
+
+    /** First and second moment of each pixel's brightness history, two floats a pixel. */
+    pub mom : f32[];
+
+    /** How many samples each pixel's history holds. */
+    pub cnt : f32[];
+
+    /** The surface id of each pixel. */
+    pub sids : i32[];
+}
+
+// The light of pixel `i` as it stands at the start of this round.
+fn filterLightAt(p : FilterPlane, i : i64) : Vec3 {
+    if (p.round == 0) {
+        return pixelAt(p.blended, i);
+    }
+    if (p.round == 1) {
+        return pixelAt(p.cur, i);
+    }
+    return pixelAt(p.alb, i);
+}
+
+// What a neighbour is compared against: the centre pixel's light and how much it tolerates.
+struct FilterCentre {
+    colour   : Vec3;
+    luma     : f32;
+    invSigma : f32;
+}
+
+/** The spatial filter. */
+pub class LumenFilter {
+    /**
+     * The filtered light of pixel (x, y) in this round: the pixel itself when it is a special surface or already
+     * smooth, otherwise the weighted mean of the neighbours that agree with it.
+     */
+    pub static fn pixel(p : FilterPlane, x : i32, y : i32) : Vec3 {
+        let i : i64 = (y * p.w + x) as i64;
+        let c : Vec3 = filterLightAt(p, i);
+        let s : i32 = p.sids[i];
+        if (s < 0 || p.cnt[i] >= FILTER_SMOOTH) {
+            return c;
+        }
+
+        let here : Vec3 = pixelAt(p.pos, i);
+        let lumC : f32 = pixelLuma(c);
+        let centre : FilterCentre = FilterCentre {
+            colour: c,
+            luma: lumC,
+            invSigma: (1.0 as f32) / LumenFilter::tolerance(p, i, lumC),
+        };
+        let stride : i32 = 1 << p.round;
+        let reach : f32 = (FILTER_REACH_SLOPE * here.distance(p.eye) + FILTER_REACH) * (stride as f32);
+        let reach2 : f32 = reach * reach;
+
+        let mut sum : Vec3 = c.scale(FILTER_CENTRE);
+        let mut weight : f32 = FILTER_CENTRE;
+        for (k of 0..9) {
+            let dx : i32 = (k % 3 - 1) * stride;
+            let dy : i32 = (k / 3 - 1) * stride;
+            if (dx == 0 && dy == 0) {
+                continue;
+            }
+            let xi : i32 = x + dx;
+            let yi : i32 = y + dy;
+            if (xi < 0 || xi >= p.w || yi < 0 || yi >= p.h) {
+                continue;
+            }
+            let j : i64 = (yi * p.w + xi) as i64;
+            if (p.sids[j] != s) {
+                continue;
+            }
+            if (pixelAt(p.pos, j).distanceSquared(here) >= reach2) {
+                continue;
+            }
+
+            let mut kernel : f32 = FILTER_AXIS;
+            if (dx != 0 && dy != 0) {
+                kernel = FILTER_DIAGONAL;
+            }
+            let q : Vec3 = filterLightAt(p, j);
+            let wgt : f32 = LumenFilter::tap(centre, q, kernel);
+            sum = sum.plus(q.scale(wgt));
+            weight = weight + wgt;
+        }
+        return sum.scale((1.0 as f32) / weight);
+    }
+
+    // How different a neighbour's light may be and still count: from the pixel's own variance when it has a
+    // history, generously when it has none. Always above zero, so the caller may divide by it.
+    static fn tolerance(p : FilterPlane, i : i64, lumC : f32) : f32 {
+        if (p.cnt[i] < FILTER_TRUST) {
+            return FILTER_NO_HISTORY * (lumC + FILTER_FLOOR);
+        }
+        let var : f32 = max(p.mom[i * 2 + 1] - p.mom[i * 2] * p.mom[i * 2], 0.0);
+        return FILTER_HISTORY * var.sqrt() + FILTER_SIGMA;
+    }
+
+    // The weight of neighbour light `q`: `kernel` at no difference, falling off smoothly (no exponential needed)
+    // with how far the neighbour is, in units of what the pixel allows. Luma is what noise lives in; the colour
+    // term keeps a red wall from bleeding into a green one of the same brightness.
+    static fn tap(centre : FilterCentre, q : Vec3, kernel : f32) : f32 {
+        let r : f32 = (pixelLuma(q) - centre.luma) * centre.invSigma;
+        let dc : Vec3 = q.minus(centre.colour);
+        let chroma : f32 = (dc.x * dc.x + dc.y * dc.y + dc.z * dc.z).sqrt()
+            / (FILTER_CHROMA * (centre.luma + FILTER_FLOOR));
+        return kernel / ((1.0 as f32) + (r * r + chroma * chroma) * (2.0 as f32));
+    }
+}

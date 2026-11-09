@@ -1,0 +1,575 @@
+// pathlight_sky — the sky of one moment: a radiance map, the sun and the moon as lights, the dome's SH9 and the stars.
+//
+// Ludax's `LightSky` integrates single scattering along a view ray, which is the right answer and too slow to
+// ask once per pixel. So when the time of day changes, the sky's radiance is evaluated over a latitude-
+// longitude grid, in parallel, and every ray afterwards is a bilinear lookup. Blurred copies of the grid
+// stand in for a prefiltered environment: a rough surface reads the blurry one, a mirror the sharp one.
+//
+// The real moon is a million times fainter than the sun, which a camera with a fixed exposure shows as black.
+// Games lift it; here the lift is one named constant (`SKY_MOON_LIFT`) applied to the moon's light, to the
+// moon's scattered sky and to the dome, so the night keeps its physics and only its scale is chosen.
+//
+// The grid and its lookups live in `skygrid`, the cloud deck in `cloud`, and the discs and stars in `celestial`;
+// this file bakes the grid for a time of day and puts the parts together.
+
+use std::concurrent::{AtomicI32, BoundedChannel, Thread};
+use std::lang::{IllegalStateException, InterruptedException};
+
+use crate::core::jobs::kernel::RangeKernel;
+use crate::core::jobs::pool::JobPool;
+use crate::core::math::scalar::{max, saturate, smoothstep, PI, TAU};
+use crate::core::math::trig::{sin, cos, asin, atan2};
+use crate::core::math::vec2::Vec2;
+use crate::core::math::vec3::Vec3;
+use crate::render::light::light_sh::LightSh9;
+use crate::render::light::light_sky::LightSky;
+use crate::render::light::light_source::LightSource;
+use crate::render::pathlight::pathlight_celestial::{
+    SUN_RADIUS, MOON_RADIUS, DISC_EDGE, lumenMoonDisc, lumenStars
+};
+use crate::render::pathlight::pathlight_cloud::{CloudLight, lumenCloudOver};
+use crate::render::pathlight::pathlight_skygrid::SkyGrid;
+
+// ---- the grid and its blurred levels (directions: azimuth wraps, elevation is clamped)
+
+const SKY_W : i32 = 128;
+const SKY_H : i32 = 64;
+const SKY_MID_W : i32 = 32;
+const SKY_MID_H : i32 = 16;
+const SKY_LOW_W : i32 = 8;
+const SKY_LOW_H : i32 = 4;
+
+/** The sky is baked by this many rows per job. */
+const SKY_ROWS_PER_JOB : i32 = 2;
+
+/** The roughness below which a surface reads the sharp sky, and below which it reads the middle blur. */
+const SKY_ROUGH_SHARP : f32 = 0.18;
+const SKY_ROUGH_MID : f32 = 0.5;
+
+// ---- the time of day
+
+/** Noon, as a share of the day: the sky before the first `set`. */
+const SKY_NOON : f64 = 0.5;
+
+/** The axial tilt of the sky at the start, and of every sky after, radians. */
+const SKY_TILT_START : f32 = 0.2;
+const SKY_TILT : f32 = 0.25;
+
+// ---- the moon's light
+
+/** The real moon's share of the sun's light, and the factor games lift it by. */
+const SKY_MOON_RATIO : f32 = 0.0000025;
+const SKY_MOON_LIFT : f32 = 26000.0;
+
+/** The night sky is the day sky lit from the moon: the eye's height above the ground and the ground's albedo. */
+const SKY_NIGHT_EYE : f64 = 2.0;
+const SKY_NIGHT_GROUND : f32 = 0.25;
+
+/** Stars show once the sun is lower than this height (the sine of its elevation), at full strength this far below. */
+const SKY_NIGHT_ONSET : f32 = 0.12;
+const SKY_NIGHT_RATE : f32 = 4.0;
+
+// ---- derived colours
+
+/** The zenith's radiance as the clouds and ground are lit by it: a little above the grid's own. */
+const SKY_ZENITH_GAIN : f32 = 1.1;
+
+/** The deep colour is the zenith's radiance filtered by a tint (water takes red first) and scaled by this. */
+const SKY_DEEP_GAIN : f32 = 0.8;
+
+/** Directions the ambient dome is integrated over, per axis. */
+const SKY_DOME_SAMPLES : i32 = 12;
+
+// ---- haze and the ground beyond the world
+
+/** Haze: the direction is flattened towards the horizon by this, and lifted by this much to read the sky above it. */
+const SKY_HAZE_FLATTEN : f32 = 0.25;
+const SKY_HAZE_LIFT : f32 = 0.05;
+
+/** Haze near the sun: the glare starts at this cosine to the sun and is complete `SKY_HAZE_GLARE_SPAN` later. */
+const SKY_HAZE_GLARE_FROM : f32 = 0.55;
+const SKY_HAZE_GLARE_SPAN : f32 = 0.4;
+
+/** In the glare the air takes the dome's irradiance times this. */
+const SKY_HAZE_DOME : f32 = 0.9;
+
+/** The ground beyond the world is read at this height of the horizon (the sine of an elevation just above it). */
+const SKY_GROUND_HORIZON : f32 = 0.02;
+
+/** The ground fades into the horizon colour at this rate per unit of dip below it. */
+const SKY_GROUND_FADE : f32 = 14.0;
+
+// Moonlit air is bluer than the sun's: the tint of the moon's sky radiance.
+fn skyMoonTint() : Vec3 {
+    return Vec3 { x: 0.8, y: 0.9, z: 1.15 };
+}
+
+// The colour a refracted ray ends on is the zenith filtered by this: water takes red first.
+fn skyDeepTint() : Vec3 {
+    return Vec3 { x: 0.04, y: 0.3, z: 0.34 };
+}
+
+// A dim earth: the albedo of the ground beyond the world, linear.
+fn skyEarth() : Vec3 {
+    return Vec3 { x: 0.13, y: 0.15, z: 0.1 };
+}
+
+// The elevation of grid row `row`, at the middle of the row: -pi/2 at the nadir to pi/2 at the zenith.
+fn skyRowElevation(row : i32) : f32 {
+    return (((row as f32) + (0.5 as f32)) / (SKY_H as f32) - (0.5 as f32)) * PI;
+}
+
+// The azimuth of grid column `col`, at the middle of the column: 0 to tau around the horizon.
+fn skyColumnAzimuth(col : i32) : f32 {
+    return (((col as f32) + (0.5 as f32)) / (SKY_W as f32)) * TAU;
+}
+
+/** Fills the radiance grid, one row of directions per job. */
+pub class SkyKernel : RangeKernel {
+    /** The radiance grid. */
+    pub lut : SkyGrid;
+
+    day   : LightSky;
+    night : LightSky;
+
+    /** A kernel with an empty grid. */
+    constructor() {
+        self.lut = new SkyGrid(SKY_W, SKY_H);
+        self.day = LightSky::atDayTime(SKY_NOON, SKY_TILT_START);
+        self.night = new LightSky(Vec3::unitY(), SKY_NIGHT_EYE, SKY_NIGHT_GROUND);
+    }
+
+    /** Points the kernel at the sky of `dayTime`. */
+    pub fn configure(mut self, dayTime : f64, tilt : f32) : void {
+        self.day = LightSky::atDayTime(dayTime, tilt);
+        self.night = new LightSky(self.day.moonDirection(), SKY_NIGHT_EYE, SKY_NIGHT_GROUND);
+    }
+
+    /** Evaluates rows `begin` up to `end` of the grid. */
+    pub fn runRange(mut self, begin : i32, end : i32) : void {
+        let tint : Vec3 = skyMoonTint();
+        let moonShare : f32 = SKY_MOON_RATIO * (SKY_MOON_LIFT - (1.0 as f32));
+        for (row of begin..end) {
+            let elevation : f32 = skyRowElevation(row);
+            for (col of 0..SKY_W) {
+                let dir : Vec3 = lumenSkyDirection(skyColumnAzimuth(col), elevation);
+                let byDay : Vec3 = self.day.skyRadiance(dir);
+                let byMoon : Vec3 = self.night.skyRadiance(dir).times(tint).scale(moonShare);
+                self.lut.put(col, row, byDay.plus(byMoon));
+            }
+        }
+    }
+}
+
+// ---- the sky baked in the background, for a clock that never stops
+
+/** Message to the baker thread that starts a bake, and the one that ends it. */
+const SKYB_GO : i32 = 1;
+const SKYB_STOP : i32 = -1;
+
+/** The baker's state: nothing asked, a bake running, a finished bake waiting to be taken. */
+const SKYB_IDLE : i32 = 0;
+const SKYB_BUSY : i32 = 1;
+const SKYB_READY : i32 = 2;
+
+// What the baker thread shares with the sky: the time asked for in, the finished dome out (the grid is the baker's kernel's).
+class SkyBakeGate {
+    pub wake  : BoundedChannel;
+    pub state : AtomicI32;
+    pub day   : f64 = 0.0;
+    pub dome  : LightSh9;
+
+    constructor() {
+        self.wake = new BoundedChannel(2);
+        self.state = new AtomicI32(SKYB_IDLE);
+        self.dome = LightSh9::zero();
+    }
+}
+
+// The ambient dome of a sky: the day's plus the moon's lifted share.
+fn skyDomeOf(real : LightSky) : LightSh9 {
+    let nightSky : LightSky = new LightSky(real.moonDirection(), SKY_NIGHT_EYE, SKY_NIGHT_GROUND);
+    let moonDome : LightSh9 = nightSky
+        .ambient(SKY_DOME_SAMPLES)
+        .scaled(SKY_MOON_RATIO * (SKY_MOON_LIFT - (1.0 as f32)));
+    return real.ambient(SKY_DOME_SAMPLES).plus(moonDome);
+}
+
+// The baker thread: sleeps on its channel, bakes the grid and the dome for the time asked, says so, repeats.
+fn skyBakeWorker(gate : SkyBakeGate, kernel : SkyKernel) : void {
+    try {
+        let mut message : i32 = gate.wake.receive();
+        while (message == SKYB_GO) {
+            kernel.configure(gate.day, SKY_TILT);
+            kernel.runRange(0, SKY_H);
+            gate.dome = skyDomeOf(LightSky::atDayTime(gate.day, SKY_TILT));
+            gate.state.set(SKYB_READY);
+            message = gate.wake.receive();
+        }
+    } catch e : InterruptedException {
+        // The channel was closed under the thread: the sky is gone, so leave quietly.
+    }
+}
+
+/**
+ * Bakes the radiance grid and the dome of a time of day on one background thread (some two and a half seconds of
+ * work), so that a moving clock never stalls a frame: `request` asks, `ready` says when the grid and dome can be
+ * read, `release` hands the baker back.
+ */
+pub class SkyBaker {
+    gate    : SkyBakeGate;
+    kernel  : SkyKernel;
+    started : bool = false;
+
+    /** A baker with no thread yet: the first `request` starts it. */
+    constructor() {
+        self.gate = new SkyBakeGate();
+        self.kernel = new SkyKernel();
+    }
+
+    /** Starts a bake of `dayTime` when none is running or waiting; false when the baker is busy. */
+    pub fn request(mut self, dayTime : f64) : bool {
+        if (self.gate.state.get() != SKYB_IDLE) {
+            return false;
+        }
+        if (!self.started) {
+            try {
+                Thread::run(skyBakeWorker, self.gate, self.kernel);
+                self.started = true;
+            } catch e : IllegalStateException {
+                return false;
+            }
+        }
+        self.gate.day = dayTime;
+        self.gate.state.set(SKYB_BUSY);
+        if (!self.gate.wake.trySend(SKYB_GO)) {
+            self.gate.state.set(SKYB_IDLE);
+            return false;
+        }
+        return true;
+    }
+
+    /** True when a finished bake waits to be read through `grid` and `dome`. */
+    pub fn ready(self) : bool {
+        return self.gate.state.get() == SKYB_READY;
+    }
+
+    /** The finished radiance grid. */
+    pub fn grid(self) : SkyGrid {
+        return self.kernel.lut;
+    }
+
+    /** The finished dome. */
+    pub fn dome(self) : LightSh9 {
+        return self.gate.dome;
+    }
+
+    /** Lets the baker bake again once the finished one has been read. */
+    pub fn release(mut self) : void {
+        self.gate.state.set(SKYB_IDLE);
+    }
+
+    /** Ends the thread. */
+    pub fn stop(mut self) : void {
+        if (self.started) {
+            self.gate.wake.trySend(SKYB_STOP);
+            self.started = false;
+        }
+    }
+}
+
+/** The unit direction at azimuth `az` (0..tau, from +z toward +x) and elevation `elev` (-pi/2..pi/2). */
+pub fn lumenSkyDirection(az : f32, elev : f32) : Vec3 {
+    let ce : f32 = cos(elev);
+    return Vec3 { x: sin(az) * ce, y: sin(elev), z: cos(az) * ce };
+}
+
+/** The sky at one moment of the day. */
+pub class LumenSky {
+    kernel  : SkyKernel;
+    pool    : JobPool;
+    baker   : SkyBaker;
+    threads : i32 = 1;
+    mid     : SkyGrid;
+    low     : SkyGrid;
+    real    : LightSky;
+
+    // What the deck, the ground beyond the rim and the deep lake are lit with while this sky stands. All the
+    // same for every pixel until the time of day changes, so `set` works them out once.
+    clouds    : CloudLight;
+    groundLit : Vec3;
+
+    // The cosines at the rim of the two discs and the sun's radiance share per unit irradiance: constants of
+    // the model that `view` would otherwise recompute for every pixel.
+    sunLimit  : f32 = cos(SUN_RADIUS);
+    sunScale  : f32 = (1.0 as f32) / (PI * sin(SUN_RADIUS) * sin(SUN_RADIUS));
+    moonLimit : f32 = cos(MOON_RADIUS);
+
+    /** The colour a refracted ray ends on when the lake bed is out of reach; set with the sky. */
+    pub deep : Vec3;
+
+    /** The sun as a light. */
+    pub sun : LightSource;
+
+    /** The moon as a light, lifted by `SKY_MOON_LIFT`. */
+    pub moon : LightSource;
+
+    /** Unit direction toward the sun. */
+    pub sunDir : Vec3;
+
+    /** Unit direction toward the moon. */
+    pub moonDir : Vec3;
+
+    /** The sun's irradiance at the ground. */
+    pub sunIrr : Vec3;
+
+    /** The moon's irradiance, lifted by `SKY_MOON_LIFT`. */
+    pub moonIrr : Vec3;
+
+    /** The sky dome as nine spherical-harmonic bands, for ambient light. */
+    pub dome : LightSh9;
+
+    /** Time of day this sky was computed for, 0..1. */
+    pub dayTime : f64;
+
+    /** How much of the night sky is showing: 0 day, 1 night. */
+    pub night : f32;
+
+    /** Animation time, for the twinkle and the cloud drift. */
+    pub time : f32;
+
+    /** A sky computed by `workers` threads (at least 1), set to noon. */
+    constructor(workers : i32) {
+        self.kernel = new SkyKernel();
+        self.pool = new JobPool(workers, self.kernel);
+        self.baker = new SkyBaker();
+        self.threads = workers;
+        self.mid = new SkyGrid(SKY_MID_W, SKY_MID_H);
+        self.low = new SkyGrid(SKY_LOW_W, SKY_LOW_H);
+        self.real = LightSky::atDayTime(SKY_NOON, SKY_TILT_START);
+        self.sun = self.real.sunLight();
+        self.moon = self.real.moonLight();
+        self.sunDir = self.real.sunDirection();
+        self.moonDir = self.real.moonDirection();
+        self.sunIrr = self.real.sunIrradiance();
+        self.moonIrr = self.real.moonIrradiance();
+        self.dome = LightSh9::zero();
+        self.dayTime = SKY_NOON;
+        self.night = 0.0;
+        self.time = 0.0;
+
+        // The derived colours start black; the `set` below is the first to fill them, in this order.
+        self.deep = Vec3::zero();
+        self.groundLit = Vec3::zero();
+        self.clouds = CloudLight {
+            sunDir: self.sunDir,
+            sunIrr: self.sunIrr,
+            moonDir: self.moonDir,
+            moonIrr: self.moonIrr,
+            zenith: Vec3::zero(),
+        };
+        self.set(SKY_NOON);
+    }
+
+    /** Stops the worker threads. */
+    pub fn close(mut self) : void {
+        self.baker.stop();
+        self.pool.shutdown();
+    }
+
+    /** Parks the pool by ending its threads (they cost CPU even when idle); `set` then runs on the caller until `resume`. */
+    pub fn suspend(mut self) : void {
+        self.pool.shutdown();
+    }
+
+    /** Starts the pool again after `suspend`. */
+    pub fn resume(mut self) : void {
+        self.pool.shutdown();
+        self.pool = new JobPool(self.threads, self.kernel);
+    }
+
+    /** Recomputes everything for time of day `dayTime` in 0..1 (0.25 sunrise, 0.5 noon, 0.75 sunset). */
+    pub fn set(mut self, dayTime : f64) : void {
+        self.dayTime = dayTime;
+        self.real = LightSky::atDayTime(dayTime, SKY_TILT);
+
+        self.bakeGrid(dayTime);
+        self.deriveLights();
+        self.deriveGroundTerms();
+        self.deriveDome();
+    }
+
+    /**
+     * Follows a moving clock without a stall: the sun, the moon and the derived lights are those of `dayTime` at once,
+     * while the radiance grid and the dome come from a bake in the background and are swapped in when it is done (the
+     * next one is started at once, for the time then). Answers true when a finished bake was swapped in, that is when
+     * the sky of the picture changed a little. `set` is for a jump (the first sky, a key that skips hours).
+     */
+    pub fn glide(mut self, dayTime : f64) : bool {
+        self.dayTime = dayTime;
+        self.real = LightSky::atDayTime(dayTime, SKY_TILT);
+        self.deriveLights();
+        self.night = saturate(SKY_NIGHT_ONSET - self.sunDir.y * SKY_NIGHT_RATE);
+        let mut swapped : bool = false;
+        if (self.baker.ready()) {
+            self.kernel.lut.copyFrom(self.baker.grid());
+            self.kernel.lut.downsampleInto(self.mid);
+            self.kernel.lut.downsampleInto(self.low);
+            self.dome = self.baker.dome();
+            self.baker.release();
+            swapped = true;
+        }
+        self.deriveGroundTerms();
+        self.baker.request(dayTime);
+        return swapped;
+    }
+
+    // Bakes the radiance grid for `dayTime` (in parallel when the pool can) and blurs it into the two coarser levels.
+    fn bakeGrid(mut self, dayTime : f64) : void {
+        self.kernel.configure(dayTime, SKY_TILT);
+        if (!self.pool.run(SKY_H, SKY_ROWS_PER_JOB)) {
+            self.kernel.runRange(0, SKY_H);
+        }
+        self.kernel.lut.downsampleInto(self.mid);
+        self.kernel.lut.downsampleInto(self.low);
+    }
+
+    // The sun and moon as lights and as directions and irradiances; the moon's are lifted.
+    fn deriveLights(mut self) : void {
+        self.sunDir = self.real.sunDirection();
+        self.moonDir = self.real.moonDirection();
+        self.sunIrr = self.real.sunIrradiance();
+        self.moonIrr = self.real.moonIrradiance().scale(SKY_MOON_LIFT);
+        self.sun = self.real.sunLight();
+        self.moon = self.real.moonLight();
+        self.moon.intensity = self.moon.intensity * SKY_MOON_LIFT;
+    }
+
+    // The zenith colour the clouds mix over, the deep-lake colour, and the light of the earth beyond the world:
+    // lookups into the finished grid. The earth is lit by the dome of the previous time of day (`deriveDome`
+    // runs after this), as it always has been: moving that would change every ground pixel.
+    fn deriveGroundTerms(mut self) : void {
+        let up : Vec3 = self.base(Vec3::unitY());
+        self.deep = up.times(skyDeepTint()).scale(SKY_DEEP_GAIN);
+        self.groundLit = self.sunIrr
+            .scale(max(self.sunDir.y, 0.0) / PI)
+            .plus(self.moonIrr.scale(max(self.moonDir.y, 0.0) / PI))
+            .plus(self.dome.irradiance(Vec3::unitY()));
+        self.clouds = CloudLight {
+            sunDir: self.sunDir,
+            sunIrr: self.sunIrr,
+            moonDir: self.moonDir,
+            moonIrr: self.moonIrr,
+            zenith: up.scale(SKY_ZENITH_GAIN),
+        };
+    }
+
+    // The ambient dome (the day's plus the moon's lifted share) and how much of the night shows.
+    fn deriveDome(mut self) : void {
+        self.dome = skyDomeOf(self.real);
+        self.night = saturate(SKY_NIGHT_ONSET - self.sunDir.y * SKY_NIGHT_RATE);
+    }
+
+    // The place of `dir` on the radiance grid as (u, v) in 0..1: azimuth around, elevation up. Two inverse
+    // trigonometric calls, so a lookup that reads several levels works this out once.
+    fn gridPlace(self, dir : Vec3) : Vec2 {
+        let mut az : f32 = atan2(dir.x, dir.z);
+        if (az < 0.0) {
+            az = az + TAU;
+        }
+        let el : f32 = asin(saturate((dir.y + (1.0 as f32)) * (0.5 as f32)) * (2.0 as f32) - (1.0 as f32));
+        return Vec2 { x: az / TAU, y: el / PI + (0.5 as f32) };
+    }
+
+    /** The radiance of the sky towards `dir` without sun, moon, stars or clouds (the grid itself). */
+    pub fn base(self, dir : Vec3) : Vec3 {
+        return self.kernel.lut.look(self.gridPlace(dir));
+    }
+
+    /**
+     * The environment's radiance along `dir` as a surface of perceptual `roughness` reflects it. Only the
+     * levels the answer is blended from are read: a rough surface never sees the sharp grid, and the blur a
+     * mirror would read is not fetched for it.
+     */
+    pub fn prefiltered(self, dir : Vec3, roughness : f32) : Vec3 {
+        let place : Vec2 = self.gridPlace(dir);
+        if (roughness < SKY_ROUGH_MID) {
+            let sharp : Vec3 = self.kernel.lut.look(place);
+            if (roughness < SKY_ROUGH_SHARP) {
+                return sharp;
+            }
+            let mid : Vec3 = self.mid.look(place);
+            return sharp.lerp(mid, (roughness - SKY_ROUGH_SHARP) / (SKY_ROUGH_MID - SKY_ROUGH_SHARP));
+        }
+        let mid : Vec3 = self.mid.look(place);
+        let low : Vec3 = self.low.look(place);
+        return mid.lerp(low, saturate((roughness - SKY_ROUGH_MID) / SKY_ROUGH_MID));
+    }
+
+    /**
+     * What an eye at `eye` sees along `dir` in the sky: the radiance map, the two discs, the stars and
+     * the cloud deck; and, below the horizon, the ground beyond the world's edge.
+     */
+    pub fn view(self, dir : Vec3, eye : Vec3) : Vec3 {
+        let backdrop : Vec3 = self.backdrop(dir);
+        let lit : Vec3 = self.addDiscs(backdrop, dir);
+        return lumenCloudOver(self.clouds, lit, dir, eye, self.time);
+    }
+
+    // The sky colour with nothing in it. Below the horizon the grid answer would be discarded wholesale, so
+    // only one of the two is asked.
+    fn backdrop(self, dir : Vec3) : Vec3 {
+        if (dir.y < 0.0) {
+            return self.ground(dir);
+        }
+        return self.base(dir);
+    }
+
+    // `c` with the sun and moon discs and the stars added where `dir` meets them.
+    fn addDiscs(self, c : Vec3, dir : Vec3) : Vec3 {
+        let mut lit : Vec3 = c;
+
+        let sunCos : f32 = dir.dot(self.sunDir);
+        if (sunCos > self.sunLimit) {
+            let edge : f32 = smoothstep(self.sunLimit, self.sunLimit + DISC_EDGE, sunCos);
+            lit = lit.plus(self.sunIrr.scale(edge * self.sunScale));
+        }
+
+        let moonCos : f32 = dir.dot(self.moonDir);
+        if (moonCos > self.moonLimit) {
+            lit = lit.plus(lumenMoonDisc(dir, self.moonDir, self.moonIrr));
+        }
+
+        if (self.night > 0.0 && dir.y > 0.0) {
+            lit = lit.plus(lumenStars(dir, self.time).scale(self.night));
+        }
+        return lit;
+    }
+
+    /**
+     * The colour of the air along `dir`, what a distant surface dissolves into. It is the sky near the horizon in
+     * that direction, except around the sun, where the sky is the sun's own glare: there the air takes the dome's
+     * smooth ambient colour instead, so a mountain between you and the sun is hazed, not lit up by a sun it hides.
+     */
+    pub fn haze(self, dir : Vec3) : Vec3 {
+        let lowered : f32 = dir.y * SKY_HAZE_FLATTEN + SKY_HAZE_LIFT;
+        let flat : Vec3 = Vec3 { x: dir.x, y: lowered, z: dir.z }.normalized();
+        let sky : Vec3 = self.base(flat);
+        let near : f32 = saturate((flat.dot(self.sunDir) - SKY_HAZE_GLARE_FROM) / SKY_HAZE_GLARE_SPAN);
+        if (near <= 0.0) {
+            return sky;
+        }
+        return sky.lerp(self.dome.irradiance(flat).scale(SKY_HAZE_DOME), near);
+    }
+
+    // The ground below the horizon, past the rim of the valley: a dim earth lit by the sun and the dome, fading
+    // into the horizon's own colour within a few degrees. The radiance map below the horizon holds the sky mirrored
+    // (which carries the sun's glare), and drawn there it puts a halo of the sun under the horizon, where no ray
+    // can reach.
+    fn ground(self, dir : Vec3) : Vec3 {
+        let along : Vec3 = Vec3 { x: dir.x, y: SKY_GROUND_HORIZON, z: dir.z }.normalized();
+        let horizon : Vec3 = self.base(along);
+        let earth : Vec3 = skyEarth().times(self.groundLit);
+        return horizon.lerp(earth, saturate(-dir.y * SKY_GROUND_FADE));
+    }
+}

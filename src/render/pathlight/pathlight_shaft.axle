@@ -1,0 +1,180 @@
+// pathlight_shaft — the sun's light shafts as a screen-space scatter of the sky's silhouette.
+//
+// Air between the eye and a surface scatters the sun toward the eye wherever the sun reaches that air, and from the
+// picture alone the best guess is: a pixel collects light along a march toward the sun's place in the picture, and
+// every sky pixel the march passes over counts. A pixel behind a gap in the leaves collects light, a pixel behind a
+// wall collects none. Three things keep it from drawing lines. A step is weighted by a smooth window that falls to
+// zero at the picture's border, so a march that leaves the picture loses its steps one by one instead of jumping.
+// Each frame jitters the start of the march and the offset of its steps from a hash of the pixel and the frame, and
+// the frame averages the frames, so no fixed step pattern aliases into columns. And the air is the air in front of
+// the surface: a surface close to the eye has little air before it and gets little, the sky has all of it.
+//
+// The functions read the sky mask and the positions and return a number; storing it, blending it over frames and
+// adding it to the picture are the frame's business, so the result cannot depend on which thread runs which row.
+
+use crate::core::math::scalar::{min, max, saturate, smoothstep};
+use crate::core::math::vec3::Vec3;
+use crate::render::pathlight::pathlight_noise::lnUnit;
+
+/** Steps of a march. */
+pub const SHAFT_STEPS : i32 = 24;
+
+/** The most of the way to the sun a march covers, and the longest it gets in pixels, whatever the sun's distance. */
+const SHAFT_SPAN : f32 = 0.92;
+const SHAFT_REACH : f32 = 0.55;
+
+/** How fast the weight of a step decays along the march. */
+const SHAFT_DECAY : f32 = 0.93;
+
+/** The start of a march wanders this many pixels each way: a blur by sampling, averaged by the frames. */
+const SHAFT_BLUR : f32 = 3.0;
+
+/** The window fades over this share of the picture's smaller side, at every border. */
+const SHAFT_MARGIN : f32 = 0.12;
+
+/** A march whose steps inside the picture carry less than this share of a full march is divided by it, not by itself. */
+const SHAFT_FLOOR : f32 = 0.35;
+
+/** A surface nearer than `SHAFT_NEAR` gets no shaft, one farther than `SHAFT_FAR` gets all of it. */
+const SHAFT_NEAR : f32 = 3.0;
+const SHAFT_FAR : f32 = 40.0;
+
+/** The brightness of a fully lit shaft, as a share of the sun's own irradiance. */
+const SHAFT_STRENGTH : f32 = 0.1;
+
+/** The shafts fade in as the sun rises: full once its elevation (the sine) reaches 1 / this. */
+const SHAFT_RISE : f32 = 8.0;
+
+/**
+ * A high sun lights the air everywhere, so its shafts are no longer a shape and only grey the sky; between these
+ * elevations (sines) the shafts fade down to `SHAFT_NOON` of themselves.
+ */
+const SHAFT_HIGH_FROM : f32 = 0.15;
+const SHAFT_HIGH_TO : f32 = 0.5;
+const SHAFT_NOON : f32 = 0.06;
+
+/** The sky's share of a shaft falls off with the picture distance to the sun, to half at this many pictures' widths. */
+const SHAFT_GLARE : f32 = 0.5;
+
+/** The pictures a march reads. */
+pub struct ShaftPlane {
+    /** Picture width in pixels. */
+    pub w : i32;
+
+    /** Picture height in pixels. */
+    pub h : i32;
+
+    /** The surface id of each pixel. */
+    pub sids : i32[];
+
+    /** The surface id of the sky. */
+    pub sky : i32;
+
+    /** World position of what each pixel hit, three floats a pixel. */
+    pub pos : f32[];
+
+    /** The eye. */
+    pub eye : Vec3;
+
+    /** Where the sun lies in the picture, in pixels. */
+    pub sun : Vec3;
+
+    /** The number of the frame: it moves the jitter. */
+    pub frame : i32;
+}
+
+/** The sun's light shafts. */
+pub class LumenShaft {
+    /**
+     * How much of the sky the march from pixel (`x`, `y`) toward the sun passes over, in 0..1, for the jitter of the
+     * plane's frame. An open sky gives 1 whatever the sun's place; a march that runs out of the picture fades out.
+     */
+    pub static fn march(p : ShaftPlane, x : i32, y : i32) : f32 {
+        let jx : f32 = lnUnit(x, y, p.frame, 1);
+        let jy : f32 = lnUnit(x, y, p.frame, 2);
+        let offset : f32 = lnUnit(x, y, p.frame, 3);
+        let px : f32 = (x as f32) + (0.5 as f32) + (jx - (0.5 as f32)) * (2.0 as f32) * SHAFT_BLUR;
+        let py : f32 = (y as f32) + (0.5 as f32) + (jy - (0.5 as f32)) * (2.0 as f32) * SHAFT_BLUR;
+
+        // The march is a share of the way to the sun, but never longer than a fraction of the picture: a sun far
+        // above the picture still gives a march the picture can hold.
+        let dx : f32 = p.sun.x - px;
+        let dy : f32 = p.sun.y - py;
+        let len : f32 = (dx * dx + dy * dy).sqrt();
+        let reach : f32 = SHAFT_REACH * (max(p.w, p.h) as f32);
+        let scale : f32 = min(SHAFT_SPAN, reach / max(len, (0.001 as f32)));
+        let margin : f32 = SHAFT_MARGIN * (min(p.w, p.h) as f32);
+
+        let mut sky : f32 = 0.0;
+        let mut seen : f32 = 0.0;
+        let mut total : f32 = 0.0;
+        let mut weight : f32 = 1.0;
+        for (k of 0..SHAFT_STEPS) {
+            let f : f32 = ((k as f32) + offset) / (SHAFT_STEPS as f32);
+            let sx : f32 = px + dx * scale * f;
+            let sy : f32 = py + dy * scale * f;
+            total = total + weight;
+
+            let window : f32 = LumenShaft::window(p, sx, sy, margin);
+            if (window > 0.0) {
+                let i : i64 = ((sy as i32) as i64) * (p.w as i64) + ((sx as i32) as i64);
+                seen = seen + weight * window;
+                if (p.sids[i] == p.sky) {
+                    sky = sky + weight * window;
+                }
+            }
+            weight = weight * SHAFT_DECAY;
+        }
+        // The glow of an open sky gathers around the sun instead of greying the whole of it.
+        let near : f32 = len / (SHAFT_GLARE * (max(p.w, p.h) as f32));
+        return (sky / max(seen, SHAFT_FLOOR * total)) / ((1.0 as f32) + near * near);
+    }
+
+    /**
+     * What the shafts add to a pixel at full strength, as a colour: the sun's irradiance `sunIrr` scaled by how far
+     * the sun has risen (`sunY`, the sine of its elevation) and by `open`, how much sky the eye sees by. Zero at night.
+     */
+    pub static fn gain(sunIrr : Vec3, sunY : f32, open : f32) : Vec3 {
+        if (sunY <= 0.0) {
+            return Vec3::zero();
+        }
+        let high : f32 = smoothstep(SHAFT_HIGH_FROM, SHAFT_HIGH_TO, sunY);
+        let noon : f32 = (1.0 as f32) - high * ((1.0 as f32) - SHAFT_NOON);
+        return sunIrr.scale(SHAFT_STRENGTH * saturate(sunY * SHAFT_RISE) * noon * open);
+    }
+
+    // The weight of a step at (sx, sy): 1 inside the picture, falling smoothly to 0 across `margin` pixels at its border.
+    static fn window(p : ShaftPlane, sx : f32, sy : f32, margin : f32) : f32 {
+        if (sx < 0.0 || sy < 0.0 || sx >= (p.w as f32) || sy >= (p.h as f32)) {
+            return 0.0;
+        }
+        let nearest : f32 = min(min(sx, (p.w as f32) - sx), min(sy, (p.h as f32) - sy));
+        return smoothstep(0.0, margin, nearest);
+    }
+
+    /**
+     * How much air lies before the surface of pixel `i`, in 0..1: nothing for a surface at the eye, everything for
+     * the sky and the far distance. The share of the shaft the pixel gets.
+     */
+    pub static fn air(p : ShaftPlane, i : i64) : f32 {
+        if (p.sids[i] == p.sky) {
+            return 1.0;
+        }
+        let dx : f32 = p.pos[i * 3] - p.eye.x;
+        let dy : f32 = p.pos[i * 3 + 1] - p.eye.y;
+        let dz : f32 = p.pos[i * 3 + 2] - p.eye.z;
+        let d : f32 = (dx * dx + dy * dy + dz * dz).sqrt();
+        return smoothstep(SHAFT_NEAR, SHAFT_FAR, d);
+    }
+
+    /** The share of last frames' shaft that stays: a still picture averages the jitter over many frames. */
+    pub static fn keep(fresh : bool, sameCam : bool) : f32 {
+        if (fresh) {
+            return 0.0;
+        }
+        if (sameCam) {
+            return 0.88;
+        }
+        return 0.65;
+    }
+}

@@ -1,0 +1,124 @@
+// pathlight_skygrid — a latitude-longitude grid of sky radiance: the one picture the sky is looked up in.
+//
+// Three interleaved f32 channels per cell, azimuth along x (it wraps) and elevation along y (it is clamped).
+// The sky bakes one grid per moment of the day and blurs it into coarser grids, so everything here is plain
+// array work that a job pool may run on different rows at the same time: a row is written by one job only.
+
+use crate::core::math::scalar::clamp;
+use crate::core::math::vec2::Vec2;
+use crate::core::math::vec3::Vec3;
+use crate::render::pathlight::pathlight_noise::lnFloor;
+
+/** A grid of RGB radiance, `w` cells around and `h` cells from the nadir to the zenith. */
+pub class SkyGrid {
+    data : f32[];
+
+    /** Cells around the horizon. */
+    pub w : i32;
+
+    /** Cells from the nadir to the zenith. */
+    pub h : i32;
+
+    /** An empty (all zero) grid of `w` x `h` cells. */
+    constructor(w : i32, h : i32) {
+        self.data = new f32[(w as i64) * h * 3];
+        self.w = w;
+        self.h = h;
+    }
+
+    // The index of the red channel of cell (x, y).
+    fn channel(self, x : i32, y : i32) : i64 {
+        return ((y * self.w + x) * 3) as i64;
+    }
+
+    /** Stores the radiance `c` in the cell (`x`, `y`). */
+    pub fn put(mut self, x : i32, y : i32, c : Vec3) : void {
+        let at : i64 = self.channel(x, y);
+        self.data[at] = c.x;
+        self.data[at + 1] = c.y;
+        self.data[at + 2] = c.z;
+    }
+
+    /** The radiance stored in the cell (`x`, `y`). */
+    pub fn texel(self, x : i32, y : i32) : Vec3 {
+        let at : i64 = self.channel(x, y);
+        return Vec3 { x: self.data[at], y: self.data[at + 1], z: self.data[at + 2] };
+    }
+
+    /** The radiance at `place` as (u, v) in 0..1, read bilinearly: azimuth wraps around, elevation is clamped. */
+    pub fn look(self, place : Vec2) : Vec3 {
+        let fx : f32 = place.x * (self.w as f32) - (0.5 as f32);
+        let fy : f32 = clamp(place.y * (self.h as f32) - (0.5 as f32), 0.0, (self.h - 1) as f32);
+        let x0 : i32 = lnFloor(fx);
+        let y0 : i32 = lnFloor(fy);
+        let tx : f32 = fx - x0 as f32;
+        let ty : f32 = fy - y0 as f32;
+
+        let xa : i32 = (x0 + self.w) % self.w;
+        let xb : i32 = (x0 + 1 + self.w) % self.w;
+        let mut y1 : i32 = y0 + 1;
+        if (y1 >= self.h) {
+            y1 = self.h - 1;
+        }
+
+        // Catmull-Rom along the elevation: a plain linear blend between the 64 rows leaves a visible band every row (a
+        // slope break each 2.8 degrees, some 25 pixels on screen); the cubic is smooth through every row.
+        let ym : i32 = clampRow(y0 - 1, self.h);
+        let y2 : i32 = clampRow(y0 + 2, self.h);
+        let p0 : Vec3 = self.texel(xa, ym).lerp(self.texel(xb, ym), tx);
+        let p1 : Vec3 = self.texel(xa, y0).lerp(self.texel(xb, y0), tx);
+        let p2 : Vec3 = self.texel(xa, y1).lerp(self.texel(xb, y1), tx);
+        let p3 : Vec3 = self.texel(xa, y2).lerp(self.texel(xb, y2), tx);
+        let t2 : f32 = ty * ty;
+        let t3 : f32 = t2 * ty;
+        let half : f32 = 0.5;
+        let w0 : f32 = half * (-t3 + (2.0 as f32) * t2 - ty);
+        let w1 : f32 = half * ((3.0 as f32) * t3 - (5.0 as f32) * t2 + (2.0 as f32));
+        let w2 : f32 = half * (-(3.0 as f32) * t3 + (4.0 as f32) * t2 + ty);
+        let w3 : f32 = half * (t3 - t2);
+        let c : Vec3 = p0.scale(w0).plus(p1.scale(w1)).plus(p2.scale(w2)).plus(p3.scale(w3));
+        return c.componentMax(Vec3::zero());
+    }
+
+    /** Overwrites this grid's cells with `other`'s; both must have the same size. */
+    pub fn copyFrom(mut self, other : SkyGrid) : void {
+        let n : i64 = (self.w as i64) * self.h * 3;
+        for (i of 0..n) {
+            self.data[i] = other.data[i];
+        }
+    }
+
+    /** Fills `coarse` with the mean of each block of this grid's cells; `coarse` must divide this grid evenly. */
+    pub fn downsampleInto(self, coarse : SkyGrid) : void {
+        let blockW : i32 = self.w / coarse.w;
+        let blockH : i32 = self.h / coarse.h;
+        let share : f32 = (1.0 as f32) / ((blockW * blockH) as f32);
+        for (j of 0..coarse.h) {
+            for (i of 0..coarse.w) {
+                let mut r : f32 = 0.0;
+                let mut g : f32 = 0.0;
+                let mut b : f32 = 0.0;
+                for (v of 0..blockH) {
+                    for (u of 0..blockW) {
+                        let c : Vec3 = self.texel(i * blockW + u, j * blockH + v);
+                        r = r + c.x;
+                        g = g + c.y;
+                        b = b + c.z;
+                    }
+                }
+                coarse.put(i, j, Vec3 { x: r * share, y: g * share, z: b * share });
+            }
+        }
+    }
+}
+
+// A row index held to the grid.
+fn clampRow(y : i32, h : i32) : i32 {
+    if (y < 0) {
+        return 0;
+    }
+    if (y >= h) {
+        return h - 1;
+    }
+    return y;
+}

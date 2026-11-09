@@ -1,0 +1,132 @@
+// pathlight_cloud — the cloud deck: where it is, how much of it covers a point, and how it is lit.
+//
+// The deck is one horizontal plane of noise high above the world. Cover and distance are pure functions of a
+// position and a time, so the shading of surfaces (which asks how much cloud lies between a point and the sun)
+// and the sky (which draws the deck) agree. The deck drifts about a cell a second: a deck of clouds drifts, it
+// does not race (it used to move thirty times faster than that, and since the clock only runs while the camera
+// does, it sped away at every turn of the head).
+
+use crate::core::math::scalar::{PI, saturate, smoothstep};
+use crate::core::math::vec2::Vec2;
+use crate::core::math::vec3::Vec3;
+use crate::render::pathlight::pathlight_noise::lnFbm2;
+
+// ---- where the deck is
+
+/** The height of the cloud deck, in cells. */
+const CLOUD_HEIGHT : f32 = 150.0;
+
+/** The height the deck is seen from, whatever the eye's own: flying up must not bring the clouds closer. */
+const CLOUD_EYE : f32 = 24.0;
+
+/** A ray rising less steeply than this never meets the deck: it is at the horizon, far beyond the world. */
+const CLOUD_MIN_SLOPE : f32 = 0.02;
+
+// ---- how much of the deck is cloud
+
+/** The cloud noise: its frequency per cell, how far it drifts along x and z per second, octaves and hash seed. */
+const CLOUD_FREQ : f32 = 0.011;
+const CLOUD_DRIFT_X : f32 = 0.012;
+const CLOUD_DRIFT_Z : f32 = 0.004;
+const CLOUD_OCTAVES : i32 = 5;
+const CLOUD_SEED : i32 = 301;
+
+/** The noise below `CLOUD_COVER_FROM` is clear sky and above `CLOUD_COVER_TO` full cloud. */
+const CLOUD_COVER_FROM : f32 = 0.5;
+const CLOUD_COVER_TO : f32 = 0.78;
+
+// ---- how the deck is lit
+
+/** How far along the sun's direction the deck is sampled to find its thickness, in cells. */
+const CLOUD_PROBE : f32 = 14.0;
+
+/** The thickness towards the sun, relative to here, is biased by this before it darkens the cloud. */
+const CLOUD_BIAS : f32 = 0.55;
+
+/** How fast a cloud reaches full sun and moon light as they rise (per unit of height). */
+const CLOUD_RISE : f32 = 3.0;
+
+/** The sun lights a cloud with this base and this much more where it is thin; the moon with this share. */
+const CLOUD_SUN_BASE : f32 = 0.25;
+const CLOUD_SUN_THIN : f32 = 0.9;
+const CLOUD_MOON : f32 = 0.5;
+
+/** A cloud fades in over this height of ray (per unit), and is at most this opaque. */
+const CLOUD_FADE : f32 = 6.0;
+const CLOUD_OPACITY : f32 = 0.92;
+
+/** What lights the deck: the sun and moon (direction and irradiance) and the zenith colour the clouds mix over. */
+pub struct CloudLight {
+    /** Unit direction toward the sun, and its irradiance at the ground. */
+    pub sunDir : Vec3;
+    pub sunIrr : Vec3;
+
+    /** Unit direction toward the moon, and its (lifted) irradiance. */
+    pub moonDir : Vec3;
+    pub moonIrr : Vec3;
+
+    /** The radiance of the zenith as the clouds are lit by it. */
+    pub zenith : Vec3;
+}
+
+// The slight blue of the lit cloud.
+fn cloudTint() : Vec3 {
+    return Vec3 { x: 0.97, y: 0.97, z: 1.0 };
+}
+
+/** Cloud cover in 0..1 at the point (`x`, `z`) of the deck at time `t` seconds. */
+pub fn lumenCloudCover(x : f32, z : f32, t : f32) : f32 {
+    let n : f32 = lnFbm2(
+        x * CLOUD_FREQ + t * CLOUD_DRIFT_X,
+        z * CLOUD_FREQ + t * CLOUD_DRIFT_Z,
+        CLOUD_OCTAVES,
+        CLOUD_SEED
+    );
+    return smoothstep(CLOUD_COVER_FROM, CLOUD_COVER_TO, n);
+}
+
+/** How far up a ray from height `y` must go to meet the cloud deck, or -1 when it cannot. */
+pub fn lumenCloudDistance(y : f32, dirY : f32) : f32 {
+    if (dirY < CLOUD_MIN_SLOPE || y >= CLOUD_HEIGHT) {
+        return -1.0;
+    }
+    return (CLOUD_HEIGHT - y) / dirY;
+}
+
+/**
+ * What the eye at `eye` sees of the deck along `dir` blended over the sky `behind` it, or `behind` itself when
+ * the ray never meets a cloud. The deck is seen from a fixed height, not the eye's, as a plane much farther than
+ * the world would be.
+ */
+pub fn lumenCloudOver(light : CloudLight, behind : Vec3, dir : Vec3, eye : Vec3, time : f32) : Vec3 {
+    let reach : f32 = lumenCloudDistance(CLOUD_EYE, dir.y);
+    if (reach <= 0.0) {
+        return behind;
+    }
+
+    let px : f32 = eye.x + dir.x * reach;
+    let pz : f32 = eye.z + dir.z * reach;
+    let cover : f32 = lumenCloudCover(px, pz, time);
+    if (cover <= 0.0) {
+        return behind;
+    }
+    return cloudShaded(light, behind, dir, Vec2::make(px, pz), cover, time);
+}
+
+// Shades the deck at `at` and blends it over the sky behind it. The deck is lit from the sun's side: thickness
+// toward the sun darkens it, an edge facing the sun glows (a silver lining).
+fn cloudShaded(light : CloudLight, behind : Vec3, dir : Vec3, at : Vec2, cover : f32, time : f32) : Vec3 {
+    let sunwardX : f32 = at.x + light.sunDir.x * CLOUD_PROBE;
+    let sunwardZ : f32 = at.y + light.sunDir.z * CLOUD_PROBE;
+    let toward : f32 = lumenCloudCover(sunwardX, sunwardZ, time);
+    let thick : f32 = saturate(toward - cover + CLOUD_BIAS);
+
+    let sunLit : Vec3 = light.sunIrr
+        .scale(saturate(light.sunDir.y * CLOUD_RISE) / PI)
+        .scale(CLOUD_SUN_BASE + CLOUD_SUN_THIN * ((1.0 as f32) - thick));
+    let moonLit : Vec3 = light.moonIrr.scale(saturate(light.moonDir.y * CLOUD_RISE) / PI).scale(CLOUD_MOON);
+    let lit : Vec3 = sunLit.plus(moonLit).plus(light.zenith).times(cloudTint());
+
+    let fade : f32 = saturate(dir.y * CLOUD_FADE);
+    return behind.lerp(lit, cover * fade * CLOUD_OPACITY);
+}

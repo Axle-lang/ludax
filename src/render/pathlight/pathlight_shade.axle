@@ -1,0 +1,230 @@
+// pathlight_shade — the light that arrives at a surface point and what the surface sends back.
+//
+// Nothing here is left to chance, which is what keeps a picture of a still world still. Every term is kept apart so
+// the debug views can show it alone and so the sum can be checked:
+//
+//   direct   the sun and the moon through the soft shadow the light engine baked for the point (read smoothly from
+//            a volume, so a shadow edge is the same on every frame) and the cloud deck shading the ground
+//   ambient  the sky dome's SH9 through the baked sky access and the baked bounce tint (a red roof tints the snow
+//            beside it), the specular of a traced or prefiltered mirror, and the flooded block light as fill
+//   emitted  what the surface radiates (lanterns, lava, crystals)
+//
+// The BRDF, the light geometry and the unit conventions are Ludax's `render/light`; this file only combines them.
+// It reads a `LumenPoint`, a `LumenLightSample` and a `LumenSky` and nothing of the world: lamps and mirrors that need
+// the world are the caller's to add.
+
+use crate::core::math::scalar::{saturate, max, PI};
+use crate::core::math::trig::sin;
+use crate::core::math::vec3::Vec3;
+use crate::render::light::light_brdf::{lightPrepare, lightBrdf};
+use crate::render::light::light_dfg::LightDfgTable;
+use crate::render::light::light_irradiance::{LightIncident, LightReason, lightIncidence};
+use crate::render::light::light_material::{
+    LightMaterial, LightAlphaMode, LightDiffuseModel, LightPrepared, LightBrdfTerms
+};
+use crate::render::light::light_source::LightSource;
+use crate::render::pathlight::pathlight_cloud::{lumenCloudCover, lumenCloudDistance};
+use crate::render::pathlight::pathlight_point::LumenPoint;
+use crate::render::pathlight::pathlight_sample::{LumenBody, LumenLightSample, lumenBodyShare};
+use crate::render::pathlight::pathlight_sky::LumenSky;
+
+/** How strongly the flooded block light fills a surface (radiance of a white wall one cell from a lamp). */
+pub const SHADE_FLOOD : f32 = 0.3;
+
+/** The share of the dome that reaches a point whose sky access is zero: a fully enclosed place still sees some. */
+const SHADE_ACCESS_FLOOR : f32 = 0.35;
+
+/** The sky body is above the horizon by more than this (a body below it lights nothing). */
+pub const SHADE_HORIZON : f32 = -0.04;
+
+/** What the densest cloud deck removes from a sky body's light. */
+const SHADE_CLOUD_REMOVE : f32 = 0.78;
+
+/** Above this night factor the moon is worth a shadow ray. */
+const SHADE_NIGHT : f32 = 0.05;
+
+/** A sky body whose light is dimmer than this is not shaded at all. */
+const SHADE_BODY_MIN : f32 = 0.00001;
+
+/** The shaded point, term by term. */
+pub struct LumenLit {
+    /** Sun, moon and lamps. */
+    pub direct : Vec3 = Vec3 { x: 0.0, y: 0.0, z: 0.0 };
+
+    /** Sky, bounce tint and flooded block light. */
+    pub ambient : Vec3 = Vec3 { x: 0.0, y: 0.0, z: 0.0 };
+
+    /** What the surface emits. */
+    pub emitted : Vec3 = Vec3 { x: 0.0, y: 0.0, z: 0.0 };
+
+    /** The sum. */
+    pub fn total(self) : Vec3 {
+        return self.direct.plus(self.ambient).plus(self.emitted);
+    }
+}
+
+// The share of the dome a probe sees: its flooded sky above the floor that no wall can remove.
+pub fn shSkyShare(l : LumenLightSample) : f32 {
+    return l.sky * (SHADE_ACCESS_FLOOR + ((1.0 as f32) - SHADE_ACCESS_FLOOR) * l.access);
+}
+
+/** The caustic's first wave train: its frequency along x and in time, and the bend of the second one across it. */
+const CAUSTIC_X_FREQ : f32 = 1.3;
+const CAUSTIC_X_PACE : f32 = 1.1;
+const CAUSTIC_Z_FREQ : f32 = 0.9;
+const CAUSTIC_Z_PACE : f32 = 0.7;
+const CAUSTIC_BEND_A : f32 = 1.5;
+
+/** The second wave train: its frequency along z and in time, the frequency of the train that bends it, and its bend. */
+const CAUSTIC_Z2_FREQ : f32 = 1.1;
+const CAUSTIC_Z2_PACE : f32 = 0.9;
+const CAUSTIC_X2_FREQ : f32 = 0.8;
+const CAUSTIC_BEND_B : f32 = 1.4;
+
+/** The dimmest the lake bed gets between the lines, and how much brighter the lines make it. */
+const CAUSTIC_FLOOR : f32 = 0.3;
+const CAUSTIC_GAIN : f32 = 2.6;
+
+/** A repeating, moving pattern of bright lines: light focused by waves onto the lake bed. */
+pub fn lumenCaustic(x : f32, z : f32, t : f32) : f32 {
+    let bendA : f32 = sin(z * CAUSTIC_Z_FREQ + t * CAUSTIC_Z_PACE) * CAUSTIC_BEND_A;
+    let a : f32 = sin(x * CAUSTIC_X_FREQ + t * CAUSTIC_X_PACE + bendA);
+    let bendB : f32 = sin(x * CAUSTIC_X2_FREQ + t) * CAUSTIC_BEND_B;
+    let b : f32 = sin(z * CAUSTIC_Z2_FREQ - t * CAUSTIC_Z2_PACE + bendB);
+    let v : f32 = (1.0 as f32) - abs(a * b);
+    let v2 : f32 = v * v;
+    return CAUSTIC_FLOOR + CAUSTIC_GAIN * v2 * v2;
+}
+
+/**
+ * How much of a body in the sky is left after the cloud deck: the clouds shade the ground by moving over it, so
+ * a point's light depends on the cover where its ray to the body crosses the deck.
+ */
+pub fn lumenCloudShade(from : Vec3, toward : Vec3, deck : f32) : f32 {
+    let reach : f32 = lumenCloudDistance(from.y, toward.y);
+    if (reach <= 0.0) {
+        return 1.0;
+    }
+    let cover : f32 = lumenCloudCover(from.x + toward.x * reach, from.z + toward.z * reach, deck);
+    return (1.0 as f32) - SHADE_CLOUD_REMOVE * cover;
+}
+
+/**
+ * The direct light of one sky body on a point through its baked soft shadow `baked`, under the cloud deck at
+ * `time`; `water` is true for a point under water, whose sun is modulated by the caustics. Shared by the valley
+ * and the Minecraft game, which differ only in where `baked` comes from.
+ */
+pub fn lumenBody(
+    light : LightSource,
+    pt : LumenPoint,
+    prepared : LightPrepared,
+    view : Vec3,
+    baked : f32,
+    time : f32,
+    water : bool
+) : Vec3 {
+    let toward : Vec3 = light.direction.negated();
+    if (toward.y < SHADE_HORIZON || light.intensity < SHADE_BODY_MIN || baked <= 0.0) {
+        return Vec3::zero();
+    }
+    let inc : LightIncident = lightIncidence(light, pt.pos, pt.n, pt.ng, pt.layer, 0);
+    if (inc.reason != LightReason::None) {
+        return Vec3::zero();
+    }
+    let vis : f32 = baked * lumenCloudShade(pt.pos, toward, time);
+    let brdf : LightBrdfTerms = lightBrdf(prepared, pt.n, view, inc.toLight);
+    let incoming : Vec3 = light.color.scale(inc.irradiance * vis);
+    let mut lit : Vec3 = brdf.diffuse.plus(brdf.specular).times(incoming);
+    if (water) {
+        lit = lit.scale(lumenCaustic(pt.pos.x, pt.pos.z, time));
+    }
+    return lit;
+}
+
+/** What a smooth surface reflects when the caller traced the mirror ray: the radiance along it. */
+pub struct LumenMirror {
+    /** True when `radiance` was traced; false asks the sky's prefiltered map. */
+    pub traced : bool = false;
+
+    /** The radiance along the mirror direction. */
+    pub radiance : Vec3 = Vec3 { x: 0.0, y: 0.0, z: 0.0 };
+}
+
+// The material of a point prepared for the BRDF: the split-sum terms at its N.V.
+pub fn lumenPrepare(dfg : LightDfgTable, pt : LumenPoint, view : Vec3) : LightPrepared {
+    let material : LightMaterial = LightMaterial {
+        baseColor: pt.albedo,
+        metallic: pt.metal,
+        roughness: pt.rough,
+        occlusion: 1.0,
+        alphaMode: LightAlphaMode::Opaque,
+        diffuseModel: LightDiffuseModel::Lambert,
+    };
+    let nv : f32 = max(pt.n.dot(view), 0.0001);
+    return lightPrepare(material, dfg.lookup(nv, pt.rough));
+}
+
+/**
+ * The light on a point from the sky and the baked terms alone: each sky body through its baked shadow, the dome
+ * through the sky light, access and bounce tint, the flooded block light and what the surface emits. The valley adds
+ * its lamps to this; the Minecraft game, whose emitters are all in the flood, shades with exactly this.
+ */
+pub fn lumenShadeCore(
+    sky : LumenSky,
+    dfg : LightDfgTable,
+    bounce : bool,
+    time : f32,
+    water : bool,
+    pt : LumenPoint,
+    view : Vec3,
+    mirror : LumenMirror,
+    probe : LumenLightSample
+) : LumenLit {
+    let prepared : LightPrepared = lumenPrepare(dfg, pt, view);
+    let nv : f32 = max(pt.n.dot(view), 0.0001);
+    let mut lit : LumenLit = LumenLit {};
+    lit.emitted = pt.emissive;
+
+    // Direct: each sky body through its own baked shadow.
+    let mut direct : Vec3 = lumenBody(
+        sky.sun,
+        pt,
+        prepared,
+        view,
+        lumenBodyShare(probe, LumenBody::Sun),
+        time,
+        water
+    );
+    if (sky.night > SHADE_NIGHT) {
+        direct = direct.plus(lumenBody(
+            sky.moon,
+            pt,
+            prepared,
+            view,
+            lumenBodyShare(probe, LumenBody::Moon),
+            time,
+            water
+        ));
+    }
+    lit.direct = direct;
+
+    // Ambient: the dome through the sky light and the access, in the colour of what the sky rays hit.
+    let mut tint : Vec3 = Vec3::splat(1.0);
+    if (bounce) {
+        tint = probe.tint;
+    }
+    let domeLight : Vec3 = sky.dome.irradiance(pt.n).scale(shSkyShare(probe)).times(tint);
+    let open : f32 = probe.sky * probe.access;
+    let mut ambient : Vec3 = prepared.diffuse.times(domeLight);
+    // The spec input is the dome itself through the sky occlusion, once: `open` is already sky times access.
+    // When the mirror ray was traced, its radiance replaces the dome's answer, so the lookup is not even made.
+    let mut specularIn : Vec3 = mirror.radiance;
+    if (!mirror.traced) {
+        let dir : Vec3 = pt.n.scale((2.0 as f32) * nv).minus(view).normalized();
+        specularIn = sky.prefiltered(dir, pt.rough).scale(open);
+    }
+    ambient = ambient.plus(prepared.specularAlbedo.times(specularIn));
+    ambient = ambient.plus(prepared.diffuse.times(probe.block).scale(SHADE_FLOOD));
+    lit.ambient = ambient;
+    return lit;
+}
