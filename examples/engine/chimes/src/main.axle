@@ -1,0 +1,188 @@
+// chimes — a software audio scene rendered offline and checked.
+//
+// Builds every sound with the synth (no audio files), plays a six-second 3D scene through Ludax's audio engine —
+// a siren flying past the listener, a music pad that crossfades into another, a tune of bells and a flurry that
+// overflows the voice pool — and bounces it to `chimes.wav`. It also draws `chimes.png`, the waveform. There is
+// no live audio device: the engine only fills buffers. The checks it prints are measured on the rendered signal.
+//
+// The Doppler windows are named here because their frame numbers are only meaningful together, and the expected
+// pitch is worked out from the siren's path rather than compared with a number copied out of the engine.
+
+use std::io::FileInputStream;
+
+use ludax::{AudioClip, AudioOffline, WavCodec, WavFile, hashFnv1a64Bytes};
+
+use crate::check::measure::{Measure, Window};
+use crate::gfx::canvas::Canvas;
+use crate::gfx::waveform::Waveform;
+use crate::scene::scene::{ChimeScene, SceneStats, SCENE_SECONDS, SCENE_VOICES};
+use crate::sounds::kit::KIT_RATE;
+
+/** The rendered scene as a 32-bit float WAV. */
+const CHIME_WAV_FILE : string = "chimes.wav";
+
+/** The waveform picture. */
+const CHIME_PNG_FILE : string = "chimes.png";
+
+/** The siren approaches from this frame (44100 Hz * 4 / 10)... */
+const CHIME_APPROACH_FROM : i32 = 17640;
+
+/** ...to this one: the last second before it passes the listener. */
+const CHIME_APPROACH_TO : i32 = 44100;
+
+/** The siren recedes from this frame (44100 Hz * 5)... */
+const CHIME_RECEDE_FROM : i32 = 220500;
+
+/** ...to this one (44100 Hz * 56 / 10). */
+const CHIME_RECEDE_TO : i32 = 246960;
+
+/** How far the measured zero crossings may sit from the physics, as a fraction. */
+const CHIME_DOPPLER_TOLERANCE : f64 = 0.02;
+
+/** The siren's pitch as it passes, in Hz: on approach it is sharper, on recede flatter. */
+const CHIME_PASS_HZ : f64 = 1000.0;
+
+// Prints one check and returns 0 for a pass, 1 for a miss.
+fn chimeReport(name : string, ok : bool, detail : string) : i32 {
+    if (ok) {
+        println("  ok    ${name}: ${detail}");
+        return 0;
+    }
+
+    println("  FAIL  ${name}: ${detail}");
+    return 1;
+}
+
+// The 64-bit hash of a clip as a 32-bit float WAV.
+fn chimeHash(clip : AudioClip) : i64 {
+    let f : WavFile = WavCodec::encodeFloat(clip);
+    return hashFnv1a64Bytes(f.bytes, f.size);
+}
+
+// Reads `size` bytes of the file back and decodes them; true if they decode to exactly `clip`.
+fn chimeFileMatches(path : string, clip : AudioClip) : bool {
+    let want : WavFile = WavCodec::encodeFloat(clip);
+    let got : i8[] = new i8[(want.size + 1) as i64];
+
+    try {
+        let input = new FileInputStream(path);
+        let n : i64 = input.readBytes(got, 0, want.size as i64);
+        input.close();
+        if (n != want.size as i64) {
+            return false;
+        }
+    } catch e : IOException {
+        return false;
+    }
+
+    let back : AudioClip = WavCodec::decode(got, want.size).clip();
+    if (back.frames != clip.frames) {
+        return false;
+    }
+    for (i of 0..clip.frames * 2) {
+        if (back.samples[i as i64] != clip.samples[i as i64]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// The siren's pitch against what the Doppler shift predicts for the approach and the recession; the number of
+// checks that failed.
+fn chimeDoppler(dry : AudioClip) : i32 {
+    let mut failures : i32 = 0;
+    let approach : Window = Window { from: CHIME_APPROACH_FROM, to: CHIME_APPROACH_TO };
+    let recede : Window = Window { from: CHIME_RECEDE_FROM, to: CHIME_RECEDE_TO };
+
+    let approachCrossings : i32 = Measure::crossings(dry, approach);
+    let recedeCrossings : i32 = Measure::crossings(dry, recede);
+    let wantApproach : f64 = Measure::predictedCrossings(approach);
+    let wantRecede : f64 = Measure::predictedCrossings(recede);
+    let approachHz : f64 = Measure::frequency(approachCrossings, approach);
+    let recedeHz : f64 = Measure::frequency(recedeCrossings, recede);
+    let wantApproachHz : f64 = wantApproach / 2.0 / approach.seconds();
+    let wantRecedeHz : f64 = wantRecede / 2.0 / recede.seconds();
+
+    let approachError : f64 = (approachCrossings as f64 - wantApproach) / wantApproach;
+    let recedeError : f64 = (recedeCrossings as f64 - wantRecede) / wantRecede;
+    let approachOk : bool = approachError < CHIME_DOPPLER_TOLERANCE
+        && approachError > -CHIME_DOPPLER_TOLERANCE;
+    let recedeOk : bool = recedeError < CHIME_DOPPLER_TOLERANCE && recedeError > -CHIME_DOPPLER_TOLERANCE;
+
+    let approachDetail : string = "measured ${approachHz} Hz from ${approachCrossings} crossings, "
+        + "predicted ${wantApproachHz} Hz (${wantApproach} crossings)";
+    failures = failures + chimeReport("Doppler, approaching", approachOk, approachDetail);
+
+    let recedeDetail : string = "measured ${recedeHz} Hz from ${recedeCrossings} crossings, "
+        + "predicted ${wantRecedeHz} Hz (${wantRecede} crossings)";
+    failures = failures + chimeReport("Doppler, receding", recedeOk, recedeDetail);
+
+    let ratio : f64 = approachHz / recedeHz;
+    let wantRatio : f64 = wantApproach / wantRecede;
+    failures = failures
+        + chimeReport(
+            "pitch drops as the siren passes",
+            approachHz > CHIME_PASS_HZ && recedeHz < CHIME_PASS_HZ,
+            "ratio ${ratio}, predicted ${wantRatio}"
+        );
+    return failures;
+}
+
+fn main() : i32 {
+    println("chimes: rendering ${KIT_RATE} Hz stereo, ${SCENE_SECONDS} s, ${SCENE_VOICES} voices");
+
+    let stats : SceneStats = new SceneStats();
+    let scene : AudioClip = ChimeScene::render(false, stats);
+    let again : SceneStats = new SceneStats();
+    let second : AudioClip = ChimeScene::render(false, again);
+    let mut failures : i32 = 0;
+
+    let peak : f32 = scene.peak();
+    failures = failures + chimeReport("peak below 1", peak < 1.0, "peak ${peak}");
+
+    let firstHash : i64 = chimeHash(scene);
+    let secondHash : i64 = chimeHash(second);
+    failures = failures
+        + chimeReport(
+            "two renders are identical",
+            firstHash == secondHash,
+            "hash ${firstHash} = ${secondHash}"
+        );
+
+    let stolen : i32 = stats.stolen;
+    let refused : i32 = stats.refused;
+    let busiest : i32 = stats.busiest;
+    let voiceDetail : string = "stolen ${stolen}, refused ${refused}, busiest ${busiest} of ${SCENE_VOICES}";
+    failures = failures
+        + chimeReport("voices were stolen", stolen > 0 && busiest <= SCENE_VOICES, voiceDetail);
+
+    failures = failures
+        + chimeReport(
+            "music crossfaded",
+            stats.oldGone && stats.newLives,
+            "old pad ended, new pad still looping"
+        );
+
+    // Doppler, measured on the dry siren: the sound alone, in a separate render.
+    let quiet : SceneStats = new SceneStats();
+    let dry : AudioClip = ChimeScene::render(true, quiet);
+
+    failures = failures + chimeDoppler(dry);
+
+    let wavError : string = AudioOffline::save(CHIME_WAV_FILE, scene, true);
+    let wavDetail : string = "float32 stereo, ${scene.frames} frames";
+    let wavOk : bool = wavError == "" && chimeFileMatches(CHIME_WAV_FILE, scene);
+    failures = failures + chimeReport("chimes.wav written and read back exactly", wavOk, wavDetail);
+
+    let picture : Canvas = Waveform::draw(scene);
+    let pngError : string = picture.savePng(CHIME_PNG_FILE);
+    let pngDetail : string = "waveform ${picture.width}x${picture.height}";
+    failures = failures + chimeReport("chimes.png written", pngError == "", pngDetail);
+
+    if (failures == 0) {
+        println("chimes: all checks passed");
+    } else {
+        println("chimes: ${failures} check(s) failed");
+    }
+    return failures;
+}

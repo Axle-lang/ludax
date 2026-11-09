@@ -1,0 +1,290 @@
+// assetdb — the data layer end to end: a virtual file system, the asset database and the importers.
+//
+// A shipped archive and a memory patch are mounted as layers; the database loads a level and, through the
+// dependencies declared for it, a glTF triangle (and its separate binary), a Blockbench crate with an embedded
+// texture, a JSON configuration and a PNG, in dependency order. It prints a summary, checks every number
+// against what the content was built from, then edits files and reloads them to show the version counter
+// move only for what changed. The exit status is the number of checks that failed.
+//
+// The paths are listed in `summaryPaths` rather than discovered, because the point of the summary is the order
+// the dependencies were installed in, which a directory listing does not preserve.
+
+use ludax::{AssetDb, AssetId, AssetKind, DataText, Image, JsonDoc, JsonValue, ModelAsset, Vfs, VfsListing};
+
+use crate::content::files::{
+    CONTENT_BROKEN_PATH, CONTENT_CONFIG_PATH, CONTENT_CRATE_PATH, CONTENT_GROUND_PATH, CONTENT_GROUND_SIDE,
+    CONTENT_LEVEL_PATH, CONTENT_TRIANGLE_BIN_PATH, CONTENT_TRIANGLE_MOVED_X, CONTENT_TRIANGLE_PATH,
+    CONTENT_VOLUME_EDITED, CONTENT_VOLUME_PATCHED, ContentFiles
+};
+use crate::report::report::Report;
+
+/** How many assets the content holds, and so how many rows the summary has. */
+const ASSETDB_ASSETS : i32 = 6;
+
+/** The width of the id column in the summary. */
+const ASSETDB_ID_WIDTH : i32 = 10;
+
+/** The width of the kind column in the summary. */
+const ASSETDB_KIND_WIDTH : i32 = 6;
+
+fn main() : i32 {
+    let files : Vfs = new Vfs();
+    let report : Report = new Report();
+    let mounted : bool = ContentFiles::mountAll(files) && files.mountCount() == 2;
+    report.expect("the archive and the memory patch mount", mounted);
+
+    let db : AssetDb = new AssetDb(files);
+
+    layers(report, db);
+    let level : AssetId = loadLevel(report, db);
+    summary(db);
+    contents(report, db, level);
+    failures(report, db);
+    reloading(report, db);
+
+    println("");
+    println("assetdb: ${report.total()} checks, ${report.failures()} failed");
+    return report.failures();
+}
+
+// The mounts as the file system reports them: who wins, and what a directory lists.
+fn layers(report : Report, db : AssetDb) : void {
+    report.section("layers");
+    let files : Vfs = db.files();
+
+    report.expect(
+        "config/game.json is in both layers and the patch (mount 1) wins",
+        files.sourceOf(CONTENT_CONFIG_PATH) == 1
+    );
+    report.expect(
+        "textures/checker.png is only in the archive (mount 0)",
+        files.sourceOf(CONTENT_GROUND_PATH) == 0
+    );
+    report.expect(
+        "a file nobody has is found nowhere",
+        files.sourceOf("nothing/here.png") == -1 && !files.exists("../escape.png")
+    );
+
+    let listing : VfsListing = files.list("models");
+    let modelsMerged : bool = listing.count() == 4 && listing.name(0) == "broken.gltf"
+        && listing.name(1) == "crate.bbmodel"
+        && listing.name(2) == "tri.bin"
+        && listing.name(3) == "tri.gltf";
+    report.expect("models/ lists its four files merged from both layers, sorted", modelsMerged);
+
+    let root : VfsListing = files.list("");
+    report.expect("the root lists its directories", root.count() == 4 && root.isDirectory(0));
+}
+
+// Registers what depends on what, then loads the level with all of it.
+fn loadLevel(report : Report, db : AssetDb) : AssetId {
+    report.section("loading");
+    db.dependsOn(CONTENT_LEVEL_PATH, CONTENT_TRIANGLE_PATH);
+    db.dependsOn(CONTENT_LEVEL_PATH, CONTENT_CRATE_PATH);
+    db.dependsOn(CONTENT_LEVEL_PATH, CONTENT_GROUND_PATH);
+    db.dependsOn(CONTENT_LEVEL_PATH, CONTENT_CONFIG_PATH);
+    db.dependsOn(CONTENT_TRIANGLE_PATH, CONTENT_TRIANGLE_BIN_PATH);
+
+    let level : AssetId = db.loadWithDependencies(CONTENT_LEVEL_PATH);
+    report.expect("the level loads with its dependencies (${db.error()})", !level.isNone());
+    report.expect(
+        "six assets are known and each was installed once",
+        db.count() == ASSETDB_ASSETS && db.installCount() == ASSETDB_ASSETS
+    );
+
+    let bin : AssetId = db.find(CONTENT_TRIANGLE_BIN_PATH);
+    let tri : AssetId = db.find(CONTENT_TRIANGLE_PATH);
+    report.expect(
+        "a dependency was loaded before the asset that needs it",
+        db.version(bin) == 1 && db.version(tri) == 1
+    );
+
+    let canonical : AssetId = AssetDb::idFor(CONTENT_TRIANGLE_PATH);
+    report.expect(
+        "ids come from the path and agree with the database",
+        tri.same(canonical) && tri.same(AssetDb::idFor("./models//tri.gltf"))
+    );
+    return level;
+}
+
+// The kind of an asset, as a short word for the summary.
+fn assetdbKindName(db : AssetDb, id : AssetId) : string {
+    return db.kindOf(id).label();
+}
+
+// A table of what the database holds, one row per asset.
+fn summary(db : AssetDb) : void {
+    println("");
+    println("  asset id    kind   v  path");
+    for (i of 0..ASSETDB_ASSETS) {
+        let path : string = assetdbSummaryPath(i);
+        let id : AssetId = db.find(path);
+        let raw : string = "${id.raw}";
+        let kind : string = assetdbKindName(db, id);
+        let left : string = assetdbPadLeft(raw, ASSETDB_ID_WIDTH);
+        let right : string = assetdbPadRight(kind, ASSETDB_KIND_WIDTH);
+        println("  ${left}  ${right} ${db.version(id)}  ${path}");
+    }
+}
+
+// The paths of the summary, in the order the dependencies were installed.
+fn assetdbSummaryPath(i : i32) : string {
+    return match i {
+        0 => CONTENT_LEVEL_PATH,
+        1 => CONTENT_TRIANGLE_PATH,
+        2 => CONTENT_TRIANGLE_BIN_PATH,
+        3 => CONTENT_CRATE_PATH,
+        4 => CONTENT_GROUND_PATH,
+        _ => CONTENT_CONFIG_PATH,
+    };
+}
+
+// Pads on the left so a right-aligned column of ids lines up.
+fn assetdbPadLeft(s : string, width : i32) : string {
+    let mut out : string = s;
+    while (out.byteLength < width) {
+        out = " " + out;
+    }
+    return out;
+}
+
+// Pads on the right so a left-aligned column of kinds lines up.
+fn assetdbPadRight(s : string, width : i32) : string {
+    let mut out : string = s;
+    while (out.byteLength < width) {
+        out = out + " ";
+    }
+    return out;
+}
+
+// What came out of each file.
+fn contents(report : Report, db : AssetDb, level : AssetId) : void {
+    report.section("contents");
+    let doc : JsonDoc = db.json(level);
+    report.expect(
+        "the level names two props",
+        doc.childCount(doc.field(doc.root(), "props")) == 2
+            && doc.asString(doc.field(doc.root(), "name")) == "first level"
+    );
+
+    let tri : ModelAsset = db.model(db.find(CONTENT_TRIANGLE_PATH));
+    report.expect(
+        "the triangle: one mesh of 3 vertices and 1 triangle",
+        tri.ok() && tri.meshCount() == 1 && tri.mesh(0).primitive(0).vertexCount() == 3
+            && tri.mesh(0).primitive(0).triangleCount() == 1
+    );
+    report.expect(
+        "the triangle's material is the orange one",
+        tri.material(0).name == "orange" && tri.material(0).baseColor.y == 0.5
+            && tri.material(0).roughness == (0.8 as f32)
+    );
+    report.expect("its binary was read from the separate file", tri.externalFiles() == "models/tri.bin\n");
+
+    let box : ModelAsset = db.model(db.find(CONTENT_CRATE_PATH));
+    report.expect(
+        "the crate: 24 vertices, 12 triangles, a 16 x 16 texture",
+        box.ok() && box.mesh(0).primitive(0).vertexCount() == 24
+            && box.mesh(0).primitive(0).triangleCount() == 12
+            && box.texture(0).width() == 16
+    );
+    report.expect(
+        "the crate is one unit across",
+        box.mesh(0).primitive(0).bounds().max.x == 1.0 && box.mesh(0).primitive(0).bounds().max.y == 1.0
+    );
+
+    let ground : Image = db.image(db.find(CONTENT_GROUND_PATH));
+    report.expect(
+        "the ground is the archive's 8 x 8 checker",
+        ground.width() == CONTENT_GROUND_SIDE && ground.get(0, 0) == ContentFiles::groundLight()
+            && ground.get(2, 0) == ContentFiles::groundDark()
+    );
+
+    let config : JsonDoc = db.json(db.find(CONTENT_CONFIG_PATH));
+    let configNode : JsonValue = config.root();
+    report.expect(
+        "the configuration is the patch's: volume 0.5, four keys",
+        config.numberOr(config.field(configNode, "volume"), 0.0) == CONTENT_VOLUME_PATCHED
+            && config.childCount(config.field(configNode, "keys")) == 4
+    );
+}
+
+// Things that must fail cleanly.
+fn failures(report : Report, db : AssetDb) : void {
+    report.section("failures");
+    report.expect(
+        "a model whose buffer file is missing fails with a reason",
+        db.load(CONTENT_BROKEN_PATH).isNone() && db.error().startsWith("models/broken.gltf: ")
+    );
+    println("        ${db.error()}");
+
+    report.expect("a file that does not exist fails", db.load("models/ghost.gltf").isNone());
+    report.expect("a path above the root is refused", db.load("../outside.json").isNone());
+
+    db.dependsOn("cycle/a.json", "cycle/b.json");
+    db.dependsOn("cycle/b.json", "cycle/a.json");
+    report.expect(
+        "a dependency cycle is refused before anything is read",
+        db.loadWithDependencies("cycle/a.json").isNone()
+            && db.error().startsWith("dependency cycle: cycle/a.json -> cycle/b.json -> cycle/a.json")
+    );
+    println("        ${db.error()}");
+}
+
+// Edits files and reloads: only what changed moves its version.
+fn reloading(report : Report, db : AssetDb) : void {
+    report.section("reloading");
+    let config : AssetId = db.find(CONTENT_CONFIG_PATH);
+    let tri : AssetId = db.find(CONTENT_TRIANGLE_PATH);
+    let ground : AssetId = db.find(CONTENT_GROUND_PATH);
+
+    report.expect(
+        "nothing changed yet: reloading everything changes nothing",
+        db.reloadAll() == 0 && db.version(config) == 1
+    );
+
+    try {
+        db.files().writeText(CONTENT_CONFIG_PATH, ContentFiles::gameConfig(CONTENT_VOLUME_EDITED));
+        db.files().writeText(CONTENT_TRIANGLE_PATH, ContentFiles::triangleGltf(CONTENT_TRIANGLE_MOVED_X));
+    } catch e : IOException {
+        report.expect("the files can be edited (${e.message})", false);
+    }
+
+    report.expect(
+        "the configuration reloads and goes to version 2",
+        db.reload(CONTENT_CONFIG_PATH) && db.version(config) == 2
+    );
+    let doc : JsonDoc = db.json(config);
+    report.expect(
+        "with the new volume",
+        doc.numberOr(doc.field(doc.root(), "volume"), 0.0) == CONTENT_VOLUME_EDITED
+    );
+    report.expect(
+        "reloading it again finds the same bytes",
+        !db.reload(CONTENT_CONFIG_PATH) && db.version(config) == 2
+    );
+    report.expect(
+        "the edited model reloads too",
+        db.reload(CONTENT_TRIANGLE_PATH) && db.version(tri) == 2
+            && db.model(tri).node(0).local.translation.x == (CONTENT_TRIANGLE_MOVED_X as f32)
+    );
+    report.expect(
+        "the untouched picture stays at version 1",
+        !db.reload(CONTENT_GROUND_PATH) && db.version(ground) == 1
+    );
+
+    try {
+        db.files().writeText(CONTENT_CONFIG_PATH, "{ this is not json");
+    } catch e : IOException {
+        report.expect("the file can be broken (${e.message})", false);
+    }
+    let kept : JsonDoc = db.json(config);
+    let keptNode : JsonValue = kept.root();
+    report.expect(
+        "a broken edit is refused and the last good configuration stays",
+        !db.reload(CONTENT_CONFIG_PATH) && db.version(config) == 2
+            && kept.numberOr(kept.field(keptNode, "volume"), 0.0) == CONTENT_VOLUME_EDITED
+    );
+    println("        ${db.error()}");
+
+    report.expect("the whole run installed 8 values", db.installCount() == 8);
+}

@@ -1,0 +1,191 @@
+// frame — one picture from the stage: extract, plan, record, execute.
+//
+// This is the whole render path of the library in order, as a game would call it: the world is extracted into a
+// camera-relative `RenderScene` (culled, sorted, lights in physical units); a render graph says which passes exist
+// and what they read and write; the compiled plan and the scene are recorded into a command stream; the CPU backend
+// executes the stream. Everything a check wants to look at afterwards is kept in the returned `PrismFrame`.
+//
+// The graph is declared with an extra pass that reads the picture and writes a texture nobody consumes; the
+// compiler must cull it. That pass is the point of the structure check, not a feature of the picture.
+
+use ludax::{
+    Camera, CmdStream, CpuRenderer, CpuSettings, FrameRecorder, GraphCompiler, GraphFormat, GraphPlan,
+    GraphResKind
+};
+use ludax::{LightUnits, PassCosts, PassKind, Profiler, RenderExtract, RenderGraph, RenderScene, Vec3};
+
+use crate::scene::stage::PrismStage;
+
+/** The id of the graph's HDR colour image (resources count from 0 in the order they are declared). */
+pub const PRISM_HDR : i32 = 1;
+
+/** The 8-bit result resource. */
+pub const PRISM_WINDOW : i32 = 3;
+
+// The acceleration buffer is sized for four million nodes; the graph only reserves it.
+const PRISM_BVH_BYTES : i32 = 4000000;
+
+// How bright the sky's specular sample is, how far below sunlit white the exposure sits, and how much of the
+// environment is mixed in.
+const PRISM_ENV_SCALE : f32 = 1.6;
+const PRISM_SUN_EXPOSURE : f32 = 0.35;
+const PRISM_ENV_EXPOSURE : f32 = 0.6;
+
+// The environment light: the number of directions the sky is sampled in for its diffuse term, the direction of
+// the radiance the specular lobe reads (up and a little towards the camera), the direction of the clear colour
+// (just above the horizon), and the colour the ground bounces back.
+const PRISM_AMBIENT_SAMPLES : i32 = 16;
+const PRISM_SPECULAR_Y : f32 = 0.7;
+const PRISM_SPECULAR_Z : f32 = 0.7;
+const PRISM_HORIZON_Y : f32 = 0.15;
+const PRISM_BOUNCE_R : f32 = 0.34;
+const PRISM_BOUNCE_G : f32 = 0.29;
+const PRISM_BOUNCE_B : f32 = 0.22;
+
+// The luminance meter's texture, which only exists to be culled: this many texels on a side.
+const PRISM_METER_SIZE : i32 = 16;
+
+// The DFG lookup and the profiler's ring: one frame is enough to absorb the recorded pass timings.
+const PRISM_DFG_SIZE : i32 = 24;
+const PRISM_DFG_ORDER : i32 = 48;
+const PRISM_PROFILE_FRAMES : i32 = 2;
+const PRISM_PROFILE_SAMPLES : i32 = 64;
+const PRISM_PROFILE_SCOPES : i32 = 8;
+
+/** Everything produced by rendering one picture. */
+pub class PrismFrame {
+    /** The camera-relative snapshot that was drawn. */
+    pub scene : RenderScene;
+
+    /** The graph as declared. */
+    pub graph : RenderGraph;
+
+    /** The compiled plan. */
+    pub plan : GraphPlan;
+
+    /** The commands that were executed. */
+    pub stream : CmdStream;
+
+    /** Counters and times per pass. */
+    pub costs : PassCosts;
+
+    /** The renderer that holds the finished picture. */
+    pub renderer : CpuRenderer;
+
+    /** Extracts, plans, records and executes a `w` x `h` picture of `stage` on `workers` threads (0 = this thread). */
+    constructor(stage : PrismStage, w : i32, h : i32, workers : i32) {
+        let camera : Camera = stage.camera((w as f32) / (h as f32));
+        let frame : RenderScene = RenderExtract::run(
+            stage.world,
+            stage.meshes,
+            stage.materials,
+            stage.lights,
+            stage.assets,
+            camera
+        );
+        PrismFrame::lightEnvironment(frame, stage);
+
+        let g : RenderGraph = PrismFrame::declareGraph(w, h);
+        let plan : GraphPlan = GraphCompiler::compile(g);
+
+        // The clear colour is the sky near the horizon, seen through the same exposure as everything else.
+        let stream : CmdStream = new CmdStream();
+        let clear : Vec3 = stage.sky.skyRadiance(Vec3::make(0.0, PRISM_HORIZON_Y, -1.0).normalized());
+        FrameRecorder::record(
+            g,
+            plan,
+            frame,
+            clear,
+            stream
+        );
+
+        let costs : PassCosts = new PassCosts(g.passTotal());
+        let settings : CpuSettings = CpuSettings {
+            workers: workers,
+            cullBackfaces: true,
+            dfgSize: PRISM_DFG_SIZE,
+            dfgOrder: PRISM_DFG_ORDER,
+        };
+        let renderer : CpuRenderer = new CpuRenderer(w, h, stage.assets, settings);
+        PrismFrame::execute(renderer, stream, frame, costs);
+
+        self.scene = frame;
+        self.graph = g;
+        self.plan = plan;
+        self.stream = stream;
+        self.costs = costs;
+        self.renderer = renderer;
+    }
+
+    // The sky: its dome as SH9 for diffuse light, one radiance towards the zenith side for the specular lobe, the
+    // ground's bounce and the exposure.
+    static fn lightEnvironment(frame : RenderScene, stage : PrismStage) : void {
+        let zenithSide : Vec3 = Vec3::make(0.0, PRISM_SPECULAR_Y, PRISM_SPECULAR_Z).normalized();
+        let specular : Vec3 = stage.sky.skyRadiance(zenithSide).scale(PRISM_ENV_SCALE);
+        frame.setEnvironment(stage.sky.ambient(PRISM_AMBIENT_SAMPLES), specular);
+        frame.setGroundRadiance(Vec3::make(PRISM_BOUNCE_R, PRISM_BOUNCE_G, PRISM_BOUNCE_B));
+        frame.setExposure(
+            LightUnits::exposure(LightUnits::ev100ForSunlitWhite() - PRISM_SUN_EXPOSURE),
+            PRISM_ENV_EXPOSURE
+        );
+    }
+
+    // The passes and the resources they read and write, with one pass added only so the compiler has one to cull.
+    static fn declareGraph(w : i32, h : i32) : RenderGraph {
+        let g : RenderGraph = new RenderGraph();
+        g.addBuffer("scene.bvh", GraphResKind::Accel, PRISM_BVH_BYTES, false);
+        g.addImage("hdr", GraphResKind::Color, w, h, GraphFormat::Hdr, false);
+        g.addImage("depth", GraphResKind::Depth, w, h, GraphFormat::Depth32, false);
+        g.addImage("window", GraphResKind::Color, w, h, GraphFormat::Srgb8, true);
+        g.addImage(
+            "luminance",
+            GraphResKind::Texture,
+            PRISM_METER_SIZE,
+            PRISM_METER_SIZE,
+            GraphFormat::Hdr,
+            false
+        );
+
+        let resolve : i32 = g.addPass("resolve", PassKind::Resolve);
+        g.reads(resolve, "hdr");
+        g.writes(resolve, "window");
+
+        let forward : i32 = g.addPass("forward", PassKind::Forward);
+        g.reads(forward, "scene.bvh");
+        g.writes(forward, "hdr");
+        g.writes(forward, "depth");
+
+        let bvh : i32 = g.addPass("bvh", PassKind::BuildAccel);
+        g.writes(bvh, "scene.bvh");
+
+        // Added to show culling: it reads the picture and writes something nobody uses.
+        let meter : i32 = g.addPass("luminance-meter", PassKind::Custom);
+        g.reads(meter, "hdr");
+        g.writes(meter, "luminance");
+        return g;
+    }
+
+    // Runs the stream on the renderer under a profiler, and folds the pass timings into `costs`.
+    static fn execute(
+        renderer : CpuRenderer,
+        stream : CmdStream,
+        frame : RenderScene,
+        costs : PassCosts
+    ) : void {
+        let profiler : Profiler = new Profiler(
+            PRISM_PROFILE_FRAMES,
+            PRISM_PROFILE_SAMPLES,
+            PRISM_PROFILE_SCOPES
+        );
+        profiler.setEnabled(true);
+        profiler.beginFrame();
+        renderer.execute(stream, frame, costs, profiler);
+        profiler.endFrame();
+        costs.absorbProfile(profiler);
+    }
+
+    /** Stops the worker threads. */
+    pub fn close(mut self) : void {
+        self.renderer.close();
+    }
+}

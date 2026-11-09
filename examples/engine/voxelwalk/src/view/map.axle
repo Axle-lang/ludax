@@ -1,0 +1,385 @@
+// map — pictures of the loaded world drawn straight from the chunk store: a top-down map and a side section.
+//
+// Nothing here knows how the world was made; it only asks `VoxWorld` for the blocks of chunks that are loaded, so
+// what the picture shows is exactly what is in memory. Cells in chunks that are not loaded stay black, which makes
+// the loaded disc of the streamer visible.
+//
+// A picture is described by a small struct rather than five numbers in a row: `topDown(w, -176, -176, 352, 2,
+// true)` is easy to call with the wrong pair transposed and impossible to read back.
+
+use ludax::{Image, VoxBlocks, VoxChunk, VoxWorld, VW_AIR, VW_WATER};
+
+/** Blocks along a chunk's edge; a chunk is this cubed. */
+const MAP_CHUNK_EDGE : i32 = 16;
+
+/** Blocks to chunk coordinates is a shift of this many bits... */
+const MAP_CHUNK_SHIFT : i32 = 4;
+
+/** ...and a block's offset within its chunk is a mask of this. */
+const MAP_CHUNK_MASK : i32 = 15;
+
+/** Chunks stacked in a column. */
+const MAP_CHUNKS_HIGH : i32 = 8;
+
+/** Blocks stacked in a column, all the world's height. */
+const MAP_BLOCKS_HIGH : i32 = 128;
+
+// The largest channel value and the divisor that scales a base colour by a light value.
+const MAP_MAX : i32 = 255;
+const MAP_LIGHT_DIV : i32 = 230;
+
+// Water darkens by this much per block of depth, and never below this.
+const MAP_WATER_STEP : i32 = 14;
+const MAP_WATER_MIN : i32 = 90;
+
+// A block's light: its own value, the slope's weight, and how height shifts it.
+const MAP_BASE_LIT : i32 = 205;
+const MAP_SLOPE_LIT : i32 = 26;
+const MAP_HEIGHT_LIT : i32 = 2;
+const MAP_GROUND_LEVEL : i32 = 40;
+const MAP_MIN_LIT : i32 = 80;
+
+// The columns of a map are sampled with a ring of this many extra columns around it, so each cell has a west
+// and a north neighbour for the slope.
+const MAP_RING : i32 = 1;
+
+// The speckle that breaks up a section's flat block colour is a hash of the block's x and y with these weights.
+const MAP_SPECKLE_X : i32 = 7;
+const MAP_SPECKLE_Y : i32 = 13;
+
+// The sky gradient's blue, and how fast red and green climb with height.
+const MAP_SKY_R : i32 = 110;
+const MAP_SKY_G : i32 = 160;
+const MAP_SKY_B : i32 = 235;
+const MAP_SKY_R_RATE : i32 = 3;
+const MAP_SKY_G_RATE : i32 = 4;
+
+// A cave's unlit colour, the vertical shading's base and spread, and how much a chunk border darkens.
+const MAP_CAVE_R : i32 = 24;
+const MAP_CAVE_G : i32 = 20;
+const MAP_CAVE_B : i32 = 32;
+const MAP_SHADE_BASE : i32 = 190;
+const MAP_SHADE_SPREAD : i32 = 40;
+const MAP_GRID_NUM : i32 = 3;
+const MAP_GRID_DEN : i32 = 4;
+
+/** A top-down picture of a rectangle of the world. */
+pub struct MapView {
+    /** The left edge, in block x. */
+    pub x0 : i32 = 0;
+
+    /** The top edge, in block z. */
+    pub z0 : i32 = 0;
+
+    /** The number of blocks across and down. */
+    pub size : i32 = 1;
+
+    /** Pixels per block. */
+    pub scale : i32 = 1;
+
+    /** Whether to mark chunk borders. */
+    pub grid : bool = false;
+}
+
+/** A vertical section along x at one block row. */
+pub struct SectionView {
+    /** The block row z the section is cut along. */
+    pub z : i32 = 0;
+
+    /** The left edge of the section, in block x. */
+    pub x0 : i32 = 0;
+
+    /** The number of blocks across. */
+    pub width : i32 = 1;
+
+    /** Pixels per block. */
+    pub scale : i32 = 1;
+}
+
+/** What one column of blocks shows from above. */
+struct WalkColumn {
+    /** y of the highest block that is not air or water; -1 when the column has none. */
+    top : i32;
+
+    /** The block at `top`; air when there is none. */
+    block : i32;
+
+    /** How deep the water is above `top`, 0 on dry land. */
+    water : i32;
+
+    /** True when the column's chunks are loaded. */
+    loaded : bool;
+}
+
+/** What one chunk shows of a column, heights local to the chunk. */
+struct WalkSurface {
+    /** y of the highest block that is not air or water; -1 when there is none. */
+    top : i32;
+
+    /** The block at `top`; air when there is none. */
+    block : i32;
+
+    /** y of the first water met above `top`; -1 when there is none. */
+    water : i32;
+}
+
+/** The columns of a map's area, with a ring of one extra column so each cell has a west and a north neighbour. */
+struct WalkSamples {
+    /** Columns per side, including the ring. */
+    side : i32;
+
+    /** Per column: y of the top block. */
+    height : i32[];
+
+    /** Per column: the top block. */
+    block : i32[];
+
+    /** Per column: the water depth above it. */
+    depth : i32[];
+
+    /** Per column: 1 when its chunks are loaded. */
+    seen : i32[];
+}
+
+/** Draws the world. */
+pub class WalkMap {
+    // A cell the picture has nothing to show for: black and opaque.
+    static fn unseen() : i32 {
+        return Image::pack(0, 0, 0, MAP_MAX);
+    }
+
+    // `base` with every channel multiplied by `num / den`, opaque.
+    static fn scaled(base : i32, num : i32, den : i32) : i32 {
+        return Image::pack(
+            Image::red(base) * num / den,
+            Image::green(base) * num / den,
+            Image::blue(base) * num / den,
+            MAP_MAX
+        );
+    }
+
+    // The same with every channel held to 0..255 afterwards.
+    static fn scaledClamped(base : i32, num : i32, den : i32) : i32 {
+        return Image::pack(
+            WalkMap::clamp(Image::red(base) * num / den, 0, MAP_MAX),
+            WalkMap::clamp(Image::green(base) * num / den, 0, MAP_MAX),
+            WalkMap::clamp(Image::blue(base) * num / den, 0, MAP_MAX),
+            MAP_MAX
+        );
+    }
+
+    // The channel value `v` clamped into `lo..hi`.
+    static fn clamp(v : i32, lo : i32, hi : i32) : i32 {
+        if (v < lo) {
+            return lo;
+        }
+        if (v > hi) {
+            return hi;
+        }
+        return v;
+    }
+
+    // The first block, from the top, that is neither air nor water inside one chunk at column `x`, `z`, and the
+    // first water met on the way down; heights are local to the chunk, -1 when there is none.
+    static fn chunkSurface(ch : VoxChunk, x : i32, z : i32) : WalkSurface {
+        let mut found : WalkSurface = WalkSurface { top: -1, block: VW_AIR, water: -1 };
+        let mut ly : i32 = MAP_CHUNK_EDGE - 1;
+        while (ly >= 0 && found.block == VW_AIR) {
+            let id : i32 = ch.at(x & MAP_CHUNK_MASK, ly, z & MAP_CHUNK_MASK);
+            if (id == VW_WATER) {
+                if (found.water < 0) {
+                    found.water = ly;
+                }
+            } else if (id != VW_AIR) {
+                found.top = ly;
+                found.block = id;
+            }
+            ly = ly - 1;
+        }
+        return found;
+    }
+
+    // The top of the column at `x`, `z`: the highest block that is not air or water, its id, the water above
+    // it, and whether the column's chunks are loaded.
+    static fn column(w : VoxWorld, x : i32, z : i32) : WalkColumn {
+        let mut col : WalkColumn = WalkColumn { top: -1, block: VW_AIR, water: 0, loaded: false };
+        let mut waterTop : i32 = -1;
+        let cx : i32 = x >> MAP_CHUNK_SHIFT;
+        let cz : i32 = z >> MAP_CHUNK_SHIFT;
+
+        let mut cy : i32 = MAP_CHUNKS_HIGH - 1;
+        while (cy >= 0 && col.block == VW_AIR) {
+            let level : i32 = cy;
+            cy = cy - 1;
+            if (!w.isLoaded(cx, level, cz)) {
+                continue;
+            }
+            col.loaded = true;
+
+            let ch : VoxChunk = w.store.chunk(cx, level, cz);
+            if (ch.isUniform() && ch.firstBlock() == VW_AIR) {
+                continue;
+            }
+
+            let surface : WalkSurface = WalkMap::chunkSurface(ch, x, z);
+            if (waterTop < 0 && surface.water >= 0) {
+                waterTop = level * MAP_CHUNK_EDGE + surface.water;
+            }
+            if (surface.block != VW_AIR) {
+                col.top = level * MAP_CHUNK_EDGE + surface.top;
+                col.block = surface.block;
+            }
+        }
+
+        if (waterTop >= 0 && col.top >= 0) {
+            col.water = waterTop - col.top;
+        }
+        return col;
+    }
+
+    // The colour of a cell seen from above: a block lit by the slope of its neighbours, or water tinted by
+    // how deep it is.
+    static fn topPixel(block : i32, height : i32, west : i32, north : i32, water : i32) : i32 {
+        if (water > 0) {
+            let lit : i32 = WalkMap::clamp(MAP_MAX - water * MAP_WATER_STEP, MAP_WATER_MIN, MAP_MAX);
+            return WalkMap::scaled(VoxBlocks::color(VW_WATER), lit, MAP_MAX);
+        }
+
+        let slope : i32 = (west - height) * MAP_SLOPE_LIT + (north - height) * MAP_SLOPE_LIT;
+        let fromHeight : i32 = (height - MAP_GROUND_LEVEL) / MAP_HEIGHT_LIT;
+        let lit : i32 = WalkMap::clamp(MAP_BASE_LIT + slope + fromHeight, MAP_MIN_LIT, MAP_MAX);
+        return WalkMap::scaledClamped(VoxBlocks::color(block), lit, MAP_LIGHT_DIV);
+    }
+
+    // Looks at every column of the view, plus the ring around it.
+    static fn sample(w : VoxWorld, view : MapView) : WalkSamples {
+        let side : i32 = view.size + MAP_RING * 2;
+        let cells : i64 = (side * side) as i64;
+        let mut samples : WalkSamples = WalkSamples {
+            side: side,
+            height: new i32[cells],
+            block: new i32[cells],
+            depth: new i32[cells],
+            seen: new i32[cells],
+        };
+
+        for (j of 0..side) {
+            for (i of 0..side) {
+                let c : WalkColumn = WalkMap::column(w, view.x0 + i - MAP_RING, view.z0 + j - MAP_RING);
+                let at : i64 = (j * side + i) as i64;
+                samples.height[at] = c.top;
+                samples.block[at] = c.block;
+                samples.depth[at] = c.water;
+                if (c.loaded) {
+                    samples.seen[at] = 1;
+                } else {
+                    samples.seen[at] = 0;
+                }
+            }
+        }
+        return samples;
+    }
+
+    // The colour of the cell at index `at`, black where its chunks are not loaded or it is empty.
+    static fn cellPixel(samples : WalkSamples, at : i64) : i32 {
+        if (samples.seen[at] != 1 || samples.block[at] == VW_AIR) {
+            return WalkMap::unseen();
+        }
+        return WalkMap::topPixel(
+            samples.block[at],
+            samples.height[at],
+            samples.height[at - 1],
+            samples.height[at - samples.side as i64],
+            samples.depth[at]
+        );
+    }
+
+    // A pixel darkened to mark a chunk border.
+    static fn gridPixel(pixel : i32) : i32 {
+        return WalkMap::scaled(pixel, MAP_GRID_NUM, MAP_GRID_DEN);
+    }
+
+    // Whether the sub-pixel (`si`, `sj`) of the block at (`wx`, `wz`) lies on the west or north edge of its chunk.
+    static fn isBorder(wx : i32, wz : i32, si : i32, sj : i32) : bool {
+        let west : bool = (wx & MAP_CHUNK_MASK) == 0 && si == 0;
+        let north : bool = (wz & MAP_CHUNK_MASK) == 0 && sj == 0;
+        return west || north;
+    }
+
+    /**
+     * The view from above of the `view.size` x `view.size` blocks at (`view.x0`, `view.z0`), each block
+     * `view.scale` pixels wide, lit from the north-west by the slope of the ground; water darkens with depth;
+     * chunk borders are marked when `view.grid` is set.
+     */
+    pub static fn topDown(w : VoxWorld, view : MapView) : Image {
+        let samples : WalkSamples = WalkMap::sample(w, view);
+        let img : Image = new Image(view.size * view.scale, view.size * view.scale);
+        for (j of 0..view.size) {
+            for (i of 0..view.size) {
+                let at : i64 = ((j + MAP_RING) * samples.side + i + MAP_RING) as i64;
+                let pixel : i32 = WalkMap::cellPixel(samples, at);
+                let wx : i32 = view.x0 + i;
+                let wz : i32 = view.z0 + j;
+                let marked : bool = view.grid && samples.seen[at] == 1;
+
+                for (sj of 0..view.scale) {
+                    for (si of 0..view.scale) {
+                        let onBorder : bool = WalkMap::isBorder(wx, wz, si, sj);
+                        let mut p : i32 = pixel;
+                        if (marked && onBorder) {
+                            p = WalkMap::gridPixel(pixel);
+                        }
+                        img.set(i * view.scale + si, j * view.scale + sj, p);
+                    }
+                }
+            }
+        }
+        return img;
+    }
+
+    // The colour of the block at (`x`, `y`, `z`) in a section: black when unloaded, sky or cave for air depending
+    // on whether it lies above the column's `top`, and a lightly speckled block colour otherwise.
+    static fn sectionPixel(w : VoxWorld, x : i32, y : i32, z : i32, top : i32) : i32 {
+        if (!w.isLoaded(x >> MAP_CHUNK_SHIFT, y >> MAP_CHUNK_SHIFT, z >> MAP_CHUNK_SHIFT)) {
+            return WalkMap::unseen();
+        }
+
+        let id : i32 = w.blockAt(x, y, z);
+        if (id == VW_AIR && y > top) {
+            return Image::pack(
+                MAP_SKY_R + y / MAP_SKY_R_RATE,
+                MAP_SKY_G + y / MAP_SKY_G_RATE,
+                MAP_SKY_B,
+                MAP_MAX
+            );
+        }
+        if (id == VW_AIR) {
+            return Image::pack(MAP_CAVE_R, MAP_CAVE_G, MAP_CAVE_B, MAP_MAX);
+        }
+
+        let shade : i32 = MAP_SHADE_BASE + (x * MAP_SPECKLE_X + y * MAP_SPECKLE_Y) % MAP_SHADE_SPREAD;
+        return WalkMap::scaled(VoxBlocks::color(id), shade, MAP_LIGHT_DIV);
+    }
+
+    /**
+     * A vertical section along x at the block row `view.z`: `view.width` blocks from `view.x0`, the whole height
+     * of the world, each block `view.scale` pixels. Open sky is blue, caves are dark.
+     */
+    pub static fn side(w : VoxWorld, view : SectionView) : Image {
+        let img : Image = new Image(view.width * view.scale, MAP_BLOCKS_HIGH * view.scale);
+        for (i of 0..view.width) {
+            let x : i32 = view.x0 + i;
+            let top : i32 = WalkMap::column(w, x, view.z).top;
+
+            for (y of 0..MAP_BLOCKS_HIGH) {
+                let pixel : i32 = WalkMap::sectionPixel(w, x, y, view.z, top);
+                for (sj of 0..view.scale) {
+                    for (si of 0..view.scale) {
+                        img.set(i * view.scale + si, (MAP_BLOCKS_HIGH - 1 - y) * view.scale + sj, pixel);
+                    }
+                }
+            }
+        }
+        return img;
+    }
+}

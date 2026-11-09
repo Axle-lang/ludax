@@ -1,0 +1,212 @@
+// canvas — a plain RGB pixel buffer with the few drawing operations the picture needs.
+//
+// Lines (Bresenham), filled discs, filled convex polygons and a vertical gradient: enough to draw a side view of
+// boxes, balls and rods. Everything clips to the buffer, so a body that wandered out of the picture costs nothing.
+
+/** Bytes per pixel: red, green and blue. */
+const CANVAS_CHANNELS : i32 = 3;
+
+/** The low 8 bits of a colour channel. */
+const CANVAS_CHANNEL_MASK : i32 = 255;
+
+/** A colour is 0xRRGGBB: red sits this many bits up... */
+const CANVAS_RED_SHIFT : i32 = 16;
+
+/** ...and green this many. */
+const CANVAS_GREEN_SHIFT : i32 = 8;
+
+/** The number of levels a channel is blended through. */
+const CANVAS_LEVELS : i32 = 256;
+
+/** No line in this picture is longer than this many pixel steps; the guard stops a bad input from hanging. */
+const CANVAS_LINE_GUARD : i32 = 20000;
+
+/** A scan line beyond any coordinate a body can reach, used to widen a polygon's span. */
+const CANVAS_FAR : f64 = 1.0e30;
+
+/** A straight run between two pixels, both included. */
+pub struct CanvasSegment {
+    /** The start column. */
+    pub x0 : i32 = 0;
+
+    /** The start row. */
+    pub y0 : i32 = 0;
+
+    /** The end column. */
+    pub x1 : i32 = 0;
+
+    /** The end row. */
+    pub y1 : i32 = 0;
+}
+
+/** An RGB image being drawn. */
+pub class Canvas {
+    /** Width in pixels. */
+    pub width : i32;
+
+    /** Height in pixels. */
+    pub height : i32;
+
+    pixels : i8[];
+
+    /** A black canvas. */
+    constructor(w : i32, h : i32) {
+        self.width = w;
+        self.height = h;
+        self.pixels = new i8[(w * h * CANVAS_CHANNELS) as i64];
+        for (i of 0..w * h * CANVAS_CHANNELS) {
+            self.pixels[i as i64] = 0 as i8;
+        }
+    }
+
+    /** The bytes, three per pixel, rows from the top. */
+    pub fn bytes(self) : i8[] {
+        return self.pixels;
+    }
+
+    /** Sets a pixel to colour `rgb` (0xRRGGBB); outside the canvas does nothing. */
+    pub fn plot(mut self, x : i32, y : i32, rgb : i32) : void {
+        if (x < 0 || y < 0 || x >= self.width || y >= self.height) {
+            return;
+        }
+        let at : i64 = ((y * self.width + x) * CANVAS_CHANNELS) as i64;
+        self.pixels[at] = canvasRed(rgb) as i8;
+        self.pixels[at + 1] = canvasGreen(rgb) as i8;
+        self.pixels[at + 2] = canvasBlue(rgb) as i8;
+    }
+
+    /** Fills the canvas with a vertical blend from `top` to `bottom`. */
+    pub fn gradient(mut self, top : i32, bottom : i32) : void {
+        let topR : i32 = canvasRed(top);
+        let topG : i32 = canvasGreen(top);
+        let topB : i32 = canvasBlue(top);
+        let bottomR : i32 = canvasRed(bottom);
+        let bottomG : i32 = canvasGreen(bottom);
+        let bottomB : i32 = canvasBlue(bottom);
+
+        for (y of 0..self.height) {
+            let t : i32 = (y * CANVAS_LEVELS) / self.height;
+            let keep : i32 = CANVAS_LEVELS - t;
+            let r : i32 = (topR * keep + bottomR * t) / CANVAS_LEVELS;
+            let g : i32 = (topG * keep + bottomG * t) / CANVAS_LEVELS;
+            let b : i32 = (topB * keep + bottomB * t) / CANVAS_LEVELS;
+            for (x of 0..self.width) {
+                self.plot(x, y, (r << CANVAS_RED_SHIFT) | (g << CANVAS_GREEN_SHIFT) | b);
+            }
+        }
+    }
+
+    /** Draws a line of one pixel. */
+    pub fn line(mut self, seg : CanvasSegment, rgb : i32) : void {
+        let x0 : i32 = seg.x0;
+        let y0 : i32 = seg.y0;
+        let x1 : i32 = seg.x1;
+        let y1 : i32 = seg.y1;
+        let mut dx : i32 = x1 - x0;
+        if (dx < 0) {
+            dx = 0 - dx;
+        }
+        let mut dy : i32 = y1 - y0;
+        if (dy < 0) {
+            dy = 0 - dy;
+        }
+        let sx : i32 = canvasSign(x0 < x1);
+        let sy : i32 = canvasSign(y0 < y1);
+        let mut err : i32 = dx - dy;
+        let mut x : i32 = x0;
+        let mut y : i32 = y0;
+        let mut guard : i32 = 0;
+        while (guard < CANVAS_LINE_GUARD) {
+            self.plot(x, y, rgb);
+            if (x == x1 && y == y1) {
+                break;
+            }
+            let e2 : i32 = 2 * err;
+            if (e2 > 0 - dy) {
+                err = err - dy;
+                x = x + sx;
+            }
+            if (e2 < dx) {
+                err = err + dx;
+                y = y + sy;
+            }
+            guard = guard + 1;
+        }
+    }
+
+    /** Fills a disc. */
+    pub fn disc(mut self, cx : i32, cy : i32, r : i32, rgb : i32) : void {
+        for (y of cy - r..cy + r + 1) {
+            for (x of cx - r..cx + r + 1) {
+                let dx : i32 = x - cx;
+                let dy : i32 = y - cy;
+                if (dx * dx + dy * dy <= r * r) {
+                    self.plot(x, y, rgb);
+                }
+            }
+        }
+    }
+
+    /** Fills a convex polygon given by `n` corners in order (either winding). */
+    pub fn polygon(mut self, xs : f64[], ys : f64[], n : i32, rgb : i32) : void {
+        let mut top : f64 = ys[0];
+        let mut bottom : f64 = ys[0];
+        for (i of 1..n) {
+            if (ys[i as i64] < top) {
+                top = ys[i as i64];
+            }
+            if (ys[i as i64] > bottom) {
+                bottom = ys[i as i64];
+            }
+        }
+        let y0 : i32 = (top as i32) - 1;
+        let y1 : i32 = (bottom as i32) + 1;
+        for (y of y0..y1 + 1) {
+            let yc : f64 = (y as f64) + 0.5;
+            let mut lo : f64 = CANVAS_FAR;
+            let mut hi : f64 = 0.0 - CANVAS_FAR;
+            for (i of 0..n) {
+                let j : i32 = (i + 1) % n;
+                let ya : f64 = ys[i as i64];
+                let yb : f64 = ys[j as i64];
+                if ((ya <= yc && yb > yc) || (yb <= yc && ya > yc)) {
+                    let t : f64 = (yc - ya) / (yb - ya);
+                    let x : f64 = xs[i as i64] + (xs[j as i64] - xs[i as i64]) * t;
+                    if (x < lo) {
+                        lo = x;
+                    }
+                    if (x > hi) {
+                        hi = x;
+                    }
+                }
+            }
+            if (lo <= hi) {
+                for (x of (lo as i32)..(hi as i32) + 1) {
+                    self.plot(x, y, rgb);
+                }
+            }
+        }
+    }
+}
+
+fn canvasSign(c : bool) : i32 {
+    if (c) {
+        return 1;
+    }
+    return -1;
+}
+
+// The red channel of a 0xRRGGBB colour.
+fn canvasRed(rgb : i32) : i32 {
+    return (rgb >> CANVAS_RED_SHIFT) & CANVAS_CHANNEL_MASK;
+}
+
+// The green channel.
+fn canvasGreen(rgb : i32) : i32 {
+    return (rgb >> CANVAS_GREEN_SHIFT) & CANVAS_CHANNEL_MASK;
+}
+
+// The blue channel.
+fn canvasBlue(rgb : i32) : i32 {
+    return rgb & CANVAS_CHANNEL_MASK;
+}

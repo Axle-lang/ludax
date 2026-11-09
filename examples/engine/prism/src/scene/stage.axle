@@ -1,0 +1,436 @@
+// stage — the world prism draws: entities in a `Scene`, their components, and the meshes and materials they name.
+//
+// Nothing here knows about pixels. A floor of tiles, two rows of five spheres (red plastic in front, gold behind, each
+// row from glossy to rough), a brick cube with a normal map, a steel column, a blue glass ball, a glowing bulb and
+// two lights: the sun, found from the library's analytic sky, and a warm lamp. Positions are f64 world coordinates;
+// the renderer subtracts the camera's position before it narrows them, which is also why the whole stage can be moved
+// 100 kilometres from the origin (`offset`) without a pixel changing (a check in main proves it).
+//
+// Two rows share one loop so the roughness gradient is visibly the only difference between plastic and gold. The
+// floor, the sky dome and the bulb are marked as not casting shadows: the first two would only darken themselves
+// and the bulb is the lamp's own surface.
+
+use ludax::{Camera, ComponentStore, DQuat, DTransform, DVec3, EntityId, LightComp, LightShadowMode, LightSky};
+use ludax::{
+    LightSource, LightUnits, LightAlphaMode, MaterialRef, MeshRef, MeshDataShapes, RenderAssets,
+    RenderMaterial
+};
+use ludax::{MeshData, Scene, Texture, TextureWrap, Vec3};
+
+use crate::scene::textures::{prismFloorImage, prismBrickImage, prismBrickNormals, prismSkyImage};
+
+// The spheres: five in each row, this far apart, on a front and a back row, with roughness rising along the row.
+const STAGE_BALLS : i32 = 5;
+const STAGE_FIRST_X : f64 = -3.8;
+const STAGE_SPACING : f64 = 1.9;
+const STAGE_ROUGH_MIN : f32 = 0.22;
+const STAGE_ROUGH_STEP : f32 = 0.19;
+
+/** The height of the spheres' centres: their radius, so they rest on the floor. */
+pub const STAGE_BALL_Y : f64 = 0.8;
+
+/** The z of the front row, the red plastic one. */
+pub const STAGE_FRONT_Z : f64 = 3.4;
+
+// The z of the back row, the gold one.
+const STAGE_BACK_Z : f64 = 0.4;
+
+// Where the lamp hangs, in stage coordinates.
+const STAGE_LAMP_X : f64 = -1.6;
+const STAGE_LAMP_Y : f64 = 2.5;
+const STAGE_LAMP_Z : f64 = -1.2;
+
+// The lamp's light: colour, intensity in candela, the radius of its sphere in metres (a 14 cm bulb) and its range
+// (0: unlimited).
+const STAGE_LAMP_R : f32 = 1.0;
+const STAGE_LAMP_G : f32 = 0.62;
+const STAGE_LAMP_B : f32 = 0.3;
+const STAGE_LAMP_CANDELA : f32 = 260000.0;
+const STAGE_LAMP_RADIUS : f32 = 0.14;
+const STAGE_LAMP_RANGE : f32 = 0.0;
+
+// The bulb's emissive colour, in scene units: a little brighter than anything it lights, and warmer.
+const STAGE_BULB_R : f32 = 9.0;
+const STAGE_BULB_G : f32 = 5.2;
+const STAGE_BULB_B : f32 = 2.4;
+
+// The sky: the direction towards the sun (normalised on use), the eye's height in metres and the ground's albedo.
+const STAGE_SUN_X : f32 = -0.55;
+const STAGE_SUN_Y : f32 = 0.52;
+const STAGE_SUN_Z : f32 = 0.5;
+const STAGE_EYE_HEIGHT : f64 = 2.0;
+const STAGE_GROUND_ALBEDO : f32 = 0.25;
+
+// The meshes: the floor's side in metres and the number of times its texture repeats along it (233 tiles over 700
+// m is about 3 m a tile), a sphere's radius with its rings and segments, and so on for the others.
+const STAGE_FLOOR_SIDE : f32 = 700.0;
+const STAGE_FLOOR_REPEAT : f32 = 233.0;
+const STAGE_BALL_RADIUS : f32 = 0.8;
+const STAGE_BALL_SEGMENTS : i32 = 64;
+const STAGE_BALL_RINGS : i32 = 36;
+const STAGE_CUBE_SIDE : f32 = 1.7;
+const STAGE_COLUMN_RADIUS : f32 = 0.5;
+const STAGE_COLUMN_HEIGHT : f32 = 2.6;
+const STAGE_COLUMN_SEGMENTS : i32 = 48;
+const STAGE_BULB_RADIUS : f32 = 0.14;
+const STAGE_BULB_SEGMENTS : i32 = 24;
+const STAGE_BULB_RINGS : i32 = 14;
+const STAGE_GLASS_RADIUS : f32 = 0.95;
+const STAGE_DOME_RADIUS : f32 = 280.0;
+const STAGE_DOME_SEGMENTS : i32 = 48;
+const STAGE_DOME_RINGS : i32 = 24;
+
+// How steep the brick's bumps are in its normal map, and how strongly the material applies them.
+const STAGE_BRICK_BUMP : f32 = 2.2;
+const STAGE_BRICK_NORMAL_SCALE : f32 = 1.0;
+
+// The materials. White tiles and bricks let their textures show unchanged; the roughness is how blurred their
+// highlights are.
+const STAGE_WHITE : f32 = 1.0;
+const STAGE_FLOOR_ROUGH : f32 = 0.45;
+const STAGE_BRICK_ROUGH : f32 = 0.85;
+const STAGE_SKY_GLOW : f32 = 1.1;
+
+// Red plastic, gold and steel.
+const STAGE_RED_R : f32 = 0.72;
+const STAGE_RED_G : f32 = 0.05;
+const STAGE_RED_B : f32 = 0.04;
+const STAGE_GOLD_R : f32 = 1.0;
+const STAGE_GOLD_G : f32 = 0.77;
+const STAGE_GOLD_B : f32 = 0.34;
+const STAGE_STEEL_R : f32 = 0.78;
+const STAGE_STEEL_G : f32 = 0.8;
+const STAGE_STEEL_B : f32 = 0.84;
+const STAGE_STEEL_ROUGH : f32 = 0.3;
+
+// Blue glass: colour, how glossy and how much of what is behind it shows through (an alpha of 0.42).
+const STAGE_GLASS_R : f32 = 0.35;
+const STAGE_GLASS_G : f32 = 0.6;
+const STAGE_GLASS_B : f32 = 0.95;
+const STAGE_GLASS_ROUGH : f32 = 0.22;
+const STAGE_GLASS_ALPHA : f32 = 0.42;
+
+// The decoys' mid grey.
+const STAGE_DECOY_GREY : f32 = 0.5;
+
+// The props behind the rows: where each stands and how far the cube is turned, radians.
+const STAGE_BRICK_X : f64 = -4.3;
+const STAGE_BRICK_Y : f64 = 0.85;
+const STAGE_BRICK_Z : f64 = -2.4;
+const STAGE_BRICK_TURN : f64 = 0.5;
+const STAGE_COLUMN_X : f64 = 3.8;
+const STAGE_COLUMN_Y : f64 = 1.3;
+const STAGE_COLUMN_Z : f64 = -3.6;
+const STAGE_GLASS_X : f64 = 0.9;
+const STAGE_GLASS_Y : f64 = 0.95;
+const STAGE_GLASS_Z : f64 = -3.6;
+
+// The decoys sit where the camera cannot see them: behind it, far to the side and far above (x, y, z each).
+const STAGE_DECOY_BEHIND_Y : f64 = 1.0;
+const STAGE_DECOY_BEHIND_Z : f64 = 40.0;
+const STAGE_DECOY_ASIDE_X : f64 = 900.0;
+const STAGE_DECOY_ASIDE_Y : f64 = 1.0;
+const STAGE_DECOY_ABOVE_Y : f64 = 900.0;
+const STAGE_DECOY_ABOVE_Z : f64 = -20.0;
+
+// The camera: where the eye is, what it looks at, the vertical field of view in radians and the clip distances.
+const STAGE_EYE_X : f64 = 0.5;
+const STAGE_EYE_Y : f64 = 3.5;
+const STAGE_EYE_Z : f64 = 11.4;
+const STAGE_TARGET_Y : f64 = 1.25;
+const STAGE_TARGET_Z : f64 = 0.2;
+const STAGE_FOV : f32 = 0.68;
+const STAGE_NEAR : f32 = 0.1;
+const STAGE_FAR : f32 = 400.0;
+
+/** The texture and mesh ids the stage's entities are made from. */
+pub struct StageParts {
+    /** The floor tiles' texture. */
+    pub floorTex : i32 = 0;
+
+    /** The brick colour texture. */
+    pub brickTex : i32 = 0;
+
+    /** The brick normal map. */
+    pub brickBump : i32 = 0;
+
+    /** The floor plane. */
+    pub floorMesh : i32 = 0;
+
+    /** The sphere both rows of balls share. */
+    pub ball : i32 = 0;
+
+    /** The cube, for the brick prop and the decoys. */
+    pub cube : i32 = 0;
+
+    /** The steel column. */
+    pub column : i32 = 0;
+
+    /** The small sphere that is the lamp's visible bulb. */
+    pub bulb : i32 = 0;
+
+    /** The larger sphere of glass. */
+    pub glassBall : i32 = 0;
+}
+
+/** The world, its components and the assets they refer to. */
+pub class PrismStage {
+    /** Meshes, materials and textures by id. */
+    pub assets : Shared<RenderAssets>;
+
+    /** Entities and their transforms. */
+    pub world : Scene;
+
+    /** Which entities are drawn as which mesh. */
+    pub meshes : ComponentStore<MeshRef>;
+
+    /** Which material each drawn entity uses. */
+    pub materials : ComponentStore<MaterialRef>;
+
+    /** Which entities shine. */
+    pub lights : ComponentStore<LightComp>;
+
+    /** The analytic sky the sun and the ambient light come from. */
+    pub sky : LightSky;
+
+    /** How many entities carry a mesh. */
+    pub drawn : i32 = 0;
+
+    /** Where the stage's origin is in the world (f64), to show that large coordinates cost nothing. */
+    pub offset : DVec3;
+
+    /** Builds the stage with its origin at `offset`. */
+    constructor(offset : DVec3) {
+        self.assets = share new RenderAssets();
+        self.world = new Scene();
+        self.meshes = new ComponentStore<MeshRef>();
+        self.materials = new ComponentStore<MaterialRef>();
+        self.lights = new ComponentStore<LightComp>();
+        let towardSun : Vec3 = Vec3::make(STAGE_SUN_X, STAGE_SUN_Y, STAGE_SUN_Z).normalized();
+        self.sky = new LightSky(towardSun, STAGE_EYE_HEIGHT, STAGE_GROUND_ALBEDO);
+        self.offset = offset;
+        self.build();
+    }
+
+    // Puts a mesh with a material at a place on the stage; returns the entity.
+    fn place(mut self, name : string, mesh : i32, material : i32, at : DVec3, turn : f64) : EntityId {
+        let id : EntityId = self.world.add(name);
+        let turned : DQuat = DQuat::fromAxisAngle(DVec3::unitY(), turn);
+        self.world.setLocal(id, DTransform::make(self.offset.plus(at), turned, DVec3::make(1.0, 1.0, 1.0)));
+        self.meshes.add(self.world.entities(), id, MeshRef { mesh: mesh });
+        self.materials.add(self.world.entities(), id, MaterialRef { material: material });
+        self.drawn = self.drawn + 1;
+        return id;
+    }
+
+    // Loads every texture and mesh, in one fixed order so the ids never depend on the placing that follows.
+    fn loadParts(mut self) : StageParts {
+        let floorTex : i32 = self.assets.addTexture(new Texture(prismFloorImage(), TextureWrap::Repeat));
+        let brickTex : i32 = self.assets.addTexture(new Texture(prismBrickImage(), TextureWrap::Repeat));
+        let bumps : Texture = new Texture(prismBrickNormals(STAGE_BRICK_BUMP), TextureWrap::Repeat);
+        let brickBump : i32 = self.assets.addTexture(bumps);
+
+        let floorShape : MeshData = MeshDataShapes::plane(
+            STAGE_FLOOR_SIDE,
+            STAGE_FLOOR_SIDE,
+            1,
+            1,
+            STAGE_FLOOR_REPEAT,
+            STAGE_FLOOR_REPEAT
+        );
+        let floorMesh : i32 = self.assets.addMesh(floorShape);
+        let ballShape : MeshData = MeshDataShapes::uvSphere(
+            STAGE_BALL_RADIUS,
+            STAGE_BALL_SEGMENTS,
+            STAGE_BALL_RINGS
+        );
+        let ball : i32 = self.assets.addMesh(ballShape);
+        let cubeShape : MeshData = MeshDataShapes::box(STAGE_CUBE_SIDE, STAGE_CUBE_SIDE, STAGE_CUBE_SIDE);
+        let cube : i32 = self.assets.addMesh(cubeShape);
+        let columnShape : MeshData = MeshDataShapes::cylinder(
+            STAGE_COLUMN_RADIUS,
+            STAGE_COLUMN_HEIGHT,
+            STAGE_COLUMN_SEGMENTS
+        );
+        let column : i32 = self.assets.addMesh(columnShape);
+        let bulbShape : MeshData = MeshDataShapes::uvSphere(
+            STAGE_BULB_RADIUS,
+            STAGE_BULB_SEGMENTS,
+            STAGE_BULB_RINGS
+        );
+        let bulb : i32 = self.assets.addMesh(bulbShape);
+        let glassShape : MeshData = MeshDataShapes::uvSphere(
+            STAGE_GLASS_RADIUS,
+            STAGE_BALL_SEGMENTS,
+            STAGE_BALL_RINGS
+        );
+        let glassBall : i32 = self.assets.addMesh(glassShape);
+        let parts : StageParts = StageParts {
+            floorTex: floorTex,
+            brickTex: brickTex,
+            brickBump: brickBump,
+            floorMesh: floorMesh,
+            ball: ball,
+            cube: cube,
+            column: column,
+            bulb: bulb,
+            glassBall: glassBall,
+        };
+        return parts;
+    }
+
+    // Loads the parts, then places the entities.
+    fn build(mut self) : void {
+        let parts : StageParts = self.loadParts();
+
+        self.buildGround(parts);
+        self.buildBalls(parts.ball);
+        self.buildProps(parts);
+
+        let bulbGlow : RenderMaterial = RenderMaterial::glowing(Vec3::make(
+            STAGE_BULB_R,
+            STAGE_BULB_G,
+            STAGE_BULB_B
+        ));
+        let glow : i32 = self.assets.addMaterial(bulbGlow);
+        let lampAt : DVec3 = DVec3::make(STAGE_LAMP_X, STAGE_LAMP_Y, STAGE_LAMP_Z);
+        let bulbId : EntityId = self.place("bulb", parts.bulb, glow, lampAt, 0.0);
+        self.noShadow(bulbId);
+
+        self.buildLights(lampAt);
+        self.buildDecoys(parts.cube);
+    }
+
+    // The tiled floor and the sky dome behind everything; neither casts a shadow.
+    fn buildGround(mut self, parts : StageParts) : void {
+        let white : Vec3 = Vec3::make(STAGE_WHITE, STAGE_WHITE, STAGE_WHITE);
+        let mut tiles : RenderMaterial = RenderMaterial::plastic(white, STAGE_FLOOR_ROUGH);
+        tiles.baseColorTexture = parts.floorTex;
+        let floorMat : i32 = self.assets.addMaterial(tiles);
+        let ground : EntityId = self.place("floor", parts.floorMesh, floorMat, DVec3::zero(), 0.0);
+        self.noShadow(ground);
+
+        // The sky: a huge inverted ball whose emissive gradient is the picture's background.
+        let skyTex : i32 = self.assets.addTexture(new Texture(prismSkyImage(), TextureWrap::Clamp));
+        let domeShape : MeshData = MeshDataShapes::uvSphere(
+            STAGE_DOME_RADIUS,
+            STAGE_DOME_SEGMENTS,
+            STAGE_DOME_RINGS
+        );
+        let dome : i32 = self.assets.addMesh(domeShape);
+        let glowLevel : Vec3 = Vec3::make(STAGE_SKY_GLOW, STAGE_SKY_GLOW, STAGE_SKY_GLOW);
+        let mut heaven : RenderMaterial = RenderMaterial::glowing(glowLevel);
+        heaven.emissiveTexture = skyTex;
+        heaven.doubleSided = true;
+        let skyMat : i32 = self.assets.addMaterial(heaven);
+        let sky : EntityId = self.place("sky", dome, skyMat, DVec3::zero(), 0.0);
+        self.noShadow(sky);
+    }
+
+    // Two rows of five: red plastic (front) and gold (behind), glossy at the left to rough at the right.
+    fn buildBalls(mut self, ball : i32) : void {
+        for (i of 0..STAGE_BALLS) {
+            let rough : f32 = STAGE_ROUGH_MIN + STAGE_ROUGH_STEP * (i as f32);
+            let x : f64 = STAGE_FIRST_X + STAGE_SPACING * (i as f64);
+            let redTint : Vec3 = Vec3::make(STAGE_RED_R, STAGE_RED_G, STAGE_RED_B);
+            let red : i32 = self.assets.addMaterial(RenderMaterial::plastic(redTint, rough));
+            let front : DVec3 = DVec3::make(x, STAGE_BALL_Y, STAGE_FRONT_Z);
+            self.place("plastic", ball, red, front, 0.0);
+
+            let goldTint : Vec3 = Vec3::make(STAGE_GOLD_R, STAGE_GOLD_G, STAGE_GOLD_B);
+            let gold : i32 = self.assets.addMaterial(RenderMaterial::metal(goldTint, rough));
+            let back : DVec3 = DVec3::make(x, STAGE_BALL_Y, STAGE_BACK_Z);
+            self.place("gold", ball, gold, back, 0.0);
+        }
+    }
+
+    // The brick cube, the steel column and the glass ball behind the rows.
+    fn buildProps(mut self, parts : StageParts) : void {
+        let white : Vec3 = Vec3::make(STAGE_WHITE, STAGE_WHITE, STAGE_WHITE);
+        let mut brick : RenderMaterial = RenderMaterial::plastic(white, STAGE_BRICK_ROUGH);
+        brick.baseColorTexture = parts.brickTex;
+        brick.normalTexture = parts.brickBump;
+        brick.normalScale = STAGE_BRICK_NORMAL_SCALE;
+        let brickMat : i32 = self.assets.addMaterial(brick);
+        let brickAt : DVec3 = DVec3::make(STAGE_BRICK_X, STAGE_BRICK_Y, STAGE_BRICK_Z);
+        self.place("brick cube", parts.cube, brickMat, brickAt, STAGE_BRICK_TURN);
+
+        let steelTint : Vec3 = Vec3::make(STAGE_STEEL_R, STAGE_STEEL_G, STAGE_STEEL_B);
+        let steel : i32 = self.assets.addMaterial(RenderMaterial::metal(steelTint, STAGE_STEEL_ROUGH));
+        let columnAt : DVec3 = DVec3::make(STAGE_COLUMN_X, STAGE_COLUMN_Y, STAGE_COLUMN_Z);
+        self.place("column", parts.column, steel, columnAt, 0.0);
+
+        let glassTint : Vec3 = Vec3::make(STAGE_GLASS_R, STAGE_GLASS_G, STAGE_GLASS_B);
+        let mut glass : RenderMaterial = RenderMaterial::plastic(glassTint, STAGE_GLASS_ROUGH);
+        glass.alphaMode = LightAlphaMode::Blend;
+        glass.alpha = STAGE_GLASS_ALPHA;
+        let glassMat : i32 = self.assets.addMaterial(glass);
+        let glassAt : DVec3 = DVec3::make(STAGE_GLASS_X, STAGE_GLASS_Y, STAGE_GLASS_Z);
+        self.place("glass", parts.glassBall, glassMat, glassAt, 0.0);
+    }
+
+    // The two lights: a warm lamp at the bulb, and the sun taken from the analytic sky.
+    fn buildLights(mut self, lampAt : DVec3) : void {
+        // The lamp: warm, a small sphere, shadows by ray.
+        let lamp : EntityId = self.world.add("lamp");
+        self.world.setLocal(lamp, DTransform::fromTranslation(self.offset.plus(lampAt)));
+        let warm : Vec3 = Vec3::make(STAGE_LAMP_R, STAGE_LAMP_G, STAGE_LAMP_B);
+        let bulb : LightComp = LightComp::point(
+            warm,
+            STAGE_LAMP_CANDELA,
+            STAGE_LAMP_RADIUS,
+            STAGE_LAMP_RANGE
+        );
+        self.lights.add(self.world.entities(), lamp, bulb.withShadows(LightShadowMode::Ray));
+
+        // The sun, from the sky model: its tint and strength, pointing opposite to the direction towards it.
+        let sunLight : LightSource = self.sky.sunLight();
+        let sun : EntityId = self.world.add("sun");
+        let travel : DVec3 = DVec3::make(
+            sunLight.direction.x as f64,
+            sunLight.direction.y as f64,
+            sunLight.direction.z as f64
+        );
+        let aim : DQuat = DQuat::fromTo(DVec3::make(0.0, 0.0, -1.0), travel);
+        self.world.setLocal(sun, DTransform::make(self.offset, aim, DVec3::make(1.0, 1.0, 1.0)));
+
+        let lux : f32 = LightUnits::sceneToLux(sunLight.intensity);
+        let beam : LightComp = LightComp::sun(sunLight.color, lux, sunLight.angularDiameter);
+        self.lights.add(self.world.entities(), sun, beam.withShadows(LightShadowMode::Ray));
+    }
+
+    // Three things the camera cannot see: behind it, far to the side and far above. Extraction culls them.
+    fn buildDecoys(mut self, cube : i32) : void {
+        let grey : Vec3 = Vec3::make(STAGE_DECOY_GREY, STAGE_DECOY_GREY, STAGE_DECOY_GREY);
+        let decoy : i32 = self.assets.addMaterial(RenderMaterial::matte(grey));
+        let behind : DVec3 = DVec3::make(0.0, STAGE_DECOY_BEHIND_Y, STAGE_DECOY_BEHIND_Z);
+        let aside : DVec3 = DVec3::make(STAGE_DECOY_ASIDE_X, STAGE_DECOY_ASIDE_Y, 0.0);
+        let above : DVec3 = DVec3::make(0.0, STAGE_DECOY_ABOVE_Y, STAGE_DECOY_ABOVE_Z);
+        self.place("behind", cube, decoy, behind, 0.0);
+        self.place("aside", cube, decoy, aside, 0.0);
+        self.place("above", cube, decoy, above, 0.0);
+    }
+
+    // The bulb and the floor do not cast shadow rays (the bulb is the lamp; the floor needs none).
+    fn noShadow(mut self, id : EntityId) : void {
+        self.meshes.set(self.world.entities(), id, MeshRef {
+            mesh: self.meshes.getOr(self.world.entities(), id, MeshRef {}).mesh,
+            castsShadow: false,
+        });
+    }
+
+    /** The camera: in front of the rows, looking slightly down at the middle of the stage. */
+    pub fn camera(self, aspect : f32) : Camera {
+        let eye : DVec3 = self.offset.plus(DVec3::make(STAGE_EYE_X, STAGE_EYE_Y, STAGE_EYE_Z));
+        let target : DVec3 = self.offset.plus(DVec3::make(0.0, STAGE_TARGET_Y, STAGE_TARGET_Z));
+        let level : Camera = Camera::perspective(
+            eye,
+            DQuat::identity(),
+            STAGE_FOV,
+            aspect,
+            STAGE_NEAR,
+            STAGE_FAR
+        );
+        return level.lookAt(target, DVec3::unitY());
+    }
+}

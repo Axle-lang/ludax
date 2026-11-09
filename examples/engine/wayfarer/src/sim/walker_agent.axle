@@ -1,0 +1,173 @@
+// walker_agent — an agent whose feet decide how far it goes.
+//
+// Steering says how fast the walker wants to move; the animation says how far one step of the walk cycle goes.
+// Here the two meet: the wanted speed sets how fast the animator plays (`speed / WALK_STRIDE` cycles a second)
+// and the position then advances by the distance the clip's root bone travelled in that step, along the
+// heading. The body is turned towards the way it wants to go at a limited rate. So the legs always cover the
+// ground the body covers, and the footstep markers of the clip say where the feet came down.
+//
+// The animator is never played slower than a floor speed, so an idle walker still breathes and its state
+// machine still runs; the legs then stay put because the root bone does not travel while idling.
+
+use ludax::{Animator, Skeleton, Pose, SteerAgent, Vec2, Vec, EventBuffer, wrapAngle, atan2, cos, sin};
+
+use crate::anim::walker::{WalkerRig, WALK_STRIDE, STEP_LEFT};
+
+// The fastest the body turns, in radians a second.
+const WALKER_TURN_RATE : f32 = 6.0;
+
+// The slowest the animator is played, so an idle walker still breathes and its state machine still runs.
+const WALKER_MIN_PLAY : f32 = 0.2;
+
+// Below this speed there is no meaningful direction to turn towards.
+const WALKER_MOVE_SPEED : f32 = 0.05;
+
+/** The animated walker. */
+pub class WalkerAgent {
+    rig       : Skeleton;
+    anim      : Animator;
+    heading   : f32 = 0.0;
+    stepMarks : Vec<f32>;
+    lefts     : i32 = 0;
+    rights    : i32 = 0;
+    covered   : f32 = 0.0;
+    pending   : i32 = 0;
+
+    /** A walker facing `heading` radians (0 is +x of the map, a quarter turn is +y). */
+    constructor(heading : f32) {
+        self.rig = WalkerRig::skeleton();
+        self.anim = WalkerRig::animator(self.rig);
+        self.heading = heading;
+        self.stepMarks = new Vec<f32>();
+    }
+
+    /** The skeleton the walker is animated on. */
+    pub fn skeleton(self) : Skeleton {
+        return self.rig;
+    }
+
+    /** The animator (its pose is the walker's current pose). */
+    pub fn animator(self) : Animator {
+        return self.anim;
+    }
+
+    /** The pose of the last step. */
+    pub fn pose(self) : Pose {
+        return self.anim.pose();
+    }
+
+    /** Where the body faces, radians. */
+    pub fn facing(self) : f32 {
+        return self.heading;
+    }
+
+    /** How many footsteps the left foot made. */
+    pub fn leftSteps(self) : i32 {
+        return self.lefts;
+    }
+
+    /** How many footsteps the right foot made. */
+    pub fn rightSteps(self) : i32 {
+        return self.rights;
+    }
+
+    /** The total distance the root bone carried the body, in map units. */
+    pub fn distanceCovered(self) : f32 {
+        return self.covered;
+    }
+
+    /** How many footstep marks were left on the ground (x, y pairs). */
+    pub fn markCount(self) : i32 {
+        return self.stepMarks.len() / 2;
+    }
+
+    /** The x of footstep mark `i`. */
+    pub fn markX(self, i : i32) : f32 {
+        return self.stepMarks.get(i * 2);
+    }
+
+    /** The y of footstep mark `i`. */
+    pub fn markY(self, i : i32) : f32 {
+        return self.stepMarks.get(i * 2 + 1);
+    }
+
+    /**
+     * Leaves a footstep mark at (`x`, `y`) for every footstep the last `advance` reported. The caller says where
+     * the walker really ended up, which is not where the root motion alone would have put it when a wall
+     * stopped it.
+     */
+    pub fn commit(mut self, x : f32, y : f32) : void {
+        while (self.pending > 0) {
+            self.stepMarks.push(x);
+            self.stepMarks.push(y);
+            self.pending = self.pending - 1;
+        }
+    }
+
+    /**
+     * One step of `dt` seconds: `agent` is where the walker is and `accel` what steering asks of it. Returns the
+     * agent after the step; its position moved by the root motion, its velocity is that movement per second.
+     */
+    pub fn advance(mut self, agent : SteerAgent, accel : Vec2, dt : f32) : SteerAgent {
+        let wanted : Vec2 = agent.vel.plus(accel.scale(dt));
+        let mut speed : f32 = wanted.length();
+        if (speed > agent.maxSpeed) {
+            speed = agent.maxSpeed;
+        }
+
+        // Face the way the steering wants to go, at a limited turn rate.
+        if (speed > WALKER_MOVE_SPEED) {
+            self.heading = WalkerAgent::turnTowards(self.heading, wanted, dt);
+        }
+
+        // Play the clip fast enough that its root motion feeds the body at exactly this speed.
+        self.anim.setFloat("speed", speed);
+        let mut play : f32 = speed / WALK_STRIDE;
+        if (play < WALKER_MIN_PLAY) {
+            play = WALKER_MIN_PLAY;
+        }
+        self.anim.setSpeed(play);
+        self.anim.update(dt);
+
+        let forward : f32 = self.anim.rootMotion().translation.z;
+        let dir : Vec2 = Vec2 { x: cos(self.heading), y: sin(self.heading) };
+        let pos : Vec2 = agent.pos.plus(dir.scale(forward));
+
+        // Record the footfalls this step produced; `commit` places them once the wall slide has decided where.
+        let ev : EventBuffer = self.anim.events();
+        for (i of 0..ev.len()) {
+            self.pending = self.pending + 1;
+            if (ev.idAt(i) == STEP_LEFT) {
+                self.lefts = self.lefts + 1;
+            } else {
+                self.rights = self.rights + 1;
+            }
+        }
+
+        if (forward > 0.0) {
+            self.covered = self.covered + forward;
+        }
+        return SteerAgent {
+            pos: pos,
+            vel: dir.scale(forward / dt),
+            maxSpeed: agent.maxSpeed,
+            maxAccel: agent.maxAccel,
+            radius: agent.radius,
+        };
+    }
+
+    // The heading after turning towards `wanted` by at most the turn rate allows in `dt`.
+    static fn turnTowards(heading : f32, wanted : Vec2, dt : f32) : f32 {
+        let aim : f32 = atan2(wanted.y, wanted.x);
+        let diff : f32 = wrapAngle(aim - heading);
+        let limit : f32 = WALKER_TURN_RATE * dt;
+        let mut turn : f32 = diff;
+        if (turn > limit) {
+            turn = limit;
+        }
+        if (turn < -limit) {
+            turn = -limit;
+        }
+        return wrapAngle(heading + turn);
+    }
+}

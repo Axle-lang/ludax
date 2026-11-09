@@ -1,0 +1,287 @@
+// kinetic — a headless physics demo: a ramp, a pyramid of boxes, balls and a swinging chain, simulated for six
+// seconds, checked, and drawn from the side into kinetic.png.
+//
+// It prints what it verified (the pyramid stands, nothing left the world, the chain's joints held, energy did not
+// rise, a second run ends in the identical state) and exits with the number of failures. `--out FILE` changes the
+// picture's name.
+//
+// Every threshold is named: a check that says "within 12 cm" and a number next to it should be the same fact,
+// and a reader should not have to guess whether 0.12 is centimetres or metres.
+
+use std::lang::IndexOutOfBoundsException;
+use std::sys::process::{argc, argAt};
+
+use ludax::DVec3;
+use ludax::EntityId;
+use ludax::PhysicsWorld;
+use ludax::Vec;
+use ludax::absD;
+
+use crate::draw::side_view::SideView;
+use crate::scene::scene::{Scene, SCENE_CHAIN_PIVOT_X, SCENE_CHAIN_PIVOT_Y};
+use crate::scene::verdict::Verdict;
+
+/** Simulation steps the demo runs: six seconds at 120 steps a second. */
+const DEMO_STEPS : i32 = 720;
+
+/** Record a trail point every this many steps, so the picture stays legible and the log small. */
+const DEMO_SAMPLE_EVERY : i32 = 8;
+
+/** The pyramid counts as standing while every box is this close to where it was placed, metres. */
+const DEMO_PYRAMID_TOLERANCE : f64 = 0.12;
+
+/** The pyramid counts as calm while no box moves faster than this, metres per second. */
+const DEMO_PYRAMID_CALM : f64 = 0.05;
+
+/** A body may sit this far below the ground before it has left the world, metres. */
+const DEMO_GROUND_MARGIN : f64 = 0.05;
+
+/** Half the world's width in the picture, metres. */
+const DEMO_HALF_WIDTH : f64 = 12.0;
+
+/** Half the world's depth, metres; the side walls are just inside it. */
+const DEMO_HALF_DEPTH : f64 = 1.3;
+
+/** The slider must have reached this x, metres: off the ramp's high end. */
+const DEMO_RAMP_END_X : f64 = -5.0;
+
+/** A chain joint that opens wider than this has come apart, metres. */
+const DEMO_JOINT_GAP : f64 = 0.08;
+
+/** How much longer than the chain's reach the bob may swing, metres. */
+const DEMO_CHAIN_SLACK : f64 = 0.1;
+
+/** Energy may rise by this fraction of its starting value and still count as conserved. */
+const DEMO_ENERGY_RISE : f64 = 0.01;
+
+/** The seed of the scene every check is made on. */
+const DEMO_SEED : u64 = 2024;
+
+/** A second seed, whose world must end differently from the first. */
+const DEMO_OTHER_SEED : u64 = 2025;
+
+/** Numbers in a position: x, y and z. */
+const DEMO_COORDS : i32 = 3;
+
+/** Numbers in a trail point: x and y; the side view ignores depth. */
+const DEMO_TRAIL_COORDS : i32 = 2;
+
+/** Bodies tracked besides the balls: the slider and the chain's bob. */
+const DEMO_TRACKED_EXTRA : i32 = 2;
+
+/** The picture's name unless `--out` gives another. */
+const DEMO_DEFAULT_OUT : string = "kinetic.png";
+
+/** What one run of the scene recorded. */
+class RunLog {
+    /** Total mechanical energy at the start. */
+    pub energyStart : f64 = 0.0;
+
+    /** The highest total energy seen afterwards. */
+    pub energyPeak : f64 = 0.0;
+
+    /** The widest gap any chain joint showed. */
+    pub jointGap : f64 = 0.0;
+
+    /** Sampled (x, y) of the tracked bodies. */
+    pub trails : Vec<f64>;
+
+    /** How many bodies are tracked per sample. */
+    pub tracked : i32 = 0;
+
+    constructor() {
+        self.trails = new Vec<f64>();
+    }
+}
+
+// Runs the world for the demo's steps and keeps what the checks need.
+fn demoRun(scene : Scene) : RunLog {
+    let world : PhysicsWorld = scene.world;
+    let mut log : RunLog = new RunLog();
+    log.energyStart = world.kineticEnergy() + world.potentialEnergy();
+    log.energyPeak = log.energyStart;
+    log.tracked = scene.balls.len() + DEMO_TRACKED_EXTRA;
+
+    for (step of 0..DEMO_STEPS) {
+        world.advance();
+        let energy : f64 = world.kineticEnergy() + world.potentialEnergy();
+        if (energy > log.energyPeak) {
+            log.energyPeak = energy;
+        }
+
+        for (j of 0..scene.joints.len()) {
+            let joint : i32 = scene.joints.get(j);
+            let gap : f64 = world.jointAnchorA(joint).distance(world.jointAnchorB(joint));
+            if (gap > log.jointGap) {
+                log.jointGap = gap;
+            }
+        }
+
+        if (step % DEMO_SAMPLE_EVERY != 0) {
+            continue;
+        }
+        for (b of 0..scene.balls.len()) {
+            let p : DVec3 = world.position(scene.balls.get(b));
+            log.trails.push(p.x);
+            log.trails.push(p.y);
+        }
+        let slider : DVec3 = world.position(scene.slider);
+        log.trails.push(slider.x);
+        log.trails.push(slider.y);
+
+        let bob : DVec3 = world.position(scene.chain.get(scene.chain.len() - 1));
+        log.trails.push(bob.x);
+        log.trails.push(bob.y);
+    }
+    return log;
+}
+
+// The command line's `i`th argument, or "" when there is none.
+fn demoArgument(i : i32) : string {
+    try {
+        return argAt(i) + "";
+    } catch e : IndexOutOfBoundsException {
+        return "";
+    }
+}
+
+// The file name after `--out`, if the command line names one.
+fn demoOutPath() : string {
+    let mut out : string = DEMO_DEFAULT_OUT;
+    let mut i : i32 = 1;
+    while (i < argc()) {
+        if (demoArgument(i) == "--out") {
+            out = demoArgument(i + 1);
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+// The pyramid: still standing, each box close to where it was placed, and calm.
+fn demoPyramid(verdict : Verdict, scene : Scene) : void {
+    let world : PhysicsWorld = scene.world;
+    let mut worstShift : f64 = 0.0;
+    let mut fastest : f64 = 0.0;
+    for (i of 0..scene.pyramid.len()) {
+        let id : EntityId = scene.pyramid.get(i);
+        let first : i32 = i * DEMO_COORDS;
+        let at : DVec3 = DVec3::make(
+            scene.pyramidAt.get(first),
+            scene.pyramidAt.get(first + 1),
+            scene.pyramidAt.get(first + 2)
+        );
+        let shift : f64 = world.position(id).distance(at);
+        if (shift > worstShift) {
+            worstShift = shift;
+        }
+
+        let speed : f64 = world.linearVelocity(id).length();
+        if (speed > fastest) {
+            fastest = speed;
+        }
+    }
+    verdict.expect(
+        "the pyramid still stands (every box within 12 cm of its place, ${worstShift} m worst)",
+        worstShift < DEMO_PYRAMID_TOLERANCE
+    );
+    verdict.expect("the pyramid is calm (fastest box ${fastest} m/s)", fastest < DEMO_PYRAMID_CALM);
+}
+
+// Nothing left the world.
+fn demoContained(verdict : Verdict, world : PhysicsWorld) : void {
+    let mut inside : bool = true;
+    for (i of 0..world.slotCount()) {
+        let id : EntityId = world.bodyAt(i);
+        if (!world.hasBody(id) || world.isStatic(id)) {
+            continue;
+        }
+        let p : DVec3 = world.position(id);
+        let below : bool = p.y < 0.0 - DEMO_GROUND_MARGIN;
+        let outside : bool = absD(p.x) > DEMO_HALF_WIDTH || absD(p.z) > DEMO_HALF_DEPTH;
+        if (!p.isFinite() || below || outside) {
+            inside = false;
+        }
+    }
+    verdict.expect("every body is above the ground and inside the walls", inside);
+}
+
+// The slider left the top of the ramp.
+fn demoSlider(verdict : Verdict, scene : Scene) : void {
+    let world : PhysicsWorld = scene.world;
+    let sliderX : f64 = world.position(scene.slider).x;
+    verdict.expect(
+        "the box slid down the ramp (now at x = ${sliderX})",
+        sliderX > DEMO_RAMP_END_X
+    );
+}
+
+// The chain held together and stayed within its length of the pivot.
+fn demoChain(verdict : Verdict, scene : Scene, log : RunLog) : void {
+    let world : PhysicsWorld = scene.world;
+    verdict.expect(
+        "the chain's joints held (widest gap ${log.jointGap} m)",
+        log.jointGap < DEMO_JOINT_GAP
+    );
+    let bob : DVec3 = world.position(scene.chain.get(scene.chain.len() - 1));
+    let pivot : DVec3 = DVec3::make(SCENE_CHAIN_PIVOT_X, SCENE_CHAIN_PIVOT_Y, 0.0);
+    let reach : f64 = bob.minus(pivot).length();
+    let chainReach : f64 = Scene::reach();
+    verdict.expect(
+        "the chain's bob is within the chain's length of the pivot (${reach} m of ${chainReach})",
+        reach < chainReach + DEMO_CHAIN_SLACK
+    );
+}
+
+// Energy never rose, and some was dissipated.
+fn demoEnergy(verdict : Verdict, world : PhysicsWorld, log : RunLog) : void {
+    let rise : f64 = log.energyPeak - log.energyStart;
+    verdict.expect(
+        "energy never rose by more than 1 % of the start (${log.energyStart} J -> peak ${log.energyPeak} J)",
+        rise <= DEMO_ENERGY_RISE * absD(log.energyStart)
+    );
+    let endEnergy : f64 = world.kineticEnergy() + world.potentialEnergy();
+    verdict.expect(
+        "energy was dissipated, not created (end ${endEnergy} J)",
+        endEnergy < log.energyStart
+    );
+}
+
+// Determinism: a second, independent run ends in the same state, and another seed does not.
+fn demoDeterminism(verdict : Verdict, world : PhysicsWorld) : void {
+    let again : Scene = new Scene(DEMO_SEED);
+    demoRun(again);
+    let hash : i64 = world.stateHash();
+    verdict.expect(
+        "a second run ends in the identical state (hash ${hash})",
+        hash == again.world.stateHash()
+    );
+
+    let other : Scene = new Scene(DEMO_OTHER_SEED);
+    demoRun(other);
+    let otherHash : i64 = other.world.stateHash();
+    verdict.expect(
+        "a different seed does not (hash ${otherHash})",
+        hash != otherHash
+    );
+}
+
+fn main() : i32 ! IOException {
+    let out : string = demoOutPath();
+    let scene : Scene = new Scene(DEMO_SEED);
+    let world : PhysicsWorld = scene.world;
+    println("kinetic demo: ${world.bodyCount()} bodies, ${DEMO_STEPS} steps of ${world.settings().substep} s");
+
+    let log : RunLog = demoRun(scene);
+    let verdict : Verdict = new Verdict();
+    demoPyramid(verdict, scene);
+    demoContained(verdict, world);
+    demoSlider(verdict, scene);
+    demoChain(verdict, scene, log);
+    demoEnergy(verdict, world, log);
+    demoDeterminism(verdict, world);
+
+    SideView::render(scene, log.trails, log.tracked, out);
+    println("wrote ${out}");
+    return verdict.finish();
+}

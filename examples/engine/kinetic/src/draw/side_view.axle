@@ -1,0 +1,293 @@
+// side_view — draws the demo world as a picture seen from the side (x to the right, y up, z ignored).
+//
+// Boxes are filled with their front face, balls are discs with a mark that shows how far they have turned,
+// capsules are rods with round ends, joints are yellow dots, the contacts of the last step are red. The faint dots
+// are the paths of the balls, the slider and the chain's bob, sampled during the run.
+//
+// Colours are RGB values written in hex, because a decimal such as 4886728 says nothing about which byte is
+// which; the names say what each one is for instead.
+//
+// The body drawing is one small function per shape kind, chosen with a `match` on the shape's enum: adding a
+// shape kind should be a compile-time question, not a fourth `if` on a number.
+
+use ludax::DQuat;
+use ludax::DVec3;
+use ludax::EntityId;
+use ludax::PhysicsWorld;
+use ludax::Shape;
+use ludax::ShapeKind;
+use ludax::Vec;
+
+use crate::draw::canvas::{Canvas, CanvasSegment};
+use crate::draw::png::PngWriter;
+use crate::scene::scene::Scene;
+
+/** Picture width in pixels. */
+const VIEW_W : i32 = 990;
+
+/** Picture height in pixels. */
+const VIEW_H : i32 = 540;
+
+/** Pixels per metre. */
+const VIEW_SCALE : f64 = 45.0;
+
+/** Metres of empty space to the left of x = 0. */
+const VIEW_LEFT : f64 = 10.0;
+
+/** The pixel row of the ground. */
+const VIEW_GROUND : f64 = 480.0;
+
+// The sky's vertical blend, and the ground band drawn over its lower rows.
+const VIEW_SKY_TOP : i32 = 0x4A90C8;
+const VIEW_SKY_BOTTOM : i32 = 0xDCEBF5;
+const VIEW_GROUND_FILL : i32 = 0x4A5D3A;
+const VIEW_GROUND_LINE : i32 = 0x2C3D39;
+
+// The body palette, cycled by slot; a sleeping body is drawn darker.
+const VIEW_STATIC : i32 = 0x777777;
+const VIEW_SLEEP_SHIFT : i32 = 0x202020;
+const VIEW_SLEEP_MASK : i32 = 0x7F7F7F;
+const VIEW_OUTLINE : i32 = 0x202020;
+const VIEW_PALETTE_COUNT : i32 = 6;
+const VIEW_RED : i32 = 0xE74C3C;
+const VIEW_BLUE : i32 = 0x3498DB;
+const VIEW_GREEN : i32 = 0x2ECC71;
+const VIEW_YELLOW : i32 = 0xF1C40F;
+const VIEW_PURPLE : i32 = 0x9B59B6;
+const VIEW_TEAL : i32 = 0x1ABC9C;
+
+// The dots, in pixels of radius: a trail point, a joint's anchor and a contact point.
+const VIEW_TRAIL_RADIUS : i32 = 1;
+const VIEW_JOINT_RADIUS : i32 = 3;
+const VIEW_CONTACT_RADIUS : i32 = 2;
+
+/** A capsule shorter than this, metres, has no direction worth a rod: only its two round ends are drawn. */
+const VIEW_ROD_MIN : f64 = 0.000001;
+
+/** The corners of a box's front face, and of a capsule's rod. */
+const VIEW_QUAD : i32 = 4;
+
+// Trails, joints and contacts.
+const VIEW_TRAIL : i32 = 0xFFFFFF;
+const VIEW_JOINT : i32 = 0xFFD700;
+const VIEW_CONTACT : i32 = 0xFF0000;
+
+/** Renders a scene to a PNG. */
+pub class SideView {
+    // The faint dots of where the tracked bodies have been, drawn first so the bodies cover them.
+    static fn trailDots(canvas : Canvas, trails : Vec<f64>, tracked : i32) : void {
+        let samples : i32 = trails.len() / (2 * tracked);
+        for (s of 0..samples) {
+            for (k of 0..tracked) {
+                let at : i32 = (s * tracked + k) * 2;
+                let x : i32 = SideView::px(trails.get(at));
+                let y : i32 = SideView::py(trails.get(at + 1));
+                canvas.disc(x, y, VIEW_TRAIL_RADIUS, VIEW_TRAIL);
+            }
+        }
+    }
+
+    /** Draws `scene` and the sampled `trails` (x, y pairs of the tracked bodies, `tracked` of them per sample). */
+    pub static fn render(
+        scene : Scene,
+        trails : Vec<f64>,
+        tracked : i32,
+        path : string
+    ) : void ! IOException {
+        let canvas : Canvas = new Canvas(VIEW_W, VIEW_H);
+        canvas.gradient(VIEW_SKY_TOP, VIEW_SKY_BOTTOM);
+        SideView::ground(canvas);
+
+        let world : PhysicsWorld = scene.world;
+        SideView::trailDots(canvas, trails, tracked);
+        for (i of 0..world.slotCount()) {
+            let id : EntityId = world.bodyAt(i);
+            if (world.hasBody(id)) {
+                SideView::body(canvas, world, id, SideView::colorOf(i, world, id));
+            }
+        }
+        SideView::joints(canvas, world);
+        SideView::contacts(canvas, world);
+        PngWriter::write(path, VIEW_W, VIEW_H, canvas.bytes());
+    }
+
+    // A dot on each joint's first anchor.
+    static fn joints(canvas : Canvas, world : PhysicsWorld) : void {
+        for (j of 0..world.jointCount()) {
+            if (!world.hasJoint(j)) {
+                continue;
+            }
+            let anchor : DVec3 = world.jointAnchorA(j);
+            let x : i32 = SideView::px(anchor.x);
+            let y : i32 = SideView::py(anchor.y);
+            canvas.disc(x, y, VIEW_JOINT_RADIUS, VIEW_JOINT);
+        }
+    }
+
+    // A dot on each contact point of the last step.
+    static fn contacts(canvas : Canvas, world : PhysicsWorld) : void {
+        for (k of 0..world.contactCount()) {
+            let p : DVec3 = world.contactPoint(k).point;
+            let x : i32 = SideView::px(p.x);
+            let y : i32 = SideView::py(p.y);
+            canvas.disc(x, y, VIEW_CONTACT_RADIUS, VIEW_CONTACT);
+        }
+    }
+
+    // The ground band and its horizon line.
+    static fn ground(canvas : Canvas) : void {
+        let groundRow : i32 = VIEW_GROUND as i32;
+        for (y of groundRow..VIEW_H) {
+            for (x of 0..VIEW_W) {
+                canvas.plot(x, y, VIEW_GROUND_FILL);
+            }
+        }
+        let horizon : CanvasSegment = CanvasSegment { x0: 0, y0: groundRow, x1: VIEW_W - 1, y1: groundRow };
+        canvas.line(horizon, VIEW_GROUND_LINE);
+    }
+
+    // The pixel column of world x, before rounding to a pixel.
+    static fn pxf(x : f64) : f64 {
+        return (x + VIEW_LEFT) * VIEW_SCALE;
+    }
+
+    // The pixel row of world y before rounding, since the picture's rows grow downward.
+    static fn pyf(y : f64) : f64 {
+        return VIEW_GROUND - y * VIEW_SCALE;
+    }
+
+    // The pixel column of world x.
+    static fn px(x : f64) : i32 {
+        return SideView::pxf(x) as i32;
+    }
+
+    // The pixel row of world y.
+    static fn py(y : f64) : i32 {
+        return SideView::pyf(y) as i32;
+    }
+
+    // Static bodies are grey; the others cycle through a palette, darker while they sleep.
+    static fn colorOf(slot : i32, world : PhysicsWorld, id : EntityId) : i32 {
+        if (world.isStatic(id)) {
+            return VIEW_STATIC;
+        }
+
+        let mut c : i32 = match slot % VIEW_PALETTE_COUNT {
+            1 => VIEW_BLUE,
+            2 => VIEW_GREEN,
+            3 => VIEW_YELLOW,
+            4 => VIEW_PURPLE,
+            5 => VIEW_TEAL,
+            _ => VIEW_RED,
+        };
+        if (world.isAsleep(id)) {
+            c = ((c >> 1) & VIEW_SLEEP_MASK) + VIEW_SLEEP_SHIFT;
+        }
+        return c;
+    }
+
+    // One body, by the kind of shape it is.
+    static fn body(canvas : Canvas, world : PhysicsWorld, id : EntityId, color : i32) : void {
+        let shape : Shape = world.shapeOf(id);
+        let pos : DVec3 = world.position(id);
+        let rot : DQuat = world.rotation(id);
+        match shape.kind {
+            ShapeKind::Sphere => SideView::sphere(canvas, shape, pos, rot, color),
+            ShapeKind::Cuboid => SideView::box(canvas, shape, pos, rot, color),
+            ShapeKind::Capsule => SideView::capsule(canvas, shape, pos, rot, color),
+            _ => {},
+        }
+    }
+
+    // A disc with a mark from its centre, so its spin is visible.
+    static fn sphere(canvas : Canvas, shape : Shape, pos : DVec3, rot : DQuat, color : i32) : void {
+        let r : i32 = (shape.radius * VIEW_SCALE) as i32;
+        let cx : i32 = SideView::px(pos.x);
+        let cy : i32 = SideView::py(pos.y);
+        canvas.disc(cx, cy, r, color);
+
+        let mark : DVec3 = pos.plus(rot.rotate(DVec3::make(shape.radius, 0.0, 0.0)));
+        let spoke : CanvasSegment = CanvasSegment {
+            x0: cx,
+            y0: cy,
+            x1: SideView::px(mark.x),
+            y1: SideView::py(mark.y),
+        };
+        canvas.line(spoke, VIEW_OUTLINE);
+    }
+
+    // The front face as a filled quadrilateral, then its four edges.
+    static fn box(canvas : Canvas, shape : Shape, pos : DVec3, rot : DQuat, color : i32) : void {
+        let mut xs : f64[] = new f64[VIEW_QUAD];
+        let mut ys : f64[] = new f64[VIEW_QUAD];
+        for (c of 0..VIEW_QUAD) {
+            let sx : f64 = SideView::cornerX(c);
+            let sy : f64 = SideView::cornerY(c);
+            let corner : DVec3 = DVec3::make(
+                sx * shape.half.x,
+                sy * shape.half.y,
+                shape.half.z
+            );
+            let p : DVec3 = pos.plus(rot.rotate(corner));
+            xs[c as i64] = SideView::pxf(p.x);
+            ys[c as i64] = SideView::pyf(p.y);
+        }
+
+        canvas.polygon(xs, ys, VIEW_QUAD, color);
+        for (c of 0..VIEW_QUAD) {
+            let d : i32 = (c + 1) % VIEW_QUAD;
+            let edge : CanvasSegment = CanvasSegment {
+                x0: xs[c as i64] as i32,
+                y0: ys[c as i64] as i32,
+                x1: xs[d as i64] as i32,
+                y1: ys[d as i64] as i32,
+            };
+            canvas.line(edge, VIEW_OUTLINE);
+        }
+    }
+
+    // A rod along the capsule's axis with a round end at each tip.
+    static fn capsule(canvas : Canvas, shape : Shape, pos : DVec3, rot : DQuat, color : i32) : void {
+        let e0 : DVec3 = shape.capsuleEnds(pos, rot, false);
+        let e1 : DVec3 = shape.capsuleEnds(pos, rot, true);
+        let dx : f64 = e1.x - e0.x;
+        let dy : f64 = e1.y - e0.y;
+        let len : f64 = (dx * dx + dy * dy).sqrt();
+        if (len > VIEW_ROD_MIN) {
+            let nx : f64 = (0.0 - dy) / len * shape.radius;
+            let ny : f64 = dx / len * shape.radius;
+
+            let mut xs : f64[] = new f64[VIEW_QUAD];
+            let mut ys : f64[] = new f64[VIEW_QUAD];
+            xs[0] = SideView::pxf(e0.x + nx);
+            ys[0] = SideView::pyf(e0.y + ny);
+            xs[1] = SideView::pxf(e1.x + nx);
+            ys[1] = SideView::pyf(e1.y + ny);
+            xs[2] = SideView::pxf(e1.x - nx);
+            ys[2] = SideView::pyf(e1.y - ny);
+            xs[3] = SideView::pxf(e0.x - nx);
+            ys[3] = SideView::pyf(e0.y - ny);
+            canvas.polygon(xs, ys, VIEW_QUAD, color);
+        }
+
+        let r : i32 = (shape.radius * VIEW_SCALE) as i32;
+        canvas.disc(SideView::px(e0.x), SideView::py(e0.y), r, color);
+        canvas.disc(SideView::px(e1.x), SideView::py(e1.y), r, color);
+    }
+
+    // The corners of a face in drawing order: (+,+), (-,+), (-,-), (+,-).
+    static fn cornerX(c : i32) : f64 {
+        if (c == 1 || c == 2) {
+            return 0.0 - 1.0;
+        }
+        return 1.0;
+    }
+
+    // The y sign of the same corner.
+    static fn cornerY(c : i32) : f64 {
+        if (c <= 1) {
+            return 1.0;
+        }
+        return 0.0 - 1.0;
+    }
+}

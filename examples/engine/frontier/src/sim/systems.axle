@@ -1,0 +1,477 @@
+// systems — the frontier's simulation: five systems over one body of state.
+//
+// `FrontierSystems` owns everything the simulation changes and nothing else: the scene and its streamed cells,
+// the car, the mission board, the input snapshot and its recording, the sky and the weather. It is also the
+// `SystemRunner` the scheduler calls, one system number at a time, in the order the scheduler worked out from
+// the declared constraints. Each system reports a cost in plain work units (cells touched, events handled),
+// not time, so the accounting is as repeatable as the run.
+//
+// Everything advances by whole ticks: the car by 1/60 s, the mission clock and the sky by 16 666 666 ns. The
+// input of a tick is a snapshot on the axes of an `InputState`: live it comes from the scripted driver and is
+// recorded; replayed it comes from a tape. Either way the car only ever sees the snapshot, so the two runs are
+// the same run.
+
+use ludax::{
+    ActionMap, CellEntry, CellStreamer, DTransform, DVec3, EntityId, GroundHeight, InputState, InputTape, Map,
+    MissionBoard, MissionBook, MissionText, ParseReport, Scene, SkyClock, StreamConfig, SystemRunner, Vec,
+    VehicleInput, VehicleModel, VehicleParams, VehicleState, Weather, WorldPartition, hashCombine, sqrtD,
+    MISSION_COMPLETED
+};
+
+use crate::sim::driver::{Driver, DriverCommand, DriverState};
+use crate::world::route::{
+    ROUTE_FLAG_UNLOADED, ROUTE_ITEM_CRATE, ROUTE_MISSION_DEBRIEF, ROUTE_MISSION_MAIN, Route, StopKind
+};
+use crate::world::terrain::FrontierTerrain;
+
+/** The seconds in one simulation tick. */
+pub const TICK_SECONDS : f64 = 0.016666666666666666;
+
+/** The nanoseconds in one simulation tick, as the fixed step counts them. */
+pub const TICK_NANOS : i64 = 16666666;
+
+// The world: cells 128 m wide, the scatter seeded for the example, and how many props each cell gets.
+const SYSTEMS_CELL_SIZE : f64 = 128.0;
+const SYSTEMS_WORLD_SEED : i64 = 20240601;
+const SYSTEMS_SCATTER_PER_CELL : i32 = 5;
+
+// The streamer's reach: how far from the car cells are loaded, how much farther they stay before they are
+// dropped (so a car on a border does not make a cell flicker), and how many cells it may load and unload per step.
+const SYSTEMS_LOAD_RADIUS : f64 = 400.0;
+const SYSTEMS_HYSTERESIS : f64 = 128.0;
+const SYSTEMS_MAX_LOADS : i32 = 6;
+const SYSTEMS_MAX_UNLOADS : i32 = 12;
+
+// The input axes the driver's pedals are written to, and each one's scale and dead zone when the action map reads
+// it back.
+const SYSTEMS_AXIS_STEER : i32 = 0;
+const SYSTEMS_AXIS_THROTTLE : i32 = 1;
+const SYSTEMS_AXIS_BRAKE : i32 = 2;
+const SYSTEMS_AXIS_SCALE : f32 = 1.0;
+const SYSTEMS_DEAD_STEER : f32 = 0.01;
+const SYSTEMS_DEAD_PEDAL : f32 = 0.02;
+
+// How often the scatter picks each kind; a depot is placed by the route, never scattered.
+const SYSTEMS_TREE_WEIGHT : i32 = 6;
+const SYSTEMS_ROCK_WEIGHT : i32 = 3;
+const SYSTEMS_HUT_WEIGHT : i32 = 1;
+const SYSTEMS_DEPOT_WEIGHT : i32 = 0;
+
+// The car starts heading slightly off the first waypoint so the first steering correction is visible.
+const SYSTEMS_START_YAW : f64 = 0.2;
+
+// A trail point every this many ticks.
+const SYSTEMS_TRAIL_EVERY : i32 = 15;
+
+// A crate is collected inside a 10 m radius, tested squared to avoid a square root.
+const SYSTEMS_CRATE_REACH_SQ : f64 = 100.0;
+
+// Work units each system reports, so the scheduler's budget means something stable.
+const SYSTEMS_COST_INPUT : i64 = 1;
+const SYSTEMS_COST_VEHICLE : i64 = 24;
+const SYSTEMS_COST_STREAM_LOAD : i64 = 10;
+
+// The sky: a four-minute day starting at dusk-ish 0.2, tilted a little.
+const SYSTEMS_DAY_SECONDS : f64 = 240.0;
+const SYSTEMS_START_TIME : f64 = 0.2;
+const SYSTEMS_SUN_TILT : f64 = 0.15;
+
+// The weather: spells of 20 to 60 s and 8 s to change between them.
+const SYSTEMS_WEATHER_SEED : u64 = 7;
+const SYSTEMS_SPELL_MIN : f64 = 20.0;
+const SYSTEMS_SPELL_MAX : f64 = 60.0;
+const SYSTEMS_TRANSITION : f64 = 8.0;
+
+// The lowest any wheel mount has been above the ground after a step, starting at "no measurement".
+const SYSTEMS_FAR : f64 = 1000000.0;
+
+// Positions enter the state hash at micrometer precision; the sky's fraction of a day at nanosecond precision.
+const SYSTEMS_HASH_POS_SCALE : f64 = 1000000.0;
+const SYSTEMS_HASH_SKY_SCALE : f64 = 1000000000.0;
+
+/** The systems, in the order they are registered. */
+pub enum Sys : i8 {
+    /** Reads this tick's input snapshot (live or from the tape). */
+    Input = 0,
+
+    /** Drives the car. */
+    Vehicle = 1,
+
+    /** Streams the world cells around the car. */
+    Stream = 2,
+
+    /** Feeds the missions. */
+    Missions = 3,
+
+    /** Advances the sun and the weather. */
+    Clock = 4,
+
+    /** The system with number `n`; anything else answers Input. */
+    pub static fn fromCode(n : i32) : Sys {
+        return match n {
+            1 => Sys::Vehicle,
+            2 => Sys::Stream,
+            3 => Sys::Missions,
+            4 => Sys::Clock,
+            _ => Sys::Input,
+        };
+    }
+
+    /** The name the scheduler knows it by. */
+    pub fn label(self) : string {
+        return match self {
+            Sys::Input => "input",
+            Sys::Vehicle => "vehicle",
+            Sys::Stream => "stream",
+            Sys::Missions => "missions",
+            Sys::Clock => "clock",
+        };
+    }
+}
+
+/** The frontier simulation. */
+pub class FrontierSystems : SystemRunner {
+    /** The world's entities; the car is one of them. */
+    pub scene : Scene;
+
+    /** The entity standing for the car. */
+    pub player : EntityId;
+
+    /** The cells and what is in them. */
+    pub part : WorldPartition;
+
+    /** The ground. */
+    pub ground : FrontierTerrain;
+
+    /** Keeps the cells around the car alive. */
+    pub streamer : CellStreamer;
+
+    /** What the car is made of. */
+    pub params : VehicleParams;
+
+    /** The car now. */
+    pub car : VehicleState;
+
+    /** The missions. */
+    pub board : MissionBoard;
+
+    /** The places on the route. */
+    pub route : Route;
+
+    /** The driver's progress along it. */
+    pub driver : DriverState;
+
+    /** This tick's input. */
+    pub input : InputState;
+
+    /** Names for what the input means. */
+    pub actions : ActionMap;
+
+    /** The input of every tick: recorded live, played back in a replay. */
+    pub tape : InputTape;
+
+    /** The time of day. */
+    pub sky : SkyClock;
+
+    /** The weather. */
+    pub weather : Weather;
+
+    /** True when input comes from the tape. */
+    pub replay : bool;
+
+    /** True when both missions are complete (or the tape ran out). */
+    pub done : bool = false;
+
+    /** Ticks simulated. */
+    pub ticks : i64 = 0;
+
+    /** The lowest any wheel mount has been above the ground after a step. */
+    pub minClearance : f64 = SYSTEMS_FAR;
+
+    /** Metres driven. */
+    pub distance : f64 = 0.0;
+
+    /** Where the car was, every 15 ticks: x and z pairs. */
+    pub trail : Vec<f64>;
+
+    /** The stage of the main mission at each trail point. */
+    pub trailStage : Vec<i32>;
+
+    /** Every cell that was ever active, in the order they first were. */
+    pub everActive : Map<i64, bool>;
+
+    /** The most cells active at once. */
+    pub peakCells : i32 = 0;
+
+    /** Crates picked up. */
+    pub crates : i32 = 0;
+
+    /** The tick on which the main mission was completed (-1: not yet). */
+    pub completedAt : i64 = -1;
+
+    /** True once the unload flag has been posted. */
+    pub unloaded : bool = false;
+
+    pickedUp  : Vec<bool>;
+    aSteer    : i32 = 0;
+    aThrottle : i32 = 0;
+    aBrake    : i32 = 0;
+    problems  : i32 = 0;
+    ranOut    : bool = false;
+
+    /** The world, the car at the start, the missions started. `tape` is the recording to play when `replay` is true, else an empty one that is filled. */
+    constructor(own tape : InputTape, replay : bool) {
+        self.tape = tape;
+        self.replay = replay;
+        self.scene = new Scene();
+        self.player = self.scene.add("car");
+        self.route = new Route();
+        self.ground = new FrontierTerrain();
+        self.params = VehicleParams::arcade();
+        self.part = new WorldPartition(SYSTEMS_CELL_SIZE, SYSTEMS_WORLD_SEED);
+        self.streamer = new CellStreamer(StreamConfig {
+            loadRadius: SYSTEMS_LOAD_RADIUS,
+            hysteresis: SYSTEMS_HYSTERESIS,
+            maxLoads: SYSTEMS_MAX_LOADS,
+            maxUnloads: SYSTEMS_MAX_UNLOADS,
+        });
+
+        self.buildPartition();
+        self.buildVehicle();
+        self.input = new InputState();
+        self.actions = new ActionMap();
+        self.buildInput();
+
+        self.sky = new SkyClock(SYSTEMS_DAY_SECONDS, SYSTEMS_START_TIME, SYSTEMS_SUN_TILT);
+        self.weather = new Weather(
+            SYSTEMS_WEATHER_SEED,
+            SYSTEMS_SPELL_MIN,
+            SYSTEMS_SPELL_MAX,
+            SYSTEMS_TRANSITION
+        );
+        self.trail = new Vec<f64>();
+        self.trailStage = new Vec<i32>();
+        self.everActive = new Map<i64, bool>();
+        self.pickedUp = new Vec<bool>();
+        for (i of 0..self.route.count()) {
+            self.pickedUp.push(false);
+        }
+
+        self.board = self.buildMissions();
+        self.trail.push(self.car.x);
+        self.trail.push(self.car.z);
+        self.trailStage.push(0);
+    }
+
+    // The partition's templates, the depots they author, and the streamer that keeps cells alive.
+    fn buildPartition(mut self) : void {
+        let tree : i32 = self.part.defineTemplate("tree", SYSTEMS_TREE_WEIGHT);
+        let rock : i32 = self.part.defineTemplate("rock", SYSTEMS_ROCK_WEIGHT);
+        let hut : i32 = self.part.defineTemplate("hut", SYSTEMS_HUT_WEIGHT);
+        let depot : i32 = self.part.defineTemplate("depot", SYSTEMS_DEPOT_WEIGHT);
+        self.part.setScatter(SYSTEMS_SCATTER_PER_CELL);
+
+        // Depots come from the route, so they sit exactly where the mission sends the car.
+        for (i of 0..self.route.count()) {
+            if (self.route.kind(i) == StopKind::Depot) {
+                let x : f64 = self.route.x(i);
+                let z : f64 = self.route.z(i);
+                let y : f64 = self.ground.heightAt(x, z);
+                self.part.add(CellEntry { template: depot, x: x, y: y, z: z, yaw: 0.0 });
+            }
+        }
+    }
+
+    // The car and the driver's progress.
+    fn buildVehicle(mut self) : void {
+        self.car = VehicleModel::placeAtRest(
+            self.params,
+            self.route.x(0),
+            self.route.z(0),
+            SYSTEMS_START_YAW,
+            self.ground
+        );
+        self.driver = Driver::begin();
+    }
+
+    // The input snapshot and the action map that names its axes.
+    fn buildInput(mut self) : void {
+        self.aSteer = self.actions.action("steer");
+        self.aThrottle = self.actions.action("throttle");
+        self.aBrake = self.actions.action("brake");
+        self.actions.bindAxis(self.aSteer, SYSTEMS_AXIS_STEER, SYSTEMS_AXIS_SCALE, SYSTEMS_DEAD_STEER);
+        self.actions.bindAxis(self.aThrottle, SYSTEMS_AXIS_THROTTLE, SYSTEMS_AXIS_SCALE, SYSTEMS_DEAD_PEDAL);
+        self.actions.bindAxis(self.aBrake, SYSTEMS_AXIS_BRAKE, SYSTEMS_AXIS_SCALE, SYSTEMS_DEAD_PEDAL);
+    }
+
+    // The mission text, parsed into the board, and the main mission started.
+    fn buildMissions(mut self) : MissionBoard {
+        let book : MissionBook = new MissionBook();
+        let report : ParseReport = MissionText::parse(book, self.route.missionText());
+        self.problems = report.count();
+        let board : MissionBoard = new MissionBoard(book);
+        board.start(ROUTE_MISSION_MAIN);
+        return board;
+    }
+
+    /** How many problems the mission text had (0 when it is well formed). */
+    pub fn missionProblems(self) : i32 {
+        return self.problems;
+    }
+
+    /** Runs system `id` for tick `tick`; answers its cost in work units. */
+    pub fn runSystem(mut self, id : i32, tick : i64) : i64 {
+        return match Sys::fromCode(id) {
+            Sys::Input => self.readInput(tick),
+            Sys::Vehicle => self.driveCar(),
+            Sys::Stream => self.streamWorld(),
+            Sys::Missions => self.feedMissions(),
+            Sys::Clock => self.runClock(),
+        };
+    }
+
+    // Replay reads the tape; live hands the driver's pedals to the axes and records them.
+    fn readInput(mut self, tick : i64) : i64 {
+        if (self.replay) {
+            if (!self.tape.play(tick as i32, self.input)) {
+                self.ranOut = true;
+                self.done = true;
+            }
+        } else {
+            let cmd : DriverCommand = Driver::command(self.route, self.car, self.driver);
+            self.input.beginFrame();
+            self.input.setAxis(SYSTEMS_AXIS_STEER, cmd.steer as f32);
+            self.input.setAxis(SYSTEMS_AXIS_THROTTLE, cmd.throttle as f32);
+            self.input.setAxis(SYSTEMS_AXIS_BRAKE, cmd.brake as f32);
+            self.tape.record(self.input);
+        }
+
+        // Both paths now go through the same action map, which is what makes a replay identical.
+        self.actions.evaluate(self.input);
+        return SYSTEMS_COST_INPUT;
+    }
+
+    fn driveCar(mut self) : i64 {
+        let command : VehicleInput = VehicleInput {
+            throttle: self.actions.valueOf(self.aThrottle) as f64,
+            brake: self.actions.valueOf(self.aBrake) as f64,
+            steer: self.actions.valueOf(self.aSteer) as f64,
+            reverse: false,
+            handbrake: false,
+        };
+        let before : VehicleState = self.car;
+        self.car = VehicleModel::step(self.params, self.car, command, self.ground, TICK_SECONDS);
+        self.driver = Driver::next(self.route, self.car, self.driver);
+
+        let dx : f64 = self.car.x - before.x;
+        let dz : f64 = self.car.z - before.z;
+        self.distance = self.distance + sqrtD(dx * dx + dz * dz);
+        let clear : f64 = VehicleModel::clearance(self.params, self.car, self.ground);
+        if (clear < self.minClearance) {
+            self.minClearance = clear;
+        }
+
+        self.scene.setLocal(
+            self.player,
+            DTransform::fromTranslation(DVec3::make(self.car.x, self.car.y, self.car.z))
+        );
+        if (self.ticks % SYSTEMS_TRAIL_EVERY == 0) {
+            self.trail.push(self.car.x);
+            self.trail.push(self.car.z);
+            self.trailStage.push(self.board.stageOf(ROUTE_MISSION_MAIN));
+        }
+        return SYSTEMS_COST_VEHICLE;
+    }
+
+    fn streamWorld(mut self) : i64 {
+        self.streamer.update(self.scene, self.part, self.ground, self.car.x, self.car.z);
+
+        // Only loads can bring a cell into existence; remembering keys in first-seen order keeps the map stable.
+        if (self.streamer.lastLoaded() > 0) {
+            for (i of 0..self.streamer.activeCount()) {
+                self.everActive.put(self.streamer.activeKeyAt(i), true);
+            }
+        }
+        if (self.streamer.activeCount() > self.peakCells) {
+            self.peakCells = self.streamer.activeCount();
+        }
+
+        let touched : i64 = (self.streamer.lastLoaded() + self.streamer.lastUnloaded()) as i64;
+        return touched * SYSTEMS_COST_STREAM_LOAD + self.streamer.activeCount() as i64;
+    }
+
+    fn feedMissions(mut self) : i64 {
+        self.board.postPosition(self.car.x, self.car.z);
+        let mut events : i64 = 1 + self.collectCrates() as i64;
+
+        // The outpost's dwell is the unload: post the flag once, on the first tick spent there.
+        if (!self.unloaded && self.driver.wp < self.route.count()
+            && self.route.kind(self.driver.wp) == StopKind::Halt
+            && self.driver.dwell > 0) {
+            self.unloaded = true;
+            self.board.postFlag(ROUTE_FLAG_UNLOADED);
+            events = events + 1;
+        }
+
+        self.board.update(TICK_NANOS);
+        self.board.clearNotes();
+        let mainDone : bool = self.board.statusOf(ROUTE_MISSION_MAIN) == MISSION_COMPLETED;
+        if (self.completedAt < 0 && mainDone) {
+            self.completedAt = self.ticks;
+        }
+        if (mainDone && self.board.statusOf(ROUTE_MISSION_DEBRIEF) == MISSION_COMPLETED) {
+            self.done = true;
+        }
+        return events;
+    }
+
+    // Collects every depot crate within reach exactly once; how many were taken.
+    fn collectCrates(mut self) : i32 {
+        let mut taken : i32 = 0;
+        for (i of 0..self.route.count()) {
+            if (self.route.kind(i) != StopKind::Depot || self.pickedUp.get(i)) {
+                continue;
+            }
+
+            let dx : f64 = self.route.x(i) - self.car.x;
+            let dz : f64 = self.route.z(i) - self.car.z;
+            if (dx * dx + dz * dz >= SYSTEMS_CRATE_REACH_SQ) {
+                continue;
+            }
+
+            self.pickedUp.set(i, true);
+            self.crates = self.crates + 1;
+            self.board.postCollect(ROUTE_ITEM_CRATE, 1);
+            taken = taken + 1;
+        }
+        return taken;
+    }
+
+    fn runClock(mut self) : i64 {
+        self.sky.advance(TICK_NANOS);
+        self.weather.advance(TICK_NANOS);
+        return 1;
+    }
+
+    /** A hash of everything the simulation holds: the same run gives the same number, to the last bit. */
+    pub fn stateHash(self) : i64 {
+        let mut h : i64 = hashCombine(self.ticks, self.driver.wp as i64);
+        h = hashCombine(h, self.driver.dwell as i64);
+        h = hashCombine(h, (self.car.x * SYSTEMS_HASH_POS_SCALE) as i64);
+        h = hashCombine(h, (self.car.y * SYSTEMS_HASH_POS_SCALE) as i64);
+        h = hashCombine(h, (self.car.z * SYSTEMS_HASH_POS_SCALE) as i64);
+        h = hashCombine(h, (self.car.yaw * SYSTEMS_HASH_POS_SCALE) as i64);
+        h = hashCombine(h, (self.car.vf * SYSTEMS_HASH_POS_SCALE) as i64);
+        h = hashCombine(h, (self.car.vl * SYSTEMS_HASH_POS_SCALE) as i64);
+        h = hashCombine(h, self.car.gear as i64);
+        h = hashCombine(h, self.board.stateHash());
+        h = hashCombine(h, self.streamer.activeSetHash());
+        h = hashCombine(h, self.streamer.contentHash(self.scene));
+        h = hashCombine(h, (self.sky.timeOfDay() * SYSTEMS_HASH_SKY_SCALE) as i64);
+        h = hashCombine(h, self.weather.changeCount() as i64);
+        h = hashCombine(h, (self.weather.state().blend * SYSTEMS_HASH_POS_SCALE) as i64);
+        h = hashCombine(h, self.crates as i64);
+        h = hashCombine(h, self.completedAt);
+        return h;
+    }
+}

@@ -1,0 +1,518 @@
+// voxelwalk — a streaming voxel world, flown over headless.
+//
+// A seeded generator makes terrain, rivers, caves and trees on demand; a streamer keeps only the chunks around the
+// camera in memory. The camera flies 5,000 blocks while the program prints how many chunks are loaded and how many
+// bytes they take (bounded by the view radius, not the distance). Then it edits the world with ray casts, saves
+// the edits, flies away so the edited chunks leave memory, comes back, and loads the save into a second world to
+// check both are block-for-block the same. Three pictures are drawn from the chunk store itself.
+//
+// The exit status is the number of checks that failed. Every budget and radius is named at the top: the checks
+// compare what the run measured against the same numbers the run was given, which is the only way the constraints
+// mean anything.
+
+use ludax::{
+    Checks, DRay, DVec3, DataFiles, Image, JobPool, Map, VoxChunk, VoxChunkStore, VoxHit, VoxInteract,
+    VoxRegion, VoxStreamBudget, VoxStreamReport, VoxStreamer, VoxWorld, VoxWorldFiles, ByteBuf, Vec,
+    nanosToMillis, nowNanos, VW_AIR, VW_LAMP, VW_STONE
+};
+
+use crate::view::map::{MapView, SectionView, WalkMap};
+use crate::walk::path::WalkPath;
+
+/** The world's seed, fixed so the run is reproducible. */
+const VOXWALK_SEED : i32 = 20260;
+
+/** Sea level, in block y. */
+const VOXWALK_SEA : i32 = 44;
+
+/** Chunks the streamer keeps around the camera. */
+const VOXWALK_RADIUS : i32 = 8;
+
+/** Extra chunks kept beyond the radius before unloading. */
+const VOXWALK_KEEP : i32 = 2;
+
+/** Most chunks one update may load. */
+const VOXWALK_LOAD_BUDGET : i32 = 160;
+
+/** Most chunks one update may unload. */
+const VOXWALK_UNLOAD_BUDGET : i32 = 512;
+
+/** Flight steps; the camera covers one chunk per step. */
+const VOXWALK_STEPS : i32 = 314;
+
+/** A settling loop that needs more rounds than this has not converged. */
+const VOXWALK_SETTLE_ROUNDS : i32 = 1000;
+
+/** Blocks along a chunk's edge. */
+const VOXWALK_CHUNK_EDGE : i32 = 16;
+
+/** Blocks in a chunk: the edge cubed. */
+const VOXWALK_CHUNK_VOLUME : i32 = 4096;
+
+/** Blocks to chunk coordinates is a shift of this many bits. */
+const VOXWALK_CHUNK_SHIFT : i32 = 4;
+
+/** The world's full height in blocks. */
+const VOXWALK_BLOCKS_HIGH : i64 = 128;
+
+/** Chunks stacked in a column (128 blocks of world height). */
+const VOXWALK_CHUNKS_HIGH : i32 = 8;
+
+/** The byte bound the streamer allows one loaded chunk. */
+const VOXWALK_CHUNK_BYTES : i64 = 10240;
+
+/** The chunk row the camera flies over: the ground sits here. */
+const VOXWALK_GROUND_CHUNK : i32 = 3;
+
+/** The flight prints a progress line every this many steps. */
+const VOXWALK_REPORT_EVERY : i32 = 26;
+
+/** The flight must cover at least this many blocks. */
+const VOXWALK_FLIGHT_BLOCKS : f64 = 5000.0;
+
+/** Edits attempted by ray casting. */
+const VOXWALK_EDITS : i32 = 8;
+
+/** The edit rays start this high above the world... */
+const VOXWALK_RAY_HEIGHT : f64 = 127.5;
+
+/** ...and reach this far down, longer than any column. */
+const VOXWALK_RAY_LENGTH : f64 = 200.0;
+
+/** The top-down picture shows this many blocks... */
+const VOXWALK_MAP_SIZE : i32 = 352;
+
+/** ...at this many pixels per block. */
+const VOXWALK_MAP_SCALE : i32 = 2;
+
+/** The side section shows this many blocks... */
+const VOXWALK_SECTION_WIDTH : i32 = 256;
+
+/** ...at this many pixels per block. */
+const VOXWALK_SECTION_SCALE : i32 = 3;
+
+/** The far picture starts this many chunks before the camera's chunk. */
+const VOXWALK_FAR_MARGIN : i32 = 11;
+
+/** XOR with the byte mask flips the last byte of a save, which is enough to make it invalid. */
+const VOXWALK_BYTE_MASK : i32 = 255;
+
+/** A dense grid, as lumen uses, takes about this many bytes per cell. */
+const VOXWALK_DENSE_BYTES : i64 = 70;
+
+/** The ray-cast edits fall on a grid under the camera: eight spots, each this many blocks further east... */
+const VOXWALK_EDIT_STEP_X : i32 = 9;
+
+/** ...the first this many blocks from the camera along x (negative: west of it)... */
+const VOXWALK_EDIT_ORIGIN_X : i32 = -30;
+
+/** ...each this many blocks further along z... */
+const VOXWALK_EDIT_STEP_Z : i32 = 5;
+
+/** ...the first this many blocks from the camera along z. */
+const VOXWALK_EDIT_ORIGIN_Z : i32 = -12;
+
+/** A ray aimed at the middle of a block, not its corner, so it never grazes an edge. */
+const VOXWALK_BLOCK_CENTRE : f64 = 0.5;
+
+/** Fewer edits than this means the rays missed the ground and the run proves nothing. */
+const VOXWALK_EDITS_MIN : i32 = 6;
+
+/** The block row the side section is cut along. */
+const VOXWALK_SECTION_ROW : i32 = 8;
+
+/** The camera flies this far east to push the edited chunks out of memory. */
+const VOXWALK_AWAY_BLOCKS : f64 = 5000.0;
+
+/** Spare bytes in the copy of a save that is then damaged. */
+const VOXWALK_DAMAGED_SLACK : i32 = 16;
+
+/** Milliseconds in a second, for the chunks-per-second line. */
+const VOXWALK_MILLIS_PER_SECOND : f64 = 1000.0;
+
+/** The top-down picture of the start. */
+const VOXWALK_MAP_FILE : string = "voxelwalk.png";
+
+/** The side section of the start. */
+const VOXWALK_SECTION_FILE : string = "voxelwalk_side.png";
+
+/** The top-down picture at the end of the flight. */
+const VOXWALK_FAR_FILE : string = "voxelwalk_far.png";
+
+/** The save file of the edited chunks. */
+const VOXWALK_REGION_FILE : string = "voxelwalk.region";
+
+/** Byte-sizes in the report are divided by these. */
+const VOXWALK_BYTES_PER_KIB : i64 = 1024;
+const VOXWALK_BYTES_PER_MIB : i64 = 1048576;
+
+// What one streamer update may do: the budgets above, generated on the job pool.
+fn voxwalkBudget() : VoxStreamBudget {
+    return VoxStreamBudget { load: VOXWALK_LOAD_BUDGET, unload: VOXWALK_UNLOAD_BUDGET, parallel: true };
+}
+
+// Brings the loaded set up to date at (x, z), spreading the work over as many updates as the budget needs.
+fn voxwalkSettle(s : VoxStreamer, w : VoxWorld, x : f64, z : f64) : i32 {
+    let mut rounds : i32 = 0;
+    let mut rep : VoxStreamReport = s.update(w, x, z, voxwalkBudget());
+    while (rep.pending > 0 && rounds < VOXWALK_SETTLE_ROUNDS) {
+        rep = s.update(w, x, z, voxwalkBudget());
+        rounds = rounds + 1;
+    }
+    return rounds;
+}
+
+// Whether the chunk of `a` at store slot `pos` is missing from `b` or holds different blocks.
+fn voxwalkChunkDiffers(a : VoxWorld, b : VoxWorld, pos : i32) : bool {
+    let key : i64 = a.store.keyAt(pos);
+    let cx : i32 = VoxChunkStore::keyX(key);
+    let cy : i32 = VoxChunkStore::keyY(key);
+    let cz : i32 = VoxChunkStore::keyZ(key);
+    if (!b.isLoaded(cx, cy, cz)) {
+        return true;
+    }
+
+    let ca : VoxChunk = a.store.chunkAt(pos);
+    let cb : VoxChunk = b.store.chunk(cx, cy, cz);
+    for (i of 0..VOXWALK_CHUNK_VOLUME) {
+        if (ca.get(i) != cb.get(i)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// How many chunks of `a` are missing from `b` or hold different blocks; 0 means the two agree.
+fn voxwalkSameChunks(a : VoxWorld, b : VoxWorld) : i32 {
+    let mut differing : i32 = 0;
+    let mut pos : i32 = a.store.first();
+    while (pos >= 0) {
+        if (voxwalkChunkDiffers(a, b, pos)) {
+            differing = differing + 1;
+        }
+        pos = a.store.next(pos);
+    }
+    return differing;
+}
+
+/** What every stage of the run shares: where its checks go, the world, and the streamer that keeps it loaded. */
+struct VoxwalkRun {
+    /** The checks of the run. */
+    c : Checks;
+
+    /** Keeps the chunks around the camera loaded. */
+    s : VoxStreamer;
+
+    /** The world being flown over and edited. */
+    w : VoxWorld;
+
+    /** Generation workers, which a second world must be given too. */
+    workers : i32;
+}
+
+/** What the flight over the world measured, for the checks and the closing report. */
+struct VoxwalkFlight {
+    /** Where the camera ended, in blocks. */
+    x : f64;
+    z : f64;
+
+    /** Most bytes and most chunks held at once. */
+    peak       : i64;
+    peakChunks : i32;
+
+    /** Updates that loaded more than their budget. */
+    overBudget : i32;
+
+    /** Columns the keep disc holds, which bounds the chunks and bytes. */
+    columns : i32;
+
+    /** Chunks generated over the whole flight. */
+    made : i64;
+}
+
+/** One block the run expects to find, because a ray-cast edit wrote it there. */
+struct VoxwalkEdit {
+    /** The block's x. */
+    x : i32;
+
+    /** The block's y. */
+    y : i32;
+
+    /** The block's z. */
+    z : i32;
+
+    /** What was written there. */
+    block : i32;
+}
+
+/** The edits made by ray casting, and how many chunks they touched. */
+struct VoxwalkEdits {
+    /** Where each edit landed and what it wrote. */
+    wanted : Vec<VoxwalkEdit>;
+
+    /** Chunks holding at least one edit. */
+    chunks : i32;
+}
+
+// The top-down picture of the map around world block (x, z).
+fn voxwalkMap(w : VoxWorld, x : i32, z : i32) : Image {
+    let view : MapView = MapView {
+        x0: x,
+        z0: z,
+        size: VOXWALK_MAP_SIZE,
+        scale: VOXWALK_MAP_SCALE,
+        grid: true,
+    };
+    return WalkMap::topDown(w, view);
+}
+
+// Draws the world as the streamer first built it: a top-down map and a side section.
+fn voxwalkStart(s : VoxStreamer, w : VoxWorld) : void ! IOException {
+    voxwalkSettle(s, w, 0.0, 0.0);
+    println("voxelwalk: start: ${w.store.count()} chunks loaded, ${w.store.bytesUsed()} bytes");
+    let half : i32 = VOXWALK_MAP_SIZE / 2;
+    DataFiles::savePng(VOXWALK_MAP_FILE, voxwalkMap(w, 0 - half, 0 - half));
+
+    let section : SectionView = SectionView {
+        z: VOXWALK_SECTION_ROW,
+        x0: 0 - VOXWALK_SECTION_WIDTH / 2,
+        width: VOXWALK_SECTION_WIDTH,
+        scale: VOXWALK_SECTION_SCALE,
+    };
+    DataFiles::savePng(VOXWALK_SECTION_FILE, WalkMap::side(w, section));
+}
+
+// The most bytes the keep disc may hold: every column of it, full height, at the per-chunk bound.
+fn voxwalkBound(columns : i32) : i64 {
+    return (columns * VOXWALK_CHUNKS_HIGH) as i64 * VOXWALK_CHUNK_BYTES;
+}
+
+// Flies the camera along the path, one chunk per step, and measures what the streamer held.
+fn voxwalkFly(s : VoxStreamer, w : VoxWorld) : VoxwalkFlight {
+    let columns : i32 = VoxStreamer::discColumns(VOXWALK_RADIUS + VOXWALK_KEEP);
+    let mut peak : i64 = 0;
+    let mut peakChunks : i32 = 0;
+    let mut overBudget : i32 = 0;
+    let started : i64 = nowNanos();
+    for (step of 1..VOXWALK_STEPS) {
+        let x : f64 = WalkPath::x(step);
+        let z : f64 = WalkPath::z(step);
+        let rep : VoxStreamReport = s.update(w, x, z, voxwalkBudget());
+        if (rep.loaded > VOXWALK_LOAD_BUDGET) {
+            overBudget = overBudget + 1;
+        }
+
+        let bytes : i64 = w.store.bytesUsed();
+        if (bytes > peak) {
+            peak = bytes;
+        }
+        if (w.store.count() > peakChunks) {
+            peakChunks = w.store.count();
+        }
+        if (step % VOXWALK_REPORT_EVERY == 0) {
+            println("voxelwalk: x=${x as i32} z=${z as i32}  chunks ${w.store.count()}  bytes ${bytes}  generated so far ${w.generated()}  pending ${rep.pending}");
+        }
+    }
+
+    let x : f64 = WalkPath::x(VOXWALK_STEPS - 1);
+    let z : f64 = WalkPath::z(VOXWALK_STEPS - 1);
+    voxwalkSettle(s, w, x, z);
+    let elapsed : f64 = nanosToMillis(nowNanos() - started);
+    let made : i64 = w.generated();
+    let perSecond : i32 = (made as f64 * VOXWALK_MILLIS_PER_SECOND / elapsed) as i32;
+    let bound : i64 = voxwalkBound(columns);
+    println("voxelwalk: flew ${x as i32} blocks in ${VOXWALK_STEPS - 1} steps: ${made} chunks generated, ${perSecond} chunks/s (wall clock, for information only)");
+    println("voxelwalk: peak ${peak} bytes in ${peakChunks} chunks; bound for this radius ${bound} bytes");
+    return VoxwalkFlight {
+        x: x,
+        z: z,
+        peak: peak,
+        peakChunks: peakChunks,
+        overBudget: overBudget,
+        columns: columns,
+        made: made,
+    };
+}
+
+// The streamer held to its radius, its budget and its memory bound for the whole flight.
+fn voxwalkFlightChecks(c : Checks, w : VoxWorld, f : VoxwalkFlight) : void {
+    c.that("the camera flew ${VOXWALK_FLIGHT_BLOCKS as i32} blocks", f.x >= VOXWALK_FLIGHT_BLOCKS);
+    c.that("memory never exceeded the bound given by the radius", f.peak <= voxwalkBound(f.columns));
+    c.that("chunks never exceeded the keep disc", f.peakChunks <= f.columns * VOXWALK_CHUNKS_HIGH);
+    c.that("no update loaded more than its budget", f.overBudget == 0);
+    c.that(
+        "far more chunks were generated than were ever held",
+        f.made > (f.peakChunks as i64) * VOXWALK_CHUNKS_HIGH
+    );
+    c.that(
+        "the full disc is loaded at the end",
+        w.isLoaded(
+            VoxStreamer::chunkOf(f.x),
+            VOXWALK_GROUND_CHUNK,
+            VoxStreamer::chunkOf(f.z)
+        )
+    );
+}
+
+// Places a lamp above the ground the ray hit; false when the world refused.
+fn voxwalkPlaceLamp(touch : VoxInteract, w : VoxWorld, hit : VoxHit, wanted : Vec<VoxwalkEdit>) : bool {
+    if (!touch.placeBlock(w, hit, VW_LAMP)) {
+        return false;
+    }
+    wanted.push(VoxwalkEdit { x: hit.frontX, y: hit.frontY, z: hit.frontZ, block: VW_LAMP });
+    return true;
+}
+
+// Breaks the block the ray hit; false when the world refused.
+fn voxwalkBreak(touch : VoxInteract, w : VoxWorld, hit : VoxHit, wanted : Vec<VoxwalkEdit>) : bool {
+    if (!touch.breakBlock(w, hit)) {
+        return false;
+    }
+    wanted.push(VoxwalkEdit { x: hit.x, y: hit.y, z: hit.z, block: VW_AIR });
+    return true;
+}
+
+// How many distinct chunks the world's edit journal touched.
+fn voxwalkEditedChunks(w : VoxWorld) : i32 {
+    let spots : Map<i64, i32> = new Map<i64, i32>();
+    for (n of 0..w.journal.end()) {
+        let key : i64 = VoxChunkStore::key(
+            w.journal.xAt(n) >> VOXWALK_CHUNK_SHIFT,
+            w.journal.yAt(n) >> VOXWALK_CHUNK_SHIFT,
+            w.journal.zAt(n) >> VOXWALK_CHUNK_SHIFT
+        );
+        spots.put(key, 1);
+    }
+    return spots.len();
+}
+
+// The ray of edit number `k`: straight down from above the world, on a grid of spots under the camera.
+fn voxwalkEditRay(f : VoxwalkFlight, k : i32) : DRay {
+    let px : f64 = f.x + (k * VOXWALK_EDIT_STEP_X + VOXWALK_EDIT_ORIGIN_X) as f64 + VOXWALK_BLOCK_CENTRE;
+    let pz : f64 = f.z + (k * VOXWALK_EDIT_STEP_Z + VOXWALK_EDIT_ORIGIN_Z) as f64 + VOXWALK_BLOCK_CENTRE;
+    let from : DVec3 = DVec3::make(px, VOXWALK_RAY_HEIGHT, pz);
+    return DRay::make(from, DVec3::make(0.0, -1.0, 0.0));
+}
+
+// Places a lamp on every other ground hit and breaks the block at the rest, below the camera.
+fn voxwalkEdit(c : Checks, w : VoxWorld, f : VoxwalkFlight) : VoxwalkEdits {
+    let touch : VoxInteract = new VoxInteract();
+    let wanted : Vec<VoxwalkEdit> = new Vec<VoxwalkEdit>();
+    for (k of 0..VOXWALK_EDITS) {
+        let down : DRay = voxwalkEditRay(f, k);
+        let hit : VoxHit = touch.cast(w, down, VOXWALK_RAY_LENGTH);
+        if (!hit.hit) {
+            continue;
+        }
+
+        if (k % 2 == 0) {
+            voxwalkPlaceLamp(touch, w, hit, wanted);
+        } else {
+            voxwalkBreak(touch, w, hit, wanted);
+        }
+    }
+
+    let chunks : i32 = voxwalkEditedChunks(w);
+    println("voxelwalk: ${wanted.len()} edits in ${chunks} chunks");
+    c.that("edits were made", wanted.len() >= VOXWALK_EDITS_MIN);
+    return VoxwalkEdits { wanted: wanted, chunks: chunks };
+}
+
+// Saves the edits, flies away until they are out of memory, flies back, and reads the save into a second world.
+fn voxwalkPersist(run : VoxwalkRun, f : VoxwalkFlight, e : VoxwalkEdits) : void ! IOException {
+    let c : Checks = run.c;
+    let s : VoxStreamer = run.s;
+    let w : VoxWorld = run.w;
+    VoxWorldFiles::save(VOXWALK_REGION_FILE, w);
+    let file : ByteBuf = DataFiles::read(VOXWALK_REGION_FILE);
+    let region : VoxRegion = new VoxRegion();
+    c.that("the saved file loads as a region", region.load(file));
+    c.sameInt("the file holds exactly the edited chunks", region.count(), e.chunks);
+    println("voxelwalk: save file ${file.len()} bytes for ${region.count()} chunks, while ${w.store.count()} chunks are loaded (${w.store.bytesUsed()} bytes)");
+    c.that(
+        "the save is smaller than one dense chunk of the loaded set",
+        (file.len() as i64) < w.store.bytesUsed()
+    );
+
+    voxwalkSettle(s, w, f.x + VOXWALK_AWAY_BLOCKS, f.z);
+    let firstKey : i64 = region.keyAt(0);
+    c.that(
+        "an edited chunk left memory when the camera flew away",
+        !w.isLoaded(
+            VoxChunkStore::keyX(firstKey),
+            VoxChunkStore::keyY(firstKey),
+            VoxChunkStore::keyZ(firstKey)
+        )
+    );
+
+    voxwalkSettle(s, w, f.x, f.z);
+    let mut intact : bool = true;
+    for (i of 0..e.wanted.len()) {
+        let edit : VoxwalkEdit = e.wanted.get(i);
+        if (w.blockAt(edit.x, edit.y, edit.z) != edit.block) {
+            intact = false;
+        }
+    }
+    c.that("every edit survived unloading and loading again", intact);
+
+    voxwalkReload(run, f, file);
+}
+
+// Reads the save into a second world and compares it chunk for chunk; also the worlds that must differ or refuse.
+fn voxwalkReload(run : VoxwalkRun, f : VoxwalkFlight, file : ByteBuf) : void ! IOException {
+    let c : Checks = run.c;
+    let w : VoxWorld = run.w;
+    let workers : i32 = run.workers;
+    let other : VoxWorld = new VoxWorld(VOXWALK_SEED, VOXWALK_SEA, workers);
+    let so : VoxStreamer = new VoxStreamer(VOXWALK_RADIUS, VOXWALK_KEEP);
+    c.that("the save loads into a second world", VoxWorldFiles::load(VOXWALK_REGION_FILE, other));
+    voxwalkSettle(so, other, f.x, f.z);
+    let differing : i32 = voxwalkSameChunks(w, other);
+    println("voxelwalk: ${w.store.count()} chunks compared with the reloaded world, ${differing} differ");
+    c.sameInt("the reloaded world equals the edited one, chunk for chunk", differing, 0);
+
+    let untouched : VoxWorld = new VoxWorld(VOXWALK_SEED, VOXWALK_SEA, workers);
+    let su : VoxStreamer = new VoxStreamer(VOXWALK_RADIUS, VOXWALK_KEEP);
+    voxwalkSettle(su, untouched, f.x, f.z);
+    c.that("without the save the edits are gone", voxwalkSameChunks(w, untouched) > 0);
+    c.sameInt("a world that was only flown over stores no chunks", untouched.editedStored(), 0);
+
+    let damaged : ByteBuf = new ByteBuf(file.len() + VOXWALK_DAMAGED_SLACK);
+    damaged.pushRange(file, 0, file.len());
+    let last : i32 = file.len() - 1;
+    damaged.set(last, damaged.get(last) ^ VOXWALK_BYTE_MASK);
+    c.that("a damaged save is refused", !VoxWorldFiles::fromBytes(untouched, damaged));
+
+    other.close();
+    untouched.close();
+}
+
+fn main() : i32 ! IOException {
+    let c : Checks = new Checks();
+    let workers : i32 = JobPool::defaultWorkers();
+    let w : VoxWorld = new VoxWorld(VOXWALK_SEED, VOXWALK_SEA, workers);
+    let s : VoxStreamer = new VoxStreamer(VOXWALK_RADIUS, VOXWALK_KEEP);
+    println("voxelwalk: seed ${VOXWALK_SEED}, view radius ${VOXWALK_RADIUS} chunks (+${VOXWALK_KEEP} kept), ${workers} generation workers");
+
+    voxwalkStart(s, w);
+    let flight : VoxwalkFlight = voxwalkFly(s, w);
+    voxwalkFlightChecks(c, w, flight);
+
+    let farX : i32 = (VoxStreamer::chunkOf(flight.x) - VOXWALK_FAR_MARGIN) * VOXWALK_CHUNK_EDGE;
+    let farZ : i32 = (VoxStreamer::chunkOf(flight.z) - VOXWALK_FAR_MARGIN) * VOXWALK_CHUNK_EDGE;
+    DataFiles::savePng(VOXWALK_FAR_FILE, voxwalkMap(w, farX, farZ));
+
+    let edits : VoxwalkEdits = voxwalkEdit(c, w, flight);
+    let run : VoxwalkRun = VoxwalkRun { c: c, s: s, w: w, workers: workers };
+    voxwalkPersist(run, flight, edits);
+
+    let corridor : i64 = (WalkPath::x(VOXWALK_STEPS - 1) as i64)
+        * ((VOXWALK_RADIUS * 2 + 1) * VOXWALK_CHUNK_EDGE) as i64
+        * VOXWALK_BLOCKS_HIGH;
+    let denseMib : i64 = corridor * VOXWALK_DENSE_BYTES / VOXWALK_BYTES_PER_MIB;
+    println("voxelwalk: a dense grid (about ${VOXWALK_DENSE_BYTES} bytes per cell, as in lumen) over the corridor flown would need ${denseMib} MiB; this run peaked at ${flight.peak / VOXWALK_BYTES_PER_KIB} KiB");
+
+    w.close();
+    println("voxelwalk: ${c.count()} checks, ${c.failures()} failed");
+    return c.failures();
+}

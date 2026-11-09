@@ -1,0 +1,249 @@
+// files — the files of the example game, made in code.
+//
+// There is no asset folder: a glTF triangle with its binary buffer in a second file, a Blockbench crate with
+// its texture embedded, a JSON level and a game configuration written with the JSON builder, and a PNG. Half
+// of them go into an archive that is mounted first (the "shipped" content), the rest into a memory directory
+// mounted over it (the "patch"), and one file exists in both so the layering has something to override.
+//
+// The JSON documents are written with `'` where the format wants `"`, so the Axle strings that build them stay
+// readable; `quoted` is the one place that turns them into real JSON.
+
+use ludax::{Base64, ByteBuf, DataText, Ieee, Image, JsonDoc, JsonValue, JsonWriter, PngCodec};
+use ludax::{Vfs, VfsArchive};
+
+/** The two colours of a checker cell alternate every this many pixels. */
+const CONTENT_CHECKER_CELL : i32 = 2;
+
+/** Three vertices of three coordinates each. */
+const CONTENT_TRIANGLE_FLOATS : i32 = 9;
+
+/** A buffer roomy enough for the triangle's nine floats, with slack a future field would not need to resize for. */
+const CONTENT_TRIANGLE_ROOM : i32 = 64;
+
+/** The byte code of `'`, which the builders write where JSON wants a quotation mark. */
+const CONTENT_APOSTROPHE : i32 = 39;
+
+/** The byte code of `"`, the character `quoted` writes in its place. */
+const CONTENT_QUOTE : i32 = 34;
+
+/** The size, in pixels, of the crate's embedded texture. */
+const CONTENT_CRATE_TEXTURE : i32 = 16;
+
+/** Bytes in the triangle's binary buffer: nine floats of four bytes. */
+const CONTENT_TRIANGLE_BYTES : i32 = 36;
+
+/** One unit along an axis, where the triangle's second and third vertex stand. */
+const CONTENT_TRIANGLE_UNIT : f32 = 1.0;
+
+/** The side, in pixels, of the shipped ground picture. */
+pub const CONTENT_GROUND_SIDE : i32 = 8;
+
+/** The volume of the configuration in the shipped archive. */
+const CONTENT_VOLUME_SHIPPED : f64 = 0.8;
+
+/** The volume of the configuration in the memory patch, which wins over the shipped one. */
+pub const CONTENT_VOLUME_PATCHED : f64 = 0.5;
+
+/** The volume a later edit writes, so a reload has a value to move to. */
+pub const CONTENT_VOLUME_EDITED : f64 = 0.25;
+
+/** Where the edited triangle's node stands along x, so a reload shows in the model. */
+pub const CONTENT_TRIANGLE_MOVED_X : i32 = 7;
+
+/** Spaces per level in the written configuration. */
+const CONTENT_JSON_INDENT : i32 = 2;
+
+/** The configuration file, present in both layers. */
+pub const CONTENT_CONFIG_PATH : string = "config/game.json";
+
+/** The picture only the archive has. */
+pub const CONTENT_GROUND_PATH : string = "textures/checker.png";
+
+/** The crate model, shipped in the archive. */
+pub const CONTENT_CRATE_PATH : string = "models/crate.bbmodel";
+
+/** The triangle model, written to the patch. */
+pub const CONTENT_TRIANGLE_PATH : string = "models/tri.gltf";
+
+/** The triangle's separate binary buffer, written to the patch. */
+pub const CONTENT_TRIANGLE_BIN_PATH : string = "models/tri.bin";
+
+/** A model whose buffer file is missing, written to the patch so the failure has something to read. */
+pub const CONTENT_BROKEN_PATH : string = "models/broken.gltf";
+
+/** The level, which depends on everything else. */
+pub const CONTENT_LEVEL_PATH : string = "scenes/level.json";
+
+/** Builders of the example's content. */
+pub class ContentFiles {
+    /** A picture of `side` x `side` pixels in two colours, as PNG bytes. */
+    pub static fn checkerPng(side : i32, a : i32, b : i32) : ByteBuf {
+        let img : Image = new Image(side, side);
+        for (y of 0..side) {
+            for (x of 0..side) {
+                let even : i32 = (x / CONTENT_CHECKER_CELL + y / CONTENT_CHECKER_CELL) % 2;
+                if (even == 0) {
+                    img.set(x, y, a);
+                } else {
+                    img.set(x, y, b);
+                }
+            }
+        }
+
+        let codec : PngCodec = new PngCodec();
+        return codec.encode(img);
+    }
+
+    /** The binary buffer of the triangle: three positions as nine little-endian floats. */
+    pub static fn triangleBin() : ByteBuf {
+        let b : ByteBuf = new ByteBuf(CONTENT_TRIANGLE_ROOM);
+        let coords : f32[] = ContentFiles::triangleCoords();
+        for (i of 0..CONTENT_TRIANGLE_FLOATS) {
+            b.pushLe32(Ieee::bitsOf(coords[i]));
+        }
+        return b;
+    }
+
+    // Three vertices in the XY plane: the origin, then one unit along each axis.
+    static fn triangleCoords() : f32[] {
+        let mut c : f32[] = new f32[CONTENT_TRIANGLE_FLOATS];
+        c[0] = 0.0;
+        c[1] = 0.0;
+        c[2] = 0.0;
+        c[3] = CONTENT_TRIANGLE_UNIT;
+        c[4] = 0.0;
+        c[5] = 0.0;
+        c[6] = 0.0;
+        c[7] = CONTENT_TRIANGLE_UNIT;
+        c[8] = 0.0;
+        return c;
+    }
+
+    /** The darker brown of the crate's checker. */
+    pub static fn crateDark() : i32 {
+        return Image::pack(110, 70, 30, 255);
+    }
+
+    /** The lighter brown of the crate's checker. */
+    pub static fn crateLight() : i32 {
+        return Image::pack(150, 100, 50, 255);
+    }
+
+    /** The near-white cell of the ground checker. */
+    pub static fn groundLight() : i32 {
+        return Image::pack(240, 240, 240, 255);
+    }
+
+    /** The near-black cell of the ground checker. */
+    pub static fn groundDark() : i32 {
+        return Image::pack(40, 40, 40, 255);
+    }
+
+    // Turns the `'` of a builder string into the `"` JSON wants.
+    static fn quoted(s : string) : string {
+        let b : ByteBuf = DataText::toBytes(s);
+        for (i of 0..b.len()) {
+            if (b.get(i) == CONTENT_APOSTROPHE) {
+                b.set(i, CONTENT_QUOTE);
+            }
+        }
+        return DataText::fromBytes(b, 0, b.len());
+    }
+
+    /** The glTF of the triangle; its buffer is the file `tri.bin` beside it, and `x` is where its node stands. */
+    pub static fn triangleGltf(x : i32) : string {
+        return ContentFiles::quoted("{'asset':{'version':'2.0','generator':'assetdb example'},"
+            + "'scene':0,'scenes':[{'nodes':[0]}],"
+            + "'nodes':[{'name':'triangle','mesh':0,'translation':[${x},0,0]}],"
+            + "'meshes':[{'primitives':[{'attributes':{'POSITION':0},'material':0}]}],"
+            + "'materials':[{'name':'orange','pbrMetallicRoughness':"
+            + "{'baseColorFactor':[1,0.5,0.1,1],'metallicFactor':0,'roughnessFactor':0.8}}],"
+            + "'buffers':[{'byteLength':${CONTENT_TRIANGLE_BYTES},'uri':'tri.bin'}],"
+            + "'bufferViews':[{'buffer':0,'byteLength':${CONTENT_TRIANGLE_BYTES}}],"
+            + "'accessors':[{'bufferView':0,'componentType':5126,'count':3,'type':'VEC3'}]}");
+    }
+
+    /** A Blockbench crate: one 16 pixel cube, every face mapped onto a texture embedded in the file. */
+    pub static fn crateModel() : string {
+        let checker : ByteBuf = ContentFiles::checkerPng(
+            CONTENT_CRATE_TEXTURE,
+            ContentFiles::crateLight(),
+            ContentFiles::crateDark()
+        );
+        let encoded : string = Base64::encode(checker);
+        let png : string = "data:image/png;base64,${encoded}";
+
+        let uv : string = "[0,0,16,16]";
+        let face : string = "{'uv':${uv},'texture':0}";
+        let faces : string = "'faces':{'north':${face},'east':${face},'south':${face},'west':${face},'up':${face},'down':${face}}";
+
+        return ContentFiles::quoted("{'name':'crate','resolution':{'width':16,'height':16},"
+            + "'elements':[{'name':'box','type':'cube','uuid':'c1',"
+            + "'from':[0,0,0],'to':[16,16,16],'origin':[8,8,8],'rotation':[0,0,0],${faces}}],"
+            + "'outliner':['c1'],"
+            + "'textures':[{'name':'crate.png','source':'${png}'}]}");
+    }
+
+    // Appends a key name to the array `keys` of `doc`.
+    static fn pushKey(doc : JsonDoc, keys : JsonValue, name : string) : void {
+        let value : JsonValue = doc.newString(name);
+        doc.push(keys, value);
+    }
+
+    /** The game configuration, built value by value and written as indented JSON. */
+    pub static fn gameConfig(volume : f64) : string {
+        let doc : JsonDoc = new JsonDoc();
+        let root : JsonValue = doc.newObject();
+        doc.setRoot(root);
+        doc.set(root, "title", doc.newString("Assetdb demo"));
+        doc.set(root, "volume", doc.newNumber(volume));
+        doc.set(root, "fullscreen", doc.newBool(false));
+
+        let keys : JsonValue = doc.newArray();
+        ContentFiles::pushKey(doc, keys, "W");
+        ContentFiles::pushKey(doc, keys, "A");
+        ContentFiles::pushKey(doc, keys, "S");
+        ContentFiles::pushKey(doc, keys, "D");
+        doc.set(root, "keys", keys);
+
+        return JsonWriter::pretty(doc, root, CONTENT_JSON_INDENT);
+    }
+
+    /** The level: a name and the props it places. */
+    pub static fn levelJson() : string {
+        return ContentFiles::quoted("{'name':'first level',"
+            + "'props':['models/tri.gltf','models/crate.bbmodel'],"
+            + "'ground':'textures/checker.png'}");
+    }
+
+    /** Mounts the shipped archive, then the memory patch over it, and fills both; false when something could not be stored. */
+    pub static fn mountAll(files : Vfs) : bool {
+        let shipped : VfsArchive = new VfsArchive();
+        let shippedConfig : string = ContentFiles::gameConfig(CONTENT_VOLUME_SHIPPED);
+        let ground : ByteBuf = ContentFiles::checkerPng(
+            CONTENT_GROUND_SIDE,
+            ContentFiles::groundLight(),
+            ContentFiles::groundDark()
+        );
+        shipped.put(CONTENT_CONFIG_PATH, DataText::toBytes(shippedConfig));
+        shipped.put(CONTENT_GROUND_PATH, ground);
+        shipped.put(CONTENT_CRATE_PATH, DataText::toBytes(ContentFiles::crateModel()));
+        files.addArchive(shipped.toBytes(), "");
+        files.addMemory("");
+
+        let patchedConfig : string = ContentFiles::gameConfig(CONTENT_VOLUME_PATCHED);
+        let broken : string = "{\"asset\":{\"version\":\"2.0\"},"
+            + "\"buffers\":[{\"byteLength\":${CONTENT_TRIANGLE_BYTES},\"uri\":\"gone.bin\"}]}";
+        try {
+            files.writeText(CONTENT_CONFIG_PATH, patchedConfig);
+            files.writeText(CONTENT_LEVEL_PATH, ContentFiles::levelJson());
+            files.write(CONTENT_TRIANGLE_BIN_PATH, ContentFiles::triangleBin());
+            files.writeText(CONTENT_TRIANGLE_PATH, ContentFiles::triangleGltf(0));
+            files.writeText(CONTENT_BROKEN_PATH, broken);
+        } catch e : IOException {
+            println("assetdb: cannot fill the memory mount: ${e.message}");
+            return false;
+        }
+        return true;
+    }
+}

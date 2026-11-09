@@ -1,0 +1,241 @@
+// render — draws the scenario top-down onto a canvas.
+//
+// Rock is dark, floor light, mud brown. Over it, for agent 1 (the walker's opposite number): the raw A* path in
+// red, the smoothed one in blue, the navigation mesh route in green. Faint dots mark the centres of the mesh's
+// polygons. Every agent leaves a coloured trail of where it really went; the walker's is thick and orange with a
+// dark mark for every footstep. Squares are starts, rings are goals, discs are where agents ended.
+//
+// The view is deliberately a plain cell-to-pixel scaling: a map cell is `VIEW_SCALE` pixels and a position in
+// cells is rounded down, so an agent at a cell's edge draws on that cell. Nothing here clips; `Canvas` ignores
+// what falls outside, which is why the draw code can stay loop-shaped.
+
+use ludax::{GridMap, GridPath, NavMesh, NavPath};
+
+use crate::app::scenario::{Scenario, SCN_AGENTS};
+use crate::gfx::canvas::{Canvas, CanvasBox, CanvasColor, CanvasSegment};
+use crate::sim::crowd::Crowd;
+use crate::sim::walker_agent::WalkerAgent;
+use crate::world::dungeon::Dungeon;
+
+/** Pixels per map cell. */
+pub const VIEW_SCALE : i32 = 10;
+
+// Line widths for the routes, the crowd trails and the walker, and the radii of the marks drawn over them.
+const VIEW_ROUTE_WIDTH : i32 = 2;
+const VIEW_TRAIL_WIDTH : i32 = 2;
+const VIEW_WALKER_WIDTH : i32 = 5;
+const VIEW_NODE_RADIUS : i32 = 3;
+const VIEW_MARK_RADIUS : i32 = 2;
+
+// The agent whose routes are drawn: the walker's opposite number.
+const VIEW_ROUTE_AGENT : i32 = 1;
+
+// The three planned routes of that agent, as 0xRRGGBB: raw A* red, smoothed blue, mesh funnel green.
+const VIEW_RAW_RGB : i32 = 0xFF4646;
+const VIEW_SMOOTH_RGB : i32 = 0x285AFF;
+const VIEW_FUNNEL_RGB : i32 = 0x14AA3C;
+
+// The walker's trail is orange; its footstep marks are a dark brown.
+const VIEW_WALKER_RGB : i32 = 0xFF9600;
+const VIEW_STEP_RGB : i32 = 0x3C1E00;
+
+// The terrain: rock, floor and mud, and the faint dots at the mesh polygons' centres.
+const VIEW_ROCK_RGB : i32 = 0x22222E;
+const VIEW_FLOOR_RGB : i32 = 0xD6D2C4;
+const VIEW_MUD_RGB : i32 = 0xA08054;
+const VIEW_DOT_RGB : i32 = 0x9696AA;
+
+// A floor cell costs this to cross; anything dearer is mud.
+const VIEW_FLOOR_COST : i32 = 1;
+
+// Pixels of gap left between two drawn cells, so the grid reads without lines.
+const VIEW_CELL_GAP : i32 = 1;
+
+// A cell's middle is half a cell from its corner.
+const VIEW_CELL_CENTRE : f32 = 0.5;
+
+// The mesh polygon dots, in pixels of radius.
+const VIEW_DOT_RADIUS : i32 = 1;
+
+// The agent tints: each channel is a base plus a step times a position on a wheel of this many positions,
+// and each channel starts this many positions after the last (agent i uses `i * 3`, then 5 and 10 on).
+const VIEW_TINT_BASE : i32 = 90;
+const VIEW_TINT_STEP : i32 = 24;
+const VIEW_TINT_WHEEL : i32 = 7;
+const VIEW_TINT_PER_AGENT : i32 = 3;
+const VIEW_TINT_GREEN_AT : i32 = 5;
+const VIEW_TINT_BLUE_AT : i32 = 10;
+
+// Where an agent starts and ends: a dark 7 pixel square, a ring of radius 6, its light centre, its halo.
+const VIEW_DARK_RGB : i32 = 0x141414;
+const VIEW_LIGHT_RGB : i32 = 0xF0F0F0;
+const VIEW_HALO_RGB : i32 = 0xFFFFFF;
+const VIEW_START_HALF : i32 = 3;
+const VIEW_START_SIDE : i32 = 7;
+const VIEW_RING_RADIUS : i32 = 6;
+const VIEW_RING_CENTRE : i32 = 3;
+const VIEW_HALO_RADIUS : i32 = 4;
+const VIEW_END_RADIUS : i32 = 3;
+
+/** Draws pictures of scenarios. */
+pub class MapView {
+    /** A canvas showing the scenario as it stands. */
+    pub static fn draw(s : Scenario) : Canvas {
+        let dungeon : Dungeon = s.dungeon();
+        let map : GridMap = dungeon.map();
+        let w : i32 = map.width();
+        let h : i32 = map.height();
+        let canvas : Canvas = new Canvas(w * VIEW_SCALE, h * VIEW_SCALE);
+        MapView::terrain(canvas, map);
+        MapView::mesh(canvas, s.navmesh());
+
+        // Agent 1 is the walker's opposite number: its three planned routes are the three colours.
+        let raw : CanvasColor = MapView::rgb(VIEW_RAW_RGB);
+        let smooth : CanvasColor = MapView::rgb(VIEW_SMOOTH_RGB);
+        let funnel : CanvasColor = MapView::rgb(VIEW_FUNNEL_RGB);
+        MapView::route(canvas, s.rawPath(VIEW_ROUTE_AGENT), raw, VIEW_ROUTE_WIDTH);
+        MapView::route(canvas, s.smoothPath(VIEW_ROUTE_AGENT), smooth, VIEW_ROUTE_WIDTH);
+        MapView::meshRoute(canvas, s.meshPath(VIEW_ROUTE_AGENT), funnel);
+
+        let crowd : Crowd = s.crowd();
+        for (i of 1..SCN_AGENTS) {
+            MapView::trail(canvas, crowd, i, MapView::tint(i), VIEW_TRAIL_WIDTH);
+        }
+
+        let walker : WalkerAgent = s.walker();
+        MapView::trail(canvas, crowd, 0, MapView::rgb(VIEW_WALKER_RGB), VIEW_WALKER_WIDTH);
+        let stepColor : CanvasColor = MapView::rgb(VIEW_STEP_RGB);
+        for (k of 0..walker.markCount()) {
+            let x : i32 = MapView::px(walker.markX(k));
+            let y : i32 = MapView::px(walker.markY(k));
+            canvas.disc(x, y, VIEW_MARK_RADIUS, stepColor);
+        }
+
+        for (i of 0..SCN_AGENTS) {
+            MapView::endpoints(canvas, s, i);
+        }
+        return canvas;
+    }
+
+    // The colour given to agent `i`: three channels spread round the wheel by a fixed offset each.
+    static fn tint(i : i32) : CanvasColor {
+        let spot : i32 = i * VIEW_TINT_PER_AGENT;
+        return CanvasColor::make(
+            MapView::wheel(spot),
+            MapView::wheel(spot + VIEW_TINT_GREEN_AT),
+            MapView::wheel(spot + VIEW_TINT_BLUE_AT)
+        );
+    }
+
+    // One tint channel at position `spot` on the wheel.
+    static fn wheel(spot : i32) : i32 {
+        return VIEW_TINT_BASE + (spot % VIEW_TINT_WHEEL) * VIEW_TINT_STEP;
+    }
+
+    // The canvas colour of a 0xRRGGBB value.
+    static fn rgb(value : i32) : CanvasColor {
+        return CanvasColor::make((value >> 16) & 255, (value >> 8) & 255, value & 255);
+    }
+
+    static fn px(v : f32) : i32 {
+        return (v * (VIEW_SCALE as f32)) as i32;
+    }
+
+    static fn terrain(canvas : Canvas, map : GridMap) : void {
+        let rock : CanvasColor = MapView::rgb(VIEW_ROCK_RGB);
+        let floor : CanvasColor = MapView::rgb(VIEW_FLOOR_RGB);
+        let mud : CanvasColor = MapView::rgb(VIEW_MUD_RGB);
+        for (y of 0..map.height()) {
+            for (x of 0..map.width()) {
+                let cost : i32 = map.costAt(x, y);
+                let mut color : CanvasColor = rock;
+                if (cost == VIEW_FLOOR_COST) {
+                    color = floor;
+                } else if (cost > VIEW_FLOOR_COST) {
+                    color = mud;
+                }
+                let cell : CanvasBox = CanvasBox {
+                    x: x * VIEW_SCALE,
+                    y: y * VIEW_SCALE,
+                    w: VIEW_SCALE - VIEW_CELL_GAP,
+                    h: VIEW_SCALE - VIEW_CELL_GAP,
+                };
+                canvas.fillRect(cell, color);
+            }
+        }
+    }
+
+    static fn mesh(canvas : Canvas, mesh : NavMesh) : void {
+        let dot : CanvasColor = MapView::rgb(VIEW_DOT_RGB);
+        for (p of 0..mesh.polygonCount()) {
+            let x : i32 = MapView::px(mesh.centerX(p));
+            let y : i32 = MapView::px(mesh.centerY(p));
+            canvas.disc(x, y, VIEW_DOT_RADIUS, dot);
+        }
+    }
+
+    static fn route(canvas : Canvas, path : GridPath, color : CanvasColor, thick : i32) : void {
+        let half : f32 = VIEW_CELL_CENTRE;
+        for (k of 1..path.len()) {
+            let x0 : i32 = MapView::px((path.xAt(k - 1) as f32) + half);
+            let y0 : i32 = MapView::px((path.yAt(k - 1) as f32) + half);
+            let x1 : i32 = MapView::px((path.xAt(k) as f32) + half);
+            let y1 : i32 = MapView::px((path.yAt(k) as f32) + half);
+            let seg : CanvasSegment = CanvasSegment { x0: x0, y0: y0, x1: x1, y1: y1 };
+            canvas.line(seg, thick, color);
+        }
+    }
+
+    static fn meshRoute(canvas : Canvas, path : NavPath, color : CanvasColor) : void {
+        for (k of 1..path.len()) {
+            let x0 : i32 = MapView::px(path.xAt(k - 1));
+            let y0 : i32 = MapView::px(path.yAt(k - 1));
+            let x1 : i32 = MapView::px(path.xAt(k));
+            let y1 : i32 = MapView::px(path.yAt(k));
+            let seg : CanvasSegment = CanvasSegment { x0: x0, y0: y0, x1: x1, y1: y1 };
+            canvas.line(seg, VIEW_ROUTE_WIDTH, color);
+            canvas.disc(x1, y1, VIEW_NODE_RADIUS, color);
+        }
+    }
+
+    static fn trail(canvas : Canvas, crowd : Crowd, i : i32, color : CanvasColor, thick : i32) : void {
+        for (k of 1..crowd.trailLength(i)) {
+            let seg : CanvasSegment = CanvasSegment {
+                x0: MapView::px(crowd.trailX(i, k - 1)),
+                y0: MapView::px(crowd.trailY(i, k - 1)),
+                x1: MapView::px(crowd.trailX(i, k)),
+                y1: MapView::px(crowd.trailY(i, k)),
+            };
+            canvas.line(seg, thick, color);
+        }
+    }
+
+    static fn endpoints(canvas : Canvas, s : Scenario, i : i32) : void {
+        let dungeon : Dungeon = s.dungeon();
+        let crowd : Crowd = s.crowd();
+        let sx : i32 = dungeon.centerX(s.fromRoom(i)) * VIEW_SCALE + VIEW_SCALE / 2;
+        let sy : i32 = dungeon.centerY(s.fromRoom(i)) * VIEW_SCALE + VIEW_SCALE / 2;
+        let gx : i32 = dungeon.centerX(s.toRoom(i)) * VIEW_SCALE + VIEW_SCALE / 2;
+        let gy : i32 = dungeon.centerY(s.toRoom(i)) * VIEW_SCALE + VIEW_SCALE / 2;
+
+        // Start: a dark square. Goal: a dark ring round a light centre.
+        let dark : CanvasColor = MapView::rgb(VIEW_DARK_RGB);
+        let square : CanvasBox = CanvasBox {
+            x: sx - VIEW_START_HALF,
+            y: sy - VIEW_START_HALF,
+            w: VIEW_START_SIDE,
+            h: VIEW_START_SIDE,
+        };
+        canvas.fillRect(square, dark);
+        canvas.disc(gx, gy, VIEW_RING_RADIUS, dark);
+        canvas.disc(gx, gy, VIEW_RING_CENTRE, MapView::rgb(VIEW_LIGHT_RGB));
+
+        // Where the agent ended: a white halo under its own colour, so it stays visible on any terrain.
+        let a : f32 = crowd.agent(i).pos.x;
+        let b : f32 = crowd.agent(i).pos.y;
+        let ex : i32 = MapView::px(a);
+        let ey : i32 = MapView::px(b);
+        canvas.disc(ex, ey, VIEW_HALO_RADIUS, MapView::rgb(VIEW_HALO_RGB));
+        canvas.disc(ex, ey, VIEW_END_RADIUS, MapView::tint(i));
+    }
+}
