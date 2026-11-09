@@ -1,0 +1,540 @@
+// buildings — the cabins, piers, towers, plaza and lantern paths of the valley, and the lamps that light them.
+//
+// Everything is written into the voxel grid cell by cell from a site (the middle column of the building), so a
+// building is moved by moving its site and reshaped by editing the constants of its own group. A cabin is a
+// `CabinFrame` (its corners and floor, computed once from the site) that its four phases share. The lamps are the
+// point of the buildings: each kind (the cabin's candle, the porch lantern, the cold pier lamps, the beacon, the
+// path lanterns) has its own colour, strength and shadow rule, and says in its constants why it differs from the
+// others. This file places lamps; `lampspec` describes them and the renderer consumes them.
+
+use ludax::{Vec3, VoxelGrid, LightShadowMode};
+
+use crate::world::blocks::{LumenBlock, LumenObstacle, LumenLayer, LumenObstacles, LumenLayers};
+use crate::world::lampspec::{LumenLampSpec, LumenLampBook};
+use crate::world::layout::{WORLD_SEA, PAD_Y, WgCell, WgSite, wgDist, siteValleyCabin};
+use crate::world::terrain::worldHeight;
+
+/** A cabin reaches this many cells west of its middle column, and `CABIN_REACH_EAST` east (the far wall excluded). */
+const CABIN_REACH_WEST : i32 = 5;
+const CABIN_REACH_EAST : i32 = 6;
+
+/** And this many north and south. */
+const CABIN_REACH_NORTH : i32 = 4;
+const CABIN_REACH_SOUTH : i32 = 5;
+
+/** The cobble foundation sticks out one cell and goes this deep, so the cabin never floats on a slope. */
+const CABIN_FOUNDATION : i32 = 3;
+
+/** The walls are this many rows above the floor row. */
+const CABIN_WALL_ROWS : i32 = 4;
+
+/** Two window panes on each long wall: the first starts this far from the west wall, the next one pitch later. */
+const CABIN_WINDOWS : i32 = 2;
+const CABIN_WINDOW_START : i32 = 3;
+const CABIN_WINDOW_PITCH : i32 = 4;
+
+/** A pane is this wide, starts this many rows above the floor and is `CABIN_WINDOW_HEIGHT` rows tall. */
+const CABIN_WINDOW_WIDTH : i32 = 2;
+const CABIN_WINDOW_SILL : i32 = 2;
+const CABIN_WINDOW_HEIGHT : i32 = 2;
+
+/** The window of the west wall is this many cells to each side of the middle. */
+const CABIN_WEST_PANE : i32 = 1;
+
+/** The doorway on the south wall is this tall (and two wide). */
+const CABIN_DOOR_HEIGHT : i32 = 2;
+
+/** The roof: this many courses, each one cell narrower on every side than the course below. */
+const CABIN_ROOF_COURSES : i32 = 6;
+
+/** The chimney stands this many cells east of the west wall and north of the south one, and is this tall. */
+const CABIN_CHIMNEY_X : i32 = 7;
+const CABIN_CHIMNEY_Z : i32 = 2;
+const CABIN_CHIMNEY_HEIGHT : i32 = 5;
+
+/** The lantern hangs this many rows above the floor, in the middle of the room. */
+const CABIN_LANTERN_ROW : i32 = 4;
+
+/** The porch lanterns stand this many cells to each side of the door. */
+const CABIN_PORCH_OFFSET : i32 = 3;
+
+/** A candle-warm lamp that flickers: the cabin's own light, linear colour. */
+const CABIN_LAMP_R : f32 = 1.0;
+const CABIN_LAMP_G : f32 = 0.72;
+const CABIN_LAMP_B : f32 = 0.38;
+
+/** Its strength in candela, its reach in cells, the share the flicker takes and its pace in radians per second. */
+const CABIN_LAMP_CANDELA : f32 = 16000.0;
+const CABIN_LAMP_RANGE : f32 = 15.0;
+const CABIN_LAMP_FLICKER : f32 = 0.05;
+const CABIN_LAMP_PACE : f32 = 9.0;
+
+/** The strength of its flooded fill. */
+const CABIN_LAMP_FILL : i32 = 230;
+
+/** An amber lantern on the porch, a little redder than the one inside. */
+const PORCH_LAMP_R : f32 = 1.0;
+const PORCH_LAMP_G : f32 = 0.62;
+const PORCH_LAMP_B : f32 = 0.28;
+
+/** Its strength, its reach, its flicker and its fill. It shines further than the one inside, to light the path. */
+const PORCH_LAMP_CANDELA : f32 = 11000.0;
+const PORCH_LAMP_RANGE : f32 = 19.0;
+const PORCH_LAMP_FLICKER : f32 = 0.02;
+const PORCH_LAMP_FILL : i32 = 210;
+
+/** The pier starts this many cells south of the cabin's middle and ends before this one. */
+const PIER_START : i32 = 5;
+const PIER_END : i32 = 38;
+
+/** It is three planks wide: this many cells to the west of the middle column, and this many to the east. */
+const PIER_WEST : i32 = 1;
+const PIER_EAST : i32 = 2;
+
+/** A pair of posts stands every this many cells, each with this many logs under its lantern. */
+const PIER_POST_PITCH : i32 = 5;
+const PIER_POST_LOGS : i32 = 2;
+
+/** A cold sea-green lamp: a different colour from every other lantern, so the water reads as cold. */
+const PIER_LAMP_R : f32 = 0.35;
+const PIER_LAMP_G : f32 = 0.9;
+const PIER_LAMP_B : f32 = 0.85;
+
+/** Its strength, its reach and its fill; it never flickers. */
+const PIER_LAMP_CANDELA : f32 = 7000.0;
+const PIER_LAMP_RANGE : f32 = 17.0;
+const PIER_LAMP_FILL : i32 = 170;
+
+/** A tower stands on its hill: its shaft is this many cells from the middle to the wall, and this tall. */
+const TOWER_HALF : i32 = 3;
+const TOWER_SHAFT : i32 = 22;
+
+/** The doorway on the east wall is this tall. */
+const TOWER_DOOR_HEIGHT : i32 = 3;
+
+/** A window crosses the walls on every row whose number modulo `TOWER_WINDOW_EVERY` is `TOWER_WINDOW_ROW`. */
+const TOWER_WINDOW_EVERY : i32 = 6;
+const TOWER_WINDOW_ROW : i32 = 3;
+
+/** The gallery slab at the top of the shaft reaches this far from the middle. */
+const TOWER_GALLERY_HALF : i32 = 4;
+
+/** The glass lantern room above it: cells from the middle to its wall and rows high. */
+const TOWER_ROOM_HALF : i32 = 1;
+const TOWER_ROOM_HEIGHT : i32 = 3;
+
+/** The roof: this many courses, the lowest reaching this far from the middle, narrowing by one every second row. */
+const TOWER_ROOF_COURSES : i32 = 5;
+const TOWER_ROOF_REACH : i32 = 2;
+
+/** The beacon: a warm white lamp that outshines every other. Linear colour. */
+const BEACON_LAMP_R : f32 = 1.0;
+const BEACON_LAMP_G : f32 = 0.93;
+const BEACON_LAMP_B : f32 = 0.78;
+
+/** Its strength, the radius of its glowing body, its reach, and the fill that floods the whole valley. */
+const BEACON_LAMP_CANDELA : f32 = 520000.0;
+const BEACON_LAMP_RADIUS : f32 = 0.9;
+const BEACON_LAMP_RANGE : f32 = 90.0;
+const BEACON_LAMP_FILL : i32 = 1023;
+
+/** The plaza at the foot of the pier: its paving spans this many cells west of the cabin's middle, to this many. */
+const PLAZA_WEST : i32 = 14;
+const PLAZA_EAST : i32 = 6;
+
+/** The paving starts this many cells south of the middle and ends before `PLAZA_FAR`. */
+const PLAZA_NEAR : i32 = 7;
+const PLAZA_FAR : i32 = 13;
+
+/** The mirror wall along the far edge of the paving: from this far west to this far, and this many rows high. */
+const PLAZA_MIRROR_WEST : i32 = 13;
+const PLAZA_MIRROR_EAST : i32 = 7;
+const PLAZA_MIRROR_HEIGHT : i32 = 3;
+
+/** The gold cubes: from this far west to this far, from this far south to this far, this many rows high. */
+const PLAZA_GOLD_WEST : i32 = 12;
+const PLAZA_GOLD_EAST : i32 = 10;
+const PLAZA_GOLD_NEAR : i32 = 8;
+const PLAZA_GOLD_FAR : i32 = 10;
+const PLAZA_GOLD_HEIGHT : i32 = 2;
+
+/** The column of ice: how far west and south of the cabin's middle it stands. */
+const PLAZA_ICE_WEST : i32 = 8;
+const PLAZA_ICE_SOUTH : i32 = 9;
+
+/** A lantern on a log post stands about every this many cells along the path between two sites. */
+const PATH_PITCH : f32 = 9.0;
+
+/** The path runs this many cells east of the straight line, so the pier and the cabin's side stay clear. */
+const PATH_SHIFT : i32 = 6;
+
+/** An amber lamp on the path, redder than the porch: the dusk colour of the whole valley. */
+const PATH_LAMP_R : f32 = 1.0;
+const PATH_LAMP_G : f32 = 0.58;
+const PATH_LAMP_B : f32 = 0.26;
+
+/** Its strength, reach, flicker and fill. */
+const PATH_LAMP_CANDELA : f32 = 8000.0;
+const PATH_LAMP_RANGE : f32 = 18.0;
+const PATH_LAMP_FLICKER : f32 = 0.03;
+const PATH_LAMP_FILL : i32 = 190;
+
+/** The flicker of the lantern number `i` of a path runs at this pace in radians per second plus this much per lantern. */
+const PATH_LAMP_PACE : f32 = 6.0;
+const PATH_LAMP_PACE_STEP : f32 = 0.7;
+
+// The corners of a cabin and its floor row: the numbers every phase of its construction shares.
+struct CabinFrame {
+    cx    : i32 = 0;
+    cz    : i32 = 0;
+    x0    : i32 = 0;
+    x1    : i32 = 0;
+    z0    : i32 = 0;
+    z1    : i32 = 0;
+    y0    : i32 = 0;
+    eaves : i32 = 0;
+
+    static fn at(site : WgSite) : CabinFrame {
+        return CabinFrame {
+            cx: site.x,
+            cz: site.z,
+            x0: site.x - CABIN_REACH_WEST,
+            x1: site.x + CABIN_REACH_EAST,
+            z0: site.z - CABIN_REACH_NORTH,
+            z1: site.z + CABIN_REACH_SOUTH,
+            y0: PAD_Y,
+            eaves: PAD_Y + 1 + CABIN_WALL_ROWS,
+        };
+    }
+}
+
+/** The one writer of buildings: a voxel grid, and a book of the lamps of what it builds, in building order. */
+pub class Buildings {
+    grid  : Shared<VoxelGrid>;
+    lamps : LumenLampBook;
+
+    /** A builder that writes into `grid`. */
+    constructor(grid : Shared<VoxelGrid>) {
+        self.grid = grid;
+        self.lamps = new LumenLampBook();
+    }
+
+    /** Enters every lamp built so far, in order, into `book`: the book is the caller's, so it is copied into, not kept. */
+    pub fn handOver(self, book : LumenLampBook) : void {
+        for (i of 0..self.lamps.len()) {
+            book.add(self.lamps.get(i));
+        }
+    }
+
+    // The box of cells from `from` to `to` (the far corner excluded) set to block `id`.
+    fn fill(self, from : WgCell, to : WgCell, id : i32) : void {
+        for (z of from.z..to.z) {
+            for (y of from.y..to.y) {
+                for (x of from.x..to.x) {
+                    self.grid.setBlock(x, y, z, id);
+                }
+            }
+        }
+    }
+
+    /** An 11 x 9 cabin with log corners, glass windows, a stepped roof, a lantern inside and porch lights. */
+    pub fn cabin(mut self, site : WgSite) : void {
+        let f : CabinFrame = CabinFrame::at(site);
+        self.cabinWalls(f);
+        self.cabinOpenings(f);
+        self.cabinRoof(f);
+        self.cabinFurnish(f);
+    }
+
+    // The foundation, the plank shell, the hollow inside it and a log at each of the four corners.
+    fn cabinWalls(self, f : CabinFrame) : void {
+        let foundation : WgCell = WgCell::at(f.x0 - 1, f.y0 - CABIN_FOUNDATION, f.z0 - 1);
+        self.fill(foundation, WgCell::at(f.x1 + 1, f.y0, f.z1 + 1), LumenBlock::Cobble.id());
+
+        let planks : i32 = LumenBlock::Planks.id();
+        self.fill(WgCell::at(f.x0, f.y0, f.z0), WgCell::at(f.x1, f.y0 + 1, f.z1), planks);
+        self.fill(WgCell::at(f.x0, f.y0 + 1, f.z0), WgCell::at(f.x1, f.eaves, f.z1), planks);
+
+        let hollow : WgCell = WgCell::at(f.x0 + 1, f.y0 + 1, f.z0 + 1);
+        self.fill(hollow, WgCell::at(f.x1 - 1, f.eaves, f.z1 - 1), 0);
+
+        // The logs run from the floor to the eaves.
+        let log : i32 = LumenBlock::Log.id();
+        for (y of (f.y0 + 1)..f.eaves) {
+            self.grid.setBlock(f.x0, y, f.z0, log);
+            self.grid.setBlock(f.x1 - 1, y, f.z0, log);
+            self.grid.setBlock(f.x0, y, f.z1 - 1, log);
+            self.grid.setBlock(f.x1 - 1, y, f.z1 - 1, log);
+        }
+    }
+
+    // The glass windows on the long walls and the west wall, and the doorway on the south wall.
+    fn cabinOpenings(self, f : CabinFrame) : void {
+        let glass : i32 = LumenBlock::Glass.id();
+        let sill : i32 = f.y0 + CABIN_WINDOW_SILL;
+        let lintel : i32 = sill + CABIN_WINDOW_HEIGHT;
+        for (w of 0..CABIN_WINDOWS) {
+            let px : i32 = f.x0 + CABIN_WINDOW_START + w * CABIN_WINDOW_PITCH;
+            self.fill(
+                WgCell::at(px, sill, f.z0),
+                WgCell::at(px + CABIN_WINDOW_WIDTH, lintel, f.z0 + 1),
+                glass
+            );
+            self.fill(
+                WgCell::at(px, sill, f.z1 - 1),
+                WgCell::at(px + CABIN_WINDOW_WIDTH, lintel, f.z1),
+                glass
+            );
+        }
+
+        let west : WgCell = WgCell::at(f.x0, sill, f.cz - CABIN_WEST_PANE);
+        self.fill(west, WgCell::at(f.x0 + 1, lintel, f.cz + CABIN_WEST_PANE + 1), glass);
+
+        let door : WgCell = WgCell::at(f.cx - 1, f.y0 + 1, f.z1 - 1);
+        self.fill(door, WgCell::at(f.cx + 1, f.y0 + 1 + CABIN_DOOR_HEIGHT, f.z1), 0);
+    }
+
+    // The stepped roof, narrowing to the ridge, and the chimney beside it.
+    fn cabinRoof(self, f : CabinFrame) : void {
+        let roof : i32 = LumenBlock::Roof.id();
+        for (i of 0..CABIN_ROOF_COURSES) {
+            let from : WgCell = WgCell::at(f.x0 - 1 + i, f.eaves + i, f.z0 - 1 + i);
+            self.fill(from, WgCell::at(f.x1 + 1 - i, f.eaves + 1 + i, f.z1 + 1 - i), roof);
+        }
+
+        let base : WgCell = WgCell::at(f.x0 + CABIN_CHIMNEY_X, f.eaves + 1, f.z0 + CABIN_CHIMNEY_Z);
+        let top : WgCell = WgCell::at(base.x + 2, base.y + CABIN_CHIMNEY_HEIGHT, base.z + 2);
+        self.fill(base, top, LumenBlock::Cobble.id());
+    }
+
+    // The lantern and its lamp, the bed, the chest and the porch lanterns.
+    fn cabinFurnish(mut self, f : CabinFrame) : void {
+        let row : i32 = f.y0 + CABIN_LANTERN_ROW;
+        self.grid.setBlock(f.cx, row, f.cz, LumenBlock::Lantern.id());
+        self.lamps.add(cabinLamp(WgCell::at(f.cx, row, f.cz)));
+
+        let sheet : WgCell = WgCell::at(f.x0 + 1, f.y0 + 1, f.z0 + 1);
+        self.fill(sheet, WgCell::at(f.x0 + 3, f.y0 + 2, f.z0 + 4), LumenBlock::WoolWhite.id());
+        let pillow : WgCell = WgCell::at(f.x0 + 1, f.y0 + 1, f.z0 + 4);
+        self.fill(pillow, WgCell::at(f.x0 + 3, f.y0 + 2, f.z0 + 5), LumenBlock::WoolRed.id());
+        self.grid.setBlock(f.x1 - 2, f.y0 + 1, f.z0 + 1, LumenBlock::Gold.id());
+
+        self.porchLantern(WgCell::at(f.cx - CABIN_PORCH_OFFSET, f.y0 + 1, f.z1));
+        self.porchLantern(WgCell::at(f.cx + CABIN_PORCH_OFFSET, f.y0 + 1, f.z1));
+    }
+
+    // A log post with a lantern on it and its amber lamp; `post` is the cell of the log.
+    fn porchLantern(mut self, post : WgCell) : void {
+        let lantern : WgCell = WgCell::at(post.x, post.y + 1, post.z);
+        self.grid.setBlock(post.x, post.y, post.z, LumenBlock::Log.id());
+        self.grid.setBlock(lantern.x, lantern.y, lantern.z, LumenBlock::Lantern.id());
+        self.lamps.add(porchLamp(lantern));
+    }
+
+    /** A wooden pier running south from the cabin into the lake, with a lantern on a post every few planks. */
+    pub fn pier(mut self, site : WgSite) : void {
+        let planks : i32 = LumenBlock::Planks.id();
+        let log : i32 = LumenBlock::Log.id();
+        for (z of (site.z + PIER_START)..(site.z + PIER_END)) {
+            // The pier stops where the land comes up out of the water.
+            if (worldHeight(site.x, z) >= WORLD_SEA + 1) {
+                continue;
+            }
+            let deck : WgCell = WgCell::at(site.x - PIER_WEST, WORLD_SEA, z);
+            self.fill(deck, WgCell::at(site.x + PIER_EAST, WORLD_SEA + 1, z + 1), planks);
+            if (z % PIER_POST_PITCH != 0) {
+                continue;
+            }
+
+            for (side of 0..2) {
+                let x : i32 = site.x - PIER_WEST + side * 2;
+                let top : i32 = WORLD_SEA + 1 + PIER_POST_LOGS;
+                for (y of (WORLD_SEA + 1)..top) {
+                    self.grid.setBlock(x, y, z, log);
+                }
+                self.grid.setBlock(x, top, z, LumenBlock::Lantern.id());
+                self.lamps.add(pierLamp(WgCell::at(x, top, z)));
+            }
+        }
+    }
+
+    /** A cobble tower with glass windows, a lantern room, a beacon and a stepped roof. */
+    pub fn tower(mut self, site : WgSite) : void {
+        let base : i32 = WORLD_SEA + 8;
+        self.towerShaft(site, base);
+
+        let gallery : i32 = base + TOWER_SHAFT;
+        let gx : i32 = TOWER_GALLERY_HALF;
+        self.fill(
+            WgCell::at(site.x - gx, gallery, site.z - gx),
+            WgCell::at(site.x + gx + 1, gallery + 1, site.z + gx + 1),
+            LumenBlock::Cobble.id()
+        );
+
+        let rx : i32 = TOWER_ROOM_HALF;
+        let room : i32 = gallery + 1;
+        let roof : i32 = room + TOWER_ROOM_HEIGHT;
+        self.fill(
+            WgCell::at(site.x - rx, room, site.z - rx),
+            WgCell::at(site.x + rx + 1, roof, site.z + rx + 1),
+            LumenBlock::Glass.id()
+        );
+
+        // The beacon sits in the middle of the room and reaches the whole valley, through its own glass and
+        // through the trees below it.
+        let beacon : WgCell = WgCell::at(site.x, room + 1, site.z);
+        self.grid.setBlock(beacon.x, beacon.y, beacon.z, LumenBlock::Beacon.id());
+        self.lamps.add(beaconLamp(beacon));
+
+        for (i of 0..TOWER_ROOF_COURSES) {
+            let inset : i32 = i / 2;
+            let reach : i32 = TOWER_ROOF_REACH;
+            self.fill(
+                WgCell::at(site.x - reach + inset, roof + i, site.z - reach + inset),
+                WgCell::at(site.x + reach + 1 - inset, roof + 1 + i, site.z + reach + 1 - inset),
+                LumenBlock::Roof.id()
+            );
+        }
+    }
+
+    // The hollow cobble shaft from `base` up, with a doorway on its east side and a cross of glass on some rows.
+    fn towerShaft(self, site : WgSite, base : i32) : void {
+        let half : i32 = TOWER_HALF;
+        for (y of base..(base + TOWER_SHAFT)) {
+            for (dz of -half..(half + 1)) {
+                for (dx of -half..(half + 1)) {
+                    let edge : bool = dx == -half || dx == half || dz == -half || dz == half;
+                    let door : bool = dx == half && dz == 0 && y < base + TOWER_DOOR_HEIGHT;
+                    if (!edge || door) {
+                        continue;
+                    }
+
+                    let mut id : i32 = LumenBlock::Cobble.id();
+                    if (y % TOWER_WINDOW_EVERY == TOWER_WINDOW_ROW && (dx == 0 || dz == 0)) {
+                        id = LumenBlock::Glass.id();
+                    }
+                    self.grid.setBlock(site.x + dx, y, site.z + dz, id);
+                }
+            }
+        }
+    }
+
+    /** A little plaza of polished stone at the foot of the pier: gold cubes and mirror panels for reflections. */
+    pub fn plaza(self) : void {
+        let cabin : WgSite = siteValleyCabin();
+        let x : i32 = cabin.x;
+        let z : i32 = cabin.z;
+        let y : i32 = PAD_Y - 1;
+        let paving : WgCell = WgCell::at(x - PLAZA_WEST, y, z + PLAZA_NEAR);
+        self.fill(paving, WgCell::at(x - PLAZA_EAST, y + 1, z + PLAZA_FAR), LumenBlock::Cobble.id());
+
+        let mirror : WgCell = WgCell::at(x - PLAZA_MIRROR_WEST, y + 1, z + PLAZA_FAR - 1);
+        let mirrorEnd : WgCell = WgCell::at(
+            x - PLAZA_MIRROR_EAST,
+            y + 1 + PLAZA_MIRROR_HEIGHT,
+            z + PLAZA_FAR
+        );
+        self.fill(mirror, mirrorEnd, LumenBlock::Mirror.id());
+
+        let gold : WgCell = WgCell::at(x - PLAZA_GOLD_WEST, y + 1, z + PLAZA_GOLD_NEAR);
+        let goldEnd : WgCell = WgCell::at(x - PLAZA_GOLD_EAST, y + 1 + PLAZA_GOLD_HEIGHT, z + PLAZA_GOLD_FAR);
+        self.fill(gold, goldEnd, LumenBlock::Gold.id());
+
+        let ice : i32 = LumenBlock::Ice.id();
+        self.grid.setBlock(x - PLAZA_ICE_WEST, y + 1, z + PLAZA_ICE_SOUTH, ice);
+        self.grid.setBlock(x - PLAZA_ICE_WEST, y + 2, z + PLAZA_ICE_SOUTH, ice);
+    }
+
+    /** Lanterns on log posts along the path from the column of `from` toward that of `to`, about one every nine cells. */
+    pub fn lanternPath(mut self, from : WgSite, to : WgSite) : void {
+        let length : f32 = wgDist(from.place(), to.place());
+        let count : i32 = (length / PATH_PITCH) as i32 + 2;
+        for (i of 0..count) {
+            let t : f32 = (i as f32) / ((count - 1) as f32);
+            let x : i32 = (from.x as f32 + ((to.x - from.x) as f32) * t) as i32 + PATH_SHIFT;
+            let z : i32 = (from.z as f32 + ((to.z - from.z) as f32) * t) as i32;
+            let h : i32 = worldHeight(x, z);
+            if (h <= WORLD_SEA + 1 || self.grid.blockAt(x, h + 1, z) != 0) {
+                continue;
+            }
+
+            self.grid.setBlock(x, h + 1, z, LumenBlock::Log.id());
+            self.grid.setBlock(x, h + 2, z, LumenBlock::Lantern.id());
+            self.lamps.add(pathLamp(WgCell::at(x, h + 2, z), i));
+        }
+    }
+}
+
+// The cabin's candle: it lights the house and the ground but never the foliage outside.
+fn cabinLamp(at : WgCell) : LumenLampSpec {
+    return LumenLampSpec {
+        x: at.x,
+        y: at.y,
+        z: at.z,
+        colour: Vec3 { x: CABIN_LAMP_R, y: CABIN_LAMP_G, z: CABIN_LAMP_B },
+        candela: CABIN_LAMP_CANDELA,
+        range: CABIN_LAMP_RANGE,
+        flicker: CABIN_LAMP_FLICKER,
+        pace: CABIN_LAMP_PACE,
+        fill: CABIN_LAMP_FILL,
+        exclude: LumenLayers::only(LumenLayer::Foliage),
+    };
+}
+
+// An amber porch lantern: it shines through the leaves of the trees around the cabin.
+fn porchLamp(at : WgCell) : LumenLampSpec {
+    return LumenLampSpec {
+        x: at.x,
+        y: at.y,
+        z: at.z,
+        colour: Vec3 { x: PORCH_LAMP_R, y: PORCH_LAMP_G, z: PORCH_LAMP_B },
+        candela: PORCH_LAMP_CANDELA,
+        range: PORCH_LAMP_RANGE,
+        flicker: PORCH_LAMP_FLICKER,
+        fill: PORCH_LAMP_FILL,
+        pass: LumenObstacles::only(LumenObstacle::Foliage),
+    };
+}
+
+fn pierLamp(at : WgCell) : LumenLampSpec {
+    return LumenLampSpec {
+        x: at.x,
+        y: at.y,
+        z: at.z,
+        colour: Vec3 { x: PIER_LAMP_R, y: PIER_LAMP_G, z: PIER_LAMP_B },
+        candela: PIER_LAMP_CANDELA,
+        range: PIER_LAMP_RANGE,
+        fill: PIER_LAMP_FILL,
+    };
+}
+
+// The beacon reaches the whole valley, through its own glass and through the trees below it.
+fn beaconLamp(at : WgCell) : LumenLampSpec {
+    return LumenLampSpec {
+        x: at.x,
+        y: at.y,
+        z: at.z,
+        colour: Vec3 { x: BEACON_LAMP_R, y: BEACON_LAMP_G, z: BEACON_LAMP_B },
+        candela: BEACON_LAMP_CANDELA,
+        radius: BEACON_LAMP_RADIUS,
+        range: BEACON_LAMP_RANGE,
+        fill: BEACON_LAMP_FILL,
+        pass: LumenObstacles::only(LumenObstacle::Glass).with(LumenObstacle::Foliage),
+    };
+}
+
+// The lantern number `i` of a path; its shadows are traced, and its flicker is out of step with its neighbours'.
+fn pathLamp(at : WgCell, i : i32) : LumenLampSpec {
+    return LumenLampSpec {
+        x: at.x,
+        y: at.y,
+        z: at.z,
+        colour: Vec3 { x: PATH_LAMP_R, y: PATH_LAMP_G, z: PATH_LAMP_B },
+        candela: PATH_LAMP_CANDELA,
+        range: PATH_LAMP_RANGE,
+        flicker: PATH_LAMP_FLICKER,
+        pace: PATH_LAMP_PACE + (i as f32) * PATH_LAMP_PACE_STEP,
+        fill: PATH_LAMP_FILL,
+        shadows: LightShadowMode::Ray,
+    };
+}

@@ -1,0 +1,639 @@
+// frame — one picture: a pool of workers traces it, and the pictures of successive frames are accumulated.
+//
+// Every frame, still or moving, traces one stochastic sample per pixel at full resolution: a sub-pixel jitter,
+// a point on the sun's disc, a lamp, a bounce direction, fog samples, each from the pixel's own Kronecker
+// sequence (see `LumenRng`). One sample is noisy; the frames that follow are what make the picture good:
+//
+//   Trace     the sample, plus what the pixel hit: its albedo, its position and the plane it lies in
+//   Temporal  the pixel's light (the sample divided by the albedo) is blended with the light the same surface
+//             point had last frame, found by projecting its position through the previous camera. History is
+//             accepted only from a pixel on the same plane, so light never leaks across an edge; a special
+//             surface (sky, water, mirror, edge) shares one id with all of its kind, so its history is pinned
+//             to the pixels nearest where the surface really fell. A still camera reads the same pixel and
+//             blends exactly; a moving one reads the four nearest.
+//   Filter    three passes of a 3 x 3 edge-avoiding filter (strides 1, 2, 4) smooth the pixels that have few
+//             samples so far, weighted by plane, position and by how much the light's own variance allows
+//   Resolve   the light times the albedo again: texture detail never passes through a filter
+//
+// Mirrors, metals, glowing blocks, water and sky are not filtered across pixels (their light is not smooth over
+// a plane), only accumulated in time. The result is the picture `post` shows. Every stage is a function of the
+// buffers of the stage before it, row by row, so which thread runs which row cannot change a bit of the result.
+
+use ludax::{
+    LumenCamera, FilterPlane, LumenFilter, ShaftPlane, LumenShaft, pixelAt, pixelPut, pixelLuma, LumenPost,
+    LumenPass, LumenRng, lnFloor
+};
+use ludax::{Vec3, JobPool, RangeKernel, min, clamp};
+
+use crate::render::env::LumenEnv;
+use crate::render::worker::{LumenWorker, WORKER_SKY};
+
+/** The largest radiance one sample may add (the sun's disc is far brighter; bloom carries the rest). */
+const FRAME_CLAMP : f32 = 600.0;
+
+/** The category of a pixel at an edge between two surfaces: filtered by nothing, accumulated as radiance. */
+const FRAME_EDGE : i32 = -4;
+
+/** An edge pixel's borrowed history is pulled down to this multiple of what the pixel shows, plus the floor. */
+const FRAME_EDGE_CEILING : f32 = 2.0;
+const FRAME_EDGE_CEILING_FLOOR : f32 = 0.1;
+
+/**
+ * A sample brighter than this multiple of the history's mean (plus the floor) is a firefly, once the history
+ * holds `FRAME_FIREFLY_AFTER` samples.
+ */
+const FRAME_FIREFLY : f32 = 6.0;
+const FRAME_FIREFLY_FLOOR : f32 = 0.25;
+const FRAME_FIREFLY_AFTER : f32 = 3.0;
+
+/** The most diffuse light a surface sample may carry into the history; far above it is a stray ray. */
+const FRAME_SURFACE_MAX : f32 = 24.0;
+
+/**
+ * How tightly the history of a special surface (sky, water, mirrors, edges) is pinned to its own pixel. Their
+ * light is the view's, not the surface's, and every one of a kind shares one id, so history from a pixel away
+ * is another reflection or another silhouette edge: past a pixel of drift it is mostly turned away.
+ */
+const FRAME_SPECIAL_TIGHT : f32 = 4.0;
+
+/** A weight this small is no weight at all: nothing in the history landed on this pixel. */
+const FRAME_EPS : f32 = 0.0001;
+
+/** The id a history set holds for a pixel nothing has been written to yet. */
+const FRAME_NO_SURFACE : i32 = -9;
+
+/** What the pool is working on. */
+pub enum LumenStage : i8 {
+    /** One stochastic sample per pixel. */
+    Trace,
+    /** Blend the sample with the reprojected history. */
+    Temporal,
+    /** One pass of the spatial filter. */
+    Filter,
+    /** Put the albedo back. */
+    Resolve,
+    /** Add the sun's light shafts, a radial scatter of the sky's silhouette. */
+    Rays,
+    /** A pass of `post`. */
+    Display,
+}
+
+/** What a pixel's history holds: its light, the albedo that was divided out, and the moments bounding it. */
+struct FrameHistory {
+    light  : Vec3;
+    albedo : Vec3;
+    mean   : f32;
+    square : f32;
+    count  : f32;
+    weight : f32;
+
+    // True when anything landed on this history: its weight is more than rounding noise.
+    pub(crate) fn usable(self) : bool {
+        return self.weight > FRAME_EPS;
+    }
+
+    // Adds `other` counted `k` times, and the weight with it: the sum a bilinear lookup builds from four pixels.
+    pub(crate) fn addScaled(mut self, other : FrameHistory, k : f32) : void {
+        self.light = self.light.plus(other.light.scale(k));
+        self.albedo = self.albedo.plus(other.albedo.scale(k));
+        self.mean = self.mean + other.mean * k;
+        self.square = self.square + other.square * k;
+        self.count = self.count + other.count * k;
+        self.weight = self.weight + k;
+    }
+
+    // Divides the sums by their total weight, which makes them a mean. The weight itself is left as it is.
+    pub(crate) fn normalize(mut self) : void {
+        let inv : f32 = (1.0 as f32) / self.weight;
+        self.light = self.light.scale(inv);
+        self.albedo = self.albedo.scale(inv);
+        self.mean = self.mean * inv;
+        self.square = self.square * inv;
+        self.count = self.count * inv;
+    }
+
+    // The first sample of a pixel with no history: its light is all there is.
+    pub(crate) static fn first(light : Vec3, albedo : Vec3) : FrameHistory {
+        let lum : f32 = pixelLuma(light);
+        return FrameHistory {
+            light: light,
+            albedo: albedo,
+            mean: lum,
+            square: lum * lum,
+            count: 1.0,
+            weight: 1.0,
+        };
+    }
+
+    // A history with nothing in it, which its weight says.
+    static fn empty() : FrameHistory {
+        return FrameHistory {
+            light: Vec3::zero(),
+            albedo: Vec3::zero(),
+            mean: 0.0,
+            square: 0.0,
+            count: 0.0,
+            weight: 0.0,
+        };
+    }
+}
+
+/** The five buffers of one history set, read or written as a whole. */
+struct FrameSet {
+    light    : f32[];
+    moments  : f32[];
+    counts   : f32[];
+    surfaces : i32[];
+    albedo   : f32[];
+
+    // A set for `n` pixels that holds no light and no surface, so nothing can be borrowed from it.
+    static fn make(n : i64) : FrameSet {
+        let mut set : FrameSet = FrameSet {
+            light: new f32[n * 3],
+            moments: new f32[n * 2],
+            counts: new f32[n],
+            surfaces: new i32[n],
+            albedo: new f32[n * 3],
+        };
+        for (i of 0..(n * 3)) {
+            set.light[i] = 0.0;
+            set.albedo[i] = 1.0;
+        }
+        for (i of 0..(n * 2)) {
+            set.moments[i] = 0.0;
+        }
+        for (i of 0..n) {
+            set.counts[i] = 0.0;
+            set.surfaces[i] = FRAME_NO_SURFACE;
+        }
+        return set;
+    }
+
+    // Stores a blended pixel and the surface it belongs to.
+    fn put(mut self, i : i64, h : FrameHistory, s : i32) : void {
+        pixelPut(self.albedo, i, h.albedo);
+        pixelPut(self.light, i, h.light);
+        self.moments[i * 2] = h.mean;
+        self.moments[i * 2 + 1] = h.square;
+        self.counts[i] = h.count;
+        self.surfaces[i] = s;
+    }
+
+    // What the set holds for pixel `i`, as a history of full weight.
+    fn at(self, i : i64) : FrameHistory {
+        return FrameHistory {
+            light: pixelAt(self.light, i),
+            albedo: pixelAt(self.albedo, i),
+            mean: self.moments[i * 2],
+            square: self.moments[i * 2 + 1],
+            count: self.counts[i],
+            weight: 1.0,
+        };
+    }
+}
+
+/** The accumulating picture and the kernel that draws, filters and displays it. */
+pub class LumenFrame : RangeKernel {
+    env : Shared<LumenEnv>;
+
+    /** The camera of the frame being drawn. */
+    pub cam : LumenCamera;
+
+    /** The camera of the frame before, which the history was drawn from. */
+    pub prev : LumenCamera;
+
+    /** The picture's width in pixels. */
+    pub w : i32;
+
+    /** The picture's height in pixels. */
+    pub h : i32;
+
+    /** The finished radiance picture, what `post` displays. */
+    pub hdr : f32[];
+
+    // The raw sample of the frame being drawn, and the albedo it was divided by. Both are dead once the
+    // temporal stage has blended them into the history, so the spatial filter borrows them as its two scratch
+    // pictures instead of two more being kept around all frame.
+    cur : f32[];
+    alb : f32[];
+
+    pos : f32[];
+    sid : i32[];
+
+    // The light shafts' share of each pixel, averaged over frames: one march is jittered, the frames settle it.
+    ray : f32[];
+
+    // The two history sets: one holds last frame's light while the temporal stage fills the other.
+    even : FrameSet;
+    odd  : FrameSet;
+
+    /** The display stage that turns the picture into pixels. */
+    pub post : LumenPost;
+
+    /** What `runRange` does next. */
+    pub stage : LumenStage = LumenStage::Trace;
+
+    /** Which display pass, when `stage` is `Display`. */
+    pub pass : LumenPass = LumenPass::Bright;
+
+    /** Which filter pass, when `stage` is `Filter`. */
+    pub round : i32 = 0;
+
+    /** Which of the two history sets holds last frame's light. */
+    pub parity : i32 = 0;
+
+    /** The number of the frame: it drives the random streams. */
+    pub index : i32 = 0;
+
+    /** Frames since anything changed; the picture rests when this reaches the sample limit. */
+    pub still : i32 = 0;
+
+    /** True when there is no history to use (the first frame, or a hard change). */
+    pub fresh : bool = true;
+
+    /** True when this frame's camera is last frame's, so a pixel's history is the same pixel. */
+    pub sameCam : bool = false;
+
+    /** The longest history a pixel may carry into this frame: short while things change, long when still. */
+    pub limit : f32 = 8.0;
+
+    /** Where the sun is in the picture, in pixels (x, y), and whether it is in front of the camera (z > 0). */
+    pub sunPixel : Vec3 = Vec3 { x: 0.0, y: 0.0, z: -1.0 };
+
+    /** What a fully lit shaft adds, radiance per channel; zero turns the pass off. */
+    pub rayGain : Vec3 = Vec3 { x: 0.0, y: 0.0, z: 0.0 };
+
+    /** How much of its pixel a sample's position may wander over, 0 to 1. */
+    pub jitter : f32 = 1.0;
+
+    /** True: the spatial filter runs. */
+    pub denoise : bool = true;
+
+    /** A `w` by `h` picture of `env`, shown at `scale` times that size. */
+    constructor(env : Shared<LumenEnv>, w : i32, h : i32, scale : i32) {
+        self.post = new LumenPost(w, h, scale);
+        self.env = env;
+        self.w = w;
+        self.h = h;
+        self.cam = new LumenCamera(0.0, 0.0, 0.0, 0.0, 0.0, 1.0);
+        self.prev = new LumenCamera(0.0, 0.0, 0.0, 0.0, 0.0, 1.0);
+        let n : i64 = (w as i64) * h;
+        self.hdr = new f32[n * 3];
+        self.cur = new f32[n * 3];
+        self.alb = new f32[n * 3];
+        self.pos = new f32[n * 3];
+        self.sid = new i32[n];
+        self.ray = new f32[n];
+        self.even = FrameSet::make(n);
+        self.odd = FrameSet::make(n);
+        for (i of 0..(n * 3)) {
+            self.hdr[i] = 0.0;
+        }
+    }
+
+    /** Does rows `begin` up to `end` of whatever `stage` names. */
+    pub fn runRange(mut self, begin : i32, end : i32) : void {
+        match self.stage {
+            LumenStage::Trace => self.trace(begin, end),
+            LumenStage::Temporal => self.temporal(begin, end),
+            LumenStage::Filter => self.filter(begin, end),
+            LumenStage::Resolve => self.resolve(begin, end),
+            LumenStage::Rays => self.shafts(begin, end),
+            LumenStage::Display => self.post.rows(self.pass, self.hdr, begin, end),
+        }
+    }
+
+    /** How many rows the stage has. */
+    pub fn rows(self) : i32 {
+        return match self.stage {
+            LumenStage::Display => self.post.rowsOf(self.pass),
+            _ => self.h,
+        };
+    }
+
+    // The offset of pixel (x, y) in a picture buffer.
+    fn at(self, x : i32, y : i32) : i64 {
+        return (y * self.w + x) as i64;
+    }
+
+    // Draws rows `begin` up to `end`: one sample per pixel, and what it hit. The chunk makes its tracer and its
+    // random stream once and reuses them for every pixel of its rows; the tracer's lamp scratch is sized by the
+    // lamps themselves, so no lamp that can light a pixel is dropped for lack of room.
+    fn trace(mut self, begin : i32, end : i32) : void {
+        let mut worker : LumenWorker = new LumenWorker(self.env.lamps.nearMax());
+        let rng : LumenRng = LumenRng {};
+        let eye : Vec3 = self.cam.eye();
+        worker.open = self.env.eyeOpen(eye);
+        worker.fwd = self.cam.forward();
+        worker.pixel = self.cam.fov / (self.h as f32);
+        // The reach a ray needs is the world's own diagonal, not a number that a grown world outgrows.
+        worker.far = self.env.scene.diagonal() + (1.0 as f32);
+        let invW : f32 = (1.0 as f32) / (self.w as f32);
+        let invH : f32 = (1.0 as f32) / (self.h as f32);
+        for (y of begin..end) {
+            for (x of 0..self.w) {
+                rng.seed(x, y, self.index);
+                let jx : f32 = (0.5 as f32) + (rng.next() - (0.5 as f32)) * self.jitter;
+                let jy : f32 = (0.5 as f32) + (rng.next() - (0.5 as f32)) * self.jitter;
+                let d : Vec3 = self.cam.ray(((x as f32) + jx) * invW, ((y as f32) + jy) * invH);
+                let mut c : Vec3 = worker.radiance(self.env, eye, d, 0, true);
+                if (!c.isFinite()) {
+                    c = Vec3::zero();
+                }
+                let i : i64 = self.at(x, y);
+                pixelPut(self.cur, i, frameClamp(c));
+                pixelPut(self.alb, i, worker.gAlb);
+                pixelPut(self.pos, i, worker.gPos);
+                self.sid[i] = worker.gSid;
+            }
+        }
+    }
+
+    // Blends rows `begin` up to `end` of the sample with the history: from the set `parity` into the other.
+    fn temporal(self, begin : i32, end : i32) : void {
+        let here : FrameSet = self.historySet(self.parity);
+        let next : FrameSet = self.historySet(1 - self.parity);
+        for (y of begin..end) {
+            for (x of 0..self.w) {
+                self.blendPixel(x, y, here, next);
+            }
+        }
+    }
+
+    // The five buffers of history set `parity`, 0 or 1.
+    fn historySet(self, parity : i32) : FrameSet {
+        if (parity == 0) {
+            return self.even;
+        }
+        return self.odd;
+    }
+
+    // What the history set `here` holds for pixel `i` of surface `s`: no weight when there is none to use.
+    fn history(self, here : FrameSet, i : i64, s : i32) : FrameHistory {
+        let h : FrameHistory = FrameHistory::empty();
+
+        if (self.fresh) {
+            return h;
+        }
+        if (self.sameCam) {
+            if (here.surfaces[i] == s) {
+                return here.at(i);
+            }
+            return h;
+        }
+
+        let q : Vec3 = self.prev.project(pixelAt(self.pos, i));
+        if (q.z <= 0.0) {
+            return h;
+        }
+
+        return self.reproject(here, q.x * (self.w as f32), q.y * (self.h as f32), s);
+    }
+
+    // The history at the point (`px`, `py`) pixels of the previous frame, blended bilinearly from the four
+    // pixels around it that belong to surface `s`.
+    fn reproject(self, here : FrameSet, px : f32, py : f32, s : i32) : FrameHistory {
+        let h : FrameHistory = FrameHistory::empty();
+        let fx : f32 = px - (0.5 as f32);
+        let fy : f32 = py - (0.5 as f32);
+        let x0 : i32 = lnFloor(fx);
+        let y0 : i32 = lnFloor(fy);
+        let tx : f32 = fx - x0 as f32;
+        let ty : f32 = fy - y0 as f32;
+
+        // The four pixels around the projected point, each weighted by how close it is on the two axes.
+        for (k of 0..4) {
+            let xi : i32 = x0 + (k & 1);
+            let yi : i32 = y0 + (k >> 1);
+            if (xi < 0 || xi >= self.w || yi < 0 || yi >= self.h) {
+                continue;
+            }
+            let j : i64 = self.at(xi, yi);
+            if (here.surfaces[j] != s) {
+                continue;
+            }
+
+            let mut wgt : f32 = frameLinear(tx, k & 1) * frameLinear(ty, k >> 1);
+
+            // A special surface keeps its history close to home: its light is the view's, and one shared id
+            // covers every water, mirror, sky and edge pixel, so the drift across the reprojection is the only
+            // identity it has. The closer the neighbour sits to where the surface really fell, the more counts.
+            if (s < 0) {
+                let dpx : f32 = fx - (xi as f32);
+                let dpy : f32 = fy - (yi as f32);
+                wgt = wgt / ((1.0 as f32) + FRAME_SPECIAL_TIGHT * (dpx * dpx + dpy * dpy));
+            }
+
+            h.addScaled(here.at(j), wgt);
+        }
+
+        if (h.usable()) {
+            h.normalize();
+        }
+        return h;
+    }
+
+    // Blends one pixel of the sample with its history into the set `next`.
+    fn blendPixel(self, x : i32, y : i32, here : FrameSet, next : FrameSet) : void {
+        let i : i64 = self.at(x, y);
+        let mut s : i32 = self.sid[i];
+        let mut albedo : Vec3 = pixelAt(self.alb, i);
+
+        // A pixel with a different surface next to it is an edge: the jittered samples of the frames see now
+        // one side and now the other, so its history is the radiance of the pixel as a whole, not the light of
+        // one surface. That is what anti-aliases a silhouette.
+        if (self.isEdge(x, y, s)) {
+            s = FRAME_EDGE;
+            albedo = Vec3::splat(1.0);
+        }
+
+        // The worker never reports an albedo below its floor, so the division cannot meet a zero.
+        let mut light : Vec3 = frameDivide(pixelAt(self.cur, i), albedo);
+        if (s >= 0) {
+            light = light.componentMin(Vec3::splat(FRAME_SURFACE_MAX));
+        }
+
+        let hist : FrameHistory = self.history(here, i, s);
+        if (!hist.usable()) {
+            next.put(i, FrameHistory::first(light, albedo), s);
+            return;
+        }
+
+        let mut carried : FrameHistory = hist;
+        if (s == FRAME_EDGE) {
+            carried = frameTameEdge(hist, pixelLuma(light));
+        }
+        next.put(i, frameFold(carried, light, albedo, self.limit), s);
+    }
+
+    // True when a neighbour of pixel (x, y) lies on another plane or another kind of thing than `s`.
+    fn isEdge(self, x : i32, y : i32, s : i32) : bool {
+        if (x > 0 && self.sid[self.at(x - 1, y)] != s) {
+            return true;
+        }
+        if (x < self.w - 1 && self.sid[self.at(x + 1, y)] != s) {
+            return true;
+        }
+        if (y > 0 && self.sid[self.at(x, y - 1)] != s) {
+            return true;
+        }
+        return y < self.h - 1 && self.sid[self.at(x, y + 1)] != s;
+    }
+
+    // One round of the spatial filter over rows `begin` up to `end`, reading the set the temporal stage wrote.
+    fn filter(mut self, begin : i32, end : i32) : void {
+        let set : FrameSet = self.historySet(1 - self.parity);
+        let plane : FilterPlane = FilterPlane {
+            w: self.w,
+            h: self.h,
+            round: self.round,
+            eye: self.cam.eye(),
+            pos: self.pos,
+            blended: set.light,
+            cur: self.cur,
+            alb: self.alb,
+            mom: set.moments,
+            cnt: set.counts,
+            sids: set.surfaces,
+        };
+
+        // Round 0 writes cur, round 1 writes alb, round 2 writes cur again; the last one is what resolve reads.
+        // Trace overwrites both with a fresh sample before they are read as scratch.
+        let mut target : f32[] = self.cur;
+        if (self.round == 1) {
+            target = self.alb;
+        }
+        for (y of begin..end) {
+            for (x of 0..self.w) {
+                pixelPut(target, self.at(x, y), LumenFilter::pixel(plane, x, y));
+            }
+        }
+    }
+
+    // The light times the albedo, into the picture `post` shows. The albedo is the accumulated one, so the
+    // texture is anti-aliased too; edge pixels keep their light as it is, since their history is radiance already.
+    fn resolve(mut self, begin : i32, end : i32) : void {
+        let set : FrameSet = self.historySet(1 - self.parity);
+        let mut light : f32[] = set.light;
+        if (self.denoise) {
+            light = self.cur;
+        }
+        for (y of begin..end) {
+            for (x of 0..self.w) {
+                let i : i64 = self.at(x, y);
+                let c : Vec3 = pixelAt(light, i);
+                if (set.surfaces[i] == FRAME_EDGE) {
+                    pixelPut(self.hdr, i, c);
+                } else {
+                    pixelPut(self.hdr, i, c.times(pixelAt(set.albedo, i)));
+                }
+            }
+        }
+    }
+
+    // Light shafts: each pixel marches toward the sun's place in the picture and sums the sky it passes over (see
+    // `LumenShaft`). One march is jittered per frame; the frames average it, and what a pixel adds is its share of
+    // the averaged shaft times how much air lies before its surface. Zero when the sun is behind the camera or
+    // below the horizon.
+    fn shafts(mut self, begin : i32, end : i32) : void {
+        let on : bool = self.sunPixel.z > 0.0 && self.rayGain.maxComponent() > 0.0;
+        let plane : ShaftPlane = ShaftPlane {
+            w: self.w,
+            h: self.h,
+            sids: self.sid,
+            sky: WORKER_SKY,
+            pos: self.pos,
+            eye: self.cam.eye(),
+            sun: self.sunPixel,
+            frame: self.index,
+        };
+        let keep : f32 = LumenShaft::keep(self.fresh, self.sameCam);
+
+        for (y of begin..end) {
+            for (x of 0..self.w) {
+                let i : i64 = self.at(x, y);
+                if (!on) {
+                    self.ray[i] = 0.0;
+                    continue;
+                }
+
+                let marched : f32 = LumenShaft::march(plane, x, y);
+                self.ray[i] = self.ray[i] * keep + marched * ((1.0 as f32) - keep);
+                let shaft : f32 = self.ray[i] * LumenShaft::air(plane, i);
+                pixelPut(self.hdr, i, pixelAt(self.hdr, i).plus(self.rayGain.scale(shaft)));
+            }
+        }
+    }
+
+    /** Ends a frame: the set just written becomes the history, and the camera becomes the previous one. */
+    pub fn finish(mut self) : void {
+        self.parity = 1 - self.parity;
+        self.index = self.index + 1;
+        self.prev.copyFrom(self.cam);
+        self.fresh = false;
+    }
+}
+
+// Pulls an edge pixel's borrowed history down to a small multiple of what the pixel itself shows. An edge pixel
+// may borrow radiance from any silhouette near its reprojection, which is what keeps a moving edge smooth, but a
+// bright silhouette must not ghost onto a dark one: similar edges blend untouched, a lantern's glow stays at its
+// lantern.
+fn frameTameEdge(hist : FrameHistory, lum : f32) : FrameHistory {
+    let mut out : FrameHistory = hist;
+    let hl : f32 = pixelLuma(hist.light);
+    let ceiling : f32 = FRAME_EDGE_CEILING * lum + FRAME_EDGE_CEILING_FLOOR;
+    if (hl > ceiling && hl > 0.0) {
+        let k : f32 = ceiling / hl;
+        out.light = hist.light.scale(k);
+        out.mean = hist.mean * k;
+        out.square = hist.square * k * k;
+    }
+    return out;
+}
+
+// Folds one sample into a history that has something in it: a running mean whose weight is one over the count
+// the history has earned, capped at `limit`. A sample far brighter than anything the history has seen is a
+// firefly and is brought down to a few times the history's mean before it is blended in.
+fn frameFold(hist : FrameHistory, light : Vec3, albedo : Vec3, limit : f32) : FrameHistory {
+    let lum : f32 = pixelLuma(light);
+    let mut l : Vec3 = light;
+    let ceiling : f32 = FRAME_FIREFLY * (hist.mean + FRAME_FIREFLY_FLOOR);
+    if (hist.count >= FRAME_FIREFLY_AFTER && lum > ceiling) {
+        l = light.scale(ceiling / lum);
+    }
+
+    let count : f32 = min(hist.count, limit) + (1.0 as f32);
+    let alpha : f32 = (1.0 as f32) / count;
+    let ll : f32 = pixelLuma(l);
+    return FrameHistory {
+        light: hist.light.plus(l.minus(hist.light).scale(alpha)),
+        albedo: hist.albedo.plus(albedo.minus(hist.albedo).scale(alpha)),
+        mean: hist.mean + (ll - hist.mean) * alpha,
+        square: hist.square + (ll * ll - hist.square) * alpha,
+        count: count,
+        weight: 1.0,
+    };
+}
+
+// A sample with every channel held to 0..FRAME_CLAMP.
+fn frameClamp(c : Vec3) : Vec3 {
+    return Vec3 {
+        x: clamp(c.x, 0.0, FRAME_CLAMP),
+        y: clamp(c.y, 0.0, FRAME_CLAMP),
+        z: clamp(c.z, 0.0, FRAME_CLAMP),
+    };
+}
+
+// The light `c` over the albedo `a`, channel by channel.
+fn frameDivide(c : Vec3, a : Vec3) : Vec3 {
+    return Vec3 { x: c.x / a.x, y: c.y / a.y, z: c.z / a.z };
+}
+
+// The weight of the near (`side` 0) or far (`side` 1) pixel of a pair when the point lies `t` of the way
+// from the near one to the far one.
+fn frameLinear(t : f32, side : i32) : f32 {
+    if (side == 1) {
+        return t;
+    }
+    return (1.0 as f32) - t;
+}

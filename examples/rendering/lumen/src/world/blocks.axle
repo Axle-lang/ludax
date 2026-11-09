@@ -1,0 +1,453 @@
+// blocks — what every block is: its light behaviour for the flood and its material for the shader.
+//
+// The flood (ludax `BlockLightTable`) wants opacity, emission and a bounce albedo per id; the shader wants a
+// glTF-style material per id and a kind that tells the tracer how to treat the block. This file defines both
+// from one list of blocks so they cannot disagree. Colours are written as sRGB bytes, as an artist would, and
+// stored in linear light.
+//
+// The world is written in `LumenBlock`s, never in numbers: the grid stores an id, and `LumenBlock::id` is the one
+// place that turns a block into it. The same goes for obstacle classes and surface layers, which a lamp lists
+// as sets (`LumenObstacles`, `LumenLayers`) instead of OR-ing numbers.
+
+use ludax::{BlockLight, BlockLightTable, Vec3, lightSrgbDecode8};
+
+/**
+ * Every block of the world. The number is the id the grid and the flat scene store: an unsigned byte, so the
+ * schema holds up to 255 blocks before it must grow, and a new block is one entry here plus its lines in the
+ * palette, the light table and — if it looks like something — a texture.
+ */
+pub enum LumenBlock : u8 {
+    /** Nothing. */
+    Air = 0,
+    /** The mountain's grey rock. */
+    Stone = 1,
+    /** The grass cover of the valley floor. */
+    Grass = 2,
+    /** The soil under the grass. */
+    Dirt = 3,
+    /** The shore and the lake bed. */
+    Sand = 4,
+    /** The lake: tinted and refracting. */
+    Water = 5,
+    /** A tree trunk. */
+    Log = 6,
+    /** Tree canopy with texel-sized holes. */
+    Leaves = 7,
+    /** The cabin's boards. */
+    Planks = 8,
+    /** Clear panes with a wooden frame. */
+    Glass = 9,
+    /** A warm glowing lamp block. */
+    Lantern = 10,
+    /** Molten rock, animated and glowing. */
+    Lava = 11,
+    /** A cold blue crystal, animated and glowing. */
+    CrystalBlue = 12,
+    /** A warm pink crystal, animated and glowing. */
+    CrystalPink = 13,
+    /** Snow on the high ground. */
+    Snow = 14,
+    /** Rough paving. */
+    Cobble = 15,
+    /** The cabin's and tower's shingles. */
+    Roof = 16,
+    /** A polished metal block for reflections. */
+    Gold = 17,
+    /** Clear, tinted ice. */
+    Ice = 18,
+    /** White wool. */
+    WoolWhite = 19,
+    /** Red wool. */
+    WoolRed = 20,
+    /** A mirror-smooth metal face. */
+    Mirror = 21,
+    /** The tower's beacon, the brightest emitter. */
+    Beacon = 22,
+    /** A pale tree trunk. */
+    Birch = 23,
+
+    /** The id the grid stores for this block. */
+    pub fn id(self) : i32 {
+        return self as i32;
+    }
+}
+
+/** How many blocks there are: the size of every per-block table. */
+pub const BLOCK_COUNT : i32 = 24;
+
+/** The roughness of a block nobody described: matte, like rock. */
+const BLOCK_ROUGH_DEFAULT : f32 = 0.9;
+
+/** The albedo of a block nobody described: mid grey in every channel, linear. */
+const BLOCK_ALBEDO_DEFAULT : f32 = 0.5;
+
+/** A packed colour is 0xRRGGBB: red sits this many bits up, green this many, and each channel is eight bits. */
+const BLOCK_RED_SHIFT : i32 = 16;
+const BLOCK_GREEN_SHIFT : i32 = 8;
+const BLOCK_CHANNEL_MASK : i32 = 255;
+
+/** Every surface layer as a mask: what a lamp lights unless it excludes some. */
+pub const LUMEN_ALL_LAYERS : u32 = 4294967295;
+
+/** How the tracer treats a block. */
+pub enum LumenKind : i8 {
+    /** Stops every ray. */
+    Opaque = 0,
+    /** Tinted and refracting: rays split at its surface. */
+    Water = 1,
+    /** Clear except for its frame; rays pass and take its tint. */
+    Glass = 2,
+    /** Decided per texel: leaves have holes. */
+    Cutout = 3,
+
+    /** The number the palette stores. */
+    pub fn code(self) : i32 {
+        return self as i32;
+    }
+
+    /** The kind stored as `n`; opaque for anything else. */
+    pub static fn fromCode(n : i32) : LumenKind {
+        return match n {
+            1 => LumenKind::Water,
+            2 => LumenKind::Glass,
+            3 => LumenKind::Cutout,
+            _ => LumenKind::Opaque,
+        };
+    }
+}
+
+/**
+ * The obstacle classes of the world: what a block is, for the lights that let some kinds of obstacle through.
+ * A block has exactly one; a lamp lists the classes it shines through in a `LumenObstacles`.
+ */
+pub enum LumenObstacle : u8 {
+    /** Ground, stone and buildings. */
+    Terrain = 1,
+    /** Leaves. */
+    Foliage = 2,
+    /** Glass and ice. */
+    Glass = 4,
+    /** Water. */
+    Water = 8,
+
+    /** The bit this class has in a mask. */
+    pub fn bit(self) : i32 {
+        return self as i32;
+    }
+}
+
+/** The surface layers lamps can include or exclude: what a lit surface is, for the lights that pick targets. */
+pub enum LumenLayer : u32 {
+    /** Ground, stone, snow, sand. */
+    Terrain = 1,
+    /** Leaves. */
+    Foliage = 2,
+    /** Planks, shingles, cobble and glass of buildings. */
+    Building = 4,
+    /** Water. */
+    Liquid = 8,
+    /** Lanterns, gold, mirrors and other small things. */
+    Props = 16,
+
+    /** The bit this layer has in a mask. */
+    pub fn bit(self) : u32 {
+        return self as u32;
+    }
+}
+
+/** A set of obstacle classes. */
+pub struct LumenObstacles {
+    /** The classes as the flood and the ray walkers take them: one bit each. */
+    pub bits : i32 = 0;
+
+    /** The empty set. */
+    pub static fn none() : LumenObstacles {
+        return LumenObstacles { bits: 0 };
+    }
+
+    /** The set of one class. */
+    pub static fn only(o : LumenObstacle) : LumenObstacles {
+        return LumenObstacles { bits: o.bit() };
+    }
+
+    /** This set and `o`. */
+    pub fn with(self, o : LumenObstacle) : LumenObstacles {
+        return LumenObstacles { bits: self.bits | o.bit() };
+    }
+
+    /** True when `o` is in the set. */
+    pub fn has(self, o : LumenObstacle) : bool {
+        return (self.bits & o.bit()) != 0;
+    }
+}
+
+/** A set of surface layers. */
+pub struct LumenLayers {
+    /** The layers as `LightSource` masks take them: one bit each. */
+    pub bits : u32 = 0;
+
+    /** The empty set. */
+    pub static fn none() : LumenLayers {
+        return LumenLayers { bits: 0 };
+    }
+
+    /** Every layer. */
+    pub static fn all() : LumenLayers {
+        return LumenLayers { bits: LUMEN_ALL_LAYERS };
+    }
+
+    /** The set of one layer. */
+    pub static fn only(l : LumenLayer) : LumenLayers {
+        return LumenLayers { bits: l.bit() };
+    }
+
+    /** This set and `l`. */
+    pub fn with(self, l : LumenLayer) : LumenLayers {
+        return LumenLayers { bits: self.bits | l.bit() };
+    }
+
+    /** True when `l` is in the set. */
+    pub fn has(self, l : LumenLayer) : bool {
+        return (self.bits & l.bit()) != 0;
+    }
+}
+
+/** The materials and tracing kinds of all blocks, as flat arrays so a lookup is one load. */
+pub class BlockPalette {
+    kinds   : i32[];
+    albedo  : f32[];
+    rough   : f32[];
+    metal   : f32[];
+    emit    : f32[];
+    passes  : f32[];
+    classes : i32[];
+    layers  : i32[];
+
+    /** The palette of the demo world. */
+    constructor() {
+        let n : i64 = BLOCK_COUNT as i64;
+        self.kinds = new i32[n];
+        self.albedo = new f32[n * 3];
+        self.rough = new f32[n];
+        self.metal = new f32[n];
+        self.emit = new f32[n * 3];
+        self.passes = new f32[n * 3];
+        self.classes = new i32[n];
+        self.layers = new i32[n];
+        for (i of 0..n) {
+            self.kinds[i] = 0;
+            self.rough[i] = BLOCK_ROUGH_DEFAULT;
+            self.metal[i] = 0.0;
+            self.classes[i] = LumenObstacle::Terrain.bit();
+            self.layers[i] = LumenLayer::Terrain.bit() as i32;
+        }
+        for (i of 0..(n * 3)) {
+            self.albedo[i] = BLOCK_ALBEDO_DEFAULT;
+            self.emit[i] = 0.0;
+            self.passes[i] = 1.0;
+        }
+        self.define(LumenBlock::Stone, LumenKind::Opaque, 0x7D7E82, 0.85, 0.0);
+        self.define(LumenBlock::Grass, LumenKind::Opaque, 0x62963A, 0.95, 0.0);
+        self.define(LumenBlock::Dirt, LumenKind::Opaque, 0x76543A, 0.95, 0.0);
+        self.define(LumenBlock::Sand, LumenKind::Opaque, 0xDECD96, 0.9, 0.0);
+        self.define(LumenBlock::Water, LumenKind::Water, 0xFFFFFF, 0.02, 0.0);
+        self.define(LumenBlock::Log, LumenKind::Opaque, 0x684E30, 0.8, 0.0);
+        self.define(LumenBlock::Leaves, LumenKind::Cutout, 0x3C7C28, 0.8, 0.0);
+        self.define(LumenBlock::Planks, LumenKind::Opaque, 0xB08A56, 0.7, 0.0);
+        self.define(LumenBlock::Glass, LumenKind::Glass, 0xFFFFFF, 0.04, 0.0);
+        self.define(LumenBlock::Lantern, LumenKind::Opaque, 0xFFBE6E, 0.5, 0.0);
+        self.define(LumenBlock::Lava, LumenKind::Opaque, 0xFF6E1E, 0.6, 0.0);
+        self.define(LumenBlock::CrystalBlue, LumenKind::Opaque, 0x4696FF, 0.15, 0.0);
+        self.define(LumenBlock::CrystalPink, LumenKind::Opaque, 0xFF46C8, 0.15, 0.0);
+        self.define(LumenBlock::Snow, LumenKind::Opaque, 0xF0F4FA, 0.75, 0.0);
+        self.define(LumenBlock::Cobble, LumenKind::Opaque, 0x6E6E70, 0.9, 0.0);
+        self.define(LumenBlock::Roof, LumenKind::Opaque, 0x8C342C, 0.6, 0.0);
+        self.define(LumenBlock::Gold, LumenKind::Opaque, 0xFFCD50, 0.22, 1.0);
+        self.define(LumenBlock::Ice, LumenKind::Glass, 0xBEE1FF, 0.05, 0.0);
+        self.define(LumenBlock::WoolWhite, LumenKind::Opaque, 0xE8E8E8, 1.0, 0.0);
+        self.define(LumenBlock::WoolRed, LumenKind::Opaque, 0xB02424, 1.0, 0.0);
+        self.define(LumenBlock::Mirror, LumenKind::Opaque, 0xEBEEF5, 0.03, 1.0);
+        self.define(LumenBlock::Beacon, LumenKind::Opaque, 0xFFFAEB, 0.4, 0.0);
+        self.define(LumenBlock::Birch, LumenKind::Opaque, 0xD8D2BE, 0.8, 0.0);
+        // What the blocks look like when they glow, in scene radiance, where 1 is a white surface in full sun. A lamp
+        // is about as bright as that, not brighter: in daylight it does not dazzle, and it comes into its own as the
+        // exposure rises toward evening (bloom only takes what is above white once exposed). What they light is the
+        // lamps' business (see `lampspec`), not the block's.
+        self.glow(LumenBlock::Lantern, 0xFFAA50, 0.9);
+        self.glow(LumenBlock::Lava, 0xFF500E, 1.6);
+        self.glow(LumenBlock::CrystalBlue, 0x3C8CFF, 0.8);
+        self.glow(LumenBlock::CrystalPink, 0xFF3CD2, 0.8);
+        self.glow(LumenBlock::Beacon, 0xFFEBBE, 4.0);
+        // What clear blocks let through per cell (linear, per channel): water drinks red first.
+        self.passing(LumenBlock::Water, 0.45, 0.8, 0.92);
+        self.passing(LumenBlock::Glass, 0.92, 0.96, 0.97);
+        self.passing(LumenBlock::Ice, 0.7, 0.88, 0.96);
+        self.sort(LumenBlock::Leaves, LumenObstacle::Foliage, LumenLayer::Foliage);
+        self.sort(LumenBlock::Glass, LumenObstacle::Glass, LumenLayer::Building);
+        self.sort(LumenBlock::Ice, LumenObstacle::Glass, LumenLayer::Props);
+        self.sort(LumenBlock::Water, LumenObstacle::Water, LumenLayer::Liquid);
+        self.sort(LumenBlock::Planks, LumenObstacle::Terrain, LumenLayer::Building);
+        self.sort(LumenBlock::Roof, LumenObstacle::Terrain, LumenLayer::Building);
+        self.sort(LumenBlock::Cobble, LumenObstacle::Terrain, LumenLayer::Building);
+        self.sort(LumenBlock::Log, LumenObstacle::Terrain, LumenLayer::Building);
+        self.sort(LumenBlock::Lantern, LumenObstacle::Terrain, LumenLayer::Props);
+        self.sort(LumenBlock::Gold, LumenObstacle::Terrain, LumenLayer::Props);
+        self.sort(LumenBlock::Mirror, LumenObstacle::Terrain, LumenLayer::Props);
+        self.sort(LumenBlock::Beacon, LumenObstacle::Terrain, LumenLayer::Props);
+        self.sort(LumenBlock::WoolWhite, LumenObstacle::Terrain, LumenLayer::Props);
+        self.sort(LumenBlock::WoolRed, LumenObstacle::Terrain, LumenLayer::Props);
+    }
+
+    // A block's base colour (0xRRGGBB, sRGB), tracing kind, perceptual roughness and metalness.
+    fn define(mut self, block : LumenBlock, kind : LumenKind, colour : i32, rough : f32, metal : f32) : void {
+        let id : i64 = block.id() as i64;
+        self.kinds[id] = kind.code();
+        self.albedo[id * 3] = lightSrgbDecode8(blockRed(colour));
+        self.albedo[id * 3 + 1] = lightSrgbDecode8(blockGreen(colour));
+        self.albedo[id * 3 + 2] = lightSrgbDecode8(blockBlue(colour));
+        self.rough[id] = rough;
+        self.metal[id] = metal;
+    }
+
+    // What a block emits: its glow colour (0xRRGGBB, sRGB) times `strength` in scene radiance.
+    fn glow(mut self, block : LumenBlock, colour : i32, strength : f32) : void {
+        let at : i64 = block.id() as i64 * 3;
+        self.emit[at] = lightSrgbDecode8(blockRed(colour)) * strength;
+        self.emit[at + 1] = lightSrgbDecode8(blockGreen(colour)) * strength;
+        self.emit[at + 2] = lightSrgbDecode8(blockBlue(colour)) * strength;
+    }
+
+    fn passing(mut self, block : LumenBlock, r : f32, g : f32, b : f32) : void {
+        let at : i64 = block.id() as i64 * 3;
+        self.passes[at] = r;
+        self.passes[at + 1] = g;
+        self.passes[at + 2] = b;
+    }
+
+    fn sort(mut self, block : LumenBlock, obstacle : LumenObstacle, layer : LumenLayer) : void {
+        let id : i64 = block.id() as i64;
+        self.classes[id] = obstacle.bit();
+        self.layers[id] = layer.bit() as i32;
+    }
+
+    /** How the tracer treats the block with id `id`. */
+    pub fn kindOf(self, id : i32) : LumenKind {
+        return LumenKind::fromCode(self.kinds[id as i64]);
+    }
+
+    /** The obstacle class bit of block `id`. */
+    pub fn classOf(self, id : i32) : i32 {
+        return self.classes[id as i64];
+    }
+
+    /** The surface layer bit of block `id`. */
+    pub fn layerOf(self, id : i32) : u32 {
+        return self.layers[id as i64] as u32;
+    }
+
+    /** Perceptual roughness of block `id`. */
+    pub fn roughOf(self, id : i32) : f32 {
+        return self.rough[id as i64];
+    }
+
+    /** 0 dielectric, 1 metal, for block `id`. */
+    pub fn metalOf(self, id : i32) : f32 {
+        return self.metal[id as i64];
+    }
+
+    /** The base colour of `id`, linear. */
+    pub fn albedoOf(self, id : i32) : Vec3 {
+        let at : i64 = id as i64 * 3;
+        return Vec3 { x: self.albedo[at], y: self.albedo[at + 1], z: self.albedo[at + 2] };
+    }
+
+    /** The light a block emits, scene radiance. */
+    pub fn emitOf(self, id : i32) : Vec3 {
+        let at : i64 = id as i64 * 3;
+        return Vec3 { x: self.emit[at], y: self.emit[at + 1], z: self.emit[at + 2] };
+    }
+
+    /** The share of each channel a clear block lets through per cell. */
+    pub fn passOf(self, id : i32) : Vec3 {
+        let at : i64 = id as i64 * 3;
+        return Vec3 { x: self.passes[at], y: self.passes[at + 1], z: self.passes[at + 2] };
+    }
+}
+
+// The channels of a packed 0xRRGGBB colour.
+fn blockRed(colour : i32) : i32 {
+    return (colour >> BLOCK_RED_SHIFT) & BLOCK_CHANNEL_MASK;
+}
+
+fn blockGreen(colour : i32) : i32 {
+    return (colour >> BLOCK_GREEN_SHIFT) & BLOCK_CHANNEL_MASK;
+}
+
+fn blockBlue(colour : i32) : i32 {
+    return colour & BLOCK_CHANNEL_MASK;
+}
+
+// A block that stops all light and bounces its own colour (0xRRGGBB).
+fn solidLight(colour : i32) : BlockLight {
+    return BlockLight::solid(blockRed(colour), blockGreen(colour), blockBlue(colour));
+}
+
+fn setLight(t : Shared<BlockLightTable>, block : LumenBlock, l : BlockLight) : void {
+    t.define(block.id(), l);
+}
+
+// A clear block: how much of each channel it stops, what it reflects, and the class it belongs to.
+fn clearLight(stopR : i32, stopG : i32, stopB : i32, obstacle : LumenObstacle) : BlockLight {
+    return BlockLight {
+        opacityR: stopR,
+        opacityG: stopG,
+        opacityB: stopB,
+        albedoR: 255 - stopR,
+        albedoG: 255 - stopG,
+        albedoB: 255 - stopB,
+        classes: LumenObstacles::only(obstacle).bits,
+    };
+}
+
+/**
+ * The flood's view of the same blocks: opacity, bounce albedo and obstacle class. No block emits here: every
+ * lamp of the world is an emitter override from its `LumenLampSpec`, and the glowing stones and lava below are
+ * dim lamp blocks that fill the cave with colour.
+ */
+pub fn lumenLightTable() : Shared<BlockLightTable> {
+    // The table is the size of the block list: `define` aborts on an id outside it, so a block added to the
+    // enum without a line here fails loudly instead of lighting as air.
+    let t : Shared<BlockLightTable> = share new BlockLightTable(BLOCK_COUNT);
+    setLight(t, LumenBlock::Stone, solidLight(0x7D7E82));
+    setLight(t, LumenBlock::Grass, solidLight(0x468C28));
+    setLight(t, LumenBlock::Dirt, solidLight(0x6E4E34));
+    setLight(t, LumenBlock::Sand, solidLight(0xDCC896));
+    setLight(t, LumenBlock::Water, clearLight(110, 50, 25, LumenObstacle::Water));
+    setLight(t, LumenBlock::Log, solidLight(0x644A2C));
+    setLight(t, LumenBlock::Leaves, BlockLight {
+        opacityR: 150,
+        opacityG: 120,
+        opacityB: 150,
+        albedoR: 105,
+        albedoG: 135,
+        albedoB: 105,
+        classes: LumenObstacles::only(LumenObstacle::Foliage).bits,
+    });
+    setLight(t, LumenBlock::Planks, solidLight(0xB08A56));
+    setLight(t, LumenBlock::Glass, clearLight(14, 8, 6, LumenObstacle::Glass));
+    setLight(t, LumenBlock::Lantern, solidLight(0xFFBE6E));
+    setLight(t, LumenBlock::Lava, BlockLight::lamp(110, 34, 6));
+    setLight(t, LumenBlock::CrystalBlue, BlockLight::lamp(14, 34, 70));
+    setLight(t, LumenBlock::CrystalPink, BlockLight::lamp(70, 14, 55));
+    setLight(t, LumenBlock::Snow, solidLight(0xF0F4FA));
+    setLight(t, LumenBlock::Cobble, solidLight(0x6E6E70));
+    setLight(t, LumenBlock::Roof, solidLight(0x8C342C));
+    setLight(t, LumenBlock::Gold, solidLight(0xFFCD50));
+    setLight(t, LumenBlock::Ice, clearLight(60, 25, 10, LumenObstacle::Glass));
+    setLight(t, LumenBlock::WoolWhite, solidLight(0xE8E8E8));
+    setLight(t, LumenBlock::WoolRed, solidLight(0xB02424));
+    setLight(t, LumenBlock::Mirror, solidLight(0xEBEEF5));
+    setLight(t, LumenBlock::Beacon, solidLight(0xFFFAEB));
+    setLight(t, LumenBlock::Birch, solidLight(0xD8D2BE));
+    return t;
+}

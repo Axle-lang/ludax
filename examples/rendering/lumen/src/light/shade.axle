@@ -1,0 +1,172 @@
+// shade — the valley's side of shading: the probe of its dense volumes, the lamps, the cheap surface seen in a reflection.
+//
+// The terms every picture shares (sun and moon through their baked shadows, the dome through the sky light and bounce
+// tint, the mirror, the flooded block light, emission) are `lumenShadeCore` in Ludax's `render/pathlight`. What stays
+// here needs the valley's world: the volume read at a probe point, the point lights with their hard shadow rays and
+// GGX highlights, and the water test that turns on the caustics.
+
+use ludax::abs;
+use ludax::{
+    Ray, Vec3, LightDfgTable, LightSource, LightMaterial, LightAlphaMode, LightDiffuseModel, LightDfg,
+    LightPrepared, LightIncident, LightBrdfTerms, LightReason, lightPrepare, lightBrdf, lightIncidence, sin,
+    saturate, max, PI, LumenBody, LumenLightSample, lumenBodyShare, LumenSky, LumenPoint, LumenLit,
+    LumenMirror, lumenShadeCore, lumenCaustic, lumenCloudShade, lumenPrepare, shSkyShare, SHADE_FLOOD,
+    SHADE_HORIZON
+};
+
+use crate::render::env::LumenEnv;
+use crate::world::blocks::LumenBlock;
+
+/** How far off a surface the light volume is sampled, so the probe is in air, not in the wall. */
+const SHADE_PROBE : f32 = 0.55;
+
+/** A lamp dimmer than this contributes nothing a surface could show. */
+const SHADE_LAMP_MIN : f32 = 0.0005;
+
+/** Above this night factor the cheap reflected surface adds the moon. */
+const SHADE_NIGHT_SIMPLE : f32 = 0.2;
+
+/** How far a lamp's shadow ray starts off the surface along its geometric normal, clear of the surface itself. */
+const SHADE_RAY_BIAS : f32 = 0.004;
+
+/** How far short of the lamp its shadow ray stops, so the lamp's own block does not shadow it. */
+const SHADE_LAMP_CLEARANCE : f32 = 0.9;
+
+/** The light volume sampled `SHADE_PROBE` off a surface along `normal`, so the probe is in air and not in the wall. */
+pub(crate) fn shProbe(env : Shared<LumenEnv>, pos : Vec3, normal : Vec3) : LumenLightSample {
+    let off : Vec3 = pos.plus(normal.scale(SHADE_PROBE));
+    return env.lightAt(off);
+}
+
+// The colour the baked sky rays hit, or white when the bounce is switched off.
+fn shTint(env : Shared<LumenEnv>, probe : LumenLightSample) : Vec3 {
+    if (env.settings.bounce) {
+        return probe.tint;
+    }
+    return Vec3::splat(1.0);
+}
+
+// The direct light of the lamps around the point: the bucketed lamps that reach it and the far reaching ones.
+fn shLamps(
+    env : Shared<LumenEnv>,
+    pt : LumenPoint,
+    prepared : LightPrepared,
+    view : Vec3,
+    near : LumenLampScratch
+) : Vec3 {
+    let mut sum : Vec3 = Vec3::zero();
+    let found : i32 = near.query(env.lamps, pt.pos);
+    let from : Vec3 = pt.pos.plus(pt.ng.scale(SHADE_RAY_BIAS));
+    for (k of 0..found) {
+        let index : i32 = near.buf[k as i64];
+        if (env.lamps.reaches(index, pt.pos)) {
+            sum = sum.plus(shLamp(env, index, pt, prepared, view, from));
+        }
+    }
+    for (k of 0..env.lamps.far.len()) {
+        let index : i32 = env.lamps.far.get(k);
+        if (env.lamps.reaches(index, pt.pos)) {
+            sum = sum.plus(shLamp(env, index, pt, prepared, view, from));
+        }
+    }
+    return sum;
+}
+
+// One lamp on one point: the spec's flicker, layers and reach through `lightIncidence`, then, if the lamp wants a
+// shadow, a ray that ignores the obstacle classes the lamp's light passes through.
+fn shLamp(
+    env : Shared<LumenEnv>,
+    index : i32,
+    pt : LumenPoint,
+    prepared : LightPrepared,
+    view : Vec3,
+    from : Vec3
+) : Vec3 {
+    let light : LightSource = env.lamps.ready.get(index);
+    let inc : LightIncident = lightIncidence(light, pt.pos, pt.n, pt.ng, pt.layer, 0);
+    if (inc.reason != LightReason::None || inc.irradiance < SHADE_LAMP_MIN) {
+        return Vec3::zero();
+    }
+    let mut seen : Vec3 = Vec3::splat(1.0);
+    if (env.lamps.castsShadow(index)) {
+        let delta : Vec3 = light.position.minus(from);
+        let dist : f32 = delta.length();
+        let dir : Vec3 = delta.scale((1.0 as f32) / max(dist, 0.001));
+        let ray : Ray = Ray::make(from, dir);
+        seen = env.scene.visibility(ray, dist - SHADE_LAMP_CLEARANCE, env.lamps.passBits(index));
+        if (seen.maxComponent() <= 0.0) {
+            return Vec3::zero();
+        }
+    }
+    let brdf : LightBrdfTerms = lightBrdf(prepared, pt.n, view, inc.toLight);
+    return brdf.diffuse.plus(brdf.specular).times(light.color.scale(inc.irradiance)).times(seen);
+}
+
+/**
+ * The radiance a Lambertian surface of `albedo` and normal `n` at `p` shows under the baked light alone: the
+ * cheap shading of what is seen in a reflection or through water, where nobody can tell the difference.
+ * `caustic` modulates the sun under water by the pattern of the waves above.
+ */
+pub fn lumenSimpleSurface(
+    env : Shared<LumenEnv>,
+    p : Vec3,
+    n : Vec3,
+    albedo : Vec3,
+    emit : Vec3,
+    caustic : bool
+) : Vec3 {
+    let probe : LumenLightSample = shProbe(env, p, n);
+    let sky : LumenSky = env.sky;
+    let tint : Vec3 = shTint(env, probe);
+    let mut light : Vec3 = sky.dome.irradiance(n).scale(shSkyShare(probe)).times(tint);
+    light = light.plus(probe.block.scale(SHADE_FLOOD));
+    let sunCos : f32 = n.dot(sky.sunDir);
+    if (sunCos > 0.0 && sky.sunDir.y > SHADE_HORIZON) {
+        let mut sun : Vec3 = sky.sunIrr.scale(probe.sun * lumenCloudShade(p, sky.sunDir, env.time) * sunCos
+            / PI);
+        if (caustic) {
+            sun = sun.scale(lumenCaustic(p.x, p.z, env.time));
+        }
+        light = light.plus(sun);
+    }
+    let moonCos : f32 = n.dot(sky.moonDir);
+    if (moonCos > 0.0 && sky.moonDir.y > SHADE_HORIZON && sky.night > SHADE_NIGHT_SIMPLE) {
+        let moonSeen : f32 = lumenBodyShare(probe, LumenBody::Moon);
+        light = light.plus(sky.moonIrr.scale(moonSeen * moonCos / PI));
+    }
+    return albedo.times(light).plus(emit);
+}
+
+/**
+ * Shades `pt` seen along the unit vector `view` (pointing at the eye). `reflected` is the radiance along the mirror
+ * direction when the caller traced it (`traced` true), for smooth surfaces. `near` is the caller's scratch for
+ * lamp indices, `LumenLamps::nearMax` entries long.
+ */
+pub fn lumenShade(
+    env : Shared<LumenEnv>,
+    pt : LumenPoint,
+    view : Vec3,
+    traced : bool,
+    reflected : Vec3,
+    near : LumenLampScratch
+) : LumenLit {
+    let probe : LumenLightSample = shProbe(env, pt.pos, pt.ng);
+    let water : bool = env.scene.at(pt.pos.x as i32, (pt.pos.y + 0.5) as i32, pt.pos.z as i32)
+        == LumenBlock::Water.id();
+    let mut lit : LumenLit = lumenShadeCore(
+        env.sky,
+        env.dfg,
+        env.settings.bounce,
+        env.time,
+        water,
+        pt,
+        view,
+        LumenMirror { traced: traced, radiance: reflected },
+        probe
+    );
+    if (env.settings.lamps) {
+        let prepared : LightPrepared = lumenPrepare(env.dfg, pt, view);
+        lit.direct = lit.direct.plus(shLamps(env, pt, prepared, view, near));
+    }
+    return lit;
+}

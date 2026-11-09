@@ -1,0 +1,452 @@
+// terrain — the land of the world: its height at every column, its surface blocks, the cave and its crystals.
+//
+// The height of a column is a function of (x, z) alone: the valley's own hills, a mountain, a lake and a ring of
+// crests, blended into rolling outer land with ranges and basins, walled in at the edge of the world and levelled
+// under each building site. Nothing here draws a random number, so the same cell gives the same ground on every
+// run, and buildings and trees ask `worldHeight` instead of reading the grid. Every number is a named constant
+// grouped by the feature it shapes, so a mountain can be made higher or a lake deeper by editing one line.
+
+use ludax::abs;
+use ludax::{Vec3, VoxelGrid, smoothstep, min, max};
+use ludax::{lnFbm2, lnUnit};
+
+use crate::world::blocks::LumenBlock;
+use crate::world::layout::{
+    WORLD_XZ, WORLD_SEA, WORLD_VALLEY, PAD_Y, HILL_ABOVE_SEA, SITE_CABINS, SITE_TOWERS, WgSite, wgDist,
+    wgPlace, siteValleyCabin, siteValleyTower, siteCabin, siteTower
+};
+
+/** The lowest ground there is, in cells: the world never has bedrock above the void. */
+const TERRAIN_FLOOR : i32 = 3;
+
+/** The valley's hills: noise frequency per cell, octaves and hash seed. */
+const VALLEY_HILL_FREQ : f32 = 0.028;
+const VALLEY_HILL_OCTAVES : i32 = 5;
+const VALLEY_HILL_SEED : i32 = 1;
+
+/** The valley floor sits at this height and its hills add up to this much more. */
+const VALLEY_FLOOR : f32 = 10.0;
+const VALLEY_HILL_RELIEF : f32 = 15.0;
+
+/** The mountain in the north-west of the valley: its centre in valley cells, its radius and its height. */
+const VALLEY_MOUNTAIN_X : f32 = 40.0;
+const VALLEY_MOUNTAIN_Z : f32 = 40.0;
+const VALLEY_MOUNTAIN_RADIUS : f32 = 44.0;
+const VALLEY_MOUNTAIN_HEIGHT : f32 = 34.0;
+
+/** The lake in the south: its centre in valley cells, its radius and how deep it cuts. */
+const VALLEY_LAKE_X : f32 = 90.0;
+const VALLEY_LAKE_Z : f32 = 94.0;
+const VALLEY_LAKE_RADIUS : f32 = 34.0;
+const VALLEY_LAKE_DEPTH : f32 = 15.0;
+
+/** The valley is this many cells from its middle to its crest, and the ring of crests rises this high. */
+const VALLEY_HALF : f32 = 80.0;
+const VALLEY_RIM_HEIGHT : f32 = 36.0;
+
+/** The crests start to rise at this share of the way from the middle to the edge, and are full height at the edge. */
+const VALLEY_RIM_FROM : f32 = 0.7;
+const VALLEY_RIM_TO : f32 = 1.0;
+
+/** Past this many cells east or south of the valley's middle the crest has an opening. */
+const VALLEY_GATE_FROM : f32 = 56.0;
+
+/** The opening is fully clear within `VALLEY_GATE_OPEN` cells of the axis and closed again beyond `VALLEY_GATE_CLOSED`. */
+const VALLEY_GATE_OPEN : f32 = 6.0;
+const VALLEY_GATE_CLOSED : f32 = 18.0;
+
+/** The outer hills: noise frequency, octaves, seed, the base height and the relief on top of it. */
+const OUTER_HILL_FREQ : f32 = 0.012;
+const OUTER_HILL_OCTAVES : i32 = 5;
+const OUTER_HILL_SEED : i32 = 77;
+const OUTER_FLOOR : f32 = 12.0;
+const OUTER_HILL_RELIEF : f32 = 26.0;
+
+/** The ridged mountains: the noise whose creases are the ridges. */
+const OUTER_RIDGE_FREQ : f32 = 0.006;
+const OUTER_RIDGE_OCTAVES : i32 = 4;
+const OUTER_RIDGE_SEED : i32 = 91;
+
+/** Where ridges rise: a slower noise of ranges, switched on between two thresholds, and how high a ridge goes. */
+const OUTER_RANGE_FREQ : f32 = 0.004;
+const OUTER_RANGE_OCTAVES : i32 = 3;
+const OUTER_RANGE_SEED : i32 = 123;
+const OUTER_RANGE_FROM : f32 = 0.52;
+const OUTER_RANGE_TO : f32 = 0.82;
+const OUTER_RIDGE_HEIGHT : f32 = 44.0;
+
+/** The lake basins: noise frequency, the offset that moves them off the ridge noise, octaves and seed. */
+const OUTER_BASIN_FREQ : f32 = 0.007;
+const OUTER_BASIN_SHIFT_X : f32 = 9.0;
+const OUTER_BASIN_SHIFT_Z : f32 = -3.0;
+const OUTER_BASIN_OCTAVES : i32 = 3;
+const OUTER_BASIN_SEED : i32 = 55;
+
+/** Noise below `OUTER_BASIN_FROM` is a full basin and above `OUTER_BASIN_TO` land; a basin sinks the ground this far. */
+const OUTER_BASIN_FROM : f32 = 0.3;
+const OUTER_BASIN_TO : f32 = 0.42;
+const OUTER_BASIN_DEPTH : f32 = 22.0;
+
+/** The valley and the outer land are one surface: the valley's ground fades out between these two distances. */
+const BLEND_FROM : f32 = 84.0;
+const BLEND_TO : f32 = 108.0;
+
+/** The wall of mountains at the edge of the world: it rises past this share of the way out, by this much. */
+const EDGE_FROM : f32 = 0.8;
+const EDGE_RISE : f32 = 30.0;
+
+/** Cells around a cabin that are levelled flat before the ground eases back to the land. */
+const PAD_CLEAR : f32 = 9.0;
+
+/** Cells around a tower that are raised to its hill before the ground eases back to the land. */
+const HILL_CLEAR : f32 = 3.0;
+
+/** Cells over which the ground eases from a levelled site back to the land. */
+const SITE_EASE : f32 = 9.0;
+
+/** The sum of ranges, the rim and the edge wall can pass the top: above this height the ground is eased down. */
+const CEILING_START : f32 = 40.0;
+
+/** The ground never rises more than this far above `CEILING_START`. */
+const CEILING_ROOM : f32 = 21.0;
+
+/** How soon the ease reaches the room: the over-height at which half of it is used. */
+const CEILING_SOFTNESS : f32 = 28.0;
+
+/** The top four cells of a column are its skin; below that is stone. */
+const SKIN_DEPTH : i32 = 3;
+
+/** Ground at or above this height is snow, and at or above `ROCK_LINE` bare stone. */
+const SNOW_LINE : i32 = 44;
+const ROCK_LINE : i32 = 35;
+
+/** Between these heights the top cell is patchy snow: a hash below the chance turns it white. */
+const SNOW_PATCH_FROM : i32 = 38;
+const SNOW_PATCH_CHANCE : f32 = 0.35;
+const SNOW_PATCH_SEED : i32 = 5;
+
+/** Ground within one cell of the water is sand. */
+const SHORE_BAND : i32 = 1;
+
+/** The bottom two layers are never carved, so a cave cannot open onto the void. */
+const CAVE_FLOOR : i32 = 2;
+
+/** The tunnel: where it opens in the mountain's flank (valley cells and height) and where it ends in the chamber. */
+const CAVE_MOUTH_X : f32 = 66.0;
+const CAVE_MOUTH_Z : f32 = 68.0;
+const CAVE_MOUTH_Y : f32 = 21.0;
+const CAVE_CHAMBER_X : f32 = 42.0;
+const CAVE_CHAMBER_Z : f32 = 46.0;
+const CAVE_CHAMBER_Y : f32 = 25.0;
+
+/** The tunnel is dug as this many overlapping balls from mouth to chamber. */
+const CAVE_TUNNEL_STEPS : i32 = 26;
+
+/** The bore starts this wide and widens by `CAVE_TUNNEL_FLARE` towards the chamber, as the square of the way along. */
+const CAVE_TUNNEL_RADIUS : f32 = 2.6;
+const CAVE_TUNNEL_FLARE : f32 = 3.8;
+
+/** The hall: its centre stands this far above the tunnel's end, and it is a ball of this radius. */
+const CAVE_HALL_LIFT : f32 = 2.0;
+const CAVE_HALL_RADIUS : f32 = 9.0;
+
+/** The lava pool: the layer it fills, its centre in valley cells, its radius and the square of cells scanned for it. */
+const CAVE_POOL_Y : i32 = 19;
+const CAVE_POOL_X : f32 = 42.0;
+const CAVE_POOL_Z : f32 = 48.0;
+const CAVE_POOL_RADIUS : f32 = 5.2;
+const CAVE_POOL_SCAN_X : i32 = 32;
+const CAVE_POOL_SCAN_Z : i32 = 36;
+const CAVE_POOL_SCAN_SIZE : i32 = 22;
+
+/** Crystals are looked for in a box this many cells on a side in x and z, from this corner in valley cells. */
+const CRYSTAL_SCAN_X : i32 = 28;
+const CRYSTAL_SCAN_Z : i32 = 32;
+const CRYSTAL_SCAN_SIZE : i32 = 30;
+
+/** And between these two layers. */
+const CRYSTAL_SCAN_Y0 : i32 = 12;
+const CRYSTAL_SCAN_Y1 : i32 = 40;
+
+/** A stone cell that touches air becomes a crystal when its hash is below this chance. */
+const CRYSTAL_CHANCE : f32 = 0.07;
+const CRYSTAL_SEED : i32 = 77;
+
+/** A crystal is pink when a second hash is below this chance, blue otherwise. */
+const CRYSTAL_PINK_CHANCE : f32 = 0.45;
+const CRYSTAL_PINK_SEED : i32 = 78;
+
+/** Crystals only grow within this many cells of the hall's heart, which stands this high. */
+const CRYSTAL_REACH : f32 = 11.5;
+const CRYSTAL_HEART_Y : f32 = 27.0;
+
+// The ground height `h` at `at`, pulled toward `level` by how close `at` lies to a building site at `site`:
+// fully inside `clear` cells of it, not at all `SITE_EASE` cells farther out.
+fn terrainLevel(h : f32, at : Vec2, site : Vec2, clear : f32, level : f32) : f32 {
+    let pull : f32 = smoothstep(0.0, 1.0, (1.0 as f32) - (wgDist(at, site) - clear) / SITE_EASE);
+    return h + (level - h) * pull;
+}
+
+// A hump that is 1 at its centre and eases to 0 at `radius` cells away, for the mountain and the lake.
+fn terrainFalloff(distance : f32, radius : f32) : f32 {
+    return smoothstep(0.0, 1.0, (1.0 as f32) - distance / radius);
+}
+
+// The valley's own ground (the map this world grew around): hills, the mountain in the north-west, the lake in the
+// south and a ring of crests with an opening to the east and one to the south. (lx, lz) are valley coordinates.
+fn valleyHeight(lx : f32, lz : f32) : f32 {
+    let here : Vec2 = Vec2 { x: lx, y: lz };
+    let mountainAt : Vec2 = Vec2 { x: VALLEY_MOUNTAIN_X, y: VALLEY_MOUNTAIN_Z };
+    let lakeAt : Vec2 = Vec2 { x: VALLEY_LAKE_X, y: VALLEY_LAKE_Z };
+
+    let hills : f32 = lnFbm2(
+        lx * VALLEY_HILL_FREQ,
+        lz * VALLEY_HILL_FREQ,
+        VALLEY_HILL_OCTAVES,
+        VALLEY_HILL_SEED
+    );
+    let mut h : f32 = VALLEY_FLOOR + hills * VALLEY_HILL_RELIEF;
+
+    let mountain : f32 = terrainFalloff(wgDist(here, mountainAt), VALLEY_MOUNTAIN_RADIUS);
+    h = h + mountain * VALLEY_MOUNTAIN_HEIGHT;
+
+    let lake : f32 = terrainFalloff(wgDist(here, lakeAt), VALLEY_LAKE_RADIUS);
+    h = h - lake * VALLEY_LAKE_DEPTH;
+
+    let reach : f32 = max(abs(lx - VALLEY_HALF), abs(lz - VALLEY_HALF)) / VALLEY_HALF;
+    let rim : f32 = smoothstep(VALLEY_RIM_FROM, VALLEY_RIM_TO, reach);
+    let mut gate : f32 = 1.0;
+    if (lx > VALLEY_GATE_FROM) {
+        gate = min(gate, smoothstep(VALLEY_GATE_OPEN, VALLEY_GATE_CLOSED, abs(lz - VALLEY_HALF)));
+    }
+    if (lz > VALLEY_GATE_FROM) {
+        gate = min(gate, smoothstep(VALLEY_GATE_OPEN, VALLEY_GATE_CLOSED, abs(lx - VALLEY_HALF)));
+    }
+    return h + rim * gate * VALLEY_RIM_HEIGHT;
+}
+
+// The land beyond the valley: rolling hills, ranges of ridged mountains where a slow noise says so, and lakes in the
+// low basins. (x, z) are world coordinates.
+fn outerHeight(x : f32, z : f32) : f32 {
+    let hills : f32 = lnFbm2(x * OUTER_HILL_FREQ, z * OUTER_HILL_FREQ, OUTER_HILL_OCTAVES, OUTER_HILL_SEED);
+    let mut h : f32 = OUTER_FLOOR + hills * OUTER_HILL_RELIEF;
+
+    let creased : f32 = lnFbm2(
+        x * OUTER_RIDGE_FREQ,
+        z * OUTER_RIDGE_FREQ,
+        OUTER_RIDGE_OCTAVES,
+        OUTER_RIDGE_SEED
+    );
+    let ridge : f32 = (1.0 as f32) - abs((2.0 as f32) * creased - (1.0 as f32));
+    let ranges : f32 = lnFbm2(
+        x * OUTER_RANGE_FREQ,
+        z * OUTER_RANGE_FREQ,
+        OUTER_RANGE_OCTAVES,
+        OUTER_RANGE_SEED
+    );
+    let range : f32 = smoothstep(OUTER_RANGE_FROM, OUTER_RANGE_TO, ranges);
+    h = h + ridge * ridge * range * OUTER_RIDGE_HEIGHT;
+
+    let basin : f32 = lnFbm2(
+        x * OUTER_BASIN_FREQ + OUTER_BASIN_SHIFT_X,
+        z * OUTER_BASIN_FREQ + OUTER_BASIN_SHIFT_Z,
+        OUTER_BASIN_OCTAVES,
+        OUTER_BASIN_SEED
+    );
+    return h - ((1.0 as f32) - smoothstep(OUTER_BASIN_FROM, OUTER_BASIN_TO, basin)) * OUTER_BASIN_DEPTH;
+}
+
+// The height of the ground before the sites are levelled: the valley blended into the outer land, then the wall
+// of mountains at the edge of the world, so the view never ends in nothing.
+fn landHeight(fx : f32, fz : f32) : f32 {
+    let lx : f32 = fx - (WORLD_VALLEY as f32);
+    let lz : f32 = fz - (WORLD_VALLEY as f32);
+    let reach : f32 = max(abs(lx - VALLEY_HALF), abs(lz - VALLEY_HALF));
+    let outer : f32 = outerHeight(fx, fz);
+    let mut h : f32 = outer;
+    if (reach < BLEND_TO) {
+        let valley : f32 = valleyHeight(lx, lz);
+        h = valley + (outer - valley) * smoothstep(BLEND_FROM, BLEND_TO, reach);
+    }
+
+    let half : f32 = (WORLD_XZ as f32) * (0.5 as f32);
+    let edge : f32 = max(abs(fx - half), abs(fz - half)) / half;
+    return h + smoothstep(EDGE_FROM, 1.0, edge) * EDGE_RISE;
+}
+
+/** The ground height at column (x, z) before any building, in cells. */
+pub fn worldHeight(x : i32, z : i32) : i32 {
+    let at : Vec2 = wgPlace(x, z);
+    let padY : f32 = (PAD_Y as f32) - (1.0 as f32);
+    let hillY : f32 = (WORLD_SEA + HILL_ABOVE_SEA) as f32;
+    let mut h : f32 = landHeight(x as f32, z as f32);
+
+    h = terrainLevel(h, at, siteValleyCabin().place(), PAD_CLEAR, padY);
+    h = terrainLevel(h, at, siteValleyTower().place(), HILL_CLEAR, hillY);
+    for (i of 0..SITE_CABINS) {
+        h = terrainLevel(h, at, siteCabin(i).place(), PAD_CLEAR, padY);
+    }
+    for (i of 0..SITE_TOWERS) {
+        h = terrainLevel(h, at, siteTower(i).place(), HILL_CLEAR, hillY);
+    }
+
+    // Above the ceiling start the ground eases toward the top instead of being cut off flat by it.
+    if (h > CEILING_START) {
+        let over : f32 = h - CEILING_START;
+        h = CEILING_START + CEILING_ROOM * over / (over + CEILING_SOFTNESS);
+    }
+
+    let ground : i32 = h as i32;
+    if (ground < TERRAIN_FLOOR) {
+        return TERRAIN_FLOOR;
+    }
+    return ground;
+}
+
+// The block of the skin of a column of height `h` at depth `y`: sand by the water, snow and bare rock up high,
+// grass over dirt between.
+fn skinBlock(h : i32, y : i32) : i32 {
+    if (h <= WORLD_SEA + SHORE_BAND) {
+        return LumenBlock::Sand.id();
+    }
+    if (h >= SNOW_LINE) {
+        return LumenBlock::Snow.id();
+    }
+    if (h >= ROCK_LINE) {
+        return LumenBlock::Stone.id();
+    }
+    if (y == h) {
+        return LumenBlock::Grass.id();
+    }
+    return LumenBlock::Dirt.id();
+}
+
+/** Fills column (x, z) of `grid`: stone, a skin of soil or snow, and water up to the sea. */
+pub fn terrainColumn(grid : Shared<VoxelGrid>, x : i32, z : i32) : void {
+    let h : i32 = worldHeight(x, z);
+    for (y of 0..(h + 1)) {
+        let mut id : i32 = LumenBlock::Stone.id();
+        if (y >= h - SKIN_DEPTH && y > 0) {
+            id = skinBlock(h, y);
+        }
+        let patchy : bool = y == h && h >= SNOW_PATCH_FROM && h < SNOW_LINE;
+        if (patchy && lnUnit(x, 0, z, SNOW_PATCH_SEED) < SNOW_PATCH_CHANCE) {
+            id = LumenBlock::Snow.id();
+        }
+        grid.setBlock(x, y, z, id);
+    }
+    for (y of (h + 1)..(WORLD_SEA + 1)) {
+        grid.setBlock(x, y, z, LumenBlock::Water.id());
+    }
+}
+
+// Empties the cells whose centres lie within `r` of `c`, never below `CAVE_FLOOR`.
+fn carveBall(grid : Shared<VoxelGrid>, c : Vec3, r : f32) : void {
+    let x0 : i32 = (c.x - r) as i32;
+    let x1 : i32 = (c.x + r) as i32 + 1;
+    let mut y0 : i32 = (c.y - r) as i32;
+    let y1 : i32 = (c.y + r) as i32 + 1;
+    let z0 : i32 = (c.z - r) as i32;
+    let z1 : i32 = (c.z + r) as i32 + 1;
+    if (y0 < CAVE_FLOOR) {
+        y0 = CAVE_FLOOR;
+    }
+    for (z of z0..z1) {
+        for (y of y0..y1) {
+            for (x of x0..x1) {
+                let dx : f32 = (x as f32) + (0.5 as f32) - c.x;
+                let dy : f32 = (y as f32) + (0.5 as f32) - c.y;
+                let dz : f32 = (z as f32) + (0.5 as f32) - c.z;
+                if (dx * dx + dy * dy + dz * dz < r * r) {
+                    grid.setBlock(x, y, z, 0);
+                }
+            }
+        }
+    }
+}
+
+/** Digs the tunnel from the mountain's flank into the chamber, floods the chamber's floor with lava and grows crystals. */
+pub fn carveCave(grid : Shared<VoxelGrid>) : void {
+    let o : f32 = WORLD_VALLEY as f32;
+    let last : f32 = (CAVE_TUNNEL_STEPS - 1) as f32;
+    for (i of 0..CAVE_TUNNEL_STEPS) {
+        let t : f32 = (i as f32) / last;
+        let px : f32 = o + CAVE_MOUTH_X + (CAVE_CHAMBER_X - CAVE_MOUTH_X) * t;
+        let pz : f32 = o + CAVE_MOUTH_Z + (CAVE_CHAMBER_Z - CAVE_MOUTH_Z) * t;
+        let py : f32 = CAVE_MOUTH_Y + (CAVE_CHAMBER_Y - CAVE_MOUTH_Y) * t;
+        let bore : f32 = CAVE_TUNNEL_RADIUS + CAVE_TUNNEL_FLARE * t * t;
+        carveBall(grid, Vec3 { x: px, y: py, z: pz }, bore);
+    }
+
+    let hall : Vec3 = Vec3 {
+        x: o + CAVE_CHAMBER_X,
+        y: CAVE_CHAMBER_Y + CAVE_HALL_LIFT,
+        z: o + CAVE_CHAMBER_Z,
+    };
+    carveBall(grid, hall, CAVE_HALL_RADIUS);
+    fillLava(grid);
+    growCrystals(grid);
+}
+
+// Lava over the stone of the pool layer within the pool's radius, wherever the hall left it uncovered.
+fn fillLava(grid : Shared<VoxelGrid>) : void {
+    let o : f32 = WORLD_VALLEY as f32;
+    let x0 : i32 = WORLD_VALLEY + CAVE_POOL_SCAN_X;
+    let z0 : i32 = WORLD_VALLEY + CAVE_POOL_SCAN_Z;
+    let centre : Vec2 = Vec2 { x: o + CAVE_POOL_X, y: o + CAVE_POOL_Z };
+    for (z of z0..(z0 + CAVE_POOL_SCAN_SIZE)) {
+        for (x of x0..(x0 + CAVE_POOL_SCAN_SIZE)) {
+            let here : Vec2 = Vec2 { x: x as f32 + (0.5 as f32), y: z as f32 + (0.5 as f32) };
+            let solid : bool = grid.blockAt(x, CAVE_POOL_Y, z) != 0;
+            if (wgDist(here, centre) < CAVE_POOL_RADIUS && solid) {
+                grid.setBlock(x, CAVE_POOL_Y, z, LumenBlock::Lava.id());
+            }
+        }
+    }
+}
+
+// Crystals on the stone around the chamber and tunnel, wherever the stone faces open air.
+fn growCrystals(grid : Shared<VoxelGrid>) : void {
+    let x0 : i32 = WORLD_VALLEY + CRYSTAL_SCAN_X;
+    let z0 : i32 = WORLD_VALLEY + CRYSTAL_SCAN_Z;
+    for (z of z0..(z0 + CRYSTAL_SCAN_SIZE)) {
+        for (y of CRYSTAL_SCAN_Y0..CRYSTAL_SCAN_Y1) {
+            for (x of x0..(x0 + CRYSTAL_SCAN_SIZE)) {
+                growCrystal(grid, x, y, z);
+            }
+        }
+    }
+}
+
+// Turns the stone cell (x, y, z) into a crystal when a hash picks it, it is inside the mountain and it touches air.
+fn growCrystal(grid : Shared<VoxelGrid>, x : i32, y : i32, z : i32) : void {
+    if (grid.blockAt(x, y, z) != LumenBlock::Stone.id()) {
+        return;
+    }
+    if (lnUnit(x, y, z, CRYSTAL_SEED) >= CRYSTAL_CHANCE) {
+        return;
+    }
+    if (!crystalSpot(x, y, z)) {
+        return;
+    }
+    let open : bool = grid.blockAt(x, y + 1, z) == 0 || grid.blockAt(x + 1, y, z) == 0
+        || grid.blockAt(x, y, z + 1) == 0
+        || grid.blockAt(x, y - 1, z) == 0;
+    if (!open) {
+        return;
+    }
+
+    let mut id : i32 = LumenBlock::CrystalBlue.id();
+    if (lnUnit(x, y, z, CRYSTAL_PINK_SEED) < CRYSTAL_PINK_CHANCE) {
+        id = LumenBlock::CrystalPink.id();
+    }
+    grid.setBlock(x, y, z, id);
+}
+
+// Crystals grow only inside the mountain: within reach of the chamber's heart.
+fn crystalSpot(x : i32, y : i32, z : i32) : bool {
+    let dx : f32 = (x as f32) - ((WORLD_VALLEY as f32) + CAVE_CHAMBER_X);
+    let dy : f32 = (y as f32) - CRYSTAL_HEART_Y;
+    let dz : f32 = (z as f32) - ((WORLD_VALLEY as f32) + CAVE_CHAMBER_Z);
+    return dx * dx + dy * dy + dz * dz < CRYSTAL_REACH * CRYSTAL_REACH;
+}

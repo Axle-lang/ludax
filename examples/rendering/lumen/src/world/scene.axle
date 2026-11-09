@@ -1,0 +1,726 @@
+// scene — the voxel world as the renderer sees it: one flat array of block ids and the ray walker over it.
+//
+// The light engine keeps blocks in 16-cell chunks behind a hash map, which is right for editing and for
+// bakes; a camera ray wants one load per cell. So the renderer takes a flat copy at start-up and walks that
+// with the Amanatides-Woo traversal. A walk never tests the cell it starts in (the origin of a secondary ray is
+// already pushed off the surface it left), steps the axis whose boundary is nearest, and reports the face it
+// entered, which is the geometric normal.
+//
+// Clear blocks (glass, ice, and water for shadow rays) are walked through with their tint accumulated in
+// `tr`; leaves and window frames are decided per texel, so a ray passes through a hole in a leaf.
+
+use ludax::lnFloor;
+use ludax::{Ray, Vec3, VoxelGrid, sqrt};
+
+use crate::world::blocks::{BLOCK_COUNT, BlockPalette, LumenBlock, LumenKind};
+use crate::world::hit::LumenHit;
+use crate::world::texture::{LumenAtlas, lumenTexelAt, lumenLeafHole, lumenGlassFrame};
+
+// A boundary time no ray can reach, for the axes a ray never crosses.
+const SCENE_NEVER : f32 = 1000000000.0;
+
+// A direction component below this is parallel enough that its axis never steps.
+const SCENE_PARALLEL : f32 = 0.0000001;
+
+// The walker's guard against a malformed ray that would otherwise loop forever.
+const SCENE_STEP_GUARD : i32 = 4000;
+
+// Below this transmittance a shadow ray is blocked: the remaining light could not show.
+const SCENE_TR_MIN : f32 = 0.01;
+
+/**
+ * Holes in leaves and the frames of glass are texel-sized detail. Past this distance a texel is smaller than a
+ * pixel and whether a ray lands in a hole is a coin toss that changes with every sub-pixel jitter. A shadow ray
+ * has no pixel to average over, so past it a shadow ray takes the mean transmittance of the detail instead
+ * (below). A seen ray keeps resolving the texels at every distance: its frames accumulate, which averages the
+ * coin toss, and a canopy or a window that stopped being hit past the detail distance would vanish.
+ */
+pub const SCENE_DETAIL : f32 = 26.0;
+
+// The mean of the texel detail past `SCENE_DETAIL`: a pane's wooden frame covers 43.75 per cent of its texels
+// and a canopy's holes are 32 per cent of theirs, so a shadow ray through a pane or a leaf there transmits
+// exactly that complement. Near texels and the far mean then agree, and a shadow does not pop at the distance.
+const SCENE_FRAME_PASS : f32 = 0.5625;
+const SCENE_LEAF_PASS : f32 = 0.68;
+
+// How many block ids a byte can name: the size of the tracing table, so a `u8` index never leaves it.
+const SCENE_IDS : i32 = 256;
+
+// The ray walker steps over bricks of 8 x 8 x 8 cells that hold only air in one move.
+const SCENE_BRICK : i32 = 8;
+const SCENE_BRICK_SHIFT : i32 = 3;
+
+/** The flat world. */
+pub class LumenScene {
+    /** Width of the world in cells. */
+    pub sx : i32;
+
+    /** Height of the world in cells. */
+    pub sy : i32;
+
+    /** Depth of the world in cells. */
+    pub sz : i32;
+
+    /** The material and tracing table every block id is read through. */
+    pub pal : BlockPalette;
+
+    /** The tabulated textures, shared by every face. */
+    pub atlas : LumenAtlas;
+
+    // One byte a cell: the block ids are unsigned bytes (255 of them before the schema must grow), and the
+    // flat world is the renderer's largest array — a word a cell would quadruple it for nothing.
+    blocks : u8[];
+
+    // The tracing word of each block id: the kind in the low byte, the obstacle class above it. The walkers
+    // read one word per block instead of walking two palette tables through two calls. The table spans all
+    // `SCENE_IDS` byte ids, so the u8 index needs no bounds check for LLVM to prove it: every check left in the walk
+    // loop is one the optimiser cannot see past.
+    pack   : i32[];
+    bricks : i8[];
+    nbx    : i32;
+    nby    : i32;
+    nbz    : i32;
+
+    /** A copy of the `sx * sy * sz` cells of `grid` from the origin up. */
+    constructor(grid : Shared<VoxelGrid>, sx : i32, sy : i32, sz : i32, own pal : BlockPalette) {
+        self.sx = sx;
+        self.sy = sy;
+        self.sz = sz;
+        self.pal = pal;
+        self.pack = new i32[SCENE_IDS as i64];
+        for (id of 0..BLOCK_COUNT) {
+            self.pack[id as i64] = (self.pal.classOf(id) << 8) | self.pal.kindOf(id).code();
+        }
+        // An id past the block list walks like air: no kind, no class.
+        for (id of BLOCK_COUNT..SCENE_IDS) {
+            self.pack[id as i64] = 0;
+        }
+        self.atlas = new LumenAtlas(self.pal);
+        self.blocks = new u8[(sx as i64) * sy * sz];
+        self.nbx = (sx + SCENE_BRICK - 1) / SCENE_BRICK;
+        self.nby = (sy + SCENE_BRICK - 1) / SCENE_BRICK;
+        self.nbz = (sz + SCENE_BRICK - 1) / SCENE_BRICK;
+        self.bricks = new i8[(self.nbx as i64) * self.nby * self.nbz];
+        for (i of 0..((self.nbx as i64) * self.nby * self.nbz)) {
+            self.bricks[i] = 0;
+        }
+        for (y of 0..sy) {
+            for (z of 0..sz) {
+                for (x of 0..sx) {
+                    let b : i32 = grid.blockAt(x, y, z);
+                    self.blocks[self.index(x, y, z)] = b as u8;
+                    if (b != 0) {
+                        self.bricks[self.brickOf(x, y, z)] = 1;
+                    }
+                }
+            }
+        }
+    }
+
+    // The brick holding cell (x, y, z): a cube of SCENE_BRICK cells a side, marked when any cell in it is not air.
+    fn brickOf(self, x : i32, y : i32, z : i32) : i64 {
+        return ((y >> SCENE_BRICK_SHIFT) as i64 * self.nbz + (z >> SCENE_BRICK_SHIFT) as i64) * self.nbx
+            + (x >> SCENE_BRICK_SHIFT) as i64;
+    }
+
+    /** The flat index of cell (x, y, z); callers keep it in bounds. */
+    pub fn index(self, x : i32, y : i32, z : i32) : i64 {
+        return (x as i64) + (self.sx as i64) * ((z as i64) + (self.sz as i64) * (y as i64));
+    }
+
+    /** True when the cell lies inside the world. */
+    pub fn inside(self, x : i32, y : i32, z : i32) : bool {
+        return x >= 0 && x < self.sx && y >= 0 && y < self.sy && z >= 0 && z < self.sz;
+    }
+
+    /** The block at a cell; air outside the world. */
+    pub fn at(self, x : i32, y : i32, z : i32) : i32 {
+        if (!self.inside(x, y, z)) {
+            return 0;
+        }
+        return self.blocks[self.index(x, y, z)] as i32;
+    }
+
+    /** True for a block light does not pass: not air, not water, not glass. */
+    pub fn isSolid(self, x : i32, y : i32, z : i32) : bool {
+        let b : i32 = self.at(x, y, z);
+        if (b == 0) {
+            return false;
+        }
+        let k : LumenKind = self.pal.kindOf(b);
+        return k != LumenKind::Water && k != LumenKind::Glass;
+    }
+
+    /** The longest straight line the world can hold: the reach a ray walker inside it needs. */
+    pub fn diagonal(self) : f32 {
+        return sqrt((self.sx * self.sx + self.sy * self.sy + self.sz * self.sz) as f32);
+    }
+
+    /** The height of the highest non-air cell in column (x, z), or -1 for an empty column. */
+    pub fn columnTop(self, x : i32, z : i32) : i32 {
+        let mut y : i32 = self.sy - 1;
+        while (y >= 0) {
+            if (self.blocks[self.index(x, y, z)] != 0) {
+                return y;
+            }
+            y = y - 1;
+        }
+        return -1;
+    }
+
+    /**
+     * Walks `ray` for at most `tmax`. `shadow` rays pass through water as well as glass, collecting its tint;
+     * other rays stop at water. A block whose obstacle class is in the `pass` mask is not there at all for this
+     * ray.
+     */
+    pub fn trace(self, ray : Ray, tmax : f32, shadow : bool, pass : i32) : LumenHit {
+        let ox : f32 = ray.origin.x;
+        let oy : f32 = ray.origin.y;
+        let oz : f32 = ray.origin.z;
+        let dx : f32 = ray.direction.x;
+        let dy : f32 = ray.direction.y;
+        let dz : f32 = ray.direction.z;
+        let mut r : LumenHit = LumenHit {};
+        let mut cx : i32 = lnFloor(ox);
+        let mut cy : i32 = lnFloor(oy);
+        let mut cz : i32 = lnFloor(oz);
+        if (!self.inside(cx, cy, cz)) {
+            return r;
+        }
+        let mut stepX : i32 = 1;
+        let mut stepY : i32 = 1;
+        let mut stepZ : i32 = 1;
+        let mut tdx : f32 = SCENE_NEVER;
+        let mut tdy : f32 = SCENE_NEVER;
+        let mut tdz : f32 = SCENE_NEVER;
+        let mut tmx : f32 = SCENE_NEVER;
+        let mut tmy : f32 = SCENE_NEVER;
+        let mut tmz : f32 = SCENE_NEVER;
+        if (dx > SCENE_PARALLEL) {
+            tdx = (1.0 as f32) / dx;
+            tmx = ((cx + 1) as f32 - ox) * tdx;
+        } else if (dx < -SCENE_PARALLEL) {
+            stepX = -1;
+            tdx = (-1.0 as f32) / dx;
+            tmx = (ox - cx as f32) * tdx;
+        }
+        if (dy > SCENE_PARALLEL) {
+            tdy = (1.0 as f32) / dy;
+            tmy = ((cy + 1) as f32 - oy) * tdy;
+        } else if (dy < -SCENE_PARALLEL) {
+            stepY = -1;
+            tdy = (-1.0 as f32) / dy;
+            tmy = (oy - cy as f32) * tdy;
+        }
+        if (dz > SCENE_PARALLEL) {
+            tdz = (1.0 as f32) / dz;
+            tmz = ((cz + 1) as f32 - oz) * tdz;
+        } else if (dz < -SCENE_PARALLEL) {
+            stepZ = -1;
+            tdz = (-1.0 as f32) / dz;
+            tmz = (oz - cz as f32) * tdz;
+        }
+        let strideX : i64 = stepX as i64;
+        let strideY : i64 = (stepY as i64) * (self.sx as i64) * (self.sz as i64);
+        let strideZ : i64 = (stepZ as i64) * (self.sx as i64);
+        // The brick of the current cell, carried across steps: only the axis the walk just stepped can have
+        // crossed a brick boundary, so the walk re-derives the brick there and not at every cell.
+        let mut bx : i32 = cx >> SCENE_BRICK_SHIFT;
+        let mut by : i32 = cy >> SCENE_BRICK_SHIFT;
+        let mut bz : i32 = cz >> SCENE_BRICK_SHIFT;
+        let mut brick : i64 = self.brickOf(cx, cy, cz);
+        let mut at : i64 = self.index(cx, cy, cz);
+        let mut nx : i32 = 0;
+        let mut ny : i32 = 0;
+        let mut nz : i32 = 0;
+        let mut t : f32 = 0.0;
+        let mut tr : Vec3 = Vec3 { x: 1.0, y: 1.0, z: 1.0 };
+        let mut guard : i32 = 0;
+        while (guard < SCENE_STEP_GUARD) {
+            guard = guard + 1;
+            if (self.bricks[brick] == 0) {
+                // The brick is all air: leave it in one move, by the face the ray reaches first.
+                let lx : i32 = (cx >> SCENE_BRICK_SHIFT) << SCENE_BRICK_SHIFT;
+                let ly : i32 = (cy >> SCENE_BRICK_SHIFT) << SCENE_BRICK_SHIFT;
+                let lz : i32 = (cz >> SCENE_BRICK_SHIFT) << SCENE_BRICK_SHIFT;
+                let mut ex : f32 = SCENE_NEVER;
+                let mut ey : f32 = SCENE_NEVER;
+                let mut ez : f32 = SCENE_NEVER;
+                if (stepX > 0 && dx > SCENE_PARALLEL) {
+                    ex = ((lx + SCENE_BRICK) as f32 - ox) * tdx;
+                } else if (dx < -SCENE_PARALLEL) {
+                    ex = (ox - lx as f32) * tdx;
+                }
+                if (stepY > 0 && dy > SCENE_PARALLEL) {
+                    ey = ((ly + SCENE_BRICK) as f32 - oy) * tdy;
+                } else if (dy < -SCENE_PARALLEL) {
+                    ey = (oy - ly as f32) * tdy;
+                }
+                if (stepZ > 0 && dz > SCENE_PARALLEL) {
+                    ez = ((lz + SCENE_BRICK) as f32 - oz) * tdz;
+                } else if (dz < -SCENE_PARALLEL) {
+                    ez = (oz - lz as f32) * tdz;
+                }
+                nx = 0;
+                ny = 0;
+                nz = 0;
+                if (ex <= ey && ex <= ez) {
+                    t = ex;
+                    nx = -stepX;
+                } else if (ey <= ez) {
+                    t = ey;
+                    ny = -stepY;
+                } else {
+                    t = ez;
+                    nz = -stepZ;
+                }
+                if (t > tmax) {
+                    break;
+                }
+                // The cell the ray enters: the far side of the face it left by, the floor of its position on
+                // the other two axes. Then the walker's state is rebuilt from that cell.
+                if (nx != 0) {
+                    if (stepX > 0) {
+                        cx = lx + SCENE_BRICK;
+                    } else {
+                        cx = lx - 1;
+                    }
+                } else {
+                    cx = lnFloor(ox + dx * t);
+                }
+                if (ny != 0) {
+                    if (stepY > 0) {
+                        cy = ly + SCENE_BRICK;
+                    } else {
+                        cy = ly - 1;
+                    }
+                } else {
+                    cy = lnFloor(oy + dy * t);
+                }
+                if (nz != 0) {
+                    if (stepZ > 0) {
+                        cz = lz + SCENE_BRICK;
+                    } else {
+                        cz = lz - 1;
+                    }
+                } else {
+                    cz = lnFloor(oz + dz * t);
+                }
+                if (!self.inside(cx, cy, cz)) {
+                    break;
+                }
+                bx = cx >> SCENE_BRICK_SHIFT;
+                by = cy >> SCENE_BRICK_SHIFT;
+                bz = cz >> SCENE_BRICK_SHIFT;
+                brick = self.brickOf(cx, cy, cz);
+                at = self.index(cx, cy, cz);
+                if (dx > SCENE_PARALLEL) {
+                    tmx = ((cx + 1) as f32 - ox) * tdx;
+                } else if (dx < -SCENE_PARALLEL) {
+                    tmx = (ox - cx as f32) * tdx;
+                }
+                if (dy > SCENE_PARALLEL) {
+                    tmy = ((cy + 1) as f32 - oy) * tdy;
+                } else if (dy < -SCENE_PARALLEL) {
+                    tmy = (oy - cy as f32) * tdy;
+                }
+                if (dz > SCENE_PARALLEL) {
+                    tmz = ((cz + 1) as f32 - oz) * tdz;
+                } else if (dz < -SCENE_PARALLEL) {
+                    tmz = (oz - cz as f32) * tdz;
+                }
+            } else {
+                if (tmx < tmy && tmx < tmz) {
+                    cx = cx + stepX;
+                    at = at + strideX;
+                    t = tmx;
+                    tmx = tmx + tdx;
+                    nx = -stepX;
+                    ny = 0;
+                    nz = 0;
+                    let nbx : i32 = cx >> SCENE_BRICK_SHIFT;
+                    if (nbx != bx) {
+                        bx = nbx;
+                        brick = self.brickOf(cx, cy, cz);
+                    }
+                } else if (tmy < tmz) {
+                    cy = cy + stepY;
+                    at = at + strideY;
+                    t = tmy;
+                    tmy = tmy + tdy;
+                    nx = 0;
+                    ny = -stepY;
+                    nz = 0;
+                    let nby : i32 = cy >> SCENE_BRICK_SHIFT;
+                    if (nby != by) {
+                        by = nby;
+                        brick = self.brickOf(cx, cy, cz);
+                    }
+                } else {
+                    cz = cz + stepZ;
+                    at = at + strideZ;
+                    t = tmz;
+                    tmz = tmz + tdz;
+                    nx = 0;
+                    ny = 0;
+                    nz = -stepZ;
+                    let nbz : i32 = cz >> SCENE_BRICK_SHIFT;
+                    if (nbz != bz) {
+                        bz = nbz;
+                        brick = self.brickOf(cx, cy, cz);
+                    }
+                }
+                if (t > tmax || !self.inside(cx, cy, cz)) {
+                    break;
+                }
+            }
+            let b : i32 = self.blocks[at] as i32;
+            if (b == 0) {
+                continue;
+            }
+            let pack : i32 = self.pack[b as i64];
+            if (pass != 0 && (pass & (pack >>> 8)) != 0) {
+                continue;
+            }
+            let kind : LumenKind = LumenKind::fromCode(pack & 255);
+            let mut face : i32 = 2;
+            if (nx > 0) {
+                face = 0;
+            } else if (nx < 0) {
+                face = 1;
+            } else if (ny > 0) {
+                face = 2;
+            } else if (ny < 0) {
+                face = 3;
+            } else if (nz > 0) {
+                face = 4;
+            } else {
+                face = 5;
+            }
+            let mut texel : i32 = 0;
+            if (kind == LumenKind::Cutout || kind == LumenKind::Glass) {
+                let fx : f32 = scUnit(ox + dx * t - cx as f32);
+                let fy : f32 = scUnit(oy + dy * t - cy as f32);
+                let fz : f32 = scUnit(oz + dz * t - cz as f32);
+                texel = lumenTexelAt(face, fx, fy, fz);
+            }
+            if (kind == LumenKind::Cutout) {
+                if (shadow && t >= SCENE_DETAIL) {
+                    // Far canopy seen by a shadow ray: the holes averaged into one transmittance.
+                    tr = tr.times(Vec3::splat(SCENE_LEAF_PASS));
+                    continue;
+                }
+                // A seen ray resolves the texel at every distance: the jitter and the frames that follow average
+                // the holes, so the canopy thins smoothly instead of switching at a distance.
+                if (lumenLeafHole(texel)) {
+                    continue;
+                }
+            }
+            if (kind == LumenKind::Glass) {
+                if (b == LumenBlock::Ice.id()) {
+                    tr = tr.times(self.pal.passOf(b));
+                    continue;
+                }
+                if (shadow && t >= SCENE_DETAIL) {
+                    tr = tr.times(self.pal.passOf(b)).times(Vec3::splat(SCENE_FRAME_PASS));
+                    continue;
+                }
+                // Likewise the frame of a pane is resolved at every distance, so a window never loses it.
+                if (!lumenGlassFrame(texel)) {
+                    tr = tr.times(self.pal.passOf(b));
+                    continue;
+                }
+            }
+            if (kind == LumenKind::Water && shadow) {
+                tr = tr.times(self.pal.passOf(b));
+                if (tr.maxComponent() < SCENE_TR_MIN) {
+                    r.hit = true;
+                    r.t = t;
+                    return r;
+                }
+                continue;
+            }
+            r.hit = true;
+            r.t = t;
+            r.x = cx;
+            r.y = cy;
+            r.z = cz;
+            r.nx = nx;
+            r.ny = ny;
+            r.nz = nz;
+            r.face = face;
+            r.block = b;
+            r.texel = texel;
+            r.tr = tr;
+            return r;
+        }
+        r.tr = tr;
+        return r;
+    }
+
+    /**
+     * How much of a light of `pass` reaches along `ray`, as a per-channel transmittance: 1 is clear, 0 is
+     * blocked. The same walk and rules as `trace` (leaf holes, glass frames, the water tint), without the
+     * description of what was struck, which a shadow ray does not need.
+     */
+    pub fn visibility(self, ray : Ray, tmax : f32, pass : i32) : Vec3 {
+        let ox : f32 = ray.origin.x;
+        let oy : f32 = ray.origin.y;
+        let oz : f32 = ray.origin.z;
+        let dx : f32 = ray.direction.x;
+        let dy : f32 = ray.direction.y;
+        let dz : f32 = ray.direction.z;
+        let mut cx : i32 = lnFloor(ox);
+        let mut cy : i32 = lnFloor(oy);
+        let mut cz : i32 = lnFloor(oz);
+        let mut tr : Vec3 = Vec3 { x: 1.0, y: 1.0, z: 1.0 };
+        if (!self.inside(cx, cy, cz)) {
+            return tr;
+        }
+        let mut stepX : i32 = 1;
+        let mut stepY : i32 = 1;
+        let mut stepZ : i32 = 1;
+        let mut tdx : f32 = SCENE_NEVER;
+        let mut tdy : f32 = SCENE_NEVER;
+        let mut tdz : f32 = SCENE_NEVER;
+        let mut tmx : f32 = SCENE_NEVER;
+        let mut tmy : f32 = SCENE_NEVER;
+        let mut tmz : f32 = SCENE_NEVER;
+        if (dx > SCENE_PARALLEL) {
+            tdx = (1.0 as f32) / dx;
+            tmx = ((cx + 1) as f32 - ox) * tdx;
+        } else if (dx < -SCENE_PARALLEL) {
+            stepX = -1;
+            tdx = (-1.0 as f32) / dx;
+            tmx = (ox - cx as f32) * tdx;
+        }
+        if (dy > SCENE_PARALLEL) {
+            tdy = (1.0 as f32) / dy;
+            tmy = ((cy + 1) as f32 - oy) * tdy;
+        } else if (dy < -SCENE_PARALLEL) {
+            stepY = -1;
+            tdy = (-1.0 as f32) / dy;
+            tmy = (oy - cy as f32) * tdy;
+        }
+        if (dz > SCENE_PARALLEL) {
+            tdz = (1.0 as f32) / dz;
+            tmz = ((cz + 1) as f32 - oz) * tdz;
+        } else if (dz < -SCENE_PARALLEL) {
+            stepZ = -1;
+            tdz = (-1.0 as f32) / dz;
+            tmz = (oz - cz as f32) * tdz;
+        }
+        let strideX : i64 = stepX as i64;
+        let strideY : i64 = (stepY as i64) * (self.sx as i64) * (self.sz as i64);
+        let strideZ : i64 = (stepZ as i64) * (self.sx as i64);
+        let mut bx : i32 = cx >> SCENE_BRICK_SHIFT;
+        let mut by : i32 = cy >> SCENE_BRICK_SHIFT;
+        let mut bz : i32 = cz >> SCENE_BRICK_SHIFT;
+        let mut brick : i64 = self.brickOf(cx, cy, cz);
+        let mut at : i64 = self.index(cx, cy, cz);
+        let mut axis : i32 = 0;
+        let mut t : f32 = 0.0;
+        let mut guard : i32 = 0;
+        while (guard < SCENE_STEP_GUARD) {
+            guard = guard + 1;
+            if (self.bricks[brick] == 0) {
+                let lx : i32 = (cx >> SCENE_BRICK_SHIFT) << SCENE_BRICK_SHIFT;
+                let ly : i32 = (cy >> SCENE_BRICK_SHIFT) << SCENE_BRICK_SHIFT;
+                let lz : i32 = (cz >> SCENE_BRICK_SHIFT) << SCENE_BRICK_SHIFT;
+                let mut ex : f32 = SCENE_NEVER;
+                let mut ey : f32 = SCENE_NEVER;
+                let mut ez : f32 = SCENE_NEVER;
+                if (stepX > 0 && dx > SCENE_PARALLEL) {
+                    ex = ((lx + SCENE_BRICK) as f32 - ox) * tdx;
+                } else if (dx < -SCENE_PARALLEL) {
+                    ex = (ox - lx as f32) * tdx;
+                }
+                if (stepY > 0 && dy > SCENE_PARALLEL) {
+                    ey = ((ly + SCENE_BRICK) as f32 - oy) * tdy;
+                } else if (dy < -SCENE_PARALLEL) {
+                    ey = (oy - ly as f32) * tdy;
+                }
+                if (stepZ > 0 && dz > SCENE_PARALLEL) {
+                    ez = ((lz + SCENE_BRICK) as f32 - oz) * tdz;
+                } else if (dz < -SCENE_PARALLEL) {
+                    ez = (oz - lz as f32) * tdz;
+                }
+                if (ex <= ey && ex <= ez) {
+                    t = ex;
+                    axis = 0;
+                } else if (ey <= ez) {
+                    t = ey;
+                    axis = 1;
+                } else {
+                    t = ez;
+                    axis = 2;
+                }
+                if (t > tmax) {
+                    break;
+                }
+                if (axis == 0) {
+                    if (stepX > 0) {
+                        cx = lx + SCENE_BRICK;
+                    } else {
+                        cx = lx - 1;
+                    }
+                } else {
+                    cx = lnFloor(ox + dx * t);
+                }
+                if (axis == 1) {
+                    if (stepY > 0) {
+                        cy = ly + SCENE_BRICK;
+                    } else {
+                        cy = ly - 1;
+                    }
+                } else {
+                    cy = lnFloor(oy + dy * t);
+                }
+                if (axis == 2) {
+                    if (stepZ > 0) {
+                        cz = lz + SCENE_BRICK;
+                    } else {
+                        cz = lz - 1;
+                    }
+                } else {
+                    cz = lnFloor(oz + dz * t);
+                }
+                if (!self.inside(cx, cy, cz)) {
+                    break;
+                }
+                bx = cx >> SCENE_BRICK_SHIFT;
+                by = cy >> SCENE_BRICK_SHIFT;
+                bz = cz >> SCENE_BRICK_SHIFT;
+                brick = self.brickOf(cx, cy, cz);
+                at = self.index(cx, cy, cz);
+                if (dx > SCENE_PARALLEL) {
+                    tmx = ((cx + 1) as f32 - ox) * tdx;
+                } else if (dx < -SCENE_PARALLEL) {
+                    tmx = (ox - cx as f32) * tdx;
+                }
+                if (dy > SCENE_PARALLEL) {
+                    tmy = ((cy + 1) as f32 - oy) * tdy;
+                } else if (dy < -SCENE_PARALLEL) {
+                    tmy = (oy - cy as f32) * tdy;
+                }
+                if (dz > SCENE_PARALLEL) {
+                    tmz = ((cz + 1) as f32 - oz) * tdz;
+                } else if (dz < -SCENE_PARALLEL) {
+                    tmz = (oz - cz as f32) * tdz;
+                }
+            } else {
+                if (tmx < tmy && tmx < tmz) {
+                    cx = cx + stepX;
+                    at = at + strideX;
+                    t = tmx;
+                    tmx = tmx + tdx;
+                    axis = 0;
+                    let nbx : i32 = cx >> SCENE_BRICK_SHIFT;
+                    if (nbx != bx) {
+                        bx = nbx;
+                        brick = self.brickOf(cx, cy, cz);
+                    }
+                } else if (tmy < tmz) {
+                    cy = cy + stepY;
+                    at = at + strideY;
+                    t = tmy;
+                    tmy = tmy + tdy;
+                    axis = 1;
+                    let nby : i32 = cy >> SCENE_BRICK_SHIFT;
+                    if (nby != by) {
+                        by = nby;
+                        brick = self.brickOf(cx, cy, cz);
+                    }
+                } else {
+                    cz = cz + stepZ;
+                    at = at + strideZ;
+                    t = tmz;
+                    tmz = tmz + tdz;
+                    axis = 2;
+                    let nbz : i32 = cz >> SCENE_BRICK_SHIFT;
+                    if (nbz != bz) {
+                        bz = nbz;
+                        brick = self.brickOf(cx, cy, cz);
+                    }
+                }
+                if (t > tmax || !self.inside(cx, cy, cz)) {
+                    break;
+                }
+            }
+            let b : i32 = self.blocks[at] as i32;
+            if (b == 0) {
+                continue;
+            }
+            let pack : i32 = self.pack[b as i64];
+            if (pass != 0 && (pass & (pack >>> 8)) != 0) {
+                continue;
+            }
+            let kind : LumenKind = LumenKind::fromCode(pack & 255);
+            if (kind == LumenKind::Opaque) {
+                return Vec3::zero();
+            }
+            if (kind == LumenKind::Water) {
+                tr = tr.times(self.pal.passOf(b));
+                if (tr.maxComponent() < SCENE_TR_MIN) {
+                    return Vec3::zero();
+                }
+                continue;
+            }
+            // Leaves and glass are decided per texel, which needs the face the ray came through.
+            let mut face : i32 = 1;
+            if (axis == 0 && stepX < 0) {
+                face = 0;
+            } else if (axis == 1) {
+                face = 3;
+                if (stepY < 0) {
+                    face = 2;
+                }
+            } else if (axis == 2) {
+                face = 5;
+                if (stepZ < 0) {
+                    face = 4;
+                }
+            }
+            let texel : i32 = lumenTexelAt(
+                face,
+                scUnit(ox + dx * t - cx as f32),
+                scUnit(oy + dy * t - cy as f32),
+                scUnit(oz + dz * t - cz as f32)
+            );
+            if (kind == LumenKind::Cutout) {
+                if (t >= SCENE_DETAIL) {
+                    tr = tr.times(Vec3::splat(SCENE_LEAF_PASS));
+                    continue;
+                }
+                if (!lumenLeafHole(texel)) {
+                    return Vec3::zero();
+                }
+                continue;
+            }
+            if (b == LumenBlock::Ice.id()) {
+                tr = tr.times(self.pal.passOf(b));
+                continue;
+            }
+            if (t >= SCENE_DETAIL) {
+                tr = tr.times(self.pal.passOf(b)).times(Vec3::splat(SCENE_FRAME_PASS));
+                continue;
+            }
+            if (!lumenGlassFrame(texel)) {
+                tr = tr.times(self.pal.passOf(b));
+                continue;
+            }
+            return Vec3::zero();
+        }
+        return tr;
+    }
+}
+
+fn scUnit(v : f32) : f32 {
+    if (v < 0.0) {
+        return 0.0;
+    }
+    if (v > 1.0) {
+        return 1.0;
+    }
+    return v;
+}

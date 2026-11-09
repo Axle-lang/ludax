@@ -1,0 +1,877 @@
+// texture — the 16 x 16 pixel look of every block, computed rather than stored.
+//
+// A block face is a grid of 16 x 16 texels. Each texel has an albedo, a height (the shader turns height
+// differences between neighbouring texels into a normal, so the surface is bumpy the way a resource pack's
+// normal maps are) and a glow factor that scales the block's emission (lava flows, crystals sparkle). The
+// patterns are noise functions of the texel and the block id, so every face of every block is the same on
+// every run and there are no image files to load.
+
+use ludax::{Vec2, Vec3, sin, min};
+use ludax::{lnUnit, lnValue2, lnFloor};
+
+use crate::world::blocks::{LumenBlock, BlockPalette, BLOCK_COUNT};
+
+/** Texels along an edge of a block face. */
+const TEX_SIZE : i32 = 16;
+
+/** Texels along an edge, as the scale from a position in the cell (0 to 1) to texel units. */
+const TEX_SIZE_F : f32 = 16.0;
+
+/** The middle of the tile in texel units, where a log's rings are centred. */
+const TEX_CENTRE : f32 = 7.5;
+
+/** The texel row or column on either side of the middle of the tile: a window's cross runs along these two. */
+const TEX_MID_LOW : i32 = 7;
+const TEX_MID_HIGH : i32 = 8;
+
+/** The faces of a block, by number: the sides `+x` and `-x` first, then the top and bottom, then `+z` and `-z`. */
+const TEX_FACE_POS_X : i32 = 0;
+const TEX_FACE_TOP : i32 = 2;
+const TEX_FACE_BOTTOM : i32 = 3;
+const TEX_FACE_NEG_Z : i32 = 5;
+
+/** Each block owns this many salts, one per face with room to spare, so no two faces share noise. */
+const TEX_SALT_STRIDE : i32 = 8;
+
+/** A packed texel keeps the column in its low byte and the row above it. */
+const TEX_ROW_SHIFT : i32 = 8;
+const TEX_COLUMN_MASK : i32 = 255;
+
+/** Holes in leaves are two texels across (the texel coordinate is shifted by this), so they survive minification. */
+const TEX_LEAF_HOLE_SHIFT : i32 = 1;
+
+/** A leaf texel is a hole when its hash is below this chance. */
+const TEX_LEAF_HOLE_CHANCE : f32 = 0.32;
+const TEX_LEAF_HOLE_Z : i32 = 7;
+const TEX_LEAF_HOLE_SEED : i32 = 91;
+
+/** The hash of every pattern: the third coordinate and the seed, one pair per pattern so no two share noise. */
+const TEX_STONE_SEED : i32 = 11;
+const TEX_STONE_CRACK_SEED : i32 = 5;
+const TEX_COBBLE_Z : i32 = 3;
+const TEX_COBBLE_SEED : i32 = 17;
+const TEX_COBBLE_GRAIN_Z : i32 = 4;
+const TEX_COBBLE_GRAIN_SEED : i32 = 19;
+const TEX_GRASS_Z : i32 = 9;
+const TEX_GRASS_SEED : i32 = 23;
+const TEX_GRASS_BLADE_SEED : i32 = 29;
+const TEX_DIRT_SEED : i32 = 31;
+const TEX_LOG_STREAK_Z : i32 = 5;
+const TEX_LOG_STREAK_SEED : i32 = 37;
+const TEX_LOG_GRAIN_Z : i32 = 6;
+const TEX_LOG_GRAIN_SEED : i32 = 41;
+const TEX_PLANKS_TONE_Z : i32 = 2;
+const TEX_PLANKS_TONE_SEED : i32 = 43;
+const TEX_PLANKS_GRAIN_Z : i32 = 8;
+const TEX_PLANKS_GRAIN_SEED : i32 = 47;
+const TEX_ROOF_Z : i32 = 12;
+const TEX_ROOF_SEED : i32 = 53;
+const TEX_LEAVES_Z : i32 = 14;
+const TEX_LEAVES_SEED : i32 = 59;
+const TEX_LAVA_A_SEED : i32 = 61;
+const TEX_LAVA_B_SEED : i32 = 67;
+const TEX_CRYSTAL_Z : i32 = 16;
+const TEX_CRYSTAL_SEED : i32 = 71;
+const TEX_LANTERN_Z : i32 = 18;
+const TEX_LANTERN_SEED : i32 = 73;
+const TEX_FLAT_SEED : i32 = 79;
+const TEX_WOOL_Z : i32 = 20;
+const TEX_WOOL_SEED : i32 = 83;
+const TEX_SAND_Z : i32 = 21;
+const TEX_SAND_SEED : i32 = 89;
+const TEX_SAND_RIPPLE_SEED : i32 = 97;
+const TEX_FRINGE_Z : i32 = 25;
+const TEX_FRINGE_SEED : i32 = 101;
+const TEX_FLECK_Z : i32 = 27;
+const TEX_FLECK_SEED : i32 = 103;
+const TEX_BEACON_Z : i32 = 30;
+const TEX_BEACON_SEED : i32 = 107;
+
+/** Stone: the shade is a base plus a spread of the hash, the relief likewise. */
+const TEX_STONE_SHADE : f32 = 0.78;
+const TEX_STONE_SHADE_SPREAD : f32 = 0.34;
+const TEX_STONE_RELIEF : f32 = 0.35;
+const TEX_STONE_RELIEF_SPREAD : f32 = 0.5;
+
+/** A crack is where a slower noise (this many noise cells per texel) falls below `TEX_STONE_CRACK_BELOW`. */
+const TEX_STONE_CRACK_SCALE : f32 = 0.55;
+const TEX_STONE_CRACK_BELOW : f32 = 0.3;
+
+/** Inside a crack the stone is this much darker and this deep. */
+const TEX_STONE_CRACK_SHADE : f32 = 0.7;
+const TEX_STONE_CRACK_RELIEF : f32 = 0.12;
+
+/** Seams between stones, boards and shingles are grooves: this deep, the relief of the lowest texel. */
+const TEX_GROOVE_RELIEF : f32 = 0.05;
+
+/** A cobble is this many texels wide and tall, and alternate columns are offset by one stone's height. */
+const TEX_COBBLE_WIDTH : i32 = 5;
+const TEX_COBBLE_HEIGHT : i32 = 4;
+
+/** A cobble's shade and relief rise with its own hash; the grain adds a little per texel. */
+const TEX_COBBLE_SHADE : f32 = 0.65;
+const TEX_COBBLE_SHADE_SPREAD : f32 = 0.5;
+const TEX_COBBLE_GRAIN : f32 = 0.1;
+const TEX_COBBLE_RELIEF : f32 = 0.55;
+const TEX_COBBLE_RELIEF_SPREAD : f32 = 0.25;
+
+/** The mortar between cobbles and the seams between boards are this much darker. */
+const TEX_SEAM_SHADE : f32 = 0.55;
+
+/** Grass blades: the noise scale along the texel, the base shade, what speckle and blade add, and the relief. */
+const TEX_GRASS_BLADE_SCALE : f32 = 0.8;
+const TEX_GRASS_SHADE : f32 = 0.62;
+const TEX_GRASS_SPECKLE : f32 = 0.6;
+const TEX_GRASS_BLADE : f32 = 0.2;
+const TEX_GRASS_RELIEF : f32 = 0.3;
+const TEX_GRASS_RELIEF_SPREAD : f32 = 0.6;
+
+/** Dirt: the shade and relief, and the hash above which a texel is a pale pebble of this shade and height. */
+const TEX_DIRT_SHADE : f32 = 0.75;
+const TEX_DIRT_SHADE_SPREAD : f32 = 0.4;
+const TEX_DIRT_RELIEF : f32 = 0.3;
+const TEX_DIRT_RELIEF_SPREAD : f32 = 0.5;
+const TEX_DIRT_PEBBLE_ABOVE : f32 = 0.93;
+const TEX_DIRT_PEBBLE_SHADE : f32 = 1.25;
+const TEX_DIRT_PEBBLE_RELIEF : f32 = 0.95;
+
+/** The salt that gives dirt, on its own and under grass, its look. */
+const TEX_DIRT_SALT : i32 = 3;
+
+/** A log's end: the rings' pace in radians per texel, the shade and relief they swing, and the darker bark rim. */
+const TEX_LOG_RING_PACE : f32 = 1.9;
+const TEX_LOG_END_SHADE : f32 = 0.8;
+const TEX_LOG_END_SHADE_SPREAD : f32 = 0.45;
+const TEX_LOG_END_RELIEF : f32 = 0.4;
+const TEX_LOG_END_RELIEF_SPREAD : f32 = 0.3;
+const TEX_LOG_RIM_SHADE : f32 = 0.55;
+
+/** A log's side: bark streaks run down the column; the shade and relief follow the streak. */
+const TEX_LOG_BARK_SHADE : f32 = 0.55;
+const TEX_LOG_BARK_STREAK : f32 = 0.6;
+const TEX_LOG_BARK_GRAIN : f32 = 0.1;
+const TEX_LOG_BARK_RELIEF : f32 = 0.2;
+const TEX_LOG_BARK_RELIEF_SPREAD : f32 = 0.7;
+
+/** Birch bark has dark flecks where a hash passes this, painted to this share of the base colour. */
+const TEX_BIRCH_FLECK_ABOVE : f32 = 0.82;
+const TEX_BIRCH_FLECK_SHADE : f32 = 0.25;
+
+/** Planks: a board is this many texels tall, and each board's seam is shifted by this many texels per board. */
+const TEX_PLANKS_BOARD : i32 = 4;
+const TEX_PLANKS_SHIFT : i32 = 7;
+
+/** A plank's shade: base, what its board's tone adds, what the grain adds; and its flat relief. */
+const TEX_PLANKS_SHADE : f32 = 0.8;
+const TEX_PLANKS_TONE : f32 = 0.3;
+const TEX_PLANKS_GRAIN : f32 = 0.08;
+const TEX_PLANKS_RELIEF : f32 = 0.6;
+
+/** Shingles: a row is this many texels tall, a shingle this wide, and alternate rows are offset by half of it. */
+const TEX_ROOF_ROW : i32 = 4;
+const TEX_ROOF_WIDTH : i32 = 8;
+const TEX_ROOF_STAGGER : i32 = 4;
+
+/** A shingle's shade and relief rise with its tone; the gaps between shingles are darker by this much. */
+const TEX_ROOF_SHADE : f32 = 0.7;
+const TEX_ROOF_SHADE_SPREAD : f32 = 0.5;
+const TEX_ROOF_RELIEF : f32 = 0.5;
+const TEX_ROOF_RELIEF_SPREAD : f32 = 0.1;
+const TEX_ROOF_GAP_SHADE : f32 = 0.5;
+
+/** Leaves: the shade and relief rise with the hash of the texel. */
+const TEX_LEAVES_SHADE : f32 = 0.55;
+const TEX_LEAVES_SHADE_SPREAD : f32 = 0.7;
+const TEX_LEAVES_RELIEF : f32 = 0.3;
+const TEX_LEAVES_RELIEF_SPREAD : f32 = 0.6;
+
+/** The fringe of grass on the side of a grass block starts this many texels from the bottom, ragged by up to three. */
+const TEX_FRINGE_TOP : i32 = 13;
+const TEX_FRINGE_RAGGED : f32 = 3.0;
+
+/** Lava: two flows of noise drift past each other; the scale of each and the speed it drifts at. */
+const TEX_LAVA_A_SCALE : f32 = 0.35;
+const TEX_LAVA_A_DRIFT : f32 = 0.35;
+const TEX_LAVA_B_SCALE : f32 = 0.5;
+const TEX_LAVA_B_DRIFT : f32 = 0.25;
+
+/** The heat is the product of the flows times this; below `TEX_LAVA_CRUST_BELOW` the lava has cooled to a crust. */
+const TEX_LAVA_HEAT : f32 = 2.2;
+const TEX_LAVA_CRUST_BELOW : f32 = 0.42;
+
+/** Glowing lava: its glow is a base plus what heat adds; its relief likewise. */
+const TEX_LAVA_GLOW : f32 = 0.4;
+const TEX_LAVA_GLOW_HEAT : f32 = 1.6;
+const TEX_LAVA_RELIEF : f32 = 0.3;
+const TEX_LAVA_RELIEF_HEAT : f32 = 0.4;
+
+/** Crust: a faint glow and a dark shade. */
+const TEX_LAVA_CRUST_GLOW : f32 = 0.12;
+const TEX_LAVA_CRUST_SHADE : f32 = 0.25;
+
+/** Crystals: the facets are this many texels across, laid out diagonally. */
+const TEX_CRYSTAL_FACET : i32 = 3;
+
+/** A crystal's glow is a base plus its facet's hash; its shade and relief likewise. */
+const TEX_CRYSTAL_GLOW : f32 = 0.55;
+const TEX_CRYSTAL_GLOW_SPREAD : f32 = 0.7;
+const TEX_CRYSTAL_SHADE : f32 = 0.7;
+const TEX_CRYSTAL_SHADE_SPREAD : f32 = 0.5;
+const TEX_CRYSTAL_RELIEF : f32 = 0.4;
+const TEX_CRYSTAL_RELIEF_SPREAD : f32 = 0.5;
+
+/** Every eleventh texel of a lattice (3 across, 5 down) sparkles, with this glow added. */
+const TEX_CRYSTAL_SPARKLE_X : i32 = 3;
+const TEX_CRYSTAL_SPARKLE_Y : i32 = 5;
+const TEX_CRYSTAL_SPARKLE_EVERY : i32 = 11;
+const TEX_CRYSTAL_SPARKLE : f32 = 0.6;
+
+/** The sparkle swings by this much at this many radians per second, each column out of step with the next. */
+const TEX_CRYSTAL_TWINKLE : f32 = 0.4;
+const TEX_CRYSTAL_TWINKLE_PACE : f32 = 2.0;
+
+/** The lantern's frame is dark with a faint glow, and stands proud. */
+const TEX_LANTERN_FRAME_SHADE : f32 = 0.18;
+const TEX_LANTERN_FRAME_RELIEF : f32 = 0.8;
+const TEX_LANTERN_FRAME_GLOW : f32 = 0.12;
+
+/** The flame behind the panes flickers by this much at this pace, each texel out of step by its row. */
+const TEX_LANTERN_FLICKER : f32 = 0.08;
+const TEX_LANTERN_PACE : f32 = 9.0;
+const TEX_LANTERN_ROW_STEP : i32 = 3;
+
+/** Its glow is a base plus what the core's hash adds. */
+const TEX_LANTERN_GLOW : f32 = 0.8;
+const TEX_LANTERN_GLOW_SPREAD : f32 = 0.4;
+
+/** The relief of a texel with no relief: halfway between groove and ridge. */
+const TEX_FLAT_RELIEF : f32 = 0.5;
+
+/** Snow and the plain blocks: how far the shade strays from 1 and how far the relief swings. */
+const TEX_SNOW_SPREAD : f32 = 0.03;
+const TEX_SNOW_RELIEF : f32 = 0.25;
+const TEX_PLAIN_SPREAD : f32 = 0.06;
+const TEX_PLAIN_RELIEF : f32 = 0.4;
+
+/** Wool: the weave alternates texels; shade is a base plus the weave and the hash, relief a base plus the weave. */
+const TEX_WOOL_SHADE : f32 = 0.88;
+const TEX_WOOL_WEAVE : f32 = 0.1;
+const TEX_WOOL_GRAIN : f32 = 0.06;
+const TEX_WOOL_RELIEF : f32 = 0.4;
+const TEX_WOOL_RELIEF_WEAVE : f32 = 0.3;
+
+/** Sand: ripples stretched along the row (noise cells per texel across and down). */
+const TEX_SAND_RIPPLE_X : f32 = 0.4;
+const TEX_SAND_RIPPLE_Y : f32 = 0.9;
+
+/** Sand's shade is a base plus the grain and the ripple; its relief a base plus the ripple. */
+const TEX_SAND_SHADE : f32 = 0.86;
+const TEX_SAND_GRAIN : f32 = 0.14;
+const TEX_SAND_RIPPLE : f32 = 0.1;
+const TEX_SAND_RELIEF : f32 = 0.4;
+const TEX_SAND_RELIEF_RIPPLE : f32 = 0.3;
+
+/** The beacon is a flat pane whose glow is a base plus a little hash. */
+const TEX_BEACON_GLOW : f32 = 0.9;
+const TEX_BEACON_GLOW_SPREAD : f32 = 0.2;
+
+/** What one texel looks like. */
+pub struct LumenTexel {
+    /** Linear albedo. */
+    pub albedo : Vec3 = Vec3 { x: (1.0 as f32), y: (1.0 as f32), z: (1.0 as f32) };
+
+    /** Relief, 0 (a groove) to 1 (a ridge). */
+    pub height : f32 = (0.5 as f32);
+
+    /** Multiplier of the block's emission. */
+    pub glow : f32 = (1.0 as f32);
+}
+
+/**
+ * The texel (ix | iy << 8) of the face `face` (0 +x, 1 -x, 2 +y, 3 -y, 4 +z, 5 -z) at the point whose
+ * fractional position inside its cell is (fx, fy, fz). The v axis points up on side faces.
+ */
+pub fn lumenTexelAt(face : i32, fx : f32, fy : f32, fz : f32) : i32 {
+    let uv : Vec2 = lumenTexelUv(face, fx, fy, fz);
+    let ix : i32 = atlasClamp(uv.x as i32);
+    let iy : i32 = atlasClamp(uv.y as i32);
+    return ix | (iy << TEX_ROW_SHIFT);
+}
+
+/**
+ * The place of the point whose fractional position inside its cell is (fx, fy, fz) on face `face`, in texel units:
+ * (u, v) in 0..16, the same mapping as `lumenTexelAt` without the rounding, so a sampler can interpolate.
+ */
+pub fn lumenTexelUv(face : i32, fx : f32, fy : f32, fz : f32) : Vec2 {
+    let mut u : f32 = fx;
+    let mut v : f32 = fy;
+    if (face < TEX_FACE_TOP) {
+        u = fz;
+        if (face == TEX_FACE_POS_X) {
+            u = (1.0 as f32) - fz;
+        }
+    } else if (face <= TEX_FACE_BOTTOM) {
+        v = fz;
+    } else if (face == TEX_FACE_NEG_Z) {
+        u = (1.0 as f32) - fx;
+    }
+    return Vec2 { x: u * TEX_SIZE_F, y: v * TEX_SIZE_F };
+}
+
+/** True where a leaf block is a hole, so light and eyes pass through. */
+pub fn lumenLeafHole(texel : i32) : bool {
+    // Holes are two texels across, so they stay resolvable to twice the distance before they turn to noise.
+    let ix : i32 = (texel & TEX_COLUMN_MASK) >> TEX_LEAF_HOLE_SHIFT;
+    let iy : i32 = (texel >> TEX_ROW_SHIFT) >> TEX_LEAF_HOLE_SHIFT;
+    return lnUnit(ix, iy, TEX_LEAF_HOLE_Z, TEX_LEAF_HOLE_SEED) < TEX_LEAF_HOLE_CHANCE;
+}
+
+/** True on the wooden frame of a glass block; the rest is clear. */
+pub fn lumenGlassFrame(texel : i32) : bool {
+    let ix : i32 = texel & TEX_COLUMN_MASK;
+    let iy : i32 = texel >> TEX_ROW_SHIFT;
+    let rim : bool = ix == 0 || ix == ATLAS_LAST_TEXEL || iy == 0 || iy == ATLAS_LAST_TEXEL;
+    let cross : bool = ix == TEX_MID_LOW || ix == TEX_MID_HIGH || iy == TEX_MID_LOW || iy == TEX_MID_HIGH;
+    return rim || cross;
+}
+
+fn txShade(base : Vec3, k : f32) : Vec3 {
+    return base.scale(k);
+}
+
+// A texel of `base` at shade `k` and relief `h`, with the block's own glow.
+fn txTexel(base : Vec3, k : f32, h : f32) : LumenTexel {
+    return LumenTexel { albedo: txShade(base, k), height: h };
+}
+
+fn txStone(base : Vec3, ix : i32, iy : i32, salt : i32) : LumenTexel {
+    let n : f32 = lnUnit(ix, iy, salt, TEX_STONE_SEED);
+    let crackX : f32 = ix as f32 * TEX_STONE_CRACK_SCALE;
+    let crackY : f32 = iy as f32 * TEX_STONE_CRACK_SCALE;
+    let crack : f32 = lnValue2(crackX, crackY, TEX_STONE_CRACK_SEED + salt);
+    let mut k : f32 = TEX_STONE_SHADE + TEX_STONE_SHADE_SPREAD * n;
+    let mut h : f32 = TEX_STONE_RELIEF + TEX_STONE_RELIEF_SPREAD * n;
+    if (crack < TEX_STONE_CRACK_BELOW) {
+        k = k * TEX_STONE_CRACK_SHADE;
+        h = TEX_STONE_CRACK_RELIEF;
+    }
+    return txTexel(base, k, h);
+}
+
+fn txCobble(base : Vec3, ix : i32, iy : i32) : LumenTexel {
+    let column : i32 = ix / TEX_COBBLE_WIDTH;
+    let cell : f32 = lnUnit(column, iy / TEX_COBBLE_HEIGHT + column % 2, TEX_COBBLE_Z, TEX_COBBLE_SEED);
+    let edge : bool = ix % TEX_COBBLE_WIDTH == 0 || iy % TEX_COBBLE_HEIGHT == 0;
+    let n : f32 = lnUnit(ix, iy, TEX_COBBLE_GRAIN_Z, TEX_COBBLE_GRAIN_SEED);
+    let mut k : f32 = TEX_COBBLE_SHADE + TEX_COBBLE_SHADE_SPREAD * cell + TEX_COBBLE_GRAIN * n;
+    let mut h : f32 = TEX_COBBLE_RELIEF + TEX_COBBLE_RELIEF_SPREAD * cell;
+    if (edge) {
+        k = k * TEX_SEAM_SHADE;
+        h = TEX_GROOVE_RELIEF;
+    }
+    return txTexel(base, k, h);
+}
+
+fn txGrassTop(base : Vec3, ix : i32, iy : i32) : LumenTexel {
+    let n : f32 = lnUnit(ix, iy, TEX_GRASS_Z, TEX_GRASS_SEED);
+    let bladeX : f32 = ix as f32 * TEX_GRASS_BLADE_SCALE;
+    let bladeY : f32 = iy as f32 * TEX_GRASS_BLADE_SCALE;
+    let blade : f32 = lnValue2(bladeX, bladeY, TEX_GRASS_BLADE_SEED);
+    let k : f32 = TEX_GRASS_SHADE + TEX_GRASS_SPECKLE * n * blade + TEX_GRASS_BLADE * blade;
+    return txTexel(base, k, TEX_GRASS_RELIEF + TEX_GRASS_RELIEF_SPREAD * n);
+}
+
+fn txDirt(base : Vec3, ix : i32, iy : i32, salt : i32) : LumenTexel {
+    let n : f32 = lnUnit(ix, iy, salt, TEX_DIRT_SEED);
+    if (n > TEX_DIRT_PEBBLE_ABOVE) {
+        return txTexel(base, TEX_DIRT_PEBBLE_SHADE, TEX_DIRT_PEBBLE_RELIEF);
+    }
+    let k : f32 = TEX_DIRT_SHADE + TEX_DIRT_SHADE_SPREAD * n;
+    return txTexel(base, k, TEX_DIRT_RELIEF + TEX_DIRT_RELIEF_SPREAD * n);
+}
+
+// The end of a log: concentric rings round the middle of the tile, with a dark bark rim.
+fn txLogEnd(base : Vec3, ix : i32, iy : i32) : LumenTexel {
+    let dx : f32 = (ix as f32) - TEX_CENTRE;
+    let dy : f32 = (iy as f32) - TEX_CENTRE;
+    let r : f32 = (dx * dx + dy * dy).sqrt();
+    let ring : f32 = (sin(r * TEX_LOG_RING_PACE) * (0.5 as f32)) + (0.5 as f32);
+    let mut k : f32 = TEX_LOG_END_SHADE + TEX_LOG_END_SHADE_SPREAD * ring;
+    let rim : bool = ix == 0 || ix == ATLAS_LAST_TEXEL || iy == 0 || iy == ATLAS_LAST_TEXEL;
+    if (rim) {
+        k = TEX_LOG_RIM_SHADE;
+    }
+    return txTexel(base, k, TEX_LOG_END_RELIEF + TEX_LOG_END_RELIEF_SPREAD * ring);
+}
+
+fn txLog(base : Vec3, face : i32, ix : i32, iy : i32) : LumenTexel {
+    if (face == TEX_FACE_TOP || face == TEX_FACE_BOTTOM) {
+        return txLogEnd(base, ix, iy);
+    }
+    let streak : f32 = lnUnit(ix, 0, TEX_LOG_STREAK_Z, TEX_LOG_STREAK_SEED);
+    let n : f32 = lnUnit(ix, iy, TEX_LOG_GRAIN_Z, TEX_LOG_GRAIN_SEED);
+    let k : f32 = TEX_LOG_BARK_SHADE + TEX_LOG_BARK_STREAK * streak + TEX_LOG_BARK_GRAIN * n;
+    return txTexel(base, k, TEX_LOG_BARK_RELIEF + TEX_LOG_BARK_RELIEF_SPREAD * streak);
+}
+
+fn txPlanks(base : Vec3, ix : i32, iy : i32) : LumenTexel {
+    let board : i32 = iy / TEX_PLANKS_BOARD;
+    let shift : i32 = (board * TEX_PLANKS_SHIFT) % TEX_SIZE;
+    let seam : bool = iy % TEX_PLANKS_BOARD == 0 || (ix + shift) % TEX_SIZE == 0;
+    let tone : f32 = lnUnit(board, (ix + shift) / TEX_SIZE, TEX_PLANKS_TONE_Z, TEX_PLANKS_TONE_SEED);
+    let grain : f32 = lnUnit(ix, iy, TEX_PLANKS_GRAIN_Z, TEX_PLANKS_GRAIN_SEED);
+    let mut k : f32 = TEX_PLANKS_SHADE + TEX_PLANKS_TONE * tone + TEX_PLANKS_GRAIN * grain;
+    let mut h : f32 = TEX_PLANKS_RELIEF;
+    if (seam) {
+        k = k * TEX_SEAM_SHADE;
+        h = TEX_GROOVE_RELIEF;
+    }
+    return txTexel(base, k, h);
+}
+
+fn txRoof(base : Vec3, ix : i32, iy : i32) : LumenTexel {
+    let row : i32 = iy / TEX_ROOF_ROW;
+    let along : i32 = ix + (row % 2) * TEX_ROOF_STAGGER;
+    let tone : f32 = lnUnit(row, along / TEX_ROOF_WIDTH, TEX_ROOF_Z, TEX_ROOF_SEED);
+    let mut k : f32 = TEX_ROOF_SHADE + TEX_ROOF_SHADE_SPREAD * tone;
+    let mut h : f32 = TEX_ROOF_RELIEF + TEX_ROOF_RELIEF_SPREAD * tone;
+    if (iy % TEX_ROOF_ROW == 0 || along % TEX_ROOF_WIDTH == 0) {
+        k = k * TEX_ROOF_GAP_SHADE;
+        h = TEX_GROOVE_RELIEF;
+    }
+    return txTexel(base, k, h);
+}
+
+fn txLeaves(base : Vec3, ix : i32, iy : i32) : LumenTexel {
+    let n : f32 = lnUnit(ix, iy, TEX_LEAVES_Z, TEX_LEAVES_SEED);
+    let k : f32 = TEX_LEAVES_SHADE + TEX_LEAVES_SHADE_SPREAD * n;
+    return txTexel(base, k, TEX_LEAVES_RELIEF + TEX_LEAVES_RELIEF_SPREAD * n);
+}
+
+fn txLava(base : Vec3, ix : i32, iy : i32, time : f32) : LumenTexel {
+    let fx : f32 = ix as f32;
+    let fy : f32 = iy as f32;
+    let aX : f32 = fx * TEX_LAVA_A_SCALE + time * TEX_LAVA_A_DRIFT;
+    let bY : f32 = fy * TEX_LAVA_B_SCALE - time * TEX_LAVA_B_DRIFT;
+    let a : f32 = lnValue2(aX, fy * TEX_LAVA_A_SCALE, TEX_LAVA_A_SEED);
+    let b : f32 = lnValue2(fx * TEX_LAVA_B_SCALE, bY, TEX_LAVA_B_SEED);
+    let heat : f32 = a * b * TEX_LAVA_HEAT;
+    let relief : f32 = TEX_LAVA_RELIEF + TEX_LAVA_RELIEF_HEAT * heat;
+    if (heat < TEX_LAVA_CRUST_BELOW) {
+        return LumenTexel {
+            albedo: txShade(base, TEX_LAVA_CRUST_SHADE),
+            height: relief,
+            glow: TEX_LAVA_CRUST_GLOW,
+        };
+    }
+    return LumenTexel {
+        albedo: txShade(base, (1.0 as f32)),
+        height: relief,
+        glow: TEX_LAVA_GLOW + TEX_LAVA_GLOW_HEAT * heat,
+    };
+}
+
+fn txCrystal(base : Vec3, ix : i32, iy : i32, time : f32) : LumenTexel {
+    let u : i32 = (ix + iy) / TEX_CRYSTAL_FACET;
+    let v : i32 = (ix - iy + TEX_SIZE) / TEX_CRYSTAL_FACET;
+    let facet : f32 = lnUnit(u, v, TEX_CRYSTAL_Z, TEX_CRYSTAL_SEED);
+    let mut glow : f32 = TEX_CRYSTAL_GLOW + TEX_CRYSTAL_GLOW_SPREAD * facet;
+    let sparkles : bool = (ix * TEX_CRYSTAL_SPARKLE_X + iy * TEX_CRYSTAL_SPARKLE_Y)
+        % TEX_CRYSTAL_SPARKLE_EVERY
+        == 0;
+    if (sparkles) {
+        let twinkle : f32 = TEX_CRYSTAL_TWINKLE * sin(time * TEX_CRYSTAL_TWINKLE_PACE + ix as f32);
+        glow = glow + TEX_CRYSTAL_SPARKLE + twinkle;
+    }
+    return LumenTexel {
+        albedo: txShade(base, TEX_CRYSTAL_SHADE + TEX_CRYSTAL_SHADE_SPREAD * facet),
+        height: TEX_CRYSTAL_RELIEF + TEX_CRYSTAL_RELIEF_SPREAD * facet,
+        glow: glow,
+    };
+}
+
+fn txLantern(base : Vec3, ix : i32, iy : i32, time : f32) : LumenTexel {
+    // The lantern shares the pane grid of a glass block: a frame around the outside and a cross through it.
+    if (lumenGlassFrame(ix | (iy << TEX_ROW_SHIFT))) {
+        return LumenTexel {
+            albedo: txShade(base, TEX_LANTERN_FRAME_SHADE),
+            height: TEX_LANTERN_FRAME_RELIEF,
+            glow: TEX_LANTERN_FRAME_GLOW,
+        };
+    }
+
+    let phase : f32 = (ix + iy * TEX_LANTERN_ROW_STEP) as f32;
+    let flick : f32 = (1.0 as f32) + TEX_LANTERN_FLICKER * sin(time * TEX_LANTERN_PACE + phase);
+    let core : f32 = lnUnit(ix, iy, TEX_LANTERN_Z, TEX_LANTERN_SEED);
+    return LumenTexel {
+        albedo: txShade(base, (1.0 as f32)),
+        height: TEX_FLAT_RELIEF,
+        glow: (TEX_LANTERN_GLOW + TEX_LANTERN_GLOW_SPREAD * core) * flick,
+    };
+}
+
+fn txFlat(base : Vec3, ix : i32, iy : i32, salt : i32, spread : f32, relief : f32) : LumenTexel {
+    let n : f32 = lnUnit(ix, iy, salt, TEX_FLAT_SEED);
+    let k : f32 = (1.0 as f32) - spread + spread * (2.0 as f32) * n;
+    return txTexel(base, k, TEX_FLAT_RELIEF + relief * (n - (0.5 as f32)));
+}
+
+fn txWool(base : Vec3, ix : i32, iy : i32) : LumenTexel {
+    let weave : f32 = ((ix + iy) % 2) as f32;
+    let n : f32 = lnUnit(ix, iy, TEX_WOOL_Z, TEX_WOOL_SEED);
+    let k : f32 = TEX_WOOL_SHADE + TEX_WOOL_WEAVE * weave + TEX_WOOL_GRAIN * n;
+    return txTexel(base, k, TEX_WOOL_RELIEF + TEX_WOOL_RELIEF_WEAVE * weave);
+}
+
+fn txSand(base : Vec3, ix : i32, iy : i32) : LumenTexel {
+    let n : f32 = lnUnit(ix, iy, TEX_SAND_Z, TEX_SAND_SEED);
+    let rippleX : f32 = ix as f32 * TEX_SAND_RIPPLE_X;
+    let rippleY : f32 = iy as f32 * TEX_SAND_RIPPLE_Y;
+    let ripple : f32 = lnValue2(rippleX, rippleY, TEX_SAND_RIPPLE_SEED);
+    let k : f32 = TEX_SAND_SHADE + TEX_SAND_GRAIN * n + TEX_SAND_RIPPLE * ripple;
+    return txTexel(base, k, TEX_SAND_RELIEF + TEX_SAND_RELIEF_RIPPLE * ripple);
+}
+
+// A grass block: grass on top, dirt below, and a ragged grass fringe over dirt on the sides.
+fn txGrassBlock(pal : BlockPalette, face : i32, ix : i32, iy : i32) : LumenTexel {
+    let base : Vec3 = pal.albedoOf(LumenBlock::Grass.id());
+    let dirt : Vec3 = pal.albedoOf(LumenBlock::Dirt.id());
+    if (face == TEX_FACE_TOP) {
+        return txGrassTop(base, ix, iy);
+    }
+    if (face == TEX_FACE_BOTTOM) {
+        return txDirt(dirt, ix, iy, TEX_DIRT_SALT);
+    }
+
+    let jag : i32 = (lnUnit(ix, 0, TEX_FRINGE_Z, TEX_FRINGE_SEED) * TEX_FRINGE_RAGGED) as i32;
+    if (iy >= TEX_FRINGE_TOP + jag - 1) {
+        return txGrassTop(base, ix, iy);
+    }
+    return txDirt(dirt, ix, iy, TEX_DIRT_SALT);
+}
+
+// A log or a birch log: rings on the ends, bark on the sides, and dark flecks on birch bark.
+fn txBark(base : Vec3, birch : bool, face : i32, ix : i32, iy : i32) : LumenTexel {
+    let mut t : LumenTexel = txLog(base, face, ix, iy);
+    let side : bool = face != TEX_FACE_TOP && face != TEX_FACE_BOTTOM;
+    if (birch && side) {
+        let fleck : f32 = lnUnit(ix, iy / 2, TEX_FLECK_Z, TEX_FLECK_SEED);
+        if (fleck > TEX_BIRCH_FLECK_ABOVE) {
+            t.albedo = base.scale(TEX_BIRCH_FLECK_SHADE);
+        }
+    }
+    return t;
+}
+
+// The beacon: flat and bright, its glow barely varying from texel to texel.
+fn txBeacon(base : Vec3, ix : i32, iy : i32) : LumenTexel {
+    let n : f32 = lnUnit(ix, iy, TEX_BEACON_Z, TEX_BEACON_SEED);
+    return LumenTexel {
+        albedo: base,
+        height: TEX_FLAT_RELIEF,
+        glow: TEX_BEACON_GLOW + TEX_BEACON_GLOW_SPREAD * n,
+    };
+}
+
+/**
+ * The texel (ix, iy) of face `face` of block `id`. `time` animates lava, crystals and lanterns; the block id and
+ * face vary the pattern so two faces do not look cloned.
+ */
+pub fn lumenTexel(pal : BlockPalette, id : i32, face : i32, ix : i32, iy : i32, time : f32) : LumenTexel {
+    let base : Vec3 = pal.albedoOf(id);
+    let salt : i32 = id * TEX_SALT_STRIDE + face;
+    if (id == LumenBlock::Stone.id()) {
+        return txStone(base, ix, iy, salt);
+    }
+    if (id == LumenBlock::Cobble.id()) {
+        return txCobble(base, ix, iy);
+    }
+    if (id == LumenBlock::Grass.id()) {
+        return txGrassBlock(pal, face, ix, iy);
+    }
+    if (id == LumenBlock::Dirt.id()) {
+        return txDirt(base, ix, iy, TEX_DIRT_SALT);
+    }
+    if (id == LumenBlock::Sand.id()) {
+        return txSand(base, ix, iy);
+    }
+    if (id == LumenBlock::Log.id() || id == LumenBlock::Birch.id()) {
+        return txBark(base, id == LumenBlock::Birch.id(), face, ix, iy);
+    }
+    if (id == LumenBlock::Planks.id()) {
+        return txPlanks(base, ix, iy);
+    }
+    if (id == LumenBlock::Roof.id()) {
+        return txRoof(base, ix, iy);
+    }
+    if (id == LumenBlock::Leaves.id()) {
+        return txLeaves(base, ix, iy);
+    }
+    if (id == LumenBlock::Lava.id()) {
+        return txLava(base, ix, iy, time);
+    }
+    if (id == LumenBlock::CrystalBlue.id() || id == LumenBlock::CrystalPink.id()) {
+        return txCrystal(base, ix, iy, time);
+    }
+    if (id == LumenBlock::Lantern.id()) {
+        return txLantern(base, ix, iy, time);
+    }
+    if (id == LumenBlock::Snow.id()) {
+        return txFlat(base, ix, iy, salt, TEX_SNOW_SPREAD, TEX_SNOW_RELIEF);
+    }
+    if (id == LumenBlock::WoolWhite.id() || id == LumenBlock::WoolRed.id()) {
+        return txWool(base, ix, iy);
+    }
+    if (id == LumenBlock::Glass.id() || id == LumenBlock::Ice.id()) {
+        return txPlanks(pal.albedoOf(LumenBlock::Planks.id()), ix, iy);
+    }
+    if (id == LumenBlock::Beacon.id()) {
+        return txBeacon(base, ix, iy);
+    }
+    return txFlat(base, ix, iy, salt, TEX_PLAIN_SPREAD, TEX_PLAIN_RELIEF);
+}
+
+/**
+ * Every static texel of every block face, computed once and kept as a mip chain (16 x 16, 8 x 8, 4 x 4, 2 x 2, 1),
+ * each level the 2 x 2 average of the one before it in linear light. A texel costs a handful of hashes, so the
+ * faces are tabulated; and a chain is what stops a distant texture shimmering: when a pixel covers several texels
+ * the sampler reads the level whose texels are about a pixel across, instead of whichever texel the ray happened
+ * to land on (this is voxel-axle's mipmapping, and for the same reason). Blocks whose texels move with time (lava,
+ * crystals, lanterns) are not tabulated and are computed on demand.
+ */
+pub class LumenAtlas {
+    albedo : f32[];
+    glow   : f32[];
+    relief : f32[];
+    moving : bool[];
+
+    /** The atlas of `pal`'s blocks at time zero. */
+    constructor(pal : BlockPalette) {
+        let tiles : i64 = (BLOCK_COUNT as i64) * 6;
+        self.albedo = new f32[tiles * ATLAS_TILE * 3];
+        self.glow = new f32[tiles * ATLAS_TILE];
+        self.relief = new f32[tiles * 512];
+        self.moving = new bool[BLOCK_COUNT as i64];
+        for (b of 0..BLOCK_COUNT) {
+            self.moving[b as i64] = b == LumenBlock::Lava.id() || b == LumenBlock::CrystalBlue.id()
+                || b == LumenBlock::CrystalPink.id()
+                || b == LumenBlock::Lantern.id();
+            for (f of 0..6) {
+                let tile : i64 = (b * 6 + f) as i64;
+                self.bakeBase(pal, b, f, tile);
+                for (level of 1..5) {
+                    self.bakeLevel(tile, level);
+                }
+            }
+        }
+    }
+
+    // The full-size texels of face `f` of block `b` as tile `tile`: albedo, glow and the height slope in x and y.
+    fn bakeBase(mut self, pal : BlockPalette, b : i32, f : i32, tile : i64) : void {
+        for (iy of 0..16) {
+            for (ix of 0..16) {
+                let t : LumenTexel = lumenTexel(pal, b, f, ix, iy, 0.0);
+                let at : i64 = tile * ATLAS_TILE + (iy * 16 + ix) as i64;
+                self.albedo[at * 3] = t.albedo.x;
+                self.albedo[at * 3 + 1] = t.albedo.y;
+                self.albedo[at * 3 + 2] = t.albedo.z;
+                self.glow[at] = t.glow;
+
+                let r : i64 = tile * 256 + (iy * 16 + ix) as i64;
+                self.relief[r * 2] = lumenTexel(pal, b, f, atlasClamp(ix + 1), iy, 0.0).height
+                    - lumenTexel(pal, b, f, atlasClamp(ix - 1), iy, 0.0).height;
+                self.relief[r * 2 + 1] = lumenTexel(pal, b, f, ix, atlasClamp(iy + 1), 0.0).height
+                    - lumenTexel(pal, b, f, ix, atlasClamp(iy - 1), 0.0).height;
+            }
+        }
+    }
+
+    // Mip level `level` of tile `tile`: each texel the average of the 2 x 2 texels of the level above it.
+    fn bakeLevel(mut self, tile : i64, level : i32) : void {
+        let size : i32 = 16 >> level;
+        let from : i32 = 16 >> (level - 1);
+        for (y of 0..size) {
+            for (x of 0..size) {
+                let at : i64 = tile * ATLAS_TILE + (atlasOffset(level) + y * size + x) as i64;
+                let mut r : f32 = 0.0;
+                let mut g : f32 = 0.0;
+                let mut bl : f32 = 0.0;
+                let mut e : f32 = 0.0;
+                for (k of 0..4) {
+                    let src : i64 = tile * ATLAS_TILE
+                        + (atlasOffset(level - 1) + (y * 2 + k / 2) * from + x * 2 + k % 2) as i64;
+                    r = r + self.albedo[src * 3];
+                    g = g + self.albedo[src * 3 + 1];
+                    bl = bl + self.albedo[src * 3 + 2];
+                    e = e + self.glow[src];
+                }
+                self.albedo[at * 3] = r * (0.25 as f32);
+                self.albedo[at * 3 + 1] = g * (0.25 as f32);
+                self.albedo[at * 3 + 2] = bl * (0.25 as f32);
+                self.glow[at] = e * (0.25 as f32);
+            }
+        }
+    }
+
+    /**
+     * The colour of the point (u, v) (texel units, 0..16) of face `face` of block `id` at animation time `time`,
+     * read at mip level `lod` (0 is the full texture, each step halves it; fractions blend two levels). Up close
+     * (lod 0) a texel is a crisp square; further, the levels are read bilinearly.
+     */
+    pub fn sample(
+        self,
+        pal : BlockPalette,
+        id : i32,
+        face : i32,
+        u : f32,
+        v : f32,
+        time : f32,
+        lod : f32
+    ) : LumenTexel {
+        if (self.moving[id as i64]) {
+            return lumenTexel(pal, id, face, atlasClamp(u as i32), atlasClamp(v as i32), time);
+        }
+        let tile : i64 = ((id * 6 + face) as i64);
+        if (lod <= 0.0) {
+            return self.nearest(tile, atlasClamp(u as i32), atlasClamp(v as i32));
+        }
+        let mut level : i32 = lod as i32;
+        if (level > 3) {
+            level = 3;
+        }
+        let mix : f32 = min(lod - level as f32, 1.0);
+        let mut a : LumenTexel = self.nearest(tile, atlasClamp(u as i32), atlasClamp(v as i32));
+        if (level > 0) {
+            a = self.bilinear(tile, level, u, v);
+        }
+        let b : LumenTexel = self.bilinear(tile, level + 1, u, v);
+        return LumenTexel {
+            albedo: a.albedo.lerp(b.albedo, mix),
+            height: 0.5,
+            glow: a.glow + (b.glow - a.glow) * mix,
+        };
+    }
+
+    /**
+     * How the relief rises across the texel (ix, iy) along u (x) and along v (y): the height differences that tilt
+     * the normal. The relief is detail of the size of a texel, so it fades out as the texel shrinks below a pixel.
+     */
+    pub fn relief(
+        self,
+        pal : BlockPalette,
+        id : i32,
+        face : i32,
+        ix : i32,
+        iy : i32,
+        time : f32,
+        lod : f32
+    ) : Vec2 {
+        let keep : f32 = (1.0 as f32) - min(lod, 1.0);
+        if (keep <= 0.0) {
+            return Vec2 { x: 0.0, y: 0.0 };
+        }
+        if (self.moving[id as i64]) {
+            let du : f32 = lumenTexel(pal, id, face, atlasClamp(ix + 1), iy, time).height
+                - lumenTexel(pal, id, face, atlasClamp(ix - 1), iy, time).height;
+            let dv : f32 = lumenTexel(pal, id, face, ix, atlasClamp(iy + 1), time).height
+                - lumenTexel(pal, id, face, ix, atlasClamp(iy - 1), time).height;
+            return Vec2 { x: du * keep, y: dv * keep };
+        }
+        let r : i64 = ((id * 6 + face) as i64) * 256 + (iy * 16 + ix) as i64;
+        return Vec2 { x: self.relief[r * 2] * keep, y: self.relief[r * 2 + 1] * keep };
+    }
+
+    fn nearest(self, tile : i64, ix : i32, iy : i32) : LumenTexel {
+        let at : i64 = tile * ATLAS_TILE + (iy * 16 + ix) as i64;
+        return LumenTexel {
+            albedo: Vec3 { x: self.albedo[at * 3], y: self.albedo[at * 3 + 1], z: self.albedo[at * 3 + 2] },
+            height: 0.5,
+            glow: self.glow[at],
+        };
+    }
+
+    // Bilinear read of mip level `level` of a tile at (u, v) in texel units of the full texture.
+    fn bilinear(self, tile : i64, level : i32, u : f32, v : f32) : LumenTexel {
+        let size : i32 = 16 >> level;
+        let scale : f32 = (size as f32) * (0.0625 as f32);
+        let fu : f32 = u * scale - (0.5 as f32);
+        let fv : f32 = v * scale - (0.5 as f32);
+        let mut x0 : i32 = lnFloor(fu);
+        let mut y0 : i32 = lnFloor(fv);
+        let tx : f32 = fu - x0 as f32;
+        let ty : f32 = fv - y0 as f32;
+        let mut x1 : i32 = x0 + 1;
+        let mut y1 : i32 = y0 + 1;
+        x0 = atlasLimit(x0, size);
+        x1 = atlasLimit(x1, size);
+        y0 = atlasLimit(y0, size);
+        y1 = atlasLimit(y1, size);
+        let base : i64 = tile * ATLAS_TILE + atlasOffset(level) as i64;
+        let a : i64 = base + (y0 * size + x0) as i64;
+        let b : i64 = base + (y0 * size + x1) as i64;
+        let c : i64 = base + (y1 * size + x0) as i64;
+        let d : i64 = base + (y1 * size + x1) as i64;
+        let top : Vec3 = Vec3 {
+            x: self.albedo[a * 3],
+            y: self.albedo[a * 3 + 1],
+            z: self.albedo[a * 3 + 2],
+        }.lerp(Vec3 { x: self.albedo[b * 3], y: self.albedo[b * 3 + 1], z: self.albedo[b * 3 + 2] }, tx);
+        let bottom : Vec3 = Vec3 {
+            x: self.albedo[c * 3],
+            y: self.albedo[c * 3 + 1],
+            z: self.albedo[c * 3 + 2],
+        }.lerp(Vec3 { x: self.albedo[d * 3], y: self.albedo[d * 3 + 1], z: self.albedo[d * 3 + 2] }, tx);
+        let glowTop : f32 = self.glow[a] + (self.glow[b] - self.glow[a]) * tx;
+        let glowBottom : f32 = self.glow[c] + (self.glow[d] - self.glow[c]) * tx;
+        return LumenTexel {
+            albedo: top.lerp(bottom, ty),
+            height: 0.5,
+            glow: glowTop + (glowBottom - glowTop) * ty,
+        };
+    }
+}
+
+/** Texels in one tile of the atlas: the 16 x 16 texture and its four coarser levels. */
+const ATLAS_TILE : i32 = 341;
+
+// Where mip level `level` starts in a tile: 256, 64, 16, 4 and 1 texels.
+fn atlasOffset(level : i32) : i32 {
+    if (level == 0) {
+        return 0;
+    }
+    if (level == 1) {
+        return 256;
+    }
+    if (level == 2) {
+        return 320;
+    }
+    if (level == 3) {
+        return 336;
+    }
+    return 340;
+}
+
+/** The last texel index along a tile's edge: tiles are 16 texels square. */
+pub const ATLAS_LAST_TEXEL : i32 = 15;
+
+/** A texel coordinate pulled back inside the tile, so a lookup past an edge reads the edge. */
+pub fn atlasClamp(v : i32) : i32 {
+    if (v < 0) {
+        return 0;
+    }
+    if (v > ATLAS_LAST_TEXEL) {
+        return ATLAS_LAST_TEXEL;
+    }
+    return v;
+}
+
+// A texel index kept inside a level of `size` texels: a face does not wrap onto its neighbour.
+fn atlasLimit(v : i32, size : i32) : i32 {
+    if (v < 0) {
+        return 0;
+    }
+    if (v >= size) {
+        return size - 1;
+    }
+    return v;
+}

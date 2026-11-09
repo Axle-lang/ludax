@@ -1,0 +1,375 @@
+// lightvol — the baked light of the world as dense volumes the renderer can read from any thread.
+//
+// This is how voxel-axle lights a world, and why it does not shimmer: the light is not found per pixel by
+// chance, it is found per cell by the light engine and read back smoothly. The engine floods the lamps' block
+// light through the voxels and bakes, for the thin shell of air cells beside every solid block, how much of the
+// sky a cell sees, what colour the sky rays hit (the bounce) and how much of the sun's disc it sees (a soft
+// shadow). Reading that back is a trilinear blend of the cells around a point, so the picture of a still world
+// is exactly the same every frame and the light moves smoothly across a face.
+//
+// The engine answers a point query with a hash lookup of the chunk, and a cell outside its stored shell is baked
+// on the spot with state shared by all callers, which is right for a mesher and wrong for sixty thousand pixels
+// read in parallel. So the flood and the shell are copied into four flat `i32` volumes, one word per cell:
+//
+//   light  red | green | blue (10 bits each, so lamps that overlap can pass one lamp block) | shell flag |
+//          solid flag
+//   cover  sky access | bounce tint red | green | blue (8 bits each)
+//   sky    flooded sky light | sun visibility | moon visibility (8 bits each)
+//
+// The sun and the moon each get their own baked shadow: around sunrise and sunset both discs are up, and the
+// engine bakes toward one direction at a time, so two bodies cannot share one map without one of them casting
+// the other's shadow. Their two words share one cell: the moon rides in the third byte of the sky word, which
+// would otherwise be padding, so a cell of the volume stays one word whatever it holds.
+//
+// Reads are trilinear over the eight cells around the point. Solid cells are left out and the remaining weights
+// renormalised, so a point beside a wall is not darkened by the wall's own zero (the rule the engine's
+// `pointSample` follows); the baked terms are read only from cells of the shell, which are the ones that were
+// baked.
+//
+// The body terms depend on where the bodies are. When the time of day moves, `bakeBody` re-bakes a slice of the
+// shell toward the higher body's new direction each frame, as voxel-axle does, so shadows glide instead of
+// jumping.
+
+use ludax::lnFloor;
+use ludax::{Vec3, VoxLightWorld, VoxBakeSettings, VoxJobList, VoxelGrid};
+
+use crate::world::scene::LumenScene;
+
+// 1 / 255: one step of an 8-bit channel, the unit of the baked terms.
+const LV_UNIT : f32 = 0.003921569;
+
+// The top set bit of a light word: this cell belongs to the baked shell. The sign bit above it marks a cell
+// the volume must skip (a solid one), so a read of the word alone decides both.
+const LV_SHELL : i32 = 1073741824;
+const LV_SOLID : i32 = -2147483648;
+
+// The most a channel of a light word holds: 10 bits, four lamp blocks' worth. Green and blue sit above red.
+const LV_CHANNEL_MAX : i32 = 1023;
+
+/** The channels of the access word are bytes: a byte's mask, and where the three tint bytes sit above access. */
+const LV_BYTE_MASK : i32 = 255;
+const LV_TINT_R_SHIFT : i32 = 8;
+const LV_TINT_G_SHIFT : i32 = 16;
+const LV_TINT_B_SHIFT : i32 = 24;
+const LV_GREEN_SHIFT : i32 = 10;
+const LV_BLUE_SHIFT : i32 = 20;
+
+// A cell off the shell has full sky access and a white tint: every byte of its cover word is 255.
+const LV_COVER_OPEN : i32 = -1;
+
+// The three bytes of the sky word: flooded sky light, then the sun's visibility, then the moon's.
+const LV_SKY_MASK : i32 = 255;
+const LV_SUN_SHIFT : i32 = 8;
+const LV_MOON_SHIFT : i32 = 16;
+const LV_SUN_FIELD : i32 = 65280;
+const LV_MOON_FIELD : i32 = 16711680;
+
+/** One slice of a body bake: the world and scene, which body, how soft, and the cells to do. */
+pub struct BodyBake {
+    /** The light world whose shell is baked. */
+    world : VoxLightWorld;
+
+    /** The scene the baked cells are copied into. */
+    scene : LumenScene;
+
+    /** Which body's shadow the slice bakes. */
+    body : LumenBody;
+
+    /** Unit direction towards the body. */
+    direction : Vec3;
+
+    /** Angular radius of the disc, in radians. */
+    halfAngle : f32;
+
+    /** Rays per shell cell. */
+    rays : i32;
+
+    /** How far a ray walks, in cells; what lies further is open sky. The default spans the valley to its ridge. */
+    reach : f32 = 520.0;
+
+    /** First shell cell of the slice. */
+    from : i32;
+
+    /** How many cells the slice holds. */
+    count : i32;
+}
+
+/** The dense light volumes. */
+pub class LumenLight {
+    sx     : i32;
+    sy     : i32;
+    sz     : i32;
+    light  : i32[];
+    cover  : i32[];
+    sunSky : i32[];
+
+    /** Floods the lamps, bakes the sky terms with `workers` threads and copies it all into volumes. */
+    constructor(world : VoxLightWorld, scene : LumenScene, workers : i32) {
+        self.sx = scene.sx;
+        self.sy = scene.sy;
+        self.sz = scene.sz;
+        let n : i64 = (self.sx as i64) * self.sy * self.sz;
+        self.light = new i32[n];
+        self.cover = new i32[n];
+        self.sunSky = new i32[n];
+
+        LumenLight::bakeShell(world, workers);
+        self.copyVolumes(world, scene);
+    }
+
+    // Floods the lamps and bakes the sky terms of every cell in the shell, on `workers` threads.
+    static fn bakeShell(world : VoxLightWorld, workers : i32) : void {
+        world.rebuildLight();
+        world.rebuildSurface();
+
+        let count : i32 = world.surface.count();
+        let jobs : VoxJobList = world.baker.jobs();
+        jobs.ensure(count);
+        for (i of 0..count) {
+            jobs.set(i, i);
+        }
+
+        let settings : VoxBakeSettings = world.settings();
+        world.baker.bakeSky(settings, count, workers > 1);
+    }
+
+    // Copies every cell of the world from the light engine into the three flat volumes.
+    fn copyVolumes(mut self, world : VoxLightWorld, scene : LumenScene) : void {
+        for (y of 0..self.sy) {
+            for (z of 0..self.sz) {
+                for (x of 0..self.sx) {
+                    self.copyCell(world, scene, x, y, z);
+                }
+            }
+        }
+    }
+
+    fn copyCell(mut self, world : VoxLightWorld, scene : LumenScene, x : i32, y : i32, z : i32) : void {
+        let at : i64 = scene.index(x, y, z);
+        let id : i32 = world.grid.cellId(x, y, z);
+
+        self.light[at] = LumenLight::lightWord(world, id, scene.isSolid(x, y, z));
+        self.cover[at] = LumenLight::coverWord(world, id);
+        self.sunSky[at] = LumenLight::skyWord(world, id);
+    }
+
+    // The light word of a cell: lamp light per channel, the shell flag and the solid flag. The solid flag rides
+    // in the sign bit: it is what the volume's reads ask first, and a word test is cheaper than a walk through
+    // the palette for every cell of every sample.
+    static fn lightWord(world : VoxLightWorld, id : i32, solid : bool) : i32 {
+        let r : i32 = lvClamp(world.flood.blockLevel(id, 0));
+        let g : i32 = lvClamp(world.flood.blockLevel(id, 1));
+        let b : i32 = lvClamp(world.flood.blockLevel(id, 2));
+        let mut word : i32 = r | (g << LV_GREEN_SHIFT) | (b << LV_BLUE_SHIFT);
+        if (world.surface.ordinalOf(id) >= 0) {
+            word = word | LV_SHELL;
+        }
+        if (solid) {
+            word = word | LV_SOLID;
+        }
+        return word;
+    }
+
+    // Sky access, then the bounce tint per channel; a cell outside the shell is fully open and untinted.
+    static fn coverWord(world : VoxLightWorld, id : i32) : i32 {
+        let ordinal : i32 = world.surface.ordinalOf(id);
+        if (ordinal < 0) {
+            return LV_COVER_OPEN;
+        }
+        let access : i32 = world.surface.access(ordinal) & LV_BYTE_MASK;
+        let r : i32 = world.surface.tint(ordinal, 0) & LV_BYTE_MASK;
+        let g : i32 = world.surface.tint(ordinal, 1) & LV_BYTE_MASK;
+        let b : i32 = world.surface.tint(ordinal, 2) & LV_BYTE_MASK;
+        return access | (r << LV_TINT_R_SHIFT) | (g << LV_TINT_G_SHIFT) | (b << LV_TINT_B_SHIFT);
+    }
+
+    // The flooded sky light. The sun's and the moon's shadows start wide open; the first slice toward each
+    // replaces the cells it reaches.
+    static fn skyWord(world : VoxLightWorld, id : i32) : i32 {
+        return (world.flood.skyLevel(id) & LV_SKY_MASK) | LV_SUN_FIELD | LV_MOON_FIELD;
+    }
+
+    /** How many cells the shell holds: the work of a full sun bake. */
+    pub fn shellSize(self, world : VoxLightWorld) : i32 {
+        return world.surface.count();
+    }
+
+    /**
+     * Re-bakes the shadow of one body over `count` cells of the shell starting at `from` (wrapping) toward the
+     * direction of the job, and copies it into the volume. Returns the cell to continue from.
+     */
+    pub fn bakeBody(mut self, job : BodyBake) : i32 {
+        let mut s : VoxBakeSettings = job.world.settings();
+        s.sunDirection = job.direction;
+        s.sunHalfAngle = job.halfAngle;
+        s.sunRays = job.rays;
+        s.reach = job.reach;
+        job.world.configure(s);
+        let n : i32 = job.world.surface.count();
+        if (n == 0) {
+            return 0;
+        }
+        let next : i32 = job.world.bakeSunSlice(job.from, job.count, true);
+        let mut take : i32 = job.count;
+        if (take > n) {
+            take = n;
+        }
+        for (i of 0..take) {
+            let ordinal : i32 = (job.from + i) % n;
+            let id : i32 = job.world.surface.cellAt(ordinal);
+            let cx : i32 = job.world.grid.cellX(id);
+            let cy : i32 = job.world.grid.cellY(id);
+            let cz : i32 = job.world.grid.cellZ(id);
+            // A shell cell may lie outside the world the renderer copied (above its ceiling): nothing reads it.
+            if (job.scene.inside(cx, cy, cz)) {
+                let at : i64 = job.scene.index(cx, cy, cz);
+                let seen : i32 = job.world.surface.sun(ordinal) & LV_SKY_MASK;
+                self.setBody(at, job.body, seen);
+            }
+        }
+        return next;
+    }
+
+    // Replaces the visibility byte of `body` in cell `at`, not OR-ing it in: every cell starts wide open, and an
+    // OR alone could never darken one. The other body's byte and the sky light are left as they are.
+    fn setBody(mut self, at : i64, body : LumenBody, seen : i32) : void {
+        let word : i32 = self.sunSky[at];
+        if (body == LumenBody::Sun) {
+            self.sunSky[at] = (word & (LV_SKY_MASK | LV_MOON_FIELD)) | (seen << LV_SUN_SHIFT);
+        } else {
+            self.sunSky[at] = (word & (LV_SKY_MASK | LV_SUN_FIELD)) | (seen << LV_MOON_SHIFT);
+        }
+    }
+
+    /** The light at the world point `p`. */
+    pub fn sample(self, scene : LumenScene, p : Vec3) : LumenLightSample {
+        let gx : f32 = p.x - (0.5 as f32);
+        let gy : f32 = p.y - (0.5 as f32);
+        let gz : f32 = p.z - (0.5 as f32);
+        let ix : i32 = lnFloor(gx);
+        let iy : i32 = lnFloor(gy);
+        let iz : i32 = lnFloor(gz);
+        let t : Vec3 = Vec3 { x: gx - ix as f32, y: gy - iy as f32, z: gz - iz as f32 };
+
+        // One bound test for the whole cube: when the base cell and its three +1 neighbours are all inside,
+        // no corner can leave the world, and the per-corner walk through `inside` is not paid. The cell ids
+        // of the cube come from one base and three strides instead of eight index computations.
+        let whole : bool = ix >= 0 && iy >= 0 && iz >= 0 && ix < scene.sx - 1 && iy < scene.sy - 1
+            && iz < scene.sz - 1;
+        let base : i64 = scene.index(ix, iy, iz);
+        let stepY : i64 = (scene.sx as i64) * (scene.sz as i64);
+        let stepZ : i64 = scene.sx as i64;
+
+        let sum : LvSum = LvSum {};
+        for (k of 0..8) {
+            let ox : i32 = k & 1;
+            let oy : i32 = (k >> 1) & 1;
+            let oz : i32 = (k >> 2) & 1;
+            let w : f32 = lvCornerWeight(t, ox, oy, oz);
+            if (w <= 0.0) {
+                continue;
+            }
+            if (!whole && !scene.inside(ix + ox, iy + oy, iz + oz)) {
+                continue;
+            }
+
+            let at : i64 = base + ox as i64 + oy as i64 * stepY + oz as i64 * stepZ;
+            let l : i32 = self.light[at];
+            // A solid cell is out by its own flag, set when the volume was copied: one sign test here
+            // replaces a walk through the palette for every corner of every sample.
+            if (l < 0) {
+                continue;
+            }
+            sum.addIn(w, l, self.sunSky[at]);
+            if ((l & LV_SHELL) != 0) {
+                sum.addShellIn(w, self.sunSky[at], self.cover[at]);
+            }
+        }
+        return sum.average();
+    }
+}
+
+// The trilinear weight of the cube corner at offset (ox, oy, oz) for the fractions `t` into the cube.
+fn lvCornerWeight(t : Vec3, ox : i32, oy : i32, oz : i32) : f32 {
+    let mut w : f32 = t.x;
+    if (ox == 0) {
+        w = (1.0 as f32) - t.x;
+    }
+    if (oy == 0) {
+        w = w * ((1.0 as f32) - t.y);
+    } else {
+        w = w * t.y;
+    }
+    if (oz == 0) {
+        w = w * ((1.0 as f32) - t.z);
+    } else {
+        w = w * t.z;
+    }
+    return w;
+}
+
+// The weighted sums of one light sample, before the division by the weights that were summed. The baked fields
+// (sun, moon, access, tint) exist only in shell cells, so they carry their own weight.
+struct LvSum {
+    wsum   : f32 = 0.0;
+    wbaked : f32 = 0.0;
+    r      : f32 = 0.0;
+    g      : f32 = 0.0;
+    b      : f32 = 0.0;
+    sky    : f32 = 0.0;
+    sun    : f32 = 0.0;
+    moon   : f32 = 0.0;
+    access : f32 = 0.0;
+    tr     : f32 = 0.0;
+    tg     : f32 = 0.0;
+    tb     : f32 = 0.0;
+
+    // Adds a corner's block light and sky light, `l` and `ss` being its light and sun/sky words.
+    fn addIn(mut self, w : f32, l : i32, ss : i32) : void {
+        self.r = self.r + w * (l & LV_CHANNEL_MAX) as f32;
+        self.g = self.g + w * ((l >>> LV_GREEN_SHIFT) & LV_CHANNEL_MAX) as f32;
+        self.b = self.b + w * ((l >>> LV_BLUE_SHIFT) & LV_CHANNEL_MAX) as f32;
+        self.sky = self.sky + w * (ss & LV_SKY_MASK) as f32;
+        self.wsum = self.wsum + w;
+    }
+
+    // Adds the baked sun, moon, access and tint of a shell corner, `c` being its cover word.
+    fn addShellIn(mut self, w : f32, ss : i32, c : i32) : void {
+        self.sun = self.sun + w * ((ss >>> LV_SUN_SHIFT) & LV_SKY_MASK) as f32;
+        self.moon = self.moon + w * ((ss >>> LV_MOON_SHIFT) & LV_SKY_MASK) as f32;
+        self.access = self.access + w * (c & LV_BYTE_MASK) as f32;
+        self.tr = self.tr + w * ((c >>> LV_TINT_R_SHIFT) & LV_BYTE_MASK) as f32;
+        self.tg = self.tg + w * ((c >>> LV_TINT_G_SHIFT) & LV_BYTE_MASK) as f32;
+        self.tb = self.tb + w * ((c >>> LV_TINT_B_SHIFT) & LV_BYTE_MASK) as f32;
+        self.wbaked = self.wbaked + w;
+    }
+
+    // The sums as a sample; the empty sample when every corner was solid or outside.
+    fn average(self) : LumenLightSample {
+        if (self.wsum < (0.0001 as f32)) {
+            return LumenLightSample {};
+        }
+
+        let k : f32 = LV_UNIT / self.wsum;
+        let mut out : LumenLightSample = LumenLightSample {
+            block: Vec3 { x: self.r * k, y: self.g * k, z: self.b * k },
+            sky: self.sky * k,
+        };
+        if (self.wbaked > (0.0001 as f32)) {
+            let kb : f32 = LV_UNIT / self.wbaked;
+            out.sun = self.sun * kb;
+            out.moon = self.moon * kb;
+            out.access = self.access * kb;
+            out.tint = Vec3 { x: self.tr * kb, y: self.tg * kb, z: self.tb * kb };
+        }
+        return out;
+    }
+}
+
+// A flooded level as the 10 bits a light word keeps per channel.
+fn lvClamp(v : i32) : i32 {
+    if (v > LV_CHANNEL_MAX) {
+        return LV_CHANNEL_MAX;
+    }
+    return v;
+}

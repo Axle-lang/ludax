@@ -1,0 +1,407 @@
+// measure — the modes that measure the renderer instead of showing a picture.
+//
+// `bench` times the stages of a frame, `flicker` measures how much a still picture changes from frame to frame
+// (the number the temporal and spatial filters exist to keep near zero) and `prof` measures the renderer's inner
+// loops one call at a time. All three drive the same `LumenSession` the window does, so what they time is what a
+// player gets, and none opens a window. Their output is text; the one picture they may write (`flicker.bmp`) is
+// a magnified difference image.
+
+use ludax::{
+    Ray, Vec3, LightAlphaMode, LightDiffuseModel, LightMaterial, nowNanos, nanosToMillis, lightBrdf,
+    lightIncidence, lightPrepare, min
+};
+use ludax::{lumenCloudCover, LumenLightSample};
+use smalt::{Surface, Bmp, Color};
+
+use crate::app::headless::LumenHeadless;
+use crate::app::options::Options;
+use crate::app::session::LumenSession;
+use crate::light::shade::lumenCloudShade;
+use crate::render::env::LumenEnv;
+use crate::world::hit::LumenHit;
+use crate::world::scene::LumenScene;
+
+// A benchmark's picture, and the scale it is shown at, when the command line asks for none.
+const BENCH_W : i32 = 640;
+const BENCH_H : i32 = 360;
+const BENCH_SCALE : i32 = 2;
+
+// A benchmark warms up, then measures this many frames with the camera still and as many with it moving.
+const BENCH_WARMUP : i32 = 60;
+const BENCH_FRAMES : i32 = 40;
+
+// How far the camera turns and moves a frame in the moving half of the benchmark.
+const BENCH_TURN : f32 = 0.012;
+const BENCH_STEP : f32 = 0.05;
+
+// How many stages the session times: trace, temporal, filter, resolve.
+const BENCH_STAGES : i32 = 4;
+
+// The seconds a measured display frame is told have passed: the exposure adapts at the same pace as in a window.
+const MEASURE_STEP : f32 = 0.016;
+
+// The flicker measurement's picture size, its warm-up frames, the frame it starts reporting at, the frames it
+// runs, and the frame whose difference image it writes.
+const FLICKER_W : i32 = 640;
+const FLICKER_H : i32 = 360;
+const FLICKER_WARMUP : i32 = 30;
+const FLICKER_FIRST : i32 = 50;
+const FLICKER_FRAMES : i32 = 70;
+const FLICKER_IMAGE : i32 = 69;
+
+// The difference image shows each channel's change times this, so a change of a few levels is visible.
+const FLICKER_GAIN : i32 = 12;
+const FLICKER_CHANNELS : i64 = 3;
+
+// How many calls each inner loop is measured over: enough that the clock's own jitter vanishes.
+const PROF_CALLS : i32 = 100000;
+
+// The prof inputs wander by this much a call (cells), so the optimiser can neither hoist nor memoise the work.
+const PROF_WANDER : f32 = 0.01;
+
+// How far above the ground the prof probes sit: the air a cell above it, and a ray start under the ceiling.
+const PROF_AIR : f32 = 1.5;
+const PROF_RAY_RISE : f32 = 20.0;
+
+// The mid-grey, fairly rough surface the BRDF is measured on, and the mip level of the texture read.
+const PROF_GREY : f32 = 0.5;
+const PROF_ROUGHNESS : f32 = 0.8;
+const PROF_MIP : f32 = 1.5;
+
+// The noon time of day: the sun high enough that the shadow walk runs its full course through air and canopy.
+const PROF_NOON : f64 = 0.5;
+
+/** How far the profiled primary ray looks, cells: past the far side of the world. */
+const PROF_PRIMARY_REACH : f32 = 500.0;
+
+/** How far the profiled shadow ray looks toward the sun, cells. */
+const PROF_SHADOW_REACH : f32 = 120.0;
+
+/** The roughness of the profiled sky read that stays on the sharp grid. */
+const PROF_SKY_ROUGHNESS : f32 = 0.1;
+
+/** Where and what a prof loop measures against: the world, the sun, and a column of open ground. */
+struct ProfRig {
+    env   : Shared<LumenEnv>;
+    scene : LumenScene;
+    sun   : Vec3;
+    up    : Vec3;
+    x     : f32;
+    z     : f32;
+    airY  : f32;
+    rockY : f32;
+
+    // A point beside the ground, `i % cycle` hundredths of a cell off the column: the wandering input.
+    fn near(self, i : i32, cycle : i32) : Vec3 {
+        return Vec3 { x: self.x + (i % cycle) as f32 * PROF_WANDER, y: self.airY, z: self.z };
+    }
+}
+
+/** The measuring front end. */
+pub class LumenMeasure {
+    /**
+     * The cost of the renderer's inner loops, one call at a time, on one thread. The bench says how long a
+     * stage takes; this says what the stage is made of. Every input wanders by a hair per call and every sum
+     * feeds the printed sinks, so the optimiser can neither hoist the work out of the loops nor drop it.
+     */
+    pub static fn prof(_o : Options) : i32 {
+        let session : LumenSession = LumenHeadless::tinySession();
+        let shot = LumenSession::shot(1);
+        session.goTo(shot);
+        session.setDay(PROF_NOON);
+
+        let env : Shared<LumenEnv> = session.env;
+        let scene : LumenScene = env.scene;
+        let ground : i32 = scene.columnTop(shot.x as i32, shot.z as i32);
+        let airY : f32 = ground as f32 + PROF_AIR;
+        let rig : ProfRig = ProfRig {
+            env: env,
+            scene: scene,
+            sun: env.sky.sunDir,
+            up: Vec3::unitY(),
+            x: shot.x,
+            z: shot.z,
+            airY: airY,
+            rockY: min(ground as f32 + PROF_RAY_RISE, (scene.sy - 2) as f32),
+        };
+        // The ray starts under the ceiling: above the world, the walker refuses the ray at the door.
+        println("lumen prof: one thread, ${PROF_CALLS} calls of each inner loop (ground top ${ground})");
+
+        LumenMeasure::profTrace(rig);
+        LumenMeasure::profClouds(rig);
+        LumenMeasure::profSky(rig);
+        LumenMeasure::profLamps(rig);
+        LumenMeasure::profShading(rig);
+        session.close();
+        return 0;
+    }
+
+    // The ray walker: a primary ray down into the valley, a shadow ray toward the sun, and one trilinear read of
+    // the baked light.
+    static fn profTrace(rig : ProfRig) : void {
+        let dir : Vec3 = Vec3 { x: 0.2, y: -0.6, z: -0.3 }.normalized();
+        let mut sink : f64 = 0.0;
+        let mut began : i64 = nowNanos();
+        for (i of 0..PROF_CALLS) {
+            let from : Vec3 = Vec3 { x: rig.near(i, 11).x, y: rig.rockY, z: rig.z };
+            let hit : LumenHit = rig.scene.trace(Ray::make(from, dir), PROF_PRIMARY_REACH, false, 0);
+            sink = sink + hit.t;
+        }
+        profLine("primary trace  ", began, sink);
+
+        began = nowNanos();
+        for (i of 0..PROF_CALLS) {
+            let shadow : Ray = Ray::make(rig.near(i, 7), rig.sun);
+            sink = sink + rig.scene.visibility(shadow, PROF_SHADOW_REACH, 0).maxComponent();
+        }
+        profLine("shadow walk    ", began, sink);
+
+        began = nowNanos();
+        for (i of 0..PROF_CALLS) {
+            let p : Vec3 = rig.near(i, 13);
+            let probe : LumenLightSample = rig.env.lightAt(p);
+            sink = sink + probe.sun + probe.sky;
+        }
+        profLine("volume sample  ", began, sink);
+    }
+
+    // The cloud deck: the five-octave field alone, and the shade a sun ray takes through it.
+    static fn profClouds(rig : ProfRig) : void {
+        let mut sink : f64 = 0.0;
+        let mut began : i64 = nowNanos();
+        for (i of 0..PROF_CALLS) {
+            let p : Vec3 = rig.near(i, 17);
+            sink = sink + lumenCloudCover(p.x, p.z, rig.env.time);
+        }
+        profLine("cloud cover    ", began, sink);
+
+        began = nowNanos();
+        for (i of 0..PROF_CALLS) {
+            sink = sink + lumenCloudShade(rig.near(i, 5), rig.sun, rig.env.time);
+        }
+        profLine("cloud shade    ", began, sink);
+    }
+
+    // The environment lookups a shaded point makes: a mirror's sharp grid and rough terrain's two blurs, along a
+    // direction that turns a little every call.
+    static fn profSky(rig : ProfRig) : void {
+        let look : Vec3 = Vec3 { x: 0.3, y: 0.5, z: 0.2 }.normalized();
+        let mut sink : f64 = 0.0;
+        let mut began : i64 = nowNanos();
+        for (i of 0..PROF_CALLS) {
+            let d : Vec3 = look.plus(rig.up.scale((i % 9) as f32 * (0.0001 as f32))).normalized();
+            sink = sink + rig.env.sky.prefiltered(d, PROF_SKY_ROUGHNESS).maxComponent();
+        }
+        profLine("sky sharp      ", began, sink);
+
+        began = nowNanos();
+        for (i of 0..PROF_CALLS) {
+            let d : Vec3 = look.plus(rig.up.scale((i % 9) as f32 * (0.0001 as f32))).normalized();
+            sink = sink + rig.env.sky.prefiltered(d, PROF_ROUGHNESS).maxComponent();
+        }
+        profLine("sky rough      ", began, sink);
+    }
+
+    // The lamps: the bucket query a shaded point makes, and the light geometry of one lamp.
+    static fn profLamps(rig : ProfRig) : void {
+        let lamps = rig.env.lamps;
+        let near : i32[] = new i32[lamps.nearMax() as i64];
+        let mut sink : f64 = 0.0;
+        let mut began : i64 = nowNanos();
+        for (i of 0..PROF_CALLS) {
+            sink = sink + lamps.near(rig.near(i, 3), near, lamps.nearMax()) as f32;
+        }
+        profLine("lamp query     ", began, sink);
+
+        began = nowNanos();
+        for (i of 0..PROF_CALLS) {
+            let inc = lightIncidence(rig.env.sky.sun, rig.near(i, 3), rig.up, rig.up, 1, 0);
+            sink = sink + inc.irradiance;
+        }
+        profLine("light incidence", began, sink);
+    }
+
+    // The BRDF of one shaded point (its material and DFG lookup prepared once, its normal a little alive), the
+    // DFG lookup every shaded point makes once, and one texture read at a mid mip level.
+    static fn profShading(rig : ProfRig) : void {
+        let material : LightMaterial = LightMaterial {
+            baseColor: Vec3::splat(PROF_GREY),
+            metallic: 0.0,
+            roughness: PROF_ROUGHNESS,
+            occlusion: 1.0,
+            alphaMode: LightAlphaMode::Opaque,
+            diffuseModel: LightDiffuseModel::Lambert,
+        };
+        let prepared = lightPrepare(material, rig.env.dfg.lookup(PROF_ROUGHNESS, PROF_ROUGHNESS));
+        let mut sink : f64 = 0.0;
+        let mut began : i64 = nowNanos();
+        for (i of 0..PROF_CALLS) {
+            let n : Vec3 = rig.up
+                .plus(Vec3 { x: (i % 5) as f32 * (0.001 as f32), y: 0.0, z: 0.0 })
+                .normalized();
+            let terms = lightBrdf(prepared, n, rig.up, rig.sun);
+            sink = sink + terms.diffuse.x;
+        }
+        profLine("brdf           ", began, sink);
+
+        began = nowNanos();
+        for (i of 0..PROF_CALLS) {
+            let dfg = rig.env.dfg.lookup((i % 100) as f32 * (0.01 as f32), (i % 37) as f32 * (0.027 as f32));
+            sink = sink + dfg.a + dfg.b;
+        }
+        profLine("dfg lookup     ", began, sink);
+
+        began = nowNanos();
+        for (i of 0..PROF_CALLS) {
+            let texel = rig.scene.atlas.sample(
+                rig.scene.pal,
+                1,
+                2,
+                (i % 16) as f32,
+                (i % 7) as f32,
+                0.0 as f32,
+                PROF_MIP
+            );
+            sink = sink + texel.albedo.x;
+        }
+        profLine("atlas sample   ", began, sink);
+    }
+
+    /**
+     * Times the stages of a frame (trace, temporal blend, spatial filter, resolve) and the display stage, each
+     * averaged over `BENCH_FRAMES` frames after a warm-up, with the camera still so every pixel carries its
+     * history, and again with it moving.
+     */
+    pub static fn bench(o : Options) : i32 {
+        let session : LumenSession = LumenHeadless::sessionFor(o, BENCH_W, BENCH_H, BENCH_SCALE);
+        session.goTo(LumenSession::shot(o.shot));
+        o.applyTo(session.env.settings);
+        let surface = new Surface(session.outW, session.outH);
+        for (k of 0..BENCH_WARMUP) {
+            session.pass();
+            session.show(surface.pixels(), MEASURE_STEP, false);
+        }
+
+        let threads : i32 = o.workerCount();
+        println("${session.frame.w}x${session.frame.h} shown at ${session.outW}x${session.outH}, ${threads} threads");
+        LumenMeasure::benchPhase(session, surface, "still ", false);
+        LumenMeasure::benchPhase(session, surface, "moving", true);
+        surface.close();
+        session.close();
+        return 0;
+    }
+
+    // Measures `BENCH_FRAMES` frames with the camera still or turning, and prints the averages in milliseconds.
+    static fn benchPhase(mut session : LumenSession, surface : Surface, name : string, moving : bool) : void {
+        for (i of 0..BENCH_STAGES) {
+            session.spent[i] = 0;
+        }
+
+        let t0 : i64 = nowNanos();
+        for (k of 0..BENCH_FRAMES) {
+            if (moving) {
+                session.cam.yaw = session.cam.yaw + BENCH_TURN;
+                session.cam.x = session.cam.x + BENCH_STEP;
+            }
+            session.pass();
+        }
+        let t1 : i64 = nowNanos();
+        for (k of 0..BENCH_FRAMES) {
+            session.show(surface.pixels(), MEASURE_STEP, false);
+        }
+        let t2 : i64 = nowNanos();
+
+        let n : f64 = BENCH_FRAMES as f64;
+        let frame : f64 = nanosToMillis(t1 - t0) / n;
+        let display : f64 = nanosToMillis(t2 - t1) / n;
+        let trace : f64 = nanosToMillis(session.spent[0]) / n;
+        let temporal : f64 = nanosToMillis(session.spent[1]) / n;
+        let filter : f64 = nanosToMillis(session.spent[2]) / n;
+        let resolve : f64 = nanosToMillis(session.spent[3]) / n;
+        let fps : f64 = 1000.0 / (frame + display);
+        println("${name}: trace ${trace} temporal ${temporal} filter ${filter} resolve ${resolve} display ${display} ms => ${fps} fps");
+    }
+
+    /**
+     * How much the picture changes from one frame to the next with the camera still but the history kept short, as
+     * it is while you move: the mean absolute difference of the displayed 8-bit values between successive frames,
+     * over the whole picture and over its top and bottom halves. Static content should read near zero. The
+     * renderer options of the command line apply, so each feature's share of the flicker can be measured by
+     * switching it off.
+     */
+    pub static fn flicker(o : Options) : i32 {
+        let mut session : LumenSession = LumenHeadless::sessionFor(o, FLICKER_W, FLICKER_H, 1);
+        session.goTo(LumenSession::shot(o.shot));
+        o.applyTo(session.env.settings);
+
+        let surface = new Surface(session.outW, session.outH);
+        let n : i64 = (session.outW as i64) * session.outH;
+        let mut last : i32[] = new i32[n];
+        for (k of 0..FLICKER_FRAMES) {
+            session.soft = true;
+            session.pass();
+            session.show(surface.pixels(), MEASURE_STEP, k < FLICKER_WARMUP);
+            let px : i32[] = surface.pixels();
+            if (k >= FLICKER_FIRST) {
+                LumenMeasure::flickerReport(k, px, last, n);
+                if (k == FLICKER_IMAGE) {
+                    LumenMeasure::flickerImage(surface, last, n);
+                }
+            }
+            for (i of 0..n) {
+                last[i] = px[i];
+            }
+        }
+        surface.close();
+        session.close();
+        return 0;
+    }
+
+    // Prints the mean difference of the picture `px` from `last`, over all of it and over its top half.
+    static fn flickerReport(k : i32, px : i32[], last : i32[], n : i64) : void {
+        let mut total : i64 = 0;
+        let mut top : i64 = 0;
+        for (i of 0..n) {
+            let d : i64 = flickerDiff(px[i], last[i]) as i64;
+            total = total + d;
+            if (i < n / 2) {
+                top = top + d;
+            }
+        }
+        let mean : f64 = (total as f64) / ((n * FLICKER_CHANNELS) as f64);
+        let upper : f64 = (top as f64) / ((n * FLICKER_CHANNELS / 2) as f64);
+        println("frame ${k}: mean difference ${mean} of 255 (top half ${upper})");
+    }
+
+    // Writes the difference between the surface's picture and `last`, magnified, as grey into `flicker.bmp`.
+    static fn flickerImage(surface : Surface, last : i32[], n : i64) : void {
+        let mut px : i32[] = surface.pixels();
+        for (i of 0..n) {
+            let mut q : i32 = flickerDiff(px[i], last[i]) * FLICKER_GAIN;
+            if (q > 255) {
+                q = 255;
+            }
+            px[i] = Color::packBytes(q, q, q);
+        }
+        Bmp::write("flicker.bmp", surface.frame());
+    }
+}
+
+// One line of the prof table: the operation, its nanoseconds a call, and the sink that kept it real.
+fn profLine(name : string, began : i64, sink : f64) : void {
+    println("${name} ${((nowNanos() - began) as f64 / (PROF_CALLS as f64))} ns a call (sink ${sink})");
+}
+
+// The absolute difference of one channel of two packed pixels, `shift` bits up.
+fn flickerChannel(a : i32, b : i32, shift : i32) : i32 {
+    let d : i32 = ((a >> shift) & 255) - ((b >> shift) & 255);
+    if (d < 0) {
+        return -d;
+    }
+    return d;
+}
+
+// The sum of the absolute differences of two packed pixels' channels.
+fn flickerDiff(a : i32, b : i32) : i32 {
+    return flickerChannel(a, b, 16) + flickerChannel(a, b, 8) + flickerChannel(a, b, 0);
+}

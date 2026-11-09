@@ -1,0 +1,202 @@
+// headless — the modes that finish without a window and produce a picture.
+//
+// A rendered still and a map of the world. Both drive the same `LumenSession` the window does, so a still frame
+// and an interactive one cannot disagree; only the loop around it differs. `run` spends as many samples as asked
+// and writes the picture; `map` reads the flat world from above. Neither opens a window, so they work over ssh
+// and in the test that compares thread counts: the picture is a function of the options and nothing else, the
+// same on one thread and on twenty. The modes that measure (`bench`, `flicker`, `prof`) are in `measure.axle`.
+
+use ludax::{Vec3, min};
+use smalt::{Surface, Bmp, Color};
+
+use crate::app::options::Options;
+use crate::app::session::LumenSession;
+use crate::world::blocks::LumenBlock;
+use crate::world::scene::LumenScene;
+
+// The default size of a rendered picture when the command line asks for none.
+const RUN_W : i32 = 960;
+const RUN_H : i32 = 540;
+
+// A session that only needs the world, not a picture, is this many pixels on a side.
+const TINY_SESSION : i32 = 64;
+
+// How far the camera turns and moves a frame when `--drift` renders a picture in motion.
+const DRIFT_TURN : f32 = 0.006;
+const DRIFT_STEP : f32 = 0.04;
+
+// The height under which a viewpoint that landed in the ground rises to find the open air.
+const PLACE_CEILING : f32 = 60.0;
+
+// The map's lake colour (linear), how much it darkens per cell of depth, and how much a step down to the
+// north-west shades a column.
+const MAP_WATER_RED : f32 = 0.02;
+const MAP_WATER_GREEN : f32 = 0.08;
+const MAP_WATER_BLUE : f32 = 0.2;
+const MAP_WATER_DEPTH : f32 = 0.12;
+const MAP_SLOPE : f32 = 0.09;
+
+/** The offline front end. */
+pub class LumenHeadless {
+    /** Renders `o.samples` passes of the chosen viewpoint into `o.frame`. */
+    pub static fn run(o : Options) : i32 {
+        let mut session : LumenSession = LumenHeadless::sessionFor(o, RUN_W, RUN_H, 0);
+        session.goTo(LumenSession::shot(o.shot));
+        LumenHeadless::place(o, session);
+
+        // The first pass is a preview; the rest are full samples.
+        session.pass();
+        for (done of 0..o.samples) {
+            if (o.drift) {
+                session.cam.yaw = session.cam.yaw + DRIFT_TURN;
+                session.cam.x = session.cam.x + DRIFT_STEP;
+            }
+            session.pass();
+        }
+
+        let surface = new Surface(session.outW, session.outH);
+        session.show(surface.pixels(), 0.0, true);
+        let ok : bool = Bmp::write(o.frame, surface.frame());
+        println("rendered ${o.samples} samples at ${session.frame.w}x${session.frame.h} into ${o.frame}");
+        surface.close();
+        session.close();
+        return LumenHeadless::status(ok);
+    }
+
+    /**
+     * A session for the options' size and thread count: `defW` by `defH` when no size was asked, shown at least
+     * `minScale` times larger than it is rendered.
+     */
+    pub static fn sessionFor(o : Options, defW : i32, defH : i32, minScale : i32) : LumenSession {
+        let mut w : i32 = o.width;
+        let mut h : i32 = o.height;
+        if (w == 0) {
+            w = defW;
+            h = defH;
+        }
+        let mut scale : i32 = o.scale;
+        if (scale < minScale) {
+            scale = minScale;
+        }
+        return new LumenSession(o.workerCount(), w, h, scale);
+    }
+
+    /** One thread and the smallest picture: a session for a mode that needs the world and not the frame. */
+    pub static fn tinySession() : LumenSession {
+        return new LumenSession(1, TINY_SESSION, TINY_SESSION, 1);
+    }
+
+    // Where and when to look: the command line's overrides, then lifting the eye out of any ground it landed in.
+    static fn place(o : Options, mut session : LumenSession) : void {
+        if (o.yaw >= 0.0) {
+            session.cam.yaw = o.yaw as f32;
+        }
+        if (o.down > -999.0) {
+            session.cam.pitch = -(o.down as f32);
+        }
+        if (o.atX >= 0.0) {
+            session.cam.x = o.atX as f32;
+        }
+        if (o.atZ >= 0.0) {
+            session.cam.z = o.atZ as f32;
+        }
+        if (o.altitude >= 1.0) {
+            session.cam.y = o.altitude as f32;
+        }
+
+        LumenHeadless::liftOutOfGround(session);
+
+        if (o.time >= 0.0) {
+            session.setDay(o.time);
+        }
+        o.applyTo(session.env.settings);
+    }
+
+    // A viewpoint moved with --x and --z may land in the ground: rise until the eye is in the open.
+    static fn liftOutOfGround(mut session : LumenSession) : void {
+        while (LumenHeadless::eyeBuried(session) && session.cam.y < PLACE_CEILING) {
+            session.cam.y = session.cam.y + (1.0 as f32);
+        }
+    }
+
+    // True when the camera's eye is inside a solid block.
+    static fn eyeBuried(session : LumenSession) : bool {
+        let eye : Vec3 = session.cam.eye();
+        return session.env.scene.isSolid(eye.x as i32, eye.y as i32, eye.z as i32);
+    }
+
+    /**
+     * A map of the world from above, one pixel a column: the colour of the top block, shaded by the slope to the
+     * north-west so ridges and valleys read, with the water tinted by its depth. It shows the shape of the land.
+     */
+    pub static fn map(o : Options) : i32 {
+        let session : LumenSession = LumenHeadless::tinySession();
+        let scene : LumenScene = session.env.scene;
+        let surface = new Surface(scene.sx, scene.sz);
+        let mut px : i32[] = surface.pixels();
+        for (z of 0..scene.sz) {
+            for (x of 0..scene.sx) {
+                let c : Vec3 = LumenHeadless::column(scene, x, z);
+                px[(z * scene.sx + x) as i64] = Color::packBytes(mapCode(c.x), mapCode(c.y), mapCode(c.z));
+            }
+        }
+        let ok : bool = Bmp::write(o.map, surface.frame());
+        println("wrote the map of ${scene.sx} x ${scene.sz} columns to ${o.map}");
+        surface.close();
+        session.close();
+        return LumenHeadless::status(ok);
+    }
+
+    // The map's colour of column (x, z): its top block, darkened by lake depth, shaded by the slope to the
+    // north-west (the column itself on the world's edge).
+    static fn column(scene : LumenScene, x : i32, z : i32) : Vec3 {
+        let top : i32 = scene.columnTop(x, z);
+        let block : i32 = scene.at(x, top, z);
+        let mut c : Vec3 = scene.pal.albedoOf(block);
+        if (block == LumenBlock::Water.id()) {
+            let depth : f32 = LumenHeadless::waterDepth(scene, x, top, z) as f32;
+            c = Vec3 { x: MAP_WATER_RED, y: MAP_WATER_GREEN, z: MAP_WATER_BLUE }.scale((1.0 as f32)
+                / ((1.0 as f32) + depth * MAP_WATER_DEPTH));
+        }
+
+        let mut nwX : i32 = x;
+        if (x > 0) {
+            nwX = x - 1;
+        }
+        let mut nwZ : i32 = z;
+        if (z > 0) {
+            nwZ = z - 1;
+        }
+        let nw : i32 = scene.columnTop(nwX, nwZ);
+        return c.scale((1.0 as f32) + ((top - nw) as f32) * MAP_SLOPE);
+    }
+
+    // How many water cells lie at and under `top` in column (x, z), down to the first other block.
+    static fn waterDepth(scene : LumenScene, x : i32, top : i32, z : i32) : i32 {
+        let mut depth : i32 = 0;
+        while (top - depth > 0 && scene.at(x, top - depth, z) == LumenBlock::Water.id()) {
+            depth = depth + 1;
+        }
+        return depth;
+    }
+
+    // The process exit status of a mode that wrote a file: 0 when it did.
+    static fn status(ok : bool) : i32 {
+        if (ok) {
+            return 0;
+        }
+        return 1;
+    }
+}
+
+// A linear channel as a display code, through the sRGB curve.
+fn mapCode(v : f32) : i32 {
+    let c : i32 = (ludax::lightSrgbEncode(min(v, 1.0)) * (255.0 as f32)) as i32;
+    if (c < 0) {
+        return 0;
+    }
+    if (c > 255) {
+        return 255;
+    }
+    return c;
+}

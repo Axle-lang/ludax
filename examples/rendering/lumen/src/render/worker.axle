@@ -1,0 +1,371 @@
+// worker — follows a ray through the world and returns the radiance that travels back along it.
+//
+// One worker per thread of a frame, with its own scratch space. A ray ends in the sky, on a surface (shaded by
+// `shade`) or on water. Water is the interesting case: the ray splits into a mirror ray and a ray refracted into
+// the lake; the share of each is Fresnel's, the refracted one picks up the water's colour as it crosses the cells
+// (the tracer multiplies the transmittance of every water cell it passes) and whatever the lake bed shows,
+// caustics included.
+//
+// Nothing is random. Textures are read through a mip chain chosen from the size of a pixel on the surface, so a
+// distant texel is an average and not a coin toss; the light comes baked from the engine's volumes; and the fog
+// is voxel-axle's aerial perspective, a function of depth alone: a surface dissolves into the colour of the air
+// behind it by `1 - exp(-(z / scale)^2)`. The sun's light shafts are not found here at all: they are a pass over
+// the finished picture (see `frame`), which follows the silhouettes and so can never shine through a wall.
+
+use ludax::{FOG_SCALE, Ray, Vec3, sin, cos, saturate, max, lightLog2};
+use ludax::{LumenLightSample, LumenSky, LumenPoint, LumenView, lnValue2};
+
+use crate::light::lamps::LumenLampScratch;
+use crate::light::shade::{LumenLit, lumenShade, lumenSimpleSurface, shProbe};
+use crate::render::env::LumenEnv;
+use crate::render::point::lumenPoint;
+use crate::world::blocks::LumenKind;
+use crate::world::hit::LumenHit;
+
+/** A surface seen edge-on is treated as at least this square on, so the texture level stays finite. */
+const WORKER_MIN_SLANT : f32 = 0.2;
+
+/** A primary ray's depth is measured along the view axis, but never as less than this share of the ray's length. */
+const WORKER_MIN_FACING : f32 = 0.2;
+
+/** Texels across a cell: the footprint of a pixel is counted in them. */
+const WORKER_TEXELS : f32 = 16.0;
+
+/** The level is this much sharper than the footprint asks for, and a reflection this much coarser. */
+const WORKER_LEVEL_SHARPEN : f32 = 0.5;
+const WORKER_MIRROR_COARSER : f32 = 1.0;
+
+/** The long swells of the lake: each a cosine over the ground, with its wave numbers along x and z, how fast it moves, and how steep. */
+const WAVE_1_KX : f32 = 0.9;
+const WAVE_1_KZ : f32 = 0.3;
+const WAVE_1_RATE : f32 = 1.3;
+const WAVE_1_SLOPE : f32 = 0.11;
+const WAVE_2_KX : f32 = 0.6;
+const WAVE_2_KZ : f32 = 1.4;
+const WAVE_2_RATE : f32 = 1.9;
+const WAVE_2_SLOPE : f32 = 0.08;
+const WAVE_3_KX : f32 = 2.7;
+const WAVE_3_KZ : f32 = 2.1;
+const WAVE_3_RATE : f32 = 2.6;
+const WAVE_3_SLOPE : f32 = 0.05;
+
+/** The fine ripple: noise cells per cell of lake, the speed it drifts along x and z, its hash seeds and its steepness. */
+const WAVE_RIPPLE_SCALE : f32 = 3.1;
+const WAVE_RIPPLE_DRIFT_X : f32 = 0.8;
+const WAVE_RIPPLE_DRIFT_Z : f32 = 0.7;
+const WAVE_RIPPLE_SEED_X : i32 = 401;
+const WAVE_RIPPLE_SEED_Z : i32 = 402;
+const WAVE_RIPPLE_SLOPE : f32 = 0.25;
+
+// Where a sky ray's hit is recorded, far along it: the reprojection only needs a stable far point. It sits
+// past the diagonal of the demo world, so a sky pixel's recorded position is outside everything.
+const WORKER_SKY_DIST : f32 = 500.0;
+
+// The ratio of the refractive indices of air and water: light bends toward the normal entering the lake.
+const WATER_ETA : f32 = 0.7502;
+
+// What a water surface reflects at normal incidence, and the steepest slope its ripples may take.
+const WATER_F0 : f32 = 0.02;
+const WATER_SLOPE_MIN : f32 = 0.02;
+
+// How far down a refracted ray looks for the lake bed, and how far a ray is nudged off a surface it leaves.
+const WATER_BED_REACH : f32 = 90.0;
+const WATER_OFFSET : f32 = 0.02;
+
+// How quickly ripples smaller than a pixel fade out with distance.
+const WATER_RIPPLE_FADE : f32 = 0.006;
+
+// A fog share below this is not worth blending.
+const FOG_MIN : f32 = 0.002;
+
+// A surface smoother than this reflects a traced ray; the deepest mirror bounce.
+const WORKER_MIRROR_ROUGH : f32 = 0.3;
+const WORKER_MIRROR_DEPTH : i32 = 2;
+
+// How far off a surface a secondary ray starts, so it does not re-hit the face it left.
+const WORKER_LIFT : f32 = 0.01;
+
+// What makes a hit unfilterable across pixels: it is a mirror, a metal, or it glows.
+const WORKER_METAL_MIN : f32 = 0.5;
+const WORKER_EMIT_MIN : f32 = 0.05;
+
+// The darkest albedo the history divides by, so a near-black surface is still stable.
+const WORKER_ALBEDO_MIN : f32 = 0.03;
+
+// How fast the depth view falls to black.
+const WORKER_DEPTH_SCALE : f32 = 0.04;
+
+/** `gSid` for a primary ray that reached the sky. */
+pub const WORKER_SKY : i32 = -1;
+
+/** `gSid` for a primary ray that hit water. */
+pub const WORKER_WATER : i32 = -2;
+
+/** `gSid` for a hit whose light must not be filtered across pixels: mirrors, metals, glowing blocks. */
+pub const WORKER_UNFILTERED : i32 = -3;
+
+/**
+ * One tracing chunk's tracer: made once per chunk of rows, with its own scratch for the nearby lamps, sized by
+ * the lamps' own worst neighbourhood so not one lamp is dropped for lack of room.
+ */
+pub class LumenWorker {
+    near : LumenLampScratch;
+
+    /** Albedo of the surface the last primary ray hit (white for sky and water). */
+    pub gAlb : Vec3 = Vec3 { x: 1.0, y: 1.0, z: 1.0 };
+
+    /** Where the last primary ray hit; for the sky, far along the ray. */
+    pub gPos : Vec3 = Vec3 { x: 0.0, y: 0.0, z: 0.0 };
+
+    /**
+     * What the last primary ray hit, as the temporal stages need to know: a surface plane (`workerPlane`'s
+     * packing of face and plane coordinate, always positive), or one of `WORKER_SKY`, `WORKER_WATER` and
+     * `WORKER_UNFILTERED`.
+     */
+    pub gSid : i32 = WORKER_SKY;
+
+    /** How far a ray may run: the world's diagonal, so a grown world needs no edit here. */
+    pub far : f32 = 760.0;
+
+    /** How much sky light the eye sees by; set once per frame, it scales the fog so a cave has none. */
+    pub open : f32 = 1.0;
+
+    /** The camera's forward axis: fog is a function of depth along it, so it does not vignette the picture. */
+    pub fwd : Vec3 = Vec3 { x: 0.0, y: 0.0, z: -1.0 };
+
+    /** The angle one pixel covers, radians: what turns a distance into the size of a pixel on a surface. */
+    pub pixel : f32 = 0.003;
+
+    /** A worker with its own lamp scratch, `nearMax` indices wide. */
+    constructor(nearMax : i32) {
+        self.near = new LumenLampScratch(nearMax);
+    }
+
+    /**
+     * The radiance along the ray from `o` in the unit direction `d`. `depth` counts mirror and refraction
+     * bounces; `primary` marks the camera's ray, which records what it hit and may show a debug view.
+     */
+    pub fn radiance(
+        mut self,
+        env : Shared<LumenEnv>,
+        o : Vec3,
+        d : Vec3,
+        depth : i32,
+        primary : bool
+    ) : Vec3 {
+        let ray : Ray = Ray::make(o, d);
+        let hit : LumenHit = env.scene.trace(ray, self.far, false, 0);
+        if (primary) {
+            self.gSid = WORKER_SKY;
+            self.gAlb = Vec3::splat(1.0);
+            self.gPos = o.plus(d.scale(WORKER_SKY_DIST));
+        }
+        if (!hit.hit) {
+            return env.sky.view(d, o).times(hit.tr);
+        }
+        let kind : LumenKind = env.scene.pal.kindOf(hit.block);
+        let mut c : Vec3 = Vec3::zero();
+        if (kind == LumenKind::Water && !(primary && env.settings.view != LumenView::Final)) {
+            if (primary) {
+                self.gSid = WORKER_WATER;
+                self.gPos = o.plus(d.scale(hit.t));
+            }
+            c = self.water(env, o, d, hit, depth);
+        } else {
+            c = self.surface(env, o, d, hit, depth, primary);
+        }
+        c = c.times(hit.tr);
+        if (primary && env.settings.view != LumenView::Final) {
+            return c;
+        }
+        let mut z : f32 = hit.t;
+        if (primary) {
+            z = hit.t * max(d.dot(self.fwd), WORKER_MIN_FACING);
+        }
+        return self.fog(env, c, d, z);
+    }
+
+    // The texture level for a pixel on a surface `dist` away seen along `d` against the normal `n`: the size of
+    // the pixel's footprint on the face in texels (a texel is a sixteenth of a cell), as a power of two. A
+    // reflection is blurrier than the camera's own view, so it is read one level coarser.
+    fn lod(self, dist : f32, d : Vec3, n : Vec3, depth : i32) : f32 {
+        let slant : f32 = max(-d.dot(n), WORKER_MIN_SLANT);
+        let footprint : f32 = dist * self.pixel / slant * WORKER_TEXELS;
+        if (footprint <= 1.0) {
+            return 0.0;
+        }
+        // Half a level sharper than the pixel footprint asks for: the sub-pixel jitter anti-aliases the rest, and a
+        // texture read exactly at its footprint looks soft once the picture is scaled up.
+        let mut level : f32 = lightLog2(footprint) - WORKER_LEVEL_SHARPEN;
+        if (level < 0.0) {
+            level = 0.0;
+        }
+        if (depth > 0) {
+            level = level + WORKER_MIRROR_COARSER;
+        }
+        return level;
+    }
+
+    // Aerial perspective: the surface dissolves into the air behind it with depth, as in voxel-axle.
+    fn fog(self, env : Shared<LumenEnv>, c : Vec3, d : Vec3, z : f32) : Vec3 {
+        let amount : f32 = env.settings.fog;
+        if (amount <= 0.0) {
+            return c;
+        }
+        let t : f32 = z * amount / FOG_SCALE;
+        let fogShare : f32 = ((1.0 as f32) - ludax::lightExp(-t * t)) * self.open;
+        if (fogShare <= FOG_MIN) {
+            return c;
+        }
+        return c.lerp(env.sky.haze(d), fogShare);
+    }
+
+    // The shading of an opaque hit, or the debug view of it.
+    fn surface(
+        mut self,
+        env : Shared<LumenEnv>,
+        o : Vec3,
+        d : Vec3,
+        hit : LumenHit,
+        depth : i32,
+        primary : bool
+    ) : Vec3 {
+        let lod : f32 = self.lod(hit.t, d, hit.normal(), depth);
+        let pt : LumenPoint = lumenPoint(env.scene.pal, env.scene.atlas, hit, o, d, env.time, lod);
+        let view : Vec3 = d.negated();
+        let mut traced : bool = false;
+        let mut mirror : Vec3 = Vec3::zero();
+        if (pt.rough < WORKER_MIRROR_ROUGH && depth < WORKER_MIRROR_DEPTH
+            && !(primary && env.settings.view != LumenView::Final)) {
+            let r : Vec3 = d.reflect(pt.n);
+            let from : Vec3 = pt.pos.plus(pt.ng.scale(WORKER_LIFT));
+            mirror = self.radiance(env, from, r, depth + 1, false);
+            traced = true;
+        }
+        if (depth > 0) {
+            // Seen in a reflection: baked light and the sun are enough, and it costs a fifth of full shading.
+            return lumenSimpleSurface(env, pt.pos, pt.n, pt.albedo, pt.emissive, false);
+        }
+
+        let lit : LumenLit = lumenShade(env, pt, view, traced, mirror, self.near);
+        if (!primary) {
+            return lit.total();
+        }
+        self.gPos = pt.pos;
+        if (traced || pt.metal > WORKER_METAL_MIN || pt.emissive.maxComponent() > WORKER_EMIT_MIN) {
+            self.gSid = WORKER_UNFILTERED;
+        } else {
+            self.gSid = workerPlane(hit);
+            self.gAlb = Vec3 {
+                x: max(pt.albedo.x, WORKER_ALBEDO_MIN),
+                y: max(pt.albedo.y, WORKER_ALBEDO_MIN),
+                z: max(pt.albedo.z, WORKER_ALBEDO_MIN),
+            };
+        }
+
+        return match env.settings.view {
+            LumenView::Albedo => pt.albedo,
+            LumenView::Normal => pt.n.scale(0.5).plus(Vec3::splat(0.5)),
+            LumenView::Direct => lit.direct,
+            LumenView::Indirect => lit.ambient,
+            LumenView::Depth => Vec3::splat(1.0 / (1.0 + hit.t * WORKER_DEPTH_SCALE)),
+            LumenView::Flood => self.probe(env, pt).block,
+            LumenView::Access => Vec3::splat(self.probe(env, pt).access),
+            LumenView::Final => lit.total(),
+            LumenView::Raw => lit.total(),
+        };
+    }
+
+    // The light volume at the point, asked just off the surface so the probe is in air.
+    fn probe(self, env : Shared<LumenEnv>, pt : LumenPoint) : LumenLightSample {
+        return shProbe(env, pt.pos, pt.ng);
+    }
+
+    // The slope of the lake surface at (x, z): four long swells and a fine ripple, all moving.
+    fn waveNormal(self, env : Shared<LumenEnv>, x : f32, z : f32, calm : f32) : Vec3 {
+        let t : f32 = env.time;
+        let mut dx : f32 = 0.0;
+        let mut dz : f32 = 0.0;
+        let w1 : f32 = cos(x * WAVE_1_KX + z * WAVE_1_KZ + t * WAVE_1_RATE);
+        let w2 : f32 = cos(z * WAVE_2_KZ - x * WAVE_2_KX + t * WAVE_2_RATE);
+        let w3 : f32 = cos(x * WAVE_3_KX + z * WAVE_3_KZ - t * WAVE_3_RATE);
+        dx = dx + WAVE_1_SLOPE * w1 * WAVE_1_KX;
+        dz = dz + WAVE_1_SLOPE * w1 * WAVE_1_KZ;
+        dx = dx - WAVE_2_SLOPE * w2 * WAVE_2_KX;
+        dz = dz + WAVE_2_SLOPE * w2 * WAVE_2_KZ;
+        dx = dx + WAVE_3_SLOPE * w3 * WAVE_3_KX;
+        dz = dz + WAVE_3_SLOPE * w3 * WAVE_3_KZ;
+
+        let rippleX : f32 = x * WAVE_RIPPLE_SCALE;
+        let rippleZ : f32 = z * WAVE_RIPPLE_SCALE;
+        let rx : f32 = lnValue2(rippleX + t * WAVE_RIPPLE_DRIFT_X, rippleZ, WAVE_RIPPLE_SEED_X)
+            - (0.5 as f32);
+        let rz : f32 = lnValue2(rippleX, rippleZ - t * WAVE_RIPPLE_DRIFT_Z, WAVE_RIPPLE_SEED_Z)
+            - (0.5 as f32);
+        dx = dx + rx * WAVE_RIPPLE_SLOPE;
+        dz = dz + rz * WAVE_RIPPLE_SLOPE;
+        return Vec3 { x: -dx * calm, y: 1.0, z: -dz * calm }.normalized();
+    }
+
+    // The lake: Fresnel mixes a traced mirror ray with a ray refracted down to the bed. Ripples smaller than a
+    // pixel fade out with distance (the swells stay), the same filtering a texture gets.
+    fn water(mut self, env : Shared<LumenEnv>, o : Vec3, d : Vec3, hit : LumenHit, depth : i32) : Vec3 {
+        let p : Vec3 = o.plus(d.scale(hit.t));
+        let mut n : Vec3 = hit.normal();
+        if (hit.ny > 0) {
+            n = self.waveNormal(env, p.x, p.z, saturate((1.0 as f32) - hit.t * WATER_RIPPLE_FADE));
+        }
+        let cosI : f32 = max(n.negated().dot(d), 0.001);
+        let one : f32 = (1.0 as f32) - cosI;
+        let one2 : f32 = one * one;
+        // Schlick's Fresnel: 2 per cent at normal incidence, all of it at a grazing angle.
+        let fresnel : f32 = WATER_F0 + ((1.0 as f32) - WATER_F0) * one2 * one2 * one;
+        let mut mirror : Vec3 = Vec3::zero();
+        if (depth < 3) {
+            let mut r : Vec3 = d.reflect(n);
+            if (r.y < WATER_SLOPE_MIN) {
+                r = Vec3 { x: r.x, y: WATER_SLOPE_MIN, z: r.z }.normalized();
+            }
+            mirror = self.radiance(env, p.plus(Vec3 { x: 0.0, y: WORKER_LIFT, z: 0.0 }), r, depth + 1, false);
+        } else {
+            mirror = env.sky.base(d.reflect(n));
+        }
+        let k : f32 = (1.0 as f32) - WATER_ETA * WATER_ETA * ((1.0 as f32) - cosI * cosI);
+        let mut below : Vec3 = Vec3::zero();
+        if (k > 0.0) {
+            let t : Vec3 = d.scale(WATER_ETA).plus(n.scale(WATER_ETA * cosI - k.sqrt())).normalized();
+            let from : Vec3 = p.minus(Vec3 { x: 0.0, y: WATER_OFFSET, z: 0.0 });
+            let ray : Ray = Ray::make(from, t);
+            let bed : LumenHit = env.scene.trace(ray, WATER_BED_REACH, true, 0);
+            let deepColour : Vec3 = env.sky.deep;
+            if (bed.hit) {
+                let lod : f32 = self.lod(hit.t + bed.t, d, hit.normal(), depth + 1);
+                let pt : LumenPoint = lumenPoint(env.scene.pal, env.scene.atlas, bed, from, t, env.time, lod);
+                let lit : Vec3 = lumenSimpleSurface(env, pt.pos, pt.n, pt.albedo, pt.emissive, true);
+                let seen : Vec3 = lit.times(bed.tr);
+                let veil : f32 = (1.0 as f32) - (bed.tr.y + bed.tr.z) * (0.5 as f32);
+                below = seen.plus(deepColour.scale(veil));
+            } else {
+                below = deepColour;
+            }
+        }
+        return mirror.scale(fresnel).plus(below.scale((1.0 as f32) - fresnel));
+    }
+}
+
+// The plane a hit face lies in, as one positive id the temporal stages compare: the plane's coordinate along
+// its normal and the face (which side of which axis) it was seen from, packed as coordinate * 8 + face. Six
+// faces fit in the 8, so the id holds for any world that fits an i32 coordinate — the old face * 1024 + plane
+// fell apart past a thousand cells, silently, in the middle of the reprojection.
+fn workerPlane(hit : LumenHit) : i32 {
+    let mut plane : i32 = hit.x;
+    if (hit.ny != 0) {
+        plane = hit.y;
+    } else if (hit.nz != 0) {
+        plane = hit.z;
+    }
+    if (hit.nx > 0 || hit.ny > 0 || hit.nz > 0) {
+        plane = plane + 1;
+    }
+    return plane * 8 + hit.face;
+}
