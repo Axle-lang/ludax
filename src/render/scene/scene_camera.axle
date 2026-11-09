@@ -1,0 +1,192 @@
+// scene_camera — the eye: perspective or orthographic, placed in f64, projected camera-relative in f32.
+//
+// A camera is plain data. Its position is an f64 point in the world and its orientation a unit quaternion (it looks
+// down its own -Z, +Y up, like the right-handed convention of `Mat4`). The renderer never sees the f64 position:
+// extraction subtracts it from every object in f64 first (`relativePoint`), so everything downstream works near
+// the origin in f32 and keeps its precision ten kilometres from the world's centre (design rule 5). The view
+// matrix therefore holds only the camera's rotation; the projection is Vulkan's (depth 0 near to 1 far, +Y down
+// in NDC), and `frustum` is built from their product, in the same camera-relative space.
+
+use crate::core::math::convert::{narrowVec3, narrowMat4, relativeVec3};
+use crate::core::math::dmat3::DMat3;
+use crate::core::math::dquat::DQuat;
+use crate::core::math::dvec3::DVec3;
+use crate::core::math::frustum::Frustum;
+use crate::core::math::mat4::Mat4;
+use crate::core::math::vec3::Vec3;
+
+// `lookAt` falls back to a perpendicular when the side vector of forward x up is shorter than this (looking along up).
+const CAM_SIDE_MIN : f64 = 0.5;
+
+/** How a camera projects. */
+pub enum CameraKind : i8 {
+    /** Parallel lines meet at the horizon; objects shrink with distance. */
+    Perspective = 0,
+    /** Parallel lines stay parallel; the view is a box. */
+    Orthographic = 1,
+}
+
+/** A camera: where it is (f64), which way it faces, and how it projects. */
+pub struct Camera {
+    /** Perspective or orthographic. */
+    pub kind : CameraKind = CameraKind::Perspective;
+
+    /** Where the eye is in the world, f64. */
+    pub position : DVec3 = DVec3 {};
+
+    /** The orientation: the camera looks along this rotation of -Z with +Y up. */
+    pub rotation : DQuat = DQuat { x: 0.0, y: 0.0, z: 0.0, w: 1.0 };
+
+    /** Vertical field of view in radians (perspective). */
+    pub fovY : f32 = 1.0;
+
+    /** Height of the view box in world units (orthographic). */
+    pub orthoHeight : f32 = 10.0;
+
+    /** Width over height of the picture (16:9 by default). */
+    pub aspect : f32 = 1.7777778;
+
+    /** Distance to the near plane; positive. */
+    pub near : f32 = 0.1;
+
+    /** Distance to the far plane; larger than `near`. */
+    pub far : f32 = 1000.0;
+
+    /** A perspective camera at `position` with orientation `rotation`. */
+    pub static fn perspective(
+        position : DVec3,
+        rotation : DQuat,
+        fovY : f32,
+        aspect : f32,
+        near : f32,
+        far : f32
+    ) : Camera {
+        return Camera {
+            kind: CameraKind::Perspective,
+            position: position,
+            rotation: rotation,
+            fovY: fovY,
+            aspect: aspect,
+            near: near,
+            far: far,
+        };
+    }
+
+    /** An orthographic camera seeing a box `height` tall (and `height * aspect` wide). */
+    pub static fn orthographic(
+        position : DVec3,
+        rotation : DQuat,
+        height : f32,
+        aspect : f32,
+        near : f32,
+        far : f32
+    ) : Camera {
+        return Camera {
+            kind: CameraKind::Orthographic,
+            position: position,
+            rotation: rotation,
+            orthoHeight: height,
+            aspect: aspect,
+            near: near,
+            far: far,
+        };
+    }
+
+    /** The same camera turned to face `target`, with `up` as the roughly-upward direction (f64 throughout). */
+    pub fn lookAt(self, target : DVec3, up : DVec3) : Camera {
+        let forward : DVec3 = target.minus(self.position).normalizedOr(DVec3::make(0.0, 0.0, -1.0));
+        let mut side : DVec3 = forward.cross(up).normalizedOr(forward.anyPerpendicular().normalized());
+        if (side.lengthSquared() < CAM_SIDE_MIN) {
+            side = forward.anyPerpendicular().normalized();
+        }
+        let upward : DVec3 = side.cross(forward);
+        let basis : DMat3 = DMat3::fromColumns(side, upward, forward.negated());
+        return Camera {
+            kind: self.kind,
+            position: self.position,
+            rotation: DQuat::fromMat3(basis).normalized(),
+            fovY: self.fovY,
+            orthoHeight: self.orthoHeight,
+            aspect: self.aspect,
+            near: self.near,
+            far: self.far,
+        };
+    }
+
+    /** The same camera at another place. */
+    pub fn movedTo(self, position : DVec3) : Camera {
+        return Camera {
+            kind: self.kind,
+            position: position,
+            rotation: self.rotation,
+            fovY: self.fovY,
+            orthoHeight: self.orthoHeight,
+            aspect: self.aspect,
+            near: self.near,
+            far: self.far,
+        };
+    }
+
+    /** The unit direction the camera looks along, in world axes (f64). */
+    pub fn forward(self) : DVec3 {
+        return self.rotation.rotate(DVec3::make(0.0, 0.0, -1.0));
+    }
+
+    /** The camera's right, in world axes. */
+    pub fn right(self) : DVec3 {
+        return self.rotation.rotate(DVec3::make(1.0, 0.0, 0.0));
+    }
+
+    /** The camera's up, in world axes. */
+    pub fn up(self) : DVec3 {
+        return self.rotation.rotate(DVec3::make(0.0, 1.0, 0.0));
+    }
+
+    /** The forward direction narrowed to f32 (a direction needs no origin). */
+    pub fn forwardF32(self) : Vec3 {
+        return narrowVec3(self.forward());
+    }
+
+    /** True for an orthographic camera. */
+    pub fn isOrthographic(self) : bool {
+        return self.kind == CameraKind::Orthographic;
+    }
+
+    /**
+     * The view matrix of camera-relative space: world axes turned into the camera's axes, no translation (the
+     * camera is the origin). Compose a model matrix whose translation is already relative to the camera.
+     */
+    pub fn view(self) : Mat4 {
+        return narrowMat4(self.rotation.conjugate().toMat4());
+    }
+
+    /** The projection to Vulkan clip space. */
+    pub fn projection(self) : Mat4 {
+        return match self.kind {
+            CameraKind::Perspective => Mat4::perspective(self.fovY, self.aspect, self.near, self.far),
+            CameraKind::Orthographic => self.orthoProjection(),
+        };
+    }
+
+    // The orthographic box of a camera: `orthoHeight` tall, `aspect` times wider.
+    fn orthoProjection(self) : Mat4 {
+        let halfH : f32 = self.orthoHeight * (0.5 as f32);
+        let halfW : f32 = halfH * self.aspect;
+        return Mat4::ortho(-halfW, halfW, -halfH, halfH, self.near, self.far);
+    }
+
+    /** Projection times view: camera-relative world space to clip space. */
+    pub fn viewProjection(self) : Mat4 {
+        return self.projection().mul(self.view());
+    }
+
+    /** The six planes of what the camera sees, in camera-relative world space. */
+    pub fn frustum(self) : Frustum {
+        return Frustum::fromViewProjection(self.viewProjection());
+    }
+
+    /** Where the world point `p` is relative to the camera: subtracted in f64, then narrowed. */
+    pub fn relativePoint(self, p : DVec3) : Vec3 {
+        return relativeVec3(p, self.position);
+    }
+}

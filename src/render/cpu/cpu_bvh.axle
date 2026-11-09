@@ -1,0 +1,387 @@
+// cpu_bvh — a bounding-volume hierarchy over triangles, for the shadow rays of the CPU backend.
+//
+// Built once per frame from the triangles that may cast shadows (camera-relative, 9 floats each). The build is a
+// median split: the triangles of a node are ordered by the centroid coordinate along the longest axis of their
+// centroids (a stable merge sort on a fixed-point key, so ties keep their input order), cut in half, and each half
+// becomes a child; leaves hold up to four triangles. No random number, hash or thread takes part, so the same
+// triangles always give the same tree and the same answers. A leaf's triangles are stored as a corner and two
+// edges, ready for the Moller-Trumbore test. Nodes are two adjacent array slots per split (the right child is the
+// left child plus one), bounds six floats per node.
+//
+// Queries: `occluded` answers whether anything lies on a ray before a distance (any hit, for shadows), `nearest`
+// the distance of the closest hit (for explaining a pixel, to show what a shadow ray hit). Both are read-only, so
+// any number of threads may ask at once. Triangles are double-sided.
+//
+// The traversal passes its ray as one `BvhRay` value (origin, direction, inverse direction); a struct of nine floats
+// costs the same as nine scalars here and keeps the recursive calls readable.
+
+use crate::core::math::geom::Ray;
+use crate::core::math::scalar::{max, min};
+use crate::core::math::vec3::Vec3;
+use crate::render::scene::scene_extract::RenderExtract;
+
+/** Floats per triangle in the arrays the tree is built from: three corners of three coordinates. */
+pub(crate) const BVH_TRI_FLOATS : i32 = 9;
+
+// Floats per triangle in the tree: a corner and two edges.
+const BVH_STORED_FLOATS : i32 = 9;
+
+// Floats per node bound: the smallest corner and the largest.
+const BVH_BOX_FLOATS : i32 = 6;
+
+// A leaf holds at most this many triangles.
+const BVH_LEAF : i32 = 4;
+
+// Hits closer than this along the ray are the surface's own (a ray starts on it).
+const BVH_T_MIN : f32 = 0.00001;
+
+// Determinants smaller than this are parallel rays.
+const BVH_DET_MIN : f32 = 0.000000000001;
+
+// A ray direction component smaller than this counts as zero when inverted (the slab test then sees a huge value).
+const BVH_DIR_MIN : f32 = 0.0000000001;
+
+// Larger than any coordinate, for an empty bound; small enough that products with it stay finite in f32.
+const BVH_HUGE : f32 = 100000000000000000000.0;
+
+// Fixed-point scale of centroid sort keys.
+const BVH_KEY_SCALE : f32 = 1024.0;
+
+// The deepest a node may sit; past it a node stays a leaf however many triangles it holds, which bounds the stack
+// of a degenerate build (many triangles sharing one centroid).
+const BVH_MAX_DEPTH : i32 = 48;
+
+// Slots of the explicit stack `nearest` walks: a path of at most `BVH_MAX_DEPTH` splits leaves one sibling per
+// level, so this is room to spare; a push that would not fit is skipped.
+const BVH_STACK : i32 = 64;
+
+// The arrays a build works over: the triangle order being sorted, the centroids and the corner coordinates.
+struct BvhBuild {
+    order   : i32[];
+    cent    : f32[];
+    corners : f32[];
+}
+
+// How a node's triangles spread: the axis along which their centroids are widest, and that width.
+struct BvhSpread {
+    axis   : i32 = 0;
+    extent : f32 = 0.0;
+}
+
+// A node of the build: its slot, the triangles order[begin..end) it holds, and how deep it sits.
+struct BvhPart {
+    node  : i32 = 0;
+    begin : i32 = 0;
+    end   : i32 = 0;
+    depth : i32 = 0;
+}
+
+// A ray as the traversal needs it: origin, direction, and the componentwise inverse of the direction.
+struct BvhRay {
+    o   : Vec3 = Vec3 {};
+    d   : Vec3 = Vec3 {};
+    inv : Vec3 = Vec3 {};
+}
+
+// The interval of the ray that is still inside every slab met so far.
+struct BvhSpan {
+    t0 : f32 = 0.0;
+    t1 : f32 = 0.0;
+}
+
+/** A triangle BVH. */
+pub class CpuBvh {
+    count : i32;
+    tri   : f32[];
+    box   : f32[];
+    first : i32[];
+    size  : i32[];
+    nodes : i32 = 0;
+
+    /** Builds the tree over `count` triangles of `BVH_TRI_FLOATS` floats each (three corners); the array is copied. */
+    constructor(corners : f32[], count : i32) {
+        self.count = count;
+        // A binary tree over n leaves has fewer than 2n nodes; the slack covers n = 0.
+        let cap : i32 = 2 * count + 2;
+        self.tri = new f32[(count * BVH_STORED_FLOATS + BVH_STORED_FLOATS) as i64];
+        self.box = new f32[(cap * BVH_BOX_FLOATS) as i64];
+        self.first = new i32[cap as i64];
+        self.size = new i32[cap as i64];
+        let mut order : i32[] = new i32[(count + 1) as i64];
+        let mut cent : f32[] = new f32[(count * 3 + 3) as i64];
+        for (t of 0..count) {
+            order[t] = t;
+            let c : Vec3 = CpuBvh::centroid(corners, t);
+            cent[t * 3] = c.x;
+            cent[t * 3 + 1] = c.y;
+            cent[t * 3 + 2] = c.z;
+        }
+        if (count > 0) {
+            self.nodes = 1;
+            let build : BvhBuild = BvhBuild { order: order, cent: cent, corners: corners };
+            self.split(BvhPart { node: 0, begin: 0, end: count, depth: 0 }, build);
+        }
+        for (i of 0..count) {
+            self.store(i, corners, order[i]);
+        }
+    }
+
+    /** How many triangles the tree holds. */
+    pub fn triangleCount(self) : i32 {
+        return self.count;
+    }
+
+    /** How many nodes the tree has. */
+    pub fn nodeCount(self) : i32 {
+        return self.nodes;
+    }
+
+    // Three floats at `at`.
+    static fn vec3At(a : f32[], at : i32) : Vec3 {
+        return Vec3::make(a[at], a[at + 1], a[at + 2]);
+    }
+
+    // The mean of the three corners of triangle `t`.
+    static fn centroid(corners : f32[], t : i32) : Vec3 {
+        let a : Vec3 = CpuBvh::vec3At(corners, t * BVH_TRI_FLOATS);
+        let b : Vec3 = CpuBvh::vec3At(corners, t * BVH_TRI_FLOATS + 3);
+        let c : Vec3 = CpuBvh::vec3At(corners, t * BVH_TRI_FLOATS + 6);
+        let three : f32 = 3.0;
+        return Vec3::make((a.x + b.x + c.x) / three, (a.y + b.y + c.y) / three, (a.z + b.z + c.z) / three);
+    }
+
+    // Stores source triangle `from` as stored triangle `i`: its first corner and its two edges from it.
+    fn store(mut self, i : i32, corners : f32[], from : i32) : void {
+        let a : Vec3 = CpuBvh::vec3At(corners, from * BVH_TRI_FLOATS);
+        let e1 : Vec3 = CpuBvh::vec3At(corners, from * BVH_TRI_FLOATS + 3).minus(a);
+        let e2 : Vec3 = CpuBvh::vec3At(corners, from * BVH_TRI_FLOATS + 6).minus(a);
+        let b : i32 = i * BVH_STORED_FLOATS;
+        self.tri[b] = a.x;
+        self.tri[b + 1] = a.y;
+        self.tri[b + 2] = a.z;
+        self.tri[b + 3] = e1.x;
+        self.tri[b + 4] = e1.y;
+        self.tri[b + 5] = e1.z;
+        self.tri[b + 6] = e2.x;
+        self.tri[b + 7] = e2.y;
+        self.tri[b + 8] = e2.z;
+    }
+
+    // Fits the box of `node` around the triangles order[begin..end) and measures how their centroids spread.
+    fn fitBox(mut self, node : i32, begin : i32, end : i32, build : BvhBuild) : BvhSpread {
+        let mut lo : Vec3 = Vec3::splat(BVH_HUGE);
+        let mut hi : Vec3 = Vec3::splat(-BVH_HUGE);
+        let mut cLo : Vec3 = Vec3::splat(BVH_HUGE);
+        let mut cHi : Vec3 = Vec3::splat(-BVH_HUGE);
+        for (i of begin..end) {
+            let t : i32 = build.order[i];
+            for (v of 0..3) {
+                let corner : Vec3 = CpuBvh::vec3At(build.corners, t * BVH_TRI_FLOATS + v * 3);
+                lo = lo.componentMin(corner);
+                hi = hi.componentMax(corner);
+            }
+            let centroid : Vec3 = CpuBvh::vec3At(build.cent, t * 3);
+            cLo = cLo.componentMin(centroid);
+            cHi = cHi.componentMax(centroid);
+        }
+
+        let b : i32 = node * BVH_BOX_FLOATS;
+        self.box[b] = lo.x;
+        self.box[b + 1] = lo.y;
+        self.box[b + 2] = lo.z;
+        self.box[b + 3] = hi.x;
+        self.box[b + 4] = hi.y;
+        self.box[b + 5] = hi.z;
+
+        let ex : f32 = cHi.x - cLo.x;
+        let ey : f32 = cHi.y - cLo.y;
+        let ez : f32 = cHi.z - cLo.z;
+        if (ez > ex && ez > ey) {
+            return BvhSpread { axis: 2, extent: ez };
+        }
+        if (ey > ex) {
+            return BvhSpread { axis: 1, extent: ey };
+        }
+        return BvhSpread { axis: 0, extent: ex };
+    }
+
+    // Reorders order[begin..end) by the centroid coordinate on `axis`, keeping the input order of ties.
+    fn sortAlong(self, begin : i32, end : i32, axis : i32, build : BvhBuild) : void {
+        let n : i32 = end - begin;
+        let mut keys : i64[] = new i64[n as i64];
+        for (i of 0..n) {
+            keys[i] = (build.cent[build.order[begin + i] * 3 + axis] * BVH_KEY_SCALE) as i64;
+        }
+        let sorted : i32[] = RenderExtract::sortedOrder(keys, n);
+        let mut copy : i32[] = new i32[n as i64];
+        for (i of 0..n) {
+            copy[i] = build.order[begin + sorted[i]];
+        }
+        for (i of 0..n) {
+            build.order[begin + i] = copy[i];
+        }
+    }
+
+    // Fills the node of `part` and recurses into its two halves.
+    fn split(mut self, part : BvhPart, build : BvhBuild) : void {
+        let node : i32 = part.node;
+        let spread : BvhSpread = self.fitBox(node, part.begin, part.end, build);
+        let n : i32 = part.end - part.begin;
+        let small : bool = n <= BVH_LEAF;
+        let tooDeep : bool = part.depth >= BVH_MAX_DEPTH;
+        let unsplittable : bool = !(spread.extent > (0.0 as f32));
+        if (small || tooDeep || unsplittable) {
+            self.first[node] = part.begin;
+            self.size[node] = n;
+            return;
+        }
+
+        self.sortAlong(part.begin, part.end, spread.axis, build);
+
+        // The two children take the next two node slots; this node points at the first.
+        let mid : i32 = part.begin + n / 2;
+        let left : i32 = self.nodes;
+        self.nodes = self.nodes + 2;
+        self.first[node] = left;
+        self.size[node] = 0;
+
+        let depth : i32 = part.depth + 1;
+        let lower : BvhPart = BvhPart { node: left, begin: part.begin, end: mid, depth: depth };
+        let upper : BvhPart = BvhPart { node: left + 1, begin: mid, end: part.end, depth: depth };
+        self.split(lower, build);
+        self.split(upper, build);
+    }
+
+    // The part of `span` inside the slab whose two planes the ray reaches at `a` and `b` (in either order).
+    static fn slab(span : BvhSpan, a : f32, b : f32) : BvhSpan {
+        return BvhSpan {
+            t0: max(span.t0, min(a, b)),
+            t1: min(span.t1, max(a, b)),
+        };
+    }
+
+    // The slab test of node `node` against `ray`, up to `tmax`.
+    fn boxHit(self, node : i32, ray : BvhRay, tmax : f32) : bool {
+        let b : i32 = node * BVH_BOX_FLOATS;
+        let ax : f32 = (self.box[b] - ray.o.x) * ray.inv.x;
+        let bx : f32 = (self.box[b + 3] - ray.o.x) * ray.inv.x;
+        let ay : f32 = (self.box[b + 1] - ray.o.y) * ray.inv.y;
+        let by : f32 = (self.box[b + 4] - ray.o.y) * ray.inv.y;
+        let az : f32 = (self.box[b + 2] - ray.o.z) * ray.inv.z;
+        let bz : f32 = (self.box[b + 5] - ray.o.z) * ray.inv.z;
+        let mut span : BvhSpan = BvhSpan { t0: 0.0, t1: tmax };
+        span = CpuBvh::slab(span, ax, bx);
+        span = CpuBvh::slab(span, ay, by);
+        span = CpuBvh::slab(span, az, bz);
+        return span.t0 <= span.t1;
+    }
+
+    // 1 / d with a huge finite value for a zero component (division by zero would trap).
+    static fn inverse(d : f32) : f32 {
+        if (d > BVH_DIR_MIN || d < -BVH_DIR_MIN) {
+            return (1.0 as f32) / d;
+        }
+        if (d < (0.0 as f32)) {
+            return -BVH_HUGE;
+        }
+        return BVH_HUGE;
+    }
+
+    // The ray the traversal walks, from the public one.
+    static fn prepare(ray : Ray) : BvhRay {
+        let d : Vec3 = ray.direction;
+        let inv : Vec3 = Vec3::make(CpuBvh::inverse(d.x), CpuBvh::inverse(d.y), CpuBvh::inverse(d.z));
+        return BvhRay { o: ray.origin, d: d, inv: inv };
+    }
+
+    // The distance along the ray of triangle `t` (index into the reordered array), or -1 for a miss.
+    fn hitTriangle(self, t : i32, ray : BvhRay, tmax : f32) : f32 {
+        let b : i32 = t * BVH_STORED_FLOATS;
+        let corner : Vec3 = CpuBvh::vec3At(self.tri, b);
+        let e1 : Vec3 = CpuBvh::vec3At(self.tri, b + 3);
+        let e2 : Vec3 = CpuBvh::vec3At(self.tri, b + 6);
+        let p : Vec3 = ray.d.cross(e2);
+        let det : f32 = e1.dot(p);
+        if (det < BVH_DET_MIN && det > -BVH_DET_MIN) {
+            return -1.0;
+        }
+        let inv : f32 = (1.0 as f32) / det;
+        let s : Vec3 = ray.o.minus(corner);
+        let u : f32 = s.dot(p) * inv;
+        if (u < (0.0 as f32) || u > (1.0 as f32)) {
+            return -1.0;
+        }
+        let q : Vec3 = s.cross(e1);
+        let v : f32 = ray.d.dot(q) * inv;
+        if (v < (0.0 as f32) || u + v > (1.0 as f32)) {
+            return -1.0;
+        }
+        let t : f32 = e2.dot(q) * inv;
+        if (t > BVH_T_MIN && t < tmax) {
+            return t;
+        }
+        return -1.0;
+    }
+
+    // Any hit below `tmax` in the subtree of `node`.
+    fn anyHit(self, node : i32, ray : BvhRay, tmax : f32) : bool {
+        if (!self.boxHit(node, ray, tmax)) {
+            return false;
+        }
+        if (self.size[node] > 0) {
+            for (i of self.first[node]..self.first[node] + self.size[node]) {
+                if (self.hitTriangle(i, ray, tmax) > (0.0 as f32)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        let left : i32 = self.first[node];
+        return self.anyHit(left, ray, tmax) || self.anyHit(left + 1, ray, tmax);
+    }
+
+    /** True when something lies on `ray` before distance `tmax` (in units of the direction's length). */
+    pub fn occluded(self, ray : Ray, tmax : f32) : bool {
+        if (self.nodes == 0) {
+            return false;
+        }
+        return self.anyHit(0, CpuBvh::prepare(ray), tmax);
+    }
+
+    /** The distance of the nearest hit on the ray below `tmax`, or -1 for none. */
+    pub fn nearest(self, ray : Ray, tmax : f32) : f32 {
+        if (self.nodes == 0) {
+            return -1.0;
+        }
+        let r : BvhRay = CpuBvh::prepare(ray);
+        let mut best : f32 = tmax;
+        let mut found : bool = false;
+        let mut stack : i32[] = new i32[BVH_STACK as i64];
+        stack[0] = 0;
+        let mut top : i32 = 1;
+        while (top > 0) {
+            top = top - 1;
+            let node : i32 = stack[top];
+            if (!self.boxHit(node, r, best)) {
+                continue;
+            }
+            if (self.size[node] > 0) {
+                for (i of self.first[node]..self.first[node] + self.size[node]) {
+                    let t : f32 = self.hitTriangle(i, r, best);
+                    if (t > (0.0 as f32)) {
+                        best = t;
+                        found = true;
+                    }
+                }
+            } else if (top < BVH_STACK - 2) {
+                stack[top] = self.first[node];
+                stack[top + 1] = self.first[node] + 1;
+                top = top + 2;
+            }
+        }
+        if (found) {
+            return best;
+        }
+        return -1.0;
+    }
+}

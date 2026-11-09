@@ -1,0 +1,181 @@
+// render_cpu_support — helpers the CPU backend suites share: a rig that records a frame through the graph and runs it.
+//
+// Every backend suite needs the same small graph, the same orthographic picture convention and the same way of
+// adding an instance, so those live here once. The rig keeps the renderer alive after construction; a caller
+// that forgets `close` leaks its worker threads, which is why each suite closes the rig at the end of its check.
+
+use ludax::{
+    Camera, CmdStream, CpuRenderer, CpuSettings, DQuat, DVec3, FrameRecorder, GraphCompiler,
+    GraphFormat
+};
+use ludax::{
+    GraphPlan, GraphResKind, Mat4, MeshData, PassCosts, PassKind, Profiler, RenderAssets,
+    RenderGraph
+};
+use ludax::{RenderInstance, RenderMaterial, RenderScene, Vec2, Vec3};
+
+/** The resource ids of the graph `CpuRig` builds. */
+pub const CPU_RIG_HDR : i32 = 1;
+
+/** The picture resource of the rig's graph. */
+pub const CPU_RIG_WINDOW : i32 = 3;
+
+/** A frame recorded through bvh -> forward -> resolve and executed on the CPU backend. */
+pub class CpuRig {
+    /** The renderer, holding the finished frame. */
+    pub renderer : CpuRenderer;
+
+    /** The counters the backend filled. */
+    pub costs : PassCosts;
+
+    /** Renders `scene` at `w` x `h` with `workers` threads on a background `bg`. */
+    constructor(
+        assets : Shared<RenderAssets>,
+        scene : RenderScene,
+        w : i32,
+        h : i32,
+        workers : i32,
+        bg : Vec3,
+        cull : bool,
+        cover : bool
+    ) {
+        let g : RenderGraph = new RenderGraph();
+        g.addBuffer("scene.bvh", GraphResKind::Accel, 1000, false);
+        g.addImage("hdr", GraphResKind::Color, w, h, GraphFormat::Hdr, false);
+        g.addImage("depth", GraphResKind::Depth, w, h, GraphFormat::Depth32, false);
+        g.addImage("window", GraphResKind::Color, w, h, GraphFormat::Srgb8, true);
+        let bvh : i32 = g.addPass("bvh", PassKind::BuildAccel);
+        g.writes(bvh, "scene.bvh");
+        let forward : i32 = g.addPass("forward", PassKind::Forward);
+        g.reads(forward, "scene.bvh");
+        g.writes(forward, "hdr");
+        g.writes(forward, "depth");
+        let resolve : i32 = g.addPass("resolve", PassKind::Resolve);
+        g.reads(resolve, "hdr");
+        g.writes(resolve, "window");
+        let plan : GraphPlan = GraphCompiler::compile(g);
+        let stream : CmdStream = new CmdStream();
+        FrameRecorder::record(g, plan, scene, bg, stream);
+        self.costs = new PassCosts(3);
+        let settings : CpuSettings = CpuSettings {
+            workers: workers,
+            cullBackfaces: cull,
+            dfgSize: 16,
+            dfgOrder: 32,
+            debugCover: cover,
+        };
+        self.renderer = new CpuRenderer(w, h, assets, settings);
+        self.renderer.execute(stream, scene, self.costs, new Profiler(1, 64, 8));
+    }
+
+    /** Stops the worker threads. */
+    pub fn close(mut self) : void {
+        self.renderer.close();
+    }
+
+    /** True when an opaque triangle is visible at the pixel. */
+    pub fn covered(self, x : i32, y : i32) : bool {
+        return self.renderer.visibleAt(x, y) >= 0;
+    }
+
+    /** The linear HDR colour at a pixel. */
+    pub fn hdr(mut self, x : i32, y : i32) : Vec3 {
+        return self.renderer.hdrAt(CPU_RIG_HDR, x, y);
+    }
+}
+
+/** An orthographic camera at the origin looking down -Z where one unit is one pixel of a `w` x `h` picture; drawn things sit at z = -10 + their z. */
+pub fn cpuOrtho(w : i32, h : i32) : Camera {
+    return Camera::orthographic(
+        DVec3::make(0.0, 0.0, 0.0),
+        DQuat::identity(),
+        h as f32,
+        (w as f32) / (h as f32),
+        1.0,
+        100.0
+    );
+}
+
+/** A perspective camera at `eye` looking at `target`. */
+pub fn cpuLookCamera(eye : Vec3, target : Vec3, fov : f32, w : i32, h : i32) : Camera {
+    return Camera::perspective(
+        DVec3::make(eye.x as f64, eye.y as f64, eye.z as f64),
+        DQuat::identity(),
+        fov,
+        (w as f32) / (h as f32),
+        0.1,
+        200.0
+    ).lookAt(
+        DVec3::make(target.x as f64, target.y as f64, target.z as f64),
+        DVec3::make(0.0, 1.0, 0.0)
+    );
+}
+
+/** A triangle in the z = 0 plane from three pixel positions of a `w` x `h` ortho picture (y down), at depth `z`. */
+pub fn cpuTriangle(
+    w : i32,
+    h : i32,
+    x0 : f32,
+    y0 : f32,
+    x1 : f32,
+    y1 : f32,
+    x2 : f32,
+    y2 : f32
+) : MeshData {
+    let m : MeshData = new MeshData(3, 1);
+    let hw : f32 = (w as f32) * (0.5 as f32);
+    let hh : f32 = (h as f32) * (0.5 as f32);
+    let n : Vec3 = Vec3::make(0.0, 0.0, 1.0);
+    m.setVertex(0, Vec3::make(x0 - hw, hh - y0, -10.0), n, Vec2::make(0.0, 0.0));
+    m.setVertex(1, Vec3::make(x1 - hw, hh - y1, -10.0), n, Vec2::make(1.0, 0.0));
+    m.setVertex(2, Vec3::make(x2 - hw, hh - y2, -10.0), n, Vec2::make(0.0, 1.0));
+    m.setTriangle(0, 0, 1, 2);
+    m.finish();
+    return m;
+}
+
+/** A quad in a plane z = `z` over the pixel rectangle (x0, y0)-(x1, y1) of an ortho picture, facing +Z, uv 0..1. */
+pub fn cpuQuad(w : i32, h : i32, x0 : f32, y0 : f32, x1 : f32, y1 : f32, z : f32) : MeshData {
+    let m : MeshData = new MeshData(4, 2);
+    let hw : f32 = (w as f32) * (0.5 as f32);
+    let hh : f32 = (h as f32) * (0.5 as f32);
+    let n : Vec3 = Vec3::make(0.0, 0.0, 1.0);
+    m.setVertex(0, Vec3::make(x0 - hw, hh - y1, z - 10.0), n, Vec2::make(0.0, 1.0));
+    m.setVertex(1, Vec3::make(x1 - hw, hh - y1, z - 10.0), n, Vec2::make(1.0, 1.0));
+    m.setVertex(2, Vec3::make(x1 - hw, hh - y0, z - 10.0), n, Vec2::make(1.0, 0.0));
+    m.setVertex(3, Vec3::make(x0 - hw, hh - y0, z - 10.0), n, Vec2::make(0.0, 0.0));
+    m.setTriangle(0, 0, 1, 2);
+    m.setTriangle(1, 0, 2, 3);
+    m.finish();
+    return m;
+}
+
+/** Puts an instance of mesh `mesh` with material `material` and the identity model into the scene. */
+pub fn cpuAdd(scene : RenderScene, mesh : i32, material : i32, objectId : i32) : void {
+    scene.addInstance(RenderInstance { mesh: mesh, material: material, objectId: objectId });
+}
+
+/** Puts an instance placed by `model` into the scene, with bounds. */
+pub fn cpuAddAt(
+    scene : RenderScene,
+    assets : Shared<RenderAssets>,
+    mesh : i32,
+    material : i32,
+    objectId : i32,
+    model : Mat4,
+    shadows : bool
+) : void {
+    scene.addInstance(RenderInstance {
+        mesh: mesh,
+        material: material,
+        objectId: objectId,
+        castsShadow: shadows,
+        model: model,
+        bounds: assets.mesh(mesh).bounds().transformed(model),
+    });
+}
+
+/** An emissive-only material: it shows `color` and nothing else. */
+pub fn cpuGlow(color : Vec3) : RenderMaterial {
+    return RenderMaterial::glowing(color);
+}

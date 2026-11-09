@@ -1,0 +1,121 @@
+// graph_record — a compiled graph and a scene become a command stream.
+//
+// The graph says which passes run and in what order; the scene says what there is to draw. `FrameRecorder::record`
+// walks the plan and, for each pass, emits BeginPass, the commands its kind needs, and EndPass:
+//   BuildAccel  builds each acceleration structure the pass writes;
+//   Forward     sets the colour (and depth) target the pass writes, clears it, and draws the scene's instances.
+//               The instance list is already sorted so equal (material, mesh) pairs are adjacent; each run becomes
+//               one BindMaterial (only when the material changes) and one DrawMesh over the run;
+//   Resolve     tone maps the colour the pass reads into the resource it writes, with the scene's exposure and knee;
+//   Custom      nothing.
+// Resource ids in the commands are the graph's resource ids; a pass id is the scope id its time is measured under.
+// An invalid plan records nothing.
+
+use crate::core::math::vec3::Vec3;
+use crate::render::cmd::cmd_stream::{CmdStream, CMD_CLEAR_COLOR, CMD_CLEAR_DEPTH, CMD_DEPTH_FAR};
+use crate::render::graph::graph_graph::RenderGraph;
+use crate::render::graph::graph_plan::GraphPlan;
+use crate::render::graph::graph_types::{GraphResKind, PassKind};
+use crate::render::scene::scene_frame::{RenderInstance, RenderScene};
+
+// No material is bound yet.
+const GREC_NO_MATERIAL : i32 = -1;
+
+// What every pass of one recording shares.
+struct GraphFrame {
+    graph : RenderGraph;
+    scene : RenderScene;
+    clear : Vec3;
+    out   : CmdStream;
+}
+
+/** Turns plans into commands. */
+pub class FrameRecorder {
+    /**
+     * Records one frame of `scene` following `plan` (compiled from `g`) into `out` (cleared first); `clear` is the
+     * background colour.
+     */
+    pub static fn record(
+        g : RenderGraph,
+        plan : GraphPlan,
+        scene : RenderScene,
+        clear : Vec3,
+        out : CmdStream
+    ) : void {
+        out.clear();
+        if (!plan.isValid()) {
+            return;
+        }
+        let frame : GraphFrame = GraphFrame { graph: g, scene: scene, clear: clear, out: out };
+        for (i of 0..plan.runCount()) {
+            let p : i32 = plan.passAt(i);
+            out.beginPass(p);
+            match g.passKindOf(p) {
+                PassKind::BuildAccel => FrameRecorder::accel(frame, p),
+                PassKind::Forward => FrameRecorder::forward(frame, p),
+                PassKind::Resolve => FrameRecorder::resolve(frame, p),
+                PassKind::Custom => FrameRecorder::nothing(),
+            }
+            out.endPass();
+        }
+    }
+
+    static fn nothing() : void {}
+
+    static fn accel(frame : GraphFrame, p : i32) : void {
+        let r : i32 = frame.graph.firstResource(p, GraphResKind::Accel, true);
+        if (r >= 0) {
+            frame.out.buildAccel(r);
+        }
+    }
+
+    static fn forward(frame : GraphFrame, p : i32) : void {
+        let color : i32 = frame.graph.firstResource(p, GraphResKind::Color, true);
+        let depth : i32 = frame.graph.firstResource(p, GraphResKind::Depth, true);
+        frame.out.setTarget(color, depth);
+        frame.out.clear(CMD_CLEAR_COLOR | CMD_CLEAR_DEPTH, frame.clear, CMD_DEPTH_FAR);
+        FrameRecorder::drawRuns(frame);
+    }
+
+    // One DrawMesh per run of equal (mesh, material) instances, binding the material only when it changes.
+    static fn drawRuns(frame : GraphFrame) : void {
+        let n : i32 = frame.scene.instanceCount();
+        let mut boundMaterial : i32 = GREC_NO_MATERIAL;
+        let mut i : i32 = 0;
+        while (i < n) {
+            let first : RenderInstance = frame.scene.instance(i);
+            let end : i32 = FrameRecorder::runEnd(frame.scene, i);
+            if (first.material != boundMaterial) {
+                frame.out.bindMaterial(first.material);
+                boundMaterial = first.material;
+            }
+            frame.out.drawMesh(first.mesh, i, end - i);
+            i = end;
+        }
+    }
+
+    // The index after the last instance of the run that starts at `start`.
+    static fn runEnd(scene : RenderScene, start : i32) : i32 {
+        let first : RenderInstance = scene.instance(start);
+        let total : i32 = scene.instanceCount();
+        let mut j : i32 = start + 1;
+        while (j < total) {
+            let next : RenderInstance = scene.instance(j);
+            if (next.mesh != first.mesh || next.material != first.material) {
+                break;
+            }
+            j = j + 1;
+        }
+        return j;
+    }
+
+    static fn resolve(frame : GraphFrame, p : i32) : void {
+        let g : RenderGraph = frame.graph;
+        let source : i32 = g.firstResource(p, GraphResKind::Color, false);
+        let mut destination : i32 = g.firstResource(p, GraphResKind::Color, true);
+        if (destination < 0) {
+            destination = g.firstResource(p, GraphResKind::Texture, true);
+        }
+        frame.out.resolve(source, destination, frame.scene.exposure(), frame.scene.toneKnee());
+    }
+}

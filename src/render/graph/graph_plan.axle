@@ -1,0 +1,543 @@
+// graph_plan — compiling a render graph: validation, culling, ordering, lifetimes and memory aliasing.
+//
+// `GraphCompiler::compile` turns the declarations of a `RenderGraph` into a `GraphPlan`, in five steps that depend
+// on declarations and ids alone (no hash, no clock), so the same graph always gives the same plan:
+//   1. Validate. Names must resolve; a resource that is read must be written by some pass (or be imported); a pass
+//      that reads and writes one resource needs an earlier writer; each pass kind needs resources of the right kind.
+//   2. Dependencies. The writers of a resource form a chain in pass-id order; a reader runs after the last writer
+//      (after the last *earlier* writer when it also writes). A cycle among them is an error that names the passes.
+//   3. Cull. A pass is live when it writes an output or imported resource, or a live pass depends on it. The others
+//      are unused and are not run, not recorded, and their private resources get no memory.
+//   4. Order. Kahn's algorithm with the lowest pass id first among the ready ones, so independent passes keep the
+//      order they were added in.
+//   5. Lifetimes and aliasing. Each used resource is alive from its first to its last pass in the order (outputs and
+//      imports to the end). Transient resources with the same size that are never alive together share one block
+//      (a greedy interval assignment by first use); the plan reports bytes with and without sharing.
+
+use crate::core::collections::vec::Vec;
+use crate::render::graph::graph_graph::RenderGraph;
+use crate::render::graph::graph_types::{GraphResKind, GraphFormat, PassKind, GraphIssueKind, GraphIssues};
+
+/** The compiled form of a graph. */
+pub class GraphPlan {
+    pub(file) issues     : GraphIssues;
+    pub(file) order      : Vec<i32>;
+    pub(file) culled     : Vec<i32>;
+    pub(file) liveFlag   : Vec<bool>;
+    pub(file) runPos     : Vec<i32>;
+    pub(file) firstUse   : Vec<i32>;
+    pub(file) lastUse    : Vec<i32>;
+    pub(file) groupOf    : Vec<i32>;
+    pub(file) groupSize  : Vec<i64>;
+    pub(file) groupEnd   : Vec<i32>;
+    pub(file) groupCls   : Vec<i32>;
+    pub(file) scratch    : Vec<i32>;
+    pub(file) transient  : i64 = 0;
+    pub(file) persistent : i64 = 0;
+
+    /** An empty plan for the graph `g`; `GraphCompiler::compile` fills it. */
+    constructor(g : RenderGraph) {
+        self.issues = new GraphIssues();
+        self.order = new Vec<i32>();
+        self.scratch = new Vec<i32>();
+        self.culled = new Vec<i32>();
+        self.liveFlag = new Vec<bool>();
+        self.runPos = new Vec<i32>();
+        self.firstUse = new Vec<i32>();
+        self.lastUse = new Vec<i32>();
+        self.groupOf = new Vec<i32>();
+        self.groupSize = new Vec<i64>();
+        self.groupEnd = new Vec<i32>();
+        self.groupCls = new Vec<i32>();
+        for (p of 0..g.passTotal()) {
+            self.liveFlag.push(false);
+            self.runPos.push(-1);
+        }
+        for (r of 0..g.resourceTotal()) {
+            self.firstUse.push(-1);
+            self.lastUse.push(-1);
+            self.groupOf.push(-1);
+        }
+    }
+
+    /** What validation found. */
+    pub fn problems(self) : GraphIssues {
+        return self.issues;
+    }
+
+    /** True when validation found nothing wrong: the plan may be run. */
+    pub fn isValid(self) : bool {
+        return self.issues.count() == 0 && self.issues.dropped() == 0;
+    }
+
+    /** How many passes run. */
+    pub fn runCount(self) : i32 {
+        return self.order.len();
+    }
+
+    /** The id of the pass that runs `i`-th (0..runCount). */
+    pub fn passAt(self, i : i32) : i32 {
+        return self.order.get(i);
+    }
+
+    /** True when pass `p` runs. */
+    pub fn isLive(self, p : i32) : bool {
+        return self.liveFlag.get(p);
+    }
+
+    /** How many passes were culled. */
+    pub fn culledCount(self) : i32 {
+        return self.culled.len();
+    }
+
+    /** The id of the `i`-th culled pass, ascending. */
+    pub fn culledAt(self, i : i32) : i32 {
+        return self.culled.get(i);
+    }
+
+    /** The position of pass `p` in the run order, or -1 when it does not run. */
+    pub fn positionOf(self, p : i32) : i32 {
+        return self.runPos.get(p);
+    }
+
+    /** The first run position that touches resource `r`, or -1 when no running pass does. */
+    pub fn firstUseOf(self, r : i32) : i32 {
+        return self.firstUse.get(r);
+    }
+
+    /** The last run position that touches resource `r` (the end of the frame for outputs and imports). */
+    pub fn lastUseOf(self, r : i32) : i32 {
+        return self.lastUse.get(r);
+    }
+
+    /** True when a running pass touches resource `r`. */
+    pub fn isUsed(self, r : i32) : bool {
+        return self.firstUse.get(r) >= 0;
+    }
+
+    /** The memory block resource `r` shares, or -1 when it has none of its own (imported, unused, output). */
+    pub fn aliasGroup(self, r : i32) : i32 {
+        return self.groupOf.get(r);
+    }
+
+    /** How many blocks the transient resources need. */
+    pub fn groupCount(self) : i32 {
+        return self.groupSize.len();
+    }
+
+    /** The size in bytes of block `g`. */
+    pub fn groupBytes(self, g : i32) : i64 {
+        return self.groupSize.get(g);
+    }
+
+    /** Bytes the transient resources would take with a block each. */
+    pub fn transientBytes(self) : i64 {
+        return self.transient;
+    }
+
+    /** Bytes the transient resources take with sharing. */
+    pub fn aliasedBytes(self) : i64 {
+        let mut total : i64 = 0;
+        for (g of 0..self.groupSize.len()) {
+            total = total + self.groupSize.get(g);
+        }
+        return total;
+    }
+
+    /** Bytes of used resources that live for the whole frame and are never shared (non-imported outputs). */
+    pub fn persistentBytes(self) : i64 {
+        return self.persistent;
+    }
+}
+
+// Which resource class a block of memory belongs to: blocks are shared only inside a class.
+const GPLAN_CLASS_IMAGE : i32 = 0;
+const GPLAN_CLASS_ACCEL : i32 = 1;
+
+// Who reads and writes what (`np` x `nr` flags) and who must run before whom (`np` x `np`), as flat 0/1 tables.
+class GraphTables {
+    np     : i32;
+    nr     : i32;
+    reads  : i32[];
+    writes : i32[];
+    dep    : i32[];
+
+    constructor(np : i32, nr : i32) {
+        self.np = np;
+        self.nr = nr;
+        self.reads = new i32[(np * nr + 1) as i64];
+        self.writes = new i32[(np * nr + 1) as i64];
+        self.dep = new i32[(np * np + 1) as i64];
+        for (i of 0..np * nr) {
+            self.reads[i] = 0;
+            self.writes[i] = 0;
+        }
+        for (i of 0..np * np) {
+            self.dep[i] = 0;
+        }
+    }
+
+    pub(file) fn isRead(self, p : i32, r : i32) : bool {
+        return self.reads[p * self.nr + r] == 1;
+    }
+
+    pub(file) fn isWrite(self, p : i32, r : i32) : bool {
+        return self.writes[p * self.nr + r] == 1;
+    }
+
+    pub(file) fn markRead(mut self, p : i32, r : i32) : void {
+        self.reads[p * self.nr + r] = 1;
+    }
+
+    pub(file) fn markWrite(mut self, p : i32, r : i32) : void {
+        self.writes[p * self.nr + r] = 1;
+    }
+
+    // True when pass `q` must run before pass `p`.
+    pub(file) fn mustPrecede(self, q : i32, p : i32) : bool {
+        return self.dep[q * self.np + p] == 1;
+    }
+
+    pub(file) fn addDependency(mut self, q : i32, p : i32) : void {
+        self.dep[q * self.np + p] = 1;
+    }
+
+    // The last pass before `p` that writes resource `r`, or -1.
+    pub(file) fn lastWriterBefore(self, r : i32, p : i32) : i32 {
+        let mut w : i32 = -1;
+        for (q of 0..p) {
+            if (self.isWrite(q, r)) {
+                w = q;
+            }
+        }
+        return w;
+    }
+}
+
+/** Compiles graphs. */
+pub class GraphCompiler {
+    /** Validates, culls, orders and measures `g`; always returns a plan, check `isValid` before running it. */
+    pub static fn compile(g : RenderGraph) : GraphPlan {
+        let plan : GraphPlan = new GraphPlan(g);
+        let np : i32 = g.passTotal();
+        let decl : GraphIssues = g.declarationIssues();
+        for (i of 0..decl.count()) {
+            plan.issues.add(decl.kind(i), decl.text(i));
+        }
+
+        let tables : GraphTables = new GraphTables(np, g.resourceTotal());
+        GraphCompiler::resolveEdges(g, plan, tables);
+        GraphCompiler::checkKinds(g, plan);
+        GraphCompiler::dependencies(g, plan, tables);
+        GraphCompiler::topological(g, plan, tables);
+        let roots : bool = GraphCompiler::cull(g, plan, tables);
+        if (!roots && np > 0) {
+            plan.issues.add(
+                GraphIssueKind::NoOutput,
+                "no pass writes an output or an imported resource, so nothing would be drawn"
+            );
+        }
+        GraphCompiler::schedule(plan, np);
+        GraphCompiler::lifetimes(g, plan);
+        GraphCompiler::alias(g, plan);
+        return plan;
+    }
+
+    // Tables of who reads and writes what; unknown names become issues.
+    static fn resolveEdges(g : RenderGraph, plan : GraphPlan, tables : GraphTables) : void {
+        for (e of 0..g.edgeTotal()) {
+            let r : i32 = g.edgeResourceOf(e);
+            let p : i32 = g.edgePassOf(e);
+            if (r < 0) {
+                plan.issues.add(
+                    GraphIssueKind::UnknownResource,
+                    "pass '${g.passName(p)}' uses '${g.edgeResourceName(e)}', which is not a declared resource"
+                );
+                continue;
+            }
+            if (g.edgeIsWrite(e)) {
+                tables.markWrite(p, r);
+            } else {
+                tables.markRead(p, r);
+            }
+        }
+    }
+
+    // Each kind of pass needs resources of the right kind.
+    static fn checkKinds(g : RenderGraph, plan : GraphPlan) : void {
+        for (p of 0..g.passTotal()) {
+            let kind : PassKind = g.passKindOf(p);
+            let name : string = g.passName(p);
+            let writesAccel : bool = g.firstResource(p, GraphResKind::Accel, true) >= 0;
+            let writesColor : bool = g.firstResource(p, GraphResKind::Color, true) >= 0;
+            let readsColor : bool = g.firstResource(p, GraphResKind::Color, false) >= 0;
+            let writesTexture : bool = g.firstResource(p, GraphResKind::Texture, true) >= 0;
+            if (kind == PassKind::BuildAccel && !writesAccel) {
+                plan.issues.add(
+                    GraphIssueKind::WrongKind,
+                    "build-accel pass '${name}' writes no acceleration structure"
+                );
+            }
+            if (kind == PassKind::Forward && !writesColor) {
+                plan.issues.add(
+                    GraphIssueKind::WrongKind,
+                    "forward pass '${name}' writes no colour target"
+                );
+            }
+            let writesTarget : bool = writesColor || writesTexture;
+            if (kind == PassKind::Resolve && (!readsColor || !writesTarget)) {
+                plan.issues.add(
+                    GraphIssueKind::WrongKind,
+                    "resolve pass '${name}' needs a colour input and a colour output"
+                );
+            }
+        }
+    }
+
+    // `tables.mustPrecede(q, p)` becomes true when q must run before p; see the file header for the rules.
+    static fn dependencies(g : RenderGraph, plan : GraphPlan, tables : GraphTables) : void {
+        let np : i32 = g.passTotal();
+        for (r of 0..g.resourceTotal()) {
+            // The writers chain in pass-id order.
+            let mut prev : i32 = -1;
+            for (p of 0..np) {
+                if (tables.isWrite(p, r)) {
+                    if (prev >= 0) {
+                        tables.addDependency(prev, p);
+                    }
+                    prev = p;
+                }
+            }
+            let lastWriter : i32 = prev;
+
+            for (p of 0..np) {
+                if (!tables.isRead(p, r)) {
+                    continue;
+                }
+                if (tables.isWrite(p, r)) {
+                    // Reads and writes: it sees the writers added before it.
+                    let w : i32 = tables.lastWriterBefore(r, p);
+                    if (w >= 0) {
+                        tables.addDependency(w, p);
+                    } else if (!g.isImported(r)) {
+                        plan.issues.add(
+                            GraphIssueKind::ReadBeforeWrite,
+                            "pass '${g.passName(p)}' reads '${g.resourceName(r)}' before any pass has written it"
+                        );
+                    }
+                } else if (lastWriter >= 0) {
+                    tables.addDependency(lastWriter, p);
+                } else if (!g.isImported(r)) {
+                    plan.issues.add(
+                        GraphIssueKind::UnwrittenRead,
+                        "pass '${g.passName(p)}' reads '${g.resourceName(r)}', which no pass writes"
+                    );
+                }
+            }
+        }
+    }
+
+    // Kahn's algorithm, lowest id first. Passes on a cycle are left out and named in an issue.
+    static fn topological(g : RenderGraph, plan : GraphPlan, tables : GraphTables) : void {
+        let np : i32 = g.passTotal();
+        let mut waiting : i32[] = new i32[(np + 1) as i64];
+        let mut done : i32[] = new i32[(np + 1) as i64];
+        for (p of 0..np) {
+            let mut n : i32 = 0;
+            for (q of 0..np) {
+                if (tables.mustPrecede(q, p)) {
+                    n = n + 1;
+                }
+            }
+            waiting[p] = n;
+            done[p] = 0;
+        }
+
+        let mut progress : bool = true;
+        while (progress) {
+            progress = false;
+            for (p of 0..np) {
+                if (done[p] == 0 && waiting[p] == 0) {
+                    done[p] = 1;
+                    plan.scratch.push(p);
+                    for (s of 0..np) {
+                        if (tables.mustPrecede(p, s)) {
+                            waiting[s] = waiting[s] - 1;
+                        }
+                    }
+                    progress = true;
+                    break;
+                }
+            }
+        }
+
+        if (plan.scratch.len() < np) {
+            let names : string = GraphCompiler::unplacedNames(g, done);
+            plan.issues.add(
+                GraphIssueKind::Cycle,
+                "the passes ${names} depend on each other in a cycle"
+            );
+        }
+    }
+
+    // The names of the passes not yet placed (`done[p]` is 0), comma separated.
+    static fn unplacedNames(g : RenderGraph, done : i32[]) : string {
+        let mut names : string = "";
+        for (p of 0..g.passTotal()) {
+            if (done[p] == 0) {
+                if (names.byteLength > 0) {
+                    names = names + ", ";
+                }
+                names = names + g.passName(p);
+            }
+        }
+        return names;
+    }
+
+    // Marks live passes; true when at least one pass is a root.
+    static fn cull(g : RenderGraph, plan : GraphPlan, tables : GraphTables) : bool {
+        let np : i32 = g.passTotal();
+        let mut anyRoot : bool = false;
+        for (p of 0..np) {
+            for (r of 0..g.resourceTotal()) {
+                if (tables.isWrite(p, r) && (g.isOutput(r) || g.isImported(r))) {
+                    plan.liveFlag.set(p, true);
+                    anyRoot = true;
+                }
+            }
+        }
+
+        let mut changed : bool = true;
+        while (changed) {
+            changed = false;
+            for (p of 0..np) {
+                if (!plan.liveFlag.get(p)) {
+                    continue;
+                }
+                for (q of 0..np) {
+                    if (tables.mustPrecede(q, p) && !plan.liveFlag.get(q)) {
+                        plan.liveFlag.set(q, true);
+                        changed = true;
+                    }
+                }
+            }
+        }
+        return anyRoot;
+    }
+
+    // The run order is the topological order restricted to live passes.
+    static fn schedule(plan : GraphPlan, np : i32) : void {
+        let sorted : Vec<i32> = plan.scratch;
+        for (i of 0..sorted.len()) {
+            let p : i32 = sorted.get(i);
+            if (plan.liveFlag.get(p)) {
+                plan.runPos.set(p, plan.order.len());
+                plan.order.push(p);
+            }
+        }
+        for (p of 0..np) {
+            if (!plan.liveFlag.get(p)) {
+                plan.culled.push(p);
+            }
+        }
+    }
+
+    // First and last run position of every resource a running pass touches.
+    static fn lifetimes(g : RenderGraph, plan : GraphPlan) : void {
+        for (e of 0..g.edgeTotal()) {
+            let r : i32 = g.edgeResourceOf(e);
+            let p : i32 = g.edgePassOf(e);
+            if (r < 0 || !plan.liveFlag.get(p) || plan.runPos.get(p) < 0) {
+                continue;
+            }
+
+            let at : i32 = plan.runPos.get(p);
+            let firstSeen : bool = plan.firstUse.get(r) >= 0;
+            if (!firstSeen || at < plan.firstUse.get(r)) {
+                plan.firstUse.set(r, at);
+            }
+            if (at > plan.lastUse.get(r)) {
+                plan.lastUse.set(r, at);
+            }
+        }
+
+        // Outputs and imports outlive the frame: they stay used to the last pass.
+        let end : i32 = plan.order.len() - 1;
+        for (r of 0..g.resourceTotal()) {
+            let escapes : bool = g.isImported(r) || g.isOutput(r);
+            if (plan.firstUse.get(r) >= 0 && escapes) {
+                plan.lastUse.set(r, end);
+            }
+        }
+    }
+
+    // The memory class of a resource: acceleration structures never share a block with images.
+    static fn aliasClass(kind : GraphResKind) : i32 {
+        if (kind == GraphResKind::Accel) {
+            return GPLAN_CLASS_ACCEL;
+        }
+        return GPLAN_CLASS_IMAGE;
+    }
+
+    // The unassigned transient resource that is first used earliest, or -1 when all are assigned.
+    static fn nextTransient(g : RenderGraph, plan : GraphPlan, taken : i32[]) : i32 {
+        let mut best : i32 = -1;
+        for (r of 0..g.resourceTotal()) {
+            let unused : bool = plan.firstUse.get(r) < 0;
+            let persistent : bool = g.isImported(r) || g.isOutput(r);
+            if (taken[r] == 1 || unused || persistent) {
+                continue;
+            }
+            if (best < 0 || plan.firstUse.get(r) < plan.firstUse.get(best)) {
+                best = r;
+            }
+        }
+        return best;
+    }
+
+    // The first existing block of the same size and class that is free by `from`, or -1.
+    static fn freeBlock(plan : GraphPlan, from : i32, bytes : i64, cls : i32) : i32 {
+        for (k of 0..plan.groupSize.len()) {
+            let isFree : bool = plan.groupEnd.get(k) < from;
+            let fits : bool = plan.groupSize.get(k) == bytes && plan.groupCls.get(k) == cls;
+            if (isFree && fits) {
+                return k;
+            }
+        }
+        return -1;
+    }
+
+    // Greedy interval colouring of the transient resources by first use; same size and class share a block.
+    static fn alias(g : RenderGraph, plan : GraphPlan) : void {
+        let nr : i32 = g.resourceTotal();
+        let mut taken : i32[] = new i32[(nr + 1) as i64];
+        for (r of 0..nr) {
+            taken[r] = 0;
+            if (plan.firstUse.get(r) >= 0 && !g.isImported(r) && g.isOutput(r)) {
+                plan.persistent = plan.persistent + g.resourceBytes(r);
+            }
+        }
+
+        while (true) {
+            let best : i32 = GraphCompiler::nextTransient(g, plan, taken);
+            if (best < 0) {
+                break;
+            }
+            taken[best] = 1;
+            let bytes : i64 = g.resourceBytes(best);
+            let cls : i32 = GraphCompiler::aliasClass(g.resourceKind(best));
+            plan.transient = plan.transient + bytes;
+
+            let mut chosen : i32 = GraphCompiler::freeBlock(plan, plan.firstUse.get(best), bytes, cls);
+            if (chosen < 0) {
+                plan.groupSize.push(bytes);
+                plan.groupEnd.push(plan.lastUse.get(best));
+                plan.groupCls.push(cls);
+                chosen = plan.groupSize.len() - 1;
+            } else {
+                plan.groupEnd.set(chosen, plan.lastUse.get(best));
+            }
+            plan.groupOf.set(best, chosen);
+        }
+    }
+}

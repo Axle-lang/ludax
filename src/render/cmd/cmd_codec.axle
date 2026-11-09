@@ -1,0 +1,193 @@
+// cmd_codec — a command stream as bytes, and back.
+//
+// A recorded frame can be saved, diffed, sent to another process or replayed against a different backend, so it
+// has a wire form. Layout, all little-endian 32-bit words: the magic "LXCS", the format version, the number of
+// commands n, then n records of eight words (opcode, a, b, c, and the bit patterns of f0..f3), then a CRC-32 of
+// everything before it. `encode` is a pure function of the stream, so equal streams give equal bytes;
+// `decode` refuses a damaged or foreign buffer with a reason instead of building a half stream.
+//
+// Axle has no float-to-bits cast, so `floatBits` and `bitsFloat` take an f32 apart by repeated halving and
+// doubling, which is exact. Finite normal numbers and zero survive the round trip bit for bit; negative zero
+// reads back as zero, denormals flush to zero, and a NaN or infinity is stored as zero or the largest finite
+// number: no command has any reason to hold one.
+
+use crate::data::bytes::{ByteBuf, Crc32};
+use crate::render::cmd::cmd_stream::{CmdSlots, CmdStream, CMD_FLOAT_SLOTS};
+
+/** The format version written and accepted. */
+pub const CMD_CODEC_VERSION : i32 = 1;
+
+// "LXCS" read as a little-endian word.
+const CMDC_MAGIC : i32 = 1396922444;
+
+// Bytes of the header (magic, version, count), of one command record (opcode, a, b, c, f0..f3) and of the checksum.
+const CMDC_HEADER : i32 = 12;
+const CMDC_RECORD : i32 = 32;
+const CMDC_CRC : i32 = 4;
+
+// Byte offsets inside a record: the integer slots follow the opcode, the float bit patterns follow those.
+const CMDC_AT_A : i32 = 4;
+const CMDC_AT_B : i32 = 8;
+const CMDC_AT_C : i32 = 12;
+const CMDC_AT_F0 : i32 = 16;
+const CMDC_AT_F1 : i32 = 20;
+const CMDC_AT_F2 : i32 = 24;
+const CMDC_AT_F3 : i32 = 28;
+
+// Byte offsets inside the header.
+const CMDC_AT_MAGIC : i32 = 0;
+const CMDC_AT_VERSION : i32 = 4;
+const CMDC_AT_COUNT : i32 = 8;
+
+// More commands than this in a header means a damaged file, not a frame; it keeps a bad count from sizing a buffer.
+const CMDC_MAX_COMMANDS : i32 = 100000000;
+
+// The largest finite f32, and its bit pattern (exponent 254, mantissa all ones).
+const CMDC_MAX : f32 = 3.4028234e38;
+const CMDC_MAX_BITS : i32 = 2139095039;
+
+// The sign bit of a word.
+const CMDC_SIGN : i32 = -2147483648;
+
+// The binary32 layout: 23 mantissa bits (2^23 is the mantissa scale, 2^-23 its unit), an 8-bit exponent biased by
+// 127 (all ones is infinity or NaN, all zeros zero or denormal; the smallest normal exponent is -126).
+const CMDC_MANTISSA_BITS : i32 = 23;
+const CMDC_SIGN_SHIFT : i32 = 31;
+const CMDC_MANTISSA_MASK : i32 = 8388607;
+const CMDC_MANTISSA_SCALE : f32 = 8388608.0;
+const CMDC_MANTISSA_UNIT : f32 = 0.00000011920928955078125;
+const CMDC_EXPONENT_MASK : i32 = 255;
+const CMDC_EXPONENT_BIAS : i32 = 127;
+const CMDC_EXPONENT_MIN : i32 = -126;
+
+/** Serialises streams. */
+pub class CmdCodec {
+    /** The bytes of `stream`. */
+    pub static fn encode(stream : CmdStream) : ByteBuf {
+        let out : ByteBuf = new ByteBuf(CMDC_HEADER + stream.count() * CMDC_RECORD + CMDC_CRC + CMDC_CRC);
+        out.pushLe32(CMDC_MAGIC);
+        out.pushLe32(CMD_CODEC_VERSION);
+        out.pushLe32(stream.count());
+        for (i of 0..stream.count()) {
+            out.pushLe32(stream.code(i));
+            out.pushLe32(stream.a(i));
+            out.pushLe32(stream.b(i));
+            out.pushLe32(stream.c(i));
+            for (k of 0..CMD_FLOAT_SLOTS) {
+                out.pushLe32(CmdCodec::floatBits(stream.f(i, k)));
+            }
+        }
+        let crc : Crc32 = new Crc32();
+        out.pushLe32(crc.sum(out, 0, out.len()));
+        return out;
+    }
+
+    /**
+     * Reads `bytes` into `into` (which is cleared first). Returns an empty string on success, otherwise why not:
+     * a wrong magic or version, a length that does not fit, an unknown opcode or a checksum that does not match.
+     * On failure `into` is left empty.
+     */
+    pub static fn decode(bytes : ByteBuf, into : CmdStream) : string {
+        into.clear();
+        if (bytes.len() < CMDC_HEADER + CMDC_CRC) {
+            return "too short for a header";
+        }
+        if (bytes.le32(CMDC_AT_MAGIC) != CMDC_MAGIC) {
+            return "not a command stream (bad magic)";
+        }
+        if (bytes.le32(CMDC_AT_VERSION) != CMD_CODEC_VERSION) {
+            return "unsupported version ${bytes.le32(CMDC_AT_VERSION)}";
+        }
+        let n : i32 = bytes.le32(CMDC_AT_COUNT);
+        if (n < 0 || n > CMDC_MAX_COMMANDS || bytes.len() != CMDC_HEADER + n * CMDC_RECORD + CMDC_CRC) {
+            return "length does not match the command count";
+        }
+        let crc : Crc32 = new Crc32();
+        let crcAt : i32 = bytes.len() - CMDC_CRC;
+        if (crc.sum(bytes, 0, crcAt) != bytes.le32(crcAt)) {
+            return "checksum mismatch";
+        }
+        for (i of 0..n) {
+            let at : i32 = CMDC_HEADER + i * CMDC_RECORD;
+            let code : i32 = bytes.le32(at);
+            if (!CmdStream::isValidCode(code)) {
+                into.clear();
+                return "unknown opcode ${code} in command ${i}";
+            }
+            let slots : CmdSlots = CmdSlots {
+                a: bytes.le32(at + CMDC_AT_A),
+                b: bytes.le32(at + CMDC_AT_B),
+                c: bytes.le32(at + CMDC_AT_C),
+                f0: CmdCodec::bitsFloat(bytes.le32(at + CMDC_AT_F0)),
+                f1: CmdCodec::bitsFloat(bytes.le32(at + CMDC_AT_F1)),
+                f2: CmdCodec::bitsFloat(bytes.le32(at + CMDC_AT_F2)),
+                f3: CmdCodec::bitsFloat(bytes.le32(at + CMDC_AT_F3)),
+            };
+            into.pushRaw(code, slots);
+        }
+        return "";
+    }
+
+    /** The IEEE-754 binary32 bit pattern of `v` (see the file header for what is not preserved). */
+    pub static fn floatBits(v : f32) : i32 {
+        if (v != v) {
+            return 0;
+        }
+        let negative : bool = v < (0.0 as f32);
+        let mut x : f32 = v;
+        if (negative) {
+            x = -v;
+        }
+        if (x == (0.0 as f32)) {
+            return 0;
+        }
+        let mut sign : i32 = 0;
+        if (negative) {
+            sign = CMDC_SIGN;
+        }
+        if (x >= CMDC_MAX) {
+            return sign | CMDC_MAX_BITS;
+        }
+        let mut e : i32 = 0;
+        while (x >= (2.0 as f32)) {
+            x = x * (0.5 as f32);
+            e = e + 1;
+        }
+        while (x < (1.0 as f32)) {
+            x = x * (2.0 as f32);
+            e = e - 1;
+        }
+        if (e < CMDC_EXPONENT_MIN) {
+            return sign;
+        }
+        let mantissa : i32 = ((x - (1.0 as f32)) * CMDC_MANTISSA_SCALE) as i32;
+        return sign | ((e + CMDC_EXPONENT_BIAS) << CMDC_MANTISSA_BITS) | mantissa;
+    }
+
+    /** The f32 whose bit pattern is `bits`. */
+    pub static fn bitsFloat(bits : i32) : f32 {
+        let exponent : i32 = (bits >>> CMDC_MANTISSA_BITS) & CMDC_EXPONENT_MASK;
+        let mantissa : i32 = bits & CMDC_MANTISSA_MASK;
+        let negative : bool = (bits >>> CMDC_SIGN_SHIFT) == 1;
+        if (exponent == 0 || exponent == CMDC_EXPONENT_MASK && mantissa != 0) {
+            return 0.0;
+        }
+        let mut v : f32 = CMDC_MAX;
+        if (exponent != CMDC_EXPONENT_MASK) {
+            v = (1.0 as f32) + (mantissa as f32) * CMDC_MANTISSA_UNIT;
+            let mut e : i32 = exponent - CMDC_EXPONENT_BIAS;
+            while (e > 0) {
+                v = v * (2.0 as f32);
+                e = e - 1;
+            }
+            while (e < 0) {
+                v = v * (0.5 as f32);
+                e = e + 1;
+            }
+        }
+        if (negative) {
+            return -v;
+        }
+        return v;
+    }
+}

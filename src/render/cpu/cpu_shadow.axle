@@ -1,0 +1,132 @@
+// cpu_shadow — shadow rays against a triangle BVH, behind the lighting library's `LightShadowQuery`.
+//
+// The library never decides how a shadow is found: it asks a `LightShadowQuery` how much of light number `i`
+// reaches a surface point. This one answers with a ray. A light whose `shadowMode` is not `Ray` is never blocked
+// (that is how "none / ray" is chosen per light). For a `Ray` light it traces one ray from the surface point, lifted
+// off the surface along the geometric normal by a small bias that grows with the distance from the camera, towards
+// the light's centre (to its position for point and spot lights, to infinity against the travel direction for a
+// directional light) and answers 1 or 0. One ray means a hard shadow edge whatever the light's radius: the soft
+// penumbra of a sized light is future work, and `LightExplain` reports this honestly as "visibility 0 or 1".
+// Lights that obviously cannot reach the point (beyond their range, or wholly behind the surface) are skipped
+// without a ray; the library rejects them for the right reason anyway. The query owns a copy of the lights and of
+// the BVH, so it never points into the caller's data.
+
+use crate::core::collections::vec::Vec;
+use crate::core::math::geom::Ray;
+use crate::core::math::vec3::Vec3;
+use crate::render::cpu::cpu_bvh::CpuBvh;
+use crate::render::light::light_material::LightSurface;
+use crate::render::light::light_shade::LightShadowQuery;
+use crate::render::light::light_source::{LightKind, LightShadowMode, LightSource};
+
+// Shadow rays start this far above the surface (camera-relative units)...
+const CSH_BIAS : f32 = 0.002;
+
+// ...plus this much for every unit of distance from the camera, because f32 positions lose precision with it.
+const CSH_BIAS_FAR : f32 = 0.00002;
+
+// "Infinitely far" for a directional light.
+const CSH_FAR : f32 = 1000000000.0;
+
+// A shadow ray whose cosine with the geometric normal is below this points into the surface: the light is behind it.
+// The small negative margin keeps grazing points, where the interpolated and the true normal disagree, lit.
+const CSH_BELOW_HORIZON : f32 = -0.05;
+
+// The origin, direction and length of a shadow ray, or `valid` false when none is needed.
+struct CsRay {
+    valid  : bool = false;
+    ray    : Ray = Ray {};
+    length : f32 = 0.0;
+}
+
+/** Ray-traced shadows for the lights of one frame. */
+pub class CpuShadowQuery : LightShadowQuery {
+    tree  : CpuBvh;
+    lamps : Vec<LightSource>;
+
+    /** A query over `count` triangles (`BVH_TRI_FLOATS` floats each, camera-relative) and a copy of `lights`. */
+    constructor(corners : f32[], count : i32, lights : Vec<LightSource>) {
+        self.tree = new CpuBvh(corners, count);
+        self.lamps = new Vec<LightSource>();
+        for (i of 0..lights.len()) {
+            self.lamps.push(lights.get(i));
+        }
+    }
+
+    /** How many triangles can block a ray. */
+    pub fn triangleCount(self) : i32 {
+        return self.tree.triangleCount();
+    }
+
+    // The ray from `surface` to light `lightIndex`.
+    fn rayFor(self, lightIndex : i32, surface : LightSurface) : CsRay {
+        if (lightIndex < 0 || lightIndex >= self.lamps.len()) {
+            return CsRay {};
+        }
+        let light : LightSource = self.lamps.get(lightIndex);
+        if (light.shadowMode != LightShadowMode::Ray) {
+            return CsRay {};
+        }
+
+        // Lift the origin off the surface so the ray does not hit the triangle it starts on.
+        let bias : f32 = CSH_BIAS + CSH_BIAS_FAR * surface.position.length();
+        let origin : Vec3 = surface.position.plus(surface.geoNormal.scale(bias));
+        let mut path : CsRay = CsRay {
+            valid: true,
+            ray: Ray::make(origin, light.direction.negated()),
+            length: CSH_FAR,
+        };
+        if (light.kind != LightKind::Directional) {
+            path = CpuShadowQuery::towardPoint(light, origin, bias);
+        }
+        if (!path.valid) {
+            return CsRay {};
+        }
+
+        let facing : f32 = path.ray.direction.dot(surface.geoNormal);
+        if (facing >= CSH_BELOW_HORIZON) {
+            return path;
+        }
+        return CsRay {};
+    }
+
+    // The ray from `origin` to a point or spot light's position, or none when the light is out of range or on top of
+    // the origin.
+    static fn towardPoint(light : LightSource, origin : Vec3, bias : f32) : CsRay {
+        let delta : Vec3 = light.position.minus(origin);
+        let dist : f32 = delta.length();
+        let outOfRange : bool = light.range > 0.0 && dist >= light.range;
+        if (!(dist > bias) || outOfRange) {
+            return CsRay {};
+        }
+        let dir : Vec3 = delta.scale((1.0 as f32) / dist);
+        return CsRay { valid: true, ray: Ray::make(origin, dir), length: dist - bias };
+    }
+
+    /**
+     * 1 when light `lightIndex` is not blocked at `surface` (or casts no ray shadow), 0 when something is in the
+     * way.
+     */
+    pub fn visibility(self, lightIndex : i32, surface : LightSurface) : f32 {
+        let r : CsRay = self.rayFor(lightIndex, surface);
+        if (!r.valid) {
+            return 1.0;
+        }
+        if (self.tree.occluded(r.ray, r.length)) {
+            return 0.0;
+        }
+        return 1.0;
+    }
+
+    /**
+     * The distance to what a shadow ray from `surface` towards light `lightIndex` hits first, or -1 for nothing
+     * (or no ray).
+     */
+    pub fn blockerDistance(self, lightIndex : i32, surface : LightSurface) : f32 {
+        let r : CsRay = self.rayFor(lightIndex, surface);
+        if (!r.valid) {
+            return -1.0;
+        }
+        return self.tree.nearest(r.ray, r.length);
+    }
+}

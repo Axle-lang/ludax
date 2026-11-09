@@ -1,0 +1,481 @@
+// render_cpu_light — checks for the CPU backend's shading: the white furnace, which way the brightest point of a lit
+// sphere faces, ray-traced shadows, bit-identical output at any thread count, and LightExplain on real pixels.
+//
+// Shading is measured on rendered frames rather than on a BRDF call, so the checks include the rasteriser and the
+// scene extraction. The white furnace is the anchor: a unit-albedo sphere under a uniform environment must return
+// that environment, which catches any energy lost or gained anywhere along the pipeline, not only in the BRDF.
+
+use ludax::{
+    Camera, Checks, CpuExplain, CpuSample, LightExplain, LightReason, LightShadowMode, LightSource,
+    Mat4, MeshDataShapes, RenderAssets
+};
+use ludax::{RenderMaterial, RenderScene, Vec3, abs};
+
+use crate::render_cpu_support::{CpuRig, cpuAddAt, cpuLookCamera};
+
+/** The shading checks of the CPU backend. */
+pub class RenderCpuLightSuite {
+    /** Runs every check of the suite. */
+    pub static fn run(c : Checks) : void {}
+}
+
+// Places an instance at the world position `at` for a camera at `eye` (the frame is camera-relative).
+fn rclPlace(
+    scene : RenderScene,
+    assets : Shared<RenderAssets>,
+    mesh : i32,
+    mat : i32,
+    id : i32,
+    at : Vec3,
+    eye : Vec3,
+    shadows : bool
+) : void {
+    cpuAddAt(scene, assets, mesh, mat, id, Mat4::translation(at.minus(eye)), shadows);
+}
+
+fn rclSun(toward : Vec3, lux : f32, mode : LightShadowMode) : LightSource {
+    let mut l : LightSource = LightSource::directional(
+        Vec3::make(1.0, 1.0, 1.0),
+        lux,
+        toward,
+        0.0093
+    );
+    l.shadowMode = mode;
+    return l;
+}
+
+// The deviation of every covered pixel of a unit-albedo sphere from the furnace radiance.
+fn rclFurnaceError(metallic : f32, roughness : f32, level : f32) : f32 {
+    let eye : Vec3 = Vec3::make(0.0, 0.0, 14.0);
+    let assets : Shared<RenderAssets> = share new RenderAssets();
+    let ball : i32 = assets.addMesh(MeshDataShapes::uvSphere(3.0, 48, 32));
+    let mut m : RenderMaterial = RenderMaterial::plastic(Vec3::make(1.0, 1.0, 1.0), roughness);
+    m.metallic = metallic;
+    let mat : i32 = assets.addMaterial(m);
+    let scene : RenderScene = new RenderScene(cpuLookCamera(eye, Vec3::zero(), 0.5, 96, 54));
+    rclPlace(scene, assets, ball, mat, 0, Vec3::zero(), eye, false);
+    scene.setUniformEnvironment(Vec3::splat(level));
+    let rig : CpuRig = new CpuRig(assets, scene, 96, 54, 0, Vec3::splat(level), true, false);
+    let mut worst : f32 = 0.0;
+    let mut pixels : i32 = 0;
+    for (y of 0..54) {
+        for (x of 0..96) {
+            if (rig.covered(x, y)) {
+                pixels = pixels + 1;
+                let v : Vec3 = rig.hdr(x, y);
+                worst = rclMax(
+                    worst,
+                    rclMax(abs(v.x - level), rclMax(abs(v.y - level), abs(v.z - level)))
+                );
+            }
+        }
+    }
+    rig.close();
+    if (pixels < 1000) {
+        return 1000.0;
+    }
+    return worst;
+}
+
+fn rclMax(a : f32, b : f32) : f32 {
+    if (a > b) {
+        return a;
+    }
+    return b;
+}
+
+fn rclFurnace(c : Checks) : void {
+    let level : f32 = 0.7;
+    let mut worst : f32 = 0.0;
+    for (metal of 0..2) {
+        for (r of 0..3) {
+            let rough : f32 = (0.3 as f32) + (0.35 as f32) * (r as f32);
+            let e : f32 = rclFurnaceError(metal as f32, rough, level);
+            println("  measured white furnace, metallic ${metal} roughness ${rough}: worst |pixel - L| = ${e} for L = 0.7");
+            worst = rclMax(worst, e);
+        }
+    }
+    c.that(
+        "furnace: a unit-albedo sphere under a uniform environment returns the environment, dielectric and metal, three roughnesses, through the whole pipeline",
+        worst < 0.006
+    );
+    // The same sphere with half the albedo is darker than the environment, never brighter.
+    let eye : Vec3 = Vec3::make(0.0, 0.0, 14.0);
+    let assets : Shared<RenderAssets> = share new RenderAssets();
+    let ball : i32 = assets.addMesh(MeshDataShapes::uvSphere(3.0, 24, 16));
+    let mat : i32 = assets.addMaterial(RenderMaterial::plastic(Vec3::make(0.5, 0.5, 0.5), 0.8));
+    let scene : RenderScene = new RenderScene(cpuLookCamera(eye, Vec3::zero(), 0.5, 64, 36));
+    rclPlace(scene, assets, ball, mat, 0, Vec3::zero(), eye, false);
+    scene.setUniformEnvironment(Vec3::splat(level));
+    let rig : CpuRig = new CpuRig(assets, scene, 64, 36, 0, Vec3::splat(level), true, false);
+    let centre : Vec3 = rig.hdr(32, 18);
+    c.that(
+        "furnace: a grey sphere is darker than the furnace but not black",
+        centre.x < level && centre.x > 0.5 * level * 0.9
+    );
+    rig.close();
+}
+
+fn rclLitSphere(c : Checks) : void {
+    let eye : Vec3 = Vec3::make(0.0, 0.0, 14.0);
+    let assets : Shared<RenderAssets> = share new RenderAssets();
+    let ball : i32 = assets.addMesh(MeshDataShapes::uvSphere(3.0, 48, 32));
+    let mat : i32 = assets.addMaterial(RenderMaterial::plastic(Vec3::make(0.8, 0.8, 0.8), 1.0));
+    let towards : Vec3 = Vec3::make(0.5, 0.6, 0.6).normalized();
+    // A directional light travelling the opposite way.
+    let scene : RenderScene = new RenderScene(cpuLookCamera(eye, Vec3::zero(), 0.5, 128, 72));
+    rclPlace(scene, assets, ball, mat, 0, Vec3::zero(), eye, false);
+    scene.addLight(rclSun(towards.negated(), 100000.0, LightShadowMode::None));
+    let rig : CpuRig = new CpuRig(assets, scene, 128, 72, 0, Vec3::zero(), true, false);
+    let mut best : f32 = -1.0;
+    let mut bx : i32 = 0;
+    let mut by : i32 = 0;
+    for (y of 0..72) {
+        for (x of 0..128) {
+            if (rig.covered(x, y)) {
+                let v : Vec3 = rig.hdr(x, y);
+                let l : f32 = v.x + v.y + v.z;
+                if (l > best) {
+                    best = l;
+                    bx = x;
+                    by = y;
+                }
+            }
+        }
+    }
+    let n : Vec3 = rig.renderer.sampleAt(bx, by).surface.normal;
+    let facing : f32 = n.dot(towards);
+    println("  measured brightest pixel of the sun-lit sphere: (${bx}, ${by}), n . toLight = ${facing}");
+    c.that(
+        "lit sphere: the brightest point under a sun faces the sun (n . l > 0.99)",
+        n.dot(towards) > 0.99
+    );
+    c.that(
+        "lit sphere: its colour is albedo x irradiance / pi x cos, about 0.8 for the reference sun",
+        abs(rig.hdr(bx, by).x - 0.8) < 0.05
+    );
+    rig.close();
+
+    // A point light: the brightest point faces the light's position, not a direction.
+    let lampAt : Vec3 = Vec3::make(7.0, 5.0, 8.0);
+    let scene2 : RenderScene = new RenderScene(cpuLookCamera(eye, Vec3::zero(), 0.5, 128, 72));
+    rclPlace(scene2, assets, ball, mat, 0, Vec3::zero(), eye, false);
+    let mut lamp : LightSource = LightSource::point(
+        Vec3::make(1.0, 1.0, 1.0),
+        40000.0,
+        lampAt.minus(eye),
+        0.05,
+        0.0
+    );
+    lamp.shadowMode = LightShadowMode::None;
+    scene2.addLight(lamp);
+    let rig2 : CpuRig = new CpuRig(assets, scene2, 128, 72, 0, Vec3::zero(), true, false);
+    let mut best2 : f32 = -1.0;
+    let mut cx : i32 = 0;
+    let mut cy : i32 = 0;
+    for (y of 0..72) {
+        for (x of 0..128) {
+            if (rig2.covered(x, y)) {
+                let v : Vec3 = rig2.hdr(x, y);
+                if (v.x + v.y + v.z > best2) {
+                    best2 = v.x + v.y + v.z;
+                    cx = x;
+                    cy = y;
+                }
+            }
+        }
+    }
+    let s2 : CpuSample = rig2.renderer.sampleAt(cx, cy);
+    let toLamp : Vec3 = lampAt.minus(eye).minus(s2.surface.position).normalized();
+    c.that(
+        "lit sphere: the brightest point under a lamp faces the lamp",
+        s2.surface.normal.dot(toLamp) > 0.98
+    );
+    rig2.close();
+}
+
+// Pixel of world point `p` for camera `cam` at `eye`.
+fn rclPixel(cam : Camera, eye : Vec3, p : Vec3, w : i32, h : i32) : i32 {
+    let ndc : Vec3 = cam.viewProjection().projectPoint(p.minus(eye));
+    let px : i32 = ((ndc.x * (0.5 as f32) + (0.5 as f32)) * (w as f32)) as i32;
+    let py : i32 = ((ndc.y * (0.5 as f32) + (0.5 as f32)) * (h as f32)) as i32;
+    return py * w + px;
+}
+
+// A ground plane with a box on it, lit by the given lights; returns the finished rig.
+fn rclShadowRig(sun : bool, mode : LightShadowMode, lamp : bool) : CpuRig {
+    let eye : Vec3 = Vec3::make(0.0, 9.0, 12.0);
+    let assets : Shared<RenderAssets> = share new RenderAssets();
+    let ground : i32 = assets.addMesh(MeshDataShapes::plane(40.0, 40.0, 8, 8, 1.0, 1.0));
+    let crate : i32 = assets.addMesh(MeshDataShapes::box(2.0, 2.0, 2.0));
+    let gm : i32 = assets.addMaterial(RenderMaterial::plastic(Vec3::make(0.7, 0.7, 0.7), 1.0));
+    let bm : i32 = assets.addMaterial(RenderMaterial::plastic(Vec3::make(0.6, 0.3, 0.2), 1.0));
+    let scene : RenderScene = new RenderScene(cpuLookCamera(eye, Vec3::zero(), 0.9, 160, 90));
+    rclPlace(scene, assets, ground, gm, 0, Vec3::zero(), eye, true);
+    rclPlace(scene, assets, crate, bm, 1, Vec3::make(0.0, 1.0, 0.0), eye, true);
+    scene.setUniformEnvironment(Vec3::splat(0.05));
+    if (sun) {
+        scene.addLight(rclSun(Vec3::make(1.0, -1.0, 0.0).normalized(), 100000.0, mode));
+    }
+    if (lamp) {
+        let mut l : LightSource = LightSource::point(
+            Vec3::make(1.0, 1.0, 1.0),
+            1500000.0,
+            Vec3::make(-4.0, 4.0, 0.0).minus(eye),
+            0.05,
+            0.0
+        );
+        l.shadowMode = mode;
+        scene.addLight(l);
+    }
+    return new CpuRig(assets, scene, 160, 90, 0, Vec3::zero(), true, false);
+}
+
+fn rclShadows(c : Checks) : void {
+    let eye : Vec3 = Vec3::make(0.0, 9.0, 12.0);
+    let cam : Camera = cpuLookCamera(eye, Vec3::zero(), 0.9, 160, 90);
+    let inShadow : i32 = rclPixel(cam, eye, Vec3::make(2.0, 0.0, 0.0), 160, 90);
+    let litNear : i32 = rclPixel(cam, eye, Vec3::make(6.0, 0.0, 0.0), 160, 90);
+    let litLeft : i32 = rclPixel(cam, eye, Vec3::make(-3.0, 0.0, 0.0), 160, 90);
+    let ray : CpuRig = rclShadowRig(true, LightShadowMode::Ray, false);
+    let none : CpuRig = rclShadowRig(true, LightShadowMode::None, false);
+    let dark : CpuRig = rclShadowRig(false, LightShadowMode::None, false);
+    let a : Vec3 = ray.hdr(inShadow % 160, inShadow / 160);
+    let b : Vec3 = none.hdr(inShadow % 160, inShadow / 160);
+    let d : Vec3 = dark.hdr(inShadow % 160, inShadow / 160);
+    println("  measured sun shadow behind the box: ray ${a.x}, no shadow ${b.x}, no sun ${d.x}");
+    c.that(
+        "shadow: the sampled pixel is on the ground (y = 0, which is -9 relative to the camera)",
+        abs(ray.renderer.sampleAt(inShadow % 160, inShadow / 160).surface.position.y + 9.0) < 0.001
+    );
+    c.that(
+        "shadow: a shadow ray blocks the sun behind the box: the pixel is only ambient",
+        abs(a.x - d.x) < 0.000001 && abs(a.y - d.y) < 0.000001 && abs(a.z - d.z) < 0.000001
+    );
+    c.that(
+        "shadow: with the shadow mode None the same pixel is lit, many times brighter",
+        b.x > 8.0 * a.x
+    );
+    let l1 : Vec3 = ray.hdr(litNear % 160, litNear / 160);
+    let l2 : Vec3 = none.hdr(litNear % 160, litNear / 160);
+    let l3 : Vec3 = ray.hdr(litLeft % 160, litLeft / 160);
+    let l4 : Vec3 = none.hdr(litLeft % 160, litLeft / 160);
+    c.that(
+        "shadow: pixels the box does not shade are identical with and without the ray",
+        l1.x == l2.x && l3.x == l4.x && l1.x > 4.0 * a.x
+    );
+    ray.close();
+    none.close();
+    dark.close();
+
+    // A lamp 4 up and 4 to the left of the box throws its shadow to the right.
+    let lampRay : CpuRig = rclShadowRig(false, LightShadowMode::Ray, true);
+    let lampNone : CpuRig = rclShadowRig(false, LightShadowMode::None, true);
+    let shadowed : i32 = rclPixel(cam, eye, Vec3::make(2.5, 0.0, 0.0), 160, 90);
+    let clear : i32 = rclPixel(cam, eye, Vec3::make(8.0, 0.0, 0.0), 160, 90);
+    let s1 : Vec3 = lampRay.hdr(shadowed % 160, shadowed / 160);
+    let s2 : Vec3 = lampNone.hdr(shadowed % 160, shadowed / 160);
+    c.that(
+        "shadow: a point light's ray is blocked by the box too",
+        s1.x < 0.4 * s2.x && s1.x > 0.02
+    );
+    c.that(
+        "shadow: and not where the box is out of the way",
+        lampRay.hdr(clear % 160, clear / 160).x == lampNone.hdr(clear % 160, clear / 160).x
+    );
+    lampRay.close();
+    lampNone.close();
+}
+
+// The same busy scene on 0, 1, 3 and 7 workers: every float of the HDR picture and every byte of the 8-bit one match.
+fn rclThreadScene(workers : i32) : CpuRig {
+    let eye : Vec3 = Vec3::make(0.0, 5.0, 13.0);
+    let assets : Shared<RenderAssets> = share new RenderAssets();
+    let ground : i32 = assets.addMesh(MeshDataShapes::plane(30.0, 30.0, 6, 6, 1.0, 1.0));
+    let ball : i32 = assets.addMesh(MeshDataShapes::uvSphere(1.2, 32, 20));
+    let can : i32 = assets.addMesh(MeshDataShapes::cylinder(1.0, 2.5, 24));
+    let gm : i32 = assets.addMaterial(RenderMaterial::plastic(Vec3::make(0.6, 0.6, 0.6), 0.8));
+    let mut gold : RenderMaterial = RenderMaterial::metal(Vec3::make(1.0, 0.78, 0.34), 0.25);
+    gold.emissive = Vec3::make(0.02, 0.01, 0.0);
+    let mg : i32 = assets.addMaterial(gold);
+    let red : i32 = assets.addMaterial(RenderMaterial::plastic(Vec3::make(0.8, 0.1, 0.1), 0.4));
+    let scene : RenderScene = new RenderScene(cpuLookCamera(
+        eye,
+        Vec3::make(0.0, 1.0, 0.0),
+        0.8,
+        128,
+        72
+    ));
+    rclPlace(scene, assets, ground, gm, 0, Vec3::zero(), eye, true);
+    rclPlace(scene, assets, ball, mg, 1, Vec3::make(-2.5, 1.2, 0.0), eye, true);
+    rclPlace(scene, assets, ball, red, 2, Vec3::make(0.5, 1.2, 1.0), eye, true);
+    rclPlace(scene, assets, can, red, 3, Vec3::make(3.0, 1.25, -1.0), eye, true);
+    scene.setUniformEnvironment(Vec3::make(0.08, 0.1, 0.14));
+    scene.addLight(rclSun(Vec3::make(0.6, -1.0, -0.4).normalized(), 90000.0, LightShadowMode::Ray));
+    let mut lamp : LightSource = LightSource::point(
+        Vec3::make(1.0, 0.8, 0.6),
+        9000.0,
+        Vec3::make(1.0, 4.0, 3.0).minus(eye),
+        0.1,
+        30.0
+    );
+    lamp.shadowMode = LightShadowMode::Ray;
+    scene.addLight(lamp);
+    return new CpuRig(assets, scene, 128, 72, workers, Vec3::make(0.1, 0.12, 0.2), true, false);
+}
+
+fn rclThreads(c : Checks) : void {
+    let reference : CpuRig = rclThreadScene(0);
+    let mut same : bool = true;
+    let mut covered : i32 = 0;
+    for (workers of 1..8) {
+        if (workers == 2 || workers == 4 || workers == 5 || workers == 6) {
+            continue;
+        }
+        let other : CpuRig = rclThreadScene(workers);
+        for (y of 0..72) {
+            for (x of 0..128) {
+                let a : Vec3 = reference.hdr(x, y);
+                let b : Vec3 = other.hdr(x, y);
+                if (a.x != b.x || a.y != b.y || a.z != b.z) {
+                    same = false;
+                }
+                if (reference.renderer.picture(3).get(x, y)
+                    != other.renderer.picture(3).get(x, y)) {
+                    same = false;
+                }
+                if (workers == 1 && reference.covered(x, y)) {
+                    covered = covered + 1;
+                }
+            }
+        }
+        other.close();
+    }
+    c.that("threads: 1, 3 and 7 workers give exactly the floats and bytes of the serial run", same);
+    c.that(
+        "threads: the scene is not trivial (it covers more than half the picture)",
+        covered > 128 * 72 / 2
+    );
+    let again : CpuRig = rclThreadScene(0);
+    let mut stable : bool = true;
+    for (y of 0..72) {
+        for (x of 0..128) {
+            if (reference.hdr(x, y).x != again.hdr(x, y).x) {
+                stable = false;
+            }
+        }
+    }
+    c.that("threads: rendering the same frame twice gives the same picture", stable);
+    again.close();
+    reference.close();
+}
+
+fn rclExplain(c : Checks) : void {
+    let eye : Vec3 = Vec3::make(0.0, 9.0, 12.0);
+    let assets : Shared<RenderAssets> = share new RenderAssets();
+    let ground : i32 = assets.addMesh(MeshDataShapes::plane(40.0, 40.0, 8, 8, 1.0, 1.0));
+    let crate : i32 = assets.addMesh(MeshDataShapes::box(2.0, 2.0, 2.0));
+    let gm : i32 = assets.addMaterial(RenderMaterial::plastic(Vec3::make(0.7, 0.7, 0.7), 0.6));
+    let bm : i32 = assets.addMaterial(RenderMaterial::plastic(Vec3::make(0.6, 0.3, 0.2), 1.0));
+    let cam : Camera = cpuLookCamera(eye, Vec3::zero(), 0.9, 160, 90);
+    let scene : RenderScene = new RenderScene(cam);
+    rclPlace(scene, assets, ground, gm, 0, Vec3::zero(), eye, true);
+    rclPlace(scene, assets, crate, bm, 1, Vec3::make(0.0, 1.0, 0.0), eye, true);
+    scene.setUniformEnvironment(Vec3::splat(0.05));
+    // 0: the sun, blocked by the box here. 1: a lamp with a range too short. 2: a lamp that excludes layer 1.
+    // 3: a plain lamp that reaches.
+    scene.addLight(rclSun(Vec3::make(1.0, -1.0, 0.0).normalized(), 100000.0, LightShadowMode::Ray));
+    let mut far : LightSource = LightSource::point(
+        Vec3::make(1.0, 1.0, 1.0),
+        5000.0,
+        Vec3::make(0.0, 6.0, 0.0).minus(eye),
+        0.05,
+        1.0
+    );
+    far.shadowMode = LightShadowMode::None;
+    scene.addLight(far);
+    let mut shy : LightSource = LightSource::point(
+        Vec3::make(1.0, 1.0, 1.0),
+        5000.0,
+        Vec3::make(2.0, 3.0, 2.0).minus(eye),
+        0.05,
+        0.0
+    );
+    shy.excludeLayers = 1;
+    scene.addLight(shy);
+    let mut plain : LightSource = LightSource::point(
+        Vec3::make(1.0, 0.9, 0.8),
+        600000.0,
+        Vec3::make(0.0, 6.0, 6.0).minus(eye),
+        0.05,
+        0.0
+    );
+    plain.shadowMode = LightShadowMode::None;
+    scene.addLight(plain);
+    let rig : CpuRig = new CpuRig(assets, scene, 160, 90, 0, Vec3::zero(), true, false);
+    let at : i32 = rclPixel(cam, eye, Vec3::make(2.0, 0.0, 0.0), 160, 90);
+    let x : i32 = at % 160;
+    let y : i32 = at / 160;
+    let e : LightExplain = CpuExplain::pixel(rig.renderer, x, y);
+    c.sameInt("explain: four lights were considered", e.count(), 4);
+    c.that("explain: the sun is blocked (Shadow)", e.light(0).reason == LightReason::Shadow);
+    c.that("explain: the short lamp is out of range", e.light(1).reason == LightReason::Range);
+    c.that("explain: the shy lamp excludes this layer", e.light(2).reason == LightReason::Excluded);
+    c.that(
+        "explain: the plain lamp reaches the pixel with a positive contribution",
+        e.light(3).reason == LightReason::None && e.light(3).rgb().x > 0.0 && e.light(3).nDotL > 0.0
+    );
+    c.sameInt("explain: exactly one light reaches", e.reaching(), 1);
+    c.that(
+        "explain: the parts add up to the renderer's shading to the last bit",
+        e.difference() == 0.0
+    );
+    let pixel : Vec3 = rig.hdr(x, y);
+    c.that(
+        "explain: and that is the colour in the HDR buffer, bit for bit",
+        e.sum().x == pixel.x && e.sum().y == pixel.y && e.sum().z == pixel.z
+    );
+    c.that("explain: a shadowed light has factor 0 recorded", e.light(0).irradiance > 0.0);
+    let text : string = CpuExplain::report(rig.renderer, x, y);
+    println(text);
+    c.that(
+        "explain: the report names every light and the blocker",
+        rclLines(text) >= 7 && rclHas(text, "excluded: in shadow, blocker")
+            && rclHas(text, "beyond its range")
+            && rclHas(text, "exclusion list")
+            && rclHas(text, "reaches the point")
+    );
+    c.that(
+        "explain: a pixel with no surface says so",
+        rclHas(CpuExplain::report(rig.renderer, 1, 1), "no opaque surface")
+            || CpuExplain::hasSurface(rig.renderer, 1, 1)
+    );
+    rig.close();
+}
+
+fn rclLines(s : string) : i32 {
+    let mut n : i32 = 0;
+    for (i of 0..s.byteLength) {
+        if (s.charAt(i) == 10) {
+            n = n + 1;
+        }
+    }
+    return n;
+}
+
+// Whether `needle` occurs in `hay` (a plain scan; the library has no string search yet).
+fn rclHas(hay : string, needle : string) : bool {
+    let n : i32 = needle.byteLength as i32;
+    let mut i : i32 = 0;
+    while ((i + n) as i64 <= hay.byteLength) {
+        let mut k : i32 = 0;
+        while (k < n && hay.charAt(i + k) == needle.charAt(k)) {
+            k = k + 1;
+        }
+        if (k == n) {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}

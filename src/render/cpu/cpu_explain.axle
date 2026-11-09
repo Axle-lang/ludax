@@ -1,0 +1,136 @@
+// cpu_explain — why a pixel has its colour (design rule 8, doc/LIGHTING.md section 9), for the CPU backend.
+//
+// `CpuExplain::pixel` rebuilds the surface the renderer shaded at (x, y) with the very function the renderer used
+// (`CpuSurface::sample`) and hands it, with the frame's lights, environment and shadow query, to the lighting
+// library's `lightExplain`. That function and the renderer's `lightShade` share one code path for each light's
+// contribution, so the explanation's `sum()` is exactly the colour in the HDR buffer: `difference()` is 0, and the
+// suite checks it against the buffer itself. `CpuExplain::report` turns the same facts into lines a person can read:
+// for each light whether it reaches the pixel with which N.L, attenuation, shadow factor and RGB, or the reason it
+// was excluded (range, layer mask, exclusion, behind the surface, outside the cone, or in shadow, and then how far
+// away the blocker is), followed by the ambient, emissive and total terms. It explains the opaque surface visible at
+// the pixel after the last flush; blended layers over it are not part of the explanation.
+
+use crate::core::math::vec3::Vec3;
+use crate::render::cpu::cpu_renderer::CpuRenderer;
+use crate::render::cpu::cpu_surface::CpuSample;
+use crate::render::light::light_explain::{LightExplain, lightExplain};
+use crate::render::light::light_irradiance::LightReason;
+use crate::render::light::light_shade::{LightAmbientInput, LightContribution, LightShadeTerms};
+use crate::render::light::light_source::{LightKind, LightSource};
+
+// Numbers print with three decimals: the value times this, rounded, is a whole number to cut in two.
+const EXPL_SCALE : f32 = 1000.0;
+const EXPL_SCALE_INT : i64 = 1000;
+const EXPL_DECIMALS : i32 = 3;
+
+/** Explains pixels of the CPU renderer's last picture. */
+pub class CpuExplain {
+    /** The explanation of pixel (x, y); `None` when no opaque surface is visible there. */
+    pub static fn pixel(r : CpuRenderer, x : i32, y : i32) : LightExplain {
+        let s : CpuSample = r.sampleAt(x, y);
+        let ambient : LightAmbientInput = r.ambientFor(s);
+        return lightExplain(r.lights(), s.surface, s.material, s.dfg, ambient, r.shadowQuery());
+    }
+
+    /** True when an opaque surface is visible at the pixel, so `pixel` explains something. */
+    pub static fn hasSurface(r : CpuRenderer, x : i32, y : i32) : bool {
+        return r.visibleAt(x, y) >= 0;
+    }
+
+    /** The word for a reason a light is not reaching a point. */
+    pub static fn reasonWord(reason : LightReason) : string {
+        return match reason {
+            LightReason::None => "reaches the point",
+            LightReason::Range => "excluded: beyond its range",
+            LightReason::Mask => "excluded: the surface's layer is not in its include mask",
+            LightReason::Excluded => "excluded: the surface's layer or object is on its exclusion list",
+            LightReason::Backface => "excluded: wholly behind the surface",
+            LightReason::Cone => "excluded: outside the spot cone",
+            LightReason::Shadow => "excluded: in shadow",
+        };
+    }
+
+    /** The word for a kind of light. */
+    pub static fn kindWord(kind : LightKind) : string {
+        return match kind {
+            LightKind::Directional => "directional",
+            LightKind::Point => "point",
+            LightKind::Spot => "spot",
+            LightKind::Emissive => "emissive",
+        };
+    }
+
+    // "(r, g, b)" with three decimals.
+    static fn rgb(c : Vec3) : string {
+        return "(${CpuExplain::fixed(c.x)}, ${CpuExplain::fixed(c.y)}, ${CpuExplain::fixed(c.z)})";
+    }
+
+    // A number with three decimals.
+    static fn fixed(v : f32) : string {
+        // Round half away from zero, then print the magnitude with its sign in front.
+        let mut half : f32 = 0.5;
+        if (v < (0.0 as f32)) {
+            half = -0.5;
+        }
+        let scaled : i64 = ((v * EXPL_SCALE) + half) as i64;
+        let mut sign : string = "";
+        let mut n : i64 = scaled;
+        if (scaled < 0) {
+            sign = "-";
+            n = -scaled;
+        }
+        let whole : i64 = n / EXPL_SCALE_INT;
+        let frac : i64 = n % EXPL_SCALE_INT;
+        let mut f : string = frac.toString();
+        while (f.byteLength < EXPL_DECIMALS as i64) {
+            f = "0" + f;
+        }
+        return "${sign}${whole}.${f}";
+    }
+
+    /** A readable account of pixel (x, y): every light, the ambient and emissive parts, and the total. */
+    pub static fn report(r : CpuRenderer, x : i32, y : i32) : string {
+        if (!CpuExplain::hasSurface(r, x, y)) {
+            return "pixel (${x}, ${y}): no opaque surface is visible here\n";
+        }
+        let s : CpuSample = r.sampleAt(x, y);
+        let e : LightExplain = CpuExplain::pixel(r, x, y);
+        let position : string = CpuExplain::rgb(s.surface.position);
+        let normal : string = CpuExplain::rgb(s.surface.normal);
+        let base : string = CpuExplain::rgb(s.material.baseColor);
+        let metallic : string = CpuExplain::fixed(s.material.metallic);
+        let roughness : string = CpuExplain::fixed(s.material.roughness);
+        let mut text : string = "pixel (${x}, ${y}) at ${position}, normal ${normal}, base colour ${base}, "
+            + "metallic ${metallic}, roughness ${roughness}\n";
+
+        for (i of 0..e.count()) {
+            let c : LightContribution = e.light(i);
+            let light : LightSource = r.lights().get(i);
+            let kind : string = CpuExplain::kindWord(light.kind);
+            let reason : string = CpuExplain::reasonWord(c.reason);
+            text = text + "  light ${i} (${kind}): ${reason}";
+            if (c.reason == LightReason::None) {
+                let nDotL : string = CpuExplain::fixed(c.nDotL);
+                let attenuation : string = CpuExplain::fixed(c.attenuation);
+                let shadow : string = CpuExplain::fixed(c.shadow);
+                let adds : string = CpuExplain::rgb(c.rgb());
+                text = text + ", N.L ${nDotL}, attenuation ${attenuation}, shadow ${shadow}, adds ${adds}";
+            } else if (c.reason == LightReason::Shadow) {
+                let blocker : string = CpuExplain::fixed(r.shadowQuery().blockerDistance(i, s.surface));
+                text = text + ", blocker ${blocker} away";
+            }
+            text = text + "\n";
+        }
+
+        let a : LightShadeTerms = e.ambientTerms();
+        let diffuse : string = CpuExplain::rgb(a.ambientDiffuse);
+        let specular : string = CpuExplain::rgb(a.ambientSpecular);
+        let emissive : string = CpuExplain::rgb(a.emissive);
+        text = text + "  ambient diffuse ${diffuse}, ambient specular ${specular}, emissive ${emissive}\n";
+
+        let sum : string = CpuExplain::rgb(e.sum());
+        let shaded : string = CpuExplain::rgb(e.shadedResult());
+        let difference : string = CpuExplain::fixed(e.difference());
+        return text + "  sum ${sum}, renderer ${shaded}, difference ${difference}\n";
+    }
+}

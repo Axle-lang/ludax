@@ -1,0 +1,276 @@
+// texture — an image prepared for sampling: linear light, a mip chain, filtered reads.
+//
+// Files store colour in sRGB; lighting is done in linear light, and so is filtering: averaging encoded values
+// makes every mip level darker than the picture it stands for. A `Texture` therefore converts once, keeps every
+// level as linear `f32` RGBA, and builds each level from the one above by averaging 2 x 2 texels weighted by
+// alpha (so a cut-out leaf does not bleed the colour of its transparent texels). Reads are nearest, bilinear, or
+// trilinear by the footprint of the pixel being shaded. Everything is plain arithmetic on f32, so a read gives
+// the same value on every machine.
+
+use crate::core::math::scalar::{clampI, min, minI};
+use crate::core::math::vec4::Vec4;
+use crate::data::image::image::Image;
+use crate::render::light::light_color::{lightSrgbDecode8, lightSrgbEncode8};
+use crate::render::light::light_math::lightLog2;
+
+// The most mip levels a chain has: the picture and one halving for each of the 31 bits of a side.
+const TEX_MAX_LEVELS : i32 = 32;
+
+// Floats per texel: linear red, green, blue and straight alpha.
+const TEX_CHANNELS : i32 = 4;
+
+// The values of an 8-bit channel, and the largest of them.
+const TEX_BYTE_VALUES : i32 = 256;
+const TEX_BYTE_MAX : f32 = 255.0;
+
+// A 2 x 2 block whose alphas sum to less than this is transparent: it has no colour worth weighting, so its colour is
+// the plain mean.
+const TEX_ALPHA_MIN : f32 = 0.0001;
+
+// A trilinear blend fraction at or below this is the lower level alone.
+const TEX_BLEND_MIN : f32 = 0.0001;
+
+/** What a coordinate outside 0..1 means. */
+pub enum TextureWrap : i8 {
+    /** The picture tiles. */
+    Repeat = 0,
+    /** The edge texel continues. */
+    Clamp = 1,
+}
+
+/** A mip-mapped texture in linear light. */
+pub class Texture {
+    wrapMode : TextureWrap;
+    count    : i32 = 0;
+    widths   : i32[];
+    heights  : i32[];
+    starts   : i32[];
+    data     : f32[];
+
+    /** The texture of `img` with its whole mip chain; an empty image gives a 1 x 1 transparent texture. */
+    constructor(img : Image, wrap : TextureWrap) {
+        self.wrapMode = wrap;
+        self.widths = new i32[TEX_MAX_LEVELS as i64];
+        self.heights = new i32[TEX_MAX_LEVELS as i64];
+        self.starts = new i32[(TEX_MAX_LEVELS + 1) as i64];
+        let total : i32 = self.layOutLevels(img.width(), img.height());
+        self.data = new f32[total as i64];
+        for (i of 0..total) {
+            self.data[i] = 0.0;
+        }
+        self.loadBase(img);
+        for (l of 1..self.count) {
+            self.reduce(l);
+        }
+    }
+
+    // Records the size and start of every level of a `w` x `h` picture (an empty one counts as 1 x 1) and returns the
+    // floats the whole chain takes.
+    fn layOutLevels(mut self, width : i32, height : i32) : i32 {
+        let mut w : i32 = width;
+        let mut h : i32 = height;
+        if (w < 1 || h < 1) {
+            w = 1;
+            h = 1;
+        }
+        let mut total : i32 = 0;
+        while (true) {
+            self.widths[self.count] = w;
+            self.heights[self.count] = h;
+            self.starts[self.count] = total;
+            total = total + w * h * TEX_CHANNELS;
+            self.count = self.count + 1;
+
+            // The chain ends at the first 1 x 1 level.
+            if (w == 1 && h == 1) {
+                break;
+            }
+            w = Texture::halved(w);
+            h = Texture::halved(h);
+        }
+        return total;
+    }
+
+    // Level 0: the picture's sRGB bytes as linear light, alpha as a fraction.
+    fn loadBase(mut self, img : Image) : void {
+        let mut lut : f32[] = new f32[TEX_BYTE_VALUES as i64];
+        for (c of 0..TEX_BYTE_VALUES) {
+            lut[c] = lightSrgbDecode8(c);
+        }
+        for (y of 0..self.heights[0]) {
+            for (x of 0..self.widths[0]) {
+                let p : i32 = img.get(x, y);
+                let at : i32 = (y * self.widths[0] + x) * TEX_CHANNELS;
+                self.data[at] = lut[Image::red(p)];
+                self.data[at + 1] = lut[Image::green(p)];
+                self.data[at + 2] = lut[Image::blue(p)];
+                self.data[at + 3] = (Image::alpha(p) as f32) / TEX_BYTE_MAX;
+            }
+        }
+    }
+
+    static fn halved(n : i32) : i32 {
+        if (n <= 1) {
+            return 1;
+        }
+        return n / 2;
+    }
+
+    // Level `l` from level `l - 1`: the mean of the (up to) 2 x 2 texels each of its texels covers.
+    fn reduce(mut self, l : i32) : void {
+        for (y of 0..self.heights[l]) {
+            for (x of 0..self.widths[l]) {
+                let mean : Vec4 = self.blockMean(l - 1, x * 2, y * 2);
+                let to : i32 = self.starts[l] + (y * self.widths[l] + x) * TEX_CHANNELS;
+                self.data[to] = mean.x;
+                self.data[to + 1] = mean.y;
+                self.data[to + 2] = mean.z;
+                self.data[to + 3] = mean.w;
+            }
+        }
+    }
+
+    // The mean of the 2 x 2 texels of level `src` whose corner is (x, y), the edge texel repeated past the level's
+    // size. Colour is weighted by alpha, so a transparent texel adds no colour; alpha is the plain mean.
+    fn blockMean(self, src : i32, x : i32, y : i32) : Vec4 {
+        let sw : i32 = self.widths[src];
+        let sh : i32 = self.heights[src];
+        let mut r : f32 = 0.0;
+        let mut g : f32 = 0.0;
+        let mut b : f32 = 0.0;
+        let mut a : f32 = 0.0;
+        let mut plainR : f32 = 0.0;
+        let mut plainG : f32 = 0.0;
+        let mut plainB : f32 = 0.0;
+        let mut n : f32 = 0.0;
+        for (j of 0..2) {
+            for (i of 0..2) {
+                let sx : i32 = minI(x + i, sw - 1);
+                let sy : i32 = minI(y + j, sh - 1);
+                let at : i32 = self.starts[src] + (sy * sw + sx) * TEX_CHANNELS;
+                let ta : f32 = self.data[at + 3];
+                r = r + self.data[at] * ta;
+                g = g + self.data[at + 1] * ta;
+                b = b + self.data[at + 2] * ta;
+                a = a + ta;
+                plainR = plainR + self.data[at];
+                plainG = plainG + self.data[at + 1];
+                plainB = plainB + self.data[at + 2];
+                n = n + (1.0 as f32);
+            }
+        }
+        if (a > TEX_ALPHA_MIN) {
+            return Vec4 { x: r / a, y: g / a, z: b / a, w: a / n };
+        }
+        return Vec4 { x: plainR / n, y: plainG / n, z: plainB / n, w: a / n };
+    }
+
+    /** How many levels the chain has; the last is 1 x 1. */
+    pub fn levels(self) : i32 {
+        return self.count;
+    }
+
+    /** The width of level `l` (0 is the picture itself). */
+    pub fn width(self, l : i32) : i32 {
+        return self.widths[Texture::clampLevel(l, self.count)];
+    }
+
+    /** The height of level `l`. */
+    pub fn height(self, l : i32) : i32 {
+        return self.heights[Texture::clampLevel(l, self.count)];
+    }
+
+    static fn clampLevel(l : i32, n : i32) : i32 {
+        return clampI(l, 0, n - 1);
+    }
+
+    // The texel index along an axis of `n` texels, wrapped or clamped.
+    fn index(self, i : i32, n : i32) : i32 {
+        if (self.wrapMode == TextureWrap::Repeat) {
+            return ((i % n) + n) % n;
+        }
+        return clampI(i, 0, n - 1);
+    }
+
+    /** The texel (x, y) of level `l` in linear light, straight alpha; coordinates outside the level wrap or clamp. */
+    pub fn texel(self, l : i32, x : i32, y : i32) : Vec4 {
+        let lv : i32 = Texture::clampLevel(l, self.count);
+        let row : i32 = self.index(y, self.heights[lv]);
+        let column : i32 = self.index(x, self.widths[lv]);
+        let at : i32 = self.starts[lv] + (row * self.widths[lv] + column) * TEX_CHANNELS;
+        return Vec4 { x: self.data[at], y: self.data[at + 1], z: self.data[at + 2], w: self.data[at + 3] };
+    }
+
+    static fn floorI(v : f32) : i32 {
+        let mut t : i32 = v as i32;
+        if ((t as f32) > v) {
+            t = t - 1;
+        }
+        return t;
+    }
+
+    /** The nearest texel of level `l` at (u, v), where 0..1 spans the picture. */
+    pub fn nearest(self, l : i32, u : f32, v : f32) : Vec4 {
+        let lv : i32 = Texture::clampLevel(l, self.count);
+        let x : i32 = Texture::floorI(u * (self.widths[lv] as f32));
+        let y : i32 = Texture::floorI(v * (self.heights[lv] as f32));
+        return self.texel(lv, x, y);
+    }
+
+    /** The four nearest texels of level `l` blended by distance, at (u, v). */
+    pub fn bilinear(self, l : i32, u : f32, v : f32) : Vec4 {
+        let lv : i32 = Texture::clampLevel(l, self.count);
+        let x : f32 = u * (self.widths[lv] as f32) - (0.5 as f32);
+        let y : f32 = v * (self.heights[lv] as f32) - (0.5 as f32);
+        let x0 : i32 = Texture::floorI(x);
+        let y0 : i32 = Texture::floorI(y);
+        let fx : f32 = x - (x0 as f32);
+        let fy : f32 = y - (y0 as f32);
+        let keepX : f32 = (1.0 as f32) - fx;
+        let keepY : f32 = (1.0 as f32) - fy;
+        let topRow : Vec4 = self.texel(lv, x0, y0).scale(keepX).plus(self.texel(lv, x0 + 1, y0).scale(fx));
+        let bottomRow : Vec4 = self
+            .texel(lv, x0, y0 + 1)
+            .scale(keepX)
+            .plus(self.texel(lv, x0 + 1, y0 + 1).scale(fx));
+        return topRow.scale(keepY).plus(bottomRow.scale(fy));
+    }
+
+    /**
+     * Bilinear reads of the two levels around the one that matches `footprint` (how many texels of the picture one
+     * pixel of the screen covers: 1 or less is the picture itself, 2 is the next level, and so on), blended.
+     */
+    pub fn trilinear(self, u : f32, v : f32, footprint : f32) : Vec4 {
+        let mut level : f32 = 0.0;
+        if (footprint > (1.0 as f32)) {
+            level = lightLog2(footprint);
+        }
+        level = min(level, (self.count - 1) as f32);
+
+        let lo : i32 = Texture::floorI(level);
+        let f : f32 = level - (lo as f32);
+        let finer : Vec4 = self.bilinear(lo, u, v);
+        if (f <= TEX_BLEND_MIN || lo + 1 >= self.count) {
+            return finer;
+        }
+        let coarser : Vec4 = self.bilinear(lo + 1, u, v);
+        return finer.scale((1.0 as f32) - f).plus(coarser.scale(f));
+    }
+
+    /** Level `l` as an sRGB image again (for viewing or saving the mip chain). */
+    pub fn levelImage(self, l : i32) : Image {
+        let lv : i32 = Texture::clampLevel(l, self.count);
+        let img : Image = new Image(self.widths[lv], self.heights[lv]);
+        for (y of 0..self.heights[lv]) {
+            for (x of 0..self.widths[lv]) {
+                let t : Vec4 = self.texel(lv, x, y);
+                let a : i32 = (t.w * TEX_BYTE_MAX + (0.5 as f32)) as i32;
+                let r : i32 = lightSrgbEncode8(t.x);
+                let g : i32 = lightSrgbEncode8(t.y);
+                let b : i32 = lightSrgbEncode8(t.z);
+                img.set(x, y, Image::pack(r, g, b, a));
+            }
+        }
+        return img;
+    }
+}

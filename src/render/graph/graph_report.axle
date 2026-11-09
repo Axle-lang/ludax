@@ -1,0 +1,153 @@
+// graph_report — a graph and its plan as text a person can read (design rule 8: observable).
+//
+// `GraphReport::text` lists the problems, the passes in the order they run with what each reads and writes, the
+// culled passes, every used resource with its size, lifetime and memory block, and the saving from aliasing. When
+// the backend has filled a `PassCosts`, each pass also shows its draw calls, triangles in and rasterised, and pixels
+// shaded: those are deterministic. Measured time is added only when asked (`withTimes`), because it differs from run
+// to run and a report without it can be compared byte for byte.
+
+use crate::render::cmd::cmd_costs::PassCosts;
+use crate::render::graph::graph_graph::RenderGraph;
+use crate::render::graph::graph_plan::GraphPlan;
+use crate::render::graph::graph_types::{GraphResKind, GraphFormat, PassKind, GraphNames, GraphIssues};
+
+// Nanoseconds in a hundredth of a millisecond, the resolution of a reported time.
+const GREP_NANOS_HUNDREDTH : i64 = 10000;
+
+// Hundredths in a millisecond, and the fraction below which it needs a leading zero to read as two decimals.
+const GREP_HUNDREDTHS : i64 = 100;
+const GREP_FRACTION_PAD : i64 = 10;
+
+/** Renders reports. */
+pub class GraphReport {
+    /**
+     * The report of `plan`, compiled from `g`. `costs` may be a table with no counts, and `withTimes` adds the
+     * measured time.
+     */
+    pub static fn text(g : RenderGraph, plan : GraphPlan, costs : PassCosts, withTimes : bool) : string {
+        let passes : i32 = g.passTotal();
+        let run : i32 = plan.runCount();
+        let culled : i32 = plan.culledCount();
+        let resources : i32 = g.resourceTotal();
+        let mut s : string = "render graph: ${passes} passes (${run} run, ${culled} culled), ${resources} resources\n";
+        s = s + GraphReport::problemLines(plan);
+        s = s + "order:\n";
+        for (i of 0..run) {
+            let p : i32 = plan.passAt(i);
+            s = s + GraphReport::passHeader(g, p, i);
+            s = s + GraphReport::costLines(costs, p, withTimes);
+        }
+        for (i of 0..culled) {
+            let name : string = g.passName(plan.culledAt(i));
+            s = s + "culled: ${name} (nothing that is drawn depends on it)\n";
+        }
+        s = s + "resources:\n";
+        for (r of 0..resources) {
+            s = s + GraphReport::resourceLine(g, plan, r);
+        }
+        return s + GraphReport::memoryLine(plan);
+    }
+
+    // The "problems:" block, empty when validation found nothing.
+    static fn problemLines(plan : GraphPlan) : string {
+        let issues : GraphIssues = plan.problems();
+        if (issues.count() == 0) {
+            return "";
+        }
+        let mut s : string = "problems:\n";
+        for (i of 0..issues.count()) {
+            s = s + "  - ${issues.text(i)}\n";
+        }
+        return s;
+    }
+
+    // The line of pass `p`, which runs `i`-th: its kind and what it reads and writes.
+    static fn passHeader(g : RenderGraph, p : i32, i : i32) : string {
+        let kind : string = GraphNames::passWord(g.passKindOf(p));
+        let reads : string = GraphReport::list(g, p, false);
+        let writes : string = GraphReport::list(g, p, true);
+        return "  ${i}. ${g.passName(p)} [${kind}] reads ${reads} writes ${writes}\n";
+    }
+
+    // The counts of pass `p`, and (when asked) its measured time; nothing for a pass that did no work.
+    static fn costLines(costs : PassCosts, p : i32, withTimes : bool) : string {
+        let mut s : string = "";
+        let drewAnything : bool = costs.drawCalls(p) > 0 || costs.pixelsShaded(p) > 0;
+        let hasWork : bool = costs.has(p) && (drewAnything || costs.trianglesSubmitted(p) > 0);
+        if (hasWork) {
+            let draws : i32 = costs.drawCalls(p);
+            let submitted : i64 = costs.trianglesSubmitted(p);
+            let rasterised : i64 = costs.trianglesRasterised(p);
+            let shaded : i64 = costs.pixelsShaded(p);
+            s = s
+                + "       ${draws} draws, ${submitted} triangles in, ${rasterised} rasterised, ${shaded} pixels shaded\n";
+        }
+        if (withTimes && costs.has(p) && costs.callsOf(p) > 0) {
+            s = s + "       ${GraphReport::millis(costs.nanosOf(p))} ms (CPU)\n";
+        }
+        return s;
+    }
+
+    // The line of resource `r`: kind, size, flags, and when used its lifetime and block.
+    static fn resourceLine(g : RenderGraph, plan : GraphPlan, r : i32) : string {
+        let mut s : string = "  ${g.resourceName(r)} ${GraphNames::kindWord(g.resourceKind(r))}";
+        if (g.resourceFormat(r) != GraphFormat::Opaque) {
+            let format : string = GraphNames::formatWord(g.resourceFormat(r));
+            s = s + " ${g.resourceWidth(r)}x${g.resourceHeight(r)} ${format}";
+        }
+        s = s + " ${g.resourceBytes(r)} B";
+        if (g.isImported(r)) {
+            s = s + " imported";
+        }
+        if (g.isOutput(r)) {
+            s = s + " output";
+        }
+        if (!plan.isUsed(r)) {
+            return s + " unused\n";
+        }
+        s = s + " alive ${plan.firstUseOf(r)}..${plan.lastUseOf(r)}";
+        if (plan.aliasGroup(r) >= 0) {
+            s = s + " block ${plan.aliasGroup(r)}";
+        }
+        return s + "\n";
+    }
+
+    // The closing line: what the transient resources take with and without sharing.
+    static fn memoryLine(plan : GraphPlan) : string {
+        let transient : i64 = plan.transientBytes();
+        let aliased : i64 = plan.aliasedBytes();
+        let groups : i32 = plan.groupCount();
+        let persistent : i64 = plan.persistentBytes();
+        let sharing : string = "${aliased} B with aliasing in ${groups} blocks";
+        return "memory: ${transient} B transient, ${sharing}, ${persistent} B persistent\n";
+    }
+
+    // The names of the resources pass `p` reads or writes, comma separated, or "-".
+    static fn list(g : RenderGraph, p : i32, write : bool) : string {
+        let mut s : string = "";
+        for (e of 0..g.edgeTotal()) {
+            if (g.edgePassOf(e) == p && g.edgeIsWrite(e) == write) {
+                if (s.byteLength > 0) {
+                    s = s + ", ";
+                }
+                s = s + g.edgeResourceName(e);
+            }
+        }
+        if (s.byteLength == 0) {
+            return "-";
+        }
+        return s;
+    }
+
+    // Milliseconds with two decimals from nanoseconds.
+    static fn millis(nanos : i64) : string {
+        let hundredths : i64 = nanos / GREP_NANOS_HUNDREDTH;
+        let whole : i64 = hundredths / GREP_HUNDREDTHS;
+        let frac : i64 = hundredths % GREP_HUNDREDTHS;
+        let mut f : string = frac.toString();
+        if (frac < GREP_FRACTION_PAD) {
+            f = "0" + f;
+        }
+        return "${whole}.${f}";
+    }
+}

@@ -1,0 +1,458 @@
+// render_graph — checks for the render graph: validation errors, culling, ordering, lifetimes, aliasing, the report,
+// and the recording of a plan into commands.
+//
+// Compilation is a pure function of the declarations, so the same graph is compiled twice and compared, and the
+// same passes are added in another order to show the order does not depend on it. Errors are checked by kind and
+// by text together: a compiler that reports the right count for the wrong reason is still broken.
+
+use ludax::{
+    Camera, Checks, CmdOp, CmdStream, DQuat, DVec3, FrameRecorder, GraphCompiler, GraphFormat,
+    GraphIssueKind
+};
+use ludax::{
+    GraphPlan, GraphReport, GraphResKind, PassCosts, PassKind, RenderGraph, RenderInstance,
+    RenderScene, Vec3
+};
+
+/** The render graph checks. */
+pub class RenderGraphSuite {
+    /** Runs every check of the suite. */
+    pub static fn run(c : Checks) : void {
+        rgrValidOrder(c);
+        rgrDeclarationOrder(c);
+        rgrErrors(c);
+        rgrAliasing(c);
+        rgrMultiWriter(c);
+        rgrReport(c);
+        rgrRecord(c);
+    }
+}
+
+// bvh -> forward -> resolve -> window, plus a probe pass nobody needs.
+fn rgrFrame(probeFirst : bool) : RenderGraph {
+    let g : RenderGraph = new RenderGraph();
+    g.addBuffer("scene.bvh", GraphResKind::Accel, 1000, false);
+    g.addImage("hdr", GraphResKind::Color, 64, 36, GraphFormat::Hdr, false);
+    g.addImage("depth", GraphResKind::Depth, 64, 36, GraphFormat::Depth32, false);
+    g.addImage("window", GraphResKind::Color, 64, 36, GraphFormat::Srgb8, true);
+    g.addImage("histogram", GraphResKind::Texture, 16, 16, GraphFormat::Hdr, false);
+    if (probeFirst) {
+        let probe : i32 = g.addPass("probe", PassKind::Custom);
+        g.reads(probe, "hdr");
+        g.writes(probe, "histogram");
+    }
+    let resolve : i32 = g.addPass("resolve", PassKind::Resolve);
+    g.reads(resolve, "hdr");
+    g.writes(resolve, "window");
+    let forward : i32 = g.addPass("forward", PassKind::Forward);
+    g.reads(forward, "scene.bvh");
+    g.writes(forward, "hdr");
+    g.writes(forward, "depth");
+    let bvh : i32 = g.addPass("bvh", PassKind::BuildAccel);
+    g.writes(bvh, "scene.bvh");
+    if (!probeFirst) {
+        let probe : i32 = g.addPass("probe", PassKind::Custom);
+        g.reads(probe, "hdr");
+        g.writes(probe, "histogram");
+    }
+    return g;
+}
+
+fn rgrValidOrder(c : Checks) : void {
+    let g : RenderGraph = rgrFrame(false);
+    let plan : GraphPlan = GraphCompiler::compile(g);
+    c.that("graph: a sound graph plans as valid", plan.isValid());
+    c.sameInt("graph: all three passes of the plan run", plan.runCount(), 3);
+    c.that(
+        "graph: they run bvh, forward, resolve whatever the order they were added in",
+        g.passName(plan.passAt(0)) == "bvh" && g.passName(plan.passAt(1)) == "forward"
+            && g.passName(plan.passAt(2)) == "resolve"
+    );
+    c.sameInt("graph: the unused probe pass is culled", plan.culledCount(), 1);
+    c.that(
+        "graph: and it is the probe",
+        g.passName(plan.culledAt(0)) == "probe" && !plan.isLive(g.findPass("probe"))
+            && plan.positionOf(g.findPass("probe")) == -1
+    );
+    let hdr : i32 = g.findResource("hdr");
+    let depth : i32 = g.findResource("depth");
+    let bvh : i32 = g.findResource("scene.bvh");
+    let window : i32 = g.findResource("window");
+    c.that(
+        "graph: hdr is alive from forward to resolve",
+        plan.firstUseOf(hdr) == 1 && plan.lastUseOf(hdr) == 2
+    );
+    c.that(
+        "graph: depth only lives during forward",
+        plan.firstUseOf(depth) == 1 && plan.lastUseOf(depth) == 1
+    );
+    c.that(
+        "graph: the bvh lives from its build to its last read",
+        plan.firstUseOf(bvh) == 0 && plan.lastUseOf(bvh) == 1
+    );
+    c.that(
+        "graph: an imported result lives to the end of the frame",
+        plan.firstUseOf(window) == 2 && plan.lastUseOf(window) == 2
+    );
+    c.that(
+        "graph: the culled pass's private resource is unused",
+        !plan.isUsed(g.findResource("histogram"))
+            && plan.aliasGroup(g.findResource("histogram")) == -1
+    );
+    c.that("graph: an imported resource gets no block", plan.aliasGroup(window) == -1);
+    let probeFirst : GraphPlan = GraphCompiler::compile(rgrFrame(true));
+    c.that(
+        "graph: adding the probe first changes nothing about what runs",
+        probeFirst.runCount() == 3 && probeFirst.culledCount() == 1
+    );
+}
+
+fn rgrDeclarationOrder(c : Checks) : void {
+    // Three independent passes keep the order they were added in, and so does the plan on every compile.
+    let g : RenderGraph = new RenderGraph();
+    g.addImage("out", GraphResKind::Color, 8, 8, GraphFormat::Srgb8, true);
+    g.addImage("a", GraphResKind::Color, 8, 8, GraphFormat::Hdr, false);
+    g.addImage("b", GraphResKind::Color, 8, 8, GraphFormat::Hdr, false);
+    let pc : i32 = g.addPass("c", PassKind::Custom);
+    let pa : i32 = g.addPass("a", PassKind::Custom);
+    let pb : i32 = g.addPass("b", PassKind::Custom);
+    let fin : i32 = g.addPass("final", PassKind::Custom);
+    g.writes(pc, "out");
+    g.writes(pa, "a");
+    g.writes(pb, "b");
+    g.reads(fin, "a");
+    g.reads(fin, "b");
+    g.writes(fin, "out");
+    let plan : GraphPlan = GraphCompiler::compile(g);
+    c.that(
+        "graph: ties go to the pass added first",
+        plan.isValid() && plan.runCount() == 4 && g.passName(plan.passAt(0)) == "c"
+            && g.passName(plan.passAt(1)) == "a"
+            && g.passName(plan.passAt(2)) == "b"
+            && g.passName(plan.passAt(3)) == "final"
+    );
+    let again : GraphPlan = GraphCompiler::compile(g);
+    let mut same : bool = again.runCount() == plan.runCount();
+    for (i of 0..plan.runCount()) {
+        if (again.passAt(i) != plan.passAt(i)) {
+            same = false;
+        }
+    }
+    c.that("graph: compiling twice gives the same order", same);
+}
+
+fn rgrErrors(c : Checks) : void {
+    let unknown : RenderGraph = new RenderGraph();
+    unknown.addImage("out", GraphResKind::Color, 8, 8, GraphFormat::Srgb8, true);
+    let p : i32 = unknown.addPass("draw", PassKind::Custom);
+    unknown.reads(p, "texture-that-is-not-there");
+    unknown.writes(p, "out");
+    let u : GraphPlan = GraphCompiler::compile(unknown);
+    c.that(
+        "graph: an unknown resource is reported by name",
+        !u.isValid() && u.problems().countOf(GraphIssueKind::UnknownResource) == 1
+            && u.problems().text(0)
+                == "pass 'draw' uses 'texture-that-is-not-there', which is not a declared resource"
+    );
+
+    let unwritten : RenderGraph = new RenderGraph();
+    unwritten.addImage("out", GraphResKind::Color, 8, 8, GraphFormat::Srgb8, true);
+    unwritten.addImage("shadow", GraphResKind::Texture, 8, 8, GraphFormat::Hdr, false);
+    let q : i32 = unwritten.addPass("light", PassKind::Custom);
+    unwritten.reads(q, "shadow");
+    unwritten.writes(q, "out");
+    let w : GraphPlan = GraphCompiler::compile(unwritten);
+    c.that(
+        "graph: a read of something nobody writes is an error",
+        !w.isValid() && w.problems().countOf(GraphIssueKind::UnwrittenRead) == 1
+            && w.problems().text(0) == "pass 'light' reads 'shadow', which no pass writes"
+    );
+
+    // The same texture, imported, is fine to read.
+    let imported : RenderGraph = new RenderGraph();
+    imported.addImage("out", GraphResKind::Color, 8, 8, GraphFormat::Srgb8, true);
+    imported.addImage("albedo", GraphResKind::Texture, 8, 8, GraphFormat::Srgb8, true);
+    let r : i32 = imported.addPass("light", PassKind::Custom);
+    imported.reads(r, "albedo");
+    imported.writes(r, "out");
+    c.that(
+        "graph: reading an imported texture needs no writer",
+        GraphCompiler::compile(imported).isValid()
+    );
+
+    let rmw : RenderGraph = new RenderGraph();
+    rmw.addImage("out", GraphResKind::Color, 8, 8, GraphFormat::Srgb8, true);
+    rmw.addImage("acc", GraphResKind::Color, 8, 8, GraphFormat::Hdr, false);
+    let s : i32 = rmw.addPass("accumulate", PassKind::Custom);
+    rmw.reads(s, "acc");
+    rmw.writes(s, "acc");
+    rmw.writes(s, "out");
+    let m : GraphPlan = GraphCompiler::compile(rmw);
+    c.that(
+        "graph: reading what you write first is a read before write",
+        !m.isValid() && m.problems().countOf(GraphIssueKind::ReadBeforeWrite) == 1
+            && m.problems().text(0)
+                == "pass 'accumulate' reads 'acc' before any pass has written it"
+    );
+
+    let cyc : RenderGraph = new RenderGraph();
+    cyc.addImage("out", GraphResKind::Color, 8, 8, GraphFormat::Srgb8, true);
+    cyc.addImage("x", GraphResKind::Color, 8, 8, GraphFormat::Hdr, false);
+    cyc.addImage("y", GraphResKind::Color, 8, 8, GraphFormat::Hdr, false);
+    let a : i32 = cyc.addPass("ping", PassKind::Custom);
+    let b : i32 = cyc.addPass("pong", PassKind::Custom);
+    let z : i32 = cyc.addPass("show", PassKind::Custom);
+    cyc.reads(a, "x");
+    cyc.writes(a, "y");
+    cyc.reads(b, "y");
+    cyc.writes(b, "x");
+    cyc.reads(z, "x");
+    cyc.writes(z, "out");
+    let cy : GraphPlan = GraphCompiler::compile(cyc);
+    c.that(
+        "graph: a cycle is found and its passes named",
+        !cy.isValid() && cy.problems().countOf(GraphIssueKind::Cycle) == 1
+            && cy.problems().text(0)
+                == "the passes ping, pong, show depend on each other in a cycle"
+    );
+
+    let dup : RenderGraph = new RenderGraph();
+    c.that(
+        "graph: the first resource of a name gets an id",
+        dup.addImage("t", GraphResKind::Color, 4, 4, GraphFormat::Hdr, false) == 0
+    );
+    c.that(
+        "graph: a duplicate resource name is refused",
+        dup.addImage("t", GraphResKind::Color, 4, 4, GraphFormat::Hdr, false) == -1
+    );
+    dup.addPass("p", PassKind::Custom);
+    c.that("graph: a duplicate pass name is refused", dup.addPass("p", PassKind::Custom) == -1);
+    let dp : GraphPlan = GraphCompiler::compile(dup);
+    c.that(
+        "graph: both duplicates are issues",
+        dp.problems().countOf(GraphIssueKind::DuplicateName) == 2 && !dp.isValid()
+    );
+
+    let nothing : RenderGraph = new RenderGraph();
+    nothing.addImage("t", GraphResKind::Color, 4, 4, GraphFormat::Hdr, false);
+    let n : i32 = nothing.addPass("p", PassKind::Custom);
+    nothing.writes(n, "t");
+    let np : GraphPlan = GraphCompiler::compile(nothing);
+    c.that(
+        "graph: a graph with no output is an error and every pass is culled",
+        np.problems().countOf(GraphIssueKind::NoOutput) == 1 && np.runCount() == 0
+            && np.culledCount() == 1
+    );
+
+    let kinds : RenderGraph = new RenderGraph();
+    kinds.addImage("out", GraphResKind::Color, 4, 4, GraphFormat::Srgb8, true);
+    kinds.addImage("d", GraphResKind::Depth, 4, 4, GraphFormat::Depth32, false);
+    let f : i32 = kinds.addPass("forward", PassKind::Forward);
+    kinds.writes(f, "d");
+    kinds.writes(f, "out");
+    kinds.addPass("build", PassKind::BuildAccel);
+    let kp : GraphPlan = GraphCompiler::compile(kinds);
+    c.that(
+        "graph: a build-accel pass without an accel output is the wrong kind",
+        kp.problems().countOf(GraphIssueKind::WrongKind) == 1
+            && kp.problems().text(0) == "build-accel pass 'build' writes no acceleration structure"
+    );
+
+    let unknownOut : RenderGraph = new RenderGraph();
+    unknownOut.markOutput("ghost");
+    c.that(
+        "graph: marking an undeclared output is an issue",
+        unknownOut.declarationIssues().countOf(GraphIssueKind::UnknownResource) == 1
+    );
+}
+
+// A chain a -> b -> c -> d where a, b and c are the same size: a and c never live together.
+fn rgrAliasing(c : Checks) : void {
+    let g : RenderGraph = new RenderGraph();
+    g.addImage("out", GraphResKind::Color, 8, 8, GraphFormat::Srgb8, true);
+    g.addImage("A", GraphResKind::Color, 64, 64, GraphFormat::Hdr, false);
+    g.addImage("B", GraphResKind::Color, 64, 64, GraphFormat::Hdr, false);
+    g.addImage("C", GraphResKind::Color, 64, 64, GraphFormat::Hdr, false);
+    g.addImage("D", GraphResKind::Color, 32, 32, GraphFormat::Hdr, false);
+    let p1 : i32 = g.addPass("p1", PassKind::Custom);
+    let p2 : i32 = g.addPass("p2", PassKind::Custom);
+    let p3 : i32 = g.addPass("p3", PassKind::Custom);
+    let p4 : i32 = g.addPass("p4", PassKind::Custom);
+    let p5 : i32 = g.addPass("p5", PassKind::Custom);
+    g.writes(p1, "A");
+    g.reads(p2, "A");
+    g.writes(p2, "B");
+    g.reads(p3, "B");
+    g.writes(p3, "C");
+    g.reads(p4, "C");
+    g.writes(p4, "D");
+    g.reads(p5, "D");
+    g.writes(p5, "out");
+    let plan : GraphPlan = GraphCompiler::compile(g);
+    let a : i32 = g.findResource("A");
+    let b : i32 = g.findResource("B");
+    let cc : i32 = g.findResource("C");
+    let d : i32 = g.findResource("D");
+    c.that("graph: the chain is valid and in order", plan.isValid() && plan.runCount() == 5);
+    c.that(
+        "graph: resources that are never alive together share a block",
+        plan.aliasGroup(a) == plan.aliasGroup(cc) && plan.aliasGroup(a) >= 0
+    );
+    c.that(
+        "graph: resources that overlap in time do not",
+        plan.aliasGroup(a) != plan.aliasGroup(b) && plan.aliasGroup(b) != plan.aliasGroup(cc)
+    );
+    c.that(
+        "graph: a different size does not share",
+        plan.aliasGroup(d) != plan.aliasGroup(a) && plan.aliasGroup(d) != plan.aliasGroup(b)
+    );
+    let big : i64 = 64 * 64 * 16;
+    let small : i64 = 32 * 32 * 16;
+    c.sameInt(
+        "graph: without sharing four blocks are needed",
+        plan.transientBytes(),
+        3 * big + small
+    );
+    c.sameInt("graph: with sharing there is one block less", plan.aliasedBytes(), 2 * big + small);
+    c.sameInt("graph: the plan groups its passes into three blocks", plan.groupCount(), 3);
+}
+
+// Two passes draw into one target in the order they were added; the pass that reads sees both.
+fn rgrMultiWriter(c : Checks) : void {
+    let g : RenderGraph = new RenderGraph();
+    g.addImage("hdr", GraphResKind::Color, 8, 8, GraphFormat::Hdr, false);
+    g.addImage("win", GraphResKind::Color, 8, 8, GraphFormat::Srgb8, true);
+    let show : i32 = g.addPass("show", PassKind::Resolve);
+    let overlay : i32 = g.addPass("overlay", PassKind::Custom);
+    let base : i32 = g.addPass("base", PassKind::Forward);
+    g.reads(show, "hdr");
+    g.writes(show, "win");
+    g.reads(overlay, "hdr");
+    g.writes(overlay, "hdr");
+    g.writes(base, "hdr");
+    let plan : GraphPlan = GraphCompiler::compile(g);
+    // base was added after overlay, so overlay has no earlier writer to read: that is the read-before-write error.
+    c.that(
+        "graph: an overlay added before the base it draws over is an error",
+        !plan.isValid() && plan.problems().countOf(GraphIssueKind::ReadBeforeWrite) == 1
+    );
+
+    let ok : RenderGraph = new RenderGraph();
+    ok.addImage("hdr", GraphResKind::Color, 8, 8, GraphFormat::Hdr, false);
+    ok.addImage("win", GraphResKind::Color, 8, 8, GraphFormat::Srgb8, true);
+    let b2 : i32 = ok.addPass("base", PassKind::Forward);
+    let o2 : i32 = ok.addPass("overlay", PassKind::Custom);
+    let s2 : i32 = ok.addPass("show", PassKind::Resolve);
+    ok.writes(b2, "hdr");
+    ok.reads(o2, "hdr");
+    ok.writes(o2, "hdr");
+    ok.reads(s2, "hdr");
+    ok.writes(s2, "win");
+    let good : GraphPlan = GraphCompiler::compile(ok);
+    c.that(
+        "graph: base, overlay, show run in that order",
+        good.isValid() && good.runCount() == 3 && good.passAt(0) == b2 && good.passAt(1) == o2
+            && good.passAt(2) == s2
+    );
+}
+
+fn rgrReport(c : Checks) : void {
+    let g0 : RenderGraph = rgrFrame(false);
+    let plan : GraphPlan = GraphCompiler::compile(g0);
+    let costs : PassCosts = new PassCosts(4);
+    let text : string = GraphReport::text(g0, plan, costs, false);
+    let again : string = GraphReport::text(g0, GraphCompiler::compile(g0), new PassCosts(4), false);
+    c.that("graph: the report is identical for two compiles", text == again);
+    c.that(
+        "graph: the report starts with the counts and the first pass",
+        rgrStartsWith(
+            text,
+            "render graph: 4 passes (3 run, 1 culled), 5 resources\norder:\n  0. bvh [build-accel] reads - writes scene.bvh\n"
+        )
+    );
+    costs.addDraw(1, 500);
+    costs.addRasterised(1, 420);
+    costs.addPixels(1, 2304);
+    let withCosts : string = GraphReport::text(g0, plan, costs, false);
+    c.that(
+        "graph: filled cost slots show up in the report",
+        withCosts.byteLength > text.byteLength
+    );
+    let bad : GraphPlan = GraphCompiler::compile(new RenderGraph());
+    c.that(
+        "graph: an empty graph reports no problem and no pass",
+        bad.isValid() && bad.runCount() == 0
+    );
+}
+
+fn rgrRecord(c : Checks) : void {
+    let g : RenderGraph = rgrFrame(false);
+    let plan : GraphPlan = GraphCompiler::compile(g);
+    let cam : Camera = Camera::perspective(
+        DVec3::make(0.0, 0.0, 0.0),
+        DQuat::identity(),
+        1.0,
+        1.7,
+        0.1,
+        100.0
+    );
+    let scene : RenderScene = new RenderScene(cam);
+    scene.addInstance(RenderInstance { mesh: 0, material: 0 });
+    scene.addInstance(RenderInstance { mesh: 0, material: 0 });
+    scene.addInstance(RenderInstance { mesh: 1, material: 0 });
+    scene.addInstance(RenderInstance { mesh: 1, material: 2 });
+    scene.setExposure(2.0, 0.5);
+    let out : CmdStream = new CmdStream();
+    FrameRecorder::record(g, plan, scene, Vec3::make(0.1, 0.2, 0.3), out);
+    // bvh 3 commands, forward 9 (begin, target, clear, bind, draw, draw, bind, draw, end), resolve 3.
+    c.sameInt("record: bvh 3, forward 9, resolve 3 commands", out.count(), 15);
+    c.that(
+        "record: pass ids and ops of the first pass",
+        out.op(0) == CmdOp::BeginPass && out.a(0) == g.findPass("bvh")
+            && out.op(1) == CmdOp::BuildAccel
+            && out.a(1) == g.findResource("scene.bvh")
+            && out.op(2) == CmdOp::EndPass
+    );
+    c.that(
+        "record: forward sets colour and depth targets",
+        out.op(4) == CmdOp::SetTarget && out.a(4) == g.findResource("hdr")
+            && out.b(4) == g.findResource("depth")
+    );
+    c.near("record: and clears to the given colour", out.f(5, 2) as f64, 0.3, 0.0000001);
+    c.that(
+        "record: equal (material, mesh) runs are one draw",
+        out.op(7) == CmdOp::DrawMesh && out.a(7) == 0 && out.b(7) == 0 && out.c(7) == 2
+    );
+    c.that(
+        "record: the next mesh is a draw with the same material and no new bind",
+        out.op(8) == CmdOp::DrawMesh && out.a(8) == 1 && out.b(8) == 2 && out.c(8) == 1
+    );
+    c.that(
+        "record: a new material is bound before its draw",
+        out.op(9) == CmdOp::BindMaterial && out.a(9) == 2 && out.op(10) == CmdOp::DrawMesh
+            && out.b(10) == 3
+    );
+    c.that(
+        "record: the resolve carries exposure and knee",
+        out.op(13) == CmdOp::Resolve && out.a(13) == g.findResource("hdr")
+            && out.b(13) == g.findResource("window")
+            && out.f(13, 0) == 2.0
+            && out.f(13, 1) == 0.5
+    );
+    let broken : RenderGraph = new RenderGraph();
+    broken.addPass("p", PassKind::Forward);
+    FrameRecorder::record(broken, GraphCompiler::compile(broken), scene, Vec3::zero(), out);
+    c.sameInt("record: an invalid plan records nothing", out.count(), 0);
+}
+
+fn rgrStartsWith(s : string, prefix : string) : bool {
+    if (s.byteLength < prefix.byteLength) {
+        return false;
+    }
+    for (i of 0..prefix.byteLength) {
+        if (s.charAt(i) != prefix.charAt(i)) {
+            return false;
+        }
+    }
+    return true;
+}

@@ -1,0 +1,431 @@
+// cpu_surface — the surface at one pixel of a stored triangle: position, normals, material and texture reads.
+//
+// Both the renderer and the explainer need to know "what is at pixel (x, y)": the renderer to shade it, the explainer
+// to say why it has its colour. They call the same `CpuSurface::sample`, so they cannot disagree. From the integer
+// edge values at the pixel centre it gets barycentric weights (exact), makes them perspective-correct with the stored
+// 1/w, interpolates position, normal and uv, and reads the material: the constants of the `RenderMaterial` times the
+// textures it names. A texture is read through `Texture::trilinear`, with the footprint taken from how uv changes
+// one pixel right and one pixel down (the same triangle plane extended by one pixel), so a minified texture is
+// filtered instead of aliased. A normal map perturbs the shading normal in the tangent frame of the triangle (from
+// its positions and uvs); the geometric normal stays the triangle's, so a bumpy surface is still not lit from behind
+// its own face. Back faces of double-sided materials are shaded with flipped normals.
+
+use crate::core::math::scalar::{clampI, max, saturate};
+use crate::core::math::trig::sqrt;
+use crate::core::math::vec3::Vec3;
+use crate::core::math::vec4::Vec4;
+use crate::render::cpu::cpu_tris::{
+    CpuSnap, CpuTris, CPU_ATTR_NORMAL, CPU_ATTR_POSITION, CPU_ATTR_UV, CPU_FLAG_BACK, CPU_PIXEL_CENTRE,
+    CPU_SUBPIXEL
+};
+use crate::render::light::light_color::lightSrgbEncode;
+use crate::render::light::light_dfg::LightDfgTable;
+use crate::render::light::light_material::{LightDfg, LightMaterial, LightSurface};
+use crate::render::scene::scene_assets::RenderAssets;
+use crate::render::scene::scene_material::RenderMaterial;
+use crate::render::texture::texture::Texture;
+
+// With no usable perspective factor each vertex counts a third.
+const CSURF_THIRD : f64 = 0.3333333333333333;
+
+// The most taps along the long axis of a pixel's footprint (the anisotropic filter's limit).
+const CSURF_MAX_TAPS : i32 = 8;
+
+// A footprint side shorter than this many texels is a point: there is no minor axis to divide by.
+const CSURF_FLAT_TEXELS : f32 = 0.0001;
+
+// The tap count is the axis ratio rounded up, but a ratio a hair over a whole number must not cost a tap.
+const CSURF_TAP_ROUND : f32 = 0.999;
+
+// A pixel that spans more than one texel along a flat footprint is minified: it takes the most taps.
+const CSURF_WIDE_TEXELS : f32 = 1.0;
+
+// A texture-space tangent frame whose uv determinant is smaller than this has no direction (degenerate uvs).
+const CSURF_UV_DET_MIN : f32 = 0.0000001;
+
+// The normal map's z is kept above this, so the shading normal never turns to the back of its own surface.
+const CSURF_MAP_Z_MIN : f32 = 0.05;
+
+/** Everything shading needs to know about one pixel's surface. */
+pub struct CpuSample {
+    /** Position, normals, view vector, layer and object id for the lighting library. */
+    pub surface : LightSurface = LightSurface {};
+
+    /** The material with its textures applied. */
+    pub material : LightMaterial = LightMaterial {};
+
+    /** The albedo/specular table entry for this view and roughness. */
+    pub dfg : LightDfg = LightDfg {};
+
+    /** Opacity after the texture, 0..1. */
+    pub alpha : f32 = 1.0;
+
+    /** Id of the material in `RenderAssets`. */
+    pub materialId : i32 = 0;
+
+    /** Id of the stored triangle. */
+    pub triangle : i32 = -1;
+}
+
+/** How the camera sees surfaces: an orthographic camera has one view vector everywhere. */
+pub struct CpuView {
+    /** True for an orthographic camera. */
+    pub ortho : bool = false;
+
+    /** The direction the camera looks along. */
+    pub forward : Vec3 = Vec3 { x: 0.0, y: 0.0, z: -1.0 };
+}
+
+/** One pixel to sample: the centre of (`x`, `y`) on stored triangle `triangle`, seen through `view`. */
+pub struct CpuPixel {
+    /** Id of the stored triangle. */
+    pub triangle : i32 = -1;
+
+    /** Pixel column. */
+    pub x : i32 = 0;
+
+    /** Pixel row. */
+    pub y : i32 = 0;
+
+    /** The camera. */
+    pub view : CpuView = CpuView {};
+}
+
+// The three edge functions of a triangle at a point of the snapped grid (twice-areas of the sub-triangles).
+struct CsEdges {
+    e0 : i64 = 0;
+    e1 : i64 = 0;
+    e2 : i64 = 0;
+}
+
+// Perspective-correct weights of the three vertices.
+struct CsBary {
+    a : f64 = 0.0;
+    b : f64 = 0.0;
+    c : f64 = 0.0;
+}
+
+// The texture coordinates at a pixel and at its right and lower neighbours: the pixel's footprint in the texture.
+struct CsFootprint {
+    u  : f32 = 0.0;
+    v  : f32 = 0.0;
+    ux : f32 = 0.0;
+    vx : f32 = 0.0;
+    uy : f32 = 0.0;
+    vy : f32 = 0.0;
+}
+
+// The weights at a pixel centre and at the centres one pixel to its right and one below.
+struct CsWeights {
+    here  : CsBary = CsBary {};
+    right : CsBary = CsBary {};
+    below : CsBary = CsBary {};
+}
+
+// The longer and shorter side of a footprint in texels, and the uv step along the longer one.
+struct CsAxes {
+    majorU : f32 = 0.0;
+    majorV : f32 = 0.0;
+    major  : f32 = 0.0;
+    minor  : f32 = 0.0;
+}
+
+// The geometric and interpolated normals, flipped together for a back face.
+struct CsFacing {
+    geo    : Vec3 = Vec3 {};
+    normal : Vec3 = Vec3 {};
+}
+
+// Where on a triangle a material is evaluated: the triangle, the footprint, the interpolated normal.
+struct CsPoint {
+    triangle  : i32 = 0;
+    footprint : CsFootprint = CsFootprint {};
+    normal    : Vec3 = Vec3 {};
+}
+
+// The material of a surface point with its textures applied, and the normal after the normal map.
+struct CsTextured {
+    light  : LightMaterial = LightMaterial {};
+    normal : Vec3 = Vec3 {};
+}
+
+// A normal-map texel with the strength it is applied at.
+struct CsNormalMap {
+    texel : Vec4 = Vec4 {};
+    scale : f32 = 1.0;
+}
+
+/** Surface queries on stored triangles. */
+pub class CpuSurface {
+    // The edge functions at the centre of pixel (x, y).
+    static fn edgesAt(s : CpuSnap, x : i32, y : i32) : CsEdges {
+        let px : i64 = (x as i64) * CPU_SUBPIXEL + CPU_PIXEL_CENTRE;
+        let py : i64 = (y as i64) * CPU_SUBPIXEL + CPU_PIXEL_CENTRE;
+        return CsEdges {
+            e0: (s.cx - s.bx) * (py - s.by) - (s.cy - s.by) * (px - s.bx),
+            e1: (s.ax - s.cx) * (py - s.cy) - (s.ay - s.cy) * (px - s.cx),
+            e2: (s.bx - s.ax) * (py - s.ay) - (s.by - s.ay) * (px - s.ax),
+        };
+    }
+
+    // The edge functions one pixel to the right of `e`.
+    static fn edgesRight(s : CpuSnap, e : CsEdges) : CsEdges {
+        return CsEdges {
+            e0: e.e0 - (s.cy - s.by) * CPU_SUBPIXEL,
+            e1: e.e1 - (s.ay - s.cy) * CPU_SUBPIXEL,
+            e2: e.e2 - (s.by - s.ay) * CPU_SUBPIXEL,
+        };
+    }
+
+    // The edge functions one pixel below `e`.
+    static fn edgesBelow(s : CpuSnap, e : CsEdges) : CsEdges {
+        return CsEdges {
+            e0: e.e0 + (s.cx - s.bx) * CPU_SUBPIXEL,
+            e1: e.e1 + (s.ax - s.cx) * CPU_SUBPIXEL,
+            e2: e.e2 + (s.bx - s.ax) * CPU_SUBPIXEL,
+        };
+    }
+
+    // The weights of vertex 0, 1, 2 at edge values `e` (twice-areas over the whole area), made perspective-correct
+    // with the stored 1/w.
+    static fn weights(tris : CpuTris, t : i32, e : CsEdges, area : f64) : CsBary {
+        let w0 : f64 = (e.e0 as f64) / area * (tris.inverseW(t, 0) as f64);
+        let w1 : f64 = (e.e1 as f64) / area * (tris.inverseW(t, 1) as f64);
+        let w2 : f64 = (e.e2 as f64) / area * (tris.inverseW(t, 2) as f64);
+        let s : f64 = w0 + w1 + w2;
+        if (!(s > 0.0)) {
+            return CsBary { a: CSURF_THIRD, b: CSURF_THIRD, c: CSURF_THIRD };
+        }
+        return CsBary { a: w0 / s, b: w1 / s, c: w2 / s };
+    }
+
+    // Attribute `field` of triangle `t` interpolated with weights `w`.
+    static fn mix(tris : CpuTris, t : i32, field : i32, w : CsBary) : f32 {
+        let fromA : f64 = (tris.attribute(t, 0, field) as f64) * w.a;
+        let fromB : f64 = (tris.attribute(t, 1, field) as f64) * w.b;
+        let fromC : f64 = (tris.attribute(t, 2, field) as f64) * w.c;
+        return (fromA + fromB + fromC) as f32;
+    }
+
+    // The three components starting at `field` (a position or a normal) interpolated with weights `w`.
+    static fn mix3(tris : CpuTris, t : i32, field : i32, w : CsBary) : Vec3 {
+        return Vec3::make(
+            CpuSurface::mix(tris, t, field, w),
+            CpuSurface::mix(tris, t, field + 1, w),
+            CpuSurface::mix(tris, t, field + 2, w)
+        );
+    }
+
+    // The texture coordinate at the pixel centre and at its right and lower neighbours.
+    static fn footprint(tris : CpuTris, t : i32, w : CsWeights) : CsFootprint {
+        return CsFootprint {
+            u: CpuSurface::mix(tris, t, CPU_ATTR_UV, w.here),
+            v: CpuSurface::mix(tris, t, CPU_ATTR_UV + 1, w.here),
+            ux: CpuSurface::mix(tris, t, CPU_ATTR_UV, w.right),
+            vx: CpuSurface::mix(tris, t, CPU_ATTR_UV + 1, w.right),
+            uy: CpuSurface::mix(tris, t, CPU_ATTR_UV, w.below),
+            vy: CpuSurface::mix(tris, t, CPU_ATTR_UV + 1, w.below),
+        };
+    }
+
+    // The footprint's two sides measured in texels of `tex` (the uv change one pixel right and one pixel down),
+    // longer one first.
+    static fn axes(tex : Texture, fp : CsFootprint) : CsAxes {
+        let w : f32 = tex.width(0) as f32;
+        let h : f32 = tex.height(0) as f32;
+        let dxu : f32 = fp.ux - fp.u;
+        let dxv : f32 = fp.vx - fp.v;
+        let dyu : f32 = fp.uy - fp.u;
+        let dyv : f32 = fp.vy - fp.v;
+        let lx : f32 = sqrt(dxu * dxu * w * w + dxv * dxv * h * h);
+        let ly : f32 = sqrt(dyu * dyu * w * w + dyv * dyv * h * h);
+        if (ly > lx) {
+            return CsAxes { majorU: dyu, majorV: dyv, major: ly, minor: lx };
+        }
+        return CsAxes { majorU: dxu, majorV: dxv, major: lx, minor: ly };
+    }
+
+    // How many taps to spread along the long side: its ratio to the short side, at least 1 and at most the limit.
+    static fn tapCount(a : CsAxes) : i32 {
+        let mut taps : i32 = 1;
+        if (a.minor > CSURF_FLAT_TEXELS) {
+            taps = (a.major / a.minor + CSURF_TAP_ROUND) as i32;
+        } else if (a.major > CSURF_WIDE_TEXELS) {
+            taps = CSURF_MAX_TAPS;
+        }
+        return clampI(taps, 1, CSURF_MAX_TAPS);
+    }
+
+    // Reads the texture at the footprint's centre. The two sides span an ellipse; the taps are spread along the
+    // longer one and each tap's own footprint is that side divided by the taps, so a floor at a grazing angle is
+    // sharp across and filtered along instead of blurred both ways.
+    static fn fetch(tex : Texture, fp : CsFootprint) : Vec4 {
+        let axes : CsAxes = CpuSurface::axes(tex, fp);
+        let taps : i32 = CpuSurface::tapCount(axes);
+        let foot : f32 = axes.major / (taps as f32);
+        if (taps == 1) {
+            return tex.trilinear(fp.u, fp.v, foot);
+        }
+
+        let mut sum : Vec4 = Vec4::zero();
+        for (i of 0..taps) {
+            let off : f32 = ((i as f32) + (0.5 as f32)) / (taps as f32) - (0.5 as f32);
+            let tap : Vec4 = tex.trilinear(fp.u + axes.majorU * off, fp.v + axes.majorV * off, foot);
+            sum = sum.plus(tap);
+        }
+        return sum.scale((1.0 as f32) / (taps as f32));
+    }
+
+    // The geometric and interpolated normals of triangle `t`; a back face shows its other side.
+    static fn facing(tris : CpuTris, t : i32, interpolated : Vec3) : CsFacing {
+        let mut geo : Vec3 = tris.geoNormal(t);
+        let mut normal : Vec3 = interpolated;
+        if ((tris.flagsOf(t) & CPU_FLAG_BACK) != 0) {
+            geo = geo.negated();
+            normal = normal.negated();
+        }
+        return CsFacing { geo: geo, normal: normal.normalizedOr(geo) };
+    }
+
+    // From the surface point to the eye: constant for an orthographic camera.
+    static fn viewVector(position : Vec3, geo : Vec3, view : CpuView) : Vec3 {
+        if (view.ortho) {
+            return view.forward.negated();
+        }
+        return position.negated().normalizedOr(geo);
+    }
+
+    /**
+     * The surface of triangle `pixel.triangle` at the centre of pixel (`pixel.x`, `pixel.y`). `pixel.view` describes
+     * the camera; `dfg` supplies the specular albedo table.
+     */
+    pub static fn sample(
+        tris : CpuTris,
+        assets : Shared<RenderAssets>,
+        dfg : LightDfgTable,
+        pixel : CpuPixel
+    ) : CpuSample {
+        let t : i32 = pixel.triangle;
+        let snap : CpuSnap = tris.snapped(t);
+        let area : f64 = snap.area() as f64;
+        let here : CsEdges = CpuSurface::edgesAt(snap, pixel.x, pixel.y);
+        let right : CsEdges = CpuSurface::edgesRight(snap, here);
+        let below : CsEdges = CpuSurface::edgesBelow(snap, here);
+        let w : CsWeights = CsWeights {
+            here: CpuSurface::weights(tris, t, here, area),
+            right: CpuSurface::weights(tris, t, right, area),
+            below: CpuSurface::weights(tris, t, below, area),
+        };
+
+        let position : Vec3 = CpuSurface::mix3(tris, t, CPU_ATTR_POSITION, w.here);
+        let interpolated : Vec3 = CpuSurface::mix3(tris, t, CPU_ATTR_NORMAL, w.here);
+        let facing : CsFacing = CpuSurface::facing(tris, t, interpolated);
+        let point : CsPoint = CsPoint {
+            triangle: t,
+            footprint: CpuSurface::footprint(tris, t, w),
+            normal: facing.normal,
+        };
+        let matId : i32 = tris.materialOf(t);
+        let textured : CsTextured = CpuSurface::applyTextures(tris, assets, matId, point);
+        let view : Vec3 = CpuSurface::viewVector(position, facing.geo, pixel.view);
+
+        let mut s : CpuSample = CpuSample {};
+        s.surface = LightSurface {
+            position: position,
+            normal: textured.normal,
+            geoNormal: facing.geo,
+            view: view,
+            layer: tris.layerOf(t) as u32,
+            objectId: tris.objectOf(t),
+        };
+        s.material = textured.light;
+        s.dfg = dfg.lookup(saturate(textured.normal.dot(view)), textured.light.roughness);
+        s.alpha = saturate(textured.light.alpha);
+        s.materialId = matId;
+        s.triangle = t;
+        return s;
+    }
+
+    // The material `matId` with its base colour, metal-roughness, emissive and normal textures read at `point`.
+    // Metal-roughness follows glTF: roughness in green, metallic in blue.
+    static fn applyTextures(
+        tris : CpuTris,
+        assets : Shared<RenderAssets>,
+        matId : i32,
+        point : CsPoint
+    ) : CsTextured {
+        let fp : CsFootprint = point.footprint;
+        let mat : RenderMaterial = assets.material(matId);
+        let mut light : LightMaterial = mat.toLight();
+        let mut n : Vec3 = point.normal;
+        if (mat.baseColorTexture >= 0) {
+            let texel : Vec4 = CpuSurface::fetch(assets.texture(mat.baseColorTexture), fp);
+            light.baseColor = light.baseColor.times(texel.xyz());
+            light.alpha = light.alpha * texel.w;
+        }
+        if (mat.metalRoughTexture >= 0) {
+            let texel : Vec4 = CpuSurface::fetch(assets.texture(mat.metalRoughTexture), fp);
+            light.roughness = saturate(light.roughness * texel.y);
+            light.metallic = saturate(light.metallic * texel.z);
+        }
+        if (mat.emissiveTexture >= 0) {
+            let texel : Vec4 = CpuSurface::fetch(assets.texture(mat.emissiveTexture), fp);
+            light.emissive = light.emissive.times(texel.xyz());
+        }
+        if (mat.normalTexture >= 0) {
+            let texel : Vec4 = CpuSurface::fetch(assets.texture(mat.normalTexture), fp);
+            let map : CsNormalMap = CsNormalMap { texel: texel, scale: mat.normalScale };
+            n = CpuSurface::bump(tris, point.triangle, point.normal, map);
+        }
+        return CsTextured { light: light, normal: n };
+    }
+
+    // A stored normal-map channel in 0..1, which `Texture` decoded as if it were sRGB colour, back to a -1..1
+    // component.
+    static fn unpackNormal(channel : f32) : f32 {
+        return lightSrgbEncode(channel) * (2.0 as f32) - (1.0 as f32);
+    }
+
+    // The shading normal after a tangent-space normal map. The map is data stored 0..1; `Texture` decoded it as if
+    // it were sRGB colour, so the encoding is undone first.
+    static fn bump(tris : CpuTris, t : i32, n : Vec3, map : CsNormalMap) : Vec3 {
+        let p0 : Vec3 = CpuSurface::corner(tris, t, 0);
+        let p1 : Vec3 = CpuSurface::corner(tris, t, 1);
+        let p2 : Vec3 = CpuSurface::corner(tris, t, 2);
+        let u0 : f32 = tris.attribute(t, 0, CPU_ATTR_UV);
+        let v0 : f32 = tris.attribute(t, 0, CPU_ATTR_UV + 1);
+        let du1 : f32 = tris.attribute(t, 1, CPU_ATTR_UV) - u0;
+        let dv1 : f32 = tris.attribute(t, 1, CPU_ATTR_UV + 1) - v0;
+        let du2 : f32 = tris.attribute(t, 2, CPU_ATTR_UV) - u0;
+        let dv2 : f32 = tris.attribute(t, 2, CPU_ATTR_UV + 1) - v0;
+        let det : f32 = du1 * dv2 - du2 * dv1;
+        if (!(det > CSURF_UV_DET_MIN || det < -CSURF_UV_DET_MIN)) {
+            return n;
+        }
+
+        let r : f32 = (1.0 as f32) / det;
+        let e1 : Vec3 = p1.minus(p0);
+        let e2 : Vec3 = p2.minus(p0);
+        let tangent : Vec3 = e1.scale(dv2).minus(e2.scale(dv1)).scale(r);
+        let ortho : Vec3 = tangent.minus(n.scale(tangent.dot(n))).normalizedOr(n.anyPerpendicular());
+        let bitangent : Vec3 = n.cross(ortho);
+
+        let tx : f32 = CpuSurface::unpackNormal(map.texel.x) * map.scale;
+        let ty : f32 = CpuSurface::unpackNormal(map.texel.y) * map.scale;
+        let tz : f32 = CpuSurface::unpackNormal(map.texel.z);
+        // Green is "up" in the image (the usual OpenGL convention), and n x tangent points up the picture.
+        let along : Vec3 = ortho.scale(tx);
+        let across : Vec3 = bitangent.scale(ty);
+        let outward : Vec3 = n.scale(max(tz, CSURF_MAP_Z_MIN));
+        return along.plus(across).plus(outward).normalizedOr(n);
+    }
+
+    // The position of vertex `k` of triangle `t`.
+    static fn corner(tris : CpuTris, t : i32, k : i32) : Vec3 {
+        return Vec3::make(
+            tris.attribute(t, k, CPU_ATTR_POSITION),
+            tris.attribute(t, k, CPU_ATTR_POSITION + 1),
+            tris.attribute(t, k, CPU_ATTR_POSITION + 2)
+        );
+    }
+}

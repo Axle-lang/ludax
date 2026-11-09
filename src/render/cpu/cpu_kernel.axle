@@ -1,0 +1,379 @@
+// cpu_kernel — the tile rasteriser and shader: one tile of the picture per unit of parallel work.
+//
+// For each 32 x 32 tile, in this order:
+//   1. visibility. The tile's triangles are walked in submission order; for every pixel whose centre a triangle
+//      covers (integer edge functions, top-left fill rule: exact, no pixel twice, none missed along a shared edge)
+//      and whose depth is smaller than what is stored, the depth and the triangle id are kept. A Mask material also
+//      reads its alpha and drops the pixel below the cutoff. Depth ties go to the earlier triangle.
+//   2. shading. Every pixel with a visible triangle is shaded once, by the lighting library's `lightShade` on the
+//      surface `CpuSurface::sample` describes, so a covered pixel costs one shading however many triangles overlapped.
+//   3. blending. Triangles of Blend materials are walked in submission order (the extractor sorted them far to near);
+//      each covered pixel that passes the depth test (without writing depth) is shaded and mixed over what is there.
+// A tile reads and writes only its own pixels and its own slot of the shaded-pixel counts, and the order inside a
+// tile does not depend on who runs it, so the picture is the same bit for bit with one thread or many.
+//
+// Debugging aid: with `debugCover` on, the number of triangles that cover each pixel is counted before the depth
+// test, which is how the suite proves the fill rule (every pixel of a mesh is covered exactly once).
+
+use crate::core::collections::vec::Vec;
+use crate::core::jobs::kernel::RangeKernel;
+use crate::core::math::scalar::{maxI64, minI, minI64, smoothstep};
+use crate::core::math::vec3::Vec3;
+use crate::render::cpu::cpu_bvh::BVH_TRI_FLOATS;
+use crate::render::cpu::cpu_shadow::CpuShadowQuery;
+use crate::render::cpu::cpu_surface::{CpuPixel, CpuSample, CpuSurface, CpuView};
+use crate::render::cpu::cpu_tris::{
+    CpuSnap, CpuTris, CPU_FLAG_BLEND, CPU_NO_TRIANGLE, CPU_PIXEL_CENTRE, CPU_SUBPIXEL, CPU_SUBPIXEL_SHIFT,
+    CPU_TILE
+};
+use crate::render::light::light_dfg::LightDfgTable;
+use crate::render::light::light_material::{LightAlphaMode, LightMaterial, LightSurface, LightDfg};
+use crate::render::light::light_sh::LightSh9;
+use crate::render::light::light_shade::{LightAmbientInput, LightShadeTerms, lightShade};
+use crate::render::light::light_source::LightSource;
+use crate::render::scene::scene_assets::RenderAssets;
+use crate::render::scene::scene_material::RenderMaterial;
+
+/** Floats per pixel of a colour buffer: linear red, green, blue. */
+pub(crate) const CPUK_CHANNELS : i32 = 3;
+
+// The band (in the sine of the reflection's elevation) over which a mirror-like surface blends sky into ground...
+const CPUK_BAND_SMOOTH : f32 = 0.12;
+
+// ...and how much wider it gets per unit of roughness: a rough lobe averages a wide part of the sky.
+const CPUK_BAND_ROUGH : f32 = 0.8;
+
+// A rectangle of pixels; as a tile, x1 and y1 are exclusive, as a covered range they are inclusive.
+struct CpuPixelRect {
+    x0 : i32 = 0;
+    y0 : i32 = 0;
+    x1 : i32 = 0;
+    y1 : i32 = 0;
+}
+
+// A pixel of a triangle at a depth: what the depth test decides about.
+struct CpuFragment {
+    triangle : i32 = 0;
+    x        : i32 = 0;
+    y        : i32 = 0;
+    depth    : f32 = 0.0;
+}
+
+/** The work of one batch of triangles on one target. */
+pub class CpuKernel : RangeKernel {
+    pub(crate) tris       : CpuTris;
+    pub(crate) vis        : i32[];
+    pub(crate) cover      : i32[];
+    pub(crate) tileShaded : i64[];
+    pub(crate) lamps      : Vec<LightSource>;
+    pub(crate) dfg        : LightDfgTable;
+    pub(crate) sky        : LightSh9;
+    pub(crate) skySpec    : Vec3;
+    pub(crate) skyBelow   : Vec3;
+    pub(crate) debugCover : bool = false;
+    pub(crate) view       : CpuView = CpuView {};
+    pub(crate) shadows    : CpuShadowQuery;
+    pub(crate) assets     : Shared<RenderAssets>;
+    width                 : i32;
+    height                : i32;
+    color                 : f32[];
+    depth                 : f32[];
+
+    /** A kernel for pictures of `width` x `height` pixels over `assets`, shading with the albedo table `dfg`. */
+    constructor(width : i32, height : i32, own assets : Shared<RenderAssets>, own dfg : LightDfgTable) {
+        self.width = width;
+        self.height = height;
+        self.assets = assets;
+        self.tris = new CpuTris(width, height);
+        self.vis = new i32[(width * height) as i64];
+        self.cover = new i32[(width * height) as i64];
+        for (i of 0..width * height) {
+            self.vis[i] = CPU_NO_TRIANGLE;
+            self.cover[i] = 0;
+        }
+        let tiles : i32 = self.tris.tilesX * self.tris.tilesY;
+        self.tileShaded = new i64[(tiles + 1) as i64];
+        for (i of 0..tiles) {
+            self.tileShaded[i] = 0;
+        }
+        self.lamps = new Vec<LightSource>();
+        self.dfg = dfg;
+        self.sky = LightSh9::zero();
+        self.skySpec = Vec3::zero();
+        self.skyBelow = Vec3::zero();
+        self.shadows = new CpuShadowQuery(new f32[BVH_TRI_FLOATS as i64], 0, self.lamps);
+        self.color = new f32[(width * height * CPUK_CHANNELS) as i64];
+        self.depth = new f32[(width * height) as i64];
+    }
+
+    /**
+     * Copies a target's colour (`CPUK_CHANNELS` floats a pixel) and depth (1 float a pixel) into the kernel's
+     * working buffers.
+     */
+    pub(crate) fn copyIn(mut self, color : f32[], depth : f32[]) : void {
+        for (i of 0..self.width * self.height * CPUK_CHANNELS) {
+            self.color[i] = color[i];
+        }
+        for (i of 0..self.width * self.height) {
+            self.depth[i] = depth[i];
+        }
+    }
+
+    /** Copies the working buffers back into the target's. */
+    pub(crate) fn copyOut(self, color : f32[], depth : f32[]) : void {
+        for (i of 0..self.width * self.height * CPUK_CHANNELS) {
+            color[i] = self.color[i];
+        }
+        for (i of 0..self.width * self.height) {
+            depth[i] = self.depth[i];
+        }
+    }
+
+    /** Replaces the shadow query (the kernel keeps it). */
+    pub(crate) fn setShadows(mut self, own q : CpuShadowQuery) : void {
+        self.shadows = q;
+    }
+
+    /** How many pixels the last run shaded (summed over the tiles in index order). */
+    pub(crate) fn shadedTotal(self) : i64 {
+        let mut total : i64 = 0;
+        for (i of 0..self.tris.tilesX * self.tris.tilesY) {
+            total = total + self.tileShaded[i];
+        }
+        return total;
+    }
+
+    /** Clears the per-tile counts before a run. */
+    pub(crate) fn resetCounts(mut self) : void {
+        for (i of 0..self.tris.tilesX * self.tris.tilesY) {
+            self.tileShaded[i] = 0;
+        }
+    }
+
+    /** Processes tiles `begin` to `end` (exclusive). */
+    pub fn runRange(mut self, begin : i32, end : i32) : void {
+        for (tile of begin..end) {
+            self.renderTile(tile);
+        }
+    }
+
+    // The pixels of tile number `tile`, clipped to the picture (x1, y1 exclusive).
+    fn tileRect(self, tile : i32) : CpuPixelRect {
+        let x0 : i32 = (tile % self.tris.tilesX) * CPU_TILE;
+        let y0 : i32 = (tile / self.tris.tilesX) * CPU_TILE;
+        let x1 : i32 = minI(x0 + CPU_TILE, self.width);
+        let y1 : i32 = minI(y0 + CPU_TILE, self.height);
+        return CpuPixelRect { x0: x0, y0: y0, x1: x1, y1: y1 };
+    }
+
+    // Forgets the visible triangle and the cover count of every pixel of `rect`.
+    fn clearTile(mut self, rect : CpuPixelRect) : void {
+        for (y of rect.y0..rect.y1) {
+            for (x of rect.x0..rect.x1) {
+                self.vis[y * self.width + x] = CPU_NO_TRIANGLE;
+                self.cover[y * self.width + x] = 0;
+            }
+        }
+    }
+
+    // Walks the binned triangles from..to in order, rasterising those whose blending matches `blend`; returns how
+    // many pixels were shaded (blend mode only).
+    fn rasterBin(mut self, from : i32, to : i32, rect : CpuPixelRect, blend : bool) : i64 {
+        let mut shaded : i64 = 0;
+        for (k of from..to) {
+            let t : i32 = self.tris.binList[k];
+            let blends : bool = (self.tris.flagsOf(t) & CPU_FLAG_BLEND) != 0;
+            if (blends == blend) {
+                shaded = shaded + self.rasterTriangle(t, rect, blend);
+            }
+        }
+        return shaded;
+    }
+
+    // Shades every pixel of `rect` that has a visible triangle, once; returns how many.
+    fn shadeVisible(mut self, rect : CpuPixelRect) : i64 {
+        let mut shaded : i64 = 0;
+        for (y of rect.y0..rect.y1) {
+            for (x of rect.x0..rect.x1) {
+                let id : i32 = self.vis[y * self.width + x];
+                if (id < 0) {
+                    continue;
+                }
+                let s : CpuSample = self.sampleOf(id, x, y);
+                let c : Vec3 = self.radiance(s);
+                let at : i32 = (y * self.width + x) * CPUK_CHANNELS;
+                self.color[at] = c.x;
+                self.color[at + 1] = c.y;
+                self.color[at + 2] = c.z;
+                shaded = shaded + 1;
+            }
+        }
+        return shaded;
+    }
+
+    fn renderTile(mut self, tile : i32) : void {
+        let rect : CpuPixelRect = self.tileRect(tile);
+        self.clearTile(rect);
+        let from : i32 = self.tris.binStart[tile];
+        let to : i32 = self.tris.binStart[tile + 1];
+
+        self.rasterBin(from, to, rect, false);
+        let mut shaded : i64 = self.shadeVisible(rect);
+        shaded = shaded + self.rasterBin(from, to, rect, true);
+        self.tileShaded[tile] = self.tileShaded[tile] + shaded;
+    }
+
+    /**
+     * The environment a surface sees: the SH9 irradiance and the radiance its specular lobe reflects, taken from the
+     * sky radiance above the horizon and the ground radiance below it, blended over a band that widens with roughness
+     * (a rough lobe averages a wide part of the sky). With one radiance for both it is constant: the furnace.
+     */
+    pub(crate) fn ambientFor(self, s : CpuSample) : LightAmbientInput {
+        let reflected : Vec3 = s.surface.view.negated().reflect(s.surface.normal);
+        let width : f32 = CPUK_BAND_SMOOTH + CPUK_BAND_ROUGH * s.material.roughness;
+        let t : f32 = smoothstep(-width, width, reflected.y);
+        return LightAmbientInput { sh: self.sky, specular: self.skyBelow.lerp(self.skySpec, t) };
+    }
+
+    /** The radiance of a sampled surface: the lighting library's whole shading of it. */
+    pub(crate) fn radiance(self, s : CpuSample) : Vec3 {
+        let ambient : LightAmbientInput = self.ambientFor(s);
+        let terms : LightShadeTerms = lightShade(
+            self.lamps,
+            s.surface,
+            s.material,
+            s.dfg,
+            ambient,
+            self.shadows
+        );
+        return terms.total();
+    }
+
+    // The surface of triangle `t` at the centre of pixel (x, y).
+    fn sampleOf(self, t : i32, x : i32, y : i32) : CpuSample {
+        let pixel : CpuPixel = CpuPixel { triangle: t, x: x, y: y, view: self.view };
+        return CpuSurface::sample(self.tris, self.assets, self.dfg, pixel);
+    }
+
+    // The pixels of triangle `t` that lie inside `tile` (x1, y1 exclusive), as an inclusive range.
+    fn coveredPixels(self, t : i32, tile : CpuPixelRect) : CpuPixelRect {
+        let s : CpuSnap = self.tris.snapped(t);
+        let lowX : i64 = minI64(minI64(s.ax, s.bx), s.cx) >> CPU_SUBPIXEL_SHIFT;
+        let highX : i64 = maxI64(maxI64(s.ax, s.bx), s.cx) >> CPU_SUBPIXEL_SHIFT;
+        let lowY : i64 = minI64(minI64(s.ay, s.by), s.cy) >> CPU_SUBPIXEL_SHIFT;
+        let highY : i64 = maxI64(maxI64(s.ay, s.by), s.cy) >> CPU_SUBPIXEL_SHIFT;
+
+        // The triangle's bounding box narrowed to the tile; `x1`/`y1` of the result are inclusive.
+        let tileLastX : i64 = (tile.x1 - 1) as i64;
+        let tileLastY : i64 = (tile.y1 - 1) as i64;
+        return CpuPixelRect {
+            x0: maxI64(lowX, tile.x0 as i64) as i32,
+            y0: maxI64(lowY, tile.y0 as i64) as i32,
+            x1: minI64(highX, tileLastX) as i32,
+            y1: minI64(highY, tileLastY) as i32,
+        };
+    }
+
+    // Top-left fill rule for an edge with direction (dx, dy): a pixel centre exactly on the edge belongs to the
+    // triangle only when the edge is a top edge (horizontal, pointing right) or a left edge (pointing up).
+    static fn isTopLeft(dx : i64, dy : i64) : bool {
+        return (dy == 0 && dx > 0) || dy < 0;
+    }
+
+    // Whether edge value `e` is inside the triangle: strictly positive, or zero on a top-left edge.
+    static fn edgeInside(e : i64, topLeft : bool) : bool {
+        return e > 0 || (e == 0 && topLeft);
+    }
+
+    // Covers the pixels of triangle `t` inside the tile. Visibility mode records depth and id; blend mode shades
+    // and mixes, and returns how many pixels it shaded.
+    fn rasterTriangle(mut self, t : i32, tile : CpuPixelRect, blend : bool) : i64 {
+        let s : CpuSnap = self.tris.snapped(t);
+        let area : f64 = s.area() as f64;
+        let z0 : f64 = self.tris.depthAt(t, 0) as f64;
+        let z1 : f64 = self.tris.depthAt(t, 1) as f64;
+        let z2 : f64 = self.tris.depthAt(t, 2) as f64;
+        let range : CpuPixelRect = self.coveredPixels(t, tile);
+        let mat : RenderMaterial = self.assets.material(self.tris.materialOf(t));
+
+        // Edge i is opposite vertex i: 0 is b to c, 1 is c to a, 2 is a to b. The inside has positive values.
+        let dx0 : i64 = s.cx - s.bx;
+        let dy0 : i64 = s.cy - s.by;
+        let dx1 : i64 = s.ax - s.cx;
+        let dy1 : i64 = s.ay - s.cy;
+        let dx2 : i64 = s.bx - s.ax;
+        let dy2 : i64 = s.by - s.ay;
+        let tl0 : bool = CpuKernel::isTopLeft(dx0, dy0);
+        let tl1 : bool = CpuKernel::isTopLeft(dx1, dy1);
+        let tl2 : bool = CpuKernel::isTopLeft(dx2, dy2);
+        let startX : i64 = (range.x0 as i64) * CPU_SUBPIXEL + CPU_PIXEL_CENTRE;
+
+        let mut shaded : i64 = 0;
+        for (y of range.y0..range.y1 + 1) {
+            let py : i64 = (y as i64) * CPU_SUBPIXEL + CPU_PIXEL_CENTRE;
+            let mut e0 : i64 = dx0 * (py - s.by) - dy0 * (startX - s.bx);
+            let mut e1 : i64 = dx1 * (py - s.cy) - dy1 * (startX - s.cx);
+            let mut e2 : i64 = dx2 * (py - s.ay) - dy2 * (startX - s.ax);
+            for (x of range.x0..range.x1 + 1) {
+                let inside : bool = CpuKernel::edgeInside(e0, tl0) && CpuKernel::edgeInside(e1, tl1)
+                    && CpuKernel::edgeInside(e2, tl2);
+                if (inside) {
+                    let depth : f64 = (e0 as f64) * z0 + (e1 as f64) * z1 + (e2 as f64) * z2;
+                    let fragment : CpuFragment = CpuFragment {
+                        triangle: t,
+                        x: x,
+                        y: y,
+                        depth: (depth / area) as f32,
+                    };
+                    shaded = shaded + self.coverPixel(fragment, blend, mat);
+                }
+                e0 = e0 - dy0 * CPU_SUBPIXEL;
+                e1 = e1 - dy1 * CPU_SUBPIXEL;
+                e2 = e2 - dy2 * CPU_SUBPIXEL;
+            }
+        }
+        return shaded;
+    }
+
+    // Records or blends the fragment when it passes the depth test (and the alpha cutoff of a masked material);
+    // returns how many pixels it shaded (blend mode only).
+    fn coverPixel(mut self, f : CpuFragment, blend : bool, mat : RenderMaterial) : i64 {
+        let p : i32 = f.y * self.width + f.x;
+        if (self.debugCover) {
+            self.cover[p] = self.cover[p] + 1;
+        }
+        let outsideDepth : bool = f.depth < (0.0 as f32) || f.depth > (1.0 as f32);
+        if (outsideDepth || f.depth >= self.depth[p]) {
+            return 0;
+        }
+        if (blend) {
+            return self.blendPixel(f);
+        }
+        if (mat.alphaMode == LightAlphaMode::Mask) {
+            let alpha : f32 = self.sampleOf(f.triangle, f.x, f.y).alpha;
+            if (alpha < mat.alphaCutoff) {
+                return 0;
+            }
+        }
+
+        self.depth[p] = f.depth;
+        self.vis[p] = f.triangle;
+        return 0;
+    }
+
+    // Shades the fragment of a blended triangle and mixes it over the colour there; 1 when it did, 0 when it was clear.
+    fn blendPixel(mut self, f : CpuFragment) : i64 {
+        let s : CpuSample = self.sampleOf(f.triangle, f.x, f.y);
+        if (!(s.alpha > (0.0 as f32))) {
+            return 0;
+        }
+        let c : Vec3 = self.radiance(s);
+        let a : f32 = s.alpha;
+        let keep : f32 = (1.0 as f32) - a;
+        let at : i32 = (f.y * self.width + f.x) * CPUK_CHANNELS;
+        self.color[at] = c.x * a + self.color[at] * keep;
+        self.color[at + 1] = c.y * a + self.color[at + 1] * keep;
+        self.color[at + 2] = c.z * a + self.color[at + 2] * keep;
+        return 1;
+    }
+}

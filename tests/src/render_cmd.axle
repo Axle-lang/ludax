@@ -1,0 +1,197 @@
+// render_cmd — checks for the command stream: recording, the float bit conversion, and the byte round trip.
+//
+// A backend reads commands by index, so the checks inspect slots rather than a decoded struct. The encoding is
+// held to its own size formula and to damage planted at each part — magic, checksum, length and opcode — so a
+// reader that accepts a bad stream fails here rather than in a renderer far from the cause.
+
+use ludax::{
+    ByteBuf, Checks, Crc32, CmdCodec, CmdOp, CmdStream, PassCosts, Pcg32, Vec3, CMD_CLEAR_COLOR,
+    CMD_CLEAR_DEPTH
+};
+
+/** The command stream checks. */
+pub class RenderCmdSuite {
+    /** Runs every check of the suite. */
+    pub static fn run(c : Checks) : void {
+        rcmRecording(c);
+        rcmFloatBits(c);
+        rcmRoundTrip(c);
+        rcmDamage(c);
+        rcmCosts(c);
+    }
+}
+
+fn rcmSample() : CmdStream {
+    let s : CmdStream = new CmdStream();
+    s.beginPass(0);
+    s.buildAccel(3);
+    s.endPass();
+    s.beginPass(1);
+    s.setTarget(1, 2);
+    s.clear(CMD_CLEAR_COLOR | CMD_CLEAR_DEPTH, Vec3::make(0.25, 0.5, 0.125), 1.0);
+    s.bindMaterial(7);
+    s.drawMesh(2, 10, 4);
+    s.endPass();
+    s.beginPass(2);
+    s.resolve(1, 5, 0.0123456789, 0.6);
+    s.endPass();
+    return s;
+}
+
+fn rcmRecording(c : Checks) : void {
+    let s : CmdStream = rcmSample();
+    c.sameInt("cmd: twelve commands were recorded", s.count(), 12);
+    c.that(
+        "cmd: opcodes are kept in order",
+        s.op(0) == CmdOp::BeginPass && s.op(1) == CmdOp::BuildAccel && s.op(7) == CmdOp::DrawMesh
+            && s.op(10) == CmdOp::Resolve
+    );
+    c.that(
+        "cmd: integer slots are kept",
+        s.a(7) == 2 && s.b(7) == 10 && s.c(7) == 4 && s.a(4) == 1 && s.b(4) == 2
+    );
+    c.near("cmd: float slots keep their value", s.f(5, 1) as f64, 0.5, 0.0000001);
+    c.that("cmd: describe names the draw", s.describe(7) == "draw-mesh mesh=2 first=10 count=4");
+    // Growth past the first allocation keeps earlier commands.
+    let big : CmdStream = new CmdStream();
+    for (i of 0..1000) {
+        big.drawMesh(i, i * 2, 1);
+    }
+    c.that(
+        "cmd: a stream grows without losing commands",
+        big.count() == 1000 && big.a(0) == 0 && big.a(999) == 999 && big.b(500) == 1000
+    );
+    big.clear();
+    c.sameInt("cmd: clearing the stream leaves it with no commands", big.count(), 0);
+    let same : CmdStream = rcmSample();
+    c.that("cmd: equal recordings compare equal", s.equals(same));
+    same.bindMaterial(1);
+    c.that("cmd: a longer stream is not equal", !s.equals(same));
+}
+
+fn rcmFloatBits(c : Checks) : void {
+    c.sameInt("cmd: floatBits of 1.0 is 0x3F800000", CmdCodec::floatBits(1.0), 1065353216);
+    c.sameInt("cmd: floatBits of 0.5 is 0x3F000000", CmdCodec::floatBits(0.5), 1056964608);
+    c.sameInt("cmd: floatBits of -2.0 is 0xC0000000", CmdCodec::floatBits(-2.0), -1073741824);
+    c.sameInt(
+        "cmd: floatBits of 0.1 is its single-precision pattern",
+        CmdCodec::floatBits(0.1),
+        1036831949
+    );
+    c.sameInt("cmd: floatBits of 100.0 is 0x42C80000", CmdCodec::floatBits(100.0), 1120403456);
+    c.sameInt("cmd: floatBits of zero is 0", CmdCodec::floatBits(0.0), 0);
+    c.sameInt("cmd: bits of the largest float", CmdCodec::floatBits(3.4028234e38), 2139095039);
+    c.sameInt("cmd: bits of the smallest normal", CmdCodec::floatBits(1.17549435e-38), 8388608);
+    let rng : Pcg32 = new Pcg32(7, 11);
+    let mut exact : bool = true;
+    for (i of 0..5000) {
+        let mut v : f32 = rng.rangeF32(-1000.0, 1000.0);
+        let scale : f32 = rng.rangeF32(-30.0, 30.0);
+        let mut k : i32 = rng.range(0, 40);
+        while (k > 0) {
+            v = v * (1.7 as f32);
+            k = k - 1;
+        }
+        v = v * (scale * (0.0001 as f32));
+        if (CmdCodec::bitsFloat(CmdCodec::floatBits(v)) != v) {
+            exact = false;
+        }
+    }
+    c.that("cmd: 5000 random floats of many magnitudes survive bits and back exactly", exact);
+}
+
+fn rcmRoundTrip(c : Checks) : void {
+    let s : CmdStream = rcmSample();
+    let bytes : ByteBuf = CmdCodec::encode(s);
+    c.sameInt("cmd: the encoding is 16 + 32 per command bytes", bytes.len(), 16 + 32 * 12);
+    let back : CmdStream = new CmdStream();
+    c.that("cmd: the encoded stream decodes", CmdCodec::decode(bytes, back) == "");
+    c.that("cmd: decode(encode(x)) has exactly the commands of x", back.equals(s));
+    let again : ByteBuf = CmdCodec::encode(back);
+    let mut sameBytes : bool = again.len() == bytes.len();
+    for (i of 0..bytes.len()) {
+        if (i < again.len() && again.get(i) != bytes.get(i)) {
+            sameBytes = false;
+        }
+    }
+    c.that("cmd: encode(decode(encode(x))) is the same bytes", sameBytes);
+    let empty : CmdStream = new CmdStream();
+    let nothing : CmdStream = new CmdStream();
+    c.that(
+        "cmd: an empty stream round-trips",
+        CmdCodec::decode(CmdCodec::encode(empty), nothing) == "" && nothing.count() == 0
+    );
+}
+
+fn rcmDamage(c : Checks) : void {
+    let good : ByteBuf = CmdCodec::encode(rcmSample());
+    let out : CmdStream = new CmdStream();
+
+    let flipped : ByteBuf = CmdCodec::encode(rcmSample());
+    flipped.set(40, flipped.get(40) ^ 1);
+    c.that(
+        "cmd: a flipped bit is caught by the checksum",
+        CmdCodec::decode(flipped, out) == "checksum mismatch" && out.count() == 0
+    );
+
+    let magic : ByteBuf = CmdCodec::encode(rcmSample());
+    magic.set(0, 0x41);
+    c.that(
+        "cmd: a wrong magic is refused",
+        CmdCodec::decode(magic, out) == "not a command stream (bad magic)"
+    );
+
+    let cut : ByteBuf = CmdCodec::encode(rcmSample());
+    cut.truncate(cut.len() - 7);
+    c.that(
+        "cmd: a truncated buffer is refused",
+        CmdCodec::decode(cut, out) == "length does not match the command count"
+    );
+
+    let tiny : ByteBuf = new ByteBuf(16);
+    c.that(
+        "cmd: a tiny buffer is refused",
+        CmdCodec::decode(tiny, out) == "too short for a header"
+    );
+
+    // An unknown opcode with a valid checksum: build the bytes by hand.
+    let hand : ByteBuf = new ByteBuf(64);
+    hand.pushLe32(1396922444);
+    hand.pushLe32(1);
+    hand.pushLe32(1);
+    hand.pushLe32(99);
+    for (i of 0..7) {
+        hand.pushLe32(0);
+    }
+    let crc : Crc32 = new Crc32();
+    hand.pushLe32(crc.sum(hand, 0, hand.len()));
+    c.that(
+        "cmd: an unknown opcode is refused even with a good checksum",
+        CmdCodec::decode(hand, out) == "unknown opcode 99 in command 0" && out.count() == 0
+    );
+    c.that(
+        "cmd: the good buffer is still good",
+        CmdCodec::decode(good, out) == "" && out.count() == 12
+    );
+}
+
+fn rcmCosts(c : Checks) : void {
+    let costs : PassCosts = new PassCosts(3);
+    costs.addDraw(1, 100);
+    costs.addDraw(1, 50);
+    costs.addRasterised(1, 120);
+    costs.addPixels(1, 4096);
+    costs.addDraw(9, 5);
+    c.that(
+        "costs: counters add per pass",
+        costs.drawCalls(1) == 2 && costs.trianglesSubmitted(1) == 150
+            && costs.trianglesRasterised(1) == 120
+            && costs.pixelsShaded(1) == 4096
+    );
+    c.that("costs: a pass out of range is ignored", costs.drawCalls(0) == 0 && !costs.has(9));
+    costs.reset();
+    c.that(
+        "costs: reset zeroes the draw calls and shaded pixels",
+        costs.drawCalls(1) == 0 && costs.pixelsShaded(1) == 0
+    );
+}

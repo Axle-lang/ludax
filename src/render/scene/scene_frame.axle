@@ -1,0 +1,184 @@
+// scene_frame — the snapshot of a world that one frame is drawn from.
+//
+// `RenderScene` is what extraction produces and every backend consumes: a camera, the instances to draw (a mesh
+// id, a material id and a model matrix each), the lights as the lighting library wants them, and the
+// environment. Everything is camera-relative f32: the extractor subtracted the camera's f64 position from each
+// translation before narrowing (design rule 5), so the camera sits at the origin and axes are the world's.
+// A snapshot is plain data with no pointers into the world, which is what lets a backend run on another thread
+// or a command stream be recorded and replayed (design rule 6).
+
+use crate::core::collections::vec::Vec;
+use crate::core::math::geom::Aabb;
+use crate::core::math::mat4::Mat4;
+use crate::core::math::vec3::Vec3;
+use crate::render::light::light_sh::LightSh9;
+use crate::render::light::light_source::LightSource;
+use crate::render::light::light_units::LightUnits;
+use crate::render::scene::scene_camera::Camera;
+
+// The tone curve's default knee: highlights above this fraction of white roll off.
+const SCENE_TONE_KNEE : f32 = 0.6;
+
+// The zeroth SH basis function: a constant radiance L has c0 = L / Y00.
+const SCENE_Y00 : f32 = 0.282094791773878;
+
+/** One thing to draw. */
+pub struct RenderInstance {
+    /** Id of the mesh in `RenderAssets`. */
+    pub mesh : i32 = 0;
+
+    /** Id of the material in `RenderAssets`. */
+    pub material : i32 = 0;
+
+    /** An id the lights' exclusion lists test against (the entity's slot). */
+    pub objectId : i32 = 0;
+
+    /** The layer bits the lights' masks test against. */
+    pub layer : u32 = 1;
+
+    /** Whether shadow rays may hit this instance. */
+    pub castsShadow : bool = true;
+
+    /** Local space to camera-relative world space. */
+    pub model : Mat4 = Mat4 {};
+
+    /** The world-space bounds of the mesh under `model`, camera-relative. */
+    pub bounds : Aabb = Aabb {};
+}
+
+/** A frame's worth of scene. */
+pub class RenderScene {
+    cam      : Camera;
+    items    : Vec<RenderInstance>;
+    lamps    : Vec<LightSource>;
+    sh       : LightSh9;
+    specular : Vec3;
+    below    : Vec3;
+    expose   : f32 = 1.0;
+    knee     : f32 = SCENE_TONE_KNEE;
+    seen     : i32 = 0;
+    culled   : i32 = 0;
+
+    /** An empty frame for `camera`, with a black environment. */
+    constructor(camera : Camera) {
+        self.cam = camera;
+        self.items = new Vec<RenderInstance>();
+        self.lamps = new Vec<LightSource>();
+        self.sh = LightSh9::zero();
+        self.specular = Vec3::zero();
+        self.below = Vec3::zero();
+        self.expose = LightUnits::exposure(LightUnits::ev100ForSunlitWhite());
+    }
+
+    /** The camera this frame is seen from (its position is the origin of every camera-relative value). */
+    pub fn camera(self) : Camera {
+        return self.cam;
+    }
+
+    /** Appends an instance. */
+    pub fn addInstance(mut self, i : RenderInstance) : void {
+        self.items.push(i);
+    }
+
+    /** How many instances. */
+    pub fn instanceCount(self) : i32 {
+        return self.items.len();
+    }
+
+    /** Instance number `i` in draw order. */
+    pub fn instance(self, i : i32) : RenderInstance {
+        return self.items.get(i);
+    }
+
+    /** Appends a light (already camera-relative). */
+    pub fn addLight(mut self, l : LightSource) : void {
+        self.lamps.push(l);
+    }
+
+    /** How many lights. */
+    pub fn lightCount(self) : i32 {
+        return self.lamps.len();
+    }
+
+    /** Light number `i`; shading and `LightExplain` index lights by this number. */
+    pub fn light(self, i : i32) : LightSource {
+        return self.lamps.get(i);
+    }
+
+    /** All the lights, as the lighting library's shading functions take them. */
+    pub fn lights(self) : Vec<LightSource> {
+        return self.lamps;
+    }
+
+    /** Makes the environment the same radiance from every direction (diffuse and specular), the furnace. */
+    pub fn setUniformEnvironment(mut self, radiance : Vec3) : void {
+        let mut sh : LightSh9 = LightSh9::zero();
+        sh.c0 = radiance.scale((1.0 as f32) / SCENE_Y00);
+        self.sh = sh;
+        self.specular = radiance;
+        self.below = radiance;
+    }
+
+    /** Sets the environment from SH9 coefficients for diffuse light and a radiance for the specular lobe. */
+    pub fn setEnvironment(mut self, sh : LightSh9, specular : Vec3) : void {
+        self.sh = sh;
+        self.specular = specular;
+        self.below = specular;
+    }
+
+    /**
+     * Gives the specular lobe a different radiance below the horizon (the ground) than above it (`setEnvironment`'s
+     * sky): a reflection direction pointing down sees `ground`, one pointing up sees the sky, with a blend that is
+     * wider for rougher surfaces.
+     */
+    pub fn setGroundRadiance(mut self, ground : Vec3) : void {
+        self.below = ground;
+    }
+
+    /** The radiance the specular lobe reflects from below the horizon. */
+    pub fn environmentGround(self) : Vec3 {
+        return self.below;
+    }
+
+    /** The environment's SH9 coefficients. */
+    pub fn environmentSh(self) : LightSh9 {
+        return self.sh;
+    }
+
+    /** The radiance the specular lobe reflects from the environment. */
+    pub fn environmentSpecular(self) : Vec3 {
+        return self.specular;
+    }
+
+    /** Sets the exposure multiplier and the tone-curve knee applied by the resolve pass. */
+    pub fn setExposure(mut self, exposure : f32, toneKnee : f32) : void {
+        self.expose = exposure;
+        self.knee = toneKnee;
+    }
+
+    /** The exposure multiplier. */
+    pub fn exposure(self) : f32 {
+        return self.expose;
+    }
+
+    /** The tone-curve knee. */
+    pub fn toneKnee(self) : f32 {
+        return self.knee;
+    }
+
+    /** Records how many instances extraction looked at and how many the frustum rejected. */
+    pub fn setCullStats(mut self, considered : i32, rejected : i32) : void {
+        self.seen = considered;
+        self.culled = rejected;
+    }
+
+    /** How many instances extraction considered. */
+    pub fn consideredCount(self) : i32 {
+        return self.seen;
+    }
+
+    /** How many of them the frustum rejected. */
+    pub fn culledCount(self) : i32 {
+        return self.culled;
+    }
+}

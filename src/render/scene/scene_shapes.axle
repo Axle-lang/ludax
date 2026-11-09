@@ -1,0 +1,267 @@
+// scene_shapes — procedural meshes: box, uv-sphere, plane, cylinder.
+//
+// Each builder returns a finished `MeshData` centred on the origin with outward unit normals, counter-clockwise
+// triangles seen from outside, and texture coordinates that put an image upright (v grows downwards). Hard-edged
+// shapes (box, cylinder caps) do not share vertices across an edge, so their normals are exact; round shapes
+// share along the seam with u running 0..1 once around. Angles come from the deterministic `sin`/`cos` of the
+// maths layer, so the same call gives the same bytes everywhere.
+
+use crate::core::math::scalar::{TAU, PI, maxI};
+use crate::core::math::trig::{sin, cos};
+use crate::core::math::vec2::Vec2;
+use crate::core::math::vec3::Vec3;
+use crate::render::scene::scene_mesh::MeshData;
+
+// A box has six faces of four vertices and two triangles each.
+const MSHAPE_BOX_FACES : i32 = 6;
+const MSHAPE_QUAD_VERTS : i32 = 4;
+const MSHAPE_QUAD_TRIS : i32 = 2;
+
+// The fewest segments around a round shape and rings on a sphere that still enclose a volume.
+const MSHAPE_MIN_SEGMENTS : i32 = 3;
+const MSHAPE_MIN_RINGS : i32 = 2;
+
+// A cylinder cap is a centre vertex and a ring that repeats its first vertex (so u wraps), and there are two.
+const MSHAPE_CAPS : i32 = 2;
+
+// One face of a box: its outward normal and the in-face axes u (to the viewer's right) and v (up), u x v = n.
+struct BoxFace {
+    normal : Vec3 = Vec3 {};
+    u      : Vec3 = Vec3 {};
+    v      : Vec3 = Vec3 {};
+}
+
+// The numbers a cylinder's sides and caps share.
+struct CylinderSpec {
+    radius   : f32 = 1.0;
+    halfH    : f32 = 0.5;
+    segments : i32 = 3;
+    side     : i32 = 0;
+    cap      : i32 = 0;
+}
+
+/** Builders of simple meshes. */
+pub class MeshDataShapes {
+    /** An axis-aligned box of the given full sizes: 24 vertices, 12 triangles. */
+    pub static fn box(sx : f32, sy : f32, sz : f32) : MeshData {
+        let m : MeshData = new MeshData(
+            MSHAPE_BOX_FACES * MSHAPE_QUAD_VERTS,
+            MSHAPE_BOX_FACES * MSHAPE_QUAD_TRIS
+        );
+        let half : Vec3 = Vec3::make(sx * (0.5 as f32), sy * (0.5 as f32), sz * (0.5 as f32));
+        for (f of 0..MSHAPE_BOX_FACES) {
+            MeshDataShapes::boxFace(m, f, half, MeshDataShapes::faceAxes(f));
+        }
+        m.finish();
+        return m;
+    }
+
+    // The normal and in-face axes of box face `f`: +x, -x, +y, -y, +z, -z.
+    static fn faceAxes(f : i32) : BoxFace {
+        let x : Vec3 = Vec3::make(1.0, 0.0, 0.0);
+        let nx : Vec3 = Vec3::make(-1.0, 0.0, 0.0);
+        let y : Vec3 = Vec3::make(0.0, 1.0, 0.0);
+        let ny : Vec3 = Vec3::make(0.0, -1.0, 0.0);
+        let z : Vec3 = Vec3::make(0.0, 0.0, 1.0);
+        let nz : Vec3 = Vec3::make(0.0, 0.0, -1.0);
+        return match f {
+            0 => BoxFace { normal: x, u: nz, v: y },
+            1 => BoxFace { normal: nx, u: z, v: y },
+            2 => BoxFace { normal: y, u: x, v: nz },
+            3 => BoxFace { normal: ny, u: x, v: z },
+            4 => BoxFace { normal: z, u: x, v: y },
+            _ => BoxFace { normal: nz, u: nx, v: y },
+        };
+    }
+
+    // Face `f` of a box with half sizes `half`: four corners and two triangles.
+    static fn boxFace(m : MeshData, f : i32, half : Vec3, face : BoxFace) : void {
+        let centre : Vec3 = face.normal.times(half);
+        let du : Vec3 = face.u.times(half);
+        let dv : Vec3 = face.v.times(half);
+        for (k of 0..MSHAPE_QUAD_VERTS) {
+            // Corners run (-1,-1), (1,-1), (1,1), (-1,1) in (u, v).
+            let mut a : f32 = -1.0;
+            let mut b : f32 = -1.0;
+            if (k == 1 || k == 2) {
+                a = 1.0;
+            }
+            if (k >= 2) {
+                b = 1.0;
+            }
+            let p : Vec3 = centre.plus(du.scale(a)).plus(dv.scale(b));
+            let uv : Vec2 = Vec2::make(
+                (a + (1.0 as f32)) * (0.5 as f32),
+                (1.0 as f32) - (b + (1.0 as f32)) * (0.5 as f32)
+            );
+            m.setVertex(f * MSHAPE_QUAD_VERTS + k, p, face.normal, uv);
+        }
+        let first : i32 = f * MSHAPE_QUAD_VERTS;
+        m.setTriangle(f * MSHAPE_QUAD_TRIS, first, first + 1, first + 2);
+        m.setTriangle(f * MSHAPE_QUAD_TRIS + 1, first, first + 2, first + 3);
+    }
+
+    /**
+     * A flat sheet in the XZ plane facing +Y, `width` along X and `depth` along Z, cut into `nx` by `nz` quads
+     * (at least 1 each). Texture coordinates run 0..`repeatU` and 0..`repeatV`.
+     */
+    pub static fn plane(
+        width : f32,
+        depth : f32,
+        nx : i32,
+        nz : i32,
+        repeatU : f32,
+        repeatV : f32
+    ) : MeshData {
+        let cx : i32 = maxI(nx, 1);
+        let cz : i32 = maxI(nz, 1);
+        let m : MeshData = new MeshData((cx + 1) * (cz + 1), cx * cz * MSHAPE_QUAD_TRIS);
+        let up : Vec3 = Vec3::make(0.0, 1.0, 0.0);
+        for (j of 0..cz + 1) {
+            for (i of 0..cx + 1) {
+                let fu : f32 = (i as f32) / (cx as f32);
+                let fv : f32 = (j as f32) / (cz as f32);
+                let p : Vec3 = Vec3::make((fu - (0.5 as f32)) * width, 0.0, ((0.5 as f32) - fv) * depth);
+                m.setVertex(j * (cx + 1) + i, p, up, Vec2::make(fu * repeatU, fv * repeatV));
+            }
+        }
+        let mut t : i32 = 0;
+        for (j of 0..cz) {
+            for (i of 0..cx) {
+                let a : i32 = j * (cx + 1) + i;
+                let b : i32 = a + 1;
+                let c : i32 = a + cx + 2;
+                let d : i32 = a + cx + 1;
+                m.setTriangle(t, a, b, c);
+                m.setTriangle(t + 1, a, c, d);
+                t = t + MSHAPE_QUAD_TRIS;
+            }
+        }
+        m.finish();
+        return m;
+    }
+
+    /**
+     * A sphere of `radius` with `segments` around the Y axis and `rings` from pole to pole (at least 3 and 2).
+     * The triangles that would collapse to nothing at the poles are left out.
+     */
+    pub static fn uvSphere(radius : f32, segments : i32, rings : i32) : MeshData {
+        let s : i32 = maxI(segments, MSHAPE_MIN_SEGMENTS);
+        let r : i32 = maxI(rings, MSHAPE_MIN_RINGS);
+        let m : MeshData = new MeshData((s + 1) * (r + 1), s * (r - 1) * MSHAPE_QUAD_TRIS);
+        for (i of 0..r + 1) {
+            let theta : f32 = PI * (i as f32) / (r as f32);
+            let st : f32 = sin(theta);
+            let ct : f32 = cos(theta);
+            for (j of 0..s + 1) {
+                let phi : f32 = TAU * (j as f32) / (s as f32);
+                let n : Vec3 = Vec3::make(st * cos(phi), ct, st * sin(phi));
+                let uv : Vec2 = Vec2::make((j as f32) / (s as f32), (i as f32) / (r as f32));
+                m.setVertex(i * (s + 1) + j, n.scale(radius), n, uv);
+            }
+        }
+        let mut t : i32 = 0;
+        for (i of 0..r) {
+            for (j of 0..s) {
+                let a : i32 = i * (s + 1) + j;
+                let b : i32 = a + s + 1;
+                let c : i32 = b + 1;
+                let d : i32 = a + 1;
+                if (i != 0) {
+                    m.setTriangle(t, a, d, c);
+                    t = t + 1;
+                }
+                if (i != r - 1) {
+                    m.setTriangle(t, a, c, b);
+                    t = t + 1;
+                }
+            }
+        }
+        m.finish();
+        return m;
+    }
+
+    /** A capped cylinder along Y, `height` tall, with `segments` sides (at least 3). */
+    pub static fn cylinder(radius : f32, height : f32, segments : i32) : MeshData {
+        let s : i32 = maxI(segments, MSHAPE_MIN_SEGMENTS);
+        let spec : CylinderSpec = CylinderSpec {
+            radius: radius,
+            halfH: height * (0.5 as f32),
+            segments: s,
+            side: (s + 1) * 2,
+            cap: s + 2,
+        };
+        // Two triangles per wall segment, one per segment in each cap's fan.
+        let triangles : i32 = s * MSHAPE_QUAD_TRIS + s * MSHAPE_CAPS;
+        let m : MeshData = new MeshData(spec.side + spec.cap * MSHAPE_CAPS, triangles);
+        let mut t : i32 = MeshDataShapes::cylinderSides(m, spec);
+        for (capNo of 0..MSHAPE_CAPS) {
+            t = MeshDataShapes::cylinderCap(m, spec, capNo, t);
+        }
+        m.finish();
+        return m;
+    }
+
+    // The wall of a cylinder: a top and a bottom vertex per angle, two triangles per segment. Returns the number of
+    // triangles written.
+    static fn cylinderSides(m : MeshData, spec : CylinderSpec) : i32 {
+        let s : i32 = spec.segments;
+        for (j of 0..s + 1) {
+            let phi : f32 = TAU * (j as f32) / (s as f32);
+            let n : Vec3 = Vec3::make(cos(phi), 0.0, sin(phi));
+            let fu : f32 = (j as f32) / (s as f32);
+            let top : Vec3 = Vec3::make(n.x * spec.radius, spec.halfH, n.z * spec.radius);
+            let bottom : Vec3 = Vec3::make(n.x * spec.radius, -spec.halfH, n.z * spec.radius);
+            m.setVertex(j * 2, top, n, Vec2::make(fu, 0.0));
+            m.setVertex(j * 2 + 1, bottom, n, Vec2::make(fu, 1.0));
+        }
+        let mut t : i32 = 0;
+        for (j of 0..s) {
+            let a : i32 = j * 2;
+            let b : i32 = a + 1;
+            let c : i32 = a + 3;
+            let d : i32 = a + 2;
+            m.setTriangle(t, a, c, b);
+            m.setTriangle(t + 1, a, d, c);
+            t = t + MSHAPE_QUAD_TRIS;
+        }
+        return t;
+    }
+
+    // Cap `capNo` (0 top, 1 bottom) of a cylinder as a fan around its centre vertex, starting at triangle `t`.
+    // Returns the next free triangle.
+    static fn cylinderCap(m : MeshData, spec : CylinderSpec, capNo : i32, first : i32) : i32 {
+        let s : i32 = spec.segments;
+        let base : i32 = spec.side + capNo * spec.cap;
+        let mut y : f32 = spec.halfH;
+        let mut ny : f32 = 1.0;
+        if (capNo == 1) {
+            y = -spec.halfH;
+            ny = -1.0;
+        }
+        let normal : Vec3 = Vec3::make(0.0, ny, 0.0);
+        m.setVertex(base, Vec3::make(0.0, y, 0.0), normal, Vec2::make(0.5, 0.5));
+        for (j of 0..s + 1) {
+            let phi : f32 = TAU * (j as f32) / (s as f32);
+            let cx : f32 = cos(phi);
+            let cz : f32 = sin(phi);
+            let rim : Vec3 = Vec3::make(cx * spec.radius, y, cz * spec.radius);
+            let uv : Vec2 = Vec2::make(
+                (cx + (1.0 as f32)) * (0.5 as f32),
+                (cz + (1.0 as f32)) * (0.5 as f32)
+            );
+            m.setVertex(base + 1 + j, rim, normal, uv);
+        }
+
+        let mut t : i32 = first;
+        for (j of 0..s) {
+            if (capNo == 0) {
+                m.setTriangle(t, base, base + 2 + j, base + 1 + j);
+            } else {
+                m.setTriangle(t, base, base + 1 + j, base + 2 + j);
+            }
+            t = t + 1;
+        }
+        return t;
+    }
+}

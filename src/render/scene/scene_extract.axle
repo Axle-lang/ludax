@@ -1,0 +1,240 @@
+// scene_extract — from the world to a `RenderScene`: components in, culled and ordered instances out.
+//
+// The world keeps what an entity *has* in `ComponentStore`s; the renderer wants a flat list of things to draw.
+// `RenderExtract::run` joins them: every living entity with a `MeshRef` becomes an instance whose model matrix is
+// its world transform made camera-relative in f64 before it is narrowed; entities with a `LightComp` become
+// lights. Instances whose bounds lie wholly outside the camera's frustum are dropped (and counted). The result is
+// ordered by a key that depends on the data alone, so two runs hand the backend the same list:
+//   opaque and masked instances by (material, mesh, entity slot), which makes equal state adjacent;
+//   blended instances after them, farthest first (view depth), entity slot breaking ties.
+// The sort is a stable merge sort: no hash, no thread, no library order enters.
+
+use crate::core::collections::vec::Vec;
+use crate::core::id::entity_id::EntityId;
+use crate::core::math::convert::{narrowMat4, narrowVec3};
+use crate::core::math::dtransform::DTransform;
+use crate::core::math::dvec3::DVec3;
+use crate::core::math::frustum::{Containment, Frustum};
+use crate::core::math::geom::Aabb;
+use crate::core::math::mat4::Mat4;
+use crate::core::math::scalar::{maxI64, minI, minI64};
+use crate::core::math::vec3::Vec3;
+use crate::render::light::light_source::LightSource;
+use crate::render::scene::scene_assets::RenderAssets;
+use crate::render::scene::scene_camera::Camera;
+use crate::render::scene::scene_frame::{RenderInstance, RenderScene};
+use crate::render::scene::scene_light::LightComp;
+use crate::world::scene::Scene;
+use crate::world::store::ComponentStore;
+
+/** Component: this entity is drawn as mesh `mesh`. */
+pub struct MeshRef {
+    /** Id in `RenderAssets`. */
+    pub mesh : i32 = 0;
+
+    /** Layer bits for light masks. */
+    pub layer : u32 = 1;
+
+    /** Whether shadow rays hit it. */
+    pub castsShadow : bool = true;
+}
+
+/** Component: this entity's mesh uses material `material`. */
+pub struct MaterialRef {
+    /** Id in `RenderAssets`. */
+    pub material : i32 = 0;
+}
+
+// Bits of an instance sort key: three 20-bit fields (material, mesh, slot), or for a blended instance the
+// inverted quantised depth and the slot, under a top bit that puts every blended instance after the opaque ones.
+const EXTRACT_FIELD : i64 = 1048575;
+const EXTRACT_MATERIAL_SCALE : i64 = 1099511627776;
+const EXTRACT_FIELD_SCALE : i64 = 1048576;
+const EXTRACT_BLEND_FLAG : i64 = 4611686018427387904;
+
+// Blended instances sort by depth in steps of 1 / this many view units.
+const EXTRACT_DEPTH_STEPS : f32 = 16.0;
+
+// Everything one extraction reads, so the steps take the source and the scene they fill and nothing else.
+struct ExtractSource {
+    scene     : Scene;
+    meshes    : ComponentStore<MeshRef>;
+    materials : ComponentStore<MaterialRef>;
+    lights    : ComponentStore<LightComp>;
+    assets    : Shared<RenderAssets>;
+    camera    : Camera;
+}
+
+// The instances that survived culling, with their sort keys, and how many were looked at and rejected.
+struct ExtractKept {
+    items      : Vec<RenderInstance>;
+    keys       : Vec<i64>;
+    considered : i32;
+    rejected   : i32;
+}
+
+/** Builds a `RenderScene` from a world. */
+pub class RenderExtract {
+    /**
+     * Extracts everything `camera` can see. `scene` supplies transforms, the stores supply components; an entity
+     * with a mesh but no `MaterialRef` uses material 0, and one whose mesh or material id does not exist is
+     * skipped. The scene's transforms are brought up to date first.
+     */
+    pub static fn run(
+        scene : Scene,
+        meshes : ComponentStore<MeshRef>,
+        materials : ComponentStore<MaterialRef>,
+        lights : ComponentStore<LightComp>,
+        assets : Shared<RenderAssets>,
+        camera : Camera
+    ) : RenderScene {
+        scene.update();
+        let src : ExtractSource = ExtractSource {
+            scene: scene,
+            meshes: meshes,
+            materials: materials,
+            lights: lights,
+            assets: assets,
+            camera: camera,
+        };
+        let out : RenderScene = new RenderScene(camera);
+        RenderExtract::addInstances(src, out);
+        RenderExtract::addLights(src, out);
+        return out;
+    }
+
+    // Culls the mesh entities, orders the survivors by their sort key and adds them to `out`.
+    static fn addInstances(src : ExtractSource, out : RenderScene) : void {
+        let kept : ExtractKept = RenderExtract::cull(src);
+        let n : i32 = kept.items.len();
+        let mut flat : i64[] = new i64[n as i64];
+        for (i of 0..n) {
+            flat[i] = kept.keys.get(i);
+        }
+        let order : i32[] = RenderExtract::sortedOrder(flat, n);
+        for (k of 0..n) {
+            out.addInstance(kept.items.get(order[k]));
+        }
+        out.setCullStats(kept.considered, kept.rejected);
+    }
+
+    // The living mesh entities inside the frustum, as instances with their keys.
+    static fn cull(src : ExtractSource) : ExtractKept {
+        let frustum : Frustum = src.camera.frustum();
+        let view : Mat4 = src.camera.view();
+        let mut kept : ExtractKept = ExtractKept {
+            items: new Vec<RenderInstance>(),
+            keys: new Vec<i64>(),
+            considered: 0,
+            rejected: 0,
+        };
+        for (d of 0..src.meshes.len()) {
+            let id : EntityId = src.meshes.entityAt(d);
+            if (!src.scene.isAlive(id)) {
+                continue;
+            }
+            let mr : MeshRef = src.meshes.valueAt(d);
+            let mat : MaterialRef = src.materials.getOr(src.scene.entities(), id, MaterialRef {});
+            if (!src.assets.hasMesh(mr.mesh) || !src.assets.hasMaterial(mat.material)) {
+                continue;
+            }
+            kept.considered = kept.considered + 1;
+
+            let model : Mat4 = RenderExtract::modelOf(src.scene.worldTransform(id), src.camera);
+            let bounds : Aabb = src.assets.mesh(mr.mesh).bounds().transformed(model);
+            if (frustum.testAabb(bounds) == Containment::Outside) {
+                kept.rejected = kept.rejected + 1;
+                continue;
+            }
+            let inst : RenderInstance = RenderInstance {
+                mesh: mr.mesh,
+                material: mat.material,
+                objectId: id.index,
+                layer: mr.layer,
+                castsShadow: mr.castsShadow,
+                model: model,
+                bounds: bounds,
+            };
+            kept.items.push(inst);
+            kept.keys.push(RenderExtract::keyOf(inst, src.assets, view));
+        }
+        return kept;
+    }
+
+    // Adds a light for every living entity with a `LightComp`, placed camera-relative.
+    static fn addLights(src : ExtractSource, out : RenderScene) : void {
+        for (d of 0..src.lights.len()) {
+            let id : EntityId = src.lights.entityAt(d);
+            if (!src.scene.isAlive(id)) {
+                continue;
+            }
+            let comp : LightComp = src.lights.valueAt(d);
+            let t : DTransform = src.scene.worldTransform(id);
+            let position : Vec3 = src.camera.relativePoint(t.translation);
+            let direction : Vec3 = narrowVec3(t.rotation.rotate(DVec3::make(0.0, 0.0, -1.0)));
+            out.addLight(comp.toSource(position, direction));
+        }
+    }
+
+    // The model matrix of a world transform, translation made relative to the camera in f64 before narrowing.
+    static fn modelOf(t : DTransform, camera : Camera) : Mat4 {
+        let relative : DTransform = DTransform::make(
+            t.translation.minus(camera.position),
+            t.rotation,
+            t.scale
+        );
+        return narrowMat4(relative.toMat4());
+    }
+
+    // The sort key of an instance; see the file header.
+    static fn keyOf(inst : RenderInstance, assets : Shared<RenderAssets>, view : Mat4) : i64 {
+        let slot : i64 = (inst.objectId as i64) & EXTRACT_FIELD;
+        if (!assets.material(inst.material).isBlended()) {
+            let material : i64 = (inst.material as i64) & EXTRACT_FIELD;
+            let mesh : i64 = (inst.mesh as i64) & EXTRACT_FIELD;
+            return material * EXTRACT_MATERIAL_SCALE + mesh * EXTRACT_FIELD_SCALE + slot;
+        }
+
+        // Far blended instances first: the key falls as the depth grows.
+        let depth : f32 = -view.transformPoint(inst.bounds.center()).z;
+        let steps : i64 = minI64(maxI64((depth * EXTRACT_DEPTH_STEPS) as i64, 0), EXTRACT_FIELD);
+        return EXTRACT_BLEND_FLAG + (EXTRACT_FIELD - steps) * EXTRACT_FIELD_SCALE + slot;
+    }
+
+    /** The indices 0..n ordered by ascending key; equal keys keep their original order (a stable merge sort). */
+    pub static fn sortedOrder(keys : i64[], n : i32) : i32[] {
+        let mut a : i32[] = new i32[n as i64 + 1];
+        let mut b : i32[] = new i32[n as i64 + 1];
+        for (i of 0..n) {
+            a[i] = i;
+        }
+        let mut width : i32 = 1;
+        while (width < n) {
+            let mut start : i32 = 0;
+            while (start < n) {
+                let mid : i32 = minI(start + width, n);
+                let end : i32 = minI(start + width * 2, n);
+                let mut l : i32 = start;
+                let mut r : i32 = mid;
+                let mut o : i32 = start;
+                while (l < mid || r < end) {
+                    let leftFirst : bool = l < mid && keys[a[l]] <= keys[a[r]];
+                    if (r >= end || leftFirst) {
+                        b[o] = a[l];
+                        l = l + 1;
+                    } else {
+                        b[o] = a[r];
+                        r = r + 1;
+                    }
+                    o = o + 1;
+                }
+                start = start + width * 2;
+            }
+            for (i of 0..n) {
+                a[i] = b[i];
+            }
+            width = width * 2;
+        }
+        return a;
+    }
+}

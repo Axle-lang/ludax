@@ -1,0 +1,720 @@
+// cpu_tris — triangle setup for the CPU rasteriser: transform, clip, snap to a sub-pixel grid, bin into tiles.
+//
+// Every triangle of every drawn instance is taken to camera-relative world space with its instance's model matrix
+// (positions) and normal matrix (normals), then to clip space with the camera's view-projection. A triangle that
+// leaves the guard band (4 screen sizes) or crosses the near plane is clipped against those five planes with
+// Sutherland-Hodgman, every attribute (position, normal, uv) interpolated linearly in clip space, which is exact for
+// attributes that are later interpolated perspective-correctly. What survives is divided by w, mapped to the screen
+// and SNAPPED to a grid of 1/256 pixel: from here on all coverage maths is integer, so coverage is exact, two
+// triangles sharing an edge agree on which side of it every pixel centre is, and the top-left rule leaves no pixel
+// covered twice or not at all.
+//
+// A triangle is stored in canonical orientation (positive signed area in the integer grid); whether it faced the
+// camera (counter-clockwise on screen, y down: negative area) is kept as a flag, because back faces are culled or
+// shaded as the back. Triangles come out in submission order and are binned into 32 x 32 pixel tiles by a counting
+// sort that keeps that order inside every tile, which is what makes the picture independent of thread count.
+//
+// The stored triangles are parallel arrays with a fixed record per triangle (`snap`, `zinv`, `attr`, `geo`, `meta`).
+// Only this file knows the strides and field offsets; the rasteriser and the surface sampler read them through the
+// accessors (`snapped`, `attribute`, `geoNormal`, `materialOf`, ...).
+
+use crate::core::math::mat3::Mat3;
+use crate::core::math::mat4::Mat4;
+use crate::core::math::scalar::{clampI, maxI, minI};
+use crate::core::math::vec2::Vec2;
+use crate::core::math::vec3::Vec3;
+use crate::core::math::vec4::Vec4;
+use crate::render::scene::scene_assets::RenderAssets;
+use crate::render::scene::scene_frame::{RenderInstance, RenderScene};
+use crate::render::scene::scene_material::RenderMaterial;
+use crate::render::scene::scene_mesh::MeshData;
+
+/** Tile edge in pixels. */
+pub const CPU_TILE : i32 = 32;
+
+/** Positions are snapped to integers of 1/CPU_SUBPIXEL of a pixel, so coverage is decided in exact integer maths. */
+pub(crate) const CPU_SUBPIXEL : i64 = 256;
+
+/** log2 of `CPU_SUBPIXEL`: a snapped coordinate shifted right by this is its pixel. */
+pub(crate) const CPU_SUBPIXEL_SHIFT : i32 = 8;
+
+/** The centre of a pixel on the snapped grid; coverage is tested at centres. */
+pub(crate) const CPU_PIXEL_CENTRE : i64 = 128;
+
+/** The id that stands for "no triangle" where a pixel has none. */
+pub const CPU_NO_TRIANGLE : i32 = -1;
+
+/** Flag bit of a stored triangle: its material blends. */
+pub const CPU_FLAG_BLEND : i32 = 1;
+
+/** Flag bit of a stored triangle: it faces away from the camera. */
+pub const CPU_FLAG_BACK : i32 = 2;
+
+/** Offset of the position (3 floats) in a vertex's attributes. */
+pub(crate) const CPU_ATTR_POSITION : i32 = 0;
+
+/** Offset of the normal (3 floats) in a vertex's attributes. */
+pub(crate) const CPU_ATTR_NORMAL : i32 = 3;
+
+/** Offset of the texture coordinate (2 floats) in a vertex's attributes. */
+pub(crate) const CPU_ATTR_UV : i32 = 6;
+
+// The guard band: clip-space x and y may reach this many times w before a triangle is clipped.
+const CTRI_GUARD : f32 = 4.0;
+
+// Clip planes: near, then left, right, bottom, top of the guard band.
+const CTRI_PLANES : i32 = 5;
+
+// Vertices that arrive from a source triangle.
+const CTRI_CORNERS : i32 = 3;
+
+// Vertices after clipping against a plane lose or gain at most one each; five planes give at most ten.
+const CTRI_POLY : i32 = 10;
+
+// A vertex with a w at or below this is behind the eye (or on it) and has no projection.
+const CTRI_W_MIN : f32 = 0.000001;
+
+// The sub-pixel scale as a float, for snapping.
+const CTRI_SUBPIXEL_F : f32 = 256.0;
+
+// Floats per work vertex: clip x y z w, then position, normal, uv.
+const CTRI_V : i32 = 12;
+const CTRI_CLIP : i32 = 0;
+const CTRI_POS : i32 = 4;
+const CTRI_NRM : i32 = 7;
+const CTRI_UV : i32 = 10;
+
+// The attributes copied to a stored triangle's vertex: everything after the clip coordinates.
+const CTRI_ATTRS : i32 = 8;
+
+// Records per triangle in each parallel array.
+const CTRI_SNAP : i32 = 6;
+const CTRI_ZINV : i32 = 6;
+const CTRI_ATTR : i32 = 24;
+const CTRI_GEO : i32 = 3;
+const CTRI_META : i32 = 5;
+
+// Fields of a triangle's `meta` record.
+const CTRI_META_INSTANCE : i32 = 0;
+const CTRI_META_MATERIAL : i32 = 1;
+const CTRI_META_FLAGS : i32 = 2;
+const CTRI_META_OBJECT : i32 = 3;
+const CTRI_META_LAYER : i32 = 4;
+
+// Triangles a batch has room for before its first growth; it doubles from there.
+const CTRI_ROOM : i32 = 256;
+
+/** The three snapped vertices of a stored triangle, in 1/`CPU_SUBPIXEL` pixels. */
+pub(crate) struct CpuSnap {
+    /** Vertex a, x. */
+    pub ax : i64 = 0;
+
+    /** Vertex a, y. */
+    pub ay : i64 = 0;
+
+    /** Vertex b, x. */
+    pub bx : i64 = 0;
+
+    /** Vertex b, y. */
+    pub by : i64 = 0;
+
+    /** Vertex c, x. */
+    pub cx : i64 = 0;
+
+    /** Vertex c, y. */
+    pub cy : i64 = 0;
+
+    /** Twice the signed area; positive for the canonical orientation every stored triangle has. */
+    pub fn area(self) : i64 {
+        return (self.bx - self.ax) * (self.cy - self.ay) - (self.by - self.ay) * (self.cx - self.ax);
+    }
+}
+
+/** What a draw call adds: a range of instances of one mesh with one material, seen through one camera. */
+pub(crate) struct CpuDraw {
+    /** Id of the mesh in `RenderAssets`. */
+    pub mesh : i32 = 0;
+
+    /** Index of the first instance of the scene to draw. */
+    pub first : i32 = 0;
+
+    /** How many instances. */
+    pub count : i32 = 0;
+
+    /** Id of the material the instances are drawn with. */
+    pub material : i32 = 0;
+
+    /** Camera-relative world space to clip space. */
+    pub viewProj : Mat4 = Mat4 {};
+
+    /** Drop back faces of single-sided materials. */
+    pub cullBack : bool = true;
+}
+
+// What every triangle cut from one source triangle shares: its face normal, instance, material and flags.
+struct CpuTriSource {
+    geo      : Vec3 = Vec3 {};
+    instance : i32 = 0;
+    material : i32 = 0;
+    flags    : i32 = 0;
+    skipBack : bool = false;
+}
+
+// How an instance takes a mesh vertex to clip space.
+struct CpuPlacement {
+    model    : Mat4 = Mat4 {};
+    normals  : Mat3 = Mat3 {};
+    viewProj : Mat4 = Mat4 {};
+}
+
+// Three vertices of a polygon buffer that form one triangle of its fan.
+struct CpuCorners {
+    a : i32 = 0;
+    b : i32 = 1;
+    c : i32 = 2;
+
+    pub(file) fn at(self, k : i32) : i32 {
+        return match k {
+            0 => self.a,
+            1 => self.b,
+            _ => self.c,
+        };
+    }
+}
+
+// Where an edge of the polygon crosses a clip plane: from vertex `from` to vertex `to`, `t` of the way along.
+struct CpuCut {
+    from : i32 = 0;
+    to   : i32 = 0;
+    t    : f32 = 0.0;
+}
+
+// The inclusive span of tiles a triangle overlaps.
+struct CpuTileRange {
+    x0 : i32 = 0;
+    y0 : i32 = 0;
+    x1 : i32 = 0;
+    y1 : i32 = 0;
+}
+
+/** Screen-space triangles of one batch of draws. */
+pub class CpuTris {
+    pub(crate) width     : i32;
+    pub(crate) height    : i32;
+    pub(crate) count     : i32 = 0;
+    pub(crate) snap      : i32[];
+    pub(crate) zinv      : f32[];
+    pub(crate) attr      : f32[];
+    pub(crate) geo       : f32[];
+    pub(crate) meta      : i32[];
+    pub(crate) tilesX    : i32;
+    pub(crate) tilesY    : i32;
+    pub(crate) binStart  : i32[];
+    pub(crate) binList   : i32[];
+    pub(crate) submitted : i64 = 0;
+    pub(crate) curObject : i32 = 0;
+    pub(crate) curLayer  : i32 = 1;
+    room                 : i32 = 0;
+    work                 : f32[];
+    polyA                : f32[];
+    polyB                : f32[];
+    snapX                : i32[];
+    snapY                : i32[];
+    snapZ                : f32[];
+    snapW                : f32[];
+
+    /** An empty batch for a target of `width` x `height` pixels. */
+    constructor(width : i32, height : i32) {
+        self.width = width;
+        self.height = height;
+        self.tilesX = (width + CPU_TILE - 1) / CPU_TILE;
+        self.tilesY = (height + CPU_TILE - 1) / CPU_TILE;
+        self.snap = new i32[0];
+        self.zinv = new f32[0];
+        self.attr = new f32[0];
+        self.geo = new f32[0];
+        self.meta = new i32[0];
+        self.reserve(CTRI_ROOM);
+        self.binStart = new i32[(self.tilesX * self.tilesY + 1) as i64];
+        self.binList = new i32[1];
+        self.work = new f32[(CTRI_CORNERS * CTRI_V) as i64];
+        self.polyA = new f32[(CTRI_POLY * CTRI_V) as i64];
+        self.polyB = new f32[(CTRI_POLY * CTRI_V) as i64];
+        self.snapX = new i32[CTRI_CORNERS as i64];
+        self.snapY = new i32[CTRI_CORNERS as i64];
+        self.snapZ = new f32[CTRI_CORNERS as i64];
+        self.snapW = new f32[CTRI_CORNERS as i64];
+        for (i of 0..self.tilesX * self.tilesY + 1) {
+            self.binStart[i] = 0;
+        }
+    }
+
+    /** Forgets every triangle. */
+    pub(crate) fn reset(mut self) : void {
+        self.count = 0;
+        self.submitted = 0;
+    }
+
+    /** The snapped vertices of triangle `t`. */
+    pub(crate) fn snapped(self, t : i32) : CpuSnap {
+        let b : i32 = t * CTRI_SNAP;
+        return CpuSnap {
+            ax: self.snap[b] as i64,
+            ay: self.snap[b + 1] as i64,
+            bx: self.snap[b + 2] as i64,
+            by: self.snap[b + 3] as i64,
+            cx: self.snap[b + 4] as i64,
+            cy: self.snap[b + 5] as i64,
+        };
+    }
+
+    /** The depth (clip z over w) at vertex `k` of triangle `t`. */
+    pub(crate) fn depthAt(self, t : i32, k : i32) : f32 {
+        return self.zinv[t * CTRI_ZINV + k];
+    }
+
+    /** The reciprocal of the clip w at vertex `k` of triangle `t`, which makes attributes perspective-correct. */
+    pub(crate) fn inverseW(self, t : i32, k : i32) : f32 {
+        return self.zinv[t * CTRI_ZINV + CTRI_CORNERS + k];
+    }
+
+    /** Attribute `field` (a `CPU_ATTR_*` offset plus a component) of vertex `k` of triangle `t`. */
+    pub(crate) fn attribute(self, t : i32, k : i32, field : i32) : f32 {
+        return self.attr[t * CTRI_ATTR + k * CTRI_ATTRS + field];
+    }
+
+    /** The face normal of the source triangle, as it was submitted (not flipped for back faces). */
+    pub(crate) fn geoNormal(self, t : i32) : Vec3 {
+        let b : i32 = t * CTRI_GEO;
+        return Vec3::make(self.geo[b], self.geo[b + 1], self.geo[b + 2]);
+    }
+
+    /** The scene instance index triangle `t` was cut from. */
+    pub(crate) fn instanceOf(self, t : i32) : i32 {
+        return self.meta[t * CTRI_META + CTRI_META_INSTANCE];
+    }
+
+    /** The material id of triangle `t`. */
+    pub(crate) fn materialOf(self, t : i32) : i32 {
+        return self.meta[t * CTRI_META + CTRI_META_MATERIAL];
+    }
+
+    /** The `CPU_FLAG_*` bits of triangle `t`. */
+    pub(crate) fn flagsOf(self, t : i32) : i32 {
+        return self.meta[t * CTRI_META + CTRI_META_FLAGS];
+    }
+
+    /** The object id the triangle's instance carried. */
+    pub(crate) fn objectOf(self, t : i32) : i32 {
+        return self.meta[t * CTRI_META + CTRI_META_OBJECT];
+    }
+
+    /** The light layer of the triangle's instance. */
+    pub(crate) fn layerOf(self, t : i32) : i32 {
+        return self.meta[t * CTRI_META + CTRI_META_LAYER];
+    }
+
+    // Gives the records room for `room` triangles, keeping the `count` stored ones.
+    fn reserve(mut self, room : i32) : void {
+        let mut snap : i32[] = new i32[(room * CTRI_SNAP) as i64];
+        let mut zinv : f32[] = new f32[(room * CTRI_ZINV) as i64];
+        let mut attr : f32[] = new f32[(room * CTRI_ATTR) as i64];
+        let mut geo : f32[] = new f32[(room * CTRI_GEO) as i64];
+        let mut meta : i32[] = new i32[(room * CTRI_META) as i64];
+        for (i of 0..self.count * CTRI_SNAP) {
+            snap[i] = self.snap[i];
+        }
+        for (i of 0..self.count * CTRI_ZINV) {
+            zinv[i] = self.zinv[i];
+        }
+        for (i of 0..self.count * CTRI_ATTR) {
+            attr[i] = self.attr[i];
+        }
+        for (i of 0..self.count * CTRI_GEO) {
+            geo[i] = self.geo[i];
+        }
+        for (i of 0..self.count * CTRI_META) {
+            meta[i] = self.meta[i];
+        }
+        self.snap = snap;
+        self.zinv = zinv;
+        self.attr = attr;
+        self.geo = geo;
+        self.meta = meta;
+        self.room = room;
+    }
+
+    /**
+     * Adds the triangles of the draw `draw` for instances `first .. first + count` of `scene`. Back faces are
+     * dropped when `cullBack` is set and the material is single-sided.
+     */
+    pub(crate) fn addDraw(
+        mut self,
+        scene : RenderScene,
+        assets : Shared<RenderAssets>,
+        draw : CpuDraw
+    ) : void {
+        let md : MeshData = assets.mesh(draw.mesh);
+        let mat : RenderMaterial = assets.material(draw.material);
+        let mut flags : i32 = 0;
+        if (mat.isBlended()) {
+            flags = CPU_FLAG_BLEND;
+        }
+        let skipBack : bool = draw.cullBack && !mat.doubleSided;
+        for (k of draw.first..draw.first + draw.count) {
+            let inst : RenderInstance = scene.instance(k);
+            self.curObject = inst.objectId;
+            self.curLayer = inst.layer as i32;
+            let place : CpuPlacement = CpuPlacement {
+                model: inst.model,
+                normals: inst.model.upper3x3().normalMatrix(),
+                viewProj: draw.viewProj,
+            };
+            for (t of 0..md.triangleCount()) {
+                for (v of 0..CTRI_CORNERS) {
+                    self.loadVertex(md, place, v, md.index(t * 3 + v));
+                }
+                self.submitted = self.submitted + 1;
+
+                let faceNormal : Vec3 = self.workFaceNormal();
+                if (!(faceNormal.lengthSquared() > (0.0 as f32))) {
+                    continue;
+                }
+                let source : CpuTriSource = CpuTriSource {
+                    geo: faceNormal.normalized(),
+                    instance: k,
+                    material: draw.material,
+                    flags: flags,
+                    skipBack: skipBack,
+                };
+                self.clipAndEmit(source);
+            }
+        }
+    }
+
+    // Writes vertex `i` of the mesh, placed by `place`, as work vertex `v`.
+    fn loadVertex(mut self, md : MeshData, place : CpuPlacement, v : i32, i : i32) : void {
+        let p : Vec3 = place.model.transformPoint(md.position(i));
+        let worldNormal : Vec3 = place.normals.transform(md.normal(i));
+        let nr : Vec3 = worldNormal.normalizedOr(Vec3::make(0.0, 1.0, 0.0));
+        let homogeneous : Vec4 = Vec4 { x: p.x, y: p.y, z: p.z, w: 1.0 };
+        let clip : Vec4 = place.viewProj.transformVec4(homogeneous);
+        let uv : Vec2 = md.uv(i);
+        let b : i32 = v * CTRI_V;
+        self.work[b + CTRI_CLIP] = clip.x;
+        self.work[b + CTRI_CLIP + 1] = clip.y;
+        self.work[b + CTRI_CLIP + 2] = clip.z;
+        self.work[b + CTRI_CLIP + 3] = clip.w;
+        self.work[b + CTRI_POS] = p.x;
+        self.work[b + CTRI_POS + 1] = p.y;
+        self.work[b + CTRI_POS + 2] = p.z;
+        self.work[b + CTRI_NRM] = nr.x;
+        self.work[b + CTRI_NRM + 1] = nr.y;
+        self.work[b + CTRI_NRM + 2] = nr.z;
+        self.work[b + CTRI_UV] = uv.x;
+        self.work[b + CTRI_UV + 1] = uv.y;
+    }
+
+    // The world-space position of work vertex `v`.
+    fn workPosition(self, v : i32) : Vec3 {
+        let b : i32 = v * CTRI_V + CTRI_POS;
+        return Vec3::make(self.work[b], self.work[b + 1], self.work[b + 2]);
+    }
+
+    // The unnormalised face normal of the work triangle; zero for a degenerate one.
+    fn workFaceNormal(self) : Vec3 {
+        let a : Vec3 = self.workPosition(0);
+        let b : Vec3 = self.workPosition(1);
+        let c : Vec3 = self.workPosition(2);
+        return b.minus(a).cross(c.minus(a));
+    }
+
+    // How far vertex `v` of a polygon buffer is inside plane `plane` (>= 0 is inside).
+    static fn side(poly : f32[], v : i32, plane : i32) : f32 {
+        let b : i32 = v * CTRI_V;
+        let w : f32 = poly[b + 3];
+        return match plane {
+            0 => poly[b + 2],
+            1 => w * CTRI_GUARD + poly[b],
+            2 => w * CTRI_GUARD - poly[b],
+            3 => w * CTRI_GUARD + poly[b + 1],
+            _ => w * CTRI_GUARD - poly[b + 1],
+        };
+    }
+
+    // True when all three work vertices are inside all five planes, so no clipping is needed.
+    fn workInside(self) : bool {
+        for (v of 0..CTRI_CORNERS) {
+            for (p of 0..CTRI_PLANES) {
+                if (CpuTris::side(self.work, v, p) < (0.0 as f32)) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    // Clips the work triangle against near and the guard band, then emits the fan.
+    fn clipAndEmit(mut self, source : CpuTriSource) : void {
+        if (self.workInside()) {
+            self.emit(self.work, CpuCorners {}, source);
+            return;
+        }
+
+        for (i of 0..CTRI_CORNERS * CTRI_V) {
+            self.polyA[i] = self.work[i];
+        }
+        let mut n : i32 = CTRI_CORNERS;
+        let mut fromA : bool = true;
+        for (p of 0..CTRI_PLANES) {
+            n = self.clipPlane(fromA, n, p);
+            fromA = !fromA;
+            if (n < CTRI_CORNERS) {
+                return;
+            }
+        }
+
+        let poly : f32[] = self.polyOf(fromA);
+        for (i of 1..n - 1) {
+            self.emit(poly, CpuCorners { a: 0, b: i, c: i + 1 }, source);
+        }
+    }
+
+    // Clips the `n` vertices of buffer A (or B) against `plane` into the other buffer; returns how many it has.
+    fn clipPlane(mut self, fromA : bool, n : i32, plane : i32) : i32 {
+        let mut out : i32 = 0;
+        for (i of 0..n) {
+            let j : i32 = (i + 1) % n;
+            let di : f32 = self.sideOf(fromA, i, plane);
+            let dj : f32 = self.sideOf(fromA, j, plane);
+            let insideI : bool = di >= (0.0 as f32);
+            if (insideI) {
+                self.copyVertex(fromA, i, out);
+                out = out + 1;
+            }
+            if (insideI != (dj >= (0.0 as f32))) {
+                let cut : CpuCut = CpuCut { from: i, to: j, t: di / (di - dj) };
+                self.lerpVertex(fromA, cut, out);
+                out = out + 1;
+            }
+        }
+        return out;
+    }
+
+    // Polygon buffer A or B.
+    fn polyOf(self, isA : bool) : f32[] {
+        if (isA) {
+            return self.polyA;
+        }
+        return self.polyB;
+    }
+
+    // Side of vertex `v` of the current source polygon (A or B) against `plane`.
+    fn sideOf(self, fromA : bool, v : i32, plane : i32) : f32 {
+        return CpuTris::side(self.polyOf(fromA), v, plane);
+    }
+
+    // Copies vertex `i` of the source polygon to slot `out` of the other one.
+    fn copyVertex(mut self, fromA : bool, i : i32, out : i32) : void {
+        let mut to : f32[] = self.polyOf(!fromA);
+        let from : f32[] = self.polyOf(fromA);
+        for (k of 0..CTRI_V) {
+            to[out * CTRI_V + k] = from[i * CTRI_V + k];
+        }
+    }
+
+    // Writes the point where `cut` crosses its edge to slot `out` of the other polygon.
+    fn lerpVertex(mut self, fromA : bool, cut : CpuCut, out : i32) : void {
+        let mut to : f32[] = self.polyOf(!fromA);
+        let from : f32[] = self.polyOf(fromA);
+        for (k of 0..CTRI_V) {
+            let a : f32 = from[cut.from * CTRI_V + k];
+            to[out * CTRI_V + k] = a + (from[cut.to * CTRI_V + k] - a) * cut.t;
+        }
+    }
+
+    // Snaps three vertices of `poly` to the screen and stores the triangle, dropping it when it is degenerate,
+    // culled, or off screen.
+    fn emit(mut self, poly : f32[], corners : CpuCorners, source : CpuTriSource) : void {
+        if (!self.snapCorners(poly, corners)) {
+            return;
+        }
+        let area : i64 = self.snapArea();
+        if (area == 0) {
+            return;
+        }
+        let back : bool = area > 0;
+        if (back && source.skipBack) {
+            return;
+        }
+        if (self.snappedOffscreen()) {
+            return;
+        }
+        if (self.count == self.room) {
+            self.reserve(self.room * 2);
+        }
+        self.store(poly, corners, back, source);
+    }
+
+    // Projects the corners to the snapped grid (snapX/Y), keeping depth and 1/w; false when one is behind the eye.
+    fn snapCorners(mut self, poly : f32[], corners : CpuCorners) : bool {
+        let mut sx : i32[] = self.snapX;
+        let mut sy : i32[] = self.snapY;
+        let mut z : f32[] = self.snapZ;
+        let mut iw : f32[] = self.snapW;
+        for (k of 0..CTRI_CORNERS) {
+            let v : i32 = corners.at(k);
+            let w : f32 = poly[v * CTRI_V + 3];
+            if (!(w > CTRI_W_MIN)) {
+                return false;
+            }
+            let inv : f32 = (1.0 as f32) / w;
+            iw[k] = inv;
+            z[k] = poly[v * CTRI_V + 2] * inv;
+
+            // Clip space -1..1 to a unit square, then to pixels in subpixel units; rounded to the grid.
+            let half : f32 = 0.5;
+            let unitX : f32 = poly[v * CTRI_V] * inv * half + half;
+            let unitY : f32 = poly[v * CTRI_V + 1] * inv * half + half;
+            let fx : f32 = unitX * (self.width as f32) * CTRI_SUBPIXEL_F;
+            let fy : f32 = unitY * (self.height as f32) * CTRI_SUBPIXEL_F;
+            sx[k] = CpuTris::floorI(fx + half);
+            sy[k] = CpuTris::floorI(fy + half);
+        }
+        return true;
+    }
+
+    // Twice the signed area of the snapped corners.
+    fn snapArea(self) : i64 {
+        let dx1 : i64 = (self.snapX[1] - self.snapX[0]) as i64;
+        let dy1 : i64 = (self.snapY[1] - self.snapY[0]) as i64;
+        let dx2 : i64 = (self.snapX[2] - self.snapX[0]) as i64;
+        let dy2 : i64 = (self.snapY[2] - self.snapY[0]) as i64;
+        return dx1 * dy2 - dy1 * dx2;
+    }
+
+    // True when the snapped corners' bounds miss the target entirely.
+    fn snappedOffscreen(self) : bool {
+        let minX : i32 = minI(minI(self.snapX[0], self.snapX[1]), self.snapX[2]);
+        let maxX : i32 = maxI(maxI(self.snapX[0], self.snapX[1]), self.snapX[2]);
+        let minY : i32 = minI(minI(self.snapY[0], self.snapY[1]), self.snapY[2]);
+        let maxY : i32 = maxI(maxI(self.snapY[0], self.snapY[1]), self.snapY[2]);
+
+        let pastRight : bool = (minX >> CPU_SUBPIXEL_SHIFT) >= self.width;
+        let pastBottom : bool = (minY >> CPU_SUBPIXEL_SHIFT) >= self.height;
+        return maxX < 0 || maxY < 0 || pastRight || pastBottom;
+    }
+
+    // Appends the snapped triangle (already tested) in canonical orientation: positive area, which for a front face
+    // (negative area) swaps its last two vertices.
+    fn store(mut self, poly : f32[], corners : CpuCorners, back : bool, source : CpuTriSource) : void {
+        let t : i32 = self.count;
+        let mut o1 : i32 = 1;
+        let mut o2 : i32 = 2;
+        if (!back) {
+            o1 = 2;
+            o2 = 1;
+        }
+        for (k of 0..CTRI_CORNERS) {
+            let src : i32 = match k {
+                0 => 0,
+                1 => o1,
+                _ => o2,
+            };
+            let v : i32 = corners.at(src);
+            self.snap[t * CTRI_SNAP + k * 2] = self.snapX[src];
+            self.snap[t * CTRI_SNAP + k * 2 + 1] = self.snapY[src];
+            self.zinv[t * CTRI_ZINV + k] = self.snapZ[src];
+            self.zinv[t * CTRI_ZINV + CTRI_CORNERS + k] = self.snapW[src];
+            for (a of 0..CTRI_ATTRS) {
+                self.attr[t * CTRI_ATTR + k * CTRI_ATTRS + a] = poly[v * CTRI_V + CTRI_POS + a];
+            }
+        }
+
+        self.geo[t * CTRI_GEO] = source.geo.x;
+        self.geo[t * CTRI_GEO + 1] = source.geo.y;
+        self.geo[t * CTRI_GEO + 2] = source.geo.z;
+
+        let mut flags : i32 = source.flags;
+        if (back) {
+            flags = flags | CPU_FLAG_BACK;
+        }
+        self.meta[t * CTRI_META + CTRI_META_INSTANCE] = source.instance;
+        self.meta[t * CTRI_META + CTRI_META_MATERIAL] = source.material;
+        self.meta[t * CTRI_META + CTRI_META_FLAGS] = flags;
+        self.meta[t * CTRI_META + CTRI_META_OBJECT] = self.curObject;
+        self.meta[t * CTRI_META + CTRI_META_LAYER] = self.curLayer;
+        self.count = t + 1;
+    }
+
+    static fn floorI(v : f32) : i32 {
+        let mut t : i32 = v as i32;
+        if ((t as f32) > v) {
+            t = t - 1;
+        }
+        return t;
+    }
+
+    // The tiles triangle `t` touches, clamped to the target.
+    fn tileRange(self, t : i32) : CpuTileRange {
+        let b : i32 = t * CTRI_SNAP;
+        let ax : i32 = self.snap[b];
+        let ay : i32 = self.snap[b + 1];
+        let bx : i32 = self.snap[b + 2];
+        let by : i32 = self.snap[b + 3];
+        let cx : i32 = self.snap[b + 4];
+        let cy : i32 = self.snap[b + 5];
+        let x0 : i32 = minI(minI(ax, bx), cx) >> CPU_SUBPIXEL_SHIFT;
+        let x1 : i32 = maxI(maxI(ax, bx), cx) >> CPU_SUBPIXEL_SHIFT;
+        let y0 : i32 = minI(minI(ay, by), cy) >> CPU_SUBPIXEL_SHIFT;
+        let y1 : i32 = maxI(maxI(ay, by), cy) >> CPU_SUBPIXEL_SHIFT;
+
+        return CpuTileRange {
+            x0: clampI(x0, 0, self.width - 1) / CPU_TILE,
+            y0: clampI(y0, 0, self.height - 1) / CPU_TILE,
+            x1: clampI(x1, 0, self.width - 1) / CPU_TILE,
+            y1: clampI(y1, 0, self.height - 1) / CPU_TILE,
+        };
+    }
+
+    /** Sorts the stored triangles into tile lists, keeping submission order inside each tile. */
+    pub(crate) fn bin(mut self) : void {
+        let tiles : i32 = self.tilesX * self.tilesY;
+        for (i of 0..tiles + 1) {
+            self.binStart[i] = 0;
+        }
+
+        // Count the triangles of each tile, then turn the counts into start offsets.
+        let mut total : i32 = 0;
+        for (t of 0..self.count) {
+            let range : CpuTileRange = self.tileRange(t);
+            for (ty of range.y0..range.y1 + 1) {
+                for (tx of range.x0..range.x1 + 1) {
+                    let slot : i32 = ty * self.tilesX + tx + 1;
+                    self.binStart[slot] = self.binStart[slot] + 1;
+                    total = total + 1;
+                }
+            }
+        }
+        for (i of 0..tiles) {
+            self.binStart[i + 1] = self.binStart[i + 1] + self.binStart[i];
+        }
+
+        // Fill each tile's list in submission order.
+        self.binList = new i32[(total + 1) as i64];
+        let mut fill : i32[] = new i32[(tiles + 1) as i64];
+        for (i of 0..tiles) {
+            fill[i] = self.binStart[i];
+        }
+        for (t of 0..self.count) {
+            let range : CpuTileRange = self.tileRange(t);
+            for (ty of range.y0..range.y1 + 1) {
+                for (tx of range.x0..range.x1 + 1) {
+                    let at : i32 = ty * self.tilesX + tx;
+                    self.binList[fill[at]] = t;
+                    fill[at] = fill[at] + 1;
+                }
+            }
+        }
+    }
+}
