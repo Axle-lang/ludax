@@ -1,0 +1,382 @@
+// hydro — checks of the metric shallow-water engine: balance, positivity, books, waves, friction, threads.
+//
+// Each check states its expected number in the comment beside it. A lake at rest stays at rest over any bed
+// (cliffs and thin rims included) to f32 rounding; a dam break keeps its depth positive and its volume; a
+// pulse crosses a flat lake at sqrt(g h); viscosity and friction only remove energy; one worker and eight give
+// the same bytes. Timing lines start with `measured`.
+
+use ludax::Checks;
+use ludax::HYDRO_SIDE_EAST;
+use ludax::HydroParams;
+use ludax::HydroWorld;
+
+/** The checks of the grid solver. */
+pub class HydroSuite {
+    /** Runs every check of the suite. */
+    pub static fn run(c : Checks) : void {
+        hydroLakeAtRest(c);
+        hydroRimAtRest(c);
+        hydroDamBreak(c);
+        hydroWaveSpeed(c);
+        hydroGravityScaling(c);
+        hydroFriction(c);
+        hydroOpenSide(c);
+        hydroThreadsAgree(c);
+        hydroCalmSleeps(c);
+        hydroViscosity(c);
+        hydroThinFilm(c);
+        hydroRepeatable(c);
+    }
+}
+
+/** A deterministic rough bed of `width` x `depth` metres-high cells in [0, `rough`], plus a step of `step`
+ * metres from column `stepAt` on. */
+pub fn hydroBed(width : i32, depth : i32, rough : f32, stepAt : i32, step : f32) : f32[] {
+    let mut bed : f32[] = new f32[(width * depth) as i64];
+    let mut seed : i64 = 12345;
+    for (z of 0..depth) {
+        for (x of 0..width) {
+            seed = (seed * 1103515245 + 12345) % 2147483648;
+            let unit : f32 = ((seed / 65536) % 1000) as f32 / (1000.0 as f32);
+            let mut height : f32 = rough * unit;
+            if (x >= stepAt) {
+                height = height + step;
+            }
+            bed[(z * width + x) as i64] = height;
+        }
+    }
+    return bed;
+}
+
+/** Parameters for the checks: no overfall unless asked, no friction. */
+pub fn hydroParams() : HydroParams {
+    let mut p : HydroParams = HydroParams::standard();
+    p.fall.capacity = 0;
+    p.manning = 0.0;
+    return p;
+}
+
+/** The largest |surface - level| over the wet cells and the largest speed, as (surface error, speed). */
+fn hydroDisturbance(w : HydroWorld, level : f32) : f64 {
+    let mut worst : f64 = 0.0;
+    for (z of 0..w.depth()) {
+        for (x of 0..w.width()) {
+            let h : f32 = w.depthOfCell(x, z);
+            if (h <= 0.0) {
+                continue;
+            }
+            let eta : f32 = w.bedAt(x, z) + h;
+            let e : f64 = (eta - level) as f64;
+            if (e > worst) {
+                worst = e;
+            }
+            if (-e > worst) {
+                worst = -e;
+            }
+        }
+    }
+    return worst;
+}
+
+// A deep lake over a rough bed with a cliff in the middle: still after twenty seconds.
+fn hydroLakeAtRest(c : Checks) : void {
+    let w : HydroWorld = new HydroWorld(64, 32, 1.0, hydroParams());
+    w.setBed(hydroBed(64, 32, 0.8, 40, 2.0), 64, 32, 1.0);
+    w.fillRect(3.5, 0, 0, 63, 31);
+    let before : f64 = w.volume();
+    for (k of 0..20) {
+        w.wakeAll();
+        w.step(1.0);
+    }
+    let err : f64 = hydroDisturbance(w, 3.5);
+    c.that("lake over rough bed and step stays level (error ${err})", err < 0.000001);
+    c.near("lake volume unchanged", w.volume(), before, before * 0.0000001);
+    println("  measured lake at rest: surface error ${err}, substeps ${w.substepCount()}");
+    w.close();
+}
+
+// A shallow lake whose rim climbs out of it: islands, thin films and a dry shore, all still.
+fn hydroRimAtRest(c : Checks) : void {
+    let w : HydroWorld = new HydroWorld(64, 32, 1.0, hydroParams());
+    w.setBed(hydroBed(64, 32, 2.0, 100, 0.0), 64, 32, 1.0);
+    w.fillRect(1.0, 0, 0, 63, 31);
+    let before : f64 = w.volume();
+    for (k of 0..20) {
+        w.wakeAll();
+        w.step(1.0);
+    }
+    let err : f64 = hydroDisturbance(w, 1.0);
+    c.that("rim with islands stays level (error ${err})", err < 0.00001);
+    c.near("rim volume unchanged", w.volume(), before, before * 0.000001);
+    let mut dry : bool = true;
+    for (z of 0..32) {
+        for (x of 0..64) {
+            if (w.bedAt(x, z) > 1.0 && w.depthOfCell(x, z) > 0.0) {
+                dry = false;
+            }
+        }
+    }
+    c.that("no water on ground above the level", dry);
+    w.close();
+}
+
+// A column of water released on a dry bed: depth never negative, volume kept, water spreads.
+fn hydroDamBreak(c : Checks) : void {
+    let w : HydroWorld = new HydroWorld(96, 16, 1.0, hydroParams());
+    w.fillRect(4.0, 0, 0, 15, 15);
+    let before : f64 = w.volume();
+    let mut lowest : f32 = 1.0;
+    for (k of 0..400) {
+        w.step(0.02);
+        for (z of 0..16) {
+            for (x of 0..96) {
+                lowest = if_min(lowest, w.depthOfCell(x, z));
+            }
+        }
+    }
+    c.that("dam break depth never negative (${lowest})", lowest >= 0.0);
+    let l : f64 = w.ledger().residual();
+    c.that("dam break volume closes (${l})", l < before * 0.00001 && -l < before * 0.00001);
+    c.that("dam break wets the dry bed", w.depthOfCell(40, 8) > 0.0);
+    println("  measured dam break: substeps ${w.substepCount()} time ${w.time()}");
+    w.close();
+}
+
+fn if_min(a : f32, b : f32) : f32 {
+    if (b < a) {
+        return b;
+    }
+    return a;
+}
+
+// Where is the crest of a pulse, in cells, along row 8 (the x of the deepest cell past `from`).
+fn hydroCrest(w : HydroWorld, from : i32) : i32 {
+    let mut best : i32 = from;
+    let mut deepest : f32 = 0.0;
+    for (x of from..w.width()) {
+        let h : f32 = w.depthOfCell(x, 1);
+        if (h > deepest) {
+            deepest = h;
+            best = x;
+        }
+    }
+    return best;
+}
+
+// A ripple on a lake of depth h travels at sqrt(g h): 4 m deep, g 9.81 -> 6.26 m/s, so 3 s -> 18.8 m.
+fn hydroWaveSpeed(c : Checks) : void {
+    let mut p : HydroParams = hydroParams();
+    p.viscosity = 0.0;
+    let w : HydroWorld = new HydroWorld(160, 4, 1.0, p);
+    w.fillRect(4.0, 0, 0, 159, 3);
+    for (z of 0..4) {
+        for (x of 78..82) {
+            w.pour(x, z, 0.1);
+        }
+    }
+    for (k of 0..300) {
+        w.step(0.01);
+    }
+    let right : i32 = hydroCrest(w, 80);
+    let reached : f32 = ((right - 80) as f32);
+    let expect : f32 = 18.79;
+    c.that(
+        "pulse travels at sqrt(g h): ${reached} m vs ${expect}",
+        reached > expect * 0.8 && reached < expect * 1.2
+    );
+    w.close();
+}
+
+// Four times the gravity doubles the wave speed.
+fn hydroGravityScaling(c : Checks) : void {
+    let mut far : f32 = 0.0;
+    let mut near : f32 = 0.0;
+    for (pass of 0..2) {
+        let mut p : HydroParams = hydroParams();
+        p.viscosity = 0.0;
+        if (pass == 1) {
+            p.gravity = 39.24;
+        }
+        let w : HydroWorld = new HydroWorld(200, 4, 1.0, p);
+        w.fillRect(4.0, 0, 0, 199, 3);
+        for (z of 0..4) {
+            for (x of 98..102) {
+                w.pour(x, z, 0.1);
+            }
+        }
+        for (k of 0..150) {
+            w.step(0.01);
+        }
+        let reached : f32 = ((hydroCrest(w, 100) - 100) as f32);
+        if (pass == 0) {
+            near = reached;
+        } else {
+            far = reached;
+        }
+        w.close();
+    }
+    let ratio : f32 = far / near;
+    c.that("quadruple gravity doubles the wave speed (ratio ${ratio})", ratio > 1.7 && ratio < 2.3);
+}
+
+// A sloshing pond loses energy to the bed: with Manning friction the peak depth difference decays faster.
+fn hydroFriction(c : Checks) : void {
+    let mut drops : f32 = 0.0;
+    let mut slow : f32 = 0.0;
+    for (pass of 0..2) {
+        let mut p : HydroParams = hydroParams();
+        p.viscosity = 0.0;
+        if (pass == 1) {
+            p.manning = 0.08;
+        }
+        let w : HydroWorld = new HydroWorld(40, 8, 1.0, p);
+        w.fillRect(1.0, 0, 0, 19, 7);
+        w.fillRect(0.5, 20, 0, 39, 7);
+        for (k of 0..400) {
+            w.step(0.05);
+        }
+        let swing : f32 = w.depthOfCell(2, 4) - w.depthOfCell(37, 4);
+        if (swing < 0.0) {
+            slow = -swing;
+        } else {
+            slow = swing;
+        }
+        if (pass == 0) {
+            drops = slow;
+        }
+        w.close();
+    }
+    c.that("friction damps sloshing (free ${drops}, rough ${slow})", slow < drops);
+}
+
+// An open east side lets the lake drain and the ledger counts it.
+fn hydroOpenSide(c : Checks) : void {
+    let w : HydroWorld = new HydroWorld(32, 8, 1.0, hydroParams());
+    w.setOutflowBoundary(HYDRO_SIDE_EAST);
+    w.fillRect(1.0, 0, 0, 31, 7);
+    let before : f64 = w.volume();
+    for (k of 0..200) {
+        w.step(0.05);
+    }
+    let l : f64 = w.ledger().outflow;
+    let r : f64 = w.ledger().residual();
+    c.that("open side drains the lake (out ${l} of ${before})", l > before * 0.2);
+    c.that("books close with an open side (${r})", r < before * 0.00001 && -r < before * 0.00001);
+    w.close();
+}
+
+// One worker and eight workers give the same water, bit for bit.
+fn hydroThreadsAgree(c : Checks) : void {
+    let a : HydroWorld = hydroThreadsRun(1);
+    let b : HydroWorld = hydroThreadsRun(8);
+    let mut same : bool = true;
+    for (z of 0..40) {
+        for (x of 0..96) {
+            if (a.depthOfCell(x, z) != b.depthOfCell(x, z)
+                || a.dischargeXOfCell(x, z) != b.dischargeXOfCell(x, z)) {
+                same = false;
+            }
+        }
+    }
+    c.that("1 and 8 threads are bit-identical", same);
+    c.that("same substep count", a.substepCount() == b.substepCount());
+    a.close();
+    b.close();
+}
+
+fn hydroThreadsRun(threads : i32) : HydroWorld {
+    let mut p : HydroParams = hydroParams();
+    p.threads = threads;
+    let w : HydroWorld = new HydroWorld(96, 40, 1.0, p);
+    w.setBed(hydroBed(96, 40, 0.5, 60, 1.5), 96, 40, 1.0);
+    w.fillRect(2.5, 0, 0, 30, 39);
+    w.setOutflowBoundary(HYDRO_SIDE_EAST);
+    for (k of 0..100) {
+        w.step(0.05);
+    }
+    return w;
+}
+
+// A calm lake costs nothing: after it settles no tile runs.
+fn hydroCalmSleeps(c : Checks) : void {
+    let w : HydroWorld = new HydroWorld(128, 64, 1.0, hydroParams());
+    w.fillRect(2.0, 0, 0, 127, 63);
+    for (k of 0..5) {
+        w.step(0.1);
+    }
+    let awake : i32 = w.activeCellCount();
+    c.that("a lake at rest sleeps (${awake} cells awake)", awake == 0);
+    w.close();
+}
+
+// Eddy viscosity only removes energy: a sloshing pond swings less with it than without.
+fn hydroViscosity(c : Checks) : void {
+    let mut swings : f32[] = new f32[2];
+    for (pass of 0..2) {
+        let mut p : HydroParams = hydroParams();
+        p.viscosity = 0.0;
+        if (pass == 1) {
+            p.viscosity = 20.0;
+        }
+        let w : HydroWorld = new HydroWorld(40, 8, 1.0, p);
+        w.fillRect(1.0, 0, 0, 19, 7);
+        w.fillRect(0.5, 20, 0, 39, 7);
+        for (k of 0..200) {
+            w.step(0.05);
+        }
+        let swing : f32 = w.depthOfCell(2, 4) - w.depthOfCell(37, 4);
+        swings[pass as i64] = swing;
+        if (swing < 0.0) {
+            swings[pass as i64] = -swing;
+        }
+        w.close();
+    }
+    c.that(
+        "viscosity damps sloshing (free ${swings[0]}, viscous ${swings[1]})",
+        swings[1] < swings[0]
+    );
+}
+
+// A thin film on a slope runs off without going negative or checkerboarding: depth stays in [0, film].
+fn hydroThinFilm(c : Checks) : void {
+    let mut bed : f32[] = new f32[(64 * 8) as i64];
+    for (z of 0..8) {
+        for (x of 0..64) {
+            bed[(z * 64 + x) as i64] = ((63 - x) as f32) * (0.05 as f32);
+        }
+    }
+    let w : HydroWorld = new HydroWorld(64, 8, 1.0, hydroParams());
+    w.setBed(bed, 64, 8, 1.0);
+    w.setOutflowBoundary(HYDRO_SIDE_EAST);
+    w.fillRect(3.2, 0, 0, 20, 7);
+    for (k of 0..400) {
+        w.step(0.05);
+    }
+    let mut lowest : f32 = 1.0;
+    for (z of 0..8) {
+        for (x of 0..64) {
+            lowest = if_min(lowest, w.depthOfCell(x, z));
+        }
+    }
+    let r : f64 = w.ledger().residual();
+    c.that("thin film stays non-negative (${lowest})", lowest >= 0.0);
+    c.that("thin film books close (${r})", r < 0.001 && -r < 0.001);
+    w.close();
+}
+
+// Two runs of the same world agree bit for bit.
+fn hydroRepeatable(c : Checks) : void {
+    let a : HydroWorld = hydroThreadsRun(1);
+    let b : HydroWorld = hydroThreadsRun(1);
+    let mut same : bool = true;
+    for (z of 0..40) {
+        for (x of 0..96) {
+            if (a.depthOfCell(x, z) != b.depthOfCell(x, z)) {
+                same = false;
+            }
+        }
+    }
+    c.that("two runs of the same world are identical", same);
+    a.close();
+    b.close();
+}

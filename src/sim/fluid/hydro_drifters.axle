@@ -1,0 +1,530 @@
+// hydro_drifters — markers that ride the water for real: they float, they fall, they float on.
+//
+// A drifter is a Lagrangian point carried by the engine's own flow, so what it does is the water's doing and not
+// an animation. It is in one of four states:
+//
+//   floating  rides the surface. Its velocity is the engine's velocity readout (`HydroSample::velocity`, built
+//             from the face discharges), advanced with the explicit midpoint rule (second order) over the
+//             substep of the engine, and its height is the water surface under it. At a closed wall it slides
+//             along the wall; into a bank (a nearly dry cell) it does not enter but slides along it; past an open
+//             side it is gone. When the water under it falls below `HYDRO_DRIFT_STRAND` it is stranded.
+//   airborne  a parcel in flight. A floating drifter that crosses an overfall lip (a face the bed detection
+//             marked) leaves the water with the local speed along the fall, at least the curtain's minimum exit
+//             speed, plus a small scatter from a fixed-seed `Pcg32`; it flies under gravity with the same quadratic
+//             air drag as the curtain's liquid parcels (a parcel of radius `HYDRO_DRIFT_RADIUS`), in micro-steps no
+//             longer than `HYDRO_DRIFT_MICRO` seconds, and lands where the grid has water: it floats again with
+//             the pool's velocity there. Landing on dry ground strands it.
+//   stranded  rests on a dry or nearly dry cell; it floats again when the depth under it is back above
+//             `HYDRO_DRIFT_RESUME`.
+//   gone      left the world through an open side; counted, no longer moved.
+//
+// Storage is structure-of-arrays, f32 positions in grid-local metres (the particle layer's coordinates), a byte of
+// state, an id, the age and the path length, and a ring buffer of the last `HYDRO_TRAIL_POINTS` positions sampled
+// every `trailInterval` simulated seconds. Bytes per drifter: position 12, velocity 12, state 1, id 4, age 4,
+// travel 4, trail clock 4, ring head and fill 8, trail 128 * 12 = 1536: about 1.6 kB; 2048 drifters are 3.3 MB.
+// Nothing allocates after construction. Drifters are few, so they are stepped on the calling thread in index order:
+// the result is trivially identical for any number of workers, and a function of the history alone.
+
+use crate::core::math::scalar::{max, maxI, min, minI};
+use crate::core::math::vec2::Vec2;
+use crate::core::math::vec3::Vec3;
+use crate::core::rng::pcg32::Pcg32;
+use crate::sim::fluid::fluid_noise::FluidNoise;
+use crate::sim::fluid::hydro_grid::{
+    HYDRO_SIDE_EAST, HYDRO_SIDE_NORTH, HYDRO_SIDE_SOUTH, HYDRO_SIDE_WEST, HydroGrid
+};
+use crate::sim::fluid::hydro_params::HydroFallParams;
+use crate::sim::fluid::hydro_passes::hydroCbrt;
+use crate::sim::fluid::hydro_sample::HydroSample;
+
+/** State: riding the water surface. */
+pub const HYDRO_DRIFT_FLOATING : u8 = 0;
+
+/** State: in flight after a lip. */
+pub const HYDRO_DRIFT_AIRBORNE : u8 = 1;
+
+/** State: resting on a dry or nearly dry cell. */
+pub const HYDRO_DRIFT_STRANDED : u8 = 2;
+
+/** State: left the world through an open side. */
+pub const HYDRO_DRIFT_GONE : u8 = 3;
+
+/** How many positions the trail of a drifter remembers. */
+pub const HYDRO_TRAIL_POINTS : i32 = 128;
+
+/** Depth under which a cell is too dry to float on, m. */
+const HYDRO_DRIFT_STRAND : f32 = 0.01;
+
+/** Depth over which a stranded drifter floats again, m. */
+const HYDRO_DRIFT_RESUME : f32 = 0.03;
+
+/** Radius of the parcel a drifter flies as, m (its drag is the curtain's, `3/8 Cd rho_air/rho_water / r`). */
+const HYDRO_DRIFT_RADIUS : f32 = 0.05;
+
+/** The longest micro-step of the flight, s. */
+const HYDRO_DRIFT_MICRO : f32 = 0.02;
+
+/** Three eighths, the sphere's drag shape factor. */
+const HYDRO_DRIFT_SHAPE : f32 = 0.375;
+
+/** How far inside a wall a clamped drifter stays, as a share of a cell. */
+const HYDRO_DRIFT_WALL : f32 = 0.001;
+
+/** How far past a lip face a launched drifter starts, as a share of a cell. */
+const HYDRO_DRIFT_CLEAR : f32 = 0.05;
+
+/** The scatter of a launch, as a share of its speed. */
+const HYDRO_DRIFT_SCATTER : f32 = 0.08;
+
+/** The `Pcg32` stream of the drifters, fixed so a world's markers are repeatable. */
+const HYDRO_DRIFT_STREAM : u64 = 211;
+
+/** The markers of one world. */
+pub(crate) class HydroDrifters {
+    /** The most drifters; 0 switches the module off. */
+    pub(crate) capacity : i32;
+
+    /** How many exist, and how many of them have left through an open side. */
+    pub(crate) count : i32 = 0;
+    pub(crate) gone  : i32 = 0;
+
+    /** The surface-layer factor on the flow, the eddy-mixing coefficient, the bed roughness and the seed of the
+     * walk, set by the world from its parameters; `ticks` counts the substeps the walk has taken. */
+    pub(crate) surfaceFactor : f32 = 1.0;
+    pub(crate) diffusion     : f32 = 0.0;
+    pub(crate) manning       : f32 = 0.0;
+    pub(crate) seed          : i64 = 20240607;
+    ticks                    : i32 = 0;
+
+    /** Simulated seconds between two trail samples. */
+    pub(crate) trailInterval : f32 = 0.25;
+
+    pub(crate) pos    : f32[];
+    pub(crate) state  : u8[];
+    pub(crate) ids    : i32[];
+    pub(crate) age    : f32[];
+    pub(crate) travel : f32[];
+    pub(crate) trail  : f32[];
+    vel               : f32[];
+    clock             : f32[];
+    head              : i32[];
+    filled            : i32[];
+    params            : HydroFallParams;
+    gravity           : f32;
+    dragScale         : f32;
+    rng               : Pcg32;
+
+    /** A module for `capacity` drifters in a world of the given `gravity` and overfall parameters. */
+    constructor(capacity : i32, params : HydroFallParams, gravity : f32) {
+        let n : i32 = maxI(capacity, 0);
+        self.capacity = n;
+        self.params = params;
+        self.gravity = gravity;
+        self.dragScale = HYDRO_DRIFT_SHAPE * params.dragCoefficient * params.airDensity / params.waterDensity;
+        self.rng = new Pcg32(params.seed, HYDRO_DRIFT_STREAM);
+        let m : i64 = (n + 1) as i64;
+        self.pos = new f32[m * 3];
+        self.vel = new f32[m * 3];
+        self.state = new u8[m];
+        self.ids = new i32[m];
+        self.age = new f32[m];
+        self.travel = new f32[m];
+        self.clock = new f32[m];
+        self.head = new i32[m];
+        self.filled = new i32[m];
+        self.trail = new f32[m * ((HYDRO_TRAIL_POINTS * 3) as i64)];
+    }
+
+    // ---- adding and removing ----
+
+    /** Adds a drifter at (x, z) on the surface; answers its index, or -1 when the module is full. */
+    pub(crate) fn add(mut self, g : Shared<HydroGrid>, x : f32, z : f32) : i32 {
+        if (self.count >= self.capacity) {
+            return -1;
+        }
+        let k : i32 = self.count;
+        let i : i64 = k as i64;
+        let px : f32 = min(
+            max(x, HYDRO_DRIFT_WALL * g.cellSize),
+            (g.width as f32) * g.cellSize - HYDRO_DRIFT_WALL * g.cellSize
+        );
+        let pz : f32 = min(
+            max(z, HYDRO_DRIFT_WALL * g.cellSize),
+            (g.depth as f32) * g.cellSize - HYDRO_DRIFT_WALL * g.cellSize
+        );
+        self.pos[(k * 3) as i64] = px;
+        self.pos[(k * 3 + 2) as i64] = pz;
+        self.pos[(k * 3 + 1) as i64] = self.levelAt(g, px, pz);
+        self.vel[(k * 3) as i64] = 0.0;
+        self.vel[(k * 3 + 1) as i64] = 0.0;
+        self.vel[(k * 3 + 2) as i64] = 0.0;
+        self.state[i] = HYDRO_DRIFT_FLOATING;
+        if (self.depthAt(g, px, pz) < HYDRO_DRIFT_STRAND) {
+            self.state[i] = HYDRO_DRIFT_STRANDED;
+        }
+        self.ids[i] = k;
+        self.age[i] = 0.0;
+        self.travel[i] = 0.0;
+        self.clock[i] = 0.0;
+        self.head[i] = 0;
+        self.filled[i] = 0;
+        self.count = self.count + 1;
+        self.sample(k);
+        return k;
+    }
+
+    /**
+     * Scatters up to `count` drifters over the wet cells flagged in `mask` (`width * depth` bytes, row-major), in a
+     * fixed order from `Pcg32(seed)`: cells are drawn without repeat and the drifter is placed at a random point of
+     * its cell. Answers how many were added (fewer when the mask has fewer wet cells or the module is full).
+     */
+    pub(crate) fn scatter(mut self, g : Shared<HydroGrid>, mask : u8[], count : i32, seed : i32) : i32 {
+        let mut wet : i32[] = new i32[(g.width * g.depth + 1) as i64];
+        let mut n : i32 = 0;
+        for (z of 0..g.depth) {
+            for (x of 0..g.width) {
+                if (mask[(z * g.width + x) as i64] != 0 && g.h[g.index(x, z) as i64] >= HYDRO_DRIFT_RESUME) {
+                    wet[n as i64] = z * g.width + x;
+                    n = n + 1;
+                }
+            }
+        }
+        let pick : Pcg32 = new Pcg32(seed as u64, HYDRO_DRIFT_STREAM);
+        let mut added : i32 = 0;
+        while (added < count && n > 0) {
+            let j : i32 = minI((pick.nextF32() * (n as f32)) as i32, n - 1);
+            let cell : i32 = wet[j as i64];
+            wet[j as i64] = wet[(n - 1) as i64];
+            n = n - 1;
+            let x : f32 = (((cell % g.width) as f32) + pick.nextF32()) * g.cellSize;
+            let z : f32 = (((cell / g.width) as f32) + pick.nextF32()) * g.cellSize;
+            if (self.add(g, x, z) < 0) {
+                break;
+            }
+            added = added + 1;
+        }
+        return added;
+    }
+
+    /** Removes every drifter. */
+    pub(crate) fn clear(mut self) : void {
+        self.count = 0;
+        self.gone = 0;
+    }
+
+    /** Whether any drifter is in flight (the world then has work even with every tile asleep). */
+    pub(crate) fn anyAirborne(self) : bool {
+        for (k of 0..self.count) {
+            if (self.state[k as i64] == HYDRO_DRIFT_AIRBORNE) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // ---- reading ----
+
+    /** How many positions the trail of drifter `k` holds now. */
+    pub(crate) fn trailCount(self, k : i32) : i32 {
+        return self.filled[k as i64];
+    }
+
+    /** The `i`-th position of the trail of drifter `k`, oldest first. */
+    pub(crate) fn trailAt(self, k : i32, i : i32) : Vec3 {
+        let n : i32 = self.filled[k as i64];
+        let start : i32 = (self.head[k as i64] - n + HYDRO_TRAIL_POINTS * 2) % HYDRO_TRAIL_POINTS;
+        let slot : i32 = (start + i) % HYDRO_TRAIL_POINTS;
+        let b : i64 = ((k * HYDRO_TRAIL_POINTS + slot) * 3) as i64;
+        return Vec3::make(self.trail[b], self.trail[b + 1], self.trail[b + 2]);
+    }
+
+    /** The ring slot the next trail sample of drifter `k` goes to (for readers of the bulk array). */
+    pub(crate) fn trailHead(self, k : i32) : i32 {
+        return self.head[k as i64];
+    }
+
+    // ---- stepping ----
+
+    /** Advances every drifter by one substep of `dt` seconds. */
+    pub(crate) fn step(mut self, g : Shared<HydroGrid>, dt : f32) : void {
+        self.ticks = self.ticks + 1;
+        for (k of 0..self.count) {
+            let s : u8 = self.state[k as i64];
+            if (s == HYDRO_DRIFT_GONE) {
+                continue;
+            }
+            self.age[k as i64] = self.age[k as i64] + dt;
+            if (s == HYDRO_DRIFT_AIRBORNE) {
+                self.fly(g, k, dt);
+            } else {
+                self.ride(g, k, dt);
+            }
+            if (self.state[k as i64] != HYDRO_DRIFT_GONE) {
+                self.clock[k as i64] = self.clock[k as i64] + dt;
+                if (self.clock[k as i64] >= self.trailInterval) {
+                    self.clock[k as i64] = self.clock[k as i64] - self.trailInterval;
+                    self.sample(k);
+                }
+            }
+        }
+    }
+
+    // Pushes the current position of drifter `k` into its trail ring.
+    fn sample(mut self, k : i32) : void {
+        let h : i32 = self.head[k as i64];
+        let b : i64 = ((k * HYDRO_TRAIL_POINTS + h) * 3) as i64;
+        self.trail[b] = self.pos[(k * 3) as i64];
+        self.trail[b + 1] = self.pos[(k * 3 + 1) as i64];
+        self.trail[b + 2] = self.pos[(k * 3 + 2) as i64];
+        self.head[k as i64] = (h + 1) % HYDRO_TRAIL_POINTS;
+        if (self.filled[k as i64] < HYDRO_TRAIL_POINTS) {
+            self.filled[k as i64] = self.filled[k as i64] + 1;
+        }
+    }
+
+    // The water depth under (x, z), m, from the cell it is in.
+    fn depthAt(self, g : Shared<HydroGrid>, x : f32, z : f32) : f32 {
+        return g.h[g.index(self.cellX(g, x), self.cellZ(g, z)) as i64];
+    }
+
+    // The elevation of the water in the cell under (x, z): a marker rides the water of its own cell, never an
+    // interpolation across a cliff.
+    fn levelAt(self, g : Shared<HydroGrid>, x : f32, z : f32) : f32 {
+        let i : i64 = g.index(self.cellX(g, x), self.cellZ(g, z)) as i64;
+        return g.bed[i] + g.h[i];
+    }
+
+    fn cellX(self, g : Shared<HydroGrid>, x : f32) : i32 {
+        return minI(maxI((x * g.invCell) as i32, 0), g.width - 1);
+    }
+
+    fn cellZ(self, g : Shared<HydroGrid>, z : f32) : i32 {
+        return minI(maxI((z * g.invCell) as i32, 0), g.depth - 1);
+    }
+
+    // Whether (x, z) is past an open side of the world.
+    fn leaves(self, g : Shared<HydroGrid>, x : f32, z : f32) : bool {
+        let open : u8 = g.open;
+        return (x < 0.0 && (open & HYDRO_SIDE_WEST) != 0)
+            || (x > (g.width as f32) * g.cellSize && (open & HYDRO_SIDE_EAST) != 0)
+            || (z < 0.0 && (open & HYDRO_SIDE_NORTH) != 0)
+            || (z > (g.depth as f32) * g.cellSize && (open & HYDRO_SIDE_SOUTH) != 0);
+    }
+
+    // The coordinate pulled inside the world (a closed wall stops it and lets it slide).
+    fn inside(self, g : Shared<HydroGrid>, v : f32, cells : i32) : f32 {
+        let edge : f32 = HYDRO_DRIFT_WALL * g.cellSize;
+        return min(max(v, edge), (cells as f32) * g.cellSize - edge);
+    }
+
+    // The velocity of the water at (x, z), clamped into the world.
+    fn flow(self, g : Shared<HydroGrid>, x : f32, z : f32) : Vec3 {
+        let v : Vec2 = HydroSample::velocity(g, self.inside(g, x, g.width), self.inside(g, z, g.depth));
+        return Vec3::make(v.x * self.surfaceFactor, 0.0, v.y * self.surfaceFactor);
+    }
+
+    // A standard normal number that depends on nothing but the marker, the substep and the axis: four uniforms
+    // of the stateless hash summed (Irwin-Hall) and scaled to unit variance, so the walk is the same whoever
+    // computes it and in whatever order.
+    fn normal(self, id : i32, axis : i32) : f32 {
+        let mut sum : f64 = 0.0;
+        for (j of 0..4) {
+            sum = sum + FluidNoise::unit(self.seed, id as i64, ((self.ticks * 8 + axis * 4 + j) as i64));
+        }
+        return ((sum - 2.0) * 1.7320508075688772) as f32;
+    }
+
+    // The eddy diffusivity at cell (x, z), m2/s: `D = alpha * h * (u* + turbulence * sqrt(g h))`, with the
+    // friction velocity `u* = sqrt(g) n |u| / h^(1/6)` of the Manning bed and the engine's turbulence field.
+    fn diffusivity(self, g : Shared<HydroGrid>, x : f32, z : f32, speed : f32) : f32 {
+        let i : i64 = g.index(self.cellX(g, x), self.cellZ(g, z)) as i64;
+        let depth : f32 = g.h[i];
+        if (depth <= HYDRO_DRIFT_STRAND) {
+            return 0.0;
+        }
+        let ustar : f32 = self.gravity.sqrt() * self.manning * speed / hydroCbrt(depth).sqrt();
+        return self.diffusion * depth * (ustar + g.turb[i] * (self.gravity * depth).sqrt());
+    }
+
+    // A floating or stranded drifter for one substep.
+    fn ride(mut self, g : Shared<HydroGrid>, k : i32, dt : f32) : void {
+        let i : i64 = k as i64;
+        let b : i64 = (k * 3) as i64;
+        let x0 : f32 = self.pos[b];
+        let z0 : f32 = self.pos[b + 2];
+        let here : f32 = self.depthAt(g, x0, z0);
+        if (self.state[i] == HYDRO_DRIFT_STRANDED) {
+            if (here < HYDRO_DRIFT_RESUME) {
+                return;
+            }
+            self.state[i] = HYDRO_DRIFT_FLOATING;
+        }
+        if (here < HYDRO_DRIFT_STRAND) {
+            self.state[i] = HYDRO_DRIFT_STRANDED;
+            return;
+        }
+
+        // The midpoint rule: the velocity here, then the velocity half a step along it.
+        let first : Vec3 = self.flow(g, x0, z0);
+        let second : Vec3 = self.flow(g, x0 + (0.5 as f32) * dt * first.x, z0 + (0.5 as f32) * dt * first.z);
+        let mut wantX : f32 = x0 + dt * second.x;
+        let mut wantZ : f32 = z0 + dt * second.z;
+        if (self.diffusion > 0.0) {
+            // Eddy mixing: a random walk with the local diffusivity, the displacement sqrt(2 D dt) N(0, 1).
+            let speed : f32 = (second.x * second.x + second.z * second.z).sqrt()
+                / max(self.surfaceFactor, 0.001);
+            let reach : f32 = (((2.0 as f32) * self.diffusivity(g, x0, z0, speed)) * dt).sqrt();
+            wantX = wantX + reach * self.normal(self.ids[i], 0);
+            wantZ = wantZ + reach * self.normal(self.ids[i], 1);
+        }
+        if (self.leaves(g, wantX, wantZ)) {
+            self.state[i] = HYDRO_DRIFT_GONE;
+            self.gone = self.gone + 1;
+            return;
+        }
+
+        let x1 : f32 = self.inside(g, wantX, g.width);
+        let z1 : f32 = self.inside(g, wantZ, g.depth);
+        let cx0 : i32 = self.cellX(g, x0);
+        let cz0 : i32 = self.cellZ(g, z0);
+        let cx1 : i32 = self.cellX(g, x1);
+        let cz1 : i32 = self.cellZ(g, z1);
+        if (self.lip(g, k, cx0, cz0, cx1, cz1, second)) {
+            return;
+        }
+
+        // A bank (a nearly dry cell) is not entered: slide along it by the component that stays wet.
+        let mut mx : f32 = x1;
+        let mut mz : f32 = z1;
+        if (self.depthAt(g, x1, z1) < HYDRO_DRIFT_STRAND) {
+            mx = x0;
+            mz = z0;
+            if (self.depthAt(g, x1, z0) >= HYDRO_DRIFT_STRAND) {
+                mx = x1;
+            } else if (self.depthAt(g, x0, z1) >= HYDRO_DRIFT_STRAND) {
+                mz = z1;
+            }
+        }
+        let dx : f32 = mx - x0;
+        let dz : f32 = mz - z0;
+        self.travel[i] = self.travel[i] + (dx * dx + dz * dz).sqrt();
+        self.pos[b] = mx;
+        self.pos[b + 2] = mz;
+        self.pos[b + 1] = self.levelAt(g, mx, mz);
+    }
+
+    // Launches drifter `k` as a parcel when its step crosses a lip face; true when it did. A fall toward +x
+    // crosses the face stored at the receiving cell (cx0 + 1) with flag +1, toward -x the face at the donor cell
+    // with flag -1; likewise along z.
+    fn lip(
+        mut self,
+        g : Shared<HydroGrid>,
+        k : i32,
+        cx0 : i32,
+        cz0 : i32,
+        cx1 : i32,
+        cz1 : i32,
+        flow : Vec3
+    ) : bool {
+        if (cx1 > cx0 && g.lipX[g.index(cx0 + 1, cz0) as i64] > 0) {
+            self.launch(g, k, 1.0, 0.0, flow);
+            return true;
+        }
+        if (cx1 < cx0 && g.lipX[g.index(cx0, cz0) as i64] < 0) {
+            self.launch(g, k, -1.0, 0.0, flow);
+            return true;
+        }
+        if (cz1 > cz0 && g.lipZ[g.index(cx0, cz0 + 1) as i64] > 0) {
+            self.launch(g, k, 0.0, 1.0, flow);
+            return true;
+        }
+        if (cz1 < cz0 && g.lipZ[g.index(cx0, cz0) as i64] < 0) {
+            self.launch(g, k, 0.0, -1.0, flow);
+            return true;
+        }
+        return false;
+    }
+
+    // Throws drifter `k` off the lip along (dirX, dirZ), a unit axis: at least the curtain's minimum exit speed.
+    fn launch(mut self, g : Shared<HydroGrid>, k : i32, dirX : f32, dirZ : f32, flow : Vec3) : void {
+        let b : i64 = (k * 3) as i64;
+        let along : f32 = flow.x * dirX + flow.z * dirZ;
+        let across : f32 = -flow.x * dirZ + flow.z * dirX;
+        let speed : f32 = max(along, self.params.minExitSpeed);
+        let scatter : f32 = HYDRO_DRIFT_SCATTER * speed * (self.rng.nextF32() - (0.5 as f32));
+        let side : f32 = across + scatter;
+        let x : f32 = self.pos[b];
+        let z : f32 = self.pos[b + 2];
+        let cell : f32 = g.cellSize;
+        // The face the drifter crosses lies at the cell edge in the direction of the fall.
+        let mut edgeX : f32 = x;
+        let mut edgeZ : f32 = z;
+        if (dirX > 0.0) {
+            let ix : i32 = (x * g.invCell) as i32;
+            edgeX = ((ix + 1) as f32) * cell;
+        }
+        if (dirX < 0.0) {
+            let ix : i32 = (x * g.invCell) as i32;
+            edgeX = (ix as f32) * cell;
+        }
+        if (dirZ > 0.0) {
+            let iz : i32 = (z * g.invCell) as i32;
+            edgeZ = ((iz + 1) as f32) * cell;
+        }
+        if (dirZ < 0.0) {
+            let iz : i32 = (z * g.invCell) as i32;
+            edgeZ = (iz as f32) * cell;
+        }
+        self.pos[b] = edgeX + dirX * HYDRO_DRIFT_CLEAR * cell;
+        self.pos[b + 2] = edgeZ + dirZ * HYDRO_DRIFT_CLEAR * cell;
+        self.vel[b] = dirX * speed - dirZ * side;
+        self.vel[b + 1] = 0.0;
+        self.vel[b + 2] = dirZ * speed + dirX * side;
+        self.state[k as i64] = HYDRO_DRIFT_AIRBORNE;
+    }
+
+    // An airborne drifter for one substep, in micro-steps.
+    fn fly(mut self, g : Shared<HydroGrid>, k : i32, dt : f32) : void {
+        let pieces : i32 = maxI(((dt / HYDRO_DRIFT_MICRO) + (0.999 as f32)) as i32, 1);
+        let h : f32 = dt / (pieces as f32);
+        let b : i64 = (k * 3) as i64;
+        for (p of 0..pieces) {
+            let mut vx : f32 = self.vel[b];
+            let mut vy : f32 = self.vel[b + 1] - self.gravity * h;
+            let mut vz : f32 = self.vel[b + 2];
+            let speed : f32 = (vx * vx + vy * vy + vz * vz).sqrt();
+            let grip : f32 = (1.0 as f32) + self.dragScale * speed * h / HYDRO_DRIFT_RADIUS;
+            vx = vx / grip;
+            vy = vy / grip;
+            vz = vz / grip;
+            let x : f32 = self.pos[b] + vx * h;
+            let y : f32 = self.pos[b + 1] + vy * h;
+            let z : f32 = self.pos[b + 2] + vz * h;
+            self.travel[k as i64] = self.travel[k as i64] + speed * h / grip;
+            self.vel[b] = vx;
+            self.vel[b + 1] = vy;
+            self.vel[b + 2] = vz;
+            if (self.leaves(g, x, z)) {
+                self.state[k as i64] = HYDRO_DRIFT_GONE;
+                self.gone = self.gone + 1;
+                return;
+            }
+
+            let cx : i32 = self.cellX(g, x);
+            let cz : i32 = self.cellZ(g, z);
+            let cell : i64 = g.index(cx, cz) as i64;
+            let surface : f32 = g.bed[cell] + g.h[cell];
+            self.pos[b] = self.inside(g, x, g.width);
+            self.pos[b + 1] = y;
+            self.pos[b + 2] = self.inside(g, z, g.depth);
+            if (y <= surface) {
+                self.pos[b + 1] = surface;
+                self.state[k as i64] = HYDRO_DRIFT_FLOATING;
+                if (g.h[cell] < HYDRO_DRIFT_STRAND) {
+                    self.state[k as i64] = HYDRO_DRIFT_STRANDED;
+                }
+                return;
+            }
+        }
+    }
+}

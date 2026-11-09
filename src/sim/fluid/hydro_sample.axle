@@ -1,0 +1,221 @@
+// hydro_sample — reading the grid between cell centres, for a renderer, a boat or a sound.
+//
+// Every reading is a bilinear blend of the four cell centres around the point, in grid-local metres. Two
+// readings need care at a shore. The depth is a plain blend, so it thins out smoothly over the last cell of
+// water. The surface elevation is blended only over the cells that hold water, weighted by their bilinear
+// weights, so the surface does not sag to the bed across a rim where one neighbour is dry; with no wet cell
+// around, it is the bed. Velocity is the plain blend of the cell velocities (dry cells have none).
+//
+// Points outside the grid read the nearest edge cell. Nothing allocates.
+
+use crate::core::math::scalar::{abs, maxI, minI};
+use crate::core::math::vec2::Vec2;
+use crate::sim::fluid::hydro_grid::HydroGrid;
+
+/** The four cells and weights of a point: cell (x, z) and its east, south and south-east neighbours. */
+pub(crate) struct HydroStencil {
+    /** Array index of the north-west cell of the four. */
+    pub(crate) base : i32 = 0;
+
+    /** Weight of the east neighbour along x (0 at the west cell's centre, 1 at the east one's). */
+    pub(crate) fx : f32 = 0.0;
+
+    /** Weight of the south neighbour along z. */
+    pub(crate) fz : f32 = 0.0;
+
+    /** Step to the east neighbour: 1, or 0 at the east edge so it repeats the cell. */
+    pub(crate) stepX : i32 = 1;
+
+    /** Step to the south neighbour: the pitch, or 0 at the south edge. */
+    pub(crate) stepZ : i32 = 0;
+}
+
+/** Interpolated readings of a grid, as static functions. */
+pub(crate) class HydroSample {
+    /** The stencil of the point (x, z) in grid-local metres. */
+    pub(crate) static fn stencil(g : Shared<HydroGrid>, x : f32, z : f32) : HydroStencil {
+        let gx : f32 = x * g.invCell - (0.5 as f32);
+        let gz : f32 = z * g.invCell - (0.5 as f32);
+        let mut ix : i32 = gx as i32;
+        let mut iz : i32 = gz as i32;
+        let mut fx : f32 = gx - (ix as f32);
+        let mut fz : f32 = gz - (iz as f32);
+        if (gx < 0.0) {
+            ix = 0;
+            fx = 0.0;
+        }
+        if (gz < 0.0) {
+            iz = 0;
+            fz = 0.0;
+        }
+        ix = minI(maxI(ix, 0), g.width - 1);
+        iz = minI(maxI(iz, 0), g.depth - 1);
+        let mut stepX : i32 = 1;
+        let mut stepZ : i32 = g.pitch;
+        if (ix + 1 >= g.width) {
+            stepX = 0;
+            fx = 0.0;
+        }
+        if (iz + 1 >= g.depth) {
+            stepZ = 0;
+            fz = 0.0;
+        }
+        return HydroStencil { base: g.index(ix, iz), fx: fx, fz: fz, stepX: stepX, stepZ: stepZ };
+    }
+
+    /** The blend of `field` over a stencil. */
+    pub(crate) static fn blend(field : f32[], s : HydroStencil) : f32 {
+        let a : f32 = field[s.base as i64];
+        let b : f32 = field[(s.base + s.stepX) as i64];
+        let c : f32 = field[(s.base + s.stepZ) as i64];
+        let d : f32 = field[(s.base + s.stepX + s.stepZ) as i64];
+        let top : f32 = a + (b - a) * s.fx;
+        let low : f32 = c + (d - c) * s.fx;
+        return top + (low - top) * s.fz;
+    }
+
+    /**
+     * The velocity of the water in the cell at array index `i` along x, m/s, built from the face discharges the
+     * last substep moved: the mean of the discharge across the cell's west face and its east face, over its
+     * depth. This is the staggered average, so a sum of it over a cross-section is the flow meter's reading
+     * (the cell's momentum variable `qx` is not: in a steep bend it runs ahead of the mass). A cell of a tile
+     * that slept, or a dry one, answers its stored velocity.
+     */
+    pub(crate) static fn flowX(g : Shared<HydroGrid>, x : i32, z : i32) : f32 {
+        let i : i64 = g.index(x, z) as i64;
+        let depth : f32 = g.h[i];
+        if (depth <= g.dry || g.tileRun[g.tileOf(x, z) as i64] == 0) {
+            return g.u[i];
+        }
+        let mean : f32 = (g.mRx[i] + g.mLx[(g.index(x, z) + 1) as i64]) * (0.5 as f32);
+        return mean / depth;
+    }
+
+    /** The velocity along z of the cell (x, z) from its face discharges; see `flowX`. */
+    pub(crate) static fn flowZ(g : Shared<HydroGrid>, x : i32, z : i32) : f32 {
+        let i : i64 = g.index(x, z) as i64;
+        let depth : f32 = g.h[i];
+        if (depth <= g.dry || g.tileRun[g.tileOf(x, z) as i64] == 0) {
+            return g.w[i];
+        }
+        let mean : f32 = (g.mRz[i] + g.mLz[(g.index(x, z) + g.pitch) as i64]) * (0.5 as f32);
+        return mean / depth;
+    }
+
+    /** The velocity at (x, z): the bilinear blend of the four cells' face-built velocities, m/s. */
+    pub(crate) static fn velocity(g : Shared<HydroGrid>, x : f32, z : f32) : Vec2 {
+        let gx : f32 = x * g.invCell - (0.5 as f32);
+        let gz : f32 = z * g.invCell - (0.5 as f32);
+        let mut ix : i32 = gx as i32;
+        let mut iz : i32 = gz as i32;
+        let mut fx : f32 = gx - (ix as f32);
+        let mut fz : f32 = gz - (iz as f32);
+        if (gx < 0.0) {
+            ix = 0;
+            fx = 0.0;
+        }
+        if (gz < 0.0) {
+            iz = 0;
+            fz = 0.0;
+        }
+        ix = minI(maxI(ix, 0), g.width - 1);
+        iz = minI(maxI(iz, 0), g.depth - 1);
+        let ex : i32 = minI(ix + 1, g.width - 1);
+        let ez : i32 = minI(iz + 1, g.depth - 1);
+        if (ex == ix) {
+            fx = 0.0;
+        }
+        if (ez == iz) {
+            fz = 0.0;
+        }
+        let ux : f32 = HydroSample::mix(
+            HydroSample::flowX(g, ix, iz),
+            HydroSample::flowX(g, ex, iz),
+            HydroSample::flowX(g, ix, ez),
+            HydroSample::flowX(g, ex, ez),
+            fx,
+            fz
+        );
+        let uz : f32 = HydroSample::mix(
+            HydroSample::flowZ(g, ix, iz),
+            HydroSample::flowZ(g, ex, iz),
+            HydroSample::flowZ(g, ix, ez),
+            HydroSample::flowZ(g, ex, ez),
+            fx,
+            fz
+        );
+        return Vec2::make(ux, uz);
+    }
+
+    // Bilinear mix of four corner values.
+    static fn mix(a : f32, b : f32, c : f32, d : f32, fx : f32, fz : f32) : f32 {
+        let top : f32 = a + (b - a) * fx;
+        let low : f32 = c + (d - c) * fx;
+        return top + (low - top) * fz;
+    }
+
+    /** The water elevation at (x, z): bed plus depth over the wet cells around, the bed where all are dry. */
+    pub(crate) static fn surface(g : Shared<HydroGrid>, x : f32, z : f32) : f32 {
+        let s : HydroStencil = HydroSample::stencil(g, x, z);
+
+        // The water the point is nearest to sets the level; cells whose surface is farther than a cell from it
+        // (the other side of a cliff, a step between a lake and a pool) are not blended in.
+        let mut best : f32 = -1.0;
+        let mut level : f32 = 0.0;
+        for (k of 0..4) {
+            let at : i64 = HydroSample::cornerAt(s, k) as i64;
+            let w : f32 = HydroSample::cornerWeight(s, k);
+            if (g.h[at] > g.dry && w > best) {
+                best = w;
+                level = g.bed[at] + g.h[at];
+            }
+        }
+        if (best < 0.0) {
+            return HydroSample::blend(g.bed, s);
+        }
+
+        let mut sum : f32 = 0.0;
+        let mut weight : f32 = 0.0;
+        for (k of 0..4) {
+            let at : i64 = HydroSample::cornerAt(s, k) as i64;
+            let w : f32 = HydroSample::cornerWeight(s, k);
+            let eta : f32 = g.bed[at] + g.h[at];
+            if (g.h[at] > g.dry && abs(eta - level) <= g.cellSize) {
+                sum = sum + w * eta;
+                weight = weight + w;
+            }
+        }
+        if (weight <= 0.000001) {
+            return level;
+        }
+        return sum / weight;
+    }
+
+    // The array index of corner `k` (0 the stencil's own cell, 1 east, 2 south, 3 south-east).
+    static fn cornerAt(s : HydroStencil, k : i32) : i32 {
+        if (k == 1) {
+            return s.base + s.stepX;
+        }
+        if (k == 2) {
+            return s.base + s.stepZ;
+        }
+        if (k == 3) {
+            return s.base + s.stepX + s.stepZ;
+        }
+        return s.base;
+    }
+
+    // The bilinear weight of corner `k`.
+    static fn cornerWeight(s : HydroStencil, k : i32) : f32 {
+        if (k == 1) {
+            return s.fx * ((1.0 as f32) - s.fz);
+        }
+        if (k == 2) {
+            return ((1.0 as f32) - s.fx) * s.fz;
+        }
+        if (k == 3) {
+            return s.fx * s.fz;
+        }
+        return ((1.0 as f32) - s.fx) * ((1.0 as f32) - s.fz);
+    }
+}

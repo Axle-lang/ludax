@@ -1,0 +1,363 @@
+// hydro_dye — checks of the passive dye tracers, the compartment volume and the closed world.
+//
+// A tracer is a conservative scalar that moves with the water: the dye in the grid, in the air and gone out of
+// the world adds up to the dye put in, through a dam break, a curtain, a jet and a splash, with one worker or
+// eight. A dye front travels at the speed of the water, a lake tinted red leaves over a lip with its own volume,
+// and a closed world with a curtain and a jet running keeps its water.
+
+use ludax::Checks;
+use ludax::HYDRO_SIDE_EAST;
+use ludax::HydroDyeLedger;
+use ludax::HydroLedger;
+use ludax::HydroParams;
+use ludax::HydroVentParams;
+use ludax::HydroWorld;
+use ludax::Vec2;
+
+/** The checks of the tracers. */
+pub class HydroDyeSuite {
+    /** Runs every check of the suite. */
+    pub static fn run(c : Checks) : void {
+        hydroDyeDamBreak(c);
+        hydroDyeFront(c);
+        hydroDyeLake(c);
+        hydroDyeJet(c);
+        hydroDyeThreads(c);
+        hydroDyeMaskVolume(c);
+        hydroDyeClosed(c);
+    }
+}
+
+/** Cells across and down of the fall worlds, the cliff column, and the plateau height. */
+const HYDRO_DYE_WIDTH : i32 = 64;
+const HYDRO_DYE_ROWS : i32 = 16;
+const HYDRO_DYE_CLIFF : i32 = 30;
+const HYDRO_DYE_TOP : f32 = 10.0;
+
+fn hydroDyeBed() : f32[] {
+    let mut bed : f32[] = new f32[(HYDRO_DYE_WIDTH * HYDRO_DYE_ROWS) as i64];
+    for (z of 0..HYDRO_DYE_ROWS) {
+        for (x of 0..HYDRO_DYE_WIDTH) {
+            let mut h : f32 = 0.0;
+            if (x < HYDRO_DYE_CLIFF) {
+                h = HYDRO_DYE_TOP;
+            }
+            bed[(z * HYDRO_DYE_WIDTH + x) as i64] = h;
+        }
+    }
+    return bed;
+}
+
+fn hydroDyeMask(x0 : i32, x1 : i32) : u8[] {
+    let mut mask : u8[] = new u8[(HYDRO_DYE_WIDTH * HYDRO_DYE_ROWS) as i64];
+    for (z of 0..HYDRO_DYE_ROWS) {
+        for (x of 0..HYDRO_DYE_WIDTH) {
+            mask[(z * HYDRO_DYE_WIDTH + x) as i64] = 0;
+            if (x >= x0 && x < x1) {
+                mask[(z * HYDRO_DYE_WIDTH + x) as i64] = 1;
+            }
+        }
+    }
+    return mask;
+}
+
+fn hydroDyeWorld(threads : i32, open : bool) : HydroWorld {
+    let mut p : HydroParams = HydroParams::standard();
+    p.threads = threads;
+    let w : HydroWorld = new HydroWorld(HYDRO_DYE_WIDTH, HYDRO_DYE_ROWS, 1.0, p);
+    w.setBed(hydroDyeBed(), HYDRO_DYE_WIDTH, HYDRO_DYE_ROWS, 1.0);
+    if (open) {
+        w.setOutflowBoundary(HYDRO_SIDE_EAST);
+    }
+    return w;
+}
+
+// The largest residual, relative to the dye put in, over the tracers that had any.
+fn hydroDyeWorst(w : HydroWorld) : f64 {
+    let mut worst : f64 = 0.0;
+    for (k of 0..w.tracerCount()) {
+        let l : HydroDyeLedger = w.tracerLedger(k);
+        if (l.injected <= 0.0) {
+            continue;
+        }
+        let r : f64 = l.residual() / l.injected;
+        if (r > worst) {
+            worst = r;
+        }
+        if (-r > worst) {
+            worst = -r;
+        }
+    }
+    return worst;
+}
+
+// A dam break with the left part dyed: the dye stays between 0 and the water, and its sum is conserved.
+fn hydroDyeDamBreak(c : Checks) : void {
+    let mut p : HydroParams = HydroParams::standard();
+    p.fall.capacity = 0;
+    let w : HydroWorld = new HydroWorld(96, 16, 1.0, p);
+    w.fillRect(4.0, 0, 0, 95, 15);
+    let mut mask : u8[] = new u8[(96 * 16) as i64];
+    for (z of 0..16) {
+        for (x of 0..96) {
+            mask[(z * 96 + x) as i64] = 0;
+            if (x < 16) {
+                mask[(z * 96 + x) as i64] = 1;
+            }
+        }
+    }
+    w.dyeRegion(0, mask);
+    w.pour(8, 8, 2.0);
+    let before : f64 = w.tracerMass(0);
+    let mut high : f32 = 0.0;
+    let mut low : f32 = 1.0;
+    for (k of 0..500) {
+        w.step(0.02);
+        for (x of 0..96) {
+            let t : f32 = w.tracerAt(((x as f32) + (0.5 as f32)), (8.5 as f32), 0);
+            if (t > high) {
+                high = t;
+            }
+            if (t < low) {
+                low = t;
+            }
+        }
+    }
+    let l : HydroDyeLedger = w.tracerLedger(0);
+    println("  measured dye, dam break: dye ${before} -> ${w.tracerMass(0)} m3, residual ${l.residual()}, concentration ${low} to ${high}");
+    c.that(
+        "the dye stays between none and all the water (${low}, ${high})",
+        low >= 0.0 && high <= 1.0001
+    );
+    c.that(
+        "dye is conserved through a dam break (${l.residual()})",
+        l.residual() < before * 0.00001 && -l.residual() < before * 0.00001
+    );
+    c.that(
+        "the dye spread beyond its first cells",
+        w.tracerAt((30.5 as f32), (8.5 as f32), 0) > 0.0
+    );
+    w.close();
+}
+
+// A dye front in a steady channel moves at the speed of the water.
+fn hydroDyeFront(c : Checks) : void {
+    let mut bed : f32[] = new f32[(200 * 4) as i64];
+    for (z of 0..4) {
+        for (x of 0..200) {
+            bed[(z * 200 + x) as i64] = (0.6 as f32) - (x as f32) * (0.003 as f32);
+        }
+    }
+    let mut p : HydroParams = HydroParams::standard();
+    p.fall.capacity = 0;
+    let w : HydroWorld = new HydroWorld(200, 4, 1.0, p);
+    w.setBed(bed, 200, 4, 1.0);
+    w.setOutflowBoundary(HYDRO_SIDE_EAST);
+    let id : i32 = w.addInflow(1.5, 2.0, 4.0);
+    for (k of 0..3000) {
+        w.step(0.1);
+    }
+    w.setInflowTracer(id, 0);
+    let mut first : f32 = 0.0;
+    for (k of 0..200) {
+        w.step(0.1);
+        if (k == 99) {
+            first = hydroDyeFrontAt(w);
+        }
+    }
+    let second : f32 = hydroDyeFrontAt(w);
+    let u : Vec2 = w.surfaceVelocityAt((80.0 as f32), (2.0 as f32));
+    let speed : f32 = (second - first) / (10.0 as f32);
+    println("  measured dye front: ${speed} m/s between 10 s and 20 s, water ${u.x} m/s at x = 80");
+    c.that(
+        "the dye front moves at the speed of the water (${speed} vs ${u.x})",
+        speed > 0.85 * u.x && speed < 1.15 * u.x
+    );
+    w.close();
+}
+
+// Where the dye concentration along the channel centre is at least one half, farthest, m.
+fn hydroDyeFrontAt(w : HydroWorld) : f32 {
+    let mut at : f32 = 0.0;
+    for (x of 0..199) {
+        if (w.tracerAt(((x as f32) + (0.5 as f32)), (2.0 as f32), 0) >= 0.5) {
+            at = (x as f32) + (0.5 as f32);
+        }
+    }
+    return at;
+}
+
+// A lake tinted red drains over a lip: the red water below is the lake's own volume lost, and the dye is
+// conserved through the curtain and the splash.
+fn hydroDyeLake(c : Checks) : void {
+    let w : HydroWorld = hydroDyeWorld(1, false);
+    w.fillRect(HYDRO_DYE_TOP + 2.0, 0, 0, HYDRO_DYE_CLIFF - 1, HYDRO_DYE_ROWS - 1);
+    let lake : u8[] = hydroDyeMask(0, HYDRO_DYE_CLIFF);
+    w.dyeRegion(0, lake);
+    let start : f64 = w.volumeOfMask(lake);
+    let dyed : f64 = w.tracerMass(0);
+    let mut peak : i32 = 0;
+    for (k of 0..3000) {
+        w.step(0.02);
+        if (w.particleCount() > peak) {
+            peak = w.particleCount();
+        }
+    }
+    let l : HydroDyeLedger = w.tracerLedger(0);
+    let water : HydroLedger = w.ledger();
+    let left : f64 = start - w.volumeOfMask(lake) - w.airborneTracerMass(0);
+    let mut below : f64 = 0.0;
+    for (z of 0..HYDRO_DYE_ROWS) {
+        for (x of HYDRO_DYE_CLIFF..HYDRO_DYE_WIDTH) {
+            let at : f32 = (x as f32) + (0.5 as f32);
+            below = below
+                + ((w.depthOfCell(x, z) * w.tracerAt(at, (z as f32) + (0.5 as f32), 0)) as f64);
+        }
+    }
+    println("  measured dye lake: lake ${start} m3, ${left} m3 left over the lip, red water below ${below} m3, dye residual ${l.residual()} of ${dyed}, water residual ${water.residual()}, ${peak} particles");
+    c.that(
+        "dye is conserved through the curtain and the splash (${l.residual()})",
+        l.residual() < dyed * 0.0001 && -l.residual() < dyed * 0.0001
+    );
+    c.that(
+        "the water that left the lake is the red water below (${left} vs ${below})",
+        below > 0.95 * left && below < 1.05 * left
+    );
+    c.that("the curtain carried dye (${peak} particles)", peak > 500);
+    c.that(
+        "the plateau kept its dye where its water stayed",
+        w.tracerAt((5.5 as f32), (8.5 as f32), 0) > 0.95
+    );
+    w.close();
+}
+
+// A jet in a dyed pool throws the dye, and it comes back.
+fn hydroDyeJet(c : Checks) : void {
+    let p : HydroParams = HydroParams::standard();
+    let w : HydroWorld = new HydroWorld(40, 40, 1.0, p);
+    w.fillRect(1.0, 0, 0, 39, 39);
+    let mut mask : u8[] = new u8[(40 * 40) as i64];
+    for (i of 0..1600) {
+        mask[i as i64] = 1;
+    }
+    w.dyeRegion(2, mask);
+    let mut v : HydroVentParams = HydroVentParams {};
+    v.discharge = 0.5;
+    w.addVent(20.0, 20.0, v);
+    let dyed : f64 = w.tracerMass(2);
+    let mut flying : f64 = 0.0;
+    for (k of 0..1000) {
+        w.step(0.01);
+        if (w.airborneTracerMass(2) > flying) {
+            flying = w.airborneTracerMass(2);
+        }
+    }
+    w.setVentPower(0, 0.0);
+    for (k of 0..1500) {
+        w.step(0.01);
+    }
+    let l : HydroDyeLedger = w.tracerLedger(2);
+    println("  measured dye jet: ${flying} m3 of dye in the air at most, residual ${l.residual()} of ${dyed}, back in the pool ${w.tracerMass(2)}");
+    c.that("the jet throws dye (${flying})", flying > 1.0);
+    c.that(
+        "the jet's dye is conserved (${l.residual()})",
+        l.residual() < dyed * 0.00001 && -l.residual() < dyed * 0.00001
+    );
+    c.that("the dye comes back (${w.tracerMass(2)} of ${dyed})", w.tracerMass(2) > dyed * 0.9999);
+    w.close();
+}
+
+// One worker and eight give the same dye, bit for bit, through a curtain with an inflow dyed.
+fn hydroDyeThreads(c : Checks) : void {
+    let a : HydroWorld = hydroDyeWorld(1, true);
+    let b : HydroWorld = hydroDyeWorld(8, true);
+    a.addInflowDyed((3.5 as f32), (8.0 as f32), (8.0 as f32), 1);
+    b.addInflowDyed((3.5 as f32), (8.0 as f32), (8.0 as f32), 1);
+    for (k of 0..1500) {
+        a.step(0.02);
+        b.step(0.02);
+    }
+    let mut same : bool = a.airborneTracerMass(1) == b.airborneTracerMass(1);
+    for (z of 0..HYDRO_DYE_ROWS) {
+        for (x of 0..HYDRO_DYE_WIDTH) {
+            let at : f32 = (x as f32) + (0.5 as f32);
+            let row : f32 = (z as f32) + (0.5 as f32);
+            if (a.tracerAt(at, row, 1) != b.tracerAt(at, row, 1)) {
+                same = false;
+            }
+        }
+    }
+    println("  measured dye threads: dye ${a.tracerMass(1)} in the grid, ${a.airborneTracerMass(1)} airborne, residual ${a.tracerLedger(1).residual()}");
+    c.that("dye with 1 and 8 workers is bit-identical", same);
+    c.that(
+        "a dyed inflow's books close (${a.tracerLedger(1).residual()})",
+        hydroDyeWorst(a) < 0.0001
+    );
+    a.close();
+    b.close();
+}
+
+// The volume of a mask is the sum of the depths in it.
+fn hydroDyeMaskVolume(c : Checks) : void {
+    let w : HydroWorld = hydroDyeWorld(1, false);
+    w.fillRect(HYDRO_DYE_TOP + 1.0, 0, 0, HYDRO_DYE_CLIFF - 1, HYDRO_DYE_ROWS - 1);
+    for (k of 0..500) {
+        w.step(0.02);
+    }
+    let mask : u8[] = hydroDyeMask(10, 50);
+    let mut sum : f64 = 0.0;
+    for (z of 0..HYDRO_DYE_ROWS) {
+        for (x of 10..50) {
+            sum = sum + (w.depthOfCell(x, z) as f64);
+        }
+    }
+    let volume : f64 = w.volumeOfMask(mask);
+    c.that(
+        "volumeOfMask is the sum of the depths (${volume} vs ${sum})",
+        volume > sum * 0.999999 && volume < sum * 1.000001
+    );
+    let everywhere : u8[] = hydroDyeMask(0, HYDRO_DYE_WIDTH);
+    c.that(
+        "volumeOfMask over everything is the grid's volume",
+        w.volumeOfMask(everywhere) == w.volume()
+    );
+    w.close();
+}
+
+// A closed world with a curtain and a jet running keeps its water: grid plus air is constant.
+fn hydroDyeClosed(c : Checks) : void {
+    let w : HydroWorld = hydroDyeWorld(1, false);
+    w.fillRect(HYDRO_DYE_TOP + 1.5, 0, 0, HYDRO_DYE_CLIFF - 1, HYDRO_DYE_ROWS - 1);
+    w.fillRect(1.0, HYDRO_DYE_CLIFF, 0, HYDRO_DYE_WIDTH - 1, HYDRO_DYE_ROWS - 1);
+    let mut v : HydroVentParams = HydroVentParams {};
+    v.discharge = 0.3;
+    w.addVent(48.0, 8.0, v);
+    let total0 : f64 = w.volume() + w.airborneVolume();
+    let mut worst : f64 = 0.0;
+    let mut peak : i32 = 0;
+    for (k of 0..6000) {
+        w.step(0.02);
+        if (k % 100 == 0) {
+            let drift : f64 = w.volume() + w.airborneVolume() - total0;
+            if (drift > worst) {
+                worst = drift;
+            }
+            if (-drift > worst) {
+                worst = -drift;
+            }
+        }
+        if (w.particleCount() > peak) {
+            peak = w.particleCount();
+        }
+    }
+    let total1 : f64 = w.volume() + w.airborneVolume();
+    let relative : f64 = (total1 - total0) / total0;
+    println("  measured closed world: ${total0} m3, after 120 s ${total1} m3, relative drift ${relative}, worst sampled ${worst / total0}, ${peak} particles, ledger residual ${w.ledger().residual()}");
+    c.that(
+        "a closed world keeps its water (relative ${relative})",
+        relative < 0.000001 && -relative < 0.000001
+    );
+    c.that("at every sample too (${worst / total0})", worst / total0 < 0.000001);
+    c.that("the curtain and the jet really ran (${peak} particles)", peak > 1000);
+    w.close();
+}

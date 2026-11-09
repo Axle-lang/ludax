@@ -1,0 +1,475 @@
+// hydro_passes — the tile loops of one substep: faces, positivity, update, and the surface fields.
+//
+// A substep is four passes over the tiles that run (`hydro_grid` explains which), each a separate parallel
+// loop with a barrier before the next, so a pass only reads what no other tile of the same pass writes:
+//
+//   faces    every cell computes the flux across its west and its north face from the cells around it
+//            (`hydro_flux`) and stores it, in the two views of a face. Faces next to a sleeping tile are zero:
+//            a sleeping tile is a wall for the tiles beside it, and the tile that runs writes the zeros itself,
+//            so exactly one tile ever writes a given face.
+//   scale    every cell finds how much of the water its four faces want out of it, and the factor, at most 1,
+//            that makes that no more than it holds. A face is paid by its donor: both its cells use the donor's
+//            factor, so the water that leaves one cell is exactly the water that arrives in the other.
+//   update   every cell adds the scaled fluxes of its four faces (it reads only faces and its own state, so it
+//            can be done in place), then applies infiltration, the semi-implicit Manning friction, the speed
+//            cap, the rest threshold and the dry rule, and refreshes its velocity and the tile's statistics.
+//   surface  turbulence is the shear of the velocity field, foam is made where it is strong, advected by the
+//            flow and decays; two stages because foam advects into a second buffer.
+//
+// Every loop runs along a row of the row-major arrays with hoisted bounds and no function call but `sqrt` in
+// its body except the face flux, which is the one place a Riemann problem is solved. No pass allocates, reads
+// a clock or depends on which thread runs which tile.
+
+use crate::core::math::scalar::{abs, max, maxI, min, minI};
+use crate::sim::fluid::hydro_flux::{HydroFaces, HydroFlux, HydroScheme};
+use crate::sim::fluid::hydro_grid::{HYDRO_TILE_H, HYDRO_TILE_W, HydroGrid};
+
+/** One third, as an f32, for the cube-root iteration. */
+const HYDRO_THIRD : f32 = 0.33333334;
+
+/** Two, as an f32. */
+const HYDRO_TWO_F : f32 = 2.0;
+
+/** Foam and turbulence under this count as none, so a tile with only such traces may sleep. */
+pub(crate) const HYDRO_SURFACE_EPSILON : f32 = 0.002;
+
+/** The shear (1/s times metres of depth, m/s) at which turbulence saturates at 1. */
+const HYDRO_SHEAR_FULL : f32 = 6.0;
+
+/** Foam made per second of fully saturated turbulence above `HYDRO_FOAM_ONSET`. */
+const HYDRO_FOAM_RATE : f32 = 1.2;
+
+/** Turbulence below which the flow makes no foam. */
+const HYDRO_FOAM_ONSET : f32 = 0.35;
+
+/** How fast foam decays, 1/s: a half-life of about four seconds. */
+const HYDRO_FOAM_DECAY : f32 = 0.17;
+
+/** How fast turbulence decays, 1/s: it dies in about two seconds. */
+const HYDRO_TURB_DECAY : f32 = 0.5;
+
+/** The cube root of a positive number: a fourth root as the guess and three Newton steps, no libm. */
+pub(crate) fn hydroCbrt(x : f32) : f32 {
+    let mut y : f32 = x.sqrt().sqrt();
+    for (k of 0..3) {
+        y = (HYDRO_TWO_F * y + x / (y * y)) * HYDRO_THIRD;
+    }
+    return y;
+}
+
+/** The passes of a substep, as static functions over a grid and a tile. */
+pub(crate) class HydroPasses {
+    /** Pass one for tile `t`: the flux across every face the tile owns. */
+    pub(crate) static fn faces(g : Shared<HydroGrid>, p : HydroScheme, t : i32) : void {
+        let tx : i32 = t % g.tilesX;
+        let tz : i32 = t / g.tilesX;
+        let x0 : i32 = tx * HYDRO_TILE_W;
+        let z0 : i32 = tz * HYDRO_TILE_H;
+        let mut x1 : i32 = minI(x0 + HYDRO_TILE_W, g.width);
+        let mut z1 : i32 = minI(z0 + HYDRO_TILE_H, g.depth);
+        let ownX1 : i32 = x1;
+        let ownZ1 : i32 = z1;
+        if (tx == g.tilesX - 1) {
+            x1 = g.width + 1;
+        }
+        if (tz == g.tilesZ - 1) {
+            z1 = g.depth + 1;
+        }
+
+        let pitch : i32 = g.pitch;
+        let mut jump : f32 = 0.0;
+        for (z of z0..z1) {
+            let base : i32 = g.index(x0, z);
+            for (x of x0..x1) {
+                let c : i32 = base + x - x0;
+                let fx : HydroFlux = HydroFaces::flux(c, 1, g.bed, g.h, g.u, g.w, p);
+                HydroPasses::storeX(g, c, fx);
+                let fz : HydroFlux = HydroFaces::flux(c, pitch, g.bed, g.h, g.w, g.u, p);
+                HydroPasses::storeZ(g, c, fz);
+                jump = max(jump, max(fx.jump, fz.jump));
+            }
+        }
+        g.tileJump[t as i64] = jump;
+
+        HydroPasses::sealEdges(g, p, t, tx, tz, x0, z0, ownX1, ownZ1);
+    }
+
+    // Faces between this tile and a sleeping neighbour carry nothing: the tile zeroes its own west and north
+    // edge when the neighbour sleeps, and the neighbour's west or north edge facing it when it is the one asleep.
+    static fn sealEdges(
+        g : Shared<HydroGrid>,
+        p : HydroScheme,
+        t : i32,
+        tx : i32,
+        tz : i32,
+        x0 : i32,
+        z0 : i32,
+        x1 : i32,
+        z1 : i32
+    ) : void {
+        if (tx > 0 && g.tileRun[(t - 1) as i64] == 0) {
+            for (z of z0..z1) {
+                HydroPasses::sealX(g, p, g.index(x0, z));
+            }
+        }
+        if (tz > 0 && g.tileRun[(t - g.tilesX) as i64] == 0) {
+            for (x of x0..x1) {
+                HydroPasses::sealZ(g, p, g.index(x, z0));
+            }
+        }
+        if (tx + 1 < g.tilesX && g.tileRun[(t + 1) as i64] == 0) {
+            for (z of z0..z1) {
+                HydroPasses::sealX(g, p, g.index(x1, z));
+            }
+        }
+        if (tz + 1 < g.tilesZ && g.tileRun[(t + g.tilesX) as i64] == 0) {
+            for (x of x0..x1) {
+                HydroPasses::sealZ(g, p, g.index(x, z1));
+            }
+        }
+    }
+
+    // A sealed face: no mass and no along-face momentum cross it, but the hydrostatic push of each side stays, so
+    // the cell that runs feels the wall it now has.
+    static fn sealX(g : Shared<HydroGrid>, p : HydroScheme, c : i32) : void {
+        let f : HydroFlux = HydroFaces::flux(c, 1, g.bed, g.h, g.u, g.w, p);
+        HydroPasses::storeX(g, c, HydroFlux {
+            normalLow: f.wallLow,
+            normalHigh: f.wallHigh,
+            wallLow: f.wallLow,
+            wallHigh: f.wallHigh,
+        });
+    }
+
+    static fn sealZ(g : Shared<HydroGrid>, p : HydroScheme, c : i32) : void {
+        let f : HydroFlux = HydroFaces::flux(c, g.pitch, g.bed, g.h, g.w, g.u, p);
+        HydroPasses::storeZ(g, c, HydroFlux {
+            normalLow: f.wallLow,
+            normalHigh: f.wallHigh,
+            wallLow: f.wallLow,
+            wallHigh: f.wallHigh,
+        });
+    }
+
+    // Stores the flux of the x face at `c` in both views; a lip face hides what falls from the cell it falls to.
+    static fn storeX(g : Shared<HydroGrid>, c : i32, f : HydroFlux) : void {
+        let i : i64 = c as i64;
+        let lip : i8 = g.lipX[i];
+        let mut toHigh : f32 = 1.0;
+        let mut toLow : f32 = 1.0;
+        if (lip > 0 && f.mass > 0.0) {
+            toHigh = 0.0;
+        }
+        if (lip < 0 && f.mass < 0.0) {
+            toLow = 0.0;
+        }
+        g.mLx[i] = f.mass * toLow;
+        g.mRx[i] = f.mass * toHigh;
+        g.nLx[i] = f.normalLow * toLow + f.wallLow * ((1.0 as f32) - toLow);
+        g.nRx[i] = f.normalHigh * toHigh + f.wallHigh * ((1.0 as f32) - toHigh);
+        g.tLx[i] = f.tangent * toLow;
+        g.tRx[i] = f.tangent * toHigh;
+    }
+
+    static fn storeZ(g : Shared<HydroGrid>, c : i32, f : HydroFlux) : void {
+        let i : i64 = c as i64;
+        let lip : i8 = g.lipZ[i];
+        let mut toHigh : f32 = 1.0;
+        let mut toLow : f32 = 1.0;
+        if (lip > 0 && f.mass > 0.0) {
+            toHigh = 0.0;
+        }
+        if (lip < 0 && f.mass < 0.0) {
+            toLow = 0.0;
+        }
+        g.mLz[i] = f.mass * toLow;
+        g.mRz[i] = f.mass * toHigh;
+        g.nLz[i] = f.normalLow * toLow + f.wallLow * ((1.0 as f32) - toLow);
+        g.nRz[i] = f.normalHigh * toHigh + f.wallHigh * ((1.0 as f32) - toHigh);
+        g.tLz[i] = f.tangent * toLow;
+        g.tRz[i] = f.tangent * toHigh;
+    }
+
+    /** Pass two for tile `t`: the share of its wanted outflow each cell can pay. */
+    pub(crate) static fn scale(g : Shared<HydroGrid>, p : HydroScheme, t : i32) : void {
+        let tx : i32 = t % g.tilesX;
+        let tz : i32 = t / g.tilesX;
+        let x0 : i32 = tx * HYDRO_TILE_W;
+        let z0 : i32 = tz * HYDRO_TILE_H;
+        let x1 : i32 = minI(x0 + HYDRO_TILE_W, g.width);
+        let z1 : i32 = minI(z0 + HYDRO_TILE_H, g.depth);
+        let pitch : i32 = g.pitch;
+        let dtI : f32 = p.dt * p.invCell;
+
+        for (z of z0..z1) {
+            let base : i32 = g.index(x0, z);
+            for (x of x0..x1) {
+                let c : i32 = base + x - x0;
+                let east : f32 = max(g.mLx[(c + 1) as i64], 0.0);
+                let west : f32 = max(-g.mRx[c as i64], 0.0);
+                let south : f32 = max(g.mLz[(c + pitch) as i64], 0.0);
+                let north : f32 = max(-g.mRz[c as i64], 0.0);
+                let wanted : f32 = (east + west + south + north) * dtI;
+                let held : f32 = g.h[c as i64];
+                let mut s : f32 = 1.0;
+                if (wanted > held) {
+                    s = held / wanted;
+                }
+                g.scale[c as i64] = s;
+
+                // The concentration of every dye in the cell as the update will see it, 0 to 1.
+                for (k of 0..g.tracers) {
+                    let at : i64 = (k * g.cells + c) as i64;
+                    let mut share : f32 = 0.0;
+                    if (held > p.tiny) {
+                        share = min(g.dye[at] / held, 1.0);
+                    }
+                    g.conc[at] = share;
+                }
+            }
+        }
+    }
+
+    /** Pass three for tile `t`: apply the scaled fluxes, the friction and the dry rules; refresh the tile's stats. */
+    pub(crate) static fn update(g : Shared<HydroGrid>, p : HydroScheme, t : i32) : void {
+        let tx : i32 = t % g.tilesX;
+        let tz : i32 = t / g.tilesX;
+        let x0 : i32 = tx * HYDRO_TILE_W;
+        let z0 : i32 = tz * HYDRO_TILE_H;
+        let x1 : i32 = minI(x0 + HYDRO_TILE_W, g.width);
+        let z1 : i32 = minI(z0 + HYDRO_TILE_H, g.depth);
+        let pitch : i32 = g.pitch;
+        let dtI : f32 = p.dt * p.invCell;
+        let drag : f32 = p.dt * p.gravity * p.manning * p.manning;
+        let soak : f32 = p.infiltration * p.dt;
+        let scale : f32[] = g.scale;
+        let mRx : f32[] = g.mRx;
+        let mLx : f32[] = g.mLx;
+        let mRz : f32[] = g.mRz;
+        let mLz : f32[] = g.mLz;
+        let nRx : f32[] = g.nRx;
+        let nLx : f32[] = g.nLx;
+        let tRz : f32[] = g.tRz;
+        let tLz : f32[] = g.tLz;
+        let tRx : f32[] = g.tRx;
+        let tLx : f32[] = g.tLx;
+        let nRz : f32[] = g.nRz;
+        let nLz : f32[] = g.nLz;
+        let conc : f32[] = g.conc;
+        let mut dyes : f32[] = g.dye;
+        let tracers : i32 = g.tracers;
+        let cells : i32 = g.cells;
+        let mut h : f32[] = g.h;
+        let mut qxa : f32[] = g.qx;
+        let mut qza : f32[] = g.qz;
+        let mut u : f32[] = g.u;
+        let mut w : f32[] = g.w;
+
+        let mut fastest : f32 = 0.0;
+        let mut moving : bool = false;
+        let mut lost : f64 = 0.0;
+        for (z of z0..z1) {
+            let base : i32 = g.index(x0, z);
+            for (x of x0..x1) {
+                let c : i32 = base + x - x0;
+                let i : i64 = c as i64;
+                let east : i64 = (c + 1) as i64;
+                let south : i64 = (c + pitch) as i64;
+                let mine : f32 = scale[i];
+
+                // The factor each face pays by: its donor's.
+                let mut sWest : f32 = mine;
+                let mut sEast : f32 = scale[east];
+                let mut sNorth : f32 = mine;
+                let mut sSouth : f32 = scale[south];
+                if (mRx[i] > 0.0) {
+                    sWest = scale[(c - 1) as i64];
+                }
+                if (mLx[east] > 0.0) {
+                    sEast = mine;
+                }
+                if (mRz[i] > 0.0) {
+                    sNorth = scale[(c - pitch) as i64];
+                }
+                if (mLz[south] > 0.0) {
+                    sSouth = mine;
+                }
+
+                let mass : f32 = mRx[i] * sWest - mLx[east] * sEast + mRz[i] * sNorth - mLz[south] * sSouth;
+                let alongX : f32 = nRx[i] * sWest - nLx[east] * sEast + tRz[i] * sNorth - tLz[south] * sSouth;
+                let alongZ : f32 = tRx[i] * sWest - tLx[east] * sEast + nRz[i] * sNorth - nLz[south] * sSouth;
+
+                // The dye moves with the water: the same fluxes, the same donor factors, the donor's concentration.
+                for (k of 0..tracers) {
+                    let off : i64 = (k * cells) as i64;
+                    let mut cWest : f32 = conc[off + i];
+                    let mut cEast : f32 = conc[off + east];
+                    let mut cNorth : f32 = conc[off + i];
+                    let mut cSouth : f32 = conc[off + south];
+                    if (mRx[i] > 0.0) {
+                        cWest = conc[off + ((c - 1) as i64)];
+                    }
+                    if (mLx[east] > 0.0) {
+                        cEast = conc[off + i];
+                    }
+                    if (mRz[i] > 0.0) {
+                        cNorth = conc[off + ((c - pitch) as i64)];
+                    }
+                    if (mLz[south] > 0.0) {
+                        cSouth = conc[off + i];
+                    }
+                    let flow : f32 = mRx[i] * sWest * cWest - mLx[east] * sEast * cEast
+                        + mRz[i] * sNorth * cNorth
+                        - mLz[south] * sSouth * cSouth;
+                    dyes[off + i] = max(dyes[off + i] + dtI * flow, 0.0);
+                }
+
+                let mut depth : f32 = h[i] + dtI * mass;
+                let mut qx : f32 = qxa[i] + dtI * alongX;
+                let mut qz : f32 = qza[i] + dtI * alongZ;
+
+                let take : f32 = min(depth, soak);
+                depth = depth - take;
+                lost = lost + (take as f64);
+
+                let mut vx : f32 = 0.0;
+                let mut vz : f32 = 0.0;
+                if (depth > p.dry) {
+                    let inv : f32 = (1.0 as f32) / depth;
+                    let mut speed : f32 = (qx * qx + qz * qz).sqrt() * inv;
+                    if (speed > 0.0 && drag > 0.0) {
+                        let ease : f32 = (1.0 as f32)
+                            / ((1.0 as f32) + drag * speed * inv / hydroCbrt(depth));
+                        qx = qx * ease;
+                        qz = qz * ease;
+                        speed = speed * ease;
+                    }
+                    if (speed > p.maxSpeed) {
+                        let cap : f32 = p.maxSpeed / speed;
+                        qx = qx * cap;
+                        qz = qz * cap;
+                        speed = p.maxSpeed;
+                    }
+                    if (speed < p.restSpeed) {
+                        qx = 0.0;
+                        qz = 0.0;
+                        speed = 0.0;
+                    }
+                    vx = qx * inv;
+                    vz = qz * inv;
+                    fastest = max(fastest, speed + (p.gravity * depth).sqrt());
+                    if (speed > 0.0) {
+                        moving = true;
+                    }
+                } else {
+                    qx = 0.0;
+                    qz = 0.0;
+                }
+
+                h[i] = depth;
+                qxa[i] = qx;
+                qza[i] = qz;
+                u[i] = vx;
+                w[i] = vz;
+            }
+        }
+
+        g.tileSpeed[t as i64] = fastest;
+        g.tileLost[t as i64] = g.tileLost[t as i64] + lost;
+        let mut flag : u8 = 0;
+        if (moving || g.tileJump[t as i64] > 0.0 || g.tileFoam[t as i64] > HYDRO_SURFACE_EPSILON) {
+            flag = 1;
+        }
+        g.tileFlow[t as i64] = flag;
+    }
+
+    /** Pass four, first stage, for tile `t`: turbulence from the shear, and the next foam. */
+    pub(crate) static fn surface(g : Shared<HydroGrid>, p : HydroScheme, t : i32) : void {
+        let tx : i32 = t % g.tilesX;
+        let tz : i32 = t / g.tilesX;
+        let x0 : i32 = tx * HYDRO_TILE_W;
+        let z0 : i32 = tz * HYDRO_TILE_H;
+        let x1 : i32 = minI(x0 + HYDRO_TILE_W, g.width);
+        let z1 : i32 = minI(z0 + HYDRO_TILE_H, g.depth);
+        let pitch : i32 = g.pitch;
+        let half : f32 = (0.5 as f32) * p.invCell;
+        let turbKeep : f32 = max((1.0 as f32) - HYDRO_TURB_DECAY * p.dt, 0.0);
+        let foamKeep : f32 = max((1.0 as f32) - HYDRO_FOAM_DECAY * p.dt, 0.0);
+        let make : f32 = HYDRO_FOAM_RATE * p.dt;
+        let shearScale : f32 = half / HYDRO_SHEAR_FULL;
+
+        let mut peak : f32 = 0.0;
+        for (z of z0..z1) {
+            let base : i32 = g.index(x0, z);
+            for (x of x0..x1) {
+                let c : i32 = base + x - x0;
+                let i : i64 = c as i64;
+                let depth : f32 = g.h[i];
+                if (depth <= p.dry) {
+                    g.turb[i] = 0.0;
+                    g.foamNext[i] = 0.0;
+                    continue;
+                }
+
+                let shear : f32 = abs(g.u[(c + 1) as i64] - g.u[(c - 1) as i64])
+                    + abs(g.u[(c + pitch) as i64] - g.u[(c - pitch) as i64])
+                    + abs(g.w[(c + 1) as i64] - g.w[(c - 1) as i64])
+                    + abs(g.w[(c + pitch) as i64] - g.w[(c - pitch) as i64]);
+                let fresh : f32 = min(shear * depth * shearScale, 1.0);
+                let turbulence : f32 = max(g.turb[i] * turbKeep, fresh);
+                g.turb[i] = turbulence;
+
+                let carried : f32 = HydroPasses::carry(g, c, p.dt * p.invCell);
+                let foam : f32 = min(
+                    carried * foamKeep + make * max(turbulence - HYDRO_FOAM_ONSET, 0.0),
+                    1.0
+                );
+                g.foamNext[i] = foam;
+                peak = max(peak, max(foam, turbulence));
+            }
+        }
+        g.tileFoam[t as i64] = peak;
+    }
+
+    // The foam that arrives at cell `c` this substep: the value at the point the water came from, by linear
+    // interpolation of the four cells around it (semi-Lagrangian advection; the Courant limit keeps it inside).
+    static fn carry(g : Shared<HydroGrid>, c : i32, dtI : f32) : f32 {
+        let i : i64 = c as i64;
+        let bx : f32 = -g.u[i] * dtI;
+        let bz : f32 = -g.w[i] * dtI;
+        let ax : f32 = abs(bx);
+        let az : f32 = abs(bz);
+        let mut stepX : i32 = 1;
+        let mut stepZ : i32 = g.pitch;
+        if (bx < 0.0) {
+            stepX = -1;
+        }
+        if (bz < 0.0) {
+            stepZ = 0 - g.pitch;
+        }
+        let near : f32 = g.foam[i];
+        let alongX : f32 = g.foam[(c + stepX) as i64];
+        let alongZ : f32 = g.foam[(c + stepZ) as i64];
+        let diagonal : f32 = g.foam[(c + stepX + stepZ) as i64];
+        return ((1.0 as f32) - ax) * ((1.0 as f32) - az) * near + ax * ((1.0 as f32) - az) * alongX
+            + ((1.0 as f32) - ax) * az * alongZ
+            + ax * az * diagonal;
+    }
+
+    /** Pass four, second stage, for tile `t`: the next foam becomes the foam. */
+    pub(crate) static fn settleFoam(g : Shared<HydroGrid>, t : i32) : void {
+        let tx : i32 = t % g.tilesX;
+        let tz : i32 = t / g.tilesX;
+        let x0 : i32 = tx * HYDRO_TILE_W;
+        let z0 : i32 = tz * HYDRO_TILE_H;
+        let x1 : i32 = minI(x0 + HYDRO_TILE_W, g.width);
+        let z1 : i32 = minI(z0 + HYDRO_TILE_H, g.depth);
+        for (z of z0..z1) {
+            let base : i32 = g.index(x0, z);
+            for (x of x0..x1) {
+                let i : i64 = (base + x - x0) as i64;
+                g.foam[i] = g.foamNext[i];
+            }
+        }
+    }
+}

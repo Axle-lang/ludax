@@ -1,0 +1,385 @@
+// hydro_vents — jets: a conduit that throws water into the air, a geyser, a fountain, a firehose.
+//
+// A vent turns a discharge into particles. Each substep it is owed `discharge * power * pulse * dt` cubic
+// metres; that volume becomes Liquid parcels of a fixed size launched from a disc of `radius` at the vent with
+// speed `speed` along an axis (`tilt` away from vertical toward `azimuth`) scattered inside a cone of half-angle
+// `spread`. From then on a parcel is like any other airborne water: it falls under gravity with drag, breaks
+// into spray by the Weber rule, lands, splashes, foams and becomes depth that flows.
+//
+// Where the water comes from decides the books. A vent that draws from the grid (`fromGrid`, the default)
+// takes what it throws out of the cells around it, limited by what they hold, so the water comes out of the
+// pool and returns to it when it lands and the world's ledger closes with no new term. A vent with an external
+// supply (a pump, a spring far below) books its water as inflow. Either way the volume owed and not yet in a
+// parcel (less than one parcel) is counted as airborne (`carried`), so the ledger closes at every instant.
+//
+// Particle count is bounded: parcels are launched at most `maxRate` per second (a parcel is as large as it must
+// be to keep that rate, never smaller than `minParcel`), so the parcels alive from one vent are at most
+// `maxRate * flightTime`, flight time being `2 speed / g` for a vertical jet, before the pool's `capacity`
+// stops them (then a grid-fed vent simply stops drawing). The jet reaches `speed^2 / (2 g)` above its exit, less
+// the slowing of air drag, which is a few percent for parcels of the default size.
+//
+// A vent is plain data plus two numbers of state (`owed`, the pulse clock is the world's), changed between steps
+// with `setVent` and `setVentPower`: a game ramps the power to start and end an eruption.
+
+use crate::core::collections::vec::Vec;
+use crate::core::math::scalar::{max, maxI, min, minI};
+use crate::core::math::trig::{cos, sin};
+use crate::core::rng::pcg32::Pcg32;
+use crate::sim::fluid::hydro_grid::HydroGrid;
+use crate::sim::fluid::hydro_particles::{HYDRO_LIQUID, HydroParticles};
+use crate::sim::fluid::hydro_sample::HydroSample;
+
+/** The `Pcg32` stream of the vents, fixed so a world's jets are repeatable. */
+const HYDRO_VENT_STREAM : u64 = 133;
+
+/** Tiny vector length under which a direction is taken as degenerate. */
+const HYDRO_VENT_TINY : f32 = 0.000001;
+
+/** The shape, strength and supply of one vent; see the file header. */
+pub struct HydroVentParams {
+    /** Position of the vent, grid-local metres; `addVent` sets it from its arguments. */
+    pub x : f32 = 0.0;
+
+    /** Position of the vent along z, grid-local metres. */
+    pub z : f32 = 0.0;
+
+    /** Discharge at full power, m3/s. */
+    pub discharge : f32 = 0.2;
+
+    /** Exit speed along the jet axis, m/s; the jet rises to `speed^2 / (2 g)`. */
+    pub speed : f32 = 15.0;
+
+    /** Tilt of the axis away from vertical, radians (0 straight up). */
+    pub tilt : f32 = 0.0;
+
+    /** Direction of the tilt around the vertical, radians from +x toward +z. */
+    pub azimuth : f32 = 0.0;
+
+    /** Radius of the exit disc, m. */
+    pub radius : f32 = 0.3;
+
+    /** Half-angle of the cone the parcels are scattered in, radians: 0.03 is a tight column, 0.3 a fan. */
+    pub spread : f32 = 0.05;
+
+    /** The dye tracer an external vent (`fromGrid` false) tints its water with, or -1 for none; a pool-fed vent
+     * throws whatever dye the pool holds. */
+    pub tracer : i32 = -1;
+
+    /** Height of the exit above the water or ground at the vent, m. */
+    pub lift : f32 = 0.1;
+
+    /** Seconds of one pulse; 0 is a continuous jet. */
+    pub pulsePeriod : f32 = 0.0;
+
+    /** The share of a pulse period the jet is on, 0 to 1. */
+    pub pulseDuty : f32 = 0.5;
+
+    /** Gain on the discharge, 0 to 1 (an eruption ramps it); 0 silences the vent. */
+    pub power : f32 = 1.0;
+
+    /** True takes the water from the grid cells around the vent; false books it as an external inflow. */
+    pub fromGrid : bool = true;
+
+    /** The most parcels launched per second; bounds the particles a vent keeps alive. */
+    pub maxRate : f32 = 20000.0;
+
+    /** The smallest parcel, m3. */
+    pub minParcel : f32 = 0.00002;
+}
+
+// One vent: its parameters and the volume taken and not yet launched.
+struct HydroVent {
+    params : HydroVentParams;
+    owed   : f64 = 0.0;
+}
+
+/** The vents of one world. */
+pub(crate) class HydroVents {
+    vents    : Vec<HydroVent>;
+    rng      : Pcg32;
+    tracers  : i32;
+    shares   : f32[];
+    owedDyes : f64[];
+
+    /** The dye each tracer received from tagged external vents, m3. */
+    pub(crate) injected : f64[];
+
+    constructor(tracers : i32) {
+        self.vents = new Vec<HydroVent>();
+        self.rng = new Pcg32(7, HYDRO_VENT_STREAM);
+        self.tracers = tracers;
+        self.shares = new f32[(tracers + 1) as i64];
+        self.owedDyes = new f64[1];
+        self.owedDyes[0] = 0.0;
+        self.injected = new f64[(tracers + 1) as i64];
+        for (k of 0..tracers + 1) {
+            self.shares[k as i64] = 0.0;
+            self.injected[k as i64] = 0.0;
+        }
+    }
+
+    /** Adds a vent and answers its handle. */
+    pub(crate) fn add(mut self, params : HydroVentParams) : i32 {
+        let n : i32 = self.vents.len();
+        let mut dye : f64[] = new f64[((n + 1) * self.tracers + 1) as i64];
+        for (q of 0..(n + 1) * self.tracers + 1) {
+            dye[q as i64] = 0.0;
+        }
+        for (q of 0..n * self.tracers) {
+            dye[q as i64] = self.owedDyes[q as i64];
+        }
+        self.vents.push(HydroVent { params: params });
+        self.owedDyes = dye;
+        return self.vents.len() - 1;
+    }
+
+    /** The dye of tracer `t` taken from the grid or the supply and not yet launched, m3. */
+    pub(crate) fn carriedDye(self, t : i32) : f64 {
+        let mut sum : f64 = 0.0;
+        for (k of 0..self.vents.len()) {
+            sum = sum + self.owedDyes[(k * self.tracers + t) as i64];
+        }
+        return sum;
+    }
+
+    /** Sets the full-power discharge of vent `id`; false for a stale handle. */
+    pub(crate) fn setDischarge(mut self, id : i32, discharge : f32) : bool {
+        if (!self.vents.has(id)) {
+            return false;
+        }
+        let mut v : HydroVent = self.vents.get(id);
+        v.params.discharge = max(discharge, 0.0);
+        self.vents.set(id, v);
+        return true;
+    }
+
+    /** Sets the power gain of vent `id` (clamped to 0..1); false for a stale handle. */
+    pub(crate) fn setPower(mut self, id : i32, power : f32) : bool {
+        if (!self.vents.has(id)) {
+            return false;
+        }
+        let mut v : HydroVent = self.vents.get(id);
+        v.params.power = min(max(power, 0.0), 1.0);
+        self.vents.set(id, v);
+        return true;
+    }
+
+    /** The parameters of vent `id` as they are now; a stale handle answers silent defaults. */
+    pub(crate) fn paramsOf(self, id : i32) : HydroVentParams {
+        if (!self.vents.has(id)) {
+            return HydroVentParams { power: 0.0 };
+        }
+        return self.vents.get(id).params;
+    }
+
+    /** How many vents there are. */
+    pub(crate) fn count(self) : i32 {
+        return self.vents.len();
+    }
+
+    /** Whether any vent could throw water now (the world has work even with every tile asleep). */
+    pub(crate) fn anyActive(self) : bool {
+        for (k of 0..self.vents.len()) {
+            let v : HydroVent = self.vents.get(k);
+            if (v.owed > 0.0 || (v.params.discharge > 0.0 && v.params.power > 0.0)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** The volume taken from the grid or the supply and not yet launched, m3 (airborne by the books). */
+    pub(crate) fn carried(self) : f64 {
+        let mut sum : f64 = 0.0;
+        for (k of 0..self.vents.len()) {
+            sum = sum + self.vents.get(k).owed;
+        }
+        return sum;
+    }
+
+    /**
+     * Runs every vent for one substep of `dt` seconds at world time `now`; answers the volume that came from
+     * outside the world (the external vents' supply), m3, for the books.
+     */
+    pub(crate) fn emit(mut self, g : Shared<HydroGrid>, store : HydroParticles, now : f64, dt : f32) : f64 {
+        let mut external : f64 = 0.0;
+        for (k of 0..self.vents.len()) {
+            let v : HydroVent = self.vents.get(k);
+            external = external + self.run(g, store, v, now, dt, k);
+            self.vents.set(k, v);
+        }
+        return external;
+    }
+
+    // One vent for one substep; the vent's `owed` is updated in place through `v`.
+    fn run(
+        mut self,
+        g : Shared<HydroGrid>,
+        store : HydroParticles,
+        v : HydroVent,
+        now : f64,
+        dt : f32,
+        id : i32
+    ) : f64 {
+        let p : HydroVentParams = v.params;
+        let parcel : f32 = max(p.minParcel, p.discharge / max(p.maxRate, 1.0));
+        let want : f32 = p.discharge * p.power * HydroVents::pulse(p, now) * dt;
+        let room : i32 = store.capacity - store.waterCount();
+        let mut taken : f64 = 0.0;
+        for (k of 0..self.tracers) {
+            g.drainedDye[k as i64] = 0.0;
+        }
+        if (want > 0.0 && room > 0) {
+            let cap : f32 = min(want, (room as f32) * parcel);
+            taken = HydroVents::draw(g, p, cap);
+        }
+        let mut external : f64 = 0.0;
+        if (p.fromGrid) {
+            // The water comes out of the pool with the dye in it.
+            for (k of 0..self.tracers) {
+                self.owedDyes[(id * self.tracers + k) as i64] = self.owedDyes[(id * self.tracers + k) as i64]
+                    + g.drainedDye[k as i64];
+            }
+        } else {
+            external = taken;
+            if (p.tracer >= 0 && p.tracer < self.tracers) {
+                self.owedDyes[(id * self.tracers + p.tracer) as i64] = self.owedDyes[(id * self.tracers
+                    + p.tracer) as i64]
+                    + taken;
+                self.injected[p.tracer as i64] = self.injected[p.tracer as i64] + taken;
+            }
+        }
+        let mut owed : f64 = v.owed + taken;
+
+        let launches : i32 = minI(maxI((owed / (parcel as f64)) as i32, 0), room);
+        if (launches > 0) {
+            for (k of 0..self.tracers) {
+                self.shares[k as i64] = min(
+                    (self.owedDyes[(id * self.tracers + k) as i64] / owed) as f32,
+                    1.0
+                );
+            }
+            self.launch(g, store, p, launches, parcel, dt, now, id);
+            owed = owed - (launches as f64) * ((parcel as f32) as f64);
+        }
+        v.owed = max(owed, 0.0);
+        return external;
+    }
+
+    // The jet's on/off gain at time `now`: 1 for a continuous vent, else a square pulse train.
+    static fn pulse(p : HydroVentParams, now : f64) : f32 {
+        if (p.pulsePeriod <= 0.0) {
+            return 1.0;
+        }
+        let cycles : f64 = now / (p.pulsePeriod as f64);
+        let phase : f64 = cycles - ((cycles as i64) as f64);
+        if (phase < (p.pulseDuty as f64)) {
+            return 1.0;
+        }
+        return 0.0;
+    }
+
+    // Takes `cap` m3 for the vent: from the cells of the exit's block when it draws from the grid (what they
+    // really held), or out of thin air for an external supply. Answers what it got.
+    static fn draw(g : Shared<HydroGrid>, p : HydroVentParams, cap : f32) : f64 {
+        if (!p.fromGrid) {
+            return cap as f64;
+        }
+        let cx : i32 = (p.x * g.invCell) as i32;
+        let cz : i32 = (p.z * g.invCell) as i32;
+        let reach : i32 = maxI(((p.radius * g.invCell) + (0.999 as f32)) as i32, 1);
+        let area : f64 = (g.cellSize as f64) * (g.cellSize as f64);
+        let mut cells : i32 = 0;
+        for (z of cz - reach..cz + reach + 1) {
+            for (x of cx - reach..cx + reach + 1) {
+                if (g.inside(x, z) && g.h[g.index(x, z) as i64] > g.dry) {
+                    cells = cells + 1;
+                }
+            }
+        }
+        if (cells == 0) {
+            return 0.0;
+        }
+        let share : f32 = cap / ((cells as f32) * (area as f32));
+        let mut got : f64 = 0.0;
+        for (z of cz - reach..cz + reach + 1) {
+            for (x of cx - reach..cx + reach + 1) {
+                if (g.inside(x, z) && g.h[g.index(x, z) as i64] > g.dry) {
+                    got = got + (g.drain(x, z, share) as f64) * area;
+                }
+            }
+        }
+        return got;
+    }
+
+    // Launches `n` parcels of `parcel` m3 spread over the substep: each is flown for the time since it left.
+    fn launch(
+        mut self,
+        g : Shared<HydroGrid>,
+        store : HydroParticles,
+        p : HydroVentParams,
+        n : i32,
+        parcel : f32,
+        dt : f32,
+        now : f64,
+        id : i32
+    ) : void {
+        let gravity : f32 = store.gravity;
+        let axisX : f32 = sin(p.tilt) * cos(p.azimuth);
+        let axisY : f32 = cos(p.tilt);
+        let axisZ : f32 = sin(p.tilt) * sin(p.azimuth);
+        // Two unit vectors across the axis: the first horizontal (or x when the axis is vertical).
+        let mut e1x : f32 = -axisZ;
+        let mut e1z : f32 = axisX;
+        let flat : f32 = (e1x * e1x + e1z * e1z).sqrt();
+        if (flat < HYDRO_VENT_TINY) {
+            e1x = 1.0;
+            e1z = 0.0;
+        } else {
+            e1x = e1x / flat;
+            e1z = e1z / flat;
+        }
+
+        let surface : f32 = HydroSample::surface(g, p.x, p.z);
+        let base : f32 = surface + p.lift;
+        for (j of 0..n) {
+            let age : f32 = dt * ((1.0 as f32) - (((j as f32) + (0.5 as f32)) / (n as f32)));
+            let theta : f32 = self.rng.nextF32() * (6.2831855 as f32);
+            let rr : f32 = p.radius * self.rng.nextF32().sqrt();
+            let ox : f32 = rr * cos(theta);
+            let oz : f32 = rr * sin(theta);
+
+            let cone : f32 = p.spread * self.rng.nextF32().sqrt();
+            let phi : f32 = self.rng.nextF32() * (6.2831855 as f32);
+            let a : f32 = cone * cos(phi);
+            let b : f32 = cone * sin(phi);
+            // direction = axis + a e1 + b e2, with e2 = axis x e1
+            let e2ax : f32 = axisY * e1z;
+            let e2ay : f32 = axisZ * e1x - axisX * e1z;
+            let e2az : f32 = -axisY * e1x;
+            let mut dx : f32 = axisX + a * e1x + b * e2ax;
+            let mut dy : f32 = axisY + b * e2ay;
+            let mut dz : f32 = axisZ + a * e1z + b * e2az;
+            let len : f32 = max((dx * dx + dy * dy + dz * dz).sqrt(), HYDRO_VENT_TINY);
+            dx = dx / len;
+            dy = dy / len;
+            dz = dz / len;
+
+            let vx : f32 = p.speed * dx;
+            let vy0 : f32 = p.speed * dy;
+            let vz : f32 = p.speed * dz;
+            let px : f32 = p.x + ox + vx * age;
+            let pz : f32 = p.z + oz + vz * age;
+            let py : f32 = base + vy0 * age - (0.5 as f32) * gravity * age * age;
+            let added : bool = store.add(HYDRO_LIQUID, px, py, pz, vx, vy0 - gravity * age, vz, parcel);
+            if (added) {
+                for (t of 0..self.tracers) {
+                    store.setFraction(store.count - 1, t, self.shares[t as i64]);
+                    self.owedDyes[(id * self.tracers + t) as i64] = self.owedDyes[(id * self.tracers
+                        + t) as i64]
+                        - (self.shares[t as i64] as f64) * (parcel as f64);
+                }
+            }
+        }
+    }
+}

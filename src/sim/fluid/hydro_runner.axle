@@ -1,0 +1,140 @@
+// hydro_runner — the passes of a substep as parallel loops, bit-identical for any thread count.
+//
+// A `JobPool` serves one kernel for life, so `HydroKernel` is a dispatcher: the world sets its `stage` (and the
+// scheme of the substep) and runs it over a count of items, which are active tiles for the grid passes and
+// particles for the flight. The determinism contract is the job library's (`core/jobs/kernel`): a loop is cut
+// into chunks of a fixed grain by item index alone, a pass writes only what belongs to its own items (a tile's
+// cells and faces, a particle's slots) and reads what no other item of the same pass writes. Whole-grid
+// reductions (the fastest speed, the books) are done serially between passes in a fixed order. So the bytes a
+// pass produces do not depend on who ran which chunk, and one worker, eight and none give the same world.
+
+use crate::core::jobs::kernel::{RangeKernel, runSerial};
+use crate::core::jobs::pool::JobPool;
+use crate::sim::fluid::hydro_air::HydroAir;
+use crate::sim::fluid::hydro_flux::HydroScheme;
+use crate::sim::fluid::hydro_grid::HydroGrid;
+use crate::sim::fluid::hydro_passes::HydroPasses;
+
+/** Tiles per chunk of a grid pass: a tile is 256 cells, so a chunk is about a thousand cells of work. */
+const HYDRO_TILE_GRAIN : i32 = 4;
+
+/** Particles per chunk of the flight; fixed, so the cut never depends on the thread count. */
+const HYDRO_PARTICLE_GRAIN : i32 = 2048;
+
+/** A pass of the substep; the kernel runs the one it is set to. */
+pub(crate) enum HydroStage : i8 {
+    /** Face fluxes. */
+    Faces = 0,
+
+    /** Positivity factors. */
+    Scale = 1,
+
+    /** Update of the cells. */
+    Update = 2,
+
+    /** Turbulence and next foam. */
+    Surface = 3,
+
+    /** Next foam becomes foam. */
+    SettleFoam = 4,
+
+    /** Particle flight. */
+    Fly = 5,
+}
+
+/** The dispatcher a `JobPool` runs. */
+pub(crate) class HydroKernel : RangeKernel {
+    grid              : Shared<HydroGrid>;
+    air               : Shared<HydroAir>;
+    pub(crate) stage  : HydroStage = HydroStage::Faces;
+    pub(crate) scheme : HydroScheme;
+
+    /** A kernel over a grid and its airborne layer. */
+    constructor(own grid : Shared<HydroGrid>, own air : Shared<HydroAir>) {
+        self.grid = grid;
+        self.air = air;
+        self.scheme = HydroScheme {};
+    }
+
+    /** Runs the current stage over the items `begin` up to `end`. */
+    pub fn runRange(mut self, begin : i32, end : i32) : void {
+        match self.stage {
+            HydroStage::Faces => {
+                for (k of begin..end) {
+                    HydroPasses::faces(self.grid, self.scheme, self.grid.activeTiles[k as i64]);
+                }
+            },
+            HydroStage::Scale => {
+                for (k of begin..end) {
+                    HydroPasses::scale(self.grid, self.scheme, self.grid.activeTiles[k as i64]);
+                }
+            },
+            HydroStage::Update => {
+                for (k of begin..end) {
+                    HydroPasses::update(self.grid, self.scheme, self.grid.activeTiles[k as i64]);
+                }
+            },
+            HydroStage::Surface => {
+                for (k of begin..end) {
+                    HydroPasses::surface(self.grid, self.scheme, self.grid.activeTiles[k as i64]);
+                }
+            },
+            HydroStage::SettleFoam => {
+                for (k of begin..end) {
+                    HydroPasses::settleFoam(self.grid, self.grid.activeTiles[k as i64]);
+                }
+            },
+            HydroStage::Fly => {
+                self.air.store.fly(self.grid, begin, end);
+            },
+        }
+    }
+}
+
+/** Runs the kernel's stages, on worker threads or on the caller. */
+pub(crate) class HydroRunner {
+    pub(crate) kernel : HydroKernel;
+    pool              : JobPool;
+    threaded          : bool;
+
+    /** A runner; `threads` above 1 starts that many workers, otherwise stages run serially on the caller. */
+    constructor(own grid : Shared<HydroGrid>, own air : Shared<HydroAir>, threads : i32) {
+        self.kernel = new HydroKernel(grid, air);
+        self.threaded = threads > 1;
+        let mut workers : i32 = threads;
+        if (workers < 1) {
+            workers = 1;
+        }
+        self.pool = new JobPool(workers, self.kernel);
+        if (!self.threaded) {
+            self.pool.shutdown();
+        }
+    }
+
+    /** Runs a grid pass over the `count` tiles that run this substep. */
+    pub(crate) fn tiles(mut self, stage : HydroStage, count : i32) : void {
+        self.run(stage, count, HYDRO_TILE_GRAIN);
+    }
+
+    /** Runs the flight over `count` particles. */
+    pub(crate) fn particles(mut self, count : i32) : void {
+        self.run(HydroStage::Fly, count, HYDRO_PARTICLE_GRAIN);
+    }
+
+    fn run(mut self, stage : HydroStage, count : i32, grain : i32) : void {
+        if (count <= 0) {
+            return;
+        }
+        self.kernel.stage = stage;
+        if (self.threaded) {
+            self.pool.run(count, grain);
+            return;
+        }
+        runSerial(self.kernel, count, grain);
+    }
+
+    /** Stops the workers; safe to call twice. */
+    pub(crate) fn close(mut self) : void {
+        self.pool.shutdown();
+    }
+}

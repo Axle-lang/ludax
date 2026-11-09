@@ -1,0 +1,353 @@
+// hydro_fall — checks of the waterfall: a lip, a curtain, a plunge pool, the books, gravity, threads and cost.
+//
+// A plateau 10 m above a lower plain, fed by an inflow, spills over a cliff along its whole width. The curtain is
+// made of particles launched at the lip and falling ballistically; the checks hold it to its documented spacing,
+// the water to its books (grid + air + outflow = poured + inflow, to f32 rounding), the pool to receive
+// what falls, and the fall to the physics: the speed at the bottom scales as sqrt(g), and one worker and eight
+// leave the same particles. Timing lines start with `measured`.
+
+use ludax::Checks;
+use ludax::HYDRO_LIQUID;
+use ludax::HYDRO_SIDE_EAST;
+use ludax::HydroLedger;
+use ludax::HydroParams;
+use ludax::HydroWorld;
+use ludax::nanosToMillis;
+use ludax::nowNanos;
+
+use crate::hydro::hydroParams;
+
+/** The checks of the overfall. */
+pub class HydroFallSuite {
+    /** Runs every check of the suite. */
+    pub static fn run(c : Checks) : void {
+        hydroFallCurtain(c);
+        hydroFallGravity(c);
+        hydroFallThreads(c);
+        hydroFallCost(c);
+    }
+}
+
+/** Plateau height above the plain, m. */
+const HYDRO_FALL_HEIGHT : f32 = 10.0;
+
+/** Cells across of the fall world; the cliff is at column `HYDRO_FALL_CLIFF`. */
+const HYDRO_FALL_WIDTH : i32 = 64;
+const HYDRO_FALL_ROWS : i32 = 16;
+const HYDRO_FALL_CLIFF : i32 = 30;
+
+// The plateau and the plain, as a bed.
+fn hydroFallBed() : f32[] {
+    let mut bed : f32[] = new f32[(HYDRO_FALL_WIDTH * HYDRO_FALL_ROWS) as i64];
+    for (z of 0..HYDRO_FALL_ROWS) {
+        for (x of 0..HYDRO_FALL_WIDTH) {
+            let mut h : f32 = 0.0;
+            if (x < HYDRO_FALL_CLIFF) {
+                h = HYDRO_FALL_HEIGHT;
+            }
+            bed[(z * HYDRO_FALL_WIDTH + x) as i64] = h;
+        }
+    }
+    return bed;
+}
+
+// A waterfall world: `inflow` m3/s onto the plateau, the plain draining east, a given gravity and thread count.
+fn hydroFallWorld(inflow : f32, gravity : f32, threads : i32, spacing : f32) : HydroWorld {
+    let mut p : HydroParams = HydroParams::standard();
+    p.manning = 0.03;
+    p.gravity = gravity;
+    p.threads = threads;
+    p.fall.curtainSpacing = spacing;
+    let w : HydroWorld = new HydroWorld(HYDRO_FALL_WIDTH, HYDRO_FALL_ROWS, 1.0, p);
+    w.setBed(hydroFallBed(), HYDRO_FALL_WIDTH, HYDRO_FALL_ROWS, 1.0);
+    w.setOutflowBoundary(HYDRO_SIDE_EAST);
+    w.addInflow(3.5, 8.0, inflow);
+    return w;
+}
+
+// The largest downward speed among the particles, m/s.
+fn hydroFastestFall(w : HydroWorld) : f32 {
+    let vel : f32[] = w.particleVelocities();
+    let mut fastest : f32 = 0.0;
+    for (k of 0..w.particleCount()) {
+        let v : f32 = -vel[(k * 3 + 1) as i64];
+        if (v > fastest) {
+            fastest = v;
+        }
+    }
+    return fastest;
+}
+
+// The longest stretch of the crest, in metres, without a liquid particle in the slab y in [3, 7]: bins of an
+// eighth of a metre along z.
+fn hydroCrestGap(w : HydroWorld) : f32 {
+    let pos : f32[] = w.particlePositions();
+    let kinds : u8[] = w.particleKinds();
+    let mut seen : u8[] = new u8[(HYDRO_FALL_ROWS * 8) as i64];
+    for (i of 0..(HYDRO_FALL_ROWS * 8)) {
+        seen[i as i64] = 0;
+    }
+    for (k of 0..w.particleCount()) {
+        let y : f32 = pos[(k * 3 + 1) as i64];
+        if (kinds[k as i64] != HYDRO_LIQUID || y < 3.0 || y > 7.0) {
+            continue;
+        }
+        let bin : i32 = (pos[(k * 3 + 2) as i64] * 8.0) as i32;
+        if (bin >= 0 && bin < HYDRO_FALL_ROWS * 8) {
+            seen[bin as i64] = 1;
+        }
+    }
+    let mut longest : i32 = 0;
+    let mut run : i32 = 0;
+    for (i of 0..(HYDRO_FALL_ROWS * 8)) {
+        if (seen[i as i64] == 0) {
+            run = run + 1;
+        } else {
+            run = 0;
+        }
+        if (run > longest) {
+            longest = run;
+        }
+    }
+    return (longest as f32) / (8.0 as f32);
+}
+
+// The largest vertical gap between neighbouring liquid particles of the crest row 8 (z in [8, 8.5)), m, over
+// the fall between 1 m above the plain and the lip.
+fn hydroFallGap(w : HydroWorld) : f32 {
+    let pos : f32[] = w.particlePositions();
+    let kinds : u8[] = w.particleKinds();
+    let mut ys : f32[] = new f32[(w.particleCount() + 1) as i64];
+    let mut n : i32 = 0;
+    for (k of 0..w.particleCount()) {
+        let z : f32 = pos[(k * 3 + 2) as i64];
+        let y : f32 = pos[(k * 3 + 1) as i64];
+        let x : f32 = pos[(k * 3) as i64];
+        if (kinds[k as i64] == HYDRO_LIQUID && z >= 8.0 && z < 8.5 && y > 1.5 && x > 30.0) {
+            ys[n as i64] = y;
+            n = n + 1;
+        }
+    }
+    // insertion sort, descending
+    for (i of 1..n) {
+        let v : f32 = ys[i as i64];
+        let mut j : i32 = i - 1;
+        while (j >= 0 && ys[j as i64] < v) {
+            ys[(j + 1) as i64] = ys[j as i64];
+            j = j - 1;
+        }
+        ys[(j + 1) as i64] = v;
+    }
+    let mut gap : f32 = 0.0;
+    for (i of 1..n) {
+        let d : f32 = ys[(i - 1) as i64] - ys[i as i64];
+        if (d > gap) {
+            gap = d;
+        }
+    }
+    return gap;
+}
+
+// The curtain, the plunge pool, the books and the steady state of one waterfall.
+fn hydroFallCurtain(c : Checks) : void {
+    let q : f32 = 16.0;
+    let w : HydroWorld = hydroFallWorld(q, 9.81, 1, 0.5);
+    let mut peak : i32 = 0;
+    let mut gap : f32 = 0.0;
+    let mut crest : f32 = 0.0;
+    for (k of 0..3600) {
+        w.step(0.02);
+        if (w.particleCount() > peak) {
+            peak = w.particleCount();
+        }
+        if (k > 1500 && k % 50 == 0) {
+            gap = max32(gap, hydroFallGap(w));
+            crest = max32(crest, hydroCrestGap(w));
+        }
+    }
+    let ledger : HydroLedger = w.ledger();
+    let residual : f64 = ledger.residual();
+    let inflow : f64 = ledger.inflow;
+    let pool : f64 = hydroFallPool(w);
+    let out0 : f64 = w.ledger().outflow;
+    for (k of 0..500) {
+        w.step(0.02);
+    }
+    let rate : f64 = (w.ledger().outflow - out0) / 10.0;
+
+    println("  measured waterfall: peak ${peak} particles, crest gap ${crest} m, fall gap ${gap} m, residual ${residual} of ${inflow} m3, outflow ${rate} m3/s, lips ${w.lipCount()}");
+    c.that("lips found along the cliff (${w.lipCount()})", w.lipCount() == HYDRO_FALL_ROWS);
+    c.that("the waterfall makes a curtain (${peak} particles)", peak > 2000);
+    c.that(
+        "curtain has no gap along the crest above its spacing (${crest} m)",
+        crest <= 0.5 * 1.01
+    );
+    c.that("curtain has no gap along the fall above its spacing (${gap} m)", gap <= 0.5 * 1.1);
+    c.that(
+        "books close (${residual} of ${inflow})",
+        residual < inflow * 0.0001 && -residual < inflow * 0.0001
+    );
+    c.that("the plunge pool receives the discharge (${pool} of ${inflow})", pool > 0.5 * inflow);
+    c.that("water persists and flows on the lower plain", w.depthOfCell(50, 8) > 0.0);
+    c.that(
+        "steady state: outflow equals inflow (${rate} of ${q})",
+        rate > 0.9 * 16.0 && rate < 1.1 * 16.0
+    );
+    c.that("foam in the plunge pool", w.foamAt(31.5, 8.0) > 0.05);
+    w.close();
+}
+
+fn max32(a : f32, b : f32) : f32 {
+    if (b > a) {
+        return b;
+    }
+    return a;
+}
+
+// The water below the cliff, grid plus what already left, m3.
+fn hydroFallPool(w : HydroWorld) : f64 {
+    let mut pool : f64 = 0.0;
+    for (z of 0..HYDRO_FALL_ROWS) {
+        for (x of HYDRO_FALL_CLIFF..HYDRO_FALL_WIDTH) {
+            pool = pool + (w.depthOfCell(x, z) as f64);
+        }
+    }
+    return pool + w.ledger().outflow;
+}
+
+// The speed at the bottom of the fall scales as sqrt(g): four times the gravity, twice the speed.
+fn hydroFallGravity(c : Checks) : void {
+    let mut slow : f32 = 0.0;
+    let mut fast : f32 = 0.0;
+    for (pass of 0..2) {
+        let mut g : f32 = 9.81;
+        if (pass == 1) {
+            g = 39.24;
+        }
+        let w : HydroWorld = hydroFallWorld(8.0, g, 1, 0.5);
+        let mut best : f32 = 0.0;
+        for (k of 0..1800) {
+            w.step(0.02);
+            best = max32(best, hydroFastestFall(w));
+        }
+        if (pass == 0) {
+            slow = best;
+        } else {
+            fast = best;
+        }
+        w.close();
+    }
+    let ratio : f32 = fast / max32(slow, 0.001);
+    println("  measured fall speed: ${slow} m/s at g, ${fast} m/s at 4g (sqrt(2 g H) = 14.0 and 28.0)");
+    c.that("fall speed scales as sqrt(g) (ratio ${ratio})", ratio > 1.8 && ratio < 2.2);
+    c.that("fall speed near sqrt(2 g H) (${slow})", slow > 11.0 && slow < 16.0);
+}
+
+// One worker and eight leave the same particles, bit for bit.
+fn hydroFallThreads(c : Checks) : void {
+    let a : HydroWorld = hydroFallWorld(12.0, 9.81, 1, 0.5);
+    let b : HydroWorld = hydroFallWorld(12.0, 9.81, 8, 0.5);
+    for (k of 0..400) {
+        a.step(0.02);
+        b.step(0.02);
+    }
+    let mut same : bool = a.particleCount() == b.particleCount();
+    let pa : f32[] = a.particlePositions();
+    let pb : f32[] = b.particlePositions();
+    for (i of 0..(a.particleCount() * 3)) {
+        if (pa[i as i64] != pb[i as i64]) {
+            same = false;
+        }
+    }
+    for (z of 0..HYDRO_FALL_ROWS) {
+        for (x of 0..HYDRO_FALL_WIDTH) {
+            if (a.depthOfCell(x, z) != b.depthOfCell(x, z)) {
+                same = false;
+            }
+        }
+    }
+    c.that(
+        "waterfall with 1 and 8 threads is bit-identical (${a.particleCount()} particles)",
+        same
+    );
+    c.that("books identical", a.ledger().residual() == b.ledger().residual());
+    a.close();
+    b.close();
+}
+
+// Cost: a 512 x 512 world with a third of it moving, and a hundred thousand particles.
+fn hydroFallCost(c : Checks) : void {
+    for (pass of 0..2) {
+        let mut p : HydroParams = hydroParams();
+        p.threads = 1;
+        if (pass == 1) {
+            p.threads = 8;
+        }
+        p.manning = 0.03;
+        let w : HydroWorld = new HydroWorld(512, 512, 2.0, p);
+        w.fillRect(1.0, 0, 0, 511, 170);
+        w.fillRect(1.6, 256, 0, 511, 170);
+        w.pour(256, 85, 0.5);
+        for (k of 0..20) {
+            w.step(0.05);
+        }
+        let mut perSub : f64 = 1000000.0;
+        let mut perMillion : f64 = 1000000.0;
+        let mut subs : i64 = 0;
+        for (round of 0..7) {
+            let cells0 : i64 = w.cellStepCount();
+            let subs0 : i64 = w.substepCount();
+            let started : i64 = nowNanos();
+            for (k of 0..40) {
+                w.step(0.05);
+            }
+            let ms : f64 = nanosToMillis(nowNanos() - started);
+            let cells : i64 = w.cellStepCount() - cells0;
+            subs = w.substepCount() - subs0;
+            if (ms / ((cells as f64) / 1000000.0) < perMillion) {
+                perMillion = ms / ((cells as f64) / 1000000.0);
+                perSub = ms / (subs as f64);
+            }
+        }
+        println("  measured grid 512 x 512 (a third awake, ${p.threads} workers, best of 7 rounds): ${perSub} ms per substep, ${perMillion} ms per million cell-steps, ${subs} substeps, ${w.activeCellCount()} cells awake");
+        c.that("a third of a 512 x 512 world steps in a few ms (${perSub} ms)", perSub < 20.0);
+        w.close();
+    }
+
+    let f : HydroWorld = hydroFallWorld(400.0, 9.81, 8, 0.14);
+    for (k of 0..1500) {
+        f.step(0.02);
+        if (f.particleCount() > 90000) {
+            break;
+        }
+    }
+    let n0 : i64 = f.particleStepCount();
+    let s0 : i64 = f.substepCount();
+    let t0 : i64 = nowNanos();
+    for (k of 0..50) {
+        f.step(0.02);
+    }
+    let fms : f64 = nanosToMillis(nowNanos() - t0);
+    let flights : i64 = f.particleStepCount() - n0;
+    let perMillionFlights : f64 = fms / ((flights as f64) / 1000000.0);
+    let perStep : f64 = fms / ((f.substepCount() - s0) as f64);
+    println("  measured particles: ${f.particleCount()} alive, ${perMillionFlights} ms per million particle-steps (grid included), ${perStep} ms per substep, ${fms} ms for 50 steps");
+    let pp : f32[] = f.particlePositions();
+    let mut bad : i32 = 0;
+    let mut top : f32 = 0.0;
+    for (i of 0..(f.particleCount() * 3)) {
+        let v : f32 = pp[i as i64];
+        if (!(v > -1000.0 && v < 5000.0)) {
+            bad = bad + 1;
+        }
+        if (v > top) {
+            top = v;
+        }
+    }
+    println("  particle sanity: ${bad} out of range, largest coordinate ${top}");
+    c.that(
+        "particle flight costs under 100 ms per million particle-steps (${perMillionFlights})",
+        perMillionFlights < 100.0
+    );
+    f.close();
+}

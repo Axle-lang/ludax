@@ -1,0 +1,564 @@
+// hydro_grid — the state of the metric water engine: one padded, row-major structure-of-arrays grid.
+//
+// Layout. A world of `width` x `depth` cells is stored in arrays of `(width + 4) x (depth + 4)` f32 values: the
+// cells plus a ring of two ghost cells, so the solver's inner loops read their four-cell stencil without a
+// single bounds test. Cell (x, z) is at `(z + 2) * pitch + (x + 2)`. The ghost ring is refilled before every
+// substep (`fillGhosts`): a wall mirrors the neighbouring cells and flips the normal velocity, which makes the
+// flux through it exactly zero by symmetry; an open side is a free outfall (a dry ghost at the edge's bed level), so
+// water leaves freely and nothing enters. Cell (x, z) covers [x, x + 1) * cellSize in grid-local metres; its centre is
+// at ((x + 0.5) * cellSize, (z + 0.5) * cellSize). All positions of the engine are grid-local, so f32 holds them
+// to better than a millimetre over a kilometre; `origin` (f64) places the grid in the world.
+//
+// Unknowns per cell are the water depth `h` above the bed and the discharges per metre width `qx`, `qz`
+// (depth times velocity); the velocities `u`, `w` are derived once per substep and stored. The bed is a separate
+// array and surface elevations are never formed absolutely: the scheme only ever needs differences of
+// `bed + depth` between neighbours, and those are accurate to the precision of the depth, not of the elevation,
+// so a lake at rest 500 m above the datum is as quiet as one at sea level.
+//
+// Memory per cell (bytes): bed 4, depth 4, deposit credit 4, discharge 8, velocity 8, twelve face-flux arrays 48, lip flags 2,
+// positivity scale 4, foam 8 (two buffers), turbulence 4: 90 bytes. A 512 x 512 world is 24 MB; a 1024 x 1024
+// one 98 MB. Nothing is allocated after construction.
+//
+// Activity. The grid is cut into tiles of `HYDRO_TILE_W x HYDRO_TILE_H` cells. A tile with a flag runs; so do
+// its eight neighbours (water cannot cross more than one cell per substep, so it cannot leave the dilated set
+// before the next flag update). A tile whose speeds and surface jumps fall under the rest thresholds clears its
+// flag and sleeps: a calm world costs a flag scan per substep and no cell work. Everything that adds water or
+// momentum from outside (sources, landing particles, edits) sets the flag of the tile it touches.
+
+use crate::core::math::scalar::{max, maxI, min, minI};
+
+/** Ghost cells on each side of the grid. */
+pub(crate) const HYDRO_PAD : i32 = 2;
+
+/** Cells across (x) of one activity tile; a power of two so the tile of a cell is a shift. */
+pub(crate) const HYDRO_TILE_W : i32 = 32;
+
+/** Cells down (z) of one activity tile. */
+pub(crate) const HYDRO_TILE_H : i32 = 8;
+
+/** Bit of `setOutflowBoundary`: the side at x = 0. */
+pub const HYDRO_SIDE_WEST : u8 = 1;
+
+/** Bit of `setOutflowBoundary`: the side at x = width. */
+pub const HYDRO_SIDE_EAST : u8 = 2;
+
+/** Bit of `setOutflowBoundary`: the side at z = 0. */
+pub const HYDRO_SIDE_NORTH : u8 = 4;
+
+/** Bit of `setOutflowBoundary`: the side at z = depth. */
+pub const HYDRO_SIDE_SOUTH : u8 = 8;
+
+/** The arrays of one world; the kernel passes, the lips, the particles and the world all work on them. */
+pub(crate) class HydroGrid {
+    pub(crate) width    : i32;
+    pub(crate) depth    : i32;
+    pub(crate) pitch    : i32;
+    pub(crate) rows     : i32;
+    pub(crate) cells    : i32;
+    pub(crate) tilesX   : i32;
+    pub(crate) tilesZ   : i32;
+    pub(crate) cellSize : f32;
+    pub(crate) invCell  : f32;
+    pub(crate) originX  : f64 = 0.0;
+    pub(crate) originZ  : f64 = 0.0;
+
+    /** Bit mask of the sides water may leave through (`HYDRO_SIDE_*`); the others are walls. */
+    pub(crate) open : u8 = 0;
+
+    /** Gravity and the dry depth of the world, set by it; the grid needs them to bound speeds it is handed. */
+    pub(crate) gravity : f32 = 9.81;
+    pub(crate) dry     : f32 = 0.001;
+
+    pub(crate) bed : f32[];
+    pub(crate) h   : f32[];
+    pub(crate) qx  : f32[];
+    pub(crate) qz  : f32[];
+    pub(crate) u   : f32[];
+    pub(crate) w   : f32[];
+
+    // The face fluxes. "x faces" lie between a cell and its west neighbour and are stored at the east cell;
+    // "z faces" lie between a cell and its north neighbour and are stored at the south cell. Every face has a
+    // view for the cell on its low side (L) and one for the cell on its high side (R): they are equal except at
+    // a lip, where the cell the water falls to must not receive it. M is mass, N momentum along the face
+    // normal, T momentum along the face.
+    pub(crate) mLx : f32[];
+    pub(crate) mRx : f32[];
+    pub(crate) nLx : f32[];
+    pub(crate) nRx : f32[];
+    pub(crate) tLx : f32[];
+    pub(crate) tRx : f32[];
+    pub(crate) mLz : f32[];
+    pub(crate) mRz : f32[];
+    pub(crate) nLz : f32[];
+    pub(crate) nRz : f32[];
+    pub(crate) tLz : f32[];
+    pub(crate) tRz : f32[];
+
+    /** Per face: 0 for an ordinary face, +1 when the bed drops from the low-side cell to the high-side cell by
+     * more than the lip threshold, -1 for the opposite drop. */
+    pub(crate) lipX : i8[];
+    pub(crate) lipZ : i8[];
+
+    /** The positivity factor of each cell: the share of its wanted outflow it can pay. */
+    pub(crate) scale : f32[];
+
+    pub(crate) foam     : f32[];
+    pub(crate) foamNext : f32[];
+    pub(crate) turb     : f32[];
+
+    /** Per cell: the depth a deposit could not yet add for want of f32 resolution (see `addDepth`), m. */
+    pub(crate) credit : f32[];
+
+    /** How many dye tracers the grid carries. */
+    pub(crate) tracers : i32;
+
+    /** The dye of every tracer, per cell, as depth of dyed water (m): the dye volume per unit area. Tracer `k`
+     * of cell index `i` is at `k * cells + i`; its concentration is `dye / depth`, always 0 to 1. */
+    pub(crate) dye : f32[];
+
+    /** The concentration of each tracer per cell as the last positivity pass saw it (same layout as `dye`); the
+     * cell update reads its neighbours' from here because their `dye` may already be new. */
+    pub(crate) conc : f32[];
+
+    /** The error-feedback credit of each dye (see `addDepth`), same layout. */
+    pub(crate) dyeCredit : f32[];
+
+    /** Scratch: the dye volume, m3, each tracer lost to `drain` since a caller last cleared it. */
+    pub(crate) drainedDye : f64[];
+
+    /** Per tile: nonzero when the tile has something moving. */
+    pub(crate) tileFlow : u8[];
+
+    /** Per tile: 1 when the tile runs this substep (flagged or next to a flagged one). */
+    pub(crate) tileRun : u8[];
+
+    /** Per tile: the largest `|u| + sqrt(g h)` of its wet cells after the last substep, m/s. */
+    pub(crate) tileSpeed : f32[];
+
+    /** Per tile: the largest relative surface jump of its faces in the last substep beyond the rest threshold;
+     * positive means "not level". */
+    pub(crate) tileJump : f32[];
+
+    /** Per tile: the largest foam or turbulence in it, so a tile that still shows foam keeps being updated. */
+    pub(crate) tileFoam : f32[];
+
+    /** Per tile: the volume infiltrated since the world last collected it, cubic metres per unit of cell area
+     * (metres of depth summed over cells); the world scales it by the cell area. */
+    pub(crate) tileLost : f64[];
+
+    /** The tiles that run this substep, in ascending order, and how many. */
+    pub(crate) activeTiles : i32[];
+    pub(crate) activeCount : i32 = 0;
+
+    /** A grid of `width` x `depth` dry, flat cells of `cellSize` metres (both at least 1). */
+    constructor(width : i32, depth : i32, cellSize : f32, tracers : i32) {
+        self.tracers = tracers;
+        self.width = width;
+        self.depth = depth;
+        self.cellSize = cellSize;
+        self.invCell = (1.0 as f32) / cellSize;
+        self.pitch = width + 2 * HYDRO_PAD;
+        self.rows = depth + 2 * HYDRO_PAD;
+        self.cells = self.pitch * self.rows;
+        self.tilesX = (width + HYDRO_TILE_W - 1) / HYDRO_TILE_W;
+        self.tilesZ = (depth + HYDRO_TILE_H - 1) / HYDRO_TILE_H;
+
+        let n : i64 = self.cells as i64;
+        self.bed = HydroGrid::zeros(n);
+        self.h = HydroGrid::zeros(n);
+        self.qx = HydroGrid::zeros(n);
+        self.qz = HydroGrid::zeros(n);
+        self.u = HydroGrid::zeros(n);
+        self.w = HydroGrid::zeros(n);
+        self.mLx = HydroGrid::zeros(n);
+        self.mRx = HydroGrid::zeros(n);
+        self.nLx = HydroGrid::zeros(n);
+        self.nRx = HydroGrid::zeros(n);
+        self.tLx = HydroGrid::zeros(n);
+        self.tRx = HydroGrid::zeros(n);
+        self.mLz = HydroGrid::zeros(n);
+        self.mRz = HydroGrid::zeros(n);
+        self.nLz = HydroGrid::zeros(n);
+        self.nRz = HydroGrid::zeros(n);
+        self.tLz = HydroGrid::zeros(n);
+        self.tRz = HydroGrid::zeros(n);
+        self.scale = HydroGrid::zeros(n);
+        self.foam = HydroGrid::zeros(n);
+        self.foamNext = HydroGrid::zeros(n);
+        self.turb = HydroGrid::zeros(n);
+        self.credit = HydroGrid::zeros(n);
+        let dyes : i64 = (maxI(tracers, 0) * self.cells + 1) as i64;
+        self.dye = HydroGrid::zeros(dyes);
+        self.conc = HydroGrid::zeros(dyes);
+        self.dyeCredit = HydroGrid::zeros(dyes);
+        self.drainedDye = new f64[(maxI(tracers, 0) + 1) as i64];
+        for (k of 0..tracers + 1) {
+            self.drainedDye[k as i64] = 0.0;
+        }
+        self.lipX = new i8[n];
+        self.lipZ = new i8[n];
+        for (i of 0..n) {
+            self.lipX[i] = 0;
+            self.lipZ[i] = 0;
+        }
+
+        let tiles : i64 = (self.tilesX * self.tilesZ) as i64;
+        self.tileFlow = new u8[tiles];
+        self.tileRun = new u8[tiles];
+        self.tileSpeed = HydroGrid::zeros(tiles);
+        self.tileJump = HydroGrid::zeros(tiles);
+        self.tileFoam = HydroGrid::zeros(tiles);
+        self.tileLost = new f64[tiles];
+        self.activeTiles = new i32[tiles];
+        for (i of 0..n) {
+            self.scale[i] = 1.0;
+        }
+        for (t of 0..tiles) {
+            self.tileLost[t] = 0.0;
+            self.tileFlow[t] = 0;
+            self.tileRun[t] = 0;
+            self.activeTiles[t] = 0;
+        }
+    }
+
+    static fn zeros(n : i64) : f32[] {
+        let mut a : f32[] = new f32[n];
+        for (i of 0..n) {
+            a[i] = 0.0;
+        }
+        return a;
+    }
+
+    // ---- addressing ----
+
+    /** The array index of cell (x, z), which may lie in the ghost ring (-2 up to width + 1). */
+    pub(crate) fn index(self, x : i32, z : i32) : i32 {
+        return (z + HYDRO_PAD) * self.pitch + x + HYDRO_PAD;
+    }
+
+    /** Whether (x, z) is a cell of the world, not a ghost. */
+    pub(crate) fn inside(self, x : i32, z : i32) : bool {
+        return x >= 0 && z >= 0 && x < self.width && z < self.depth;
+    }
+
+    /** The tile that holds cell (x, z). */
+    pub(crate) fn tileOf(self, x : i32, z : i32) : i32 {
+        return (z / HYDRO_TILE_H) * self.tilesX + x / HYDRO_TILE_W;
+    }
+
+    // ---- the bed ----
+
+    /** Copies `heights` (`width * depth` values, row-major, metres) into the bed and fills its ghost ring. */
+    pub(crate) fn loadBed(mut self, heights : f32[]) : void {
+        for (z of 0..self.depth) {
+            for (x of 0..self.width) {
+                self.bed[self.index(x, z) as i64] = heights[(z * self.width + x) as i64];
+            }
+        }
+        self.fillBedGhosts();
+    }
+
+    /** Sets one bed cell and refreshes the ghosts around it; the caller wakes the tile. */
+    pub(crate) fn setBedCell(mut self, x : i32, z : i32, height : f32) : void {
+        self.bed[self.index(x, z) as i64] = height;
+        self.fillBedGhosts();
+    }
+
+    // The bed ghosts: walls and open sides alike repeat the edge, which keeps the reconstruction flat there.
+    fn fillBedGhosts(mut self) : void {
+        let last : i32 = self.width - 1;
+        let bottom : i32 = self.depth - 1;
+        for (z of 0..self.depth) {
+            let row : i32 = self.index(0, z);
+            self.bed[(row - 1) as i64] = self.bed[row as i64];
+            self.bed[(row - 2) as i64] = self.bed[row as i64];
+            self.bed[(row + last + 1) as i64] = self.bed[(row + last) as i64];
+            self.bed[(row + last + 2) as i64] = self.bed[(row + last) as i64];
+        }
+        for (x of -HYDRO_PAD..(self.width + HYDRO_PAD)) {
+            let top : f32 = self.bed[self.index(x, 0) as i64];
+            let low : f32 = self.bed[self.index(x, bottom) as i64];
+            self.bed[self.index(x, -1) as i64] = top;
+            self.bed[self.index(x, -2) as i64] = top;
+            self.bed[self.index(x, bottom + 1) as i64] = low;
+            self.bed[self.index(x, bottom + 2) as i64] = low;
+        }
+    }
+
+    // ---- ghosts of the unknowns ----
+
+    /** Refills the ghost ring of depth, discharge and velocity from the cells, per the boundary kinds. */
+    pub(crate) fn fillGhosts(mut self) : void {
+        let last : i32 = self.width - 1;
+        let bottom : i32 = self.depth - 1;
+        let west : bool = (self.open & HYDRO_SIDE_WEST) != 0;
+        let east : bool = (self.open & HYDRO_SIDE_EAST) != 0;
+        let north : bool = (self.open & HYDRO_SIDE_NORTH) != 0;
+        let south : bool = (self.open & HYDRO_SIDE_SOUTH) != 0;
+
+        // The second ghost of a wall mirrors the second cell, of an open side it repeats the edge.
+        let mut westFar : i32 = 1;
+        let mut eastFar : i32 = last - 1;
+        let mut northFar : i32 = 1;
+        let mut southFar : i32 = bottom - 1;
+        if (west) {
+            westFar = 0;
+        }
+        if (east) {
+            eastFar = last;
+        }
+        if (north) {
+            northFar = 0;
+        }
+        if (south) {
+            southFar = bottom;
+        }
+
+        for (z of 0..self.depth) {
+            let row : i32 = self.index(0, z);
+            self.ghost(row - 1, row, true, west);
+            self.ghost(row - 2, row + westFar, true, west);
+            self.ghost(row + last + 1, row + last, true, east);
+            self.ghost(row + last + 2, row + eastFar, true, east);
+        }
+
+        for (x of -HYDRO_PAD..(self.width + HYDRO_PAD)) {
+            self.ghost(self.index(x, -1), self.index(x, 0), false, north);
+            self.ghost(self.index(x, -2), self.index(x, northFar), false, north);
+            self.ghost(self.index(x, bottom + 1), self.index(x, bottom), false, south);
+            self.ghost(self.index(x, bottom + 2), self.index(x, southFar), false, south);
+        }
+    }
+
+    // One ghost cell from its source cell. A wall mirrors it (normal velocity flipped); an open side is dry.
+    fn ghost(mut self, dst : i32, src : i32, normalX : bool, open : bool) : void {
+        let d : i64 = dst as i64;
+        let s : i64 = src as i64;
+        self.h[d] = self.h[s];
+        self.qx[d] = self.qx[s];
+        self.qz[d] = self.qz[s];
+        self.u[d] = self.u[s];
+        self.w[d] = self.w[s];
+
+        // An open side is a free outfall: the ghost is dry at the edge's bed level, so water runs out over it at
+        // the critical rate and nothing ever comes in.
+        if (open) {
+            self.h[d] = 0.0;
+            self.qx[d] = 0.0;
+            self.qz[d] = 0.0;
+            self.u[d] = 0.0;
+            self.w[d] = 0.0;
+            return;
+        }
+
+        // A wall mirrors the cell with its normal velocity flipped, so the flux through it is zero by symmetry.
+        if (normalX) {
+            self.qx[d] = -self.qx[s];
+            self.u[d] = -self.u[s];
+        } else {
+            self.qz[d] = -self.qz[s];
+            self.w[d] = -self.w[s];
+        }
+    }
+
+    // ---- the activity tiles ----
+
+    /** Flags the tile of cell (x, z) so it runs next substep (it clamps to the grid). */
+    pub(crate) fn wake(mut self, x : i32, z : i32) : void {
+        let cx : i32 = minI(maxI(x, 0), self.width - 1);
+        let cz : i32 = minI(maxI(z, 0), self.depth - 1);
+        self.tileFlow[self.tileOf(cx, cz) as i64] = 1;
+    }
+
+    /** Flags every tile (used after bulk edits; calm tiles clear themselves after one substep). */
+    pub(crate) fn wakeAll(mut self) : void {
+        for (t of 0..(self.tilesX * self.tilesZ)) {
+            self.tileFlow[t as i64] = 1;
+        }
+    }
+
+    /** Builds `activeTiles`: every flagged tile and its eight neighbours, in tile order. */
+    pub(crate) fn buildActive(mut self) : void {
+        let total : i32 = self.tilesX * self.tilesZ;
+        for (t of 0..total) {
+            self.tileRun[t as i64] = 0;
+        }
+        for (tz of 0..self.tilesZ) {
+            for (tx of 0..self.tilesX) {
+                if (self.tileFlow[(tz * self.tilesX + tx) as i64] == 0) {
+                    continue;
+                }
+                self.runAround(tx, tz);
+            }
+        }
+
+        let mut count : i32 = 0;
+        for (t of 0..total) {
+            if (self.tileRun[t as i64] != 0) {
+                self.activeTiles[count as i64] = t;
+                count = count + 1;
+            }
+        }
+        self.activeCount = count;
+    }
+
+    fn runAround(mut self, tx : i32, tz : i32) : void {
+        for (dz of -1..2) {
+            for (dx of -1..2) {
+                let x : i32 = tx + dx;
+                let z : i32 = tz + dz;
+                if (x < 0 || z < 0 || x >= self.tilesX || z >= self.tilesZ) {
+                    continue;
+                }
+                self.tileRun[(z * self.tilesX + x) as i64] = 1;
+            }
+        }
+    }
+
+    /** The largest wave-plus-flow speed over the tiles that run, m/s; 0 when nothing runs or moves. */
+    pub(crate) fn fastest(self) : f32 {
+        let mut fast : f32 = 0.0;
+        for (k of 0..self.activeCount) {
+            fast = max(fast, self.tileSpeed[self.activeTiles[k as i64] as i64]);
+        }
+        return fast;
+    }
+
+    // ---- water in and out ----
+
+    /**
+     * Adds `depth` metres of water to cell (x, z) together with the momentum per unit area `(mx, mz)` (m2/s)
+     * it carries, and refreshes the cell's velocity and the tile's speed so the next time step already knows
+     * about it. The caller keeps the books.
+     */
+    pub(crate) fn deposit(mut self, x : i32, z : i32, depth : f32, mx : f32, mz : f32) : void {
+        let i : i64 = self.index(x, z) as i64;
+        self.addDepth(i, depth);
+        self.qx[i] = self.qx[i] + mx;
+        self.qz[i] = self.qz[i] + mz;
+        self.refresh(x, z);
+        self.wake(x, z);
+    }
+
+    // Adds `amount` metres to the depth of the cell at array index `i` with error feedback: a depth of a metre
+    // has a resolution of 1e-7, a landing parcel adds a few 1e-5, and rounding the same fraction the same way
+    // thousands of times would lose water systematically. What the sum could not hold stays in `credit` and is
+    // added to the next deposit, so the books close to f32 rounding of one cell, not of every parcel.
+    fn addDepth(mut self, i : i64, amount : f32) : void {
+        let want : f32 = amount + self.credit[i];
+        let before : f32 = self.h[i];
+        let after : f32 = max(before + want, 0.0);
+        self.h[i] = after;
+        self.credit[i] = want - (after - before);
+    }
+
+    /** Removes up to `depth` metres from cell (x, z), keeping its velocity; answers what was really removed. */
+    pub(crate) fn drain(mut self, x : i32, z : i32, depth : f32) : f32 {
+        let i : i64 = self.index(x, z) as i64;
+        let taken : f32 = min(depth, self.h[i]);
+        if (taken > 0.0) {
+            // The water leaves with its dye, in proportion.
+            let share : f32 = taken / self.h[i];
+            for (k of 0..self.tracers) {
+                let at : i64 = (k * self.cells) as i64 + i;
+                let out : f32 = min(self.dye[at] * share, self.dye[at]);
+                self.addDye(at, -out);
+                self.drainedDye[k as i64] = self.drainedDye[k as i64]
+                    + (out as f64) * (self.cellSize as f64) * (self.cellSize as f64);
+            }
+        }
+        self.addDepth(i, -taken);
+        self.refresh(x, z);
+        self.wake(x, z);
+        return taken;
+    }
+
+    // Adds `amount` metres of dyed water to the dye array entry `at`, with the same error feedback as the depth.
+    fn addDye(mut self, at : i64, amount : f32) : void {
+        let want : f32 = amount + self.dyeCredit[at];
+        let before : f32 = self.dye[at];
+        let after : f32 = max(before + want, 0.0);
+        self.dye[at] = after;
+        self.dyeCredit[at] = want - (after - before);
+    }
+
+    /** Adds `depth` metres of water that is pure tracer `k` to the dye of cell (x, z) (the water itself is added
+     * separately); the caller keeps the books. */
+    pub(crate) fn depositDye(mut self, x : i32, z : i32, k : i32, depth : f32) : void {
+        if (k < 0 || k >= self.tracers) {
+            return;
+        }
+        self.addDye((k * self.cells) as i64 + (self.index(x, z) as i64), depth);
+    }
+
+    /** The dye volume of tracer `k` in the grid, m3, in f64, credits included. */
+    pub(crate) fn dyeVolume(self, k : i32) : f64 {
+        if (k < 0 || k >= self.tracers) {
+            return 0.0;
+        }
+        let mut sum : f64 = 0.0;
+        for (z of 0..self.depth) {
+            let mut row : f64 = 0.0;
+            let base : i64 = (k * self.cells) as i64 + (self.index(0, z) as i64);
+            for (x of 0..self.width) {
+                row = row + (self.dye[base + (x as i64)] as f64) + (self.dyeCredit[base + (x as i64)] as f64);
+            }
+            sum = sum + row;
+        }
+        return sum * (self.cellSize as f64) * (self.cellSize as f64);
+    }
+
+    /** The water in the cells flagged in `mask` (`width * depth` bytes, row-major), m3, in one pass: per-row f64
+     * sums combined in row order, so the value is independent of anything but the state. */
+    pub(crate) fn volumeOfMask(self, mask : u8[]) : f64 {
+        let mut sum : f64 = 0.0;
+        for (z of 0..self.depth) {
+            let mut row : f64 = 0.0;
+            let base : i32 = self.index(0, z);
+            for (x of 0..self.width) {
+                if (mask[(z * self.width + x) as i64] != 0) {
+                    row = row + (self.h[(base + x) as i64] as f64) + (self.credit[(base + x) as i64] as f64);
+                }
+            }
+            sum = sum + row;
+        }
+        return sum * (self.cellSize as f64) * (self.cellSize as f64);
+    }
+
+    /** Recomputes the velocity of cell (x, z) from its discharge and raises its tile's speed bound. */
+    pub(crate) fn refresh(mut self, x : i32, z : i32) : void {
+        let i : i64 = self.index(x, z) as i64;
+        let depth : f32 = self.h[i];
+        if (depth <= self.dry) {
+            self.u[i] = 0.0;
+            self.w[i] = 0.0;
+            self.qx[i] = 0.0;
+            self.qz[i] = 0.0;
+            return;
+        }
+        let inv : f32 = (1.0 as f32) / depth;
+        self.u[i] = self.qx[i] * inv;
+        self.w[i] = self.qz[i] * inv;
+        let speed : f32 = (self.u[i] * self.u[i] + self.w[i] * self.w[i]).sqrt()
+            + (self.gravity * depth).sqrt();
+        let t : i64 = self.tileOf(x, z) as i64;
+        self.tileSpeed[t] = max(self.tileSpeed[t], speed);
+    }
+
+    // ---- totals ----
+
+    /** The water in the grid, in cubic metres: the sum of depth times cell area, in f64, in cell order. */
+    pub(crate) fn volume(self) : f64 {
+        let mut sum : f64 = 0.0;
+        for (z of 0..self.depth) {
+            let mut row : f64 = 0.0;
+            let base : i32 = self.index(0, z);
+            for (x of 0..self.width) {
+                row = row + (self.h[(base + x) as i64] as f64) + (self.credit[(base + x) as i64] as f64);
+            }
+            sum = sum + row;
+        }
+        let area : f64 = (self.cellSize as f64) * (self.cellSize as f64);
+        return sum * area;
+    }
+}

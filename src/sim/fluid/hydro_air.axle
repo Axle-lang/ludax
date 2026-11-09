@@ -1,0 +1,414 @@
+// hydro_air — what becomes of airborne water: landing, splash, breakup and foam, in one serial phase.
+//
+// The flight kernel (`hydro_particles`) only records a fate for each particle. This phase acts on the fates in
+// index order, on one thread, so the grid and the pools change in an order that is a function of the history
+// alone. It is the only code that moves water from the particles into the grid (and a little back out as a
+// splash), and the books are kept here:
+//
+//   land      the parcel's volume becomes depth in the cell under it, and a share (`landingKick`) of its
+//             horizontal momentum becomes discharge there, so a falling curtain drives a current out of the
+//             plunge pool. A parcel landing faster than the splash speed does not give everything back: part
+//             of it leaves again as a crown of smaller drops thrown up and out (volume taken exactly), and the
+//             rest lands. Nothing evaporates: every drop comes down again.
+//   foam      every landing writes foam and turbulence into its cell in proportion to `speed * depth added`,
+//             so the plunge pool is white while the curtain feeds it and stays aerated for a few seconds after.
+//   split     a parcel that was unstable long enough becomes two spray drops of half its volume each, flying
+//             apart with opposite sideways velocities, so mass and momentum are conserved exactly; if the pool
+//             has no room for the second drop the parcel simply keeps flying and tries again later.
+//
+// Volume bookkeeping: every parcel carries `volume` cubic metres in f32. Halving is exact, a splash takes
+// `n` children of a rounded volume and the remainder lands (the remainder is computed in f64 from what the
+// children really carry), so water is neither made nor lost beyond the rounding of the f32 depth of a cell.
+
+use crate::core::math::scalar::{max, maxI, min, minI};
+use crate::core::math::trig::{cos, sin};
+use crate::core::rng::pcg32::Pcg32;
+use crate::sim::fluid::fluid_noise::FluidNoise;
+use crate::sim::fluid::hydro_grid::HydroGrid;
+use crate::sim::fluid::hydro_params::HydroFallParams;
+use crate::sim::fluid::hydro_particles::{
+    HYDRO_AERATED, HYDRO_FATE_FLY, HYDRO_FATE_LAND, HYDRO_FATE_LEAVE, HYDRO_FATE_SPLIT, HYDRO_LIQUID,
+    HYDRO_SPRAY, HydroParticles
+};
+
+/** The `Pcg32` stream of the serial phases, fixed so a world's scatter is repeatable. */
+const HYDRO_AIR_STREAM : u64 = 91;
+
+/** Speed ratios (landing speed over splash speed) at which a splash throws two and four drops. */
+const HYDRO_SPLASH_TWO : f32 = 3.0;
+const HYDRO_SPLASH_FOUR : f32 = 6.0;
+
+/** Speed ratio over which the splash share reaches its maximum. */
+const HYDRO_SPLASH_FULL : f32 = 5.0;
+
+/** Share of the landing speed a crown drop leaves sideways, at most, and its upward share. */
+const HYDRO_CROWN_OUT : f32 = 0.3;
+const HYDRO_CROWN_UP : f32 = 0.45;
+
+/** The sideways speed two halves of a breaking parcel fly apart at, as a share of its speed. */
+const HYDRO_BREAK_SPREAD : f32 = 0.18;
+
+/** The airborne population of one world: its pool, its serial phase and its books. */
+pub(crate) class HydroAir {
+    pub(crate) store : HydroParticles;
+    grid             : Shared<HydroGrid>;
+    params           : HydroFallParams;
+    rng              : Pcg32;
+
+    /** Volume that came down from the air into the grid since the world was built, m3. */
+    pub(crate) landed : f64 = 0.0;
+
+    /** Volume that flew out of the world through an open side since the world was built, m3. */
+    pub(crate) left : f64 = 0.0;
+
+    // The aerated parcels the substep may still launch, and a counter that keys the hash of their scatter.
+    budget : i32 = 0;
+    froths : i32 = 0;
+
+    /** The dye of each tracer, m3, that flew out of the world with `left`. */
+    pub(crate) leftDye : f64[];
+
+    /** An air layer over `grid` under the (checked) overfall parameters. */
+    constructor(own grid : Shared<HydroGrid>, params : HydroFallParams) {
+        self.grid = grid;
+        self.params = params;
+        self.store = new HydroParticles(params.capacity, params.aerationCapacity, params, grid.tracers);
+        self.leftDye = new f64[(grid.tracers + 1) as i64];
+        for (t of 0..grid.tracers + 1) {
+            self.leftDye[t as i64] = 0.0;
+        }
+        self.rng = new Pcg32(params.seed, HYDRO_AIR_STREAM);
+    }
+
+    /** The grid this layer lands its water in. */
+    pub(crate) fn grid(self) : Shared<HydroGrid> {
+        return self.grid;
+    }
+
+    /**
+     * Pours `volume` cubic metres into cell (x, z) as a landing without a splash, with `speed` m/s along x
+     * (`alongX`) or z, and counts it as landed; the overfall uses it when its curtain cannot be drawn.
+     */
+    pub(crate) fn pour(
+        mut self,
+        x : i32,
+        z : i32,
+        volume : f64,
+        speed : f32,
+        alongX : bool,
+        dyes : f64[],
+        first : i32
+    ) : void {
+        let g : Shared<HydroGrid> = self.grid;
+        let area : f64 = (g.cellSize as f64) * (g.cellSize as f64);
+        let depth : f32 = (volume / area) as f32;
+        let kick : f32 = self.params.landingKick * depth * speed;
+        if (alongX) {
+            g.deposit(x, z, depth, kick, 0.0);
+        } else {
+            g.deposit(x, z, depth, 0.0, kick);
+        }
+        for (t of 0..g.tracers) {
+            g.depositDye(x, z, t, (dyes[(first + t) as i64] / area) as f32);
+        }
+        self.landed = self.landed + volume;
+    }
+
+    /** Acts on every fate the flight kernel wrote, in index order. */
+    pub(crate) fn settle(mut self) : void {
+        self.budget = self.params.aerationPerStep;
+        let mut k : i32 = 0;
+        while (k < self.store.count) {
+            let fate : u8 = self.store.fate[k as i64];
+            if (fate == HYDRO_FATE_FLY) {
+                k = k + 1;
+                continue;
+            }
+            if (fate == HYDRO_FATE_SPLIT) {
+                if (!self.split(k)) {
+                    self.store.fate[k as i64] = HYDRO_FATE_FLY;
+                    self.store.clock[k as i64] = 0.0;
+                }
+                k = k + 1;
+                continue;
+            }
+            if (fate == HYDRO_FATE_LAND) {
+                self.land(k);
+            }
+            if (fate == HYDRO_FATE_LEAVE) {
+                self.left = self.left + (self.store.volume[k as i64] as f64);
+                for (t of 0..self.store.tracers) {
+                    self.leftDye[t as i64] = self.leftDye[t as i64]
+                        + (self.store.fraction(k, t) as f64) * (self.store.volume[k as i64] as f64);
+                }
+            }
+            self.store.remove(k);
+        }
+    }
+
+    // ---- landing ----
+
+    // The cell under the particle `k`, clamped to the grid; the x and z of it packed as x + z * width.
+    fn cellX(self, k : i32) : i32 {
+        let x : f32 = self.store.pos[(k * 3) as i64] * self.grid.invCell;
+        return minI(maxI(x as i32, 0), self.grid.width - 1);
+    }
+
+    fn cellZ(self, k : i32) : i32 {
+        let z : f32 = self.store.pos[(k * 3 + 2) as i64] * self.grid.invCell;
+        return minI(maxI(z as i32, 0), self.grid.depth - 1);
+    }
+
+    // Parcel `k` reaches the ground or the water: splash, then the rest lands with foam.
+    fn land(mut self, k : i32) : void {
+        let mut g : Shared<HydroGrid> = self.grid;
+        let b : i64 = (k * 3) as i64;
+        let vx : f32 = self.store.vel[b];
+        let vy : f32 = self.store.vel[b + 1];
+        let vz : f32 = self.store.vel[b + 2];
+        let volume : f64 = self.store.volume[k as i64] as f64;
+        if (volume <= 0.0) {
+            return;
+        }
+        if (self.store.kind[k as i64] == HYDRO_AERATED) {
+            self.landFroth(k);
+            return;
+        }
+
+        let cx : i32 = self.cellX(k);
+        let cz : i32 = self.cellZ(k);
+        let speed : f32 = (vx * vx + vy * vy + vz * vz).sqrt();
+        let ratio : f32 = speed / self.params.splashSpeed;
+        let mut keep : f64 = volume;
+        if (ratio > 1.0) {
+            keep = keep - self.crown(k, cx, cz, ratio, volume);
+        }
+        if (speed > self.params.aerationSpeed) {
+            keep = keep - self.aerate(k, cx, cz, speed, volume, keep);
+        }
+
+        let area : f64 = (g.cellSize as f64) * (g.cellSize as f64);
+        let depth : f32 = (keep / area) as f32;
+        let kick : f32 = self.params.landingKick * depth;
+        g.deposit(cx, cz, depth, kick * vx, kick * vz);
+        self.landed = self.landed + keep;
+        for (t of 0..g.tracers) {
+            let dyed : f64 = (self.store.fraction(k, t) as f64) * keep;
+            g.depositDye(cx, cz, t, (dyed / area) as f32);
+        }
+
+        let i : i64 = g.index(cx, cz) as i64;
+        let energy : f32 = speed * depth;
+        g.foam[i] = min(g.foam[i] + self.params.foamGain * energy, 1.0);
+        g.turb[i] = min(g.turb[i] + self.params.turbulenceGain * energy, 1.0);
+        let tile : i64 = g.tileOf(cx, cz) as i64;
+        g.tileFoam[tile] = max(g.tileFoam[tile], max(g.foam[i], g.turb[i]));
+    }
+
+    // An aerated parcel comes down: its water goes back to the cell under it, with a share of its momentum, and
+    // the dye it carries; no splash, no new froth.
+    fn landFroth(mut self, k : i32) : void {
+        let g : Shared<HydroGrid> = self.grid;
+        let b : i64 = (k * 3) as i64;
+        let cx : i32 = self.cellX(k);
+        let cz : i32 = self.cellZ(k);
+        let volume : f64 = self.store.volume[k as i64] as f64;
+        let area : f64 = (g.cellSize as f64) * (g.cellSize as f64);
+        let depth : f32 = (volume / area) as f32;
+        let kick : f32 = self.params.landingKick * depth;
+        g.deposit(cx, cz, depth, kick * self.store.vel[b], kick * self.store.vel[b + 2]);
+        self.landed = self.landed + volume;
+        for (t of 0..g.tracers) {
+            let dyed : f64 = (self.store.fraction(k, t) as f64) * volume;
+            g.depositDye(cx, cz, t, (dyed / area) as f32);
+        }
+    }
+
+    // Turns a share of a hard landing into aerated parcels: froth thrown up and out at up to 0.6 of the impact
+    // speed, mostly upward, each living between half and one and a half `aerationLife`. Their water is taken from
+    // the landing (what the parcels really carry is subtracted from `keep`), so it is returned when they die.
+    // The scatter is a stateless hash of the parcel number, so it is the same for any worker count. Answers the
+    // volume taken.
+    fn aerate(mut self, k : i32, cx : i32, cz : i32, speed : f32, volume : f64, keep : f64) : f64 {
+        let p : HydroFallParams = self.params;
+        if (p.aerationShare <= 0.0 || self.store.aeratedCapacity <= 0 || self.budget <= 0) {
+            return 0.0;
+        }
+        let want : f64 = min((p.aerationShare as f64) * volume, keep * 0.9);
+        let parcel : f64 = p.aerationParcel as f64;
+        if (want < 0.5 * parcel) {
+            return 0.0;
+        }
+
+        let room : i32 = self.store.aeratedCapacity - self.store.aerated;
+        let n : i32 = minI(
+            minI(maxI(((want / parcel) + 0.5) as i32, 1), p.aerationPerLanding),
+            minI(self.budget, room)
+        );
+        if (n < 1) {
+            return 0.0;
+        }
+        let each : f32 = (want / (n as f64)) as f32;
+        let g : Shared<HydroGrid> = self.grid;
+        let b : i64 = (k * 3) as i64;
+        let cell : i64 = g.index(cx, cz) as i64;
+        let top : f32 = g.bed[cell] + g.h[cell];
+        let seed : i64 = p.seed as i64;
+        self.froths = self.froths + 1;
+        let mut taken : f64 = 0.0;
+        for (j of 0..n) {
+            let key : i64 = (self.froths as i64) * 4096 + ((j * 8) as i64);
+            let launch : f32 = (0.6 as f32) * speed
+                * (((0.3 as f64) + 0.7 * FluidNoise::unit(seed, key, 1)) as f32);
+            let rise : f32 = launch * (((0.7 as f64) + 0.3 * FluidNoise::unit(seed, key, 2)) as f32);
+            let out : f32 = launch * (0.5 as f32) * (FluidNoise::unit(seed, key, 3) as f32);
+            let angle : f32 = (FluidNoise::unit(seed, key, 4) as f32) * (6.2831855 as f32);
+            let radius : f32 = p.aerationRadiusMin
+                + (p.aerationRadiusMax - p.aerationRadiusMin) * (FluidNoise::unit(seed, key, 5) as f32);
+            let life : f32 = p.aerationLife * (((0.5 as f64) + FluidNoise::unit(seed, key, 6)) as f32);
+            let made : bool = self.store.add(
+                HYDRO_AERATED,
+                self.store.pos[b],
+                max(self.store.pos[b + 1], top + radius),
+                self.store.pos[b + 2],
+                self.store.vel[b] * (0.2 as f32) + out * cos(angle),
+                rise,
+                self.store.vel[b + 2] * (0.2 as f32) + out * sin(angle),
+                each
+            );
+            if (!made) {
+                break;
+            }
+            let at : i32 = self.store.count - 1;
+            self.store.radius[at as i64] = radius;
+            self.store.life[at as i64] = life;
+            self.store.copyFractions(k, at);
+            taken = taken + (each as f64);
+            self.budget = self.budget - 1;
+        }
+        return taken;
+    }
+
+    // Throws a crown of spray from a hard landing; answers the volume it took (what its children really carry).
+    fn crown(mut self, k : i32, cx : i32, cz : i32, ratio : f32, volume : f64) : f64 {
+        let p : HydroFallParams = self.params;
+        let grow : f32 = min((ratio - 1.0) / HYDRO_SPLASH_FULL, 1.0);
+        let share : f32 = p.splashShare * grow;
+        let mut drops : i32 = 1;
+        if (ratio >= HYDRO_SPLASH_TWO) {
+            drops = 2;
+        }
+        if (ratio >= HYDRO_SPLASH_FOUR) {
+            drops = 4;
+        }
+        let each : f32 = (((share as f64) * volume) / (drops as f64)) as f32;
+        if (each < p.minParcel * (0.25 as f32)) {
+            return 0.0;
+        }
+
+        let g : Shared<HydroGrid> = self.grid;
+        let b : i64 = (k * 3) as i64;
+        let vx : f32 = self.store.vel[b];
+        let vz : f32 = self.store.vel[b + 2];
+        let speed : f32 = (vx * vx + self.store.vel[b + 1] * self.store.vel[b + 1] + vz * vz).sqrt();
+        let top : f32 = g.bed[g.index(cx, cz) as i64] + g.h[g.index(cx, cz) as i64]
+            + HydroParticles::radiusOf(each);
+
+        let mut taken : f64 = 0.0;
+        for (n of 0..drops) {
+            let angle : f32 = self.rng.nextF32() * (6.2831855 as f32);
+            let out : f32 = HYDRO_CROWN_OUT * speed * ((0.5 as f32) + self.rng.nextF32());
+            let up : f32 = HYDRO_CROWN_UP * speed * ((0.5 as f32) + self.rng.nextF32());
+            let dx : f32 = cos(angle);
+            let dz : f32 = sin(angle);
+            let made : bool = self.store.add(
+                HYDRO_SPRAY,
+                self.store.pos[b],
+                max(self.store.pos[b + 1], top),
+                self.store.pos[b + 2],
+                vx * (0.3 as f32) + dx * out,
+                up,
+                vz * (0.3 as f32) + dz * out,
+                each
+            );
+            if (!made) {
+                break;
+            }
+            self.store.copyFractions(k, self.store.count - 1);
+            taken = taken + (each as f64);
+        }
+        return taken;
+    }
+
+    // ---- breakup ----
+
+    // Parcel `k` becomes two halves; false when the pool is full (the parcel is left as it was).
+    fn split(mut self, k : i32) : bool {
+        let mut s : HydroParticles = self.store;
+        if (s.waterCount() >= s.capacity) {
+            return false;
+        }
+        let b : i64 = (k * 3) as i64;
+        let vx : f32 = s.vel[b];
+        let vy : f32 = s.vel[b + 1];
+        let vz : f32 = s.vel[b + 2];
+        let speed : f32 = (vx * vx + vy * vy + vz * vz).sqrt();
+
+        // A sideways direction, perpendicular to the flight, from two random numbers.
+        let mut ax : f32 = self.rng.nextF32() - (0.5 as f32);
+        let mut ay : f32 = self.rng.nextF32() - (0.5 as f32);
+        let mut az : f32 = self.rng.nextF32() - (0.5 as f32);
+        let along : f32 = hydroProject(speed, ax * vx + ay * vy + az * vz);
+        let inv : f32 = (1.0 as f32) / max(speed * speed, 0.000001);
+        ax = ax - along * vx * inv;
+        ay = ay - along * vy * inv;
+        az = az - along * vz * inv;
+        let len : f32 = max((ax * ax + ay * ay + az * az).sqrt(), 0.000001);
+        let spread : f32 = HYDRO_BREAK_SPREAD * speed / len;
+        ax = ax * spread;
+        ay = ay * spread;
+        az = az * spread;
+
+        let half : f32 = s.volume[k as i64] * (0.5 as f32);
+        let r : f32 = HydroParticles::radiusOf(half);
+        let px : f32 = s.pos[b];
+        let py : f32 = s.pos[b + 1];
+        let pz : f32 = s.pos[b + 2];
+        let offset : f32 = (0.5 as f32) * r / len;
+
+        s.add(
+            HYDRO_SPRAY,
+            px - ax * offset,
+            py - ay * offset,
+            pz - az * offset,
+            vx - ax,
+            vy - ay,
+            vz - az,
+            half
+        );
+        s.copyFractions(k, s.count - 1);
+
+        // The first half takes the parent's slot.
+        s.pos[b] = px + ax * offset;
+        s.pos[b + 1] = py + ay * offset;
+        s.pos[b + 2] = pz + az * offset;
+        s.vel[b] = vx + ax;
+        s.vel[b + 1] = vy + ay;
+        s.vel[b + 2] = vz + az;
+        s.volume[k as i64] = half;
+        s.radius[k as i64] = r;
+        s.kind[k as i64] = HYDRO_SPRAY;
+        s.clock[k as i64] = 0.0;
+        s.fate[k as i64] = HYDRO_FATE_FLY;
+        return true;
+    }
+}
+
+// The projection of a random vector on the flight direction needs the speed to be nonzero; at rest nothing
+// is projected out.
+fn hydroProject(speed : f32, dot : f32) : f32 {
+    if (speed <= 0.000001) {
+        return 0.0;
+    }
+    return dot;
+}

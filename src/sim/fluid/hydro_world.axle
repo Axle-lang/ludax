@@ -1,0 +1,1065 @@
+// hydro_world — HydroWorld, the metric water simulation a game or a scene drives: rivers, lakes and waterfalls.
+//
+// What it is. A shallow-water solver on a regular grid of square cells, in SI units, over a bed the game hands
+// in as a plain `f32[]` of heights; a layer of ballistic particles for the water that leaves a lip and falls;
+// and the books that say where every cubic metre is. `step(dt)` advances any time: it cuts it into substeps whose
+// length comes from the Courant condition `dt <= cfl * cellSize / max(|u| + sqrt(g h))`, evaluated on the state
+// itself, so a trickle is stepped coarsely and a flood finely, and the result is a function of the inputs alone.
+//
+// One substep, in order: ghost cells, face fluxes, positivity factors, cell update (`hydro_passes`); the lips
+// collect what crossed them and launch particles (`hydro_lips`); the boundary and the sinks take what leaves,
+// the inflows pour what enters; the particles fly and land (`hydro_particles`, `hydro_air`); foam and turbulence
+// follow the flow. Water that falls anywhere becomes depth in the grid and flows downhill from there, over any
+// bed, into puddles and out through declared sinks and open sides only.
+//
+// The books. `ledger()` holds every cubic metre: in the grid, in the air (particles and the lips' carries),
+// out through the open sides and the sinks, soaked into the ground; and what came in: poured by
+// `fillTo`/`pour`, and through the inflows. They agree to the rounding of f32 depths (see `HydroLedger`).
+//
+// Positions are grid-local metres (x and z from the grid corner); `origin()` places the grid in the world. All
+// reads are interpolated. The world is reproducible bit for bit: no wall clock, no hash order, random numbers
+// from an explicit `Pcg32`, and any `threads` gives the same state.
+
+use crate::core::math::scalar::{max, maxI, min, minI};
+use crate::core::math::vec2::Vec2;
+use crate::core::math::vec3::Vec3;
+use crate::sim::fluid::hydro_air::HydroAir;
+use crate::sim::fluid::hydro_drifters::HydroDrifters;
+use crate::sim::fluid::hydro_flux::HydroScheme;
+use crate::sim::fluid::hydro_grid::{
+    HYDRO_SIDE_EAST, HYDRO_SIDE_NORTH, HYDRO_SIDE_SOUTH, HYDRO_SIDE_WEST, HYDRO_TILE_H, HYDRO_TILE_W,
+    HydroGrid
+};
+use crate::sim::fluid::hydro_lips::HydroLips;
+use crate::sim::fluid::hydro_params::{HydroFallParams, HydroParams};
+use crate::sim::fluid::hydro_particles::HydroParticles;
+use crate::sim::fluid::hydro_runner::{HydroRunner, HydroStage};
+use crate::sim::fluid::hydro_sample::{HydroSample, HydroStencil};
+use crate::sim::fluid::hydro_sources::{HydroPort, HydroSources};
+use crate::sim::fluid::hydro_vents::{HydroVentParams, HydroVents};
+
+/** The fastest speed assumed when nothing moves, m/s: it bounds the substep of a world with only sources. */
+const HYDRO_QUIET_SPEED : f32 = 1.0;
+
+/** A drop no bed has, m: the lip threshold of a world without overfall. */
+const HYDRO_NO_LIP : f32 = 1000000.0;
+
+/** Time under which the rest of a step is not worth a substep, s. */
+const HYDRO_TINY_TIME : f32 = 0.000001;
+
+/** The share of the explicit diffusion limit `cellSize^2 / (4 dt)` the viscosity may use. */
+const HYDRO_VISCOUS_SHARE : f32 = 0.5;
+
+/** Where every cubic metre is. `residual()` is zero up to the rounding of f32 depths. */
+pub struct HydroLedger {
+    /** Water in the grid, m3. */
+    pub grid : f64 = 0.0;
+
+    /** Water in the air: falling particles and the volume waiting at the lips, m3. */
+    pub airborne : f64 = 0.0;
+
+    /** Water that left through open sides, m3. */
+    pub outflow : f64 = 0.0;
+
+    /** Water taken out by sinks, m3. */
+    pub sunk : f64 = 0.0;
+
+    /** Water that soaked into the ground (`HydroParams.infiltration`), m3. */
+    pub soaked : f64 = 0.0;
+
+    /** Water put in by `fillTo`, `pour` and the likes, m3. */
+    pub poured : f64 = 0.0;
+
+    /** Water that came in through the inflows, m3. */
+    pub inflow : f64 = 0.0;
+
+    /** What is accounted for minus what came in: zero when the books close. */
+    pub fn residual(self) : f64 {
+        return self.grid + self.airborne + self.outflow + self.sunk + self.soaked - self.poured - self.inflow;
+    }
+}
+
+/** Where the dye of one tracer is: the same books as the water's, for one passive scalar. */
+pub struct HydroDyeLedger {
+    /** Dye in the grid, m3 of dyed water. */
+    pub grid : f64 = 0.0;
+
+    /** Dye in the air: on particles, at the lips and waiting at the vents, m3. */
+    pub airborne : f64 = 0.0;
+
+    /** Dye that left: through open sides, with particles that flew out, and into sinks, m3. */
+    pub outflow : f64 = 0.0;
+
+    /** Dye put in: by tagged inflows and vents, `fillToDyed` and `dyeRegion`, m3. */
+    pub injected : f64 = 0.0;
+
+    /** What is accounted for minus what was put in: zero up to f32 rounding. */
+    pub fn residual(self) : f64 {
+        return self.grid + self.airborne + self.outflow - self.injected;
+    }
+}
+
+/** One airborne particle, for readers that want a record (a renderer reads the bulk arrays instead). */
+pub struct HydroParticle {
+    /** Grid-local position, m. */
+    pub x : f32 = 0.0;
+    pub y : f32 = 0.0;
+    pub z : f32 = 0.0;
+
+    /** Velocity, m/s. */
+    pub vx : f32 = 0.0;
+    pub vy : f32 = 0.0;
+    pub vz : f32 = 0.0;
+
+    /** Radius of the sphere of its water, m. */
+    pub radius : f32 = 0.0;
+
+    /** `HYDRO_LIQUID`, `HYDRO_SPRAY` or `HYDRO_AERATED`. */
+    pub kind : u8 = 0;
+}
+
+/** The metric water world; see the file header. */
+pub class HydroWorld {
+    grid      : Shared<HydroGrid>;
+    air       : Shared<HydroAir>;
+    lips      : HydroLips;
+    runner    : HydroRunner;
+    sources   : HydroSources;
+    vents     : HydroVents;
+    drifters  : HydroDrifters;
+    params    : HydroParams;
+    poured    : f64 = 0.0;
+    inflowed  : f64 = 0.0;
+    outflowed : f64 = 0.0;
+    sunk      : f64 = 0.0;
+    soaked    : f64 = 0.0;
+    clock     : f64 = 0.0;
+    lost      : f64 = 0.0;
+    substeps  : i64 = 0;
+    cellSteps : i64 = 0;
+    flights   : i64 = 0;
+    dyeIn     : f64[];
+    dyeOut    : f64[];
+    dyeEdge   : f64[];
+
+    /**
+     * A dry, flat world of `width` x `depth` cells of `cellSize` metres under `params` (see
+     * `HydroParams.checked`; sizes below 1 become 1). Give it a bed with `setBed`, then water.
+     */
+    constructor(width : i32, depth : i32, cellSize : f32, params : HydroParams) {
+        let w : i32 = maxI(width, 1);
+        let d : i32 = maxI(depth, 1);
+        let mut size : f32 = cellSize;
+        if (size <= 0.0) {
+            size = 1.0;
+        }
+        let checked : HydroParams = params.checked();
+        self.params = checked;
+        self.grid = share new HydroGrid(w, d, size, self.params.tracers);
+        self.grid.gravity = self.params.gravity;
+        self.grid.dry = self.params.dryDepth;
+        self.lips = new HydroLips();
+        self.air = share new HydroAir(self.grid, self.params.fall);
+        self.air.store.gravity = self.params.gravity;
+        self.sources = new HydroSources(self.params.tracers);
+        self.vents = new HydroVents(self.params.tracers);
+        self.drifters = new HydroDrifters(self.params.drifters, self.params.fall, self.params.gravity);
+        self.drifters.trailInterval = self.params.trailInterval;
+        self.drifters.surfaceFactor = self.params.drifterSurfaceFactor;
+        self.drifters.diffusion = self.params.drifterDiffusion;
+        self.drifters.manning = self.params.manning;
+        self.dyeIn = new f64[(self.params.tracers + 1) as i64];
+        self.dyeOut = new f64[(self.params.tracers + 1) as i64];
+        self.dyeEdge = new f64[(self.params.tracers + 1) as i64];
+        for (t of 0..self.params.tracers + 1) {
+            self.dyeIn[t as i64] = 0.0;
+            self.dyeOut[t as i64] = 0.0;
+            self.dyeEdge[t as i64] = 0.0;
+        }
+        self.runner = new HydroRunner(self.grid, self.air, self.params.threads);
+        self.lips.detect(self.grid, self.lipThreshold(), self.params.fall.cliffSlope);
+    }
+
+    // The drop that makes a lip: the configured one, or none at all when the overfall is switched off (a lip
+    // hides the water that falls from the cell below it, which only the particles give back).
+    fn lipThreshold(self) : f32 {
+        if (self.params.fall.capacity <= 0) {
+            return HYDRO_NO_LIP;
+        }
+        return self.params.fall.dropThreshold;
+    }
+
+    // ---- shape, bed and boundaries ----
+
+    /** Cells across (x). */
+    pub fn width(self) : i32 {
+        return self.grid.width;
+    }
+
+    /** Cells down (z). */
+    pub fn depth(self) : i32 {
+        return self.grid.depth;
+    }
+
+    /** Edge length of a cell, m. */
+    pub fn cellSize(self) : f32 {
+        return self.grid.cellSize;
+    }
+
+    /** The parameters in force (already `checked`). */
+    pub fn settings(self) : HydroParams {
+        return self.params;
+    }
+
+    /** Where the grid corner lies in the world, m: add it to grid-local positions to get world ones. */
+    pub fn origin(self) : Vec2 {
+        return Vec2::make(self.grid.originX as f32, self.grid.originZ as f32);
+    }
+
+    /** Places the grid corner at (x, z) in the world; it only moves the labels, never the water. */
+    pub fn setOrigin(mut self, x : f64, z : f64) : void {
+        self.grid.originX = x;
+        self.grid.originZ = z;
+    }
+
+    /**
+     * Replaces the bed by `heights` (`width * depth` metres, row-major, z rows of x cells), of a grid of the
+     * dimensions the world was built with. The values are copied once into the padded bed (the caller's array
+     * is not kept) and the lips are found again. Water stays where it is, so call it before filling, or accept
+     * that water over a risen bed now floats on it. False, doing nothing, when the dimensions differ.
+     */
+    pub fn setBed(mut self, heights : f32[], width : i32, depth : i32, cellSize : f32) : bool {
+        if (width != self.grid.width || depth != self.grid.depth) {
+            return false;
+        }
+        self.grid.loadBed(heights);
+        self.lips.detect(self.grid, self.lipThreshold(), self.params.fall.cliffSlope);
+        self.grid.wakeAll();
+        return true;
+    }
+
+    /** Sets one bed cell (an edit: a dam, a digger) and wakes the water around it. */
+    pub fn setBedAt(mut self, x : i32, z : i32, height : f32) : void {
+        if (!self.grid.inside(x, z)) {
+            return;
+        }
+        self.grid.setBedCell(x, z, height);
+        self.lips.detect(self.grid, self.lipThreshold(), self.params.fall.cliffSlope);
+        self.grid.wake(x, z);
+    }
+
+    /** The bed height of cell (x, z); 0 outside. */
+    pub fn bedAt(self, x : i32, z : i32) : f32 {
+        if (!self.grid.inside(x, z)) {
+            return 0.0;
+        }
+        return self.grid.bed[self.grid.index(x, z) as i64];
+    }
+
+    /**
+     * Chooses which sides of the grid let water leave (`HYDRO_SIDE_WEST | HYDRO_SIDE_EAST | ...`); the others
+     * are walls. Water crossing an open side is counted in the ledger's `outflow`; nothing ever enters.
+     */
+    pub fn setOutflowBoundary(mut self, sides : u8) : void {
+        self.grid.open = sides;
+        self.grid.wakeAll();
+    }
+
+    // ---- water in and out ----
+
+    /**
+     * Pre-fills to the elevation `level` every cell whose `mask` entry is nonzero (`width * depth` bytes,
+     * row-major) and whose bed is below it: a reservoir at rest, which keeps its level if the bed holds it.
+     * Cells already deeper are left alone. The volume is booked as poured.
+     */
+    pub fn fillTo(mut self, level : f32, mask : u8[]) : void {
+        self.fillToDyed(level, mask, -1);
+    }
+
+    /**
+     * `fillTo` whose new water is pure dye `tracer` (0 up to `tracerCount() - 1`; -1 for none): the dye is booked
+     * as injected. Water already in the cells keeps its own dye.
+     */
+    pub fn fillToDyed(mut self, level : f32, mask : u8[], tracer : i32) : void {
+        for (z of 0..self.grid.depth) {
+            for (x of 0..self.grid.width) {
+                if (mask[(z * self.grid.width + x) as i64] != 0) {
+                    self.raiseTo(x, z, level, tracer);
+                }
+            }
+        }
+        self.restart();
+    }
+
+    /**
+     * Tints the water already present in every cell flagged in `mask` with dye `tracer`: the cell's water becomes
+     * all dye `tracer` (its other dyes are left, so a cell can hold more than one tracer only up to its depth;
+     * dye the cell had of this tracer is not counted twice). The dye added is booked as injected.
+     */
+    pub fn dyeRegion(mut self, tracer : i32, mask : u8[]) : void {
+        if (tracer < 0 || tracer >= self.grid.tracers) {
+            return;
+        }
+        let area : f64 = (self.grid.cellSize as f64) * (self.grid.cellSize as f64);
+        for (z of 0..self.grid.depth) {
+            for (x of 0..self.grid.width) {
+                if (mask[(z * self.grid.width + x) as i64] == 0) {
+                    continue;
+                }
+                let i : i64 = self.grid.index(x, z) as i64;
+                let at : i64 = (tracer * self.grid.cells) as i64 + i;
+                let more : f32 = self.grid.h[i] - self.grid.dye[at];
+                if (more > 0.0) {
+                    self.grid.depositDye(x, z, tracer, more);
+                    self.dyeIn[tracer as i64] = self.dyeIn[tracer as i64] + (more as f64) * area;
+                }
+            }
+        }
+        self.grid.wakeAll();
+    }
+
+    /** `fillTo` over the rectangle of cells `x0 ..= x1` by `z0 ..= z1`. */
+    pub fn fillRect(mut self, level : f32, x0 : i32, z0 : i32, x1 : i32, z1 : i32) : void {
+        for (z of maxI(z0, 0)..minI(z1, self.grid.depth - 1) + 1) {
+            for (x of maxI(x0, 0)..minI(x1, self.grid.width - 1) + 1) {
+                self.raiseTo(x, z, level, -1);
+            }
+        }
+        self.restart();
+    }
+
+    /**
+     * Fills to `level` the basin that contains cell (x, z): every cell reached from it through cells whose bed
+     * is below `level` (four-connected). Nothing happens when the seed's own bed is above the level. This is the
+     * way to fill a lake or a reservoir without drawing a mask.
+     */
+    pub fn fillBasin(mut self, level : f32, x : i32, z : i32) : void {
+        if (!self.grid.inside(x, z) || self.bedAt(x, z) >= level) {
+            return;
+        }
+        let w : i32 = self.grid.width;
+        let n : i32 = w * self.grid.depth;
+        let mut seen : u8[] = new u8[n as i64];
+        let mut queue : i32[] = new i32[n as i64];
+        for (i of 0..n) {
+            seen[i as i64] = 0;
+        }
+        let mut head : i32 = 0;
+        let mut tail : i32 = 1;
+        queue[0] = z * w + x;
+        seen[(z * w + x) as i64] = 1;
+        while (head < tail) {
+            let at : i32 = queue[head as i64];
+            head = head + 1;
+            let cx : i32 = at % w;
+            let cz : i32 = at / w;
+            self.raiseTo(cx, cz, level, -1);
+            for (k of 0..4) {
+                let mut nx : i32 = cx;
+                let mut nz : i32 = cz;
+                if (k == 0) {
+                    nx = cx - 1;
+                }
+                if (k == 1) {
+                    nx = cx + 1;
+                }
+                if (k == 2) {
+                    nz = cz - 1;
+                }
+                if (k == 3) {
+                    nz = cz + 1;
+                }
+                if (!self.grid.inside(nx, nz) || self.bedAt(nx, nz) >= level) {
+                    continue;
+                }
+                let id : i32 = nz * w + nx;
+                if (seen[id as i64] != 0) {
+                    continue;
+                }
+                seen[id as i64] = 1;
+                queue[tail as i64] = id;
+                tail = tail + 1;
+            }
+        }
+        self.restart();
+    }
+
+    // Raises cell (x, z) to the elevation `level` if its water is lower, keeping the books.
+    fn raiseTo(mut self, x : i32, z : i32, level : f32, tracer : i32) : void {
+        let i : i64 = self.grid.index(x, z) as i64;
+        let want : f32 = level - self.grid.bed[i];
+        if (want <= self.grid.h[i]) {
+            return;
+        }
+        let area : f64 = (self.grid.cellSize as f64) * (self.grid.cellSize as f64);
+        let added : f32 = want - self.grid.h[i];
+        self.poured = self.poured + (added as f64) * area;
+        self.grid.h[i] = want;
+        self.grid.refresh(x, z);
+        if (tracer >= 0 && tracer < self.grid.tracers) {
+            self.grid.depositDye(x, z, tracer, added);
+            self.dyeIn[tracer as i64] = self.dyeIn[tracer as i64] + (added as f64) * area;
+        }
+    }
+
+    // After a bulk edit every tile gets one look: calm ones fall asleep after a substep.
+    fn restart(mut self) : void {
+        for (t of 0..(self.grid.tilesX * self.grid.tilesZ)) {
+            self.grid.tileSpeed[t as i64] = self.waveSpeedOf(t);
+        }
+        self.grid.wakeAll();
+    }
+
+    // The largest `sqrt(g h)` of a tile, for the first time step after a bulk edit.
+    fn waveSpeedOf(self, t : i32) : f32 {
+        let tx : i32 = t % self.grid.tilesX;
+        let tz : i32 = t / self.grid.tilesX;
+        let mut deepest : f32 = 0.0;
+        for (z of tz * HYDRO_TILE_H..minI((tz + 1) * HYDRO_TILE_H, self.grid.depth)) {
+            for (x of tx * HYDRO_TILE_W..minI((tx + 1) * HYDRO_TILE_W, self.grid.width)) {
+                deepest = max(deepest, self.grid.h[self.grid.index(x, z) as i64]);
+            }
+        }
+        return (self.params.gravity * deepest).sqrt();
+    }
+
+    /** Pours `depth` metres onto cell (x, z) at once (rain, a test pulse); a negative depth lifts water out. */
+    pub fn pour(mut self, x : i32, z : i32, depth : f32) : void {
+        if (!self.grid.inside(x, z)) {
+            return;
+        }
+        let area : f64 = (self.grid.cellSize as f64) * (self.grid.cellSize as f64);
+        if (depth >= 0.0) {
+            self.grid.deposit(x, z, depth, 0.0, 0.0);
+            self.poured = self.poured + (depth as f64) * area;
+        } else {
+            let taken : f32 = self.grid.drain(x, z, -depth);
+            self.poured = self.poured - (taken as f64) * area;
+        }
+    }
+
+    /**
+     * Adds a source of `discharge` m3/s at the point (x, z) (grid-local metres) and answers its handle. It
+     * spreads over the cells within `HydroParams.inflowRadius` of the point's cell.
+     */
+    pub fn addInflow(mut self, x : f32, z : f32, discharge : f32) : i32 {
+        let port : HydroPort = HydroPort {
+            cellX: (x * self.grid.invCell) as i32,
+            cellZ: (z * self.grid.invCell) as i32,
+            discharge: max(discharge, 0.0),
+        };
+        return self.sources.addInflow(port);
+    }
+
+    /** Sets the discharge of inflow `id` (time-varying inflows call this each frame); false for a stale id. */
+    pub fn setInflow(mut self, id : i32, discharge : f32) : bool {
+        return self.sources.setInflow(id, discharge);
+    }
+
+    /** The discharge of inflow `id` now, m3/s. */
+    pub fn inflowAt(self, id : i32) : f32 {
+        return self.sources.inflowOf(id);
+    }
+
+    /** Adds a sink taking up to `discharge` m3/s at the point (x, z); answers its handle. */
+    pub fn addSink(mut self, x : f32, z : f32, discharge : f32) : i32 {
+        let port : HydroPort = HydroPort {
+            cellX: (x * self.grid.invCell) as i32,
+            cellZ: (z * self.grid.invCell) as i32,
+            discharge: max(discharge, 0.0),
+        };
+        return self.sources.addSink(port);
+    }
+
+    /** Sets the discharge of sink `id`; false for a stale id. */
+    pub fn setSink(mut self, id : i32, discharge : f32) : bool {
+        return self.sources.setSink(id, discharge);
+    }
+
+    // ---- jets ----
+
+    /**
+     * Adds a vent (a jet, see `HydroVentParams`) at (x, z), grid-local metres, and answers its handle. It needs
+     * the overfall module's particle pool (`params.fall.capacity` above 0); with the pool off it throws nothing.
+     */
+    pub fn addVent(mut self, x : f32, z : f32, params : HydroVentParams) : i32 {
+        let mut placed : HydroVentParams = params;
+        placed.x = x;
+        placed.z = z;
+        return self.vents.add(placed);
+    }
+
+    /** Sets the full-power discharge of vent `id`, m3/s; false for a stale handle. */
+    pub fn setVent(mut self, id : i32, discharge : f32) : bool {
+        return self.vents.setDischarge(id, discharge);
+    }
+
+    /** Sets the power gain of vent `id`, 0 to 1 (an eruption ramps it); false for a stale handle. */
+    pub fn setVentPower(mut self, id : i32, power : f32) : bool {
+        return self.vents.setPower(id, power);
+    }
+
+    /** The parameters of vent `id` as they stand now (a stale handle answers a silent vent). */
+    pub fn ventParams(self, id : i32) : HydroVentParams {
+        return self.vents.paramsOf(id);
+    }
+
+    /** How many vents there are. */
+    pub fn ventCount(self) : i32 {
+        return self.vents.count();
+    }
+
+    // ---- stepping ----
+
+    /**
+     * Advances the world by `dt` seconds in Courant-limited substeps. Time that would need more than
+     * `HydroParams.maxSubsteps` substeps is dropped and counted in `lostSeconds` (the world slows rather than
+     * stalls). A world with nothing awake, no particles and no active port costs nothing.
+     */
+    pub fn step(mut self, dt : f32) : void {
+        let mut remaining : f32 = dt;
+        let mut used : i32 = 0;
+        while (remaining > HYDRO_TINY_TIME && used < self.params.maxSubsteps) {
+            self.grid.buildActive();
+            let busy : bool = self.grid.activeCount > 0 || self.air.store.count > 0
+                || self.sources.anyActive()
+                || self.vents.anyActive()
+                || self.drifters.anyAirborne()
+                || self.lips.carried() > 0.0;
+            if (!busy) {
+                self.clock = self.clock + (remaining as f64);
+                return;
+            }
+
+            let fast : f32 = max(self.grid.fastest(), HYDRO_QUIET_SPEED);
+            let limit : f32 = self.params.cfl * self.grid.cellSize / fast;
+            let pieces : i32 = maxI(((remaining / limit) + (0.999 as f32)) as i32, 1);
+            let slice : f32 = remaining / (pieces as f32);
+            self.substep(slice);
+            remaining = remaining - slice;
+            used = used + 1;
+        }
+        if (remaining > HYDRO_TINY_TIME) {
+            self.lost = self.lost + (remaining as f64);
+        }
+    }
+
+    // The constants of one substep, from the parameters and the length of the slice.
+    fn scheme(self, dt : f32) : HydroScheme {
+        let p : HydroParams = self.params;
+        let cell : f32 = self.grid.cellSize;
+        let limit : f32 = HYDRO_VISCOUS_SHARE * cell * cell / ((4.0 as f32) * dt);
+        return HydroScheme {
+            dt: dt,
+            gravity: p.gravity,
+            dry: p.dryDepth,
+            slopeDepth: (4.0 as f32) * p.dryDepth,
+            viscosity: min(p.viscosity, limit),
+            invCell: self.grid.invCell,
+            manning: p.manning,
+            restSpeed: p.restSpeed,
+            restJump: p.restJump,
+            maxSpeed: p.maxSpeed,
+            infiltration: p.infiltration,
+        };
+    }
+
+    fn substep(mut self, dt : f32) : void {
+        let g : Shared<HydroGrid> = self.grid;
+        self.runner.kernel.scheme = self.scheme(dt);
+        let tiles : i32 = g.activeCount;
+        self.cellSteps = self.cellSteps + ((tiles * HYDRO_TILE_W * HYDRO_TILE_H) as i64);
+
+        if (tiles > 0) {
+            g.fillGhosts();
+            self.runner.tiles(HydroStage::Faces, tiles);
+            self.runner.tiles(HydroStage::Scale, tiles);
+            self.runner.tiles(HydroStage::Update, tiles);
+            self.collectBoundary(dt);
+            self.collectLost();
+        }
+
+        if (self.params.fall.capacity > 0) {
+            self.inflowed = self.inflowed + self.vents.emit(g, self.air.store, self.clock, dt);
+            self.lips.launch(self.air, self.params.fall, self.params.gravity, dt);
+        }
+        self.inflowed = self.inflowed + self.sources.pour(g, self.params.inflowRadius, dt);
+        self.sunk = self.sunk + self.sources.drain(g, self.params.inflowRadius, dt);
+
+        if (self.air.store.count > 0) {
+            self.air.store.dt = dt;
+            self.flights = self.flights + (self.air.store.count as i64);
+            self.runner.particles(self.air.store.count);
+            self.air.settle();
+        }
+
+        self.drifters.step(g, dt);
+
+        if (tiles > 0) {
+            self.runner.tiles(HydroStage::Surface, tiles);
+            self.runner.tiles(HydroStage::SettleFoam, tiles);
+        }
+        self.clock = self.clock + (dt as f64);
+        self.substeps = self.substeps + 1;
+    }
+
+    // The water that crossed the open sides this substep, from the flux of the boundary faces (signed, so an
+    // inflow through an open side would show as negative outflow and the books would still close).
+    fn collectBoundary(mut self, dt : f32) : void {
+        let g : Shared<HydroGrid> = self.grid;
+        let open : u8 = g.open;
+        if (open == 0) {
+            return;
+        }
+        let last : i32 = g.width - 1;
+        let bottom : i32 = g.depth - 1;
+        let scale : f64 = (dt as f64) * (g.cellSize as f64);
+        let mut sum : f64 = 0.0;
+        if ((open & HYDRO_SIDE_WEST) != 0) {
+            for (z of 0..g.depth) {
+                sum = sum + self.edge(self.sideFlux(g.index(0, z), 0, z, true, true), 0, z);
+            }
+        }
+        if ((open & HYDRO_SIDE_EAST) != 0) {
+            for (z of 0..g.depth) {
+                sum = sum + self.edge(self.sideFlux(g.index(last + 1, z), last, z, true, false), last, z);
+            }
+        }
+        if ((open & HYDRO_SIDE_NORTH) != 0) {
+            for (x of 0..g.width) {
+                sum = sum + self.edge(self.sideFlux(g.index(x, 0), x, 0, false, true), x, 0);
+            }
+        }
+        if ((open & HYDRO_SIDE_SOUTH) != 0) {
+            for (x of 0..g.width) {
+                sum = sum
+                    + self.edge(self.sideFlux(g.index(x, bottom + 1), x, bottom, false, false), x, bottom);
+            }
+        }
+        self.outflowed = self.outflowed + sum * scale;
+        for (t of 0..g.tracers) {
+            self.dyeOut[t as i64] = self.dyeOut[t as i64] + self.dyeEdge[t as i64] * scale;
+            self.dyeEdge[t as i64] = 0.0;
+        }
+    }
+
+    // Passes a boundary flux through and books the dye it carries out: the water leaving cell (x, z) takes the
+    // cell's concentration of every tracer with it.
+    fn edge(mut self, flux : f64, x : i32, z : i32) : f64 {
+        if (flux > 0.0) {
+            let at : i32 = self.grid.index(x, z);
+            for (t of 0..self.grid.tracers) {
+                self.dyeEdge[t as i64] = self.dyeEdge[t as i64]
+                    + flux * (self.grid.conc[(t * self.grid.cells + at) as i64] as f64);
+            }
+        }
+        return flux;
+    }
+
+    // The mass flux, m2/s, out of the domain across the boundary face stored at `face`, whose inner cell is
+    // (x, z); zero when the tile of that cell sleeps (its faces are stale). `alongX` picks the face family and
+    // `leading` whether the domain lies on the high-index side (west and north sides) or the low one.
+    fn sideFlux(self, face : i32, x : i32, z : i32, alongX : bool, leading : bool) : f64 {
+        let g : Shared<HydroGrid> = self.grid;
+        if (g.tileRun[g.tileOf(x, z) as i64] == 0) {
+            return 0.0;
+        }
+        let i : i64 = face as i64;
+        let mut step : i32 = g.pitch;
+        if (alongX) {
+            step = 1;
+        }
+        if (leading) {
+            // The domain cell is the high-index cell of the face; outflow is minus its mass flux.
+            let mut flux : f32 = g.mRz[i];
+            if (alongX) {
+                flux = g.mRx[i];
+            }
+            let mut paid : f32 = 1.0;
+            if (flux < 0.0) {
+                paid = g.scale[i];
+            }
+            return ((-flux) * paid) as f64;
+        }
+        let mut flux : f32 = g.mLz[i];
+        if (alongX) {
+            flux = g.mLx[i];
+        }
+        let mut paid : f32 = 1.0;
+        if (flux > 0.0) {
+            paid = g.scale[(face - step) as i64];
+        }
+        return (flux * paid) as f64;
+    }
+
+    // Collects the infiltration the tiles summed this substep.
+    fn collectLost(mut self) : void {
+        if (self.params.infiltration <= 0.0) {
+            return;
+        }
+        let area : f64 = (self.grid.cellSize as f64) * (self.grid.cellSize as f64);
+        for (k of 0..self.grid.activeCount) {
+            let t : i64 = self.grid.activeTiles[k as i64] as i64;
+            self.soaked = self.soaked + self.grid.tileLost[t] * area;
+            self.grid.tileLost[t] = 0.0;
+        }
+    }
+
+    /** Wakes every tile for the next substep (a test, or after an edit that bypassed the world's own calls). */
+    pub fn wakeAll(mut self) : void {
+        self.grid.wakeAll();
+    }
+
+    /** Stops the worker threads (a world with `threads` above 1 must be closed). */
+    pub fn close(mut self) : void {
+        self.runner.close();
+    }
+
+    // ---- readings: the grid ----
+
+    /** The water depth at (x, z) in grid-local metres, interpolated; 0 on dry ground. */
+    pub fn depthAt(self, x : f32, z : f32) : f32 {
+        return HydroSample::blend(self.grid.h, HydroSample::stencil(self.grid, x, z));
+    }
+
+    /** The bed height at (x, z), interpolated. */
+    pub fn bedHeightAt(self, x : f32, z : f32) : f32 {
+        return HydroSample::blend(self.grid.bed, HydroSample::stencil(self.grid, x, z));
+    }
+
+    /** The elevation of the water surface at (x, z); the bed where nothing around is wet. */
+    pub fn surfaceHeightAt(self, x : f32, z : f32) : f32 {
+        return HydroSample::surface(self.grid, x, z);
+    }
+
+    /**
+     * The horizontal velocity of the water at (x, z), m/s (x, then z), built from the face discharges of the last
+     * substep (the staggered average over the cell's two faces, divided by its depth), so that its sum over a
+     * cross-section agrees with the flow meter (`faceDischargeX`). Dry cells and sleeping tiles answer their
+     * stored velocity.
+     */
+    pub fn surfaceVelocityAt(self, x : f32, z : f32) : Vec2 {
+        return HydroSample::velocity(self.grid, x, z);
+    }
+
+    /** Whitewater coverage at (x, z), 0 to 1. */
+    pub fn foamAt(self, x : f32, z : f32) : f32 {
+        return HydroSample::blend(self.grid.foam, HydroSample::stencil(self.grid, x, z));
+    }
+
+    /** Turbulence at (x, z), 0 to 1: the shear of the flow, for capillary detail and foam. */
+    pub fn turbulenceAt(self, x : f32, z : f32) : f32 {
+        return HydroSample::blend(self.grid.turb, HydroSample::stencil(self.grid, x, z));
+    }
+
+    /** The depth of cell (x, z) exactly (no interpolation); 0 outside. */
+    pub fn depthOfCell(self, x : i32, z : i32) : f32 {
+        if (!self.grid.inside(x, z)) {
+            return 0.0;
+        }
+        return self.grid.h[self.grid.index(x, z) as i64];
+    }
+
+    /** The discharge per metre width of cell (x, z) along x, m2/s; 0 outside. */
+    pub fn dischargeXOfCell(self, x : i32, z : i32) : f32 {
+        if (!self.grid.inside(x, z)) {
+            return 0.0;
+        }
+        return self.grid.qx[self.grid.index(x, z) as i64];
+    }
+
+    /** The discharge per metre width of cell (x, z) along z, m2/s; 0 outside. */
+    pub fn dischargeZOfCell(self, x : i32, z : i32) : f32 {
+        if (!self.grid.inside(x, z)) {
+            return 0.0;
+        }
+        return self.grid.qz[self.grid.index(x, z) as i64];
+    }
+
+    /**
+     * The discharge per metre, m2/s, across the face between cells (x - 1, z) and (x, z) in the last substep,
+     * positive toward higher x: a flow meter. Zero for a face of a tile that slept, and outside the grid.
+     */
+    pub fn faceDischargeX(self, x : i32, z : i32) : f32 {
+        if (x < 1 || !self.grid.inside(x, z)) {
+            return 0.0;
+        }
+        if (self.grid.tileRun[self.grid.tileOf(x, z) as i64] == 0) {
+            return 0.0;
+        }
+        return self.grid.mRx[self.grid.index(x, z) as i64];
+    }
+
+    // ---- readings: the particles ----
+
+    /** How many airborne particles (liquid and spray) are alive. */
+    pub fn particleCount(self) : i32 {
+        return self.air.store.count;
+    }
+
+    /** The `k`-th particle as a record; `k` must be inside `0..particleCount()`. */
+    pub fn particleAt(self, k : i32) : HydroParticle {
+        let b : i64 = (k * 3) as i64;
+        let store : HydroParticles = self.air.store;
+        return HydroParticle {
+            x: store.pos[b],
+            y: store.pos[b + 1],
+            z: store.pos[b + 2],
+            vx: store.vel[b],
+            vy: store.vel[b + 1],
+            vz: store.vel[b + 2],
+            radius: store.radius[k as i64],
+            kind: store.kind[k as i64],
+        };
+    }
+
+    /** The positions of the particles, grid-local metres, xyz interleaved: valid for `3 * particleCount()` values
+     * and until the next `step`; borrowed, not copied. */
+    pub fn particlePositions(self) : f32[] {
+        return self.air.store.pos;
+    }
+
+    /** The velocities of the particles, m/s, xyz interleaved, like `particlePositions`. */
+    pub fn particleVelocities(self) : f32[] {
+        return self.air.store.vel;
+    }
+
+    /** The radii of the particles, m: of the sphere of their water. */
+    pub fn particleRadii(self) : f32[] {
+        return self.air.store.radius;
+    }
+
+    /** The kinds of the particles (`HYDRO_LIQUID`, `HYDRO_SPRAY`, `HYDRO_AERATED`). */
+    pub fn particleKinds(self) : u8[] {
+        return self.air.store.kind;
+    }
+
+    /** The age, s, of each aerated parcel (`HYDRO_AERATED`); for liquid and spray it is the breakup clock. */
+    pub fn particleAges(self) : f32[] {
+        return self.air.store.clock;
+    }
+
+    /** The life, s, of each aerated parcel: `age / life` runs 0 to 1 and fades it out; 0 for liquid and spray. */
+    pub fn particleLives(self) : f32[] {
+        return self.air.store.life;
+    }
+
+    /** How many particles of `kind` are alive. */
+    pub fn particleCountOf(self, kind : u8) : i32 {
+        return self.air.store.countOf(kind);
+    }
+
+    /** The number of lips (overfall faces) found in the bed. */
+    pub fn lipCount(self) : i32 {
+        return self.lips.count;
+    }
+
+    // ---- drifters ----
+
+    /**
+     * Drops a marker at (x, z) on the water surface; it floats with the flow, falls over lips, lands and floats on
+     * (see `hydro_drifters`). Answers its index, or -1 when `HydroParams.drifters` of them exist already.
+     */
+    pub fn addDrifter(mut self, x : f32, z : f32) : i32 {
+        return self.drifters.add(self.grid, x, z);
+    }
+
+    /**
+     * Scatters up to `count` markers over the wet cells flagged in `mask` (`width * depth` bytes), in a fixed
+     * order from `seed`; answers how many were placed.
+     */
+    pub fn addDrifters(mut self, mask : u8[], count : i32, seed : i32) : i32 {
+        return self.drifters.scatter(self.grid, mask, count, seed);
+    }
+
+    /** Removes every marker. */
+    pub fn removeDrifters(mut self) : void {
+        self.drifters.clear();
+    }
+
+    /** How many markers exist (gone ones included until `removeDrifters`). */
+    pub fn drifterCount(self) : i32 {
+        return self.drifters.count;
+    }
+
+    /** How many markers left the world through an open side. */
+    pub fn driftersGone(self) : i32 {
+        return self.drifters.gone;
+    }
+
+    /** Positions of the markers, grid-local metres, xyz interleaved; valid for `3 * drifterCount()` values. */
+    pub fn drifterPositions(self) : f32[] {
+        return self.drifters.pos;
+    }
+
+    /** States of the markers: `HYDRO_DRIFT_FLOATING`, `_AIRBORNE`, `_STRANDED` or `_GONE`. */
+    pub fn drifterStates(self) : u8[] {
+        return self.drifters.state;
+    }
+
+    /** Simulated seconds marker `k` has lived. */
+    pub fn drifterAge(self, k : i32) : f32 {
+        return self.drifters.age[k as i64];
+    }
+
+    /** The path length marker `k` has covered, m. */
+    pub fn drifterTravel(self, k : i32) : f32 {
+        return self.drifters.travel[k as i64];
+    }
+
+    /** How many positions marker `k`'s trail holds now (at most `HYDRO_TRAIL_POINTS`). */
+    pub fn drifterTrailCount(self, k : i32) : i32 {
+        return self.drifters.trailCount(k);
+    }
+
+    /** The `i`-th position of marker `k`'s trail, oldest first. */
+    pub fn drifterTrailAt(self, k : i32, i : i32) : Vec3 {
+        return self.drifters.trailAt(k, i);
+    }
+
+    /** All trails, `HYDRO_TRAIL_POINTS` xyz positions per marker as rings (marker `k` starts at
+     * `k * HYDRO_TRAIL_POINTS * 3`); `drifterTrailHead(k)` is the slot of the next sample, so the oldest of
+     * `drifterTrailCount(k)` positions is that many slots before it. */
+    pub fn drifterTrails(self) : f32[] {
+        return self.drifters.trail;
+    }
+
+    /** The ring slot marker `k`'s next trail sample goes to. */
+    pub fn drifterTrailHead(self, k : i32) : i32 {
+        return self.drifters.trailHead(k);
+    }
+
+    // ---- dye tracers and compartments ----
+
+    /** How many dye tracers the world carries (`HydroParams.tracers`). */
+    pub fn tracerCount(self) : i32 {
+        return self.grid.tracers;
+    }
+
+    /**
+     * Adds an inflow whose water is pure dye `tracer` (the dye is booked as injected); `setInflowTracer` tags or
+     * untags an existing one. Answers the inflow's handle.
+     */
+    pub fn addInflowDyed(mut self, x : f32, z : f32, discharge : f32, tracer : i32) : i32 {
+        let id : i32 = self.addInflow(x, z, discharge);
+        self.sources.setInflowTracer(id, tracer);
+        return id;
+    }
+
+    /** Tags inflow `id` with dye `tracer` (-1 for none); false for a stale handle. */
+    pub fn setInflowTracer(mut self, id : i32, tracer : i32) : bool {
+        return self.sources.setInflowTracer(id, tracer);
+    }
+
+    /** The concentration of dye `k` in the water at (x, z), 0 to 1 (0 on dry ground or for a bad `k`): what a
+     * renderer colours the water with. */
+    pub fn tracerAt(self, x : f32, z : f32, k : i32) : f32 {
+        if (k < 0 || k >= self.grid.tracers) {
+            return 0.0;
+        }
+        let s : HydroStencil = HydroSample::stencil(self.grid, x, z);
+        let mut shifted : HydroStencil = s;
+        shifted.base = s.base + k * self.grid.cells;
+        let depth : f32 = HydroSample::blend(self.grid.h, s);
+        if (depth <= self.params.dryDepth) {
+            return 0.0;
+        }
+        return min(HydroSample::blend(self.grid.dye, shifted) / depth, 1.0);
+    }
+
+    /** The dye `k` in the grid, m3. */
+    pub fn tracerMass(self, k : i32) : f64 {
+        return self.grid.dyeVolume(k);
+    }
+
+    /** The dye `k` in the air (particles, lips, vents), m3. */
+    pub fn airborneTracerMass(self, k : i32) : f64 {
+        return self.air.store.dyeVolume(k) + self.lips.carriedDye(k, self.grid.tracers)
+            + self.vents.carriedDye(k);
+    }
+
+    /** The books of dye `k`; its `residual()` is zero up to f32 rounding. */
+    pub fn tracerLedger(self, k : i32) : HydroDyeLedger {
+        if (k < 0 || k >= self.grid.tracers) {
+            return HydroDyeLedger {};
+        }
+        return HydroDyeLedger {
+            grid: self.grid.dyeVolume(k),
+            airborne: self.airborneTracerMass(k),
+            outflow: self.dyeOut[k as i64] + self.air.leftDye[k as i64] + self.sources.sunkDye[k as i64],
+            injected: self.dyeIn[k as i64] + self.sources.injectedDye[k as i64]
+                + self.vents.injected[k as i64],
+        };
+    }
+
+    /**
+     * The water in the cells flagged in `mask` (`width * depth` bytes, row-major), m3, in one allocation-free
+     * pass: per-row f64 sums combined in row order, deterministic for any thread count.
+     */
+    pub fn volumeOfMask(self, mask : u8[]) : f64 {
+        return self.grid.volumeOfMask(mask);
+    }
+
+    // ---- the books and the counters ----
+
+    /** The water in the grid, m3. */
+    pub fn volume(self) : f64 {
+        return self.grid.volume();
+    }
+
+    /** The water in the air: particles plus the lips' carries, m3. */
+    pub fn airborneVolume(self) : f64 {
+        return self.air.store.airborne() + self.lips.carried() + self.vents.carried();
+    }
+
+    /** The whole ledger; its `residual()` is zero up to f32 rounding. */
+    pub fn ledger(self) : HydroLedger {
+        return HydroLedger {
+            grid: self.grid.volume(),
+            airborne: self.airborneVolume(),
+            outflow: self.outflowed + self.air.left,
+            sunk: self.sunk,
+            soaked: self.soaked,
+            poured: self.poured,
+            inflow: self.inflowed,
+        };
+    }
+
+    /** Seconds simulated so far. */
+    pub fn time(self) : f64 {
+        return self.clock;
+    }
+
+    /** Substeps run so far. */
+    pub fn substepCount(self) : i64 {
+        return self.substeps;
+    }
+
+    /** Cell updates done so far (cells of the tiles that ran, summed over substeps): the unit of cost. */
+    pub fn cellStepCount(self) : i64 {
+        return self.cellSteps;
+    }
+
+    /** Particle flights done so far (alive particles summed over substeps). */
+    pub fn particleStepCount(self) : i64 {
+        return self.flights;
+    }
+
+    /** Seconds `step` had to drop for want of substeps. */
+    pub fn lostSeconds(self) : f64 {
+        return self.lost;
+    }
+
+    /** How many cells the next substep would update (tiles that would run times their size). */
+    pub fn activeCellCount(mut self) : i32 {
+        self.grid.buildActive();
+        return self.grid.activeCount * HYDRO_TILE_W * HYDRO_TILE_H;
+    }
+
+    /** The substep length the next step would use at most, s: `cfl * cellSize / fastest`. */
+    pub fn courantTime(mut self) : f32 {
+        self.grid.buildActive();
+        let fast : f32 = max(self.grid.fastest(), HYDRO_QUIET_SPEED);
+        return self.params.cfl * self.grid.cellSize / fast;
+    }
+}

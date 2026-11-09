@@ -1,0 +1,177 @@
+// hydro_foam — checks of the aerated parcels: froth thrown up where a fall lands, and then given back.
+//
+// The emitter takes a share of each hard-landing parcel's water and makes short-lived aerated parcels of it; they
+// fly, age, and at the end of their life pour their water back into the grid. So the volume ledger of the world
+// stays exact with the emitter on, a closed world loses nothing, the count never passes its cap, and one worker and
+// eight make the same froth.
+
+use ludax::Checks;
+use ludax::HYDRO_AERATED;
+use ludax::HYDRO_LIQUID;
+use ludax::HYDRO_SIDE_EAST;
+use ludax::HydroLedger;
+use ludax::HydroParams;
+use ludax::HydroWorld;
+use ludax::nanosToMillis;
+use ludax::nowNanos;
+
+/** The checks of the aeration. */
+pub class HydroFoamSuite {
+    /** Runs every check of the suite. */
+    pub static fn run(c : Checks) : void {
+        hydroFoamFall(c);
+        hydroFoamCap(c);
+        hydroFoamClosed(c);
+        hydroFoamThreads(c);
+    }
+}
+
+/** The fall worlds: a plateau 12 m up to column 30, a plain below, 64 x 16 cells. */
+const HYDRO_FOAM_WIDTH : i32 = 64;
+const HYDRO_FOAM_ROWS : i32 = 16;
+const HYDRO_FOAM_CLIFF : i32 = 30;
+
+fn hydroFoamWorld(inflow : f32, share : f32, cap : i32, threads : i32, open : bool) : HydroWorld {
+    let mut bed : f32[] = new f32[(HYDRO_FOAM_WIDTH * HYDRO_FOAM_ROWS) as i64];
+    for (z of 0..HYDRO_FOAM_ROWS) {
+        for (x of 0..HYDRO_FOAM_WIDTH) {
+            let mut h : f32 = 0.0;
+            if (x < HYDRO_FOAM_CLIFF) {
+                h = 12.0;
+            }
+            bed[(z * HYDRO_FOAM_WIDTH + x) as i64] = h;
+        }
+    }
+    let mut p : HydroParams = HydroParams::standard();
+    p.threads = threads;
+    p.fall.aerationShare = share;
+    p.fall.aerationCapacity = cap;
+    let w : HydroWorld = new HydroWorld(HYDRO_FOAM_WIDTH, HYDRO_FOAM_ROWS, 1.0, p);
+    w.setBed(bed, HYDRO_FOAM_WIDTH, HYDRO_FOAM_ROWS, 1.0);
+    if (open) {
+        w.setOutflowBoundary(HYDRO_SIDE_EAST);
+    }
+    if (inflow > 0.0) {
+        w.addInflow(3.5, 8.0, inflow);
+    }
+    return w;
+}
+
+// Froth appears at the impact, is drawn as its own kind, and the books close with the emitter on; its cost per substep.
+fn hydroFoamFall(c : Checks) : void {
+    let mut peak : i32 = 0;
+    let mut liquid : i32 = 0;
+    let mut ms : f64 = 0.0;
+    let mut msOff : f64 = 0.0;
+    let mut residual : f64 = 0.0;
+    let mut inflow : f64 = 0.0;
+    for (pass of 0..2) {
+        let mut share : f32 = 0.04;
+        if (pass == 1) {
+            share = 0.0;
+        }
+        let w : HydroWorld = hydroFoamWorld(12.0, share, 150000, 8, true);
+        for (k of 0..2000) {
+            w.step(0.02);
+            if (pass == 0 && w.particleCountOf(HYDRO_AERATED) > peak) {
+                peak = w.particleCountOf(HYDRO_AERATED);
+                liquid = w.particleCountOf(HYDRO_LIQUID);
+            }
+        }
+        let subs0 : i64 = w.substepCount();
+        let started : i64 = nowNanos();
+        for (k of 0..200) {
+            w.step(0.02);
+        }
+        let took : f64 = nanosToMillis(nowNanos() - started) / ((w.substepCount() - subs0) as f64);
+        if (pass == 0) {
+            ms = took;
+            let l : HydroLedger = w.ledger();
+            residual = l.residual();
+            inflow = l.inflow;
+        } else {
+            msOff = took;
+        }
+        w.close();
+    }
+    println("  measured aeration: ${peak} aerated parcels at most (${liquid} liquid), ${ms} ms per substep against ${msOff} without, ledger residual ${residual} of ${inflow} m3");
+    c.that("the impact makes froth (${peak} parcels)", peak > 5000);
+    c.that(
+        "the ledger is exact with the emitter on (${residual})",
+        residual < inflow * 0.0001 && -residual < inflow * 0.0001
+    );
+}
+
+// The count never passes its cap, and the emitter is conservative whatever the cap.
+fn hydroFoamCap(c : Checks) : void {
+    let w : HydroWorld = hydroFoamWorld(40.0, 0.1, 500, 1, true);
+    let mut peak : i32 = 0;
+    for (k of 0..1500) {
+        w.step(0.02);
+        if (w.particleCountOf(HYDRO_AERATED) > peak) {
+            peak = w.particleCountOf(HYDRO_AERATED);
+        }
+    }
+    let l : HydroLedger = w.ledger();
+    println("  measured aeration cap: ${peak} parcels at most under a cap of 500, residual ${l.residual()}");
+    c.that("the froth stays within its cap (${peak})", peak <= 500 && peak > 100);
+    c.that(
+        "and the books close (${l.residual()})",
+        l.residual() < l.inflow * 0.0001 && -l.residual() < l.inflow * 0.0001
+    );
+    w.close();
+}
+
+// A closed world keeps its water with froth flying: grid plus air is constant.
+fn hydroFoamClosed(c : Checks) : void {
+    let w : HydroWorld = hydroFoamWorld(0.0, 0.04, 150000, 1, false);
+    w.fillRect(13.5, 0, 0, HYDRO_FOAM_CLIFF - 1, HYDRO_FOAM_ROWS - 1);
+    let total0 : f64 = w.volume() + w.airborneVolume();
+    let mut peak : i32 = 0;
+    for (k of 0..4000) {
+        w.step(0.02);
+        if (w.particleCountOf(HYDRO_AERATED) > peak) {
+            peak = w.particleCountOf(HYDRO_AERATED);
+        }
+    }
+    let relative : f64 = (w.volume() + w.airborneVolume() - total0) / total0;
+    println("  measured closed world with froth: ${peak} aerated parcels at most, relative drift ${relative}");
+    c.that(
+        "a closed world keeps its water with froth in the air (${relative})",
+        relative < 0.000001 && -relative < 0.000001
+    );
+    c.that("there was froth (${peak})", peak > 1000);
+    w.close();
+}
+
+// One worker and eight make the same froth, bit for bit.
+fn hydroFoamThreads(c : Checks) : void {
+    let a : HydroWorld = hydroFoamWorld(12.0, 0.04, 150000, 1, true);
+    let b : HydroWorld = hydroFoamWorld(12.0, 0.04, 150000, 8, true);
+    for (k of 0..1200) {
+        a.step(0.02);
+        b.step(0.02);
+    }
+    let mut same : bool = a.particleCount() == b.particleCount();
+    let pa : f32[] = a.particlePositions();
+    let pb : f32[] = b.particlePositions();
+    let ka : u8[] = a.particleKinds();
+    let kb : u8[] = b.particleKinds();
+    for (i of 0..(a.particleCount() * 3)) {
+        if (pa[i as i64] != pb[i as i64]) {
+            same = false;
+        }
+    }
+    for (i of 0..a.particleCount()) {
+        if (ka[i as i64] != kb[i as i64]) {
+            same = false;
+        }
+    }
+    c.that(
+        "froth with 1 and 8 workers is bit-identical (${a.particleCountOf(HYDRO_AERATED)} aerated)",
+        same
+    );
+    c.that("the froth was there to compare", a.particleCountOf(HYDRO_AERATED) > 1000);
+    a.close();
+    b.close();
+}

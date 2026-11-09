@@ -1,0 +1,246 @@
+// hydro_flux — the numerical flux of one face: limited reconstruction, hydrostatic correction, HLL.
+//
+// The scheme is a second-order finite-volume solver of the shallow-water equations on a collocated grid
+// (Audusse et al. 2004/2005 on a Kurganov-Petrova footing), chosen because it has, by construction, the three
+// properties a river and a lake need together:
+//
+//   well balanced  The face states are reconstructed from the surface `bed + depth`, not from the depth, and the
+//                  bed under the face is the higher of its two cell beds. A lake at rest has a flat surface, so
+//                  the limited slope is exactly zero, both face states are equal, and the momentum balance of a
+//                  cell is a difference of equal numbers: the water stays at rest over any bed, a cliff, a
+//                  step or a thin wet/dry rim, to the rounding of f32.
+//   positive       A face never exports more water than its donor cell holds (`hydro_passes` scales the fluxes
+//                  by a per-cell factor), and a state with no depth above the sill is dry: a front cannot run
+//                  into negative depth, and a film a millimetre deep does not checkerboard.
+//   sharp          Slopes of the surface and of the velocity are limited with the minmod limiter, which is
+//                  total-variation diminishing: bores and waves keep their fronts over a few cells without
+//                  overshoot. The limiter is switched off (first order) in and next to dry cells, where the
+//                  reconstruction would invent water.
+//
+// The Riemann solver is HLL with the Davis wave speeds and the wet/dry extension of Toro for a dry side. It
+// resolves the contact only through the transverse velocity (carried like a passive scalar), which is all a
+// shallow flow needs, and it is cheap and branch-light enough to vectorise the loop that calls it. Division by
+// zero traps in Axle, so every denominator is guarded by an explicit test.
+//
+// Viscosity is a conservative momentum flux, `-nu * h * du/dx` across the face: it rounds off shear layers and
+// cannot create or destroy momentum. Everything here is a pure function of the cells around the face.
+
+use crate::core::math::scalar::{abs, max, min};
+
+/** Half, as an f32 (a float literal beside an f32 would be an f64). */
+const HYDRO_HALF : f32 = 0.5;
+
+/** One, as an f32. */
+const HYDRO_ONE : f32 = 1.0;
+
+/** Two, as an f32. */
+const HYDRO_TWO : f32 = 2.0;
+
+/** The constants of the scheme for one substep, copied into every pass. */
+pub(crate) struct HydroScheme {
+    /** Length of the substep, s. */
+    pub(crate) dt : f32 = 0.0;
+
+    /** Gravity, m/s2. */
+    pub(crate) gravity : f32 = 9.81;
+
+    /** Cells shallower than this are dry (no velocity), m. */
+    pub(crate) dry : f32 = 0.001;
+
+    /** The smallest depth at which the limited slopes are used; four dry depths, so a rim stays first order. */
+    pub(crate) slopeDepth : f32 = 0.004;
+
+    /** Depth under which a reconstructed face state is dry for the Riemann solver, m. */
+    pub(crate) tiny : f32 = 0.000001;
+
+    /** Eddy viscosity after the explicit stability limit, m2/s. */
+    pub(crate) viscosity : f32 = 0.0;
+
+    /** One over the cell size, 1/m. */
+    pub(crate) invCell : f32 = 1.0;
+
+    /** Manning roughness, s/m^(1/3). */
+    pub(crate) manning : f32 = 0.0;
+
+    /** Momentum below this speed is dropped, m/s. */
+    pub(crate) restSpeed : f32 = 0.0;
+
+    /** Relative surface jump under which two cells are level. */
+    pub(crate) restJump : f32 = 0.0;
+
+    /** Speed cap, m/s. */
+    pub(crate) maxSpeed : f32 = 40.0;
+
+    /** Infiltration, m of depth lost per second. */
+    pub(crate) infiltration : f32 = 0.0;
+}
+
+/** What crosses one face in one substep, per metre of face. */
+pub(crate) struct HydroFlux {
+    /** Mass, m2/s (positive from the low-index cell to the high-index one). */
+    pub(crate) mass : f32 = 0.0;
+
+    /** Momentum along the face normal as the low-index cell feels it (includes its hydrostatic correction). */
+    pub(crate) normalLow : f32 = 0.0;
+
+    /** The same for the high-index cell. */
+    pub(crate) normalHigh : f32 = 0.0;
+
+    /** The hydrostatic push of the low-index cell's own water on the face, as against a wall: what it feels
+     * when no water arrives from across (a lip). */
+    pub(crate) wallLow : f32 = 0.0;
+
+    /** The same for the high-index cell. */
+    pub(crate) wallHigh : f32 = 0.0;
+
+    /** Momentum along the face. */
+    pub(crate) tangent : f32 = 0.0;
+
+    /** The surface jump across the face beyond the rest threshold; positive when the cells are not level. */
+    pub(crate) jump : f32 = 0.0;
+}
+
+/** The limiter: the smaller of two slopes when they agree in sign, zero when they do not (a local extremum). */
+pub(crate) fn hydroMinmod(a : f32, b : f32) : f32 {
+    if (a * b <= 0.0) {
+        return 0.0;
+    }
+    if (a > 0.0) {
+        return min(a, b);
+    }
+    return max(a, b);
+}
+
+// A face state after reconstruction: depth above the common sill and the two velocities there.
+struct HydroSide {
+    depth   : f32 = 0.0;
+    normal  : f32 = 0.0;
+    tangent : f32 = 0.0;
+}
+
+/** The flux functions, as static functions over the grid arrays. */
+pub(crate) class HydroFaces {
+    /**
+     * The flux across the face between cell `c - step` (low) and cell `c` (high), where `step` is 1 for a face
+     * normal to x and the pitch for one normal to z. `un` is the velocity along the normal, `ut` along the face.
+     */
+    pub(crate) static fn flux(
+        c : i32,
+        step : i32,
+        bed : f32[],
+        h : f32[],
+        un : f32[],
+        ut : f32[],
+        p : HydroScheme
+    ) : HydroFlux {
+        let l : i64 = (c - step) as i64;
+        let l2 : i64 = (c - 2 * step) as i64;
+        let r : i64 = c as i64;
+        let r2 : i64 = (c + step) as i64;
+        let hl : f32 = h[l];
+        let hr : f32 = h[r];
+
+        // Limited surface slope in the low and high cell; first order unless the whole stencil is wet.
+        let dLow : f32 = (bed[l] - bed[l2]) + (hl - h[l2]);
+        let dMid : f32 = (bed[r] - bed[l]) + (hr - hl);
+        let dHigh : f32 = (bed[r2] - bed[r]) + (h[r2] - hr);
+        let wetLow : bool = min(h[l2], min(hl, hr)) >= p.slopeDepth;
+        let wetHigh : bool = min(hl, min(hr, h[r2])) >= p.slopeDepth;
+        let mut surfLow : f32 = 0.0;
+        let mut surfHigh : f32 = 0.0;
+        let mut normLow : f32 = 0.0;
+        let mut normHigh : f32 = 0.0;
+        let mut tangLow : f32 = 0.0;
+        let mut tangHigh : f32 = 0.0;
+        if (wetLow) {
+            surfLow = hydroMinmod(dLow, dMid);
+            normLow = hydroMinmod(un[l] - un[l2], un[r] - un[l]);
+            tangLow = hydroMinmod(ut[l] - ut[l2], ut[r] - ut[l]);
+        }
+        if (wetHigh) {
+            surfHigh = hydroMinmod(dMid, dHigh);
+            normHigh = hydroMinmod(un[r2] - un[r], un[r] - un[l]);
+            tangHigh = hydroMinmod(ut[r2] - ut[r], ut[r] - ut[l]);
+        }
+
+        let depthLow : f32 = max(hl + HYDRO_HALF * surfLow, 0.0);
+        let depthHigh : f32 = max(hr - HYDRO_HALF * surfHigh, 0.0);
+        let sill : f32 = bed[r] - bed[l];
+        let mut low : HydroSide = HydroSide {
+            depth: max(depthLow - max(sill, 0.0), 0.0),
+            normal: un[l] + HYDRO_HALF * normLow,
+            tangent: ut[l] + HYDRO_HALF * tangLow,
+        };
+        let mut high : HydroSide = HydroSide {
+            depth: max(depthHigh - max(-sill, 0.0), 0.0),
+            normal: un[r] - HYDRO_HALF * normHigh,
+            tangent: ut[r] - HYDRO_HALF * tangHigh,
+        };
+        if (low.depth <= p.tiny) {
+            low = HydroSide {};
+        }
+        if (high.depth <= p.tiny) {
+            high = HydroSide {};
+        }
+
+        let mut out : HydroFlux = HydroFaces::solve(low, high, p);
+        let correctionLow : f32 = HYDRO_HALF * p.gravity * (depthLow - low.depth) * (depthLow + low.depth);
+        let correctionHigh : f32 = HYDRO_HALF * p.gravity * (depthHigh - high.depth)
+            * (depthHigh + high.depth);
+        let drag : f32 = p.viscosity * min(hl, hr) * p.invCell;
+        out.normalLow = out.normalLow + correctionLow - drag * (un[r] - un[l]);
+        out.normalHigh = out.normalHigh + correctionHigh - drag * (un[r] - un[l]);
+        out.tangent = out.tangent - drag * (ut[r] - ut[l]);
+        out.wallLow = HYDRO_HALF * p.gravity * depthLow * depthLow;
+        out.wallHigh = HYDRO_HALF * p.gravity * depthHigh * depthHigh;
+        out.jump = abs(high.depth - low.depth) - p.restJump * (high.depth + low.depth);
+        return out;
+    }
+
+    // The HLL flux of two face states; momentum without the hydrostatic correction.
+    static fn solve(low : HydroSide, high : HydroSide, p : HydroScheme) : HydroFlux {
+        let g : f32 = p.gravity;
+        let cl : f32 = (g * low.depth).sqrt();
+        let cr : f32 = (g * high.depth).sqrt();
+        let lowDry : bool = low.depth <= p.tiny;
+        let highDry : bool = high.depth <= p.tiny;
+
+        let mut sl : f32 = min(low.normal - cl, high.normal - cr);
+        let mut sr : f32 = max(low.normal + cl, high.normal + cr);
+        if (lowDry) {
+            sl = high.normal - HYDRO_TWO * cr;
+            sr = high.normal + cr;
+        }
+        if (highDry) {
+            sl = low.normal - cl;
+            sr = low.normal + HYDRO_TWO * cl;
+        }
+        if (lowDry && highDry) {
+            sl = 0.0;
+            sr = 0.0;
+        }
+
+        let sLeft : f32 = min(sl, 0.0);
+        let sRight : f32 = max(sr, 0.0);
+        let width : f32 = sRight - sLeft;
+        if (width <= p.tiny) {
+            return HydroFlux {};
+        }
+
+        let hl : f32 = low.depth;
+        let hr : f32 = high.depth;
+        let ml : f32 = hl * low.normal;
+        let mr : f32 = hr * high.normal;
+        let nl : f32 = ml * low.normal + HYDRO_HALF * g * hl * hl;
+        let nr : f32 = mr * high.normal + HYDRO_HALF * g * hr * hr;
+        let tl : f32 = ml * low.tangent;
+        let tr : f32 = mr * high.tangent;
+        let cross : f32 = sLeft * sRight;
+        let inv : f32 = HYDRO_ONE / width;
+
+        let mass : f32 = (sRight * ml - sLeft * mr + cross * (hr - hl)) * inv;
+        let normal : f32 = (sRight * nl - sLeft * nr + cross * (mr - ml)) * inv;
+        let tangent : f32 = (sRight * tl - sLeft * tr + cross * (hr * high.tangent - hl * low.tangent)) * inv;
+        return HydroFlux { mass: mass, normalLow: normal, normalHigh: normal, tangent: tangent };
+    }
+}

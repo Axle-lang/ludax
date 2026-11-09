@@ -1,0 +1,241 @@
+// hydro_sources — inflows and sinks: the declared places where the world gains and loses water.
+//
+// An inflow is a discharge in cubic metres per second poured into the cells of the block around a point whose
+// bed lies under the water of its centre cell (never onto a dry bank above it; a spring,
+// a river entering the map, a dam release); a sink takes a discharge out of the same kind of block (a drain, a
+// well, an intake) and can only take what is there. Both are plain data a game changes between steps
+// (`setDischarge`), so a time-varying inflow is a call per frame. Each substep deposits `discharge * dt` spread
+// equally over the block's cells; the volume really added or removed (the f32 depth, times the cell area) is
+// what is returned and booked, so the world's ledger closes whatever the rounding.
+//
+// Water enters at rest: the momentum of the cell is unchanged and its velocity thins out, which is what a
+// spring does. A game that wants a jet adds an impact or launches particles itself.
+
+use crate::core::collections::vec::Vec;
+use crate::sim::fluid::hydro_grid::HydroGrid;
+
+/** A level above any bed: an inflow whose centre is outside the grid takes every cell of its block. */
+const HYDRO_ANY_LEVEL : f32 = 1000000000.0;
+
+/** One inflow or sink: a block of cells and the discharge through it. */
+pub(crate) struct HydroPort {
+    /** Cell x of the centre of the block. */
+    pub(crate) cellX : i32 = 0;
+
+    /** Cell z of the centre of the block. */
+    pub(crate) cellZ : i32 = 0;
+
+    /** Discharge, m3/s (zero or more). */
+    pub(crate) discharge : f32 = 0.0;
+
+    /** The dye tracer an inflow tints its water with, or -1 for none. */
+    pub(crate) tracer : i32 = -1;
+
+    /** False for a removed port. */
+    pub(crate) active : bool = true;
+}
+
+/** The inflows and sinks of one world. */
+pub(crate) class HydroSources {
+    inflows : Vec<HydroPort>;
+    sinks   : Vec<HydroPort>;
+
+    /** The dye each tracer received from tagged inflows, and the dye the sinks took out, m3. */
+    pub(crate) injectedDye : f64[];
+    pub(crate) sunkDye     : f64[];
+
+    constructor(tracers : i32) {
+        self.inflows = new Vec<HydroPort>();
+        self.sinks = new Vec<HydroPort>();
+        self.injectedDye = new f64[(tracers + 1) as i64];
+        self.sunkDye = new f64[(tracers + 1) as i64];
+        for (t of 0..tracers + 1) {
+            self.injectedDye[t as i64] = 0.0;
+            self.sunkDye[t as i64] = 0.0;
+        }
+    }
+
+    /** Adds an inflow and answers its handle. */
+    pub(crate) fn addInflow(mut self, port : HydroPort) : i32 {
+        self.inflows.push(port);
+        return self.inflows.len() - 1;
+    }
+
+    /** Adds a sink and answers its handle. */
+    pub(crate) fn addSink(mut self, port : HydroPort) : i32 {
+        self.sinks.push(port);
+        return self.sinks.len() - 1;
+    }
+
+    /** Sets the discharge of inflow `id` (a negative value is zero); false for a stale handle. */
+    pub(crate) fn setInflow(mut self, id : i32, discharge : f32) : bool {
+        if (!self.inflows.has(id)) {
+            return false;
+        }
+        let mut port : HydroPort = self.inflows.get(id);
+        port.discharge = discharge;
+        if (discharge < 0.0) {
+            port.discharge = 0.0;
+        }
+        self.inflows.set(id, port);
+        return true;
+    }
+
+    /** Tags inflow `id` with a dye tracer (-1 for none); false for a stale handle. */
+    pub(crate) fn setInflowTracer(mut self, id : i32, tracer : i32) : bool {
+        if (!self.inflows.has(id)) {
+            return false;
+        }
+        let mut port : HydroPort = self.inflows.get(id);
+        port.tracer = tracer;
+        self.inflows.set(id, port);
+        return true;
+    }
+
+    /** Sets the discharge of sink `id`; false for a stale handle. */
+    pub(crate) fn setSink(mut self, id : i32, discharge : f32) : bool {
+        if (!self.sinks.has(id)) {
+            return false;
+        }
+        let mut port : HydroPort = self.sinks.get(id);
+        port.discharge = discharge;
+        if (discharge < 0.0) {
+            port.discharge = 0.0;
+        }
+        self.sinks.set(id, port);
+        return true;
+    }
+
+    /** The discharge of inflow `id`, 0 for a stale handle. */
+    pub(crate) fn inflowOf(self, id : i32) : f32 {
+        if (!self.inflows.has(id)) {
+            return 0.0;
+        }
+        return self.inflows.get(id).discharge;
+    }
+
+    /** Whether any inflow or sink is passing water (the world then has work even with every tile asleep). */
+    pub(crate) fn anyActive(self) : bool {
+        for (k of 0..self.inflows.len()) {
+            if (self.inflows.get(k).discharge > 0.0) {
+                return true;
+            }
+        }
+        for (k of 0..self.sinks.len()) {
+            if (self.sinks.get(k).discharge > 0.0) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** Pours every inflow for `dt` seconds; answers the volume added, m3, in f64. */
+    pub(crate) fn pour(mut self, g : Shared<HydroGrid>, radius : i32, dt : f32) : f64 {
+        let area : f64 = (g.cellSize as f64) * (g.cellSize as f64);
+        let mut added : f64 = 0.0;
+        for (k of 0..self.inflows.len()) {
+            let port : HydroPort = self.inflows.get(k);
+            if (port.discharge <= 0.0) {
+                continue;
+            }
+            let level : f32 = HydroSources::waterLevel(g, port);
+            let cells : i32 = HydroSources::lowCount(g, port, radius, level);
+            let share : f32 = port.discharge * dt / ((cells as f32) * (area as f32));
+            for (z of port.cellZ - radius..port.cellZ + radius + 1) {
+                for (x of port.cellX - radius..port.cellX + radius + 1) {
+                    if (!HydroSources::takes(g, x, z, level)) {
+                        continue;
+                    }
+                    g.deposit(x, z, share, 0.0, 0.0);
+                    if (port.tracer >= 0 && port.tracer < g.tracers) {
+                        g.depositDye(x, z, port.tracer, share);
+                        self.injectedDye[port.tracer as i64] = self.injectedDye[port.tracer as i64]
+                            + (share as f64) * area;
+                    }
+                    added = added + (share as f64) * area;
+                }
+            }
+        }
+        return added;
+    }
+
+    /** Drains every sink for `dt` seconds; answers the volume removed, m3, in f64. */
+    pub(crate) fn drain(mut self, g : Shared<HydroGrid>, radius : i32, dt : f32) : f64 {
+        let area : f64 = (g.cellSize as f64) * (g.cellSize as f64);
+        let mut removed : f64 = 0.0;
+        for (k of 0..self.sinks.len()) {
+            let port : HydroPort = self.sinks.get(k);
+            if (port.discharge <= 0.0) {
+                continue;
+            }
+            let cells : i32 = HydroSources::blockCount(g, port, radius);
+            let share : f32 = port.discharge * dt / ((cells as f32) * (area as f32));
+            for (z of port.cellZ - radius..port.cellZ + radius + 1) {
+                for (x of port.cellX - radius..port.cellX + radius + 1) {
+                    if (!g.inside(x, z)) {
+                        continue;
+                    }
+                    for (t of 0..g.tracers) {
+                        g.drainedDye[t as i64] = 0.0;
+                    }
+                    removed = removed + (g.drain(x, z, share) as f64) * area;
+                    for (t of 0..g.tracers) {
+                        self.sunkDye[t as i64] = self.sunkDye[t as i64] + g.drainedDye[t as i64];
+                        g.drainedDye[t as i64] = 0.0;
+                    }
+                }
+            }
+        }
+        return removed;
+    }
+
+    // The water level an inflow fills to: the surface of its centre cell (plus the dry depth), so an inflow
+    // never pours onto a cell whose bed is above the water it feeds. A centre outside the grid takes anything.
+    static fn waterLevel(g : Shared<HydroGrid>, port : HydroPort) : f32 {
+        if (!g.inside(port.cellX, port.cellZ)) {
+            return HYDRO_ANY_LEVEL;
+        }
+        let i : i64 = g.index(port.cellX, port.cellZ) as i64;
+        return g.bed[i] + g.h[i] + g.dry;
+    }
+
+    // Whether cell (x, z) is inside the grid and its bed is not above `level`.
+    static fn takes(g : Shared<HydroGrid>, x : i32, z : i32, level : f32) : bool {
+        if (!g.inside(x, z)) {
+            return false;
+        }
+        return g.bed[g.index(x, z) as i64] <= level;
+    }
+
+    // How many cells of the block take the inflow (at least one).
+    static fn lowCount(g : Shared<HydroGrid>, port : HydroPort, radius : i32, level : f32) : i32 {
+        let mut n : i32 = 0;
+        for (z of port.cellZ - radius..port.cellZ + radius + 1) {
+            for (x of port.cellX - radius..port.cellX + radius + 1) {
+                if (HydroSources::takes(g, x, z, level)) {
+                    n = n + 1;
+                }
+            }
+        }
+        if (n < 1) {
+            return 1;
+        }
+        return n;
+    }
+
+    // How many cells of the block around a port lie inside the grid (at least one).
+    static fn blockCount(g : Shared<HydroGrid>, port : HydroPort, radius : i32) : i32 {
+        let mut n : i32 = 0;
+        for (z of port.cellZ - radius..port.cellZ + radius + 1) {
+            for (x of port.cellX - radius..port.cellX + radius + 1) {
+                if (g.inside(x, z)) {
+                    n = n + 1;
+                }
+            }
+        }
+        if (n < 1) {
+            return 1;
+        }
+        return n;
+    }
+}

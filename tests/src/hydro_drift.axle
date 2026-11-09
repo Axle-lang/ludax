@@ -1,0 +1,576 @@
+// hydro_drift — checks of the drifters: markers that ride the water, fall over a lip and float on.
+//
+// A marker is carried by the engine's own velocity, so what it does is checked against physics, not against a
+// script: on a steady channel it moves at the mean surface velocity along its path; in a bend it stays in the
+// channel; over a 12 m lip it falls for `sqrt(2 H / g)` and lands where the grid has water, then drifts on at the
+// river's speed; it strands where the water leaves and floats again when it returns; it is gone past an open side;
+// all of that is bit-identical for one and eight workers.
+
+use ludax::Checks;
+use ludax::HYDRO_DRIFT_AIRBORNE;
+use ludax::HYDRO_DRIFT_FLOATING;
+use ludax::HYDRO_DRIFT_GONE;
+use ludax::HYDRO_DRIFT_STRANDED;
+use ludax::HYDRO_SIDE_EAST;
+use ludax::HydroParams;
+use ludax::HydroWorld;
+use ludax::Vec2;
+use ludax::Vec3;
+use ludax::sin;
+
+/** The checks of the drifters. */
+pub class HydroDriftSuite {
+    /** Runs every check of the suite. */
+    pub static fn run(c : Checks) : void {
+        hydroDriftChannel(c);
+        hydroDriftBend(c);
+        hydroDriftFall(c);
+        hydroDriftStrand(c);
+        hydroDriftGone(c);
+        hydroDriftThreads(c);
+        hydroDriftClosed(c);
+        hydroDriftSurfaceFactor(c);
+        hydroDriftEscape(c);
+    }
+}
+
+// ---- a straight steady channel ----
+
+// A channel 200 m by 4 m falling 0.6 m, fed 4 m3/s at its head, open at its foot, steady after 300 s.
+fn hydroDriftChannelWorld(factor : f32, diffusion : f32) : HydroWorld {
+    let mut bed : f32[] = new f32[(200 * 4) as i64];
+    for (z of 0..4) {
+        for (x of 0..200) {
+            bed[(z * 200 + x) as i64] = (0.6 as f32) - (x as f32) * (0.003 as f32);
+        }
+    }
+    let mut p : HydroParams = HydroParams::standard();
+    p.fall.capacity = 0;
+    p.drifterSurfaceFactor = factor;
+    p.drifterDiffusion = diffusion;
+    let w : HydroWorld = new HydroWorld(200, 4, 1.0, p);
+    w.setBed(bed, 200, 4, 1.0);
+    w.setOutflowBoundary(HYDRO_SIDE_EAST);
+    w.addInflow(1.5, 2.0, 4.0);
+    for (k of 0..3000) {
+        w.step(0.1);
+    }
+    return w;
+}
+
+// A marker on a steady channel moves at the mean surface velocity along its path.
+fn hydroDriftChannel(c : Checks) : void {
+    let w : HydroWorld = hydroDriftChannelWorld(1.0, 0.0);
+    let k : i32 = w.addDrifter(40.0, 2.0);
+    let mut mean : f64 = 0.0;
+    let mut samples : i32 = 0;
+    for (n of 0..200) {
+        w.step(0.1);
+        let pos : f32[] = w.drifterPositions();
+        let u : Vec2 = w.surfaceVelocityAt(pos[(k * 3) as i64], pos[(k * 3 + 2) as i64]);
+        mean = mean + (u.x as f64);
+        samples = samples + 1;
+    }
+    mean = mean / (samples as f64);
+    let pos : f32[] = w.drifterPositions();
+    let speed : f64 = ((pos[(k * 3) as i64] - 40.0) as f64) / 20.0;
+    println("  measured drifter on a channel: ${speed} m/s over 20 s, mean surface velocity along its path ${mean} m/s, travel ${w.drifterTravel(k)} m");
+    c.that(
+        "a marker moves at the surface velocity (${speed} vs ${mean})",
+        speed > 0.95 * mean && speed < 1.05 * mean
+    );
+    c.that(
+        "its path length is its displacement on a straight channel",
+        w.drifterTravel(k) < ((pos[(k * 3) as i64] - 40.0) * 1.05)
+    );
+    c.that("its trail holds the samples (${w.drifterTrailCount(k)})", w.drifterTrailCount(k) == 81);
+    w.close();
+}
+
+// ---- a bend ----
+
+fn hydroDriftCentre(x : i32) : f32 {
+    return (20.0 as f32) + (8.0 as f32) * sin((x as f32) * (0.157 as f32));
+}
+
+// The meandering channel of the river test: 3 cells wide, banks 6 m high, a steady 3 m3/s.
+fn hydroDriftBendWorld() : HydroWorld {
+    let mut bed : f32[] = new f32[(80 * 40) as i64];
+    for (z of 0..40) {
+        for (x of 0..80) {
+            let off : f32 = ((z as f32) + (0.5 as f32)) - hydroDriftCentre(x);
+            let mut height : f32 = (4.0 as f32) - (0.05 as f32) * (x as f32);
+            if (off > 2.2 || off < -2.2) {
+                height = height + (6.0 as f32);
+            }
+            bed[(z * 80 + x) as i64] = height;
+        }
+    }
+    let mut p : HydroParams = HydroParams::standard();
+    p.fall.capacity = 0;
+    let w : HydroWorld = new HydroWorld(80, 40, 1.0, p);
+    w.setBed(bed, 80, 40, 1.0);
+    w.setOutflowBoundary(HYDRO_SIDE_EAST);
+    w.addInflow(1.5, hydroDriftCentre(1), 3.0);
+    for (k of 0..2000) {
+        w.step(0.1);
+    }
+    return w;
+}
+
+// A marker follows the bends of the meandering channel and stays inside it.
+fn hydroDriftBend(c : Checks) : void {
+    let w : HydroWorld = hydroDriftBendWorld();
+    let k : i32 = w.addDrifter(6.5, hydroDriftCentre(6));
+    let mut worst : f32 = 0.0;
+    let mut steps : i32 = 0;
+    while (steps < 600 && w.drifterStates()[k as i64] != HYDRO_DRIFT_GONE) {
+        w.step(0.1);
+        steps = steps + 1;
+        let pos : f32[] = w.drifterPositions();
+        let x : f32 = pos[(k * 3) as i64];
+        let z : f32 = pos[(k * 3 + 2) as i64];
+        let cx : i32 = driftCell(x);
+        let cz : i32 = driftCell(z);
+        if (w.depthOfCell(cx, cz) < 0.01) {
+            worst = worst + (1.0 as f32);
+        }
+    }
+    let state : u8 = w.drifterStates()[k as i64];
+    println("  measured drifter in a bend: ${steps} steps of 0.1 s to the foot, steps on dry ground ${worst}, state ${state}, travel ${w.drifterTravel(k)} m");
+    c.that(
+        "the marker rode the meanders to the open foot (state ${state})",
+        state == HYDRO_DRIFT_GONE
+    );
+    c.that("and stayed in the water of the channel (${worst} steps on dry ground)", worst == 0.0);
+    c.that(
+        "along the channel, longer than the straight line (${w.drifterTravel(k)} m)",
+        w.drifterTravel(k) > 75.0
+    );
+    c.that("the open foot counted it", w.driftersGone() == 1);
+    w.close();
+}
+
+fn driftMax(a : f32, b : f32) : f32 {
+    if (b > a) {
+        return b;
+    }
+    return a;
+}
+
+// ---- a lip ----
+
+/** The fall worlds: a plateau 12 m up to column 30, a plain below, 64 x 16 cells. */
+const HYDRO_DRIFT_WIDTH : i32 = 64;
+const HYDRO_DRIFT_ROWS : i32 = 16;
+const HYDRO_DRIFT_CLIFF : i32 = 30;
+const HYDRO_DRIFT_TOP : f32 = 12.0;
+
+fn hydroDriftFallWorld(gravity : f32, threads : i32, open : bool, diffusion : f32) : HydroWorld {
+    let mut bed : f32[] = new f32[(HYDRO_DRIFT_WIDTH * HYDRO_DRIFT_ROWS) as i64];
+    for (z of 0..HYDRO_DRIFT_ROWS) {
+        for (x of 0..HYDRO_DRIFT_WIDTH) {
+            let mut h : f32 = 0.0;
+            if (x < HYDRO_DRIFT_CLIFF) {
+                h = HYDRO_DRIFT_TOP;
+            }
+            bed[(z * HYDRO_DRIFT_WIDTH + x) as i64] = h;
+        }
+    }
+    let mut p : HydroParams = HydroParams::standard();
+    p.gravity = gravity;
+    p.threads = threads;
+    p.drifterDiffusion = diffusion;
+    let w : HydroWorld = new HydroWorld(HYDRO_DRIFT_WIDTH, HYDRO_DRIFT_ROWS, 1.0, p);
+    w.setBed(bed, HYDRO_DRIFT_WIDTH, HYDRO_DRIFT_ROWS, 1.0);
+    if (open) {
+        w.setOutflowBoundary(HYDRO_SIDE_EAST);
+    }
+    w.addInflow(3.5, 8.0, 12.0);
+    return w;
+}
+
+// What a fall measured: seconds airborne, the height dropped, where it left and where it landed.
+fn hydroDriftFallRun(gravity : f32, c : Checks, label : string) : f32 {
+    let w : HydroWorld = hydroDriftFallWorld(gravity, 1, true, 0.0);
+    for (n of 0..1500) {
+        w.step(0.02);
+    }
+    let k : i32 = w.addDrifter(20.0, 8.0);
+    let mut leftAt : f32 = 0.0;
+    let mut leftY : f32 = 0.0;
+    let mut leftX : f32 = 0.0;
+    let mut landed : f32 = 0.0;
+    let mut landX : f32 = 0.0;
+    let mut landY : f32 = 0.0;
+    let mut flying : bool = false;
+    for (n of 0..6000) {
+        w.step(0.01);
+        let state : u8 = w.drifterStates()[k as i64];
+        let pos : f32[] = w.drifterPositions();
+        if (state == HYDRO_DRIFT_AIRBORNE && !flying) {
+            flying = true;
+            leftAt = w.drifterAge(k);
+            leftX = pos[(k * 3) as i64];
+            leftY = pos[(k * 3 + 1) as i64];
+        }
+        if (flying && state == HYDRO_DRIFT_FLOATING) {
+            landed = w.drifterAge(k);
+            landX = pos[(k * 3) as i64];
+            landY = pos[(k * 3 + 1) as i64];
+            break;
+        }
+    }
+    let seconds : f32 = landed - leftAt;
+    let height : f32 = leftY - landY;
+    let expect : f32 = (((2.0 as f32) * height) / gravity).sqrt();
+    println("  measured drifter fall (${label}): left the lip at ${leftAt} s from x = ${leftX}, ${height} m in ${seconds} s (sqrt(2H/g) = ${expect}), landed at x = ${landX}, ${landX - 30.0} m from the wall, pool depth ${w.depthOfCell(31, 8)} m, lip depth ${w.depthOfCell(29, 8)} m, lip height ${leftY}");
+    c.that("${label}: the marker went over the lip (${flying})", flying);
+    c.that(
+        "${label}: it falls for sqrt(2H/g) within 6% (${seconds} vs ${expect})",
+        seconds > 0.94 * expect && seconds < 1.06 * expect
+    );
+    c.that(
+        "${label}: it lands in the pool beyond the wall (${landX})",
+        landX > 30.5 && landX < 45.0
+    );
+    w.close();
+    return seconds;
+}
+
+// A marker falls a 12 m lip in sqrt(2H/g), at both gravities, lands and keeps drifting on at the river's speed.
+fn hydroDriftFall(c : Checks) : void {
+    let slow : f32 = hydroDriftFallRun(9.81, c, "g");
+    let fast : f32 = hydroDriftFallRun(39.24, c, "4g");
+    let ratio : f32 = slow / fast;
+    c.that("four times the gravity halves the fall (ratio ${ratio})", ratio > 1.85 && ratio < 2.15);
+
+    let w : HydroWorld = hydroDriftFallWorld(9.81, 1, true, 0.5);
+    for (n of 0..4000) {
+        w.step(0.02);
+    }
+    let k : i32 = w.addDrifter(20.0, 8.0);
+    let mut landed : bool = false;
+    for (n of 0..3000) {
+        w.step(0.01);
+        if (w.drifterStates()[k as i64] == HYDRO_DRIFT_FLOATING
+            && w.drifterPositions()[(k * 3) as i64] > 31.0) {
+            landed = true;
+            break;
+        }
+    }
+    let x0 : f32 = w.drifterPositions()[(k * 3) as i64];
+    let mut mean : f64 = 0.0;
+    for (n of 0..2000) {
+        w.step(0.01);
+        let pos : f32[] = w.drifterPositions();
+        let u : Vec2 = w.surfaceVelocityAt(pos[(k * 3) as i64], pos[(k * 3 + 2) as i64]);
+        mean = mean + (u.x as f64) / 2000.0;
+    }
+    let speed : f64 = ((w.drifterPositions()[(k * 3) as i64] - x0) as f64) / 20.0;
+    println("  measured drifter after the fall: ${speed} m/s over 20 s from x = ${x0}, surface velocity along its path ${mean} m/s");
+    c.that("it landed and floated on (${landed})", landed);
+    c.that(
+        "it drifts downstream faster than the depth-averaged flow, surface layer and eddies (${speed} vs ${mean})",
+        speed > mean && speed < 2.5 * mean
+    );
+    w.close();
+}
+
+// ---- stranding ----
+
+// A marker where the water leaves is stranded, and floats again when the water returns.
+fn hydroDriftStrand(c : Checks) : void {
+    let p : HydroParams = HydroParams::standard();
+    let w : HydroWorld = new HydroWorld(10, 10, 1.0, p);
+    w.fillRect(0.5, 0, 0, 9, 9);
+    let k : i32 = w.addDrifter(5.5, 5.5);
+    w.step(0.05);
+    c.that("a marker on deep water floats", w.drifterStates()[k as i64] == HYDRO_DRIFT_FLOATING);
+    for (z of 3..8) {
+        for (x of 3..8) {
+            w.pour(x, z, -1.0);
+        }
+    }
+    w.step(0.05);
+    c.that(
+        "it is stranded when the water leaves",
+        w.drifterStates()[k as i64] == HYDRO_DRIFT_STRANDED
+    );
+    let at : f32 = w.drifterPositions()[(k * 3) as i64];
+    w.step(0.5);
+    c.that("a stranded marker stays put", w.drifterPositions()[(k * 3) as i64] == at);
+    for (z of 3..8) {
+        for (x of 3..8) {
+            w.pour(x, z, 0.4);
+        }
+    }
+    w.step(0.05);
+    c.that(
+        "it floats again when the water returns",
+        w.drifterStates()[k as i64] == HYDRO_DRIFT_FLOATING
+    );
+    w.close();
+}
+
+// ---- an open side ----
+
+// A marker is gone past an open side and counted.
+fn hydroDriftGone(c : Checks) : void {
+    let w : HydroWorld = hydroDriftChannelWorld(1.2, 0.5);
+    let k : i32 = w.addDrifter(180.0, 2.0);
+    let mut steps : i32 = 0;
+    while (steps < 600 && w.drifterStates()[k as i64] != HYDRO_DRIFT_GONE) {
+        w.step(0.1);
+        steps = steps + 1;
+    }
+    println("  measured drifter leaving: gone after ${steps} steps of 0.1 s from 20 m of the foot");
+    c.that(
+        "a marker leaves through the open side",
+        w.drifterStates()[k as i64] == HYDRO_DRIFT_GONE
+    );
+    c.that("and is counted", w.driftersGone() == 1);
+    let at : f32 = w.drifterPositions()[(k * 3) as i64];
+    w.step(1.0);
+    c.that("a gone marker is not moved again", w.drifterPositions()[(k * 3) as i64] == at);
+    w.close();
+}
+
+// ---- threads and determinism ----
+
+fn hydroDriftScene(threads : i32) : HydroWorld {
+    let w : HydroWorld = hydroDriftFallWorld(9.81, threads, true, 0.5);
+    for (n of 0..1500) {
+        w.step(0.02);
+    }
+    let mut mask : u8[] = new u8[(HYDRO_DRIFT_WIDTH * HYDRO_DRIFT_ROWS) as i64];
+    for (i of 0..(HYDRO_DRIFT_WIDTH * HYDRO_DRIFT_ROWS)) {
+        mask[i as i64] = 1;
+    }
+    w.addDrifters(mask, 24, 5);
+    for (n of 0..2500) {
+        w.step(0.02);
+    }
+    return w;
+}
+
+fn hydroDriftSame(a : HydroWorld, b : HydroWorld) : bool {
+    let mut same : bool = a.drifterCount() == b.drifterCount();
+    let pa : f32[] = a.drifterPositions();
+    let pb : f32[] = b.drifterPositions();
+    for (i of 0..(a.drifterCount() * 3)) {
+        if (pa[i as i64] != pb[i as i64]) {
+            same = false;
+        }
+    }
+    for (k of 0..a.drifterCount()) {
+        if (a.drifterStates()[k as i64] != b.drifterStates()[k as i64]) {
+            same = false;
+        }
+        if (a.drifterTrailCount(k) != b.drifterTrailCount(k)) {
+            same = false;
+            continue;
+        }
+        for (i of 0..a.drifterTrailCount(k)) {
+            let ta : Vec3 = a.drifterTrailAt(k, i);
+            let tb : Vec3 = b.drifterTrailAt(k, i);
+            if (ta.x != tb.x || ta.y != tb.y || ta.z != tb.z) {
+                same = false;
+            }
+        }
+    }
+    return same;
+}
+
+// One worker and eight give the same markers, positions and trails, bit for bit; so do two runs of one.
+fn hydroDriftThreads(c : Checks) : void {
+    let a : HydroWorld = hydroDriftScene(1);
+    let b : HydroWorld = hydroDriftScene(8);
+    let d : HydroWorld = hydroDriftScene(1);
+    let mut airborne : i32 = 0;
+    for (k of 0..a.drifterCount()) {
+        if (a.drifterStates()[k as i64] != HYDRO_DRIFT_STRANDED) {
+            airborne = airborne + 1;
+        }
+    }
+    println("  measured drifters: ${a.drifterCount()} markers, ${a.driftersGone()} gone, ${airborne} not stranded, trail of the first ${a.drifterTrailCount(0)} points");
+    c.that("1 and 8 workers move the markers identically", hydroDriftSame(a, b));
+    c.that("two runs are identical", hydroDriftSame(a, d));
+    c.that("the scene had markers (${a.drifterCount()})", a.drifterCount() == 24);
+    a.close();
+    b.close();
+    d.close();
+}
+
+// ---- a closed world ----
+
+// In a closed world with a lake, a curtain and a pool, the markers released near the lip all finish in the pool.
+fn hydroDriftClosed(c : Checks) : void {
+    let w : HydroWorld = hydroDriftFallWorld(9.81, 1, false, 0.5);
+    w.setInflow(0, 0.0);
+    w.fillRect(HYDRO_DRIFT_TOP + 2.0, 0, 0, HYDRO_DRIFT_CLIFF - 1, HYDRO_DRIFT_ROWS - 1);
+    let mut mask : u8[] = new u8[(HYDRO_DRIFT_WIDTH * HYDRO_DRIFT_ROWS) as i64];
+    for (z of 0..HYDRO_DRIFT_ROWS) {
+        for (x of 0..HYDRO_DRIFT_WIDTH) {
+            mask[(z * HYDRO_DRIFT_WIDTH + x) as i64] = 0;
+            if (x >= 24 && x < 29) {
+                mask[(z * HYDRO_DRIFT_WIDTH + x) as i64] = 1;
+            }
+        }
+    }
+    let n : i32 = w.addDrifters(mask, 12, 11);
+    let mut done : i32 = 0;
+    let mut when : f32 = 0.0;
+    for (step of 0..9000) {
+        w.step(0.02);
+        done = 0;
+        for (k of 0..n) {
+            if (w.drifterStates()[k as i64] == HYDRO_DRIFT_FLOATING
+                && w.drifterPositions()[(k * 3) as i64] > 30.5) {
+                done = done + 1;
+            }
+        }
+        if (done == n) {
+            when = ((step + 1) as f32) * (0.02 as f32);
+            break;
+        }
+    }
+    println("  measured closed pool and curtain: ${done} of ${n} markers in the pool after ${when} s, residual ${w.ledger().residual()} m3");
+    c.that("markers were released in the lake (${n})", n == 12);
+    c.that("every marker finished in the pool (${done} of ${n})", done == n);
+    c.that("within three minutes (${when} s)", when > 0.0 && when < 180.0);
+    w.close();
+}
+
+// ---- the surface layer and eddy mixing ----
+
+// Two hundred markers on the steady channel: the mean drift is the surface factor times the surface velocity, and the
+// spread along the stream grows as sqrt(2 D t) with the diffusivity `D = alpha h u*` the model states.
+fn hydroDriftSurfaceFactor(c : Checks) : void {
+    let w : HydroWorld = hydroDriftChannelWorld(1.2, 0.5);
+    for (n of 0..200) {
+        w.addDrifter(40.0, 0.5 + 3.0 * ((n % 50) as f32) / (50.0 as f32));
+    }
+    let mut mean : f64 = 0.0;
+    for (n of 0..200) {
+        w.step(0.1);
+        let u : Vec2 = w.surfaceVelocityAt(60.0, 2.0);
+        mean = mean + (u.x as f64) / 200.0;
+    }
+    let pos : f32[] = w.drifterPositions();
+    let mut sum : f64 = 0.0;
+    for (k of 0..200) {
+        sum = sum + ((pos[(k * 3) as i64] - 40.0) as f64);
+    }
+    let drift : f64 = sum / 200.0 / 20.0;
+    let mut var : f64 = 0.0;
+    for (k of 0..200) {
+        let d : f64 = ((pos[(k * 3) as i64] - 40.0) as f64) - sum / 200.0;
+        var = var + d * d / 200.0;
+    }
+    let depth : f32 = w.depthOfCell(60, 2);
+    let u : f32 = w.surfaceVelocityAt(60.0, 2.0).x;
+    // u* = sqrt(g) n u / h^(1/6) with n = 0.03; D = 0.5 h u*
+    let mut root : f32 = 1.0;
+    for (it of 0..12) {
+        root = ((2.0 as f32) * root + depth / (root * root)) / (3.0 as f32);
+    }
+    let ustar : f32 = (9.81 as f32).sqrt() * (0.03 as f32) * u / root.sqrt();
+    let diff : f64 = (0.5 * ((depth * ustar) as f64));
+    let expect : f64 = (2.0 * diff * 20.0).sqrt();
+    let spread : f64 = var.sqrt();
+    println("  measured surface layer: drift ${drift} m/s of 1.2 x ${mean} = ${1.2 * mean}, spread ${spread} m after 20 s (sqrt(2 D t) = ${expect}, D = ${diff} m2/s)");
+    c.that(
+        "the mean drift is the surface factor times the surface velocity (${drift} vs ${1.2 * mean})",
+        drift > 1.2 * mean * 0.97 && drift < 1.2 * mean * 1.03
+    );
+    c.that(
+        "the spread grows as sqrt(2 D t) within 25% (${spread} vs ${expect})",
+        spread > 0.75 * expect && spread < 1.25 * expect
+    );
+    w.close();
+}
+
+// Markers released above a lip all go over it, land in the plunge pool and leave it for the river by eddy mixing.
+fn hydroDriftEscape(c : Checks) : void {
+    let w : HydroWorld = hydroDriftFallWorld(9.81, 1, true, 0.5);
+    for (n of 0..1500) {
+        w.step(0.02);
+    }
+    let mut mask : u8[] = new u8[(HYDRO_DRIFT_WIDTH * HYDRO_DRIFT_ROWS) as i64];
+    for (z of 0..HYDRO_DRIFT_ROWS) {
+        for (x of 0..HYDRO_DRIFT_WIDTH) {
+            mask[(z * HYDRO_DRIFT_WIDTH + x) as i64] = 0;
+            if (x >= 20 && x < 29) {
+                mask[(z * HYDRO_DRIFT_WIDTH + x) as i64] = 1;
+            }
+        }
+    }
+    let n : i32 = w.addDrifters(mask, 24, 3);
+    for (step of 0..24000) {
+        w.step(0.01);
+        if (w.driftersGone() == n) {
+            break;
+        }
+    }
+    let mut stay : f64 = 0.0;
+    let mut left : i32 = 0;
+    for (k of 0..n) {
+        if (w.drifterStates()[k as i64] == HYDRO_DRIFT_GONE) {
+            left = left + 1;
+            stay = stay + (w.drifterAge(k) as f64);
+        }
+    }
+    let mean : f64 = stay / ((max1(left)) as f64);
+    println("  measured plunge pool escape: ${left} of ${n} markers left through the outlet, mean time from release to leaving ${mean} s, simulated ${w.time()} s");
+    c.that("most markers leave the pool for the river (${left} of ${n})", left * 10 >= n * 8);
+    c.that("within four minutes (${mean} s on average)", mean < 240.0);
+    w.close();
+
+    // A closed pool: eddy mixing never pins a marker against a wall: all still float and still move.
+    let p : HydroWorld = hydroDriftFallWorld(9.81, 1, false, 0.5);
+    p.setInflow(0, 0.0);
+    p.fillRect(HYDRO_DRIFT_TOP + 2.0, 0, 0, HYDRO_DRIFT_CLIFF - 1, HYDRO_DRIFT_ROWS - 1);
+    let m : i32 = p.addDrifters(mask, 12, 7);
+    for (step of 0..21000) {
+        p.step(0.01);
+    }
+    let mut before : f32[] = new f32[(m * 3) as i64];
+    for (i of 0..(m * 3)) {
+        before[i as i64] = p.drifterPositions()[i as i64];
+    }
+    for (step of 0..3000) {
+        p.step(0.01);
+    }
+    let mut moving : i32 = 0;
+    let mut floating : i32 = 0;
+    for (k of 0..m) {
+        let dx : f32 = p.drifterPositions()[(k * 3) as i64] - before[(k * 3) as i64];
+        let dz : f32 = p.drifterPositions()[(k * 3 + 2) as i64] - before[(k * 3 + 2) as i64];
+        if (dx * dx + dz * dz > 0.0004) {
+            moving = moving + 1;
+        }
+        if (p.drifterStates()[k as i64] == HYDRO_DRIFT_FLOATING) {
+            floating = floating + 1;
+        }
+    }
+    println("  measured closed pool: ${floating} of ${m} floating, ${moving} still moving in the last 30 s");
+    c.that(
+        "no marker is pinned against a wall of the closed pool (${moving} of ${m} moving)",
+        moving * 10 >= m * 9
+    );
+    c.that("all of them still float (${floating} of ${m})", floating == m);
+    p.close();
+}
+
+fn max1(n : i32) : i32 {
+    if (n < 1) {
+        return 1;
+    }
+    return n;
+}
+
+// The cell index of a coordinate in metres on a grid of one metre cells.
+fn driftCell(v : f32) : i32 {
+    return v as i32;
+}

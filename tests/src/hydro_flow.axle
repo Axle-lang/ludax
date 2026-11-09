@@ -1,0 +1,193 @@
+// hydro_flow — checks of the hydrology: a reservoir over its weir, a river through a zigzag channel, persistence.
+//
+// A reservoir behind a broad crest passes `Q = C b H^1.5` with `C = sqrt(g) (2/3)^1.5 = 1.705`: the head the engine
+// settles at for a given inflow must match the head the law gives within fifteen percent. A river in a meandering
+// channel carries the same discharge through every cross-section once steady, and what enters leaves.
+
+use ludax::Checks;
+use ludax::HYDRO_SIDE_EAST;
+use ludax::HydroParams;
+use ludax::HydroWorld;
+use ludax::Vec2;
+use ludax::sin;
+
+use crate::hydro::hydroParams;
+
+/** The checks of the hydrology. */
+pub class HydroFlowSuite {
+    /** Runs every check of the suite. */
+    pub static fn run(c : Checks) : void {
+        hydroFlowWeir(c);
+        hydroFlowReservoirHolds(c);
+        hydroFlowRiver(c);
+    }
+}
+
+/** Crest height of the weir check, m. */
+const HYDRO_WEIR_CREST : f32 = 1.0;
+
+// A weir of 4 cells across 8 rows, a reservoir behind it fed at 4 m3/s, open downstream.
+fn hydroWeirWorld(inflow : f32, level : f32, ramp : i32) : HydroWorld {
+    // Cells of a quarter metre: 192 across (48 m), 32 down (8 m); the crest is cells 80 to 95 (20 to 24 m).
+    let mut bed : f32[] = new f32[(192 * 32) as i64];
+    for (z of 0..32) {
+        for (x of 0..192) {
+            bed[(z * 192 + x) as i64] = 0.0;
+            if (ramp > 0 && x >= 80 - ramp && x < 80) {
+                bed[(z * 192 + x) as i64] = HYDRO_WEIR_CREST
+                    * (((x - 80 + ramp) as f32) + (0.5 as f32))
+                    / (ramp as f32);
+            }
+            if (x >= 80 && x < 96) {
+                bed[(z * 192 + x) as i64] = HYDRO_WEIR_CREST;
+            }
+        }
+    }
+    let mut p : HydroParams = hydroParams();
+    p.viscosity = 0.0;
+    let w : HydroWorld = new HydroWorld(192, 32, 0.25, p);
+    w.setBed(bed, 192, 32, 0.25);
+    w.setOutflowBoundary(HYDRO_SIDE_EAST);
+    w.fillRect(level, 0, 0, 79, 31);
+    w.addInflow(3.5, 4.0, inflow);
+    return w;
+}
+
+// The head over the crest at steady state matches the broad-crested weir law within fifteen percent.
+fn hydroFlowWeir(c : Checks) : void {
+    let q : f32 = 4.0;
+    let w : HydroWorld = hydroWeirWorld(q, 1.3, 32);
+    for (k of 0..2400) {
+        w.step(0.1);
+    }
+    let level : f32 = w.bedAt(40, 16) + w.depthOfCell(40, 16);
+    let head : f32 = level - HYDRO_WEIR_CREST;
+    // Q = 1.705 * 8 * H^1.5  ->  H = (Q / 13.64)^(2/3)
+    let predicted : f32 = 0.4467;
+    let ratio : f32 = head / predicted;
+    println("  measured weir: head ${head} m, law ${predicted} m, ratio ${ratio}");
+    c.that(
+        "weir head within 15% of the broad-crested law (${head} vs ${predicted})",
+        ratio > 0.85 && ratio < 1.15
+    );
+    let l : f64 = w.ledger().residual();
+    c.that("weir books close (${l})", l < 0.01 && -l < 0.01);
+    let sharp : HydroWorld = hydroWeirWorld(q, 1.3, 0);
+    for (k of 0..2400) {
+        sharp.step(0.1);
+    }
+    let sharpHead : f32 = sharp.bedAt(40, 16) + sharp.depthOfCell(40, 16) - HYDRO_WEIR_CREST;
+    let discharge : f32 = (q / ((8.0 as f32) * sharpHead * sharpHead.sqrt())) / (1.705 as f32);
+    println("  measured sharp-edged weir: head ${sharpHead} m, discharge coefficient ${discharge} of the ideal (entry loss at the step)");
+    c.that(
+        "a sharp-edged crest passes 70% to 110% of the ideal discharge (${discharge})",
+        discharge > 0.7 && discharge < 1.1
+    );
+    sharp.close();
+}
+
+// A reservoir with no inflow and a rim above its level keeps its level.
+fn hydroFlowReservoirHolds(c : Checks) : void {
+    let w : HydroWorld = hydroWeirWorld(0.0, 0.9, 0);
+    let before : f64 = w.volume();
+    for (k of 0..600) {
+        w.step(0.1);
+    }
+    let kept : f64 = w.volume();
+    c.that(
+        "a full reservoir below its rim holds its water (${kept} of ${before})",
+        kept > before * 0.999
+    );
+    w.close();
+}
+
+/** The meandering channel: width, depth, and the centre line z at column x. */
+fn hydroCentre(x : i32) : f32 {
+    let phase : f32 = (x as f32) * (0.157 as f32);
+    return (20.0 as f32) + (8.0 as f32) * sin(phase);
+}
+
+// A channel three cells wide wandering across an 80 x 40 plain that falls 2 m along it, banks 6 m high.
+fn hydroRiverWorld(q : f32) : HydroWorld {
+    let mut bed : f32[] = new f32[(80 * 40) as i64];
+    for (z of 0..40) {
+        for (x of 0..80) {
+            let off : f32 = ((z as f32) + (0.5 as f32)) - hydroCentre(x);
+            let mut height : f32 = (4.0 as f32) - (0.05 as f32) * (x as f32);
+            if (off > 2.2 || off < -2.2) {
+                height = height + (6.0 as f32);
+            }
+            bed[(z * 80 + x) as i64] = height;
+        }
+    }
+    let mut p : HydroParams = hydroParams();
+    p.manning = 0.03;
+    let w : HydroWorld = new HydroWorld(80, 40, 1.0, p);
+    w.setBed(bed, 80, 40, 1.0);
+    w.setOutflowBoundary(HYDRO_SIDE_EAST);
+    w.addInflow(1.5, hydroCentre(1), q);
+    return w;
+}
+
+// The discharge across the vertical line at column x: sum of qx over the rows (dz = 1 m).
+fn hydroSection(w : HydroWorld, x : i32) : f64 {
+    let mut sum : f64 = 0.0;
+    for (z of 0..40) {
+        sum = sum + (w.faceDischargeX(x, z) as f64);
+    }
+    return sum;
+}
+
+// Steady river: every cross-section carries the inflow, and the outflow equals it.
+fn hydroFlowRiver(c : Checks) : void {
+    let q : f32 = 3.0;
+    let w : HydroWorld = hydroRiverWorld(q);
+    for (k of 0..3000) {
+        w.step(0.1);
+    }
+    let out0 : f64 = w.ledger().outflow;
+    let mut a : f64 = 0.0;
+    let mut b : f64 = 0.0;
+    let mut d : f64 = 0.0;
+    let mut va : f64 = 0.0;
+    let mut vb : f64 = 0.0;
+    let mut vd : f64 = 0.0;
+    for (k of 0..300) {
+        w.step(0.1);
+        a = a + hydroSection(w, 20) / 300.0;
+        b = b + hydroSection(w, 40) / 300.0;
+        d = d + hydroSection(w, 60) / 300.0;
+        va = va + hydroVelocitySection(w, 20) / 300.0;
+        vb = vb + hydroVelocitySection(w, 40) / 300.0;
+        vd = vd + hydroVelocitySection(w, 60) / 300.0;
+    }
+    let out : f64 = (w.ledger().outflow - out0) / 30.0;
+    println("  measured river: outflow ${out} m3/s of ${q}, sections ${a} ${b} ${d}");
+    c.that("river outflow equals inflow (${out})", out > 0.95 * 3.0 && out < 1.05 * 3.0);
+    c.that(
+        "every cross-section carries the inflow (${a} ${b} ${d})",
+        a > 2.7 && a < 3.3 && b > 2.7 && b < 3.3 && d > 2.7 && d < 3.3
+    );
+    let l : f64 = w.ledger().residual();
+    println("  measured river velocity readout: sections ${va} ${vb} ${vd} m3/s of ${q}");
+    c.that(
+        "the velocity readout agrees with the flow meter (${va} ${vb} ${vd})",
+        va > 2.7 && va < 3.3 && vb > 2.7 && vb < 3.3 && vd > 2.7 && vd < 3.3
+    );
+    c.that("river books close (${l})", l < 0.05 && -l < 0.05);
+    c.that("water persists far downstream", w.depthOfCell(70, hydroCentre(70) as i32) > 0.0);
+    w.close();
+}
+
+// The discharge across the column x as the velocity readout sees it: sum of velocity times depth over the rows.
+fn hydroVelocitySection(w : HydroWorld, x : i32) : f64 {
+    let mut sum : f64 = 0.0;
+    for (z of 0..40) {
+        let v : Vec2 = w.surfaceVelocityAt(
+            ((x as f32) + (0.5 as f32)),
+            ((z as f32) + (0.5 as f32))
+        );
+        sum = sum + ((v.x * w.depthOfCell(x, z)) as f64);
+    }
+    return sum;
+}
