@@ -1,0 +1,186 @@
+// world — the whole state of one run.
+//
+// `World` owns every container the simulation needs and nothing that draws. What happens in a tick is in
+// `sim.axle` and the system files beside it, which take the world. This file therefore holds only data, and
+// must not import those systems: Axle 0.18.3 fails to resolve generic fields across an import cycle. All
+// randomness comes from three `Pcg32` streams of one seed (map, waves, effects), so the effects can draw as
+// many numbers as they like without moving the waves, and a seed always replays the same run.
+
+use ludax::{Slab, SparseSet, Map, Vec, BitSet, IdAllocator, EntityId, Pcg32};
+
+use crate::audio::cues::Cue;
+use crate::sim::config::{START_GOLD, START_LIVES, FIRST_WAVE_DELAY};
+use crate::sim::grid::Grid;
+use crate::sim::mapgen::scatterRocks;
+use crate::sim::pathing::RouteBook;
+use crate::sim::units::{Enemy, Tower, Shot, Slow, Fx, FxSpawn};
+use crate::sim::waves::composeWave;
+
+/** The three random streams of a seed: the map's rocks, the waves' composition and pace, the effects' scatter. */
+const WORLD_MAP_STREAM : u64 = 1;
+const WORLD_WAVE_STREAM : u64 = 2;
+const WORLD_FX_STREAM : u64 = 3;
+
+/** One run of the game, from the first tick to the last. */
+pub class World {
+    /** The seed this run was made from. */
+    pub(crate) seed : u64;
+
+    /** The tile map. */
+    pub(crate) grid : Grid;
+
+    /** Next-step answers for walking enemies. */
+    pub(crate) routes : RouteBook;
+
+    /** Every living enemy. */
+    pub(crate) enemies : Slab<Enemy>;
+
+    /** Every tower. */
+    pub(crate) towers : Slab<Tower>;
+
+    /** Tile number to the bits of the id of the tower standing on it. */
+    pub(crate) towerAt : Map<i32, i64>;
+
+    /** Slow effects, keyed by the slot of the enemy they affect. */
+    pub(crate) slows : SparseSet<Slow>;
+
+    /** Hands out keys for shots. */
+    pub(crate) shotIds : IdAllocator;
+
+    /** Projectiles in flight, keyed by their id's index. */
+    pub(crate) shots : SparseSet<Shot>;
+
+    /** Hands out keys for effects. */
+    pub(crate) fxIds : IdAllocator;
+
+    /** Visual effects, keyed by their id's index. */
+    pub(crate) fx : SparseSet<Fx>;
+
+    /** Gold in the purse. */
+    pub(crate) gold : i32 = START_GOLD;
+
+    /** Lives left; the run ends at 0. */
+    pub(crate) lives : i32 = START_LIVES;
+
+    /** Score so far. */
+    pub(crate) score : i32 = 0;
+
+    /** Enemies killed. */
+    pub(crate) kills : i32 = 0;
+
+    /** The number of the wave last started (0 before the first). */
+    pub(crate) wave : i32 = 0;
+
+    /** Ticks simulated. */
+    pub(crate) tick : i32 = 0;
+
+    /** Ticks until the next wave starts; counts only while no wave is spawning. */
+    pub(crate) countdown : i32 = FIRST_WAVE_DELAY;
+
+    /** True while the current wave still has enemies to release. */
+    pub(crate) spawning : bool = false;
+
+    /** True from a wave's start until its last enemy is gone. */
+    pub(crate) clearPending : bool = false;
+
+    /** The enemy kinds of the wave being released, in order. */
+    pub(crate) plan : Vec<i32>;
+
+    /** Where in `plan` the next spawn comes from. */
+    pub(crate) planCursor : i32 = 0;
+
+    /** The composition of the wave after this one, drawn early for the preview. */
+    pub(crate) upcoming : Vec<i32>;
+
+    /** Ticks until the next enemy of the plan appears. */
+    pub(crate) spawnTimer : i32 = 0;
+
+    /** True once the base has fallen. */
+    pub(crate) lost : bool = false;
+
+    /** Draws the map. */
+    pub(crate) mapRng : Pcg32;
+
+    /** Draws the waves. */
+    pub(crate) waveRng : Pcg32;
+
+    /** Draws the effects' scatter. */
+    pub(crate) fxRng : Pcg32;
+
+    /** Cues raised since the caller last drained them. */
+    pub(crate) cues : Vec<i32>;
+
+    /** Scratch list of ids to remove after a loop, as id bits. */
+    pub(crate) doomed : Vec<i64>;
+
+    /** Scratch list of shot or effect keys to remove after a loop. */
+    pub(crate) doomedKeys : Vec<i32>;
+
+    /** Scratch set for the build check's reachability fill. */
+    pub(crate) reached : BitSet;
+
+    /** A fresh run for `seed`: rocks scattered, the first wave composed, nothing built. */
+    constructor(seed : u64) {
+        self.seed = seed;
+        self.grid = new Grid();
+        self.routes = new RouteBook();
+        self.enemies = new Slab<Enemy>();
+        self.towers = new Slab<Tower>();
+        self.towerAt = new Map<i32, i64>();
+        self.slows = new SparseSet<Slow>();
+        self.shotIds = new IdAllocator();
+        self.shots = new SparseSet<Shot>();
+        self.fxIds = new IdAllocator();
+        self.fx = new SparseSet<Fx>();
+        self.plan = new Vec<i32>();
+        self.upcoming = new Vec<i32>();
+        self.mapRng = new Pcg32(seed, WORLD_MAP_STREAM);
+        self.waveRng = new Pcg32(seed, WORLD_WAVE_STREAM);
+        self.fxRng = new Pcg32(seed, WORLD_FX_STREAM);
+        self.cues = new Vec<i32>();
+        self.doomed = new Vec<i64>();
+        self.doomedKeys = new Vec<i32>();
+        self.reached = new BitSet(Grid::tileCount());
+        scatterRocks(self.grid, self.mapRng, self.routes.finder());
+        composeWave(1, self.waveRng, self.upcoming);
+    }
+
+    /** Notes that `cue` happened. */
+    pub fn raise(mut self, cue : Cue) : void {
+        self.cues.push(cue as i32);
+    }
+
+    /** Starts an effect; effects are never referred to again. */
+    pub fn spawnFx(mut self, request : FxSpawn) : void {
+        let id : EntityId = self.fxIds.create();
+        self.fx.insert(id.index, Fx {
+            kind: request.kind,
+            pos: request.pos,
+            vel: request.vel,
+            life: request.life,
+            span: request.life,
+            value: request.value,
+        });
+    }
+
+    /** The id of the tower on tile `t`, or the none id. */
+    pub fn towerOn(self, t : i32) : EntityId {
+        return EntityId::fromBits(self.towerAt.getOr(t, EntityId::none().bits()));
+    }
+
+    /** How many enemies of the kind numbered `kind` the coming wave holds. */
+    pub fn upcomingOf(self, kind : i32) : i32 {
+        let mut n : i32 = 0;
+        for (i of 0..self.upcoming.len()) {
+            if (self.upcoming.get(i) == kind) {
+                n = n + 1;
+            }
+        }
+        return n;
+    }
+
+    /** The number of living enemies. */
+    pub fn enemyCount(self) : i32 {
+        return self.enemies.len();
+    }
+}

@@ -1,0 +1,593 @@
+// checks — the game's own self-tests, run with `--check`.
+//
+// Each group states a rule the game depends on and tries to break it: A* against an independent shortest-path
+// computation, the rule that the route can never be closed, mouse picking against projection, frustum
+// culling, the same-seed-same-checksum determinism, wave composition, ids that go stale, the economy and the
+// synthesised sound. The program exits with the number of failures, so 0 is a pass.
+
+use ludax::{Checks, Pcg32, Vec, Vec3, BitSet, EntityId};
+use smalt::Clip;
+
+use crate::app::actions::refreshHover;
+use crate::app::game::Game;
+use crate::audio::cues::Cue;
+use crate::audio::sound::loadClip;
+use crate::gfx::sky::{skyAt, SKY_START_DIVISOR};
+use crate::gfx::view::{ScreenPoint, View};
+use crate::sim::checksum::checksum;
+use crate::sim::commands::{Verdict, buildTower, upgradeTower, sellTower, checkBuild};
+use crate::sim::config::{GRID_W, GRID_H, MAX_LEVEL, SELL_PERCENT, START_GOLD, MAX_WAVE_SIZE, DAY_TICKS};
+use crate::sim::grid::Grid;
+use crate::sim::intmath::intAbs;
+use crate::sim::pathing::Pathfinder;
+use crate::sim::sim::stepWorld;
+use crate::sim::stats::{TowerKind, EnemyKind, enemyStats, towerStats};
+use crate::sim::units::Enemy;
+use crate::sim::waves::{composeWave, waveBudget};
+use crate::sim::world::World;
+use crate::ui::layout::BUILD_SLOTS;
+
+/**
+ * Cost of one straight step in the reference.
+ *
+ * Stated here rather than imported from `pathing.axle`: the reference route must be independent of the code it
+ * checks, or the check would agree with a bug in both.
+ */
+const CHECK_STEP_STRAIGHT : i32 = 10;
+
+/** Cost of one diagonal step in the reference. */
+const CHECK_STEP_DIAGONAL : i32 = 14;
+
+/** Distance standing for "unreachable" in the reference. */
+const CHECK_UNREACHED : i32 = 1000000;
+
+/** Share of tiles turned to rock in the random maps the path check draws. */
+const CHECK_ROCK_PERCENT : i32 = 28;
+
+/** Tiles the picking check demands before it trusts its sample. */
+const CHECK_MIN_PICKED : i32 = 600;
+
+/** Slack over the wave budget allowed for composition rounding. */
+const CHECK_BUDGET_SLACK : i32 = 60;
+
+/** Share of the board, in tenths, the default view must see. */
+const CHECK_VISIBLE_TENTHS : i32 = 8;
+
+/** First row the test picker draws buildable tiles from. */
+const CHECK_FREE_ROW_MIN : i32 = 4;
+
+/** One past the last row the test picker draws buildable tiles from. */
+const CHECK_FREE_ROW_MAX : i32 = 11;
+
+/** Tiles the test picker tries before it falls back to a fixed corner. */
+const CHECK_FREE_TRIES : i32 = 100;
+
+/** Column in which the route check builds its wall. */
+const CHECK_WALL_COLUMN : i32 = 10;
+
+/** A row that is not the lane's, for placing an enemy off the beaten track in a test. */
+const LANE_TEST_ROW : i32 = 4;
+
+/** The path check draws this many random maps from this seed and stream, and wants more than `CHECK_MIN_ROUTES` routes. */
+const CHECK_PATH_TRIALS : i32 = 24;
+const CHECK_PATH_SEED : u64 = 99;
+const CHECK_PATH_STREAM : u64 = 5;
+const CHECK_MIN_ROUTES : i32 = 5;
+
+/** A purse too large to run dry while a wall is built. */
+const CHECK_RICH : i32 = 100000;
+
+/** A tile off the wall where an ordinary build must still succeed: column and row. */
+const CHECK_SAFE_COL : i32 = 5;
+const CHECK_SAFE_ROW : i32 = 3;
+
+/** The column beside the spawn where the enemy-in-the-way check stands its enemy. */
+const CHECK_ENEMY_COL : i32 = 1;
+
+/** The picking check looks from this many viewpoints, each turned by `CHECK_PICK_TURN` and pulled back by `CHECK_PICK_BACK`. */
+const CHECK_PICK_VIEWS : i32 = 4;
+const CHECK_PICK_TURN : f32 = 0.9;
+const CHECK_PICK_BACK : f32 = 1.5;
+
+/** The game seed for the view checks, and the seed and stream that choose their free tile. */
+const CHECK_VIEW_SEED : u64 = 3;
+const CHECK_PICK_STREAM : u64 = 3;
+
+/** Gold that lets the picking and economy checks build whatever they like. */
+const CHECK_GOLD : i32 = 1000;
+
+/** The height at which the pick check aims at a tower: about the middle of its body. */
+const CHECK_TOWER_BODY : f32 = 0.5;
+
+/** The half extents of the box that stands for a tile in the culling count, of a point-sized probe, and of a body. */
+const CHECK_TILE_HALF : f32 = 0.5;
+const CHECK_TILE_THIN : f32 = 0.05;
+const CHECK_PROBE_HALF : f32 = 0.1;
+const CHECK_BODY_HALF : f32 = 1.0;
+
+/** The culling check puts a box this far behind and above the eye, and another this far to the side. */
+const CHECK_BEHIND_UP : f32 = 30.0;
+const CHECK_BEHIND_BACK : f32 = 40.0;
+const CHECK_SIDE : f32 = 300.0;
+
+/** Zooming in by this much must cull at least half the tiles. */
+const CHECK_ZOOM_IN : f32 = -14.0;
+
+/** The scripted run builds a tower every `CHECK_BUILD_EVERY` ticks, at tick `CHECK_BUILD_AT` of each period, from its own stream. */
+const CHECK_BUILD_EVERY : i32 = 400;
+const CHECK_BUILD_AT : i32 = 100;
+const CHECK_SPOT_STREAM : u64 = 8;
+
+/** The determinism check: two seeds, how long a run goes, and a short run that must differ from it. */
+const CHECK_SEED_A : u64 = 11;
+const CHECK_SEED_B : u64 = 12;
+const CHECK_RUN_TICKS : i32 = 5000;
+const CHECK_SHORT_TICKS : i32 = 100;
+
+/** The wave check composes waves 1 to `CHECK_WAVES` from this seed and stream, and expects a boss every `CHECK_BOSS_EVERY`. */
+const CHECK_WAVE_SEED : u64 = 5;
+const CHECK_WAVE_STREAM : u64 = 2;
+const CHECK_WAVES : i32 = 30;
+const CHECK_BOSS_EVERY : i32 = 5;
+
+/** The economy check's tile: column and row. */
+const CHECK_SHOP_COL : i32 = 6;
+const CHECK_SHOP_ROW : i32 = 3;
+
+/** The sky check: how high the night factor must read at midnight, and how low at noon. */
+const CHECK_NIGHT_HIGH : f32 = 0.9;
+const CHECK_NIGHT_LOW : f32 = 0.1;
+
+/** A sound clip must decode to more than this many frames to count as loaded. */
+const CHECK_MIN_FRAMES : i32 = 1000;
+
+// The cost of walking `path`: straight steps and diagonal steps.
+fn costOf(path : Vec<i32>) : i32 {
+    let mut total : i32 = 0;
+    for (i of 1..path.len()) {
+        let dx : i32 = Grid::colOf(path.get(i)) - Grid::colOf(path.get(i - 1));
+        let dz : i32 = Grid::rowOf(path.get(i)) - Grid::rowOf(path.get(i - 1));
+        if (dx != 0 && dz != 0) {
+            total = total + CHECK_STEP_DIAGONAL;
+        } else {
+            total = total + CHECK_STEP_STRAIGHT;
+        }
+    }
+    return total;
+}
+
+// Adjacent tiles only, none blocked, no diagonal past a blocked corner, from `from` to `to`.
+fn stepsAreLegal(blocked : BitSet, path : Vec<i32>, from : i32, to : i32) : bool {
+    if (path.get(0) != from || path.get(path.len() - 1) != to) {
+        return false;
+    }
+    for (i of 1..path.len()) {
+        let ax : i32 = Grid::colOf(path.get(i - 1));
+        let az : i32 = Grid::rowOf(path.get(i - 1));
+        let bx : i32 = Grid::colOf(path.get(i));
+        let bz : i32 = Grid::rowOf(path.get(i));
+        if (intAbs(bx - ax) > 1 || intAbs(bz - az) > 1 || blocked.has(path.get(i))) {
+            return false;
+        }
+        let isDiagonal : bool = bx != ax && bz != az;
+        let cutsCorner : bool = blocked.has(Grid::index(bx, az)) || blocked.has(Grid::index(ax, bz));
+        if (isDiagonal && cutsCorner) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Tries the step (`dx`, `dz`) from tile `t`; true when it improved a tile.
+fn relax(blocked : BitSet, best : i32[], t : i32, dx : i32, dz : i32) : bool {
+    if (dx == 0 && dz == 0) {
+        return false;
+    }
+    let x : i32 = Grid::colOf(t) + dx;
+    let z : i32 = Grid::rowOf(t) + dz;
+    if (!Grid::inside(x, z) || blocked.has(Grid::index(x, z))) {
+        return false;
+    }
+    let mut step : i32 = CHECK_STEP_STRAIGHT;
+    if (dx != 0 && dz != 0) {
+        step = CHECK_STEP_DIAGONAL;
+        if (blocked.has(Grid::index(Grid::colOf(t) + dx, Grid::rowOf(t)))
+            || blocked.has(Grid::index(Grid::colOf(t), Grid::rowOf(t) + dz))) {
+            return false;
+        }
+    }
+    let next : i32 = Grid::index(x, z);
+    if (best[t] + step < best[next]) {
+        best[next] = best[t] + step;
+        return true;
+    }
+    return false;
+}
+
+// Shortest cost by repeated relaxation (Bellman-Ford) over the same movement rules; -1 when unreachable.
+fn referenceCost(blocked : BitSet, from : i32, to : i32) : i32 {
+    let n : i32 = Grid::tileCount();
+    let mut best : i32[] = new i32[n as i64];
+    for (t of 0..n) {
+        best[t] = CHECK_UNREACHED;
+    }
+    best[from] = 0;
+    let mut changed : bool = true;
+    while (changed) {
+        changed = false;
+        for (t of 0..n) {
+            if (best[t] >= CHECK_UNREACHED) {
+                continue;
+            }
+            for (dz of -1..=1) {
+                for (dx of -1..=1) {
+                    changed = relax(blocked, best, t, dx, dz) || changed;
+                }
+            }
+        }
+    }
+    if (best[to] >= CHECK_UNREACHED) {
+        return -1;
+    }
+    return best[to];
+}
+
+// True when `route` passes through `tile`.
+fn routeVisits(route : Vec<i32>, tile : i32) : bool {
+    for (i of 0..route.len()) {
+        if (route.get(i) == tile) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// An enemy standing on a tile makes `checkBuild` answer EnemyInWay.
+fn enemyBlocks(w : World, tile : i32) : bool {
+    w.enemies.insert(Enemy::newborn(EnemyKind::Grunt, tile, Grid::centerOf(tile), 10));
+    return checkBuild(w, TowerKind::Arrow, tile) == Verdict::EnemyInWay;
+}
+
+// A random buildable tile near the lane.
+fn pickFreeTile(w : World, rng : Pcg32) : i32 {
+    for (attempt of 0..CHECK_FREE_TRIES) {
+        let t : i32 = Grid::index(
+            rng.range(2, GRID_W - 2),
+            rng.range(CHECK_FREE_ROW_MIN, CHECK_FREE_ROW_MAX)
+        );
+        if (w.grid.isBuildable(t)) {
+            return t;
+        }
+    }
+    return Grid::index(3, 3);
+}
+
+// Builds a few towers at fixed ticks and runs `ticks` ticks; returns the final checksum.
+fn scriptedRun(seed : u64, ticks : i32) : i64 {
+    let w = new World(seed);
+    let spots = new Pcg32(seed, CHECK_SPOT_STREAM);
+    for (tick of 0..ticks) {
+        if (tick % CHECK_BUILD_EVERY == CHECK_BUILD_AT) {
+            let slot : i32 = (tick / CHECK_BUILD_EVERY) % BUILD_SLOTS;
+            buildTower(w, TowerKind::fromSlot(slot), pickFreeTile(w, spots));
+        }
+        stepWorld(w);
+    }
+    return checksum(w);
+}
+
+fn sameList(a : Vec<i32>, b : Vec<i32>) : bool {
+    if (a.len() != b.len()) {
+        return false;
+    }
+    for (i of 0..a.len()) {
+        if (a.get(i) != b.get(i)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn onlyKind(a : Vec<i32>, kind : EnemyKind) : bool {
+    for (i of 0..a.len()) {
+        if (a.get(i) != kind as i32) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// A* finds routes that are valid steps and as cheap as an independent relaxation over the same rules.
+fn checkPathfinding(c : Checks) : void {
+    let finder = new Pathfinder();
+    let path = new Vec<i32>();
+    let rng = new Pcg32(CHECK_PATH_SEED, CHECK_PATH_STREAM);
+    let mut optimal : i32 = 0;
+    let mut valid : i32 = 0;
+    let mut found : i32 = 0;
+    for (trial of 0..CHECK_PATH_TRIALS) {
+        let grid = new Grid();
+        for (t of 0..Grid::tileCount()) {
+            if (rng.range(0, 100) < CHECK_ROCK_PERCENT) {
+                grid.placeRock(t);
+            }
+        }
+        let from : i32 = rng.range(0, Grid::tileCount());
+        let to : i32 = rng.range(0, Grid::tileCount());
+        let reference : i32 = referenceCost(grid.blockedSet(), from, to);
+        let ok : bool = finder.find(grid.blockedSet(), from, to, path);
+        c.that("A* agrees with the reference on whether a route exists", ok == (reference >= 0));
+        if (ok) {
+            found = found + 1;
+            if (stepsAreLegal(grid.blockedSet(), path, from, to)) {
+                valid = valid + 1;
+            }
+            if (costOf(path) == reference) {
+                optimal = optimal + 1;
+            }
+        }
+    }
+    c.that("some random maps have routes", found > CHECK_MIN_ROUTES);
+    c.sameInt("every found route has legal steps", valid, found);
+    c.sameInt("every found route is as cheap as the reference", optimal, found);
+}
+
+// A wall across the map with one gap: closing the gap is refused, and nothing changes.
+fn checkRouteStaysOpen(c : Checks) : void {
+    let mut w = new World(1);
+    w.grid.clearRocks();
+    w.gold = CHECK_RICH;
+    let gapRow : i32 = GRID_H - 1;
+    for (z of 0..gapRow) {
+        c.that(
+            "wall tile builds",
+            buildTower(w, TowerKind::Arrow, Grid::index(CHECK_WALL_COLUMN, z)) == Verdict::Done
+        );
+    }
+    let gap : i32 = Grid::index(CHECK_WALL_COLUMN, gapRow);
+    c.that("the last gap is refused", checkBuild(w, TowerKind::Arrow, gap) == Verdict::CutsRoute);
+    let towers : i32 = w.towers.len();
+    let gold : i32 = w.gold;
+    c.that("building in the gap fails", buildTower(w, TowerKind::Arrow, gap) == Verdict::CutsRoute);
+    c.sameInt("a refused build leaves the towers alone", w.towers.len(), towers);
+    c.sameInt("a refused build leaves the gold alone", w.gold, gold);
+    c.that(
+        "the map still has a route",
+        w.routes.finder().canReach(w.grid.blockedSet(), Grid::spawnTile(), Grid::goalTile())
+    );
+    c.that("the tile is not left blocked by the check", !w.grid.isBlocked(gap));
+    let t : i32 = Grid::index(CHECK_SAFE_COL, CHECK_SAFE_ROW);
+    c.that("a harmless tile still builds", buildTower(w, TowerKind::Cannon, t) == Verdict::Done);
+    let steps = new Vec<i32>();
+    c.that(
+        "routes go around the wall",
+        w.routes.finder().find(w.grid.blockedSet(), Grid::spawnTile(), Grid::goalTile(), steps)
+    );
+    c.that("the detour passes through the gap", routeVisits(steps, gap));
+    let entry : i32 = Grid::spawnTile();
+    c.that(
+        "an enemy on a tile blocks building there",
+        enemyBlocks(w, Grid::index(CHECK_ENEMY_COL, LANE_TEST_ROW))
+    );
+    c.that(
+        "rocks and the keep cannot be built on",
+        !w.grid.isBuildable(Grid::goalTile()) && !w.grid.isBuildable(entry)
+    );
+}
+
+// Projecting a tile's middle to a pixel and picking that pixel returns the same tile, from several angles.
+fn checkPicking(c : Checks) : void {
+    let mut g = new Game(CHECK_VIEW_SEED, true);
+    g.begin();
+    let mut wrong : i32 = 0;
+    let mut tested : i32 = 0;
+    for (angle of 0..CHECK_PICK_VIEWS) {
+        g.rig.orbit(CHECK_PICK_TURN, 0.0);
+        g.rig.zoom(CHECK_PICK_BACK);
+        g.updateView();
+        for (t of 0..Grid::tileCount()) {
+            let at = Grid::centerOf(t);
+            let p : ScreenPoint = g.view.project(at.x, 0.0, at.y);
+            if (!p.visible || p.x < 0 || p.y < 0 || p.x >= g.width || p.y >= g.height) {
+                continue;
+            }
+
+            tested = tested + 1;
+            if (g.view.groundTile(p.x, p.y) != t) {
+                wrong = wrong + 1;
+            }
+        }
+    }
+    c.that("many tiles were tested", tested > CHECK_MIN_PICKED);
+    c.sameInt("every projected tile picks itself", wrong, 0);
+    g.world.gold = CHECK_GOLD;
+    let tile : i32 = pickFreeTile(g.world, new Pcg32(CHECK_VIEW_SEED, CHECK_PICK_STREAM));
+    c.that("the tower builds", buildTower(g.world, TowerKind::Frost, tile) == Verdict::Done);
+    g.updateView();
+    let top = Grid::centerOf(tile);
+    let at : ScreenPoint = g.view.project(top.x, CHECK_TOWER_BODY, top.y);
+    g.ui.mouseX = at.x;
+    g.ui.mouseY = at.y;
+    refreshHover(g);
+    c.that("a click on the tower body picks the tower", !g.ui.hoverTower.isNone());
+    c.sameInt("and reports its tile", g.ui.hoverTile, tile);
+}
+
+// How many ground tiles the frustum of `view` keeps.
+fn visibleTiles(view : View) : i32 {
+    let mut seen : i32 = 0;
+    for (t of 0..Grid::tileCount()) {
+        let at = Grid::centerOf(t);
+        if (view.seesBox(
+            Vec3::make(at.x, 0.0, at.y),
+            Vec3::make(CHECK_TILE_HALF, CHECK_TILE_THIN, CHECK_TILE_HALF)
+        )) {
+            seen = seen + 1;
+        }
+    }
+    return seen;
+}
+
+// The frustum keeps what the camera looks at and drops what is behind it; zooming in culls tiles.
+fn checkCulling(c : Checks) : void {
+    let g = new Game(CHECK_VIEW_SEED, true);
+    g.begin();
+    g.updateView();
+    let target = g.rig.target();
+    c.that(
+        "the point looked at is inside",
+        g.view.seesBox(Vec3::make(target.x, 0.0, target.z), Vec3::splat(CHECK_PROBE_HALF))
+    );
+    let eye = g.rig.eye();
+    c.that(
+        "a box behind the camera is culled",
+        !g.view.seesBox(
+            Vec3::make(eye.x, eye.y + CHECK_BEHIND_UP, eye.z + CHECK_BEHIND_BACK),
+            Vec3::splat(CHECK_BODY_HALF)
+        )
+    );
+    let aside : Vec3 = Vec3::make(target.x + CHECK_SIDE, 0.0, target.z);
+    c.that("a box far off to the side is culled", !g.view.seesBox(aside, Vec3::splat(CHECK_BODY_HALF)));
+    let allSeen : i32 = visibleTiles(g.view);
+
+    g.rig.zoom(CHECK_ZOOM_IN);
+    g.updateView();
+    let closeSeen : i32 = visibleTiles(g.view);
+
+    c.that(
+        "the default view sees most of the board",
+        allSeen > Grid::tileCount() * CHECK_VISIBLE_TENTHS / 10
+    );
+    c.that("zooming in culls tiles", closeSeen < allSeen / 2);
+}
+
+// The same seed and the same commands give the same state; another seed gives another.
+fn checkDeterminism(c : Checks) : void {
+    let a : i64 = scriptedRun(CHECK_SEED_A, CHECK_RUN_TICKS);
+    let b : i64 = scriptedRun(CHECK_SEED_A, CHECK_RUN_TICKS);
+    let other : i64 = scriptedRun(CHECK_SEED_B, CHECK_RUN_TICKS);
+    c.that("the same seed gives the same checksum", a == b);
+    c.that("another seed gives another checksum", a != other);
+    let early : i64 = scriptedRun(CHECK_SEED_A, CHECK_SHORT_TICKS);
+    c.that("the checksum moves as the run goes on", early != a);
+}
+
+// Waves repeat for a seed, stay inside their budget and size, and end with a boss every fifth wave.
+fn checkWaves(c : Checks) : void {
+    let a = new Vec<i32>();
+    let b = new Vec<i32>();
+    let r1 = new Pcg32(CHECK_WAVE_SEED, CHECK_WAVE_STREAM);
+    let r2 = new Pcg32(CHECK_WAVE_SEED, CHECK_WAVE_STREAM);
+    let mut inBudget : bool = true;
+    let mut sized : bool = true;
+    for (wave of 1..=CHECK_WAVES) {
+        composeWave(wave, r1, a);
+        composeWave(wave, r2, b);
+        c.that("a seed composes the same wave twice", sameList(a, b));
+        let mut weight : i32 = 0;
+        for (i of 0..a.len()) {
+            weight = weight + enemyStats(EnemyKind::fromIndex(a.get(i))).weight;
+        }
+        if (weight > waveBudget(wave) + CHECK_BUDGET_SLACK) {
+            inBudget = false;
+        }
+        if (a.len() > MAX_WAVE_SIZE + 1 || a.len() == 0) {
+            sized = false;
+        }
+        if (wave % CHECK_BOSS_EVERY == 0) {
+            c.that("every fifth wave ends with a boss", a.get(a.len() - 1) == EnemyKind::Boss as i32);
+        }
+    }
+    c.that("waves stay inside their budget", inBudget);
+    c.that("waves have a sane size", sized);
+    composeWave(1, new Pcg32(CHECK_WAVE_SEED, CHECK_WAVE_STREAM), a);
+    c.that("wave one is only grunts", onlyKind(a, EnemyKind::Grunt));
+}
+
+// An id kept past its entity's death is stale, and a recycled slot does not revive it.
+fn checkIds(c : Checks) : void {
+    let w = new World(2);
+    let grunt : Enemy = Enemy::newborn(EnemyKind::Grunt, 0, Grid::centerOf(0), 5);
+    let first : EntityId = w.enemies.insert(grunt);
+    c.that("a new enemy is alive", w.enemies.has(first));
+    w.enemies.remove(first);
+    c.that("a removed enemy is stale", !w.enemies.has(first));
+    let brute : Enemy = Enemy::newborn(EnemyKind::Brute, 1, Grid::centerOf(1), 5);
+    let second : EntityId = w.enemies.insert(brute);
+    c.sameInt("the slot is reused", second.index, first.index);
+    let staysStale : bool = !w.enemies.has(first) && w.enemies.has(second);
+    c.that("the old id stays stale beside the new tenant", staysStale);
+}
+
+// Building, upgrading and selling move the right amounts of gold and respect the limits.
+fn checkEconomy(c : Checks) : void {
+    let mut w = new World(4);
+    w.grid.clearRocks();
+    let tile : i32 = Grid::index(CHECK_SHOP_COL, CHECK_SHOP_ROW);
+    let cost : i32 = towerStats(TowerKind::Cannon, 1).cost;
+    c.sameInt("the run starts with its gold", w.gold, START_GOLD);
+    w.gold = cost - 1;
+    c.that("too little gold refuses", buildTower(w, TowerKind::Cannon, tile) == Verdict::NoGold);
+    w.gold = CHECK_GOLD;
+    c.that("with gold it builds", buildTower(w, TowerKind::Cannon, tile) == Verdict::Done);
+    c.sameInt("the price is paid", w.gold, CHECK_GOLD - cost);
+    c.that("the tile is now taken", buildTower(w, TowerKind::Arrow, tile) == Verdict::Occupied);
+    let id : EntityId = w.towerOn(tile);
+    c.that("the tower can be found by its tile", w.towers.has(id));
+    for (step of 1..MAX_LEVEL) {
+        c.that("it upgrades", upgradeTower(w, id) == Verdict::Done);
+    }
+    c.that("the top level refuses more", upgradeTower(w, id) == Verdict::MaxLevel);
+    let invested : i32 = w.towers.get(id).invested;
+    let before : i32 = w.gold;
+    c.that("selling works", sellTower(w, id) == Verdict::Done);
+    c.sameInt(
+        "the refund is the sell share of the investment",
+        w.gold - before,
+        invested * SELL_PERCENT / 100
+    );
+    c.that("the tile is free again", w.grid.isBuildable(tile));
+    c.that("a sold tower cannot be sold twice", sellTower(w, id) == Verdict::NoTower);
+}
+
+// Noon is brighter than midnight, and the night factor follows.
+fn checkSky(c : Checks) : void {
+    let morning : i32 = DAY_TICKS / SKY_START_DIVISOR;
+    let noon = skyAt(DAY_TICKS / 4 - morning);
+    let night = skyAt(DAY_TICKS * 3 / 4 - morning);
+    c.that(
+        "midday is brighter than midnight",
+        noon.ambient > night.ambient && noon.red + noon.green > night.red + night.green
+    );
+    c.that("night is flagged", night.night > CHECK_NIGHT_HIGH && noon.night < CHECK_NIGHT_LOW);
+}
+
+// Every effect is synthesised, survives the trip through a WAV file, and decodes to about its length.
+fn checkSound(c : Checks) : void {
+    let mut loaded : i32 = 0;
+    for (i of 0..Cue::count()) {
+        let clip : Clip = loadClip(Cue::fromIndex(i));
+        if (clip.loaded() && clip.frameCount() > CHECK_MIN_FRAMES) {
+            loaded = loaded + 1;
+        }
+        clip.close();
+    }
+    c.sameInt("every sound effect decodes", loaded, Cue::count());
+}
+
+/** Runs every group of checks and returns the number that failed. */
+pub fn runChecks() : i32 {
+    let c : Checks = new Checks();
+    checkPathfinding(c);
+    checkRouteStaysOpen(c);
+    checkPicking(c);
+    checkCulling(c);
+    checkDeterminism(c);
+    checkWaves(c);
+    checkIds(c);
+    checkEconomy(c);
+    checkSky(c);
+    checkSound(c);
+    println("checks: ${c.count()} run, ${c.failures()} failed");
+    return c.failures();
+}

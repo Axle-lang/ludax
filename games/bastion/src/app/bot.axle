@@ -1,0 +1,302 @@
+// bot — a scripted player for the smoke test.
+//
+// The bot plays through the same door a person does: it builds `Event`s (key presses, pointer moves, clicks)
+// and hands them to `handleEvent`. To click a tile it projects the tile's middle through the current view to
+// a pixel, so every build also exercises the camera, the picking ray and the build rules. Choices come from a
+// `Pcg32` of its own, so a seed gives one fixed game. It also nudges the camera, to check that picking holds
+// from many angles, and records how often a click landed on the wrong tile (which must be never).
+
+use ludax::{Pcg32, Vec};
+use smalt::{Event, EventKind, Scancode, MouseButton};
+
+use crate::app::game::Game;
+use crate::app::input::{handleEvent, applyHeld, Held};
+use crate::gfx::route::RouteOverlay;
+use crate::gfx::view::ScreenPoint;
+use crate::sim::grid::Grid;
+use crate::sim::stats::{TowerKind, towerStats};
+use crate::ui::layout::Layout;
+use crate::ui::state::Screen;
+
+/** Ticks between two decisions of the bot. */
+const THINK_EVERY : i32 = 24;
+
+/** How many tiles either side of the route the bot builds within. */
+const REACH : i32 = 2;
+
+/** Ticks the bot waits on the game-over screen before it plays again. */
+const GRIEF_TICKS : i32 = 90;
+
+/** The bot's random stream, apart from the streams the game itself draws on. */
+const BOT_STREAM : u64 = 7;
+
+/** Each decision rolls a die of this many sides, and the odds below are out of it. */
+const ROLL_SIDES : i32 = 100;
+
+/** It calls the next wave early on a roll under `CALL_CHANCE`, when the field is empty and the countdown is longer than the other. */
+const CALL_CHANCE : i32 = 30;
+const CALL_MIN_COUNTDOWN : i32 = 500;
+
+/** It upgrades on a roll under the first, and sells on a roll under the second once it owns more than `SELL_MIN_TOWERS`. */
+const UPGRADE_BELOW : i32 = 22;
+const SELL_BELOW : i32 = 26;
+const SELL_MIN_TOWERS : i32 = 8;
+
+/** The designs are chosen from this many rolls (arrows take two), shifted by up to `DESIGN_JITTER` from the tower count. */
+const DESIGN_ROLLS : i32 = 4;
+const DESIGN_JITTER : i32 = 2;
+
+/** The camera wobble repeats every `WOBBLE_PERIOD` ticks in four legs: turn, pan, turn back, pan back. */
+const WOBBLE_PERIOD : i32 = 600;
+const WOBBLE_LEG : i32 = 150;
+
+/** How hard the wobble turns and pans the camera, and how long a frame it pretends each tick is, in seconds. */
+const WOBBLE_TURN : f32 = 0.35;
+const WOBBLE_PAN : f32 = 0.4;
+const WOBBLE_FRAME_SECONDS : f32 = 0.016;
+
+/** Where on a tile the bot clicks, as a height above the ground: on the grass, or on a tower's body. */
+const CLICK_GROUND : f32 = 0.0;
+const CLICK_TOWER : f32 = 0.4;
+
+/** A player that works from a seed. */
+pub class Bot {
+    rng        : Pcg32;
+    route      : RouteOverlay;
+    candidates : Vec<i32>;
+    dead       : i32 = 0;
+
+    /** Clicks that built a tower. */
+    pub(crate) builds : i32 = 0;
+
+    /** Build clicks the rules refused. */
+    pub(crate) refused : i32 = 0;
+
+    /** Upgrades paid for. */
+    pub(crate) upgrades : i32 = 0;
+
+    /** Towers sold. */
+    pub(crate) sales : i32 = 0;
+
+    /** Clicks whose tower landed on a different tile than the one aimed at. */
+    pub(crate) misses : i32 = 0;
+
+    /** Waves called early. */
+    pub(crate) calls : i32 = 0;
+
+    /** A bot whose choices are drawn from `seed`. */
+    constructor(seed : u64) {
+        self.rng = new Pcg32(seed, BOT_STREAM);
+        self.route = new RouteOverlay();
+        self.candidates = new Vec<i32>();
+    }
+
+    /** One tick of thinking; does something only every `THINK_EVERY` ticks. */
+    pub fn act(mut self, g : Game) : void {
+        self.steerCamera(g);
+        if (g.screen == Screen::Playing && g.world.tick % THINK_EVERY != 0) {
+            return;
+        }
+        match g.screen {
+            Screen::Title => press(g, Scancode::Return),
+            Screen::GameOver => {
+                self.dead = self.dead + THINK_EVERY;
+                if (self.dead >= GRIEF_TICKS) {
+                    self.dead = 0;
+                    press(g, Scancode::Return);
+                }
+            },
+            Screen::Playing => self.play(g),
+            Screen::Paused => {},
+        }
+    }
+
+    // A slow wobble of the camera, so clicks are made from many viewpoints.
+    fn steerCamera(self, g : Game) : void {
+        if (g.screen != Screen::Playing) {
+            return;
+        }
+        let leg : i32 = g.world.tick % WOBBLE_PERIOD / WOBBLE_LEG;
+        let mut held : Held = Held::none();
+        match leg {
+            0 => {
+                held.turn = WOBBLE_TURN;
+            },
+            1 => {
+                held.right = WOBBLE_PAN;
+            },
+            2 => {
+                held.turn = -WOBBLE_TURN;
+            },
+            _ => {
+                held.right = -WOBBLE_PAN;
+            },
+        }
+        applyHeld(g, held, WOBBLE_FRAME_SECONDS);
+    }
+
+    // The decision: sell the odd tower, upgrade when rich, otherwise build, and call waves when idle.
+    fn play(mut self, g : Game) : void {
+        g.updateView();
+        self.route.refresh(g.world);
+        let roll : i32 = self.rng.range(0, ROLL_SIDES);
+        let idle : bool = g.world.enemies.len() == 0 && g.world.countdown > CALL_MIN_COUNTDOWN;
+        if (idle && roll < CALL_CHANCE) {
+            press(g, Scancode::Space);
+            self.calls = self.calls + 1;
+            return;
+        }
+        if (roll < UPGRADE_BELOW && g.world.towers.len() > 0) {
+            self.upgradeOne(g);
+            return;
+        }
+        if (roll < SELL_BELOW && g.world.towers.len() > SELL_MIN_TOWERS) {
+            self.sellOne(g);
+            return;
+        }
+        self.buildOne(g);
+    }
+
+    // Chooses a design and a tile beside the route, and clicks it.
+    fn buildOne(mut self, g : Game) : void {
+        // Four rolls over three designs: arrows twice, frost and cannon once each.
+        let slot : i32 = (g.world.towers.len() + self.rng.range(0, DESIGN_JITTER)) % DESIGN_ROLLS;
+        let kind : TowerKind = match slot {
+            2 => TowerKind::Frost,
+            3 => TowerKind::Cannon,
+            _ => TowerKind::Arrow,
+        };
+
+        if (g.world.gold < towerStats(kind, 1).cost) {
+            return;
+        }
+
+        self.listCandidates(g);
+        if (self.candidates.isEmpty()) {
+            return;
+        }
+        let tile : i32 = self.candidates.get(self.rng.range(0, self.candidates.len()));
+
+        dropChoice(g);
+        press(g, keyFor(kind));
+
+        let before : i32 = g.world.towers.len();
+        let aimed : bool = self.click(g, tile, CLICK_GROUND);
+        if (!aimed) {
+            return;
+        }
+
+        if (g.world.towers.len() <= before) {
+            self.refused = self.refused + 1;
+            return;
+        }
+
+        self.builds = self.builds + 1;
+        if (!g.world.towerOn(tile).isNone()) {
+            return;
+        }
+        self.misses = self.misses + 1;
+    }
+
+    // Free tiles within `REACH` of the route.
+    fn listCandidates(mut self, g : Game) : void {
+        self.candidates.clear();
+        for (t of 0..Grid::tileCount()) {
+            if (g.world.grid.isBuildable(t) && self.nearRoute(t)) {
+                self.candidates.push(t);
+            }
+        }
+    }
+
+    fn nearRoute(self, t : i32) : bool {
+        let x : i32 = Grid::colOf(t);
+        let z : i32 = Grid::rowOf(t);
+        for (dz of -REACH..=REACH) {
+            for (dx of -REACH..=REACH) {
+                if (!Grid::inside(x + dx, z + dz)) {
+                    continue;
+                }
+                if (self.route.covers(Grid::index(x + dx, z + dz))) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    // Clicks a tower and presses U.
+    fn upgradeOne(mut self, g : Game) : void {
+        let pick : i32 = self.rng.range(0, g.world.towers.slotCount());
+        if (!g.world.towers.isLiveAt(pick)) {
+            return;
+        }
+        let tile : i32 = g.world.towers.valueAt(pick).tile;
+        dropChoice(g);
+        if (self.click(g, tile, CLICK_TOWER)) {
+            let before : i32 = g.world.towers.valueAt(pick).level;
+            press(g, Scancode::U);
+            if (g.world.towers.isLiveAt(pick) && g.world.towers.valueAt(pick).level > before) {
+                self.upgrades = self.upgrades + 1;
+            }
+        }
+    }
+
+    // Clicks a tower and presses X.
+    fn sellOne(mut self, g : Game) : void {
+        let pick : i32 = self.rng.range(0, g.world.towers.slotCount());
+        if (!g.world.towers.isLiveAt(pick)) {
+            return;
+        }
+        let tile : i32 = g.world.towers.valueAt(pick).tile;
+        dropChoice(g);
+        if (self.click(g, tile, CLICK_TOWER)) {
+            press(g, Scancode::X);
+            self.sales = self.sales + 1;
+        }
+    }
+
+    // Moves the pointer to the pixel where tile `t` (at `height` above the ground) appears and clicks there.
+    // False when that pixel is off the map view (behind a bar or off screen), in which case nothing is sent.
+    fn click(self, g : Game, t : i32, height : f32) : bool {
+        let c = Grid::centerOf(t);
+        let at : ScreenPoint = g.view.project(c.x, height, c.y);
+        let lay : Layout = Layout::forWindow(g.width, g.height);
+        let inside : bool = at.visible && at.x > 0 && at.y > 0 && at.x < g.width && at.y < g.height;
+        if (!inside || lay.coversBars(at.x, at.y) || lay.card.contains(at.x, at.y)) {
+            return false;
+        }
+
+        let motion : Event = Event { kind: EventKind::MouseMotion, timestamp: 0, x: at.x, y: at.y };
+        let down : Event = Event {
+            kind: EventKind::MouseButtonDown,
+            timestamp: 0,
+            button: MouseButton::Left,
+            x: at.x,
+            y: at.y,
+        };
+        handleEvent(g, motion);
+        handleEvent(g, down);
+        return true;
+    }
+}
+
+// The number key that chooses `kind` for building.
+fn keyFor(kind : TowerKind) : Scancode {
+    return match kind {
+        TowerKind::Cannon => Scancode::Num2,
+        TowerKind::Frost => Scancode::Num3,
+        TowerKind::Arrow => Scancode::Num1,
+    };
+}
+
+// Cancels a build choice or a selection the way a player would (Escape twice would pause, so ask first).
+fn dropChoice(g : Game) : void {
+    if (g.ui.building || !g.ui.selected.isNone()) {
+        press(g, Scancode::Escape);
+    }
+}
+
+// A key press, delivered as the window would deliver it.
+fn press(g : Game, key : Scancode) : void {
+    handleEvent(g, Event { kind: EventKind::KeyDown, timestamp: 0, scancode: key });
+}

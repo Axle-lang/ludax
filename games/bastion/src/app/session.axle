@@ -1,0 +1,207 @@
+// session — the interactive program: window, clocks, input, the simulation, sound and the picture.
+//
+// One iteration of the loop is one displayed frame. The pacer measures how long the last frame took; that
+// time goes into ludax's `FixedStep`, which hands back as many 60 Hz simulation ticks as are owed, so the
+// game plays the same at any frame rate. Events are drained first so the held-key state the camera reads is
+// this frame's. The loop is wrapped in profiler scopes that the F3 overlay lists.
+
+use ludax::secondsToNanos;
+use smalt::{
+    Platform, PlatformError, WindowDesc, Window, Clock, FramePacer, Events, Event, EventKind, Scancode, Bmp,
+    mixerLoop
+};
+
+use crate::app::actions::refreshHover;
+use crate::app::args::Args;
+use crate::app::bot::Bot;
+use crate::app::game::Game;
+use crate::app::input::{handleEvent, readHeld, applyHeld};
+use crate::app::probe::NANOS_PER_MICRO;
+use crate::audio::cues::Cue;
+use crate::audio::sound::Sfx;
+use crate::gfx::frame::drawFrame;
+use crate::gfx::renderer::Renderer;
+use crate::sim::config::{VIEW_W, VIEW_H, FRAME_RATE};
+use crate::ui::pen::Pen;
+use crate::ui::state::Screen;
+
+/** Slowest frame the simulation will be fed: a long stall does not become a burst of ticks. */
+const MAX_FRAME_SECONDS : f64 = 0.1;
+
+/** Smallest window side, in pixels, the framebuffer follows; a smaller resize event is ignored. */
+const MIN_WINDOW_SIDE : i32 = 64;
+
+/** The board turns behind the title at this many radians per second (double, as it is scaled by the frame time). */
+const TITLE_ORBIT_SPEED : f64 = 0.2;
+
+/** How loud each effect plays, 0 to 1, so the constant shooting stays under the rare big events. */
+const GAIN_ARROW : f64 = 0.22;
+const GAIN_FROST : f64 = 0.2;
+const GAIN_CANNON : f64 = 0.45;
+const GAIN_EXPLODE : f64 = 0.55;
+const GAIN_KILL : f64 = 0.3;
+const GAIN_GAME_OVER : f64 = 0.8;
+const GAIN_DEFAULT : f64 = 0.6;
+
+/** Opens the window and plays until the player quits (or `--frames` runs out); returns the exit code. */
+pub fn runWindowed(args : Args) : i32 ! PlatformError {
+    let platform = new Platform();
+    defer platform.close();
+    let win = platform.open(WindowDesc { title: "Bastion", w: VIEW_W, h: VIEW_H, resizable: true });
+    defer win.close();
+    let clock = new Clock();
+    defer clock.close();
+    let events = new Events();
+    defer events.close();
+    let renderer = new Renderer(VIEW_W, VIEW_H, args.seed);
+    defer renderer.close();
+    let pen = new Pen(renderer.frame());
+    defer pen.close();
+    let sfx = new Sfx();
+    defer sfx.close();
+    let audio : Future<i32> = spawn mixerLoop(sfx.mixerHandle());
+
+    let mut game = new Game(args.seed, args.seedGiven);
+    game.ui.showDebug = args.debugOverlay;
+    game.probe.profiler.setEnabled(args.debugOverlay);
+    let bot = new Bot(args.seed);
+    let pacer = new FramePacer(FRAME_RATE);
+    let mut running = true;
+    let mut served : i32 = game.runSerial;
+    while (running && win.isOpen()) {
+        let dt : f64 = pacer.tick(clock).min(MAX_FRAME_SECONDS);
+        game.frames = game.frames + 1;
+        game.probe.profiler.beginFrame();
+
+        let inputToken : i32 = game.probe.profiler.begin(game.probe.input);
+        if (!drainEvents(win, clock, events, game, renderer)) {
+            running = false;
+        }
+        if (args.autoplay) {
+            bot.act(game);
+        }
+        applyHeld(game, readHeld(events), dt as f32);
+        if (game.screen == Screen::Title) {
+            game.rig.orbit(TITLE_ORBIT_SPEED * dt as f32, 0.0);
+        }
+        game.probe.profiler.end(inputToken);
+
+        game.advance(secondsToNanos(dt));
+        playCues(game, sfx);
+        if (game.runSerial != served) {
+            served = game.runSerial;
+            renderer.newRun(game.world.seed);
+        }
+
+        game.ui.ageToast();
+        game.updateView();
+        refreshHover(game);
+        presentFrame(win, renderer, pen, game, pacer);
+        game.probe.profiler.endFrame();
+
+        if (args.maxFrames > 0 && game.frames >= args.maxFrames) {
+            running = false;
+        }
+    }
+
+    if (args.debugOverlay) {
+        printProfile(game);
+    }
+
+    sfx.stopPump();
+    await audio;
+    return 0;
+}
+
+// Drains every event the platform has: resize and screenshot are handled here, the rest by `handleEvent`.
+// False when the player asked to quit.
+fn drainEvents(win : Window, clock : Clock, events : Events, game : Game, renderer : Renderer) : bool {
+    events.pump(win, clock);
+    let mut keepGoing : bool = true;
+    while (events.hasNext()) {
+        let e : Event = events.next();
+        let wantsShot : bool = e.kind == EventKind::KeyDown && e.scancode == Scancode::F12 && !e.repeat;
+        if (e.kind == EventKind::WindowResized) {
+            resize(game, renderer, e.width, e.height);
+        } else if (wantsShot) {
+            Bmp::write("bastion.bmp", renderer.frame());
+            game.ui.say("Saved bastion.bmp", false);
+        }
+
+        if (!handleEvent(game, e)) {
+            keepGoing = false;
+        }
+    }
+    return keepGoing;
+}
+
+// Draws the frame unless the window is minimised, then hands it to the window.
+fn presentFrame(win : Window, renderer : Renderer, pen : Pen, game : Game, pacer : FramePacer) : void {
+    if (win.minimised()) {
+        return;
+    }
+    drawFrame(renderer, pen, game, pacer.fps().round() as i32);
+    let token : i32 = game.probe.profiler.begin(game.probe.present);
+    renderer.present(win);
+    game.probe.profiler.end(token);
+}
+
+// Matches the framebuffer and the camera to the new window size.
+fn resize(game : Game, renderer : Renderer, w : i32, h : i32) : void {
+    if (w < MIN_WINDOW_SIDE || h < MIN_WINDOW_SIDE) {
+        return;
+    }
+    game.width = w;
+    game.height = h;
+    renderer.resize(w, h);
+}
+
+// Plays and logs the sounds the simulation asked for since the last frame, then clears the list.
+fn playCues(game : Game, sfx : Sfx) : void {
+    sfx.nextFrame();
+    let world = game.world;
+    for (i of 0..world.cues.len()) {
+        let cue : Cue = Cue::fromIndex(world.cues.get(i));
+        if (!game.ui.muted) {
+            sfx.play(cue, gainOf(cue));
+        }
+        noteInLog(game, cue);
+    }
+    world.cues.clear();
+}
+
+// Loudness per effect, so the constant shooting stays under the rare big events.
+fn gainOf(cue : Cue) : f64 {
+    return match cue {
+        Cue::ShootArrow => GAIN_ARROW,
+        Cue::ShootFrost => GAIN_FROST,
+        Cue::ShootCannon => GAIN_CANNON,
+        Cue::Explode => GAIN_EXPLODE,
+        Cue::Kill => GAIN_KILL,
+        Cue::GameOver => GAIN_GAME_OVER,
+        _ => GAIN_DEFAULT,
+    };
+}
+
+// The events worth a line in the F3 log.
+fn noteInLog(game : Game, cue : Cue) : void {
+    let wave : i32 = game.world.wave;
+    match cue {
+        Cue::WaveStart => game.log.info("wave", "wave ${wave} begins"),
+        Cue::WaveClear => game.log.info("wave", "wave ${wave} cleared"),
+        Cue::Leak => game.log.warn("base", "an enemy reached the keep, lives ${game.world.lives}"),
+        _ => {},
+    }
+}
+
+// With `--debug`, the last profiled frame is also written to the console on the way out.
+fn printProfile(game : Game) : void {
+    let prof = game.probe.profiler;
+    for (rank of 0..prof.entryCount()) {
+        let e = prof.entry(rank);
+        let micros : i64 = e.inclusiveNanos / NANOS_PER_MICRO;
+        println("profile ${game.probe.names.name(e.scope)} ${micros} us x${e.calls}");
+    }
+    let frameMicros : i64 = prof.lastFrameNanos() / NANOS_PER_MICRO;
+    println("profile frame ${frameMicros} us");
+}

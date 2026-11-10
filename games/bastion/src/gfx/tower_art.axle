@@ -1,0 +1,252 @@
+// tower_art — drawing the towers: a stone plinth, level pips and the body of each design.
+//
+// Each tower is a few boxes placed from its simulation state; nothing here changes the state. The plinth and the
+// pips are shared, the rest is one function per design. A turn of a model about the vertical axis by the negative
+// of the tower's aim angle points its local +x axis the same way as the simulation's `atan2(dz, dx)`. Every size,
+// offset and tint is a named constant grouped by the part it shapes. A constant that meets a variable in the
+// arithmetic of a position is `f64`, so the sum is computed in double and rounded to `f32` once where it lands,
+// which is how the bare literals they replace behaved; the picture stays byte-identical to the one drawn before
+// the numbers were named. A constant that was always an `f32` stays one.
+
+use ludax::{Vec2, Vec3, sin, cos, max};
+
+use crate::gfx::ctx::{BoxSpec, DrawCtx};
+use crate::sim::grid::Grid;
+use crate::sim::stats::TowerKind;
+use crate::sim::units::Tower;
+use crate::sim::world::World;
+
+/** A tint that leaves a texture as it is. */
+const TOWER_NO_TINT : i32 = 0xFFFFFF;
+
+/** The tower's bounds for the frustum test: the height of its middle, half width and half height. */
+const TOWER_CULL_Y : f32 = 0.6;
+const TOWER_CULL_HALF_XZ : f32 = 0.5;
+const TOWER_CULL_HALF_Y : f32 = 0.8;
+
+/** Ticks after firing during which a tower's head is visibly pushed back. */
+const RECOIL_TICKS : i32 = 8;
+
+/** Tiles the head is pushed back at the moment of firing. */
+const RECOIL_REACH : f32 = 0.1;
+
+/** The plinth every tower stands on: height of its centre, width and height. */
+const PLINTH_Y : f32 = 0.09;
+const PLINTH_WIDTH : f32 = 0.82;
+const PLINTH_HEIGHT : f64 = 0.18;
+
+/** A level pip: height of its centre, offset toward the front, step between pips, size and glow. */
+const PIP_Y : f32 = 0.2;
+const PIP_FRONT : f64 = 0.36;
+const PIP_STEP : f32 = 0.2;
+const PIP_WIDTH : f32 = 0.1;
+const PIP_THICK : f32 = 0.07;
+const PIP_TINT : i32 = 0xFFD24A;
+const PIP_GLOW : f32 = 0.8;
+
+/** The arrow tower's shaft: width, and its height at level 0 plus a step for each level. */
+const ARROW_BODY_WIDTH : f32 = 0.34;
+const ARROW_BODY_HEIGHT : f32 = 0.5;
+const ARROW_BODY_PER_LEVEL : f32 = 0.14;
+
+/** Its platform: height of its centre over the shaft's top, width, thickness and tint. */
+const ARROW_DECK_RISE : f64 = 0.07;
+const ARROW_DECK_WIDTH : f32 = 0.5;
+const ARROW_DECK_HEIGHT : f32 = 0.14;
+const ARROW_DECK_TINT : i32 = 0xD8C0A0;
+
+/** Bow and arrow ride this far over the shaft's top. */
+const ARROW_WEAPON_RISE : f64 = 0.2;
+
+/** The bow: distance from the middle before recoil, then thickness, height, span and tint. */
+const ARROW_BOW_REACH : f32 = 0.2;
+const ARROW_BOW_THICK : f32 = 0.08;
+const ARROW_BOW_HEIGHT : f32 = 0.1;
+const ARROW_BOW_SPAN : f32 = 0.62;
+const ARROW_BOW_TINT : i32 = 0xB89060;
+
+/** The nocked arrow: distance from the middle, length, thickness and tint. */
+const ARROW_TIP_REACH : f64 = 0.3;
+const ARROW_TIP_LENGTH : f32 = 0.36;
+const ARROW_TIP_THICK : f32 = 0.04;
+const ARROW_TIP_TINT : i32 = 0xE0E0E0;
+
+/** The cannon's round body: height of its centre, size at level 0 plus a step per level, and how squat it is. */
+const CANNON_BODY_Y : f32 = 0.42;
+const CANNON_BODY_SIZE : f32 = 0.62;
+const CANNON_BODY_PER_LEVEL : f32 = 0.06;
+const CANNON_BODY_SQUASH : f64 = 0.8;
+const CANNON_BODY_TINT : i32 = 0x707078;
+
+/** The barrel: height, distance from the middle before recoil, length, thickness and tint. */
+const CANNON_BARREL_Y : f32 = 0.56;
+const CANNON_BARREL_REACH : f32 = 0.26;
+const CANNON_BARREL_LENGTH : f32 = 0.62;
+const CANNON_BARREL_THICK : f32 = 0.22;
+const CANNON_BARREL_TINT : i32 = 0x45454C;
+
+/** The muzzle ring: distance past the barrel's start, length, thickness and tint. */
+const CANNON_MUZZLE_REACH : f64 = 0.3;
+const CANNON_MUZZLE_LENGTH : f32 = 0.1;
+const CANNON_MUZZLE_THICK : f32 = 0.28;
+const CANNON_MUZZLE_TINT : i32 = 0x2E2E33;
+
+/** The frost tower's stand: height of its centre, width, height and tint. */
+const FROST_STAND_Y : f32 = 0.35;
+const FROST_STAND_WIDTH : f32 = 0.3;
+const FROST_STAND_HEIGHT : f32 = 0.34;
+const FROST_STAND_TINT : i32 = 0x9ED8F0;
+
+/** The crystal turns `FROST_SPIN` radians a frame and bobs `FROST_BOB` tiles at `FROST_BOB_SPEED` radians a frame. */
+const FROST_SPIN : f32 = 0.04;
+const FROST_BOB : f32 = 0.04;
+const FROST_BOB_SPEED : f32 = 0.07;
+
+/** The crystal: height of its resting centre, width, and height at level 0 plus a step per level. */
+const FROST_CRYSTAL_Y : f64 = 0.78;
+const FROST_CRYSTAL_WIDTH : f32 = 0.32;
+const FROST_CRYSTAL_HEIGHT : f32 = 0.55;
+const FROST_CRYSTAL_PER_LEVEL : f32 = 0.1;
+
+/** A second crystal crosses the first, turned by an eighth of a turn, in a paler blue. */
+const FROST_CROSS_TURN : f64 = 0.785;
+const FROST_CRYSTAL_TINT : i32 = 0x7FD8FF;
+const FROST_CROSS_TINT : i32 = 0xA8E8FF;
+
+/** The crystal glows by this much by day, and by `FROST_GLOW_NIGHT` more at the darkest of the night. */
+const FROST_GLOW_DAY : f64 = 0.45;
+const FROST_GLOW_NIGHT : f64 = 0.4;
+
+/** Draws every tower. */
+pub fn drawTowers(ctx : DrawCtx, world : World) : void {
+    for (slot of 0..world.towers.slotCount()) {
+        if (!world.towers.isLiveAt(slot)) {
+            continue;
+        }
+
+        let t : Tower = world.towers.valueAt(slot);
+        let c : Vec2 = Grid::centerOf(t.tile);
+        let base : Vec3 = Vec3::make(c.x, 0.0, c.y);
+        let middle : Vec3 = Vec3::make(c.x, TOWER_CULL_Y, c.y);
+        let half : Vec3 = Vec3::make(TOWER_CULL_HALF_XZ, TOWER_CULL_HALF_Y, TOWER_CULL_HALF_XZ);
+        if (ctx.sees(middle, half)) {
+            drawTower(ctx, t, base);
+        }
+    }
+}
+
+// The stone plinth, the level pips, and the kind's own body.
+fn drawTower(ctx : DrawCtx, t : Tower, base : Vec3) : void {
+    let plinth : BoxSpec = BoxSpec::make(
+        Vec3::make(base.x, PLINTH_Y, base.z),
+        Vec3::make(PLINTH_WIDTH, PLINTH_HEIGHT, PLINTH_WIDTH),
+        TOWER_NO_TINT
+    );
+    ctx.skinBox(ctx.assets.cube, ctx.assets.stone, plinth);
+
+    for (i of 0..t.level) {
+        let dx : f32 = ((i - 1) as f32) * PIP_STEP;
+        let pip : BoxSpec = BoxSpec::make(
+            Vec3::make(base.x + dx, PIP_Y, base.z + PIP_FRONT),
+            Vec3::make(PIP_WIDTH, PIP_THICK, PIP_THICK),
+            PIP_TINT
+        );
+        ctx.glowBox(ctx.assets.cube, ctx.assets.stone, pip, PIP_GLOW);
+    }
+
+    let since : f32 = max((0.0 as f32), (RECOIL_TICKS as f32) - t.sinceShot as f32);
+    let recoil : f32 = since / (RECOIL_TICKS as f32) * RECOIL_REACH;
+    match t.kind {
+        TowerKind::Arrow => drawArrowTower(ctx, t, base, recoil),
+        TowerKind::Cannon => drawCannon(ctx, t, base, recoil),
+        TowerKind::Frost => drawFrostTower(ctx, t, base),
+    }
+}
+
+// A point `reach` tiles from `base` along the tower's aim, at height `y`; the product is rounded in `f32`.
+fn towerAlong(base : Vec3, aim : f32, reach : f32, y : f64) : Vec3 {
+    return Vec3::make(base.x + cos(aim) * reach, y, base.z + sin(aim) * reach);
+}
+
+// The same with a reach computed in double, so the product is rounded once like the bare literals it replaces.
+fn towerAlongExact(base : Vec3, aim : f32, reach : f64, y : f64) : Vec3 {
+    return Vec3::make(base.x + cos(aim) * reach, y, base.z + sin(aim) * reach);
+}
+
+// A wooden shaft with a deck, and a bow and arrow that kick back when it fires.
+fn drawArrowTower(ctx : DrawCtx, t : Tower, base : Vec3, recoil : f32) : void {
+    let height : f32 = ARROW_BODY_HEIGHT + ARROW_BODY_PER_LEVEL * t.level as f32;
+    let top : f32 = (PLINTH_HEIGHT as f32) + height;
+    let yaw : f32 = (0.0 as f32) - t.aim;
+
+    let shaft : BoxSpec = BoxSpec::make(
+        Vec3::make(base.x, PLINTH_HEIGHT + height * 0.5, base.z),
+        Vec3::make(ARROW_BODY_WIDTH, height, ARROW_BODY_WIDTH),
+        TOWER_NO_TINT
+    );
+    ctx.skinBox(ctx.assets.cube, ctx.assets.wood, shaft);
+
+    let deck : BoxSpec = BoxSpec::make(
+        Vec3::make(base.x, top + ARROW_DECK_RISE, base.z),
+        Vec3::make(ARROW_DECK_WIDTH, ARROW_DECK_HEIGHT, ARROW_DECK_WIDTH),
+        ARROW_DECK_TINT
+    );
+    ctx.skinTurned(ctx.assets.cube, ctx.assets.wood, deck, yaw);
+
+    let weaponY = top + ARROW_WEAPON_RISE;
+    let bowAt : Vec3 = towerAlong(base, t.aim, ARROW_BOW_REACH - recoil, weaponY);
+    let bowSize : Vec3 = Vec3::make(ARROW_BOW_THICK, ARROW_BOW_HEIGHT, ARROW_BOW_SPAN);
+    let bow : BoxSpec = BoxSpec::make(bowAt, bowSize, ARROW_BOW_TINT);
+    ctx.skinTurned(ctx.assets.cube, ctx.assets.wood, bow, yaw);
+
+    let tipAt : Vec3 = towerAlongExact(base, t.aim, ARROW_TIP_REACH, weaponY);
+    let tipSize : Vec3 = Vec3::make(ARROW_TIP_LENGTH, ARROW_TIP_THICK, ARROW_TIP_THICK);
+    let tip : BoxSpec = BoxSpec::make(tipAt, tipSize, ARROW_TIP_TINT);
+    ctx.skinTurned(ctx.assets.cube, ctx.assets.stone, tip, yaw);
+}
+
+// A squat iron ball with a barrel and a muzzle ring that kick back when it fires.
+fn drawCannon(ctx : DrawCtx, t : Tower, base : Vec3, recoil : f32) : void {
+    let yaw : f32 = (0.0 as f32) - t.aim;
+    let size : f32 = CANNON_BODY_SIZE + CANNON_BODY_PER_LEVEL * t.level as f32;
+    let reach : f32 = CANNON_BARREL_REACH - recoil;
+
+    let bodySize : Vec3 = Vec3::make(size, size * CANNON_BODY_SQUASH, size);
+    let body : BoxSpec = BoxSpec::make(Vec3::make(base.x, CANNON_BODY_Y, base.z), bodySize, CANNON_BODY_TINT);
+    ctx.skinBox(ctx.assets.ball, ctx.assets.stone, body);
+
+    let barrelAt : Vec3 = towerAlong(base, t.aim, reach, CANNON_BARREL_Y);
+    let barrelSize : Vec3 = Vec3::make(CANNON_BARREL_LENGTH, CANNON_BARREL_THICK, CANNON_BARREL_THICK);
+    let barrel : BoxSpec = BoxSpec::make(barrelAt, barrelSize, CANNON_BARREL_TINT);
+    ctx.skinTurned(ctx.assets.cube, ctx.assets.stone, barrel, yaw);
+
+    let muzzleAt : Vec3 = towerAlongExact(base, t.aim, reach + CANNON_MUZZLE_REACH, CANNON_BARREL_Y);
+    let muzzleSize : Vec3 = Vec3::make(CANNON_MUZZLE_LENGTH, CANNON_MUZZLE_THICK, CANNON_MUZZLE_THICK);
+    let muzzle : BoxSpec = BoxSpec::make(muzzleAt, muzzleSize, CANNON_MUZZLE_TINT);
+    ctx.skinTurned(ctx.assets.cube, ctx.assets.stone, muzzle, yaw);
+}
+
+// A small stand under two crossed crystals that turn and bob, brighter at night.
+fn drawFrostTower(ctx : DrawCtx, t : Tower, base : Vec3) : void {
+    let standSize : Vec3 = Vec3::make(FROST_STAND_WIDTH, FROST_STAND_HEIGHT, FROST_STAND_WIDTH);
+    let stand : BoxSpec = BoxSpec::make(
+        Vec3::make(base.x, FROST_STAND_Y, base.z),
+        standSize,
+        FROST_STAND_TINT
+    );
+    ctx.skinBox(ctx.assets.cube, ctx.assets.stone, stand);
+
+    let clock : f32 = ctx.light.clock;
+    let spin : f32 = clock * FROST_SPIN;
+    let bob : f32 = FROST_BOB * sin(clock * FROST_BOB_SPEED);
+    let height : f32 = FROST_CRYSTAL_HEIGHT + FROST_CRYSTAL_PER_LEVEL * t.level as f32;
+    let glow = FROST_GLOW_DAY + FROST_GLOW_NIGHT * ctx.light.night;
+    let middle : Vec3 = Vec3::make(base.x, FROST_CRYSTAL_Y + bob, base.z);
+    let size : Vec3 = Vec3::make(FROST_CRYSTAL_WIDTH, height, FROST_CRYSTAL_WIDTH);
+
+    let crystal : BoxSpec = BoxSpec::make(middle, size, FROST_CRYSTAL_TINT);
+    ctx.glowTurned(ctx.assets.cube, ctx.assets.stone, crystal, glow, spin);
+
+    let cross : BoxSpec = BoxSpec::make(middle, size, FROST_CROSS_TINT);
+    ctx.glowTurned(ctx.assets.cube, ctx.assets.stone, cross, glow, spin + FROST_CROSS_TURN);
+}

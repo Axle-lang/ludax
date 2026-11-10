@@ -1,0 +1,251 @@
+// enemy_art — drawing the enemies: a shadow blob and a body of a few shapes for each kind.
+//
+// Every size here is a multiple of the kind's radius, so a change of radius in the stat table rescales the whole
+// creature, and every height is that multiple plus the walking hop. Facing angles are the simulation's
+// `atan2(dz, dx)`; the model is turned by the negative of that angle to point its local +x axis the same way.
+// Frozen enemies swap their colours for icy ones. Nothing here changes the simulation.
+
+use ludax::{Vec3, sin, cos, abs};
+
+use crate::gfx::ctx::{BoxSpec, DrawCtx};
+use crate::sim::stats::{EnemyKind, enemyStats};
+use crate::sim::units::Enemy;
+use crate::sim::world::World;
+
+/** An enemy's bounds for the frustum test, in radii: the height of its middle and its half extent. */
+const ENEMY_CULL_Y : f64 = 1.5;
+const ENEMY_CULL_HALF : f64 = 1.6;
+
+/** The walking hop: `ENEMY_HOP_SPEED` radians a tick of age, as a share of the radius. */
+const ENEMY_HOP_SPEED : f32 = 0.22;
+const ENEMY_HOP_HEIGHT : f32 = 0.35;
+
+/** The shadow blob under every enemy: height over the ground, width in radii, thickness and tint. */
+const SHADOW_Y : f64 = 0.02;
+const SHADOW_WIDTH : f64 = 2.4;
+const SHADOW_THICK : f64 = 0.02;
+const SHADOW_TINT : i32 = 0x1E3016;
+
+/** The grunt's body: height of its centre and size in radii, and its colour by day and frozen. */
+const GRUNT_BODY_Y : f64 = 1.0;
+const GRUNT_BODY_X : f64 = 2.1;
+const GRUNT_BODY_Y_SIZE : f64 = 2.2;
+const GRUNT_BODY_Z : f64 = 2.0;
+const GRUNT_TINT : i32 = 0x66B84A;
+const GRUNT_FROZEN_TINT : i32 = 0x7FB8E8;
+
+/** Its eye: distance ahead, height, size (width and height, then length) in radii, and tint. */
+const GRUNT_EYE_AHEAD : f64 = 0.7;
+const GRUNT_EYE_Y : f64 = 1.4;
+const GRUNT_EYE_SIZE : f64 = 0.5;
+const GRUNT_EYE_LENGTH : f64 = 0.9;
+const GRUNT_EYE_TINT : i32 = 0x20281A;
+
+/** The runner's body: height of its centre and size in radii, and its colour by day and frozen. */
+const RUNNER_BODY_Y : f64 = 0.9;
+const RUNNER_BODY_X : f64 = 3.0;
+const RUNNER_BODY_Y_SIZE : f64 = 1.7;
+const RUNNER_BODY_Z : f64 = 2.0;
+const RUNNER_TINT : i32 = 0xE8C23A;
+const RUNNER_FROZEN_TINT : i32 = 0x9ACBF0;
+
+/** Its tail: distance behind, length and thickness in radii, and tint. */
+const RUNNER_TAIL_BEHIND : f64 = 1.4;
+const RUNNER_TAIL_LENGTH : f64 = 1.0;
+const RUNNER_TAIL_THICK : f64 = 0.4;
+const RUNNER_TAIL_TINT : i32 = 0xB0902A;
+
+/** The brute walks heavily: its hop is this share of the usual. */
+const BRUTE_HOP : f64 = 0.4;
+
+/** The brute's block body: height of its centre, size in radii (width, height), and colour by day and frozen. */
+const BRUTE_BODY_Y : f64 = 1.0;
+const BRUTE_BODY_WIDTH : f64 = 2.0;
+const BRUTE_BODY_HEIGHT : f64 = 1.9;
+const BRUTE_TINT : i32 = 0x8A4FB0;
+const BRUTE_FROZEN_TINT : i32 = 0x7A98C8;
+
+/** Its head: height of its centre, size in radii, and colour by day and frozen. */
+const BRUTE_HEAD_Y : f64 = 2.1;
+const BRUTE_HEAD_SIZE : f64 = 1.1;
+const BRUTE_HEAD_TINT : i32 = 0xB07AD0;
+const BRUTE_HEAD_FROZEN_TINT : i32 = 0xA8C0E0;
+
+/** The boss hops this share of the usual. */
+const BOSS_HOP : f64 = 0.3;
+
+/** The boss's body: height of its centre, size in radii (width, height), and colour by day and frozen. */
+const BOSS_BODY_Y : f64 = 1.1;
+const BOSS_BODY_WIDTH : f64 = 2.3;
+const BOSS_BODY_HEIGHT : f64 = 2.2;
+const BOSS_TINT : i32 = 0xB02A2A;
+const BOSS_FROZEN_TINT : i32 = 0x8AA8D0;
+
+/** Its horns: height of their centres, distance to either side, width and height in radii, and tint. */
+const BOSS_HORN_Y : f64 = 2.6;
+const BOSS_HORN_SPREAD : f64 = 0.8;
+const BOSS_HORN_WIDTH : f64 = 0.3;
+const BOSS_HORN_HEIGHT : f64 = 1.2;
+const BOSS_HORN_TINT : i32 = 0xE8E0C8;
+
+/** Its glowing glare: distance ahead, height, size in radii (width, height, then length), and colour. */
+const BOSS_GLARE_AHEAD : f64 = 0.9;
+const BOSS_GLARE_Y : f64 = 1.5;
+const BOSS_GLARE_WIDTH : f64 = 0.4;
+const BOSS_GLARE_HEIGHT : f64 = 0.3;
+const BOSS_GLARE_LENGTH : f64 = 1.2;
+const BOSS_GLARE_TINT : i32 = 0xFFE060;
+
+/** How one enemy stands this frame: its radius, the walking hop, the turn of its model and whether it is frozen. */
+struct Pose {
+    /** The radius of its kind, in tiles. */
+    radius : f32;
+
+    /** How far the walk lifts it off the ground, in tiles. */
+    hop : f32;
+
+    /** The turn of its model about the vertical, in radians. */
+    yaw : f32;
+
+    /** True while a slow is on it. */
+    frozen : bool;
+
+    /** `ice` when frozen, otherwise `warm`. */
+    fn tint(self, warm : i32, ice : i32) : i32 {
+        if (self.frozen) {
+            return ice;
+        }
+        return warm;
+    }
+
+    /** A size of `x`, `y` and `z` radii. */
+    fn scaled(self, x : f64, y : f64, z : f64) : Vec3 {
+        return Vec3::make(self.radius * x, self.radius * y, self.radius * z);
+    }
+}
+
+/** Draws every enemy. */
+pub fn drawEnemies(ctx : DrawCtx, world : World) : void {
+    for (slot of 0..world.enemies.slotCount()) {
+        if (!world.enemies.isLiveAt(slot)) {
+            continue;
+        }
+
+        let e : Enemy = world.enemies.valueAt(slot);
+        let r : f32 = enemyStats(e.kind).radius;
+        let middle : Vec3 = Vec3::make(e.pos.x, r * ENEMY_CULL_Y, e.pos.y);
+        let half : Vec3 = Vec3::make(r * ENEMY_CULL_HALF, r * ENEMY_CULL_HALF, r * ENEMY_CULL_HALF);
+        if (!ctx.sees(middle, half)) {
+            continue;
+        }
+
+        let frozen : bool = world.slows.has(world.enemies.idAt(slot).index);
+        drawEnemy(ctx, e, frozen);
+    }
+}
+
+// A shadow blob, then the body for the kind.
+fn drawEnemy(ctx : DrawCtx, e : Enemy, frozen : bool) : void {
+    let r : f32 = enemyStats(e.kind).radius;
+    let hop : f32 = abs(sin(e.age as f32 * ENEMY_HOP_SPEED)) * r * ENEMY_HOP_HEIGHT;
+    let pose : Pose = Pose { radius: r, hop: hop, yaw: (0.0 as f32) - e.heading, frozen: frozen };
+
+    let shadowAt : Vec3 = Vec3::make(e.pos.x, SHADOW_Y, e.pos.y);
+    let shadowSize : Vec3 = Vec3::make(r * SHADOW_WIDTH, SHADOW_THICK, r * SHADOW_WIDTH);
+    let shadow : BoxSpec = BoxSpec::make(shadowAt, shadowSize, SHADOW_TINT);
+    ctx.paintBox(ctx.assets.ball, ctx.assets.stone, shadow);
+
+    match e.kind {
+        EnemyKind::Grunt => drawGrunt(ctx, e, pose),
+        EnemyKind::Runner => drawRunner(ctx, e, pose),
+        EnemyKind::Brute => drawBrute(ctx, e, pose),
+        EnemyKind::Boss => drawBoss(ctx, e, pose),
+    }
+}
+
+// A round green blob with a dark eye on its front.
+fn drawGrunt(ctx : DrawCtx, e : Enemy, pose : Pose) : void {
+    let r : f32 = pose.radius;
+
+    let bodyAt : Vec3 = Vec3::make(e.pos.x, r * GRUNT_BODY_Y + pose.hop, e.pos.y);
+    let bodySize : Vec3 = pose.scaled(GRUNT_BODY_X, GRUNT_BODY_Y_SIZE, GRUNT_BODY_Z);
+    let body : BoxSpec = BoxSpec::make(bodyAt, bodySize, pose.tint(GRUNT_TINT, GRUNT_FROZEN_TINT));
+    ctx.paintTurned(ctx.assets.ball, ctx.assets.stone, body, pose.yaw);
+
+    let eyeAt : Vec3 = Vec3::make(
+        e.pos.x + cos(e.heading) * r * GRUNT_EYE_AHEAD,
+        r * GRUNT_EYE_Y + pose.hop,
+        e.pos.y + sin(e.heading) * r * GRUNT_EYE_AHEAD
+    );
+    let eyeSize : Vec3 = pose.scaled(GRUNT_EYE_SIZE, GRUNT_EYE_SIZE, GRUNT_EYE_LENGTH);
+    let eye : BoxSpec = BoxSpec::make(eyeAt, eyeSize, GRUNT_EYE_TINT);
+    ctx.paintTurned(ctx.assets.cube, ctx.assets.stone, eye, pose.yaw);
+}
+
+// A long yellow body with a short tail behind.
+fn drawRunner(ctx : DrawCtx, e : Enemy, pose : Pose) : void {
+    let r : f32 = pose.radius;
+    let y = r * RUNNER_BODY_Y + pose.hop;
+
+    let bodySize : Vec3 = pose.scaled(RUNNER_BODY_X, RUNNER_BODY_Y_SIZE, RUNNER_BODY_Z);
+    let body : BoxSpec = BoxSpec::make(
+        Vec3::make(e.pos.x, y, e.pos.y),
+        bodySize,
+        pose.tint(RUNNER_TINT, RUNNER_FROZEN_TINT)
+    );
+    ctx.paintTurned(ctx.assets.ball, ctx.assets.stone, body, pose.yaw);
+
+    let tailAt : Vec3 = Vec3::make(
+        e.pos.x - cos(e.heading) * r * RUNNER_TAIL_BEHIND,
+        y,
+        e.pos.y - sin(e.heading) * r * RUNNER_TAIL_BEHIND
+    );
+    let tailSize : Vec3 = pose.scaled(RUNNER_TAIL_LENGTH, RUNNER_TAIL_THICK, RUNNER_TAIL_THICK);
+    let tail : BoxSpec = BoxSpec::make(tailAt, tailSize, RUNNER_TAIL_TINT);
+    ctx.paintTurned(ctx.assets.cube, ctx.assets.stone, tail, pose.yaw);
+}
+
+// A purple block with a round head, hopping less than the others.
+fn drawBrute(ctx : DrawCtx, e : Enemy, pose : Pose) : void {
+    let r : f32 = pose.radius;
+
+    let bodyAt : Vec3 = Vec3::make(e.pos.x, r * BRUTE_BODY_Y + pose.hop * BRUTE_HOP, e.pos.y);
+    let bodySize : Vec3 = pose.scaled(BRUTE_BODY_WIDTH, BRUTE_BODY_HEIGHT, BRUTE_BODY_WIDTH);
+    let body : BoxSpec = BoxSpec::make(bodyAt, bodySize, pose.tint(BRUTE_TINT, BRUTE_FROZEN_TINT));
+    ctx.paintTurned(ctx.assets.cube, ctx.assets.stone, body, pose.yaw);
+
+    let headAt : Vec3 = Vec3::make(e.pos.x, r * BRUTE_HEAD_Y + pose.hop * BRUTE_HOP, e.pos.y);
+    let headSize : Vec3 = pose.scaled(BRUTE_HEAD_SIZE, BRUTE_HEAD_SIZE, BRUTE_HEAD_SIZE);
+    let head : BoxSpec = BoxSpec::make(headAt, headSize, pose.tint(BRUTE_HEAD_TINT, BRUTE_HEAD_FROZEN_TINT));
+    ctx.paintTurned(ctx.assets.ball, ctx.assets.stone, head, pose.yaw);
+}
+
+// A red body with two horns and a glowing glare on its front.
+fn drawBoss(ctx : DrawCtx, e : Enemy, pose : Pose) : void {
+    let r : f32 = pose.radius;
+
+    let bodyAt : Vec3 = Vec3::make(e.pos.x, r * BOSS_BODY_Y + pose.hop * BOSS_HOP, e.pos.y);
+    let bodySize : Vec3 = pose.scaled(BOSS_BODY_WIDTH, BOSS_BODY_HEIGHT, BOSS_BODY_WIDTH);
+    let body : BoxSpec = BoxSpec::make(bodyAt, bodySize, pose.tint(BOSS_TINT, BOSS_FROZEN_TINT));
+    ctx.paintTurned(ctx.assets.ball, ctx.assets.stone, body, pose.yaw);
+
+    drawHorn(ctx, e, pose, e.pos.y - r * BOSS_HORN_SPREAD);
+    drawHorn(ctx, e, pose, e.pos.y + r * BOSS_HORN_SPREAD);
+
+    let glareAt : Vec3 = Vec3::make(
+        e.pos.x + cos(e.heading) * r * BOSS_GLARE_AHEAD,
+        r * BOSS_GLARE_Y,
+        e.pos.y + sin(e.heading) * r * BOSS_GLARE_AHEAD
+    );
+    let glareSize : Vec3 = pose.scaled(BOSS_GLARE_WIDTH, BOSS_GLARE_HEIGHT, BOSS_GLARE_LENGTH);
+    let glare : BoxSpec = BoxSpec::make(glareAt, glareSize, BOSS_GLARE_TINT);
+    ctx.glowTurned(ctx.assets.cube, ctx.assets.stone, glare, 1.0, pose.yaw);
+}
+
+// One boss horn, standing at world depth `z`.
+fn drawHorn(ctx : DrawCtx, e : Enemy, pose : Pose, z : f32) : void {
+    let at : Vec3 = Vec3::make(e.pos.x, pose.radius * BOSS_HORN_Y, z);
+    let size : Vec3 = pose.scaled(BOSS_HORN_WIDTH, BOSS_HORN_HEIGHT, BOSS_HORN_WIDTH);
+    let horn : BoxSpec = BoxSpec::make(at, size, BOSS_HORN_TINT);
+    ctx.paintTurned(ctx.assets.cube, ctx.assets.stone, horn, pose.yaw);
+}

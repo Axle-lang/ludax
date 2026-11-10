@@ -1,0 +1,199 @@
+// synth — building the game's sound effects as sample data, with no audio files.
+//
+// Each effect is a short run of 16-bit mono samples computed from simple oscillators, envelopes and a seeded
+// noise source, then wrapped in a WAV header, which is the one thing smalt's `Clip` can load. The oscillators
+// use ludax's own `sin`, so the samples are the same on every machine. Every length, pitch and share is a
+// named constant grouped by the effect it shapes; the pitches are `f64` because they are summed with `f32`
+// positions in the effect and rounded to `f32` once, exactly as the bare literals they replace were.
+
+use ludax::{Pcg32, sin, min, TAU};
+
+use crate::audio::cues::Cue;
+
+/** Samples per second the effects are made at; smalt resamples to the device rate when loading. */
+pub const SYNTH_RATE : i32 = 22050;
+
+/** Peak amplitude of a finished effect, out of 32767. */
+const PEAK : f32 = 14000.0;
+
+/** The noise of every effect comes from this seed, with the cue as its stream, so a hiss is the same every run. */
+const SYNTH_SEED : u64 = 77;
+
+/** The attack ramp of every effect, in seconds: long enough to avoid a click at the start. */
+const SYNTH_ATTACK : f32 = 0.004;
+
+/** How long each effect lasts, in seconds. */
+const SFX_BUILD_SECONDS : f32 = 0.22;
+const SFX_UPGRADE_SECONDS : f32 = 0.36;
+const SFX_SELL_SECONDS : f32 = 0.20;
+const SFX_DENY_SECONDS : f32 = 0.16;
+const SFX_ARROW_SECONDS : f32 = 0.10;
+const SFX_CANNON_SECONDS : f32 = 0.32;
+const SFX_FROST_SECONDS : f32 = 0.18;
+const SFX_EXPLODE_SECONDS : f32 = 0.45;
+const SFX_KILL_SECONDS : f32 = 0.14;
+const SFX_LEAK_SECONDS : f32 = 0.40;
+const SFX_WAVE_START_SECONDS : f32 = 0.60;
+const SFX_WAVE_CLEAR_SECONDS : f32 = 0.55;
+const SFX_GAME_OVER_SECONDS : f32 = 1.10;
+const SFX_CLICK_SECONDS : f32 = 0.05;
+
+/** Build: a pitch that leaps by `SFX_BUILD_LEAP` hertz a little under halfway through. */
+const SFX_BUILD_HZ : f64 = 330.0;
+const SFX_BUILD_LEAP : f64 = 330.0;
+const SFX_BUILD_LEAP_AT : f32 = 0.45;
+
+/** A rising chord: the root, and the shares of it added at the first and second step. Upgrade and wave-clear share it. */
+const SFX_CHORD_HZ : f64 = 392.0;
+const SFX_CHORD_THIRD : f64 = 0.25;
+const SFX_CHORD_FIFTH : f64 = 0.5;
+
+/** Where in the effect the chord's two steps come: upgrade, then wave-clear. */
+const SFX_UPGRADE_STEP_1 : f32 = 0.33;
+const SFX_UPGRADE_STEP_2 : f32 = 0.66;
+const SFX_WAVE_CLEAR_STEP_1 : f32 = 0.3;
+const SFX_WAVE_CLEAR_STEP_2 : f32 = 0.6;
+
+/** The effects that glide down: the pitch they start at and how far it falls over the effect, in hertz. */
+const SFX_SELL_HZ : f64 = 1320.0;
+const SFX_SELL_FALL : f64 = 500.0;
+const SFX_ARROW_HZ : f64 = 900.0;
+const SFX_ARROW_FALL : f64 = 500.0;
+const SFX_CANNON_HZ : f64 = 150.0;
+const SFX_CANNON_FALL : f64 = 100.0;
+const SFX_EXPLODE_HZ : f64 = 90.0;
+const SFX_EXPLODE_FALL : f64 = 50.0;
+const SFX_KILL_HZ : f64 = 520.0;
+const SFX_KILL_FALL : f64 = 380.0;
+const SFX_LEAK_HZ : f64 = 260.0;
+const SFX_LEAK_FALL : f64 = 160.0;
+const SFX_GAME_OVER_HZ : f64 = 220.0;
+const SFX_GAME_OVER_FALL : f64 = 110.0;
+
+/** The steady tones: a flat buzz for a refusal and a click. */
+const SFX_DENY_HZ : f32 = 110.0;
+const SFX_CLICK_HZ : f32 = 1200.0;
+
+/** The frost bolt's pitch wobbles around `SFX_FROST_HZ` by `SFX_FROST_WARBLE` hertz, `SFX_FROST_RATE` radians a second. */
+const SFX_FROST_HZ : f64 = 1500.0;
+const SFX_FROST_WARBLE : f64 = 600.0;
+const SFX_FROST_RATE : f64 = 90.0;
+
+/** The wave horn: a low note that steps up by `SFX_HORN_STEP` hertz halfway through. */
+const SFX_HORN_HZ : f64 = 196.0;
+const SFX_HORN_STEP : f64 = 98.0;
+const SFX_HORN_STEP_AT : f32 = 0.5;
+
+/** The share of an effect's samples that is tone, the rest noise; the effects not listed are pure tone. */
+const SFX_ARROW_TONE : f32 = 0.35;
+const SFX_CANNON_TONE : f32 = 0.55;
+const SFX_EXPLODE_TONE : f32 = 0.2;
+const SFX_KILL_TONE : f32 = 0.8;
+const SFX_DENY_TONE : f32 = 0.85;
+
+/** The samples of the effect for `cue`, as signed 16-bit values widened to i32. */
+pub fn render(cue : Cue) : i32[] {
+    let seconds : f32 = lengthOf(cue);
+    let count : i32 = (seconds * SYNTH_RATE as f32) as i32;
+    let mut out : i32[] = new i32[count as i64];
+    let noise = new Pcg32(SYNTH_SEED, cue as i32 as u64);
+    let share : f32 = toneShare(cue);
+    let mut phase : f32 = (0.0 as f32);
+    for (i of 0..count) {
+        let t : f32 = i as f32 / SYNTH_RATE as f32;
+        let along : f32 = t / seconds;
+        let hz : f32 = pitchAt(cue, t, along);
+        phase = phase + hz / SYNTH_RATE as f32;
+
+        let tone : f32 = sin((phase - floorOf(phase)) * TAU);
+        let hiss : f32 = noise.rangeF32(-(1.0 as f32), (1.0 as f32));
+        let mixed : f32 = tone * share + hiss * ((1.0 as f32) - share);
+        out[i] = (mixed * envelope(cue, t, along) * PEAK) as i32;
+    }
+    return out;
+}
+
+// How long each effect lasts, in seconds.
+fn lengthOf(cue : Cue) : f32 {
+    return match cue {
+        Cue::Build => SFX_BUILD_SECONDS,
+        Cue::Upgrade => SFX_UPGRADE_SECONDS,
+        Cue::Sell => SFX_SELL_SECONDS,
+        Cue::Deny => SFX_DENY_SECONDS,
+        Cue::ShootArrow => SFX_ARROW_SECONDS,
+        Cue::ShootCannon => SFX_CANNON_SECONDS,
+        Cue::ShootFrost => SFX_FROST_SECONDS,
+        Cue::Explode => SFX_EXPLODE_SECONDS,
+        Cue::Kill => SFX_KILL_SECONDS,
+        Cue::Leak => SFX_LEAK_SECONDS,
+        Cue::WaveStart => SFX_WAVE_START_SECONDS,
+        Cue::WaveClear => SFX_WAVE_CLEAR_SECONDS,
+        Cue::GameOver => SFX_GAME_OVER_SECONDS,
+        Cue::Click => SFX_CLICK_SECONDS,
+    };
+}
+
+// The pitch at time `t` (`along` is the position in the effect, 0 to 1).
+fn pitchAt(cue : Cue, t : f32, along : f32) : f32 {
+    return match cue {
+        Cue::Build => SFX_BUILD_HZ + SFX_BUILD_LEAP * step(along, SFX_BUILD_LEAP_AT),
+        Cue::Upgrade => chord(along, SFX_UPGRADE_STEP_1, SFX_UPGRADE_STEP_2),
+        Cue::Sell => glide(SFX_SELL_HZ, SFX_SELL_FALL, along),
+        Cue::Deny => SFX_DENY_HZ,
+        Cue::ShootArrow => glide(SFX_ARROW_HZ, SFX_ARROW_FALL, along),
+        Cue::ShootCannon => glide(SFX_CANNON_HZ, SFX_CANNON_FALL, along),
+        Cue::ShootFrost => SFX_FROST_HZ + SFX_FROST_WARBLE * sin(t * SFX_FROST_RATE),
+        Cue::Explode => glide(SFX_EXPLODE_HZ, SFX_EXPLODE_FALL, along),
+        Cue::Kill => glide(SFX_KILL_HZ, SFX_KILL_FALL, along),
+        Cue::Leak => glide(SFX_LEAK_HZ, SFX_LEAK_FALL, along),
+        Cue::WaveStart => SFX_HORN_HZ + SFX_HORN_STEP * step(along, SFX_HORN_STEP_AT),
+        Cue::WaveClear => chord(along, SFX_WAVE_CLEAR_STEP_1, SFX_WAVE_CLEAR_STEP_2),
+        Cue::GameOver => glide(SFX_GAME_OVER_HZ, SFX_GAME_OVER_FALL, along),
+        Cue::Click => SFX_CLICK_HZ,
+    };
+}
+
+// A pitch that starts at `from` hertz and falls by `fall` hertz as `along` goes from 0 to 1.
+fn glide(from : f64, fall : f64, along : f32) : f32 {
+    return from - fall * along;
+}
+
+// The chord's root, a third higher after `first` and a fifth higher after `second`.
+fn chord(along : f32, first : f32, second : f32) : f32 {
+    return SFX_CHORD_HZ
+        * (1.0 + SFX_CHORD_THIRD * step(along, first) + SFX_CHORD_FIFTH * step(along, second));
+}
+
+// 1 once `along` has passed `edge`, else 0.
+fn step(along : f32, edge : f32) : f32 {
+    if (along >= edge) {
+        return 1.0;
+    }
+    return 0.0;
+}
+
+// How much of the sample is the tone (the rest is noise).
+fn toneShare(cue : Cue) : f32 {
+    return match cue {
+        Cue::ShootArrow => SFX_ARROW_TONE,
+        Cue::ShootCannon => SFX_CANNON_TONE,
+        Cue::Explode => SFX_EXPLODE_TONE,
+        Cue::Kill => SFX_KILL_TONE,
+        Cue::Deny => SFX_DENY_TONE,
+        _ => 1.0,
+    };
+}
+
+// Loudness over the life of the effect: a short attack and a decay that suits the sound.
+fn envelope(cue : Cue, t : f32, along : f32) : f32 {
+    let attack : f32 = min(t / SYNTH_ATTACK, (1.0 as f32));
+    let decay : f32 = ((1.0 as f32) - along) * ((1.0 as f32) - along);
+    if (cue == Cue::GameOver || cue == Cue::WaveStart || cue == Cue::WaveClear) {
+        return attack * (1.0 - along);
+    }
+    return attack * decay;
+}
+
+fn floorOf(v : f32) : f32 {
+    return (v as i32) as f32;
+}

@@ -1,0 +1,394 @@
+// ground — drawing the land: the lawn, the route, rocks, trees, the portal and the keep.
+//
+// Everything here is static for the length of a run apart from the route overlay, so it is mostly a loop over
+// tiles with a frustum test in front of each draw. `Scenery` holds the trees, scattered outside the board from
+// a seeded generator. Every size, offset and tint is a named constant grouped by the thing it shapes, so the
+// portal or the keep can be reshaped without reading the drawing code.
+
+use ludax::{Pcg32, Vec, Vec3, sin};
+
+use crate::gfx::ctx::{BoxSpec, DrawCtx};
+use crate::gfx::route::RouteOverlay;
+use crate::sim::config::{GRID_W, GRID_H};
+use crate::sim::grid::Grid;
+use crate::sim::world::World;
+
+/** Trees to scatter around the board. */
+const TREE_COUNT : i32 = 46;
+
+/** Trees may stand this far beyond the board's edge along x, in tiles. */
+const TREE_REACH_X : f32 = 12.0;
+
+/** Trees may stand this far beyond the board's edge along z, in tiles. */
+const TREE_REACH_Z : f32 = 10.0;
+
+/** A tree closer than this to the board, in tiles, would overlap its tiles, so it is placed elsewhere. */
+const TREE_BOARD_MARGIN : f32 = 0.8;
+
+/** The smallest tree, as a multiplier of the model. */
+const TREE_SIZE_MIN : f32 = 0.8;
+
+/** The largest tree, as a multiplier of the model. */
+const TREE_SIZE_MAX : f32 = 1.5;
+
+/** The random stream that places trees; fixed so a seed gives the same woods every run. */
+const TREE_STREAM : u64 = 4;
+
+/** The foliage tint of a tree's upper blob, a little paler than the lower one. */
+const TREE_TOP_TINT : i32 = 0xE0F0E0;
+
+/** The cull box of a tree, in multiples of its size (double, so each product rounds once): half width and depth, half height. */
+const TREE_CULL_HALF_XZ : f64 = 0.9;
+const TREE_CULL_HALF_Y : f64 = 1.2;
+
+/** The trunk: height of its centre, width and depth, and height. */
+const TREE_TRUNK_Y : f64 = 0.35;
+const TREE_TRUNK_WIDTH : f64 = 0.25;
+const TREE_TRUNK_HEIGHT : f64 = 0.7;
+
+/** The lower blob of foliage: height of its centre, width and depth, and height. */
+const TREE_LOWER_Y : f64 = 1.05;
+const TREE_LOWER_WIDTH : f64 = 1.3;
+const TREE_LOWER_HEIGHT : f64 = 1.1;
+
+/** The upper blob: height of its centre, width and depth, and height. */
+const TREE_UPPER_Y : f64 = 1.6;
+const TREE_UPPER_WIDTH : f64 = 0.9;
+const TREE_UPPER_HEIGHT : f64 = 0.8;
+
+/** The lawn under the board is sunk this far so the tiles never z-fight with it. */
+const LAWN_DROP : f32 = -0.04;
+
+/** The muted green of the lawn. */
+const LAWN_TINT : i32 = 0x8FA98A;
+
+/** Alternate tiles are darkened slightly so the grid reads without lines. */
+const TILE_TINT_LIGHT : i32 = 0xFFFFFF;
+
+/** The darker tint of every other tile. */
+const TILE_TINT_DARK : i32 = 0xE8E8E8;
+
+/** Half the width of a tile, for the frustum test. */
+const TILE_HALF : f32 = 0.5;
+
+/** Half the thickness of a tile, for the frustum test. */
+const TILE_HALF_THICK : f32 = 0.06;
+
+/** The big lump of a boulder: height of its centre and its tint. */
+const ROCK_BIG_Y : f32 = 0.22;
+const ROCK_BIG_TINT : i32 = 0xC8C8D0;
+
+/** Its width is the base plus a step per `t % ROCK_WIDTH_CYCLE`, so neighbouring rocks differ. */
+const ROCK_WIDTH_CYCLE : i32 = 5;
+const ROCK_WIDTH_BASE : f32 = 0.78;
+const ROCK_WIDTH_STEP : f32 = 0.04;
+
+/** Its height is the base plus a step per `t % ROCK_HEIGHT_CYCLE`. */
+const ROCK_HEIGHT_CYCLE : i32 = 3;
+const ROCK_HEIGHT_BASE : f32 = 0.55;
+const ROCK_HEIGHT_STEP : f32 = 0.1;
+
+/** Its depth, the same for every rock. */
+const ROCK_DEPTH : f32 = 0.7;
+
+/** The small stone leaning on the boulder: offset from the tile centre, height, size and tint. */
+const ROCK_SMALL_OFFSET_X : f32 = 0.18;
+const ROCK_SMALL_OFFSET_Z : f32 = -0.15;
+const ROCK_SMALL_Y : f32 = 0.12;
+const ROCK_SMALL_SIZE : f32 = 0.4;
+const ROCK_SMALL_HEIGHT : f32 = 0.3;
+const ROCK_SMALL_TINT : i32 = 0xA8A8B0;
+
+/** The small stone is turned by this many radians, so it does not line up with the boulder. */
+const ROCK_SMALL_TURN : f32 = 1.0;
+
+/** The portal's posts are this far in front of the tile centre along x (the gate faces the route). */
+const PORTAL_SHIFT_X : f32 = -0.05;
+
+/** Each post stands this far to either side of the centre along z, at this height. */
+const PORTAL_POST_OFFSET : f32 = 0.42;
+const PORTAL_POST_Y : f32 = 0.7;
+
+/** Each post's width and depth, and its height. */
+const PORTAL_POST_WIDTH : f32 = 0.22;
+const PORTAL_POST_HEIGHT : f32 = 1.4;
+
+/** The lintel across the posts: height of its centre, and thickness, height and span. */
+const PORTAL_LINTEL_Y : f32 = 1.45;
+const PORTAL_LINTEL_THICK : f32 = 0.26;
+const PORTAL_LINTEL_HEIGHT : f32 = 0.2;
+const PORTAL_LINTEL_SPAN : f32 = 1.1;
+
+/** The glowing core between the posts: its colour, the height of its centre and its size at rest. */
+const PORTAL_CORE_TINT : i32 = 0xB04BFF;
+const PORTAL_CORE_Y : f32 = 0.6;
+const PORTAL_CORE_WIDTH : f32 = 0.5;
+const PORTAL_CORE_HEIGHT : f32 = 0.95;
+const PORTAL_CORE_DEPTH : f32 = 0.7;
+
+/** The core breathes between `BASE - DEPTH` and `BASE + DEPTH` of its size, `SPEED` radians per frame. */
+const PORTAL_PULSE_BASE : f32 = 0.85;
+const PORTAL_PULSE_DEPTH : f32 = 0.15;
+const PORTAL_PULSE_SPEED : f32 = 0.12;
+
+/** The portal's bounds for the frustum test: half width in x and z, and the height of its middle and half height. */
+const PORTAL_CULL_HALF_XZ : f32 = 0.7;
+const PORTAL_CULL_Y : f32 = 0.8;
+
+/** The keep's bounds for the frustum test: the height of its middle, half width in x and z, and half height. */
+const KEEP_CULL_Y : f32 = 0.8;
+const KEEP_CULL_HALF_XZ : f32 = 0.8;
+const KEEP_CULL_HALF_Y : f32 = 1.0;
+
+/** The keep's main block: its width, its height (it sits on the lawn, so its centre is half that) and its tint. */
+const KEEP_WIDTH : f32 = 0.8;
+const KEEP_HEIGHT : f32 = 0.9;
+const KEEP_TINT : i32 = 0xE8E0D0;
+
+/** The keep has a turret at each of its four corners. */
+const KEEP_TURRETS : i32 = 4;
+
+/** A corner turret stands this far from the centre along each axis. */
+const TURRET_OFFSET : f32 = 0.38;
+
+/** A turret's centre height, width, height and tint. */
+const TURRET_Y : f32 = 0.6;
+const TURRET_WIDTH : f32 = 0.26;
+const TURRET_HEIGHT : f32 = 1.2;
+const TURRET_TINT : i32 = 0xD8D0C0;
+
+/** A turret's roof: the height of its centre, its width and thickness, and its red. */
+const TURRET_ROOF_Y : f32 = 1.28;
+const TURRET_ROOF_WIDTH : f32 = 0.34;
+const TURRET_ROOF_HEIGHT : f32 = 0.16;
+const TURRET_ROOF_TINT : i32 = 0xC04030;
+
+/** The flagpole: the height of its centre, its width and its height. */
+const POLE_Y : f32 = 1.25;
+const POLE_WIDTH : f32 = 0.05;
+const POLE_HEIGHT : f32 = 0.7;
+
+/** The flag: the height of its centre, its offset from the pole along z, and its thickness, height and length. */
+const FLAG_Y : f32 = 1.45;
+const FLAG_OFFSET_Z : f32 = 0.17;
+const FLAG_THICK : f32 = 0.03;
+const FLAG_HEIGHT : f32 = 0.26;
+const FLAG_LENGTH : f32 = 0.34;
+
+/** The blue of the cloth. */
+const FLAG_TINT : i32 = 0x3A6BFF;
+
+/** A tint that leaves a texture as it is. */
+const NO_TINT : i32 = 0xFFFFFF;
+
+/** Trees placed by a seed: positions and sizes around the board. */
+pub class Scenery {
+    /** World x of each tree. */
+    pub(crate) xs : Vec<f32>;
+
+    /** World z of each tree, paired with `xs` by index. */
+    pub(crate) zs : Vec<f32>;
+
+    /** Size multiplier of each tree, paired with `xs` by index. */
+    pub(crate) sizes : Vec<f32>;
+
+    /** Scatters trees for `seed`, never on the board itself. */
+    constructor(seed : u64) {
+        self.xs = new Vec<f32>();
+        self.zs = new Vec<f32>();
+        self.sizes = new Vec<f32>();
+        let rng = new Pcg32(seed, TREE_STREAM);
+        let width : f32 = GRID_W as f32;
+        let depth : f32 = GRID_H as f32;
+        while (self.xs.len() < TREE_COUNT) {
+            let x : f32 = rng.rangeF32(-TREE_REACH_X, width + TREE_REACH_X);
+            let z : f32 = rng.rangeF32(-TREE_REACH_Z, depth + TREE_REACH_Z);
+            let nearX : bool = x > -TREE_BOARD_MARGIN && x < width + TREE_BOARD_MARGIN;
+            let nearZ : bool = z > -TREE_BOARD_MARGIN && z < depth + TREE_BOARD_MARGIN;
+            if (nearX && nearZ) {
+                continue;
+            }
+
+            self.xs.push(x);
+            self.zs.push(z);
+            self.sizes.push(rng.rangeF32(TREE_SIZE_MIN, TREE_SIZE_MAX));
+        }
+    }
+}
+
+/** Draws the lawn, the route marking, rocks, trees, portal and keep. */
+pub fn drawGround(ctx : DrawCtx, world : World, route : RouteOverlay, scenery : Scenery) : void {
+    let centre : Vec3 = Vec3::make(GRID_W as f32 * 0.5, LAWN_DROP, GRID_H as f32 * 0.5);
+    let lawn : BoxSpec = BoxSpec { at: centre, size: Vec3::splat(1.0), tint: LAWN_TINT };
+    ctx.skinBox(ctx.assets.land, ctx.assets.grass, lawn);
+
+    for (t of 0..Grid::tileCount()) {
+        drawTile(ctx, world, route, t);
+    }
+    drawTrees(ctx, scenery);
+    drawPortal(ctx);
+    drawKeep(ctx);
+}
+
+// One lawn tile, the route in earth, and the rock if there is one.
+fn drawTile(ctx : DrawCtx, world : World, route : RouteOverlay, t : i32) : void {
+    let c = Grid::centerOf(t);
+    let centre : Vec3 = Vec3::make(c.x, 0.0, c.y);
+    let half : Vec3 = Vec3::make(TILE_HALF, TILE_HALF_THICK, TILE_HALF);
+    if (!ctx.sees(centre, half)) {
+        return;
+    }
+
+    let mut tint : i32 = TILE_TINT_LIGHT;
+    if ((Grid::colOf(t) + Grid::rowOf(t)) % 2 == 1) {
+        tint = TILE_TINT_DARK;
+    }
+    let mut surface = ctx.assets.grass;
+    if (route.covers(t)) {
+        surface = ctx.assets.dirt;
+    }
+    let tile : BoxSpec = BoxSpec { at: centre, size: Vec3::splat(1.0), tint: tint };
+    ctx.skinBox(ctx.assets.tile, surface, tile);
+
+    if (world.grid.isRock(t)) {
+        drawRock(ctx, centre, t);
+    }
+}
+
+// A lumpy boulder whose shape depends on its tile, so neighbours differ, with a small stone beside it.
+fn drawRock(ctx : DrawCtx, base : Vec3, t : i32) : void {
+    let wide : f32 = ROCK_WIDTH_BASE + (t % ROCK_WIDTH_CYCLE) as f32 * ROCK_WIDTH_STEP;
+    let tall : f32 = ROCK_HEIGHT_BASE + (t % ROCK_HEIGHT_CYCLE) as f32 * ROCK_HEIGHT_STEP;
+    let bigAt : Vec3 = Vec3::make(base.x, ROCK_BIG_Y, base.z);
+    let bigSize : Vec3 = Vec3::make(wide, tall, ROCK_DEPTH);
+    let big : BoxSpec = BoxSpec::make(bigAt, bigSize, ROCK_BIG_TINT);
+    ctx.skinTurned(ctx.assets.ball, ctx.assets.stone, big, t as f32);
+
+    let smallAt : Vec3 = Vec3::make(
+        base.x + ROCK_SMALL_OFFSET_X,
+        ROCK_SMALL_Y,
+        base.z + ROCK_SMALL_OFFSET_Z
+    );
+    let smallSize : Vec3 = Vec3::make(ROCK_SMALL_SIZE, ROCK_SMALL_HEIGHT, ROCK_SMALL_SIZE);
+    let small : BoxSpec = BoxSpec::make(smallAt, smallSize, ROCK_SMALL_TINT);
+    ctx.skinTurned(ctx.assets.ball, ctx.assets.stone, small, ROCK_SMALL_TURN);
+}
+
+// Trunk and two blobs of foliage for each scattered tree; `k` scales all of it.
+fn drawTrees(ctx : DrawCtx, s : Scenery) : void {
+    for (i of 0..s.xs.len()) {
+        let x : f32 = s.xs.get(i);
+        let z : f32 = s.zs.get(i);
+        let k : f32 = s.sizes.get(i);
+        let reach : Vec3 = Vec3::make(TREE_CULL_HALF_XZ * k, TREE_CULL_HALF_Y * k, TREE_CULL_HALF_XZ * k);
+        if (!ctx.sees(Vec3::make(x, k, z), reach)) {
+            continue;
+        }
+
+        let trunk : BoxSpec = BoxSpec {
+            at: Vec3::make(x, TREE_TRUNK_Y * k, z),
+            size: Vec3::make(TREE_TRUNK_WIDTH * k, TREE_TRUNK_HEIGHT * k, TREE_TRUNK_WIDTH * k),
+            tint: NO_TINT,
+        };
+        let lower : BoxSpec = BoxSpec {
+            at: Vec3::make(x, TREE_LOWER_Y * k, z),
+            size: Vec3::make(TREE_LOWER_WIDTH * k, TREE_LOWER_HEIGHT * k, TREE_LOWER_WIDTH * k),
+            tint: NO_TINT,
+        };
+        let upper : BoxSpec = BoxSpec {
+            at: Vec3::make(x, TREE_UPPER_Y * k, z),
+            size: Vec3::make(TREE_UPPER_WIDTH * k, TREE_UPPER_HEIGHT * k, TREE_UPPER_WIDTH * k),
+            tint: TREE_TOP_TINT,
+        };
+        ctx.skinBox(ctx.assets.cube, ctx.assets.wood, trunk);
+        ctx.skinBox(ctx.assets.ball, ctx.assets.leaves, lower);
+        ctx.skinBox(ctx.assets.ball, ctx.assets.leaves, upper);
+    }
+}
+
+// The purple gate the enemies come out of: two posts, a lintel and a pulsing core.
+fn drawPortal(ctx : DrawCtx) : void {
+    let c = Grid::centerOf(Grid::spawnTile());
+    let half : Vec3 = Vec3::make(PORTAL_CULL_HALF_XZ, PORTAL_CULL_Y, PORTAL_CULL_HALF_XZ);
+    if (!ctx.sees(Vec3::make(c.x, PORTAL_CULL_Y, c.y), half)) {
+        return;
+    }
+
+    let x : f32 = c.x + PORTAL_SHIFT_X;
+    let postSize : Vec3 = Vec3::make(PORTAL_POST_WIDTH, PORTAL_POST_HEIGHT, PORTAL_POST_WIDTH);
+    let near : BoxSpec = BoxSpec {
+        at: Vec3::make(x, PORTAL_POST_Y, c.y - PORTAL_POST_OFFSET),
+        size: postSize,
+        tint: NO_TINT,
+    };
+    let far : BoxSpec = BoxSpec {
+        at: Vec3::make(x, PORTAL_POST_Y, c.y + PORTAL_POST_OFFSET),
+        size: postSize,
+        tint: NO_TINT,
+    };
+    let lintel : BoxSpec = BoxSpec {
+        at: Vec3::make(x, PORTAL_LINTEL_Y, c.y),
+        size: Vec3::make(PORTAL_LINTEL_THICK, PORTAL_LINTEL_HEIGHT, PORTAL_LINTEL_SPAN),
+        tint: NO_TINT,
+    };
+    ctx.skinBox(ctx.assets.cube, ctx.assets.stone, near);
+    ctx.skinBox(ctx.assets.cube, ctx.assets.stone, far);
+    ctx.skinBox(ctx.assets.cube, ctx.assets.stone, lintel);
+
+    let beat : f32 = sin(ctx.light.clock * PORTAL_PULSE_SPEED);
+    let pulse : f32 = PORTAL_PULSE_BASE + PORTAL_PULSE_DEPTH * beat;
+    let coreSize : Vec3 = Vec3::make(
+        PORTAL_CORE_WIDTH * pulse,
+        PORTAL_CORE_HEIGHT * pulse,
+        PORTAL_CORE_DEPTH * pulse
+    );
+    let coreAt : Vec3 = Vec3::make(c.x, PORTAL_CORE_Y, c.y);
+    let core : BoxSpec = BoxSpec::make(coreAt, coreSize, PORTAL_CORE_TINT);
+    ctx.glowBox(ctx.assets.ball, ctx.assets.stone, core, 1.0);
+}
+
+// The base the enemies are after: a stone keep with corner turrets and a flag.
+fn drawKeep(ctx : DrawCtx) : void {
+    let c = Grid::centerOf(Grid::goalTile());
+    let half : Vec3 = Vec3::make(KEEP_CULL_HALF_XZ, KEEP_CULL_HALF_Y, KEEP_CULL_HALF_XZ);
+    if (!ctx.sees(Vec3::make(c.x, KEEP_CULL_Y, c.y), half)) {
+        return;
+    }
+
+    let block : BoxSpec = BoxSpec {
+        at: Vec3::make(c.x, KEEP_HEIGHT * 0.5, c.y),
+        size: Vec3::make(KEEP_WIDTH, KEEP_HEIGHT, KEEP_WIDTH),
+        tint: KEEP_TINT,
+    };
+    ctx.skinBox(ctx.assets.cube, ctx.assets.stone, block);
+
+    for (i of 0..KEEP_TURRETS) {
+        let dx : f32 = TURRET_OFFSET * (((i % 2) as f32) * (2.0 as f32) - (1.0 as f32));
+        let dz : f32 = TURRET_OFFSET * (((i / 2) as f32) * (2.0 as f32) - (1.0 as f32));
+        let turret : BoxSpec = BoxSpec {
+            at: Vec3::make(c.x + dx, TURRET_Y, c.y + dz),
+            size: Vec3::make(TURRET_WIDTH, TURRET_HEIGHT, TURRET_WIDTH),
+            tint: TURRET_TINT,
+        };
+        let roof : BoxSpec = BoxSpec {
+            at: Vec3::make(c.x + dx, TURRET_ROOF_Y, c.y + dz),
+            size: Vec3::make(TURRET_ROOF_WIDTH, TURRET_ROOF_HEIGHT, TURRET_ROOF_WIDTH),
+            tint: TURRET_ROOF_TINT,
+        };
+        ctx.skinBox(ctx.assets.cube, ctx.assets.stone, turret);
+        ctx.skinBox(ctx.assets.cube, ctx.assets.wood, roof);
+    }
+
+    let pole : BoxSpec = BoxSpec {
+        at: Vec3::make(c.x, POLE_Y, c.y),
+        size: Vec3::make(POLE_WIDTH, POLE_HEIGHT, POLE_WIDTH),
+        tint: NO_TINT,
+    };
+    let flag : BoxSpec = BoxSpec {
+        at: Vec3::make(c.x, FLAG_Y, c.y + FLAG_OFFSET_Z),
+        size: Vec3::make(FLAG_THICK, FLAG_HEIGHT, FLAG_LENGTH),
+        tint: FLAG_TINT,
+    };
+    ctx.skinBox(ctx.assets.cube, ctx.assets.wood, pole);
+    ctx.paintBox(ctx.assets.cube, ctx.assets.wood, flag);
+}

@@ -1,0 +1,150 @@
+// shots — flying projectiles and what they do on arrival.
+//
+// A shot homes on its target; if the target dies on the way it flies on to where it was last seen. An arrow
+// or frost bolt hurts only its target and only if it is still alive; a cannon shell explodes where it lands
+// and hurts everything near, less toward the edge of the blast. Frost bolts also lay a slow on the enemy,
+// which only ever gets stronger or longer, never weaker, when hit again.
+
+use ludax::{EntityId, Vec2, Vec3, max};
+
+use crate::audio::cues::Cue;
+use crate::sim::config::{SHOT_HEIGHT, PERCENT_WHOLE};
+use crate::sim::stats::{TowerKind, enemyStats};
+use crate::sim::units::{Shot, Enemy, Slow, FxKind, FxSpawn};
+use crate::sim::world::World;
+
+/** Fraction of a tile at which a shot counts as having arrived. */
+const ARRIVE_SLACK : f32 = 0.06;
+
+/** Height of a shell's arc at the middle of its flight, in tiles. */
+const SHELL_ARC : f32 = 1.2;
+
+/** Shortest start distance for which a shell arcs; below it the arc would divide by ~zero. */
+const SHELL_MIN_RANGE : f32 = 0.01;
+
+/** A shell's height over the flat flight is the arc height times this times `f * (1 - f)`. Double, so the product rounds once. */
+const SHELL_PARABOLA : f64 = 4.0;
+
+/** The spark where a bolt lands: its height, how fast it rises and how many ticks it lives. */
+const HIT_SPARK_HEIGHT : f32 = 0.7;
+const HIT_SPARK_RISE : f32 = 0.03;
+const HIT_SPARK_TICKS : i32 = 10;
+
+/** A blast's ring lies this high and lives this many ticks, and keeps the blast radius in hundredths of a tile. */
+const BLAST_RING_HEIGHT : f32 = 0.05;
+const BLAST_RING_TICKS : i32 = 18;
+const BLAST_RING_UNIT : f64 = 100.0;
+
+/** A blast hurts fully at its centre and `BLAST_FALLOFF` percent less at its rim (double, rounded down). */
+const BLAST_CENTRE : f64 = 100.0;
+const BLAST_FALLOFF : f64 = 50.0;
+
+/** One tick for every shot. */
+pub fn stepShots(w : World) : void {
+    w.doomedKeys.clear();
+    for (d of 0..w.shots.len()) {
+        let s : Shot = w.shots.valueAt(d);
+        if (advance(w, s, d)) {
+            w.doomedKeys.push(w.shots.keyAt(d));
+        }
+    }
+    for (i of 0..w.doomedKeys.len()) {
+        let key : i32 = w.doomedKeys.get(i);
+        w.shots.remove(key);
+        w.shotIds.destroy(w.shotIds.idAt(key));
+    }
+}
+
+// Moves the shot stored at dense position `d`; true when it has arrived and must be removed.
+fn advance(w : World, shot : Shot, d : i32) : bool {
+    let mut s : Shot = shot;
+    if (w.enemies.has(s.target)) {
+        s.aimAt = w.enemies.get(s.target).pos;
+    }
+    let toGo : Vec2 = s.aimAt.minus(s.pos);
+    let remaining : f32 = toGo.length();
+    if (remaining <= s.speed + ARRIVE_SLACK) {
+        s.pos = s.aimAt;
+        land(w, s);
+        return true;
+    }
+    s.pos = s.pos.plus(toGo.scale(s.speed / remaining));
+    s.height = heightAt(s, remaining);
+    w.shots.setValueAt(d, s);
+    return false;
+}
+
+// Flat flight for bolts, a parabola for shells.
+fn heightAt(s : Shot, remaining : f32) : f32 {
+    if (s.kind != TowerKind::Cannon || s.startDistance < SHELL_MIN_RANGE) {
+        return SHOT_HEIGHT;
+    }
+    let flown : f32 = (1.0 as f32) - remaining / s.startDistance;
+    let f : f32 = max(0.0, flown);
+    return SHOT_HEIGHT + SHELL_ARC * SHELL_PARABOLA * f * (1.0 - f);
+}
+
+// The shot reaches its end point.
+fn land(w : World, s : Shot) : void {
+    if (s.splash > 0.0) {
+        explode(w, s);
+        return;
+    }
+    if (w.enemies.has(s.target)) {
+        hurt(w, s.target, s.damage);
+        if (s.slowPercent > 0) {
+            applySlow(w, s.target, s.slowPercent, s.slowTicks);
+        }
+        w.spawnFx(FxSpawn {
+            kind: FxKind::Spark,
+            pos: Vec3::make(s.pos.x, HIT_SPARK_HEIGHT, s.pos.y),
+            vel: Vec3::make(0.0, HIT_SPARK_RISE, 0.0),
+            life: HIT_SPARK_TICKS,
+            value: 0,
+        });
+    }
+}
+
+// A blast: everything within the radius takes damage that falls off to half at the rim.
+fn explode(w : World, s : Shot) : void {
+    w.raise(Cue::Explode);
+    let ringSize : i32 = (s.splash * BLAST_RING_UNIT) as i32;
+    w.spawnFx(FxSpawn {
+        kind: FxKind::Ring,
+        pos: Vec3::make(s.pos.x, BLAST_RING_HEIGHT, s.pos.y),
+        vel: Vec3::zero(),
+        life: BLAST_RING_TICKS,
+        value: ringSize,
+    });
+    for (slot of 0..w.enemies.slotCount()) {
+        if (!w.enemies.isLiveAt(slot)) {
+            continue;
+        }
+        let e : Enemy = w.enemies.valueAt(slot);
+        let reach : f32 = s.splash + enemyStats(e.kind).radius;
+        let dist : f32 = e.pos.distance(s.pos);
+        if (dist <= reach) {
+            let share : i32 = (BLAST_CENTRE - BLAST_FALLOFF * dist / reach) as i32;
+            hurt(w, w.enemies.idAt(slot), s.damage * share / PERCENT_WHOLE);
+        }
+    }
+}
+
+fn hurt(w : World, id : EntityId, amount : i32) : void {
+    let mut e : Enemy = w.enemies.get(id);
+    e.health = e.health - amount;
+    w.enemies.set(id, e);
+}
+
+fn applySlow(w : World, id : EntityId, percent : i32, ticks : i32) : void {
+    let old : Slow = w.slows.getOr(id.index, Slow { percent: 0, ticks: 0 });
+    let mut strongest : i32 = percent;
+    if (old.percent > strongest) {
+        strongest = old.percent;
+    }
+    let mut longest : i32 = ticks;
+    if (old.ticks > longest) {
+        longest = old.ticks;
+    }
+    w.slows.insert(id.index, Slow { percent: strongest, ticks: longest });
+}

@@ -1,0 +1,195 @@
+// commands — what the player can do to the world: build, upgrade, sell, call a wave early.
+//
+// Each command checks its rules first and answers with a `Verdict`, so the interface can say *why* a click
+// did nothing. The interesting rule is the last one for building: a tower is a wall, so before it goes down
+// the map is flood-filled from the base with the tile blocked, and the build is refused unless the spawn and
+// every enemy on the field can still walk to the base. The lane can therefore be lengthened and bent into a
+// maze but never shut.
+
+use ludax::EntityId;
+
+use crate::audio::cues::Cue;
+use crate::sim::config::{SELL_PERCENT, MAX_LEVEL, EARLY_BONUS_PER_SECOND, TICK_HZ, PERCENT_WHOLE};
+use crate::sim::grid::Grid;
+use crate::sim::stats::{TowerKind, towerStats};
+use crate::sim::units::{Tower, Enemy};
+use crate::sim::wave_clock::startWave;
+use crate::sim::world::World;
+
+/** Ticks a newly built tower waits before its first shot. */
+const TOWER_FIRST_SHOT : i32 = 30;
+
+/** Ticks-since-last-shot a new tower reports, so it draws without recoil. */
+const TOWER_NO_RECOIL : i32 = 100;
+
+/** The outcome of a command. */
+pub enum Verdict : i8 {
+    /** It worked. */
+    Done = 0,
+
+    /** Not enough gold. */
+    NoGold = 1,
+
+    /** Something already stands there, or the tile is not buildable. */
+    Occupied = 2,
+
+    /** An enemy is on or about to step onto the tile. */
+    EnemyInWay = 3,
+
+    /** The tower would close the last route to the base. */
+    CutsRoute = 4,
+
+    /** The tower is already at its top level. */
+    MaxLevel = 5,
+
+    /** There is no such tower. */
+    NoTower = 6,
+
+    /** A wave is still being released. */
+    WaveBusy = 7,
+
+    /** The sentence the interface shows for this outcome. */
+    pub fn message(self) : string {
+        return match self {
+            Verdict::Done => "Done",
+            Verdict::NoGold => "Not enough gold",
+            Verdict::Occupied => "Tile is not free",
+            Verdict::EnemyInWay => "An enemy is in the way",
+            Verdict::CutsRoute => "That would block the route",
+            Verdict::MaxLevel => "Already at maximum level",
+            Verdict::NoTower => "No tower there",
+            Verdict::WaveBusy => "A wave is still arriving",
+        };
+    }
+}
+
+/** Whether a `kind` tower could be built on tile `t` right now, without building it. */
+pub fn checkBuild(w : World, kind : TowerKind, t : i32) : Verdict {
+    if (!w.grid.isBuildable(t)) {
+        return Verdict::Occupied;
+    }
+    if (w.gold < towerStats(kind, 1).cost) {
+        return Verdict::NoGold;
+    }
+    if (enemyNear(w, t)) {
+        return Verdict::EnemyInWay;
+    }
+    w.grid.setTowerBlock(t, true);
+    let open : bool = routeStaysOpen(w);
+    w.grid.setTowerBlock(t, false);
+    if (!open) {
+        return Verdict::CutsRoute;
+    }
+    return Verdict::Done;
+}
+
+/** Builds a `kind` tower on tile `t` if the rules allow, spending the gold and re-pathing the enemies. */
+pub fn buildTower(w : World, kind : TowerKind, t : i32) : Verdict {
+    let verdict : Verdict = checkBuild(w, kind, t);
+    if (verdict != Verdict::Done) {
+        w.raise(Cue::Deny);
+        return verdict;
+    }
+    let cost : i32 = towerStats(kind, 1).cost;
+    w.gold = w.gold - cost;
+    let tower : Tower = Tower {
+        kind: kind,
+        tile: t,
+        level: 1,
+        cooldown: TOWER_FIRST_SHOT,
+        invested: cost,
+        aim: 0.0,
+        sinceShot: TOWER_NO_RECOIL,
+    };
+    w.towerAt.put(t, w.towers.insert(tower).bits());
+    w.grid.setTowerBlock(t, true);
+    w.routes.invalidate();
+    w.raise(Cue::Build);
+    return Verdict::Done;
+}
+
+/** Raises the tower `id` one level if it has gold and room to grow. */
+pub fn upgradeTower(w : World, id : EntityId) : Verdict {
+    if (!w.towers.has(id)) {
+        return Verdict::NoTower;
+    }
+    let mut t : Tower = w.towers.get(id);
+    if (t.level >= MAX_LEVEL) {
+        w.raise(Cue::Deny);
+        return Verdict::MaxLevel;
+    }
+    let price : i32 = towerStats(t.kind, t.level).upgradeCost;
+    if (w.gold < price) {
+        w.raise(Cue::Deny);
+        return Verdict::NoGold;
+    }
+    w.gold = w.gold - price;
+    t.level = t.level + 1;
+    t.invested = t.invested + price;
+    w.towers.set(id, t);
+    w.raise(Cue::Upgrade);
+    return Verdict::Done;
+}
+
+/** Sells the tower `id` for a share of what it cost, opening its tile again. */
+pub fn sellTower(w : World, id : EntityId) : Verdict {
+    if (!w.towers.has(id)) {
+        return Verdict::NoTower;
+    }
+    let t : Tower = w.towers.get(id);
+    w.gold = w.gold + sellValue(t);
+    w.towerAt.remove(t.tile);
+    w.towers.remove(id);
+    w.grid.setTowerBlock(t.tile, false);
+    w.routes.invalidate();
+    w.raise(Cue::Sell);
+    return Verdict::Done;
+}
+
+/** What selling `t` pays. */
+pub fn sellValue(t : Tower) : i32 {
+    return t.invested * SELL_PERCENT / PERCENT_WHOLE;
+}
+
+/** Calls the next wave now, paying a bonus for the waiting skipped. Refused while a wave is arriving. */
+pub fn callWaveEarly(w : World) : Verdict {
+    if (w.spawning) {
+        w.raise(Cue::Deny);
+        return Verdict::WaveBusy;
+    }
+    w.gold = w.gold + w.countdown / TICK_HZ * EARLY_BONUS_PER_SECOND;
+    startWave(w);
+    return Verdict::Done;
+}
+
+// True when an enemy stands on tile `t` or is walking onto it.
+fn enemyNear(w : World, t : i32) : bool {
+    for (slot of 0..w.enemies.slotCount()) {
+        if (!w.enemies.isLiveAt(slot)) {
+            continue;
+        }
+        let e : Enemy = w.enemies.valueAt(slot);
+        if (e.fromTile == t || e.toTile == t) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// With the candidate tile already marked blocked: can the spawn and every enemy still reach the base?
+fn routeStaysOpen(w : World) : bool {
+    w.routes.finder().reachableFrom(w.grid.blockedSet(), Grid::goalTile(), w.reached);
+    if (!w.reached.has(Grid::spawnTile())) {
+        return false;
+    }
+    for (slot of 0..w.enemies.slotCount()) {
+        if (!w.enemies.isLiveAt(slot)) {
+            continue;
+        }
+        let e : Enemy = w.enemies.valueAt(slot);
+        if (!w.reached.has(e.fromTile) || !w.reached.has(e.toTile)) {
+            return false;
+        }
+    }
+    return true;
+}
