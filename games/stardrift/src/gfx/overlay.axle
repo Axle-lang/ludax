@@ -1,0 +1,258 @@
+// overlay — the F3 debug panel: frame time, entity counts, the profiler's ranking and the last log lines.
+//
+// It reads the engine's own instruments rather than keeping any of its own: scope timings come from Ludax's
+// `Profiler` (the last finished frame, most expensive first), the log lines from the `MemorySink` behind the
+// game's `Logger`, and the frame-time graph from a `Ring` of recent frame lengths. Frame times are
+// the only thing that differs from run to run, so nothing in the simulation may read them. The panel is laid
+// out top to bottom in sections, each of which answers the `y` where the next begins; every offset inside a
+// section is a named constant.
+
+use ludax::{Ring, LogRecord, ProfileEntry};
+use smalt::{Frame, Rect};
+
+use crate::core::config::{BULLET_CAPACITY, PARTICLE_CAPACITY};
+use crate::core::palette::{PAL_TEXT, PAL_TEXT_DIM, PAL_ACCENT};
+use crate::gfx::draw::{Draw, Pixel};
+use crate::gfx::typeface::Typeface;
+use crate::sim::world::World;
+
+/** Frames of history in the graph. */
+const HISTORY : i32 = 120;
+
+/** Left edge of the panel: the view is 960 wide and the panel 336 from its right edge. */
+const PANEL_X : i32 = 624;
+
+/** Top edge of the panel. */
+const PANEL_Y : i32 = 70;
+
+/** Width of the panel. */
+const PANEL_W : i32 = 320;
+
+/** Height of the panel. */
+const PANEL_H : i32 = 440;
+
+/** How opaque the panel is over the scene, as a fraction. */
+const PANEL_OPACITY_NUM : i32 = 7;
+const PANEL_OPACITY_DEN : i32 = 10;
+
+/** Space between the panel's edge and its text on the left and at the top. */
+const PANEL_PAD : i32 = 10;
+const PANEL_PAD_TOP : i32 = 8;
+
+/** Height of one text line. */
+const LINE : i32 = 15;
+
+/** Text scale of everything in the panel. */
+const OVERLAY_SCALE : i32 = 1;
+
+/** Extra space after the title, after the counters, after the graph and after the profiler's rows. */
+const TITLE_GAP : i32 = 2;
+const COUNTERS_GAP : i32 = 4;
+const GRAPH_GAP : i32 = 8;
+const PROFILE_GAP : i32 = 6;
+
+/** Profiler rows shown. */
+const ROWS : i32 = 9;
+
+/** Log lines shown. */
+const LOG_LINES : i32 = 5;
+
+/** Nanoseconds per millisecond, as a real. */
+const NANOS_PER_MS : f64 = 1000000.0;
+
+/** Where the second figure of a row starts: "tick" beside the frame rate, "queued spawns" beside the grid. */
+const TICK_COLUMN : i32 = 110;
+const SPAWNS_COLUMN : i32 = 150;
+
+/** Decimals shown for a frame rate and for a scope's milliseconds. */
+const FPS_DECIMALS : i32 = 1;
+const MILLIS_DECIMALS : i32 = 3;
+
+/** Colour of the frame-time line and its fill. */
+const GRAPH_INK : i32 = 0x6FE3FF;
+const GRAPH_FILL : i32 = 0x14303C;
+
+/** Fallback top of the frame-time graph, in microseconds, when every sample is tiny. */
+const GRAPH_FLOOR : i32 = 8000;
+
+/** Height of the graph, and how far from the right edge of its row its "max" label starts. */
+const GRAPH_H : i32 = 44;
+const GRAPH_MAX_LEFT : i32 = 90;
+
+/** Background of the panel and of the graph inside it. */
+const PANEL_FILL : i32 = 0x05070F;
+const GRAPH_BG : i32 = 0x0A0E1A;
+
+/** The profiler table's columns, measured from the panel's text edge: right edges of "incl ms", "self" and "n". */
+const PROFILE_INCL_RIGHT : i32 = 210;
+const PROFILE_SELF_RIGHT : i32 = 270;
+const PROFILE_CALLS_RIGHT : i32 = 300;
+
+/** Where the inclusive and self milliseconds of a row start. */
+const PROFILE_INCL_LEFT : i32 = 150;
+const PROFILE_SELF_LEFT : i32 = 225;
+
+/** A count shown against the most it can reach: "bullets 12 / 320". */
+struct Ratio {
+    label : string;
+    value : i64;
+    sep   : string;
+    total : i64;
+}
+
+/** The debug panel. */
+pub class Overlay {
+    frames  : Ring<i32>;
+    samples : i32[];
+
+    /** An empty history. */
+    constructor() {
+        self.frames = new Ring<i32>(HISTORY);
+        self.samples = new i32[HISTORY as i64];
+    }
+
+    /** Records how long the last frame took, in microseconds. */
+    pub fn record(mut self, micros : i32) : void {
+        self.frames.pushOverwrite(micros);
+    }
+
+    /** Draws the panel. */
+    pub fn draw(mut self, f : Frame, kit : Typeface, w : World, fps : f64) : void {
+        let panel : Rect = Rect::make(PANEL_X, PANEL_Y, PANEL_W, PANEL_H);
+        f.shade(panel, PANEL_FILL, PANEL_OPACITY_NUM, PANEL_OPACITY_DEN);
+        f.border(panel, Draw::half(PAL_TEXT_DIM));
+
+        let x : i32 = PANEL_X + PANEL_PAD;
+        let mut y : i32 = PANEL_Y + PANEL_PAD_TOP;
+        kit.text(x, y, "DEBUG  F3", OVERLAY_SCALE, PAL_ACCENT);
+        y = y + LINE + TITLE_GAP;
+        y = self.counters(f, kit, w, fps, Pixel::at(x, y));
+        y = self.graph(f, kit, x, y);
+        y = self.profile(f, kit, w, x, y);
+        self.logLines(kit, w, x, y);
+    }
+
+    // "label value / total" on one row: the value bright, the limit dim.
+    fn ratio(self, kit : Typeface, at : Pixel, r : Ratio) : void {
+        let pen : i32 = kit.plain(at.x, at.y, r.label, r.value, OVERLAY_SCALE, PAL_TEXT);
+        kit.plain(pen, at.y, r.sep, r.total, OVERLAY_SCALE, PAL_TEXT_DIM);
+    }
+
+    // The numbers that say how busy the world is. `at` is the top left of the first row; answers where the
+    // next section begins.
+    fn counters(self, f : Frame, kit : Typeface, w : World, fps : f64, at : Pixel) : i32 {
+        let x : i32 = at.x;
+        let mut y : i32 = at.y;
+        let pen : i32 = kit.text(x, y, "fps ", OVERLAY_SCALE, PAL_TEXT_DIM);
+        kit.fixed(pen, y, fps, FPS_DECIMALS, OVERLAY_SCALE, PAL_TEXT);
+        kit.plain(x + TICK_COLUMN, y, "tick ", w.tickCount, OVERLAY_SCALE, PAL_TEXT);
+        y = y + LINE;
+
+        let entities : Ratio = Ratio {
+            label: "entities ",
+            value: w.entities.len() as i64,
+            sep: " / slots ",
+            total: w.entities.slotCount() as i64,
+        };
+        self.ratio(kit, Pixel::at(x, y), entities);
+        y = y + LINE;
+
+        let bullets : Ratio = Ratio {
+            label: "bullets ",
+            value: w.bullets.count() as i64,
+            sep: " / ",
+            total: BULLET_CAPACITY as i64,
+        };
+        self.ratio(kit, Pixel::at(x, y), bullets);
+        y = y + LINE;
+
+        let particles : Ratio = Ratio {
+            label: "particles ",
+            value: w.fx.field.pool.count() as i64,
+            sep: " / ",
+            total: PARTICLE_CAPACITY as i64,
+        };
+        self.ratio(kit, Pixel::at(x, y), particles);
+        y = y + LINE;
+
+        kit.plain(x, y, "grid proxies ", w.grid.count() as i64, OVERLAY_SCALE, PAL_TEXT);
+        let spawns : i64 = w.director.pending() as i64;
+        kit.plain(x + SPAWNS_COLUMN, y, "queued spawns ", spawns, OVERLAY_SCALE, PAL_TEXT);
+        y = y + LINE;
+
+        kit.plain(x, y, "seed ", w.seed as i64, OVERLAY_SCALE, PAL_TEXT_DIM);
+        return y + LINE + COUNTERS_GAP;
+    }
+
+    // The frame-length graph, newest frame at the right.
+    fn graph(mut self, f : Frame, kit : Typeface, x : i32, top : i32) : i32 {
+        let n : i32 = self.frames.len();
+        let mut worst : i32 = GRAPH_FLOOR;
+        for (i of 0..n) {
+            let v : i32 = self.frames.get(i);
+            self.samples[i as i64] = v;
+            if (v > worst) {
+                worst = v;
+            }
+        }
+
+        kit.text(x, top, "frame time (us)", OVERLAY_SCALE, PAL_TEXT_DIM);
+        kit.plain(
+            x + PANEL_W - GRAPH_MAX_LEFT,
+            top,
+            "max ",
+            worst as i64,
+            OVERLAY_SCALE,
+            PAL_TEXT_DIM
+        );
+
+        let box : Rect = Rect::make(x, top + LINE, PANEL_W - 2 * PANEL_PAD, GRAPH_H);
+        f.fillRect(box, GRAPH_BG);
+        f.spark(box, self.samples, n, 0, worst, GRAPH_INK, GRAPH_FILL);
+        return top + LINE + GRAPH_H + GRAPH_GAP;
+    }
+
+    // The profiler's ranking: name, inclusive and self milliseconds, calls.
+    fn profile(self, f : Frame, kit : Typeface, w : World, x : i32, top : i32) : i32 {
+        let prof = w.tm.prof;
+        kit.text(x, top, "scope", OVERLAY_SCALE, PAL_TEXT_DIM);
+        kit.right(x + PROFILE_INCL_RIGHT, top, "incl ms", OVERLAY_SCALE, PAL_TEXT_DIM);
+        kit.right(x + PROFILE_SELF_RIGHT, top, "self", OVERLAY_SCALE, PAL_TEXT_DIM);
+        kit.right(x + PROFILE_CALLS_RIGHT, top, "n", OVERLAY_SCALE, PAL_TEXT_DIM);
+
+        let mut y : i32 = top + LINE;
+        let rows : i32 = prof.entryCount().min(ROWS);
+        for (rank of 0..rows) {
+            let e : ProfileEntry = prof.entry(rank);
+            kit.text(x, y, w.tm.names.name(e.scope), OVERLAY_SCALE, PAL_TEXT);
+            self.millis(kit, x + PROFILE_INCL_LEFT, y, e.inclusiveNanos, PAL_TEXT);
+            self.millis(kit, x + PROFILE_SELF_LEFT, y, e.selfNanos, PAL_TEXT_DIM);
+            kit.numberRight(
+                x + PROFILE_CALLS_RIGHT,
+                y,
+                e.calls as i64,
+                OVERLAY_SCALE,
+                PAL_TEXT_DIM
+            );
+            y = y + LINE;
+        }
+        return y + PROFILE_GAP;
+    }
+
+    fn millis(self, kit : Typeface, x : i32, y : i32, nanos : i64, ink : i32) : void {
+        let ms : f64 = (nanos as f64) / NANOS_PER_MS;
+        kit.fixed(x, y, ms, MILLIS_DECIMALS, OVERLAY_SCALE, ink);
+    }
+
+    // The newest log lines, oldest first.
+    fn logLines(self, kit : Typeface, w : World, x : i32, top : i32) : void {
+        kit.text(x, top, "log", OVERLAY_SCALE, PAL_TEXT_DIM);
+        let sink = w.tm.log.sink();
+        let shown : i32 = sink.count().min(LOG_LINES);
+        let first : i32 = sink.count() - shown;
+        for (i of 0..shown) {
+            let r : LogRecord = sink.at(first + i);
+            kit.text(x, top + LINE * (i + 1), r.message, OVERLAY_SCALE, PAL_TEXT);
+        }
+    }
+}

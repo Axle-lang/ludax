@@ -1,0 +1,235 @@
+// field — draws the playfield: backdrop, stars, entities, shots, particles, popups and the screen flash.
+//
+// Everything here reads the world and writes pixels; nothing changes the simulation. The scene is drawn with
+// an offset (the screen shake) so that the HUD, drawn afterwards without it, stays still while the world
+// trembles. What the individual things look like is in `hulls`; this file is the order they are painted in
+// and the effects that are not hulls. Sparks and glows are additive, so overlapping fire adds up to white
+// the way light does.
+
+use smalt::{Frame, Rect, Color};
+
+use crate::core::config::{VIEW_W, VIEW_H};
+use crate::core::palette::{PAL_SKY_TOP, PAL_SKY_BOTTOM, PAL_SHOT, PAL_BOLT};
+use crate::core::types::{Entity, Kind, Bullet, Particle, Popup};
+use crate::gfx::draw::{Draw, Offset, Pixel};
+use crate::gfx::hulls::Hulls;
+use crate::gfx::typeface::Typeface;
+use crate::sim::stars::Star;
+use crate::sim::world::World;
+
+/** Base brightness of a star and the range its twinkle adds, in 0..255. */
+const STAR_BASE : i32 = 160;
+const STAR_TWINKLE : i32 = 90;
+
+/** How fast a star's twinkle runs through its range: steps of phase per tick. */
+const STAR_TWINKLE_RATE : i32 = 7;
+
+/** Blue lead of a star over its red and green, and the layer that is nearest and so streaks. */
+const STAR_BLUE : i32 = 30;
+const STAR_NEAREST : i32 = 3;
+
+/** Scale of a fully opaque colour channel. */
+const FIELD_ALPHA : i32 = 256;
+
+/** Core colours of an enemy bolt and of a ship shot. */
+const BOLT_CORE : i32 = 0xFFD0C0;
+const SHOT_CORE : i32 = 0xFFFFFF;
+
+/** Ship speed per streak pixel behind the nearest stars, and the velocity divisor of a streak's length. */
+const STREAK_SPEED : i32 = 90;
+const STREAK_SCALE : i32 = 300;
+
+/** Colour of a score popup and of its multiplier. */
+const POPUP_COLOR : i32 = 0xFFE9A0;
+const POPUP_MULTIPLIER : i32 = 0xFF8A4A;
+
+/** Velocity divisor that turns a shot's velocity into the length of its streak. */
+const SHOT_STREAK : i32 = 28;
+
+/** Colour of the full-screen flash. */
+const FLASH_COLOR : i32 = 0xFFFFFF;
+
+/** Strength of the full-screen flash at full flash, out of `FLASH_OUT_OF`. */
+const FLASH_STRENGTH : f32 = 100.0;
+const FLASH_OUT_OF : i32 = 255;
+
+/** The glow of an enemy bolt: radius and percent; and the radius of its bright core. */
+const BOLT_GLOW_RADIUS : i32 = 13;
+const BOLT_GLOW_PERCENT : i32 = 90;
+const BOLT_CORE_RADIUS : i32 = 3;
+
+/** The glow at the head of a ship shot: radius and percent; and the radius of its white core. */
+const SHOT_GLOW_RADIUS : i32 = 9;
+const SHOT_GLOW_PERCENT : i32 = 50;
+const SHOT_CORE_RADIUS : i32 = 1;
+
+/** A spark brighter than this share of full strength, out of `FIELD_ALPHA`, grows a cross of dimmer pixels. */
+const PARTICLE_CROSS_ABOVE : i32 = 128;
+
+/** A popup's brightness is its remaining ticks times this plus the floor, out of `FIELD_ALPHA`. */
+const POPUP_FADE_PER_TICK : i32 = 4;
+const POPUP_FADE_FLOOR : i32 = 40;
+
+/** A popup's text scale, how far its number starts left of its position, and the gap before its multiplier. */
+const POPUP_SCALE : i32 = 1;
+const POPUP_LEFT : i32 = 14;
+const POPUP_GAP : i32 = 3;
+
+/** Drawing of the playfield. */
+pub class FieldView {
+    /** Paints the whole field. `shake` is the screen-shake offset. */
+    pub static fn draw(f : Frame, w : World, kit : Typeface, shake : Offset) : void {
+        FieldView::backdrop(f);
+        FieldView::stars(f, w, shake);
+        FieldView::entities(f, w, shake, kit);
+        FieldView::bullets(f, w, shake);
+        Hulls::ship(f, w.ship, w.tickCount as i32, shake);
+        FieldView::particles(f, w, shake);
+        FieldView::popups(w, shake, kit);
+        FieldView::flash(f, w);
+    }
+
+    // A vertical gradient, one row at a time.
+    static fn backdrop(f : Frame) : void {
+        for (y of 0..VIEW_H) {
+            f.hLine(0, y, VIEW_W, Color::mix(PAL_SKY_TOP, PAL_SKY_BOTTOM, y, VIEW_H));
+        }
+    }
+
+    // Stars twinkle; the nearest layer stretches into streaks against the ship's velocity.
+    static fn stars(f : Frame, w : World, shake : Offset) : void {
+        let streak : i32 = (w.ship.speed() as i32) / STREAK_SPEED;
+        for (i of 0..w.stars.stars.len()) {
+            let s : Star = w.stars.stars.get(i);
+            let twinkle : i32 = STAR_BASE
+                + ((w.tickCount as i32 + s.phase * STAR_TWINKLE_RATE) % STAR_TWINKLE);
+            let level : i32 = (twinkle * s.layer) / STAR_NEAREST;
+            let color : i32 = Color::packBytes(level, level, Color::clamp8(level + STAR_BLUE));
+            let x : i32 = (s.x as i32) + shake.x * s.layer / STAR_NEAREST;
+            let y : i32 = (s.y as i32) + shake.y * s.layer / STAR_NEAREST;
+            Draw::add(f, x, y, color);
+            if (s.layer == STAR_NEAREST) {
+                Draw::add(f, x + 1, y, color);
+                Draw::add(f, x, y + 1, Draw::half(color));
+                for (k of 1..streak + 1) {
+                    let tx : i32 = x - (w.ship.vx as i32) * k / STREAK_SCALE;
+                    let ty : i32 = y - (w.ship.vy as i32) * k / STREAK_SCALE;
+                    Draw::add(f, tx, ty, Color::scale(color, 1, k + 1));
+                }
+            }
+        }
+    }
+
+    // Rocks, drones, gunships and pick-ups, each by its own hull.
+    static fn entities(f : Frame, w : World, shake : Offset, kit : Typeface) : void {
+        for (slot of 0..w.entities.slotCount()) {
+            if (!w.entities.isLiveAt(slot)) {
+                continue;
+            }
+            let e : Entity = w.entities.valueAt(slot);
+            match e.kind {
+                Kind::Rock => Hulls::rock(f, e, shake),
+                Kind::Drone => Hulls::drone(f, e, shake),
+                Kind::Gunship => Hulls::gunship(f, e, shake),
+                Kind::Pickup => {
+                    let left : i32 = w.lifetimes.getOr(w.entities.idAt(slot).index, 0);
+                    Hulls::pickup(f, e, left, shake, kit);
+                },
+            }
+        }
+    }
+
+    // Ship shots are short streaks, enemy bolts are glowing orbs.
+    static fn bullets(f : Frame, w : World, shake : Offset) : void {
+        let mut slot : i32 = w.bullets.first();
+        while (slot >= 0) {
+            let b : Bullet = w.bullets.get(slot);
+            let head : Pixel = Pixel::shaken(b.x, b.y, shake);
+            if (b.hostile) {
+                FieldView::bolt(f, head);
+            } else {
+                FieldView::shot(f, head, b);
+            }
+            slot = w.bullets.next(slot);
+        }
+    }
+
+    // An enemy bolt: a red glow around a pale core.
+    static fn bolt(f : Frame, head : Pixel) : void {
+        Draw::glow(f, head, BOLT_GLOW_RADIUS, PAL_BOLT, BOLT_GLOW_PERCENT);
+        f.disc(head.x, head.y, BOLT_CORE_RADIUS, BOLT_CORE);
+    }
+
+    // A ship shot: a streak trailing back along its velocity to a bright head, with a second dimmer line beside it.
+    static fn shot(f : Frame, head : Pixel, b : Bullet) : void {
+        let tail : Pixel = Pixel::at(
+            head.x - (b.vx as i32) / SHOT_STREAK,
+            head.y - (b.vy as i32) / SHOT_STREAK
+        );
+        let beside : Pixel = Pixel::at(tail.x + 1, tail.y);
+        let ahead : Pixel = Pixel::at(head.x + 1, head.y);
+        Draw::glow(f, head, SHOT_GLOW_RADIUS, PAL_SHOT, SHOT_GLOW_PERCENT);
+        Draw::lineAdd(f, tail, head, PAL_SHOT);
+        Draw::lineAdd(f, beside, ahead, Draw::half(PAL_SHOT));
+        f.disc(head.x, head.y, SHOT_CORE_RADIUS, SHOT_CORE);
+    }
+
+    // Sparks fade with age; rings expand and thin out.
+    static fn particles(f : Frame, w : World, shake : Offset) : void {
+        let pool = w.fx.field.pool;
+        let mut slot : i32 = pool.first();
+        while (slot >= 0) {
+            let p : Particle = pool.get(slot);
+            let k : i32 = (p.life * FIELD_ALPHA) / p.span;
+            let color : i32 = Color::scale(p.color, k, FIELD_ALPHA);
+            let at : Pixel = Pixel::shaken(p.x, p.y, shake);
+            if (p.ring) {
+                Draw::ringAdd(f, at, p.size as i32, color);
+                Draw::ringAdd(f, at, (p.size as i32) + 1, Draw::half(color));
+            } else {
+                Draw::add(f, at.x, at.y, color);
+                if (k > PARTICLE_CROSS_ABOVE) {
+                    let dim : i32 = Draw::half(color);
+                    Draw::add(f, at.x + 1, at.y, dim);
+                    Draw::add(f, at.x - 1, at.y, dim);
+                    Draw::add(f, at.x, at.y + 1, dim);
+                    Draw::add(f, at.x, at.y - 1, dim);
+                }
+            }
+            slot = pool.next(slot);
+        }
+    }
+
+    // Floating score numbers, fading out; a multiplier is shown after the points.
+    static fn popups(w : World, shake : Offset, kit : Typeface) : void {
+        let pool = w.fx.popups;
+        let mut slot : i32 = pool.first();
+        while (slot >= 0) {
+            let p : Popup = pool.get(slot);
+            let fade : i32 = p.life * POPUP_FADE_PER_TICK + POPUP_FADE_FLOOR;
+            let at : Pixel = Pixel::shaken(p.x, p.y, shake);
+            let ink : i32 = Color::scale(POPUP_COLOR, fade, FIELD_ALPHA);
+            let pen : i32 = kit.prefixed(
+                at.x - POPUP_LEFT,
+                at.y,
+                "+",
+                p.value as i64,
+                POPUP_SCALE,
+                ink
+            );
+            if (p.multiplier > 1) {
+                let tint : i32 = Color::scale(POPUP_MULTIPLIER, fade, FIELD_ALPHA);
+                kit.prefixed(pen + POPUP_GAP, at.y, "x", p.multiplier as i64, POPUP_SCALE, tint);
+            }
+            slot = pool.next(slot);
+        }
+    }
+
+    // A white wash over the whole screen for big explosions.
+    static fn flash(f : Frame, w : World) : void {
+        if (w.fx.flash > 0.0) {
+            let strength : i32 = (w.fx.flash * FLASH_STRENGTH) as i32;
+            f.shade(Rect::make(0, 0, VIEW_W, VIEW_H), FLASH_COLOR, strength, FLASH_OUT_OF);
+        }
+    }
+}

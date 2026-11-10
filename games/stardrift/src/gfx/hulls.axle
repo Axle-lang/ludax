@@ -1,0 +1,397 @@
+// hulls — what each thing in the slab looks like: rocks, drones, gunships, pick-ups and the ship.
+//
+// Vector style: a dark fill with a bright edge and, for the ships, an additive glow. A rock is a ring of
+// vertices whose distance from the centre comes from a hash of the rock's seed, so every rock keeps its own
+// outline however it spins; its facets are shaded by how far they face the light. Ships are arrowheads or
+// hexagons built from triangles and lines. Every size, offset and tint is a named constant grouped by the
+// thing it shapes, so a hull can be reshaped without reading the drawing code.
+
+use ludax::{sin, cos, hashMix, TAU, HALF_PI};
+use smalt::{Frame, Rect, Color};
+
+use crate::core::config::HALF;
+use crate::core::palette::{
+    PAL_ROCK_FILL, PAL_ROCK_EDGE, PAL_SHIP_FILL, PAL_SHIP_EDGE, PAL_DRONE_FILL, PAL_DRONE_EDGE,
+    PAL_GUNSHIP_FILL, PAL_GUNSHIP_EDGE, PAL_SHIELD, PAL_RAPID, PAL_SPREAD, PAL_NOVA
+};
+use crate::core::types::{Entity, Power};
+use crate::gfx::draw::{Draw, Offset, Pixel};
+use crate::gfx::typeface::Typeface;
+use crate::sim::factory::Factory;
+use crate::sim::ship::Ship;
+
+/** The brightest value of one colour channel. */
+const HULL_CHANNEL_MAX : i32 = 255;
+
+/** Edge colour of anything that was just hit. */
+const HIT_EDGE : i32 = 0xFFFFFF;
+
+/** Direction the light comes from (up and to the left). */
+const LIGHT_ANGLE : f32 = -2.4;
+
+/** How far a facet turned towards the light brightens. */
+const LIGHT_RANGE : f32 = 160.0;
+
+/** Brightness a facet has when it faces away from the light, in 0..255. */
+const LIGHT_BASE : i32 = 95;
+
+/** Converts a percentage to a factor. */
+const PERCENT : f32 = 0.01;
+
+/** Vertices of a rock's outline. */
+const ROCK_SIDES : i32 = 11;
+
+/** The hash that shapes a rock reads this many vertex slots per seed, so neighbouring seeds do not share one. */
+const ROCK_HASH_STRIDE : i64 = 64;
+
+/** The hash is cut to this many bits before it picks a reach. */
+const ROCK_HASH_MASK : i64 = 0xFFFF;
+
+/** Smallest and largest share of its radius a rock's vertex reaches, in percent. */
+const ROCK_ROUGH_MIN : i32 = 74;
+const ROCK_ROUGH_MAX : i32 = 100;
+
+/** A facet's fill is the rock's fill at `ROCK_FILL_UNIT` percent plus a share of the facet's light. */
+const ROCK_FILL_UNIT : i32 = 100;
+const ROCK_FILL_LIGHT_SHARE : i32 = 2;
+
+/** Fill of a rock that was just hit. */
+const ROCK_HIT_FILL : i32 = 0x6A7090;
+
+/** Length of a drone's drawn hull as a multiple of its radius. */
+const DRONE_LENGTH : f32 = 1.5;
+
+/** The glow around a drone: radius and percent of full strength. */
+const DRONE_GLOW_RADIUS : i32 = 20;
+const DRONE_GLOW_PERCENT : i32 = 30;
+
+/** How far an arrowhead's wing tips sit behind its centre, as a share of its length. */
+const WING_BACK : f32 = 0.7;
+
+/** How far an arrowhead's tail notch sits behind its centre, as a share of its length. */
+const NOTCH_BACK : f32 = 0.35;
+
+/** Sides of a gunship's hull. */
+const GUNSHIP_SIDES : i32 = 6;
+
+/** Length of a gunship's barrel as a multiple of its radius. */
+const BARREL_LENGTH : f32 = 1.9;
+
+/** Colour and radius of a gunship's core. */
+const CORE_COLOR : i32 = 0xFFC090;
+const CORE_RADIUS : i32 = 4;
+
+/** Fill of a gunship that was just hit. */
+const GUNSHIP_HIT_FILL : i32 = 0x805040;
+
+/** The glow around a gunship: radius and percent of full strength. */
+const GUNSHIP_GLOW_RADIUS : i32 = 34;
+const GUNSHIP_GLOW_PERCENT : i32 = 28;
+
+/** The pips under a gunship, one per hit point: left of the centre, step, gap under the hull, width and height. */
+const PIP_LEFT : i32 = 8;
+const PIP_STEP : i32 = 5;
+const PIP_GAP : i32 = 6;
+const PIP_W : i32 = 4;
+const PIP_H : i32 = 3;
+
+/** Length of the ship's drawn hull, a little larger than its collision circle. */
+const SHIP_DRAW_LENGTH : f32 = 21.0;
+
+/** Half-width of the ship's drawn hull. */
+const SHIP_DRAW_WIDTH : f32 = 13.0;
+
+/** The glow around the ship: radius and percent of full strength. */
+const SHIP_GLOW_RADIUS : i32 = 30;
+const SHIP_GLOW_PERCENT : i32 = 22;
+
+/** Distance behind the ship where the engine glow sits. */
+const ENGINE_OFFSET : f32 = 12.0;
+
+/** Colour, radius and percent of the engine glow. */
+const ENGINE_COLOR : i32 = 0xFF9A40;
+const ENGINE_GLOW_RADIUS : i32 = 14;
+const ENGINE_GLOW_PERCENT : i32 = 80;
+
+/** Ticks per blink of the ship while it is invulnerable without a shield. */
+const SHIP_BLINK_TICKS : i32 = 5;
+
+/** The shield bubble: its base radius, the ticks of its shimmer and how far that moves it. */
+const SHIELD_RADIUS : i32 = 18;
+const SHIELD_SHIMMER_TICKS : i32 = 6;
+const SHIELD_SHIMMER_DIVISOR : i32 = 2;
+
+/** Ticks of shield left when the bubble starts to flicker, and the ticks per flicker. */
+const SHIELD_WARNING : i32 = 120;
+const SHIELD_FLICKER_TICKS : i32 = 6;
+
+/** The glow inside the shield bubble: radius and percent of full strength. */
+const SHIELD_GLOW_RADIUS : i32 = 24;
+const SHIELD_GLOW_PERCENT : i32 = 18;
+
+/** Sides of the diamond a pick-up is drawn as. */
+const PICKUP_SIDES : i32 = 4;
+
+/** The glow around a pick-up: radius and percent of full strength. */
+const PICKUP_GLOW_RADIUS : i32 = 26;
+const PICKUP_GLOW_PERCENT : i32 = 45;
+
+/** Ticks before expiry when a pick-up starts to blink, and the ticks per blink. */
+const PICKUP_BLINK : i32 = 150;
+const PICKUP_BLINK_TICKS : i32 = 6;
+
+/** Scale of the letter inside a pick-up. */
+const PICKUP_LETTER_SCALE : i32 = 1;
+
+/** An arrowhead hull: where it is, which way it points, how big, and how it is coloured. */
+struct Arrowhead {
+    centre : Pixel;
+    angle  : f32;
+    length : f32;
+    width  : f32;
+    fill   : i32;
+    edge   : i32;
+    hot    : bool;
+}
+
+/** Drawing of the things in the slab and of the ship. */
+pub class Hulls {
+    // The vertex `i` of rock `e`: its angle follows the rock's spin, its reach comes from a hash of the seed.
+    static fn rockVertex(e : Entity, i : i32) : Pixel {
+        let slot : i64 = (e.seed as i64) * ROCK_HASH_STRIDE + (i as i64);
+        let hash : i32 = (hashMix(slot) & ROCK_HASH_MASK) as i32;
+        let rough : i32 = ROCK_ROUGH_MIN + hash % (ROCK_ROUGH_MAX - ROCK_ROUGH_MIN);
+        let reach : f32 = e.radius * (rough as f32) * PERCENT;
+        let angle : f32 = e.angle + TAU * (i as f32) / (ROCK_SIDES as f32);
+        return Pixel::at((e.x + cos(angle) * reach) as i32, (e.y + sin(angle) * reach) as i32);
+    }
+
+    // The fill of a rock facet that catches `light`, or the flash colour when the rock was just hit.
+    static fn rockFill(light : i32, hot : bool) : i32 {
+        if (hot) {
+            return ROCK_HIT_FILL;
+        }
+        return Color::scale(
+            PAL_ROCK_FILL,
+            ROCK_FILL_UNIT + light / ROCK_FILL_LIGHT_SHARE,
+            ROCK_FILL_UNIT
+        );
+    }
+
+    // The outline of a rock facet that catches `light`, or the flash colour when the rock was just hit.
+    static fn rockEdge(light : i32, hot : bool) : i32 {
+        if (hot) {
+            return HIT_EDGE;
+        }
+        return Color::scale(PAL_ROCK_EDGE, LIGHT_BASE + light, HULL_CHANNEL_MAX);
+    }
+
+    /** A faceted rock lit from the upper left: each facet brightens as it turns towards the light. */
+    pub static fn rock(f : Frame, e : Entity, at : Offset) : void {
+        let centre : Pixel = Pixel::shaken(e.x, e.y, at);
+        let hot : bool = e.flash > 0;
+        let mut prev : Pixel = Hulls::rockVertex(e, 0).moved(at);
+
+        for (i of 1..ROCK_SIDES + 1) {
+            let next : Pixel = Hulls::rockVertex(e, i % ROCK_SIDES).moved(at);
+            let facing : f32 = e.angle + TAU * ((i as f32) - HALF) / (ROCK_SIDES as f32);
+            let light : i32 = ((cos(facing - LIGHT_ANGLE) * LIGHT_RANGE) as i32).max(0);
+
+            let fill : i32 = Hulls::rockFill(light, hot);
+            let edge : i32 = Hulls::rockEdge(light, hot);
+            Draw::triangle(f, centre, prev, next, fill);
+            Draw::line(f, prev, next, edge);
+            prev = next;
+        }
+    }
+
+    /** A drone: a small magenta arrowhead with a glow. */
+    pub static fn drone(f : Frame, e : Entity, at : Offset) : void {
+        let centre : Pixel = Pixel::shaken(e.x, e.y, at);
+        Draw::glow(f, centre, DRONE_GLOW_RADIUS, PAL_DRONE_EDGE, DRONE_GLOW_PERCENT);
+
+        let hull : Arrowhead = Arrowhead {
+            centre: centre,
+            angle: e.angle,
+            length: e.radius * DRONE_LENGTH,
+            width: e.radius,
+            fill: PAL_DRONE_FILL,
+            edge: PAL_DRONE_EDGE,
+            hot: e.flash > 0,
+        };
+        Hulls::arrow(f, hull);
+    }
+
+    /** A gunship: a hexagon with a barrel pointing at its target, a core and one pip per hit point left. */
+    pub static fn gunship(f : Frame, e : Entity, at : Offset) : void {
+        let centre : Pixel = Pixel::shaken(e.x, e.y, at);
+        Draw::glow(f, centre, GUNSHIP_GLOW_RADIUS, PAL_GUNSHIP_EDGE, GUNSHIP_GLOW_PERCENT);
+
+        let mut edge : i32 = PAL_GUNSHIP_EDGE;
+        let mut fill : i32 = PAL_GUNSHIP_FILL;
+        if (e.flash > 0) {
+            edge = HIT_EDGE;
+            fill = GUNSHIP_HIT_FILL;
+        }
+
+        let mut prev : Pixel = Hulls::ringPoint(centre, e.angle, e.radius);
+        for (i of 1..GUNSHIP_SIDES + 1) {
+            let a : f32 = e.angle + TAU * (i as f32) / (GUNSHIP_SIDES as f32);
+            let next : Pixel = Hulls::ringPoint(centre, a, e.radius);
+            Draw::triangle(f, centre, prev, next, fill);
+            Draw::line(f, prev, next, edge);
+            prev = next;
+        }
+
+        let muzzle : Pixel = Pixel::at(
+            centre.x + (cos(e.angle) * e.radius * BARREL_LENGTH) as i32,
+            centre.y + (sin(e.angle) * e.radius * BARREL_LENGTH) as i32
+        );
+        Draw::line(f, centre, muzzle, edge);
+        f.disc(centre.x, centre.y, CORE_RADIUS, CORE_COLOR);
+
+        for (pip of 0..e.hp) {
+            let left : i32 = centre.x - PIP_LEFT + pip * PIP_STEP;
+            let top : i32 = centre.y + (e.radius as i32) + PIP_GAP;
+            f.fillRect(Rect::make(left, top, PIP_W, PIP_H), edge);
+        }
+    }
+
+    // The pixel `reach` away from `centre` in direction `angle`.
+    static fn ringPoint(centre : Pixel, angle : f32, reach : f32) : Pixel {
+        return Pixel::at(
+            centre.x + (cos(angle) * reach) as i32,
+            centre.y + (sin(angle) * reach) as i32
+        );
+    }
+
+    // A filled arrowhead: nose ahead, two wing tips behind, a notch in the tail.
+    static fn arrow(f : Frame, hull : Arrowhead) : void {
+        let cx : i32 = hull.centre.x;
+        let cy : i32 = hull.centre.y;
+        let length : f32 = hull.length;
+        let width : f32 = hull.width;
+        let c : f32 = cos(hull.angle);
+        let s : f32 = sin(hull.angle);
+        let back : f32 = length * WING_BACK;
+        let nose : Pixel = Pixel::at(cx + (c * length) as i32, cy + (s * length) as i32);
+        let left : Pixel = Pixel::at(
+            cx + (-c * back - s * width) as i32,
+            cy + (-s * back + c * width) as i32
+        );
+        let right : Pixel = Pixel::at(
+            cx + (-c * back + s * width) as i32,
+            cy + (-s * back - c * width) as i32
+        );
+        let tail : Pixel = Pixel::at(
+            cx + (-c * length * NOTCH_BACK) as i32,
+            cy + (-s * length * NOTCH_BACK) as i32
+        );
+
+        let mut body : i32 = hull.fill;
+        let mut rim : i32 = hull.edge;
+        if (hull.hot) {
+            body = HIT_EDGE;
+            rim = HIT_EDGE;
+        }
+
+        Draw::triangle(f, nose, left, tail, body);
+        Draw::triangle(f, nose, right, tail, body);
+        Draw::line(f, nose, left, rim);
+        Draw::line(f, left, tail, rim);
+        Draw::line(f, tail, right, rim);
+        Draw::line(f, right, nose, rim);
+    }
+
+    static fn powerColor(tier : i32) : i32 {
+        return match Factory::powerOf(tier) {
+            Power::Shield => PAL_SHIELD,
+            Power::Rapid => PAL_RAPID,
+            Power::Spread => PAL_SPREAD,
+            Power::Nova => PAL_NOVA,
+        };
+    }
+
+    static fn powerLetter(tier : i32) : string {
+        return match Factory::powerOf(tier) {
+            Power::Shield => "S",
+            Power::Rapid => "R",
+            Power::Spread => "W",
+            Power::Nova => "N",
+        };
+    }
+
+    /** A pick-up: a spinning diamond with its letter inside, blinking when about to expire. */
+    pub static fn pickup(
+        f : Frame,
+        e : Entity,
+        ticksLeft : i32,
+        at : Offset,
+        kit : Typeface
+    ) : void {
+        if (ticksLeft < PICKUP_BLINK && (ticksLeft / PICKUP_BLINK_TICKS) % 2 == 0) {
+            return;
+        }
+        let centre : Pixel = Pixel::shaken(e.x, e.y, at);
+        let color : i32 = Hulls::powerColor(e.tier);
+        Draw::glow(f, centre, PICKUP_GLOW_RADIUS, color, PICKUP_GLOW_PERCENT);
+
+        for (k of 0..PICKUP_SIDES) {
+            let a : f32 = e.angle + HALF_PI * (k as f32);
+            let b : f32 = a + HALF_PI;
+            let from : Pixel = Hulls::ringPoint(centre, a, e.radius);
+            let to : Pixel = Hulls::ringPoint(centre, b, e.radius);
+            Draw::line(f, from, to, color);
+        }
+
+        let letter : string = Hulls::powerLetter(e.tier);
+        let top : i32 = centre.y - kit.height(PICKUP_LETTER_SCALE) / 2;
+        kit.centred(centre.x, top, letter, PICKUP_LETTER_SCALE, color);
+    }
+
+    /** The ship: hull, engine glow and the shield bubble; it blinks while invulnerable. */
+    pub static fn ship(f : Frame, s : Ship, tick : i32, at : Offset) : void {
+        if (!s.alive) {
+            return;
+        }
+        if (s.invuln > 0 && s.shield == 0 && (s.invuln / SHIP_BLINK_TICKS) % 2 == 0) {
+            return;
+        }
+        let centre : Pixel = Pixel::shaken(s.x, s.y, at);
+        Draw::glow(f, centre, SHIP_GLOW_RADIUS, PAL_SHIP_EDGE, SHIP_GLOW_PERCENT);
+        if (s.thrusting) {
+            let engine : Pixel = Pixel::at(
+                centre.x - (s.dirX() * ENGINE_OFFSET) as i32,
+                centre.y - (s.dirY() * ENGINE_OFFSET) as i32
+            );
+            Draw::glow(f, engine, ENGINE_GLOW_RADIUS, ENGINE_COLOR, ENGINE_GLOW_PERCENT);
+        }
+
+        let hull : Arrowhead = Arrowhead {
+            centre: centre,
+            angle: s.angle,
+            length: SHIP_DRAW_LENGTH,
+            width: SHIP_DRAW_WIDTH,
+            fill: PAL_SHIP_FILL,
+            edge: PAL_SHIP_EDGE,
+            hot: false,
+        };
+        Hulls::arrow(f, hull);
+        Hulls::shield(f, s, tick, centre);
+    }
+
+    // The shield bubble around the ship at `centre`; in its last moments it flickers.
+    static fn shield(f : Frame, s : Ship, tick : i32, centre : Pixel) : void {
+        if (s.shield <= 0) {
+            return;
+        }
+        if (s.shield < SHIELD_WARNING && (s.shield / SHIELD_FLICKER_TICKS) % 2 != 1) {
+            return;
+        }
+
+        let radius : i32 = SHIELD_RADIUS + (tick % SHIELD_SHIMMER_TICKS) / SHIELD_SHIMMER_DIVISOR;
+        Draw::ringAdd(f, centre, radius, PAL_SHIELD);
+        Draw::ringAdd(f, centre, radius + 1, Draw::third(PAL_SHIELD));
+        Draw::glow(f, centre, SHIELD_GLOW_RADIUS, PAL_SHIELD, SHIELD_GLOW_PERCENT);
+    }
+}

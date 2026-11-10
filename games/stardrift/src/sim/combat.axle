@@ -1,0 +1,417 @@
+// combat — what happens when things get hurt, destroyed or collected.
+//
+// The collision pass only decides who touched whom; every consequence is decided here: damage, splitting
+// rocks, score and combo, drops, the ship's death and the power-ups. Keeping the outcomes in one place means
+// a nova blast and a bullet destroy a gunship in exactly the same way.
+
+use ludax::{EntityId, Vec2, sin, cos, sqrt, TAU, PI};
+
+use crate::core::config::{
+    SCORE_ROCK_LARGE, SCORE_ROCK_MEDIUM, SCORE_ROCK_SMALL, SCORE_DRONE, SCORE_GUNSHIP, SCORE_PICKUP,
+    POWER_TICKS, NOVA_RADIUS, RESPAWN_TICKS, EPS, ROCK_TIER_LARGE, ROCK_TIER_MEDIUM, ROCK_TIER_SMALL
+};
+use crate::core::palette::{
+    PAL_ROCK_EDGE, PAL_DRONE_EDGE, PAL_GUNSHIP_EDGE, PAL_SHIP_EDGE, PAL_SHIELD, PAL_NOVA
+};
+use crate::core::types::{Entity, Kind, Layer, Power, Sfx};
+use crate::sim::factory::Factory;
+use crate::sim::fx::{SparkSpec, RingSpec};
+use crate::sim::world::World;
+
+/** Percent chance that a destroyed rock drops a power-up. */
+const DROP_ROCK : i32 = 3;
+
+/** Percent chance that a destroyed drone drops a power-up. */
+const DROP_DRONE : i32 = 9;
+
+/** Percent chance that a destroyed gunship drops a power-up. */
+const DROP_GUNSHIP : i32 = 40;
+
+/** The dice are rolled in percent. */
+const DROP_PERCENT : i32 = 100;
+
+/**
+ * Which power-up a drop is: a second roll of `DROP_KINDS` sides. Shield takes everything below
+ * `DROP_RAPID_FROM`, so it is the common one, and the nova is the rarest, with a single side.
+ */
+const DROP_KINDS : i32 = 10;
+const DROP_RAPID_FROM : i32 = 6;
+const DROP_SPREAD_FROM : i32 = 8;
+const DROP_NOVA_FROM : i32 = 9;
+
+/** Pieces a rock splits into, thrown apart in opposite directions. */
+const SPLIT_PIECES : i32 = 2;
+
+/** Speed at which the pieces of a split rock fly apart, as a multiple of the rock drift speed. */
+const SPLIT_KICK : f32 = 0.9;
+
+/** How far from the old centre a piece starts, as a share of the old radius. */
+const SPLIT_OFFSET : f32 = 0.5;
+
+/** Share of the old velocity a piece keeps. */
+const SPLIT_INHERIT : f32 = 0.5;
+
+/** Visual power of a rock's explosion per size class, so a large rock blows up bigger than a small one. */
+const ROCK_POWER_PER_TIER : f32 = 0.5;
+
+/** Speed of the knock-back when the ship hits something, pixels per second. */
+const KNOCK : f32 = 190.0;
+
+/** Share of the knock-back a protected ship receives. */
+const KNOCK_SOFT : f32 = 0.1;
+
+/** Share of the knock-back an enemy receives from the ship's ram. */
+const KNOCK_HARD : f32 = 0.5;
+
+/** Damage of the nova blast. */
+const NOVA_DAMAGE : i32 = 4;
+
+/** Ticks the ship is untouchable after its shield breaks. */
+const SHIELD_BREAK_INVULN : i32 = 45;
+
+/** Ticks an entity flashes white after a hit that did not destroy it. */
+const HIT_FLASH_TICKS : i32 = 5;
+
+/** Sparks thrown by such a hit: how many, how fast, how long and what colour. */
+const HIT_SPARKS : i32 = 4;
+const HIT_SPARK_SLOW : f32 = 40.0;
+const HIT_SPARK_FAST : f32 = 160.0;
+const HIT_SPARK_LIFE : i32 = 8;
+const HIT_SPARK_COLOR : i32 = 0xFFE9A0;
+
+/** Blast power at and above which a boom is drawn and heard as a big one. */
+const BIG_BOOM_POWER : f32 = 2.5;
+
+/** Visual power of the explosion of a drone, of a gunship, of the ship and of an enemy bolt wiped by a nova. */
+const DRONE_POWER : f32 = 1.1;
+const GUNSHIP_POWER : f32 = 2.8;
+const SHIP_POWER : f32 = 3.0;
+const BOLT_POWER : f32 = 0.3;
+
+/** The ring that shows a shield breaking: size, growth per tick, life; and the shake it causes. */
+const SHIELD_RING_SIZE : f32 = 14.0;
+const SHIELD_RING_GROWTH : f32 = 3.5;
+const SHIELD_RING_LIFE : i32 = 18;
+const SHIELD_BREAK_SHAKE : f32 = 0.3;
+
+/** The shake of the ship being destroyed. */
+const SHIP_DEATH_SHAKE : f32 = 0.9;
+
+/** The ring a collected pick-up leaves: colour, size, growth per tick and life. */
+const PICKUP_RING : i32 = 0xFFFFFF;
+const PICKUP_RING_SIZE : f32 = 6.0;
+const PICKUP_RING_GROWTH : f32 = 2.0;
+const PICKUP_RING_LIFE : i32 = 14;
+
+/** The nova's two rings, outer then inner: size, growth per tick and life; the inner one's colour too. */
+const NOVA_RING_SIZE : f32 = 10.0;
+const NOVA_RING_GROWTH : f32 = 11.0;
+const NOVA_RING_LIFE : i32 = 28;
+const NOVA_INNER_COLOR : i32 = 0x80D0FF;
+const NOVA_INNER_SIZE : f32 = 4.0;
+const NOVA_INNER_GROWTH : f32 = 8.0;
+const NOVA_INNER_LIFE : i32 = 34;
+
+/** The shake and the screen flash of the nova. */
+const NOVA_SHAKE : f32 = 0.7;
+const NOVA_FLASH : f32 = 0.6;
+
+/** The consequences of collisions. */
+pub class Combat {
+    /** Hurts the entity `id` by `damage` at the point `at`; destroys it when its hit points run out. */
+    pub static fn hurt(w : World, id : EntityId, damage : i32, at : Vec2) : void {
+        if (!w.entities.has(id)) {
+            return;
+        }
+        let mut e : Entity = w.entities.get(id);
+        e.hp = e.hp - damage;
+        if (e.hp <= 0) {
+            Combat::destroy(w, id);
+            return;
+        }
+
+        e.flash = HIT_FLASH_TICKS;
+        w.entities.set(id, e);
+
+        let spark : SparkSpec = SparkSpec {
+            slow: HIT_SPARK_SLOW,
+            fast: HIT_SPARK_FAST,
+            color: HIT_SPARK_COLOR,
+            life: HIT_SPARK_LIFE,
+        };
+        for (i of 0..HIT_SPARKS) {
+            w.fx.spark(at, spark);
+        }
+        w.sound(Sfx::Hit);
+    }
+
+    /** Destroys the entity `id`: score, debris, splitting and drops. */
+    pub static fn destroy(w : World, id : EntityId) : void {
+        if (!w.entities.has(id)) {
+            return;
+        }
+        let e : Entity = w.entities.get(id);
+        w.remove(id);
+        w.tallyKill(e.kind);
+
+        let base : i32 = Combat::worth(e);
+        let gained : i32 = w.score.award(base);
+        w.fx.popup(Vec2::make(e.x, e.y - e.radius), gained, w.score.multiplier());
+        match e.kind {
+            Kind::Rock => Combat::breakRock(w, e),
+            Kind::Drone => Combat::blast(w, e, DRONE_POWER, PAL_DRONE_EDGE, DROP_DRONE),
+            Kind::Gunship => Combat::blast(w, e, GUNSHIP_POWER, PAL_GUNSHIP_EDGE, DROP_GUNSHIP),
+            Kind::Pickup => {},
+        }
+    }
+
+    // Score value of a destroyed entity.
+    static fn worth(e : Entity) : i32 {
+        return match e.kind {
+            Kind::Rock => Combat::rockWorth(e.tier),
+            Kind::Drone => SCORE_DRONE,
+            Kind::Gunship => SCORE_GUNSHIP,
+            Kind::Pickup => 0,
+        };
+    }
+
+    static fn rockWorth(tier : i32) : i32 {
+        return match tier {
+            ROCK_TIER_LARGE => SCORE_ROCK_LARGE,
+            ROCK_TIER_MEDIUM => SCORE_ROCK_MEDIUM,
+            _ => SCORE_ROCK_SMALL,
+        };
+    }
+
+    // The sound of a blast: a big one is heard as such.
+    static fn boom(w : World, big : bool) : void {
+        if (big) {
+            w.sound(Sfx::BigBoom);
+        } else {
+            w.sound(Sfx::Boom);
+        }
+    }
+
+    // Fireball, sound and a possible drop for a destroyed non-rock.
+    static fn blast(w : World, e : Entity, power : f32, color : i32, dropChance : i32) : void {
+        w.fx.explosion(Vec2::make(e.x, e.y), power, color);
+        Combat::boom(w, power >= BIG_BOOM_POWER);
+        Combat::maybeDrop(w, Vec2::make(e.x, e.y), dropChance);
+    }
+
+    // A rock bursts into smaller ones that fly apart, unless it was already the smallest.
+    static fn breakRock(w : World, e : Entity) : void {
+        let power : f32 = ROCK_POWER_PER_TIER * (e.tier as f32);
+        w.fx.explosion(Vec2::make(e.x, e.y), power, PAL_ROCK_EDGE);
+        Combat::boom(w, e.tier >= ROCK_TIER_LARGE);
+        if (e.tier > ROCK_TIER_SMALL) {
+            Combat::split(w, e);
+        }
+        Combat::maybeDrop(w, Vec2::make(e.x, e.y), DROP_ROCK);
+    }
+
+    // Two pieces one tier smaller, thrown out on opposite sides of a random axis.
+    static fn split(w : World, e : Entity) : void {
+        let offset : f32 = w.rng.rangeF32(0.0, TAU);
+        let tier : i32 = e.tier - 1;
+        let kick : f32 = Factory::rockSpeed(tier) * SPLIT_KICK;
+        for (i of 0..SPLIT_PIECES) {
+            let angle : f32 = offset + PI * (i as f32);
+            let c : f32 = cos(angle);
+            let s : f32 = sin(angle);
+
+            let ox : f32 = c * e.radius * SPLIT_OFFSET;
+            let oy : f32 = s * e.radius * SPLIT_OFFSET;
+            let pos : Vec2 = Vec2::make(e.x + ox, e.y + oy);
+            let vel : Vec2 = Vec2::make(
+                e.vx * SPLIT_INHERIT + c * kick,
+                e.vy * SPLIT_INHERIT + s * kick
+            );
+            Factory::rock(w, pos, vel, tier);
+        }
+    }
+
+    // Rolls the dice for a power-up at `at`.
+    static fn maybeDrop(w : World, at : Vec2, percent : i32) : void {
+        if (w.rng.range(0, DROP_PERCENT) >= percent) {
+            return;
+        }
+        let roll : i32 = w.rng.range(0, DROP_KINDS);
+        Factory::pickup(w, at, Combat::dropFor(roll));
+    }
+
+    // The power-up a roll of `DROP_KINDS` sides stands for; the nova is rarer than the three timed ones.
+    static fn dropFor(roll : i32) : Power {
+        if (roll >= DROP_NOVA_FROM) {
+            return Power::Nova;
+        }
+        if (roll >= DROP_SPREAD_FROM) {
+            return Power::Spread;
+        }
+        if (roll >= DROP_RAPID_FROM) {
+            return Power::Rapid;
+        }
+        return Power::Shield;
+    }
+
+    /** The ship runs into the entity `id` (a rock, drone or gunship). */
+    pub static fn shipRamsInto(w : World, id : EntityId) : void {
+        if (!w.entities.has(id)) {
+            return;
+        }
+        let mut s = w.ship;
+        let mut e : Entity = w.entities.get(id);
+        let dx : f32 = s.x - e.x;
+        let dy : f32 = s.y - e.y;
+        let dist : f32 = sqrt(dx * dx + dy * dy) + EPS;
+        if (s.invuln > 0) {
+            // Pushed apart without harm while protected.
+            s.vx = s.vx + dx / dist * KNOCK * KNOCK_SOFT;
+            s.vy = s.vy + dy / dist * KNOCK * KNOCK_SOFT;
+            return;
+        }
+
+        Combat::hitShip(w);
+        match e.kind {
+            Kind::Drone => Combat::destroy(w, id),
+            _ => {
+                e.vx = e.vx - dx / dist * KNOCK * KNOCK_HARD;
+                e.vy = e.vy - dy / dist * KNOCK * KNOCK_HARD;
+                w.entities.set(id, e);
+            },
+        }
+    }
+
+    /** The ship takes a hit: the shield absorbs it, otherwise a life is lost. */
+    pub static fn hitShip(w : World) : void {
+        let mut s = w.ship;
+        if (!s.alive || s.invuln > 0) {
+            return;
+        }
+        if (s.shield > 0) {
+            Combat::breakShield(w);
+            return;
+        }
+
+        s.alive = false;
+        s.lives = s.lives - 1;
+        s.respawn = RESPAWN_TICKS;
+        s.rapid = 0;
+        s.spread = 0;
+        s.thrusting = false;
+        w.score.breakChain();
+        w.fx.explosion(Vec2::make(s.x, s.y), SHIP_POWER, PAL_SHIP_EDGE);
+        w.fx.shake(SHIP_DEATH_SHAKE);
+        w.sound(Sfx::Death);
+        w.tm.log.warn("ship", "ship destroyed, lives left ${s.lives}");
+    }
+
+    // The shield takes the hit and is gone; the ship is untouchable for a moment.
+    static fn breakShield(w : World) : void {
+        let mut s = w.ship;
+        s.shield = 0;
+        s.invuln = SHIELD_BREAK_INVULN;
+        let ring : RingSpec = RingSpec {
+            size: SHIELD_RING_SIZE,
+            growth: SHIELD_RING_GROWTH,
+            color: PAL_SHIELD,
+            life: SHIELD_RING_LIFE,
+        };
+        w.fx.ring(Vec2::make(s.x, s.y), ring);
+        w.fx.shake(SHIELD_BREAK_SHAKE);
+        w.sound(Sfx::Hit);
+        w.tm.log.info("ship", "shield absorbed a hit");
+    }
+
+    /** The ship collects the pick-up `id`. */
+    pub static fn collect(w : World, id : EntityId) : void {
+        if (!w.entities.has(id)) {
+            return;
+        }
+        let e : Entity = w.entities.get(id);
+        w.remove(id);
+        w.score.bonus(SCORE_PICKUP);
+        w.fx.popup(Vec2::make(e.x, e.y - e.radius), SCORE_PICKUP, 1);
+
+        let ring : RingSpec = RingSpec {
+            size: PICKUP_RING_SIZE,
+            growth: PICKUP_RING_GROWTH,
+            color: PICKUP_RING,
+            life: PICKUP_RING_LIFE,
+        };
+        w.fx.ring(Vec2::make(e.x, e.y), ring);
+        w.sound(Sfx::Pickup);
+
+        let mut s = w.ship;
+        match Factory::powerOf(e.tier) {
+            Power::Shield => {
+                s.shield = POWER_TICKS;
+                w.tm.log.info("power", "shield");
+            },
+            Power::Rapid => {
+                s.rapid = POWER_TICKS;
+                w.tm.log.info("power", "rapid fire");
+            },
+            Power::Spread => {
+                s.spread = POWER_TICKS;
+                w.tm.log.info("power", "spread shot");
+            },
+            Power::Nova => Combat::nova(w),
+        }
+    }
+
+    /** The nova blast: damages everything near the ship and wipes the enemy bolts from the screen. */
+    pub static fn nova(w : World) : void {
+        let s = w.ship;
+        let centre : Vec2 = Vec2::make(s.x, s.y);
+        let outer : RingSpec = RingSpec {
+            size: NOVA_RING_SIZE,
+            growth: NOVA_RING_GROWTH,
+            color: PAL_NOVA,
+            life: NOVA_RING_LIFE,
+        };
+        let inner : RingSpec = RingSpec {
+            size: NOVA_INNER_SIZE,
+            growth: NOVA_INNER_GROWTH,
+            color: NOVA_INNER_COLOR,
+            life: NOVA_INNER_LIFE,
+        };
+        w.sound(Sfx::Nova);
+        w.fx.ring(centre, outer);
+        w.fx.ring(centre, inner);
+        w.fx.shake(NOVA_SHAKE);
+        w.fx.flashScreen(NOVA_FLASH);
+        w.tm.log.info("power", "nova");
+
+        Combat::novaHurtsEnemies(w, centre);
+        Combat::novaWipesBolts(w);
+    }
+
+    // Everything in the blast radius takes `NOVA_DAMAGE`.
+    static fn novaHurtsEnemies(w : World, centre : Vec2) : void {
+        w.grid.query(centre, NOVA_RADIUS, w.near);
+        for (k of 0..w.near.len()) {
+            let p = w.grid.proxy(w.near.get(k));
+            if (p.layer != Layer::Enemy || !p.touches(centre, NOVA_RADIUS)) {
+                continue;
+            }
+
+            let id : EntityId = EntityId::make(p.index, p.generation);
+            Combat::hurt(w, id, NOVA_DAMAGE, Vec2::make(p.x, p.y));
+        }
+    }
+
+    // Every enemy bolt in flight goes up in a small flash.
+    static fn novaWipesBolts(w : World) : void {
+        let mut slot : i32 = w.bullets.first();
+        while (slot >= 0) {
+            let next : i32 = w.bullets.next(slot);
+            let b = w.bullets.get(slot);
+            if (b.hostile) {
+                w.fx.explosion(Vec2::make(b.x, b.y), BOLT_POWER, PAL_NOVA);
+                w.bullets.release(slot);
+            }
+            slot = next;
+        }
+    }
+}

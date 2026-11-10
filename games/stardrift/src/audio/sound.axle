@@ -1,0 +1,415 @@
+// sound — the game's sound effects: the recipes, and playing them through smalt's mixer.
+//
+// Every effect has a few variants with slightly different pitch, so a rapid volley does not repeat one sample
+// like a machine. The recipes are built with `Synth`, written to short-lived WAV files, loaded into a smalt
+// `SoundBank` per effect and the files deleted again. Which variant plays is picked from a `Pcg32` of the
+// audio layer's own: sound is presentation, and nothing the simulation does depends on it.
+//
+// Every number of a recipe is a named constant, grouped by effect, so an effect can be retuned without
+// reading the code that mixes it.
+//
+// If the machine has no audio device the mixer does not open and the whole layer quietly becomes a no-op, so
+// a headless run needs no special case.
+
+use std::ffi::libc::fs;
+
+use ludax::{Pcg32, Vec};
+use smalt::{Mixer, SoundBank};
+
+use crate::audio::synth::{Synth, Wav, Wave, Tone, Hiss};
+use crate::core::types::Sfx;
+
+/** Variants generated per effect that has more than one. */
+const VARIANTS : i32 = 3;
+
+/** Variants of an effect that is played the same way every time. */
+const SFX_SINGLE : i32 = 1;
+
+/** The variant whose pitch is left as written; the others sit a step below and above it. */
+const SFX_NEUTRAL_VARIANT : i32 = 1;
+
+/** Playback volume of everything, 0 to 1. */
+const MASTER : f64 = 0.55;
+
+/** Base name of the temporary files. */
+const TEMP_NAME : string = ".stardrift-sfx.wav";
+
+/** Relative pitch change between two variants of one effect. */
+const PITCH_STEP : f64 = 0.12;
+
+/** Seed and stream of the generator that picks a variant at play time. */
+const SFX_PICK_SEED : u64 = 99;
+const SFX_PICK_STREAM : u64 = 9;
+
+/** Seed and stream of the noise the recipes use; fixed so every run synthesises the same samples. */
+const SFX_NOISE_SEED : u64 = 5;
+const SFX_NOISE_STREAM : u64 = 5;
+
+/** Share of the master volume each effect plays at; the shot is the most frequent, so the quietest. */
+const SFX_LEVEL_SHOOT : f64 = 0.5;
+const SFX_LEVEL_HIT : f64 = 0.6;
+const SFX_LEVEL_BOOM : f64 = 0.9;
+const SFX_LEVEL_BIG_BOOM : f64 = 1.0;
+const SFX_LEVEL_PICKUP : f64 = 0.8;
+const SFX_LEVEL_WAVE : f64 = 0.8;
+const SFX_LEVEL_DEATH : f64 = 1.0;
+const SFX_LEVEL_NOVA : f64 = 1.0;
+
+/** The laser: a square wave sliding down from a high chirp. */
+const SHOOT_FROM_HZ : f64 = 1250.0;
+const SHOOT_TO_HZ : f64 = 260.0;
+const SHOOT_SECONDS : f64 = 0.13;
+const SHOOT_DECAY : f64 = 4.0;
+const SHOOT_GAIN : f64 = 0.30;
+
+/** The hit: a short click of lightly smoothed noise over a low sine thud. */
+const HIT_CLICK_SECONDS : f64 = 0.06;
+const HIT_CLICK_SMOOTH : f64 = 0.2;
+const HIT_CLICK_DECAY : f64 = 5.0;
+const HIT_CLICK_GAIN : f64 = 0.35;
+const HIT_THUD_FROM_HZ : f64 = 260.0;
+const HIT_THUD_TO_HZ : f64 = 110.0;
+const HIT_THUD_SECONDS : f64 = 0.08;
+const HIT_THUD_DECAY : f64 = 4.0;
+const HIT_THUD_GAIN : f64 = 0.5;
+
+/** The three booms: how long, how dull and how loud. The small and big ones are pitched per variant. */
+const BOOM_SMALL_SECONDS : f64 = 0.32;
+const BOOM_SMALL_SMOOTH : f64 = 0.86;
+const BOOM_SMALL_GAIN : f64 = 1.0;
+const BOOM_BIG_SECONDS : f64 = 0.7;
+const BOOM_BIG_SMOOTH : f64 = 0.93;
+const BOOM_BIG_GAIN : f64 = 1.2;
+const BOOM_DEATH_SECONDS : f64 = 0.9;
+const BOOM_DEATH_SMOOTH : f64 = 0.95;
+const BOOM_DEATH_GAIN : f64 = 1.2;
+
+/** Under every boom: a rumble of smoothed noise and a sine falling to sub-bass, each scaled by the boom's gain. */
+const BOOM_RUMBLE_DECAY : f64 = 3.5;
+const BOOM_RUMBLE_GAIN : f64 = 0.9;
+const BOOM_SUB_FROM_HZ : f64 = 150.0;
+const BOOM_SUB_TO_HZ : f64 = 38.0;
+const BOOM_SUB_DECAY : f64 = 3.0;
+const BOOM_SUB_GAIN : f64 = 0.8;
+
+/** The pick-up chime: three rising square notes, a major triad, the last one held longer. */
+const ARP_ROOT_HZ : f64 = 523.0;
+const ARP_THIRD_HZ : f64 = 659.0;
+const ARP_FIFTH_HZ : f64 = 784.0;
+const ARP_NOTE_SECONDS : f64 = 0.07;
+const ARP_NOTE_DECAY : f64 = 2.0;
+const ARP_LAST_SECONDS : f64 = 0.16;
+const ARP_LAST_DECAY : f64 = 3.0;
+const ARP_THIRD_AT : f64 = 0.07;
+const ARP_FIFTH_AT : f64 = 0.14;
+const ARP_NOTE_GAIN : f64 = 0.22;
+
+/** The wave horn: two saw glides an octave up, the second a little behind and quieter. */
+const WAVE_SECONDS : f64 = 0.35;
+const WAVE_DECAY : f64 = 2.0;
+const WAVE_LOW_FROM_HZ : f64 = 220.0;
+const WAVE_LOW_TO_HZ : f64 = 440.0;
+const WAVE_LOW_GAIN : f64 = 0.22;
+const WAVE_HIGH_FROM_HZ : f64 = 330.0;
+const WAVE_HIGH_TO_HZ : f64 = 660.0;
+const WAVE_HIGH_GAIN : f64 = 0.18;
+const WAVE_HIGH_AT : f64 = 0.08;
+
+/** The death: a long saw growl falling through a big boom. */
+const DEATH_GROWL_FROM_HZ : f64 = 520.0;
+const DEATH_GROWL_TO_HZ : f64 = 50.0;
+const DEATH_GROWL_SECONDS : f64 = 0.8;
+const DEATH_GROWL_DECAY : f64 = 3.0;
+const DEATH_GROWL_GAIN : f64 = 0.35;
+
+/** The nova: a sine rising fast, then a burst of dull noise that starts before the rise has ended. */
+const NOVA_RISE_FROM_HZ : f64 = 200.0;
+const NOVA_RISE_TO_HZ : f64 = 1400.0;
+const NOVA_RISE_SECONDS : f64 = 0.4;
+const NOVA_RISE_DECAY : f64 = 0.5;
+const NOVA_RISE_GAIN : f64 = 0.5;
+const NOVA_HISS_SECONDS : f64 = 0.7;
+const NOVA_HISS_SMOOTH : f64 = 0.6;
+const NOVA_HISS_DECAY : f64 = 2.5;
+const NOVA_HISS_GAIN : f64 = 0.7;
+const NOVA_HISS_AT : f64 = 0.3;
+
+/** How long, how dull and how loud one boom is. */
+struct Boom {
+    seconds : f64;
+    smooth  : f64;
+    gain    : f64;
+}
+
+/** The sound effects and the device that plays them. */
+pub class Sound {
+    /** The mixer; the program's main loop pumps it on a thread of its own when it is open. */
+    pub mixer : Mixer;
+
+    /** Whether there is a device to play on. */
+    pub enabled : bool = false;
+
+    /** Whether the player turned sound off with M. */
+    pub muted : bool = false;
+
+    shoot  : SoundBank;
+    hit    : SoundBank;
+    boom   : SoundBank;
+    big    : SoundBank;
+    pickup : SoundBank;
+    wave   : SoundBank;
+    death  : SoundBank;
+    nova   : SoundBank;
+    rng    : Pcg32;
+
+    /** Opens the audio device and, when there is one, synthesises every effect. */
+    constructor() {
+        self.mixer = new Mixer();
+        self.rng = new Pcg32(SFX_PICK_SEED, SFX_PICK_STREAM);
+        self.shoot = new SoundBank(VARIANTS);
+        self.hit = new SoundBank(VARIANTS);
+        self.boom = new SoundBank(VARIANTS);
+        self.big = new SoundBank(VARIANTS);
+        self.pickup = new SoundBank(VARIANTS);
+        self.wave = new SoundBank(SFX_SINGLE);
+        self.death = new SoundBank(SFX_SINGLE);
+        self.nova = new SoundBank(SFX_SINGLE);
+        self.enabled = self.mixer.isOpen();
+        if (self.enabled) {
+            self.build();
+        }
+    }
+
+    /** Stops the device and frees the clips. Stop and join the pump thread first. */
+    pub fn close(self) : void {
+        self.mixer.close();
+        self.shoot.close();
+        self.hit.close();
+        self.boom.close();
+        self.big.close();
+        self.pickup.close();
+        self.wave.close();
+        self.death.close();
+        self.nova.close();
+    }
+
+    /** Flips the mute switch. */
+    pub fn toggleMute(mut self) : void {
+        self.muted = !self.muted;
+    }
+
+    /** Plays effect `s` unless sound is off. */
+    pub fn play(mut self, s : Sfx) : void {
+        if (!self.enabled || self.muted) {
+            return;
+        }
+        let roll : f64 = self.rng.nextF64();
+        let volume : f64 = MASTER * Sound::level(s);
+        self.bankOf(s).playRand(self.mixer, roll, volume);
+    }
+
+    // The share of the master volume that effect `s` plays at.
+    static fn level(s : Sfx) : f64 {
+        return match s {
+            Sfx::Shoot => SFX_LEVEL_SHOOT,
+            Sfx::Hit => SFX_LEVEL_HIT,
+            Sfx::Boom => SFX_LEVEL_BOOM,
+            Sfx::BigBoom => SFX_LEVEL_BIG_BOOM,
+            Sfx::Pickup => SFX_LEVEL_PICKUP,
+            Sfx::Wave => SFX_LEVEL_WAVE,
+            Sfx::Death => SFX_LEVEL_DEATH,
+            Sfx::Nova => SFX_LEVEL_NOVA,
+        };
+    }
+
+    // The variants of effect `s`.
+    fn bankOf(self, s : Sfx) : SoundBank {
+        return match s {
+            Sfx::Shoot => self.shoot,
+            Sfx::Hit => self.hit,
+            Sfx::Boom => self.boom,
+            Sfx::BigBoom => self.big,
+            Sfx::Pickup => self.pickup,
+            Sfx::Wave => self.wave,
+            Sfx::Death => self.death,
+            Sfx::Nova => self.nova,
+        };
+    }
+
+    // Synthesises every effect and loads it into its bank.
+    fn build(mut self) : void {
+        let noise : Pcg32 = new Pcg32(SFX_NOISE_SEED, SFX_NOISE_STREAM);
+        let small : Boom = Boom {
+            seconds: BOOM_SMALL_SECONDS,
+            smooth: BOOM_SMALL_SMOOTH,
+            gain: BOOM_SMALL_GAIN,
+        };
+        let big : Boom = Boom {
+            seconds: BOOM_BIG_SECONDS,
+            smooth: BOOM_BIG_SMOOTH,
+            gain: BOOM_BIG_GAIN,
+        };
+
+        for (v of 0..VARIANTS) {
+            let pitch : f64 = 1.0 + PITCH_STEP * ((v - SFX_NEUTRAL_VARIANT) as f64);
+            Sound::install(self.shoot, Sound::shootSound(pitch));
+            Sound::install(self.hit, Sound::hitSound(noise, pitch));
+            Sound::install(self.boom, Sound::boomSound(noise, small, pitch));
+            Sound::install(self.big, Sound::boomSound(noise, big, pitch));
+            Sound::install(self.pickup, Sound::arpeggio(pitch));
+        }
+        Sound::install(self.wave, Sound::waveSound());
+        Sound::install(self.death, Sound::deathSound(noise));
+        Sound::install(self.nova, Sound::novaSound(noise));
+    }
+
+    // Writes `samples` to the temporary file, loads it into `bank` and deletes it.
+    static fn install(bank : SoundBank, samples : Vec<i32>) : void {
+        if (Wav::write(TEMP_NAME, samples)) {
+            bank.add(TEMP_NAME);
+        }
+        fs::remove(TEMP_NAME);
+    }
+
+    // A square wave sliding down: the classic laser.
+    static fn shootSound(pitch : f64) : Vec<i32> {
+        let laser : Tone = Tone {
+            kind: Wave::Square,
+            from: SHOOT_FROM_HZ * pitch,
+            to: SHOOT_TO_HZ * pitch,
+            seconds: SHOOT_SECONDS,
+            decay: SHOOT_DECAY,
+            gain: SHOOT_GAIN,
+        };
+        return Synth::sweep(laser);
+    }
+
+    // A click of noise over a short low thud.
+    static fn hitSound(noise : Pcg32, pitch : f64) : Vec<i32> {
+        let click : Hiss = Hiss {
+            seconds: HIT_CLICK_SECONDS,
+            smooth: HIT_CLICK_SMOOTH,
+            decay: HIT_CLICK_DECAY,
+            gain: HIT_CLICK_GAIN,
+        };
+        let thud : Tone = Tone {
+            kind: Wave::Sine,
+            from: HIT_THUD_FROM_HZ * pitch,
+            to: HIT_THUD_TO_HZ,
+            seconds: HIT_THUD_SECONDS,
+            decay: HIT_THUD_DECAY,
+            gain: HIT_THUD_GAIN,
+        };
+        let out : Vec<i32> = Synth::noise(noise, click);
+        Synth::mixIn(out, Synth::sweep(thud), 0);
+        return out;
+    }
+
+    // Dull rumbling noise with a falling sub-bass tone under it; `pitch` scales how dull the rumble is.
+    static fn boomSound(noise : Pcg32, boom : Boom, pitch : f64) : Vec<i32> {
+        let rumble : Hiss = Hiss {
+            seconds: boom.seconds,
+            smooth: boom.smooth * pitch,
+            decay: BOOM_RUMBLE_DECAY,
+            gain: BOOM_RUMBLE_GAIN * boom.gain,
+        };
+        let sub : Tone = Tone {
+            kind: Wave::Sine,
+            from: BOOM_SUB_FROM_HZ,
+            to: BOOM_SUB_TO_HZ,
+            seconds: boom.seconds,
+            decay: BOOM_SUB_DECAY,
+            gain: BOOM_SUB_GAIN * boom.gain,
+        };
+        let out : Vec<i32> = Synth::noise(noise, rumble);
+        Synth::mixIn(out, Synth::sweep(sub), 0);
+        return out;
+    }
+
+    // One steady square-wave note of `hz`.
+    static fn note(hz : f64, seconds : f64, decay : f64) : Vec<i32> {
+        let tone : Tone = Tone {
+            kind: Wave::Square,
+            from: hz,
+            to: hz,
+            seconds: seconds,
+            decay: decay,
+            gain: ARP_NOTE_GAIN,
+        };
+        return Synth::sweep(tone);
+    }
+
+    // Three rising notes.
+    static fn arpeggio(pitch : f64) : Vec<i32> {
+        let root : Vec<i32> = Sound::note(ARP_ROOT_HZ * pitch, ARP_NOTE_SECONDS, ARP_NOTE_DECAY);
+        let third : Vec<i32> = Sound::note(ARP_THIRD_HZ * pitch, ARP_NOTE_SECONDS, ARP_NOTE_DECAY);
+        let fifth : Vec<i32> = Sound::note(ARP_FIFTH_HZ * pitch, ARP_LAST_SECONDS, ARP_LAST_DECAY);
+        Synth::mixIn(root, third, Synth::frames(ARP_THIRD_AT));
+        Synth::mixIn(root, fifth, Synth::frames(ARP_FIFTH_AT));
+        return root;
+    }
+
+    // Two sliding tones announcing a wave.
+    static fn waveSound() : Vec<i32> {
+        let low : Tone = Tone {
+            kind: Wave::Saw,
+            from: WAVE_LOW_FROM_HZ,
+            to: WAVE_LOW_TO_HZ,
+            seconds: WAVE_SECONDS,
+            decay: WAVE_DECAY,
+            gain: WAVE_LOW_GAIN,
+        };
+        let high : Tone = Tone {
+            kind: Wave::Saw,
+            from: WAVE_HIGH_FROM_HZ,
+            to: WAVE_HIGH_TO_HZ,
+            seconds: WAVE_SECONDS,
+            decay: WAVE_DECAY,
+            gain: WAVE_HIGH_GAIN,
+        };
+        let out : Vec<i32> = Synth::sweep(low);
+        Synth::mixIn(out, Synth::sweep(high), Synth::frames(WAVE_HIGH_AT));
+        return out;
+    }
+
+    // A long falling growl and an explosion.
+    static fn deathSound(noise : Pcg32) : Vec<i32> {
+        let blast : Boom = Boom {
+            seconds: BOOM_DEATH_SECONDS,
+            smooth: BOOM_DEATH_SMOOTH,
+            gain: BOOM_DEATH_GAIN,
+        };
+        let growl : Tone = Tone {
+            kind: Wave::Saw,
+            from: DEATH_GROWL_FROM_HZ,
+            to: DEATH_GROWL_TO_HZ,
+            seconds: DEATH_GROWL_SECONDS,
+            decay: DEATH_GROWL_DECAY,
+            gain: DEATH_GROWL_GAIN,
+        };
+        let out : Vec<i32> = Sound::boomSound(noise, blast, 1.0);
+        Synth::mixIn(out, Synth::sweep(growl), 0);
+        return out;
+    }
+
+    // A rising sweep that breaks into noise.
+    static fn novaSound(noise : Pcg32) : Vec<i32> {
+        let rise : Tone = Tone {
+            kind: Wave::Sine,
+            from: NOVA_RISE_FROM_HZ,
+            to: NOVA_RISE_TO_HZ,
+            seconds: NOVA_RISE_SECONDS,
+            decay: NOVA_RISE_DECAY,
+            gain: NOVA_RISE_GAIN,
+        };
+        let burst : Hiss = Hiss {
+            seconds: NOVA_HISS_SECONDS,
+            smooth: NOVA_HISS_SMOOTH,
+            decay: NOVA_HISS_DECAY,
+            gain: NOVA_HISS_GAIN,
+        };
+        let out : Vec<i32> = Synth::sweep(rise);
+        Synth::mixIn(out, Synth::noise(noise, burst), Synth::frames(NOVA_HISS_AT));
+        return out;
+    }
+}

@@ -1,0 +1,166 @@
+// session — the interactive program: a window, a frame loop and the fixed-step simulation inside it.
+//
+// Each frame: wait for the frame boundary, read the keyboard, bank the real time that passed into Ludax's
+// `FixedStep`, run as many 1/60 s simulation ticks as it releases, hand the sounds those ticks asked for to
+// the mixer, draw, and put the picture on the window. Drawing therefore never changes what the game does, and
+// a slow frame costs a few extra ticks (up to a cap) instead of a slow-motion game.
+
+use ludax::{FixedStep, secondsToNanos};
+use smalt::mixerLoop;
+use smalt::{
+    Platform, PlatformError, Window, WindowDesc, Clock, Events, Event, EventKind, FramePacer,
+    Surface, Bmp
+};
+
+use crate::app::controls::{Controls, Command};
+use crate::app::game::{Game, Mode};
+use crate::app::options::Options;
+use crate::app::telemetry::{Telemetry, SCOPE_FRAME, SCOPE_INPUT, SCOPE_RENDER, SCOPE_PRESENT};
+use crate::audio::sound::Sound;
+use crate::core::config::{VIEW_W, VIEW_H, TICK_HZ, MAX_STEPS_PER_FRAME, FRAME_RATE};
+use crate::core::types::Input;
+use crate::gfx::renderer::Renderer;
+
+/** Microseconds in a second, as a real, for the frame-time graph. */
+const MICROS : f64 = 1000000.0;
+
+/** The interactive session. */
+pub class Session {
+    /** Opens the window and runs until the player quits. Answers the exit code. */
+    pub static fn run(opts : Options) : i32 {
+        try {
+            return Session::play(opts);
+        } catch e : PlatformError {
+            println(e.message);
+            return 1;
+        }
+    }
+
+    static fn play(opts : Options) : i32 ! PlatformError {
+        let platform = new Platform();
+        defer platform.close();
+        let win = platform.open(WindowDesc { title: "Stardrift", w: VIEW_W, h: VIEW_H });
+        defer win.close();
+        let clock = new Clock();
+        defer clock.close();
+        let events = new Events();
+        defer events.close();
+        let screen = new Surface(VIEW_W, VIEW_H);
+        defer screen.close();
+
+        let mut game : Game = new Game(opts.seed as u64, new Telemetry());
+        let mut renderer : Renderer = new Renderer(screen.frame());
+        renderer.debug = opts.debug;
+        game.firstWave = opts.wave;
+        let tm = game.world.tm;
+        tm.prof.setEnabled(opts.debug);
+        let mut sound : Sound = new Sound();
+        sound.muted = opts.mute;
+        let audio : Future<i32> = spawn mixerLoop(sound.mixer);
+
+        let pacer = new FramePacer(FRAME_RATE);
+        let fixed : FixedStep = FixedStep::atHertz(TICK_HZ, MAX_STEPS_PER_FRAME);
+        let mut running : bool = true;
+        let mut input : Input = Input {};
+
+        while (running && win.isOpen()) {
+            // The wait for the frame boundary is outside the profiled frame: it is idle time, not work.
+            let seconds : f64 = pacer.tick(clock);
+            tm.prof.beginFrame();
+            let whole : i32 = tm.begin(SCOPE_FRAME);
+            fixed.advanceNanos(secondsToNanos(seconds));
+
+            let reading : i32 = tm.begin(SCOPE_INPUT);
+            events.pump(win, clock);
+            if (Session::handleEvents(events, game, renderer, sound, screen)) {
+                running = false;
+            }
+            input = Controls::held(events);
+            tm.end(reading);
+
+            while (fixed.takeStep()) {
+                game.tick(input);
+            }
+            Session::playSounds(game, sound);
+
+            if (!win.minimised()) {
+                Session::drawFrame(win, screen, renderer, game, pacer.fps());
+            }
+            tm.end(whole);
+            tm.prof.endFrame();
+            renderer.overlay.record((seconds * MICROS) as i32);
+        }
+
+        sound.mixer.requestStop();
+        await audio;
+        sound.close();
+        renderer.close();
+        game.close();
+        return 0;
+    }
+
+    // Reads every pending event and applies it; true when the player asked to quit.
+    static fn handleEvents(
+        events : Events,
+        game : Game,
+        renderer : Renderer,
+        sound : Sound,
+        screen : Surface
+    ) : bool {
+        let mut quit : bool = false;
+        while (events.hasNext()) {
+            let e : Event = events.next();
+            if (e.kind == EventKind::Quit) {
+                quit = true;
+            }
+            if (e.kind == EventKind::WindowFocusLost && game.mode == Mode::Playing) {
+                game.togglePause();
+            }
+            match Controls::command(e) {
+                Command::Confirm => game.confirm(),
+                Command::Pause => game.togglePause(),
+                Command::Debug => {
+                    renderer.debug = !renderer.debug;
+                    game.world.tm.prof.setEnabled(renderer.debug);
+                },
+                Command::Mute => sound.toggleMute(),
+                Command::Screenshot => Session::screenshot(screen),
+                Command::Quit => quit = true,
+                Command::None => {},
+            }
+        }
+        return quit;
+    }
+
+    // Draws the game into `screen` and shows it on the window, each part timed as its own scope.
+    static fn drawFrame(
+        win : Window,
+        screen : Surface,
+        renderer : Renderer,
+        game : Game,
+        fps : f64
+    ) : void {
+        let tm = game.world.tm;
+        let draw : i32 = tm.begin(SCOPE_RENDER);
+        renderer.draw(screen.frame(), game, fps);
+        tm.end(draw);
+        let show : i32 = tm.begin(SCOPE_PRESENT);
+        screen.present(win);
+        tm.end(show);
+    }
+
+    // Hands every sound the simulation asked for since the last frame to the mixer.
+    static fn playSounds(game : Game, sound : Sound) : void {
+        for (i of 0..game.outbox.len()) {
+            sound.play(game.outbox.get(i));
+        }
+        game.outbox.clear();
+    }
+
+    // F12: the window contents as stardrift.bmp.
+    static fn screenshot(screen : Surface) : void {
+        if (Bmp::write("stardrift.bmp", screen.frame())) {
+            println("wrote stardrift.bmp");
+        }
+    }
+}

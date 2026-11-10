@@ -1,0 +1,282 @@
+// screens — the title, pause and game-over screens drawn over the world.
+//
+// The world keeps running behind the title and the game-over screens, so they only add what belongs to them:
+// a dimming of the field, big lettering and a few lines of text. The lettering is the UI face at an integer
+// multiple of its size, with an additive glow under it that pulses with the menu clock. Each screen has its
+// own block of constants for where its lines sit, measured from the top of the view; a two-column table is a
+// `Table` that knows its column and its row spacing.
+
+use ludax::{sin, TAU};
+use smalt::{Frame, Rect, Color};
+
+use crate::core::config::{VIEW_W, VIEW_H};
+use crate::core::palette::{
+    PAL_TEXT, PAL_TEXT_DIM, PAL_ACCENT, PAL_SHIP_EDGE, PAL_DRONE_EDGE, PAL_GUNSHIP_EDGE,
+    PAL_ROCK_EDGE, PAL_SHIELD, PAL_RAPID, PAL_SPREAD, PAL_NOVA
+};
+use crate::core::types::Kind;
+use crate::gfx::draw::{Draw, Pixel};
+use crate::gfx::typeface::Typeface;
+use crate::sim::world::World;
+
+/** The brightest value of one colour channel. */
+const SCREEN_CHANNEL_MAX : i32 = 255;
+
+/** The tint the field is darkened with under a screen, and the denominator of how much of it is laid on. */
+const DIM_COLOR : i32 = 0x02030A;
+const DIM_OUT_OF : i32 = 10;
+
+/** How much of `DIM_OUT_OF` the title darkens the field, and how much the pause and game-over screens do. */
+const TITLE_DIM : i32 = 4;
+const HEAVY_DIM : i32 = 6;
+
+/** Text scale of ordinary lines and of the larger lines (a prompt, a subtitle, "NEW BEST!"). */
+const LINE_SCALE : i32 = 1;
+const BIG_SCALE : i32 = 2;
+
+/** The halo of a heading: percent of full glow, and the divisor of the text's half width for its lobes' spread. */
+const HEADING_GLOW_PERCENT : i32 = 18;
+const HEADING_GLOW_SPREAD : i32 = 2;
+
+/** Distance from the start of a key's name to its description. */
+const KEY_COLUMN : i32 = 120;
+
+/** Ticks of one blink of the "press enter" line. */
+const BLINK : i64 = 36;
+
+/** The title: scale and top of the lettering, how far it pulses, and the tops of the lines under it. */
+const TITLE_SCALE : i32 = 8;
+const TITLE_TOP : i32 = 120;
+const TITLE_SUBTITLE_TOP : i32 = 250;
+const TITLE_PROMPT_TOP : i32 = 320;
+const TITLE_CONTROLS_TOP : i32 = 400;
+
+/** Period of the title's brightness pulse in ticks, how far it swings, and the brightness it swings around. */
+const TITLE_PULSE_TICKS : f32 = 240.0;
+const TITLE_PULSE_DEPTH : f32 = 55.0;
+const TITLE_PULSE_BASE : i32 = 200;
+
+/** The best score on the title: top of its row, and how far its label and number sit from the middle. */
+const TITLE_BEST_TOP : i32 = 556;
+const TITLE_BEST_LABEL : i32 = 30;
+const TITLE_BEST_NUMBER : i32 = 4;
+
+/** The controls table: its columns' distance from the middle, the first row's drop below its heading, the step. */
+const CONTROLS_LEFT : i32 = 320;
+const CONTROLS_RIGHT : i32 = 30;
+const TABLE_FIRST_ROW : i32 = 22;
+const TABLE_ROW_STEP : i32 = 18;
+
+/** The pause screen: scale and top of its lettering, and the tops of the lines under it. */
+const PAUSE_SCALE : i32 = 6;
+const PAUSE_TOP : i32 = 200;
+const PAUSE_PROMPT_TOP : i32 = 290;
+const PAUSE_CONTROLS_TOP : i32 = 380;
+
+/** The game-over screen: scale and top of its lettering and the top of each line under it. */
+const OVER_SCALE : i32 = 7;
+const OVER_TOP : i32 = 84;
+const OVER_SCORE_LABEL_TOP : i32 = 190;
+const OVER_SCORE_TOP : i32 = 208;
+const OVER_SCORE_SCALE : i32 = 4;
+const OVER_NEW_BEST_TOP : i32 = 262;
+const OVER_BEST_TOP : i32 = 266;
+const OVER_BEST_LEFT : i32 = 50;
+const OVER_PROMPT_TOP : i32 = 500;
+
+/** The statistics: their column's distance left of the middle and its width, and the tops of the two blocks. */
+const STATS_LEFT : i32 = 140;
+const STATS_WIDTH : i32 = 280;
+const STATS_RUN_TOP : i32 = 318;
+const STATS_KILLS_TOP : i32 = 366;
+const STATS_ROW_STEP : i32 = 20;
+
+/** A column of rows on a screen: where it starts and how far apart its rows are. */
+struct Table {
+    f    : Frame;
+    kit  : Typeface;
+    x    : i32;
+    top  : i32;
+    step : i32;
+
+    // The top edge of row `index`.
+    fn rowTop(self, index : i32) : i32 {
+        return self.top + index * self.step;
+    }
+
+    // Row `index` of a two-column table: the key or label in `ink`, then its meaning in the normal colour.
+    fn entry(self, index : i32, key : string, meaning : string, ink : i32) : void {
+        let top : i32 = self.rowTop(index);
+        self.kit.text(self.x, top, key, LINE_SCALE, ink);
+        self.kit.text(self.x + KEY_COLUMN, top, meaning, LINE_SCALE, PAL_TEXT);
+    }
+
+    // Row `index` of a column of statistics: a label in `ink` and its number against the right edge.
+    fn figure(mut self, index : i32, label : string, value : i32, ink : i32) : void {
+        let top : i32 = self.rowTop(index);
+        self.kit.text(self.x, top, label, LINE_SCALE, ink);
+        self.kit.numberRight(self.x + STATS_WIDTH, top, value as i64, LINE_SCALE, PAL_TEXT);
+    }
+}
+
+/** The non-play screens. */
+pub class Screens {
+    // Darkens the field so that text reads over it.
+    static fn dim(f : Frame, num : i32) : void {
+        f.shade(Rect::make(0, 0, VIEW_W, VIEW_H), DIM_COLOR, num, DIM_OUT_OF);
+    }
+
+    // The word `s` in lettering of `scale`, in `ink`, over a halo, centred on `cx`.
+    static fn heading(
+        f : Frame,
+        kit : Typeface,
+        cx : i32,
+        top : i32,
+        s : string,
+        scale : i32,
+        ink : i32
+    ) : void {
+        let half : i32 = kit.width(s, scale) / 2;
+        let mid : i32 = top + kit.height(scale) / 2;
+        let radius : i32 = kit.height(scale);
+        let shift : i32 = half / HEADING_GLOW_SPREAD;
+        Draw::glow(f, Pixel::at(cx - shift, mid), radius, ink, HEADING_GLOW_PERCENT);
+        Draw::glow(f, Pixel::at(cx + shift, mid), radius, ink, HEADING_GLOW_PERCENT);
+        kit.centred(cx + scale, top + scale, s, scale, Draw::quarter(ink));
+        kit.centred(cx, top, s, scale, ink);
+    }
+
+    // A blinking prompt line.
+    static fn prompt(kit : Typeface, top : i32, s : string, uiTicks : i64) : void {
+        if ((uiTicks / BLINK) % 2 == 0) {
+            kit.centred(VIEW_W / 2, top, s, BIG_SCALE, PAL_TEXT);
+        }
+    }
+
+    /** The title screen. */
+    pub static fn title(f : Frame, kit : Typeface, uiTicks : i64, best : i32) : void {
+        Screens::dim(f, TITLE_DIM);
+        let phase : f32 = TAU * (uiTicks as f32) / TITLE_PULSE_TICKS;
+        let pulse : i32 = TITLE_PULSE_BASE + ((sin(phase) * TITLE_PULSE_DEPTH) as i32);
+        let ink : i32 = Color::scale(PAL_SHIP_EDGE, pulse, SCREEN_CHANNEL_MAX);
+        let middle : i32 = VIEW_W / 2;
+        let subtitle : string = "DRIFT. SHOOT. SURVIVE THE WAVES.";
+
+        Screens::heading(f, kit, middle, TITLE_TOP, "STARDRIFT", TITLE_SCALE, ink);
+        kit.centred(middle, TITLE_SUBTITLE_TOP, subtitle, BIG_SCALE, PAL_TEXT_DIM);
+        Screens::prompt(kit, TITLE_PROMPT_TOP, "PRESS ENTER TO LAUNCH", uiTicks);
+        Screens::controls(f, kit, TITLE_CONTROLS_TOP);
+        if (best > 0) {
+            kit.centred(
+                middle - TITLE_BEST_LABEL,
+                TITLE_BEST_TOP,
+                "BEST",
+                LINE_SCALE,
+                PAL_TEXT_DIM
+            );
+            kit.number(
+                middle + TITLE_BEST_NUMBER,
+                TITLE_BEST_TOP,
+                best as i64,
+                LINE_SCALE,
+                PAL_ACCENT
+            );
+        }
+    }
+
+    // Two columns: the keys, and what the pick-ups do.
+    static fn controls(f : Frame, kit : Typeface, top : i32) : void {
+        let first : i32 = top + TABLE_FIRST_ROW;
+        let keys : Table = Table {
+            f: f,
+            kit: kit,
+            x: VIEW_W / 2 - CONTROLS_LEFT,
+            top: first,
+            step: TABLE_ROW_STEP,
+        };
+        let powers : Table = Table {
+            f: f,
+            kit: kit,
+            x: VIEW_W / 2 + CONTROLS_RIGHT,
+            top: first,
+            step: TABLE_ROW_STEP,
+        };
+
+        kit.text(keys.x, top, "CONTROLS", LINE_SCALE, PAL_ACCENT);
+        keys.entry(0, "LEFT / RIGHT", "turn (or A / D)", PAL_TEXT_DIM);
+        keys.entry(1, "UP", "thrust (or W)", PAL_TEXT_DIM);
+        keys.entry(2, "SPACE", "fire (or Z)", PAL_TEXT_DIM);
+        keys.entry(3, "P", "pause", PAL_TEXT_DIM);
+        keys.entry(4, "F3 / M / F12", "debug / sound / screenshot", PAL_TEXT_DIM);
+        keys.entry(5, "ESC", "quit", PAL_TEXT_DIM);
+
+        kit.text(powers.x, top, "POWER-UPS", LINE_SCALE, PAL_ACCENT);
+        powers.entry(0, "S  shield", "absorbs one hit", PAL_SHIELD);
+        powers.entry(1, "R  rapid fire", "twice the rate", PAL_RAPID);
+        powers.entry(2, "W  spread shot", "three at once", PAL_SPREAD);
+        powers.entry(3, "N  nova", "blast around you", PAL_NOVA);
+        powers.entry(4, "CHAIN", "kills in a row raise the multiplier", PAL_ACCENT);
+    }
+
+    /** The pause screen. */
+    pub static fn paused(f : Frame, kit : Typeface, uiTicks : i64) : void {
+        Screens::dim(f, HEAVY_DIM);
+        Screens::heading(f, kit, VIEW_W / 2, PAUSE_TOP, "PAUSED", PAUSE_SCALE, PAL_TEXT);
+        Screens::prompt(kit, PAUSE_PROMPT_TOP, "PRESS P TO RESUME", uiTicks);
+        Screens::controls(f, kit, PAUSE_CONTROLS_TOP);
+    }
+
+    /** The game-over screen with the result of the run. */
+    pub static fn over(
+        f : Frame,
+        kit : Typeface,
+        w : World,
+        uiTicks : i64,
+        best : i32,
+        newBest : bool
+    ) : void {
+        Screens::dim(f, HEAVY_DIM);
+        let middle : i32 = VIEW_W / 2;
+        let points : i64 = w.score.points as i64;
+
+        Screens::heading(f, kit, middle, OVER_TOP, "GAME OVER", OVER_SCALE, PAL_DRONE_EDGE);
+        kit.centred(middle, OVER_SCORE_LABEL_TOP, "SCORE", LINE_SCALE, PAL_TEXT_DIM);
+        kit.numberCentred(middle, OVER_SCORE_TOP, points, OVER_SCORE_SCALE, PAL_TEXT);
+        if (newBest) {
+            kit.centred(middle, OVER_NEW_BEST_TOP, "NEW BEST!", BIG_SCALE, PAL_ACCENT);
+        } else {
+            let left : i32 = middle - OVER_BEST_LEFT;
+            kit.prefixed(left, OVER_BEST_TOP, "BEST ", best as i64, LINE_SCALE, PAL_TEXT_DIM);
+        }
+        Screens::stats(f, kit, w);
+        Screens::prompt(kit, OVER_PROMPT_TOP, "PRESS ENTER TO PLAY AGAIN", uiTicks);
+    }
+
+    // Wave reached, longest chain and what was destroyed.
+    static fn stats(f : Frame, kit : Typeface, w : World) : void {
+        let left : i32 = VIEW_W / 2 - STATS_LEFT;
+        let run : Table = Table {
+            f: f,
+            kit: kit,
+            x: left,
+            top: STATS_RUN_TOP,
+            step: STATS_ROW_STEP,
+        };
+        let kills : Table = Table {
+            f: f,
+            kit: kit,
+            x: left,
+            top: STATS_KILLS_TOP,
+            step: STATS_ROW_STEP,
+        };
+        let rocks : i32 = w.tally.getOr(Kind::Rock as i32, 0);
+        let drones : i32 = w.tally.getOr(Kind::Drone as i32, 0);
+        let gunships : i32 = w.tally.getOr(Kind::Gunship as i32, 0);
+
+        run.figure(0, "Wave reached", w.director.wave, PAL_TEXT_DIM);
+        run.figure(1, "Longest chain", w.score.bestChain, PAL_TEXT_DIM);
+        kills.figure(0, "Rocks destroyed", rocks, PAL_ROCK_EDGE);
+        kills.figure(1, "Drones destroyed", drones, PAL_DRONE_EDGE);
+        kills.figure(2, "Gunships destroyed", gunships, PAL_GUNSHIP_EDGE);
+    }
+}

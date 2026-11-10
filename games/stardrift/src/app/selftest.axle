@@ -1,0 +1,219 @@
+// selftest — `--selftest`: the game's own containers and rules, checked with Ludax's `Checks` harness.
+//
+// The engine's suites prove Ludax's containers; these prove the pieces the game builds on top of them (the
+// bullet pool, the collision grid, the wave plan, the combo) and the rules that make a run reproducible: the
+// same seed gives the same checksum, another seed does not, and an id kept past the death of its entity is
+// refused. The process exits with the number of failed checks, so 0 is a pass.
+
+use ludax::{Checks, EntityId, Vec, Vec2};
+
+use crate::app::bot::Bot;
+use crate::app::checksum::Checksum;
+use crate::app::controls::Command;
+use crate::app::game::Game;
+use crate::app::telemetry::Telemetry;
+use crate::core::types::{Bullet, Input, Kind, Layer, Power};
+use crate::sim::collide::Collide;
+use crate::sim::combat::Combat;
+use crate::sim::director::Director;
+use crate::sim::factory::Factory;
+use crate::sim::grid::{SpatialGrid, Proxy};
+use crate::sim::pool::Pool;
+use crate::sim::score::Score;
+use crate::sim::step::Step;
+use crate::sim::world::World;
+
+/** Ticks played by the determinism checks. */
+const SELFTEST_TICKS : i32 = 3000;
+
+/** The self-test. */
+pub class SelfTest {
+    /** Runs every check; answers the number that failed. */
+    pub static fn run() : i32 {
+        let c : Checks = new Checks();
+        SelfTest::pool(c);
+        SelfTest::grid(c);
+        SelfTest::generations(c);
+        SelfTest::combat(c);
+        SelfTest::score(c);
+        SelfTest::waves(c);
+        SelfTest::determinism(c);
+        println("selftest: ${c.count()} checks, ${c.failures()} failed");
+        return c.failures();
+    }
+
+    // A fresh world in play, with its own telemetry.
+    static fn world(seed : u64) : World {
+        let w : World = new World(seed, new Telemetry());
+        w.reset(seed, false);
+        return w;
+    }
+
+    static fn pool(c : Checks) : void {
+        let p : Pool<i32> = new Pool<i32>(3, 0);
+        c.sameInt("a new pool is empty", p.count() as i64, 0);
+        c.sameInt("slots are handed out from 0", p.acquire(10) as i64, 0);
+        c.sameInt("then 1", p.acquire(11) as i64, 1);
+        c.sameInt("then 2", p.acquire(12) as i64, 2);
+        c.sameInt("a full pool refuses", p.acquire(13) as i64, -1);
+        c.that("releasing a live slot succeeds", p.release(1));
+        c.that("releasing it twice is harmless", !p.release(1));
+        c.that("a released slot is not live", !p.isLive(1));
+        c.sameInt("the freed slot is reused first", p.acquire(14) as i64, 1);
+        c.sameInt("the value is stored", p.get(1) as i64, 14);
+        c.sameInt("walking starts at the first live slot", p.first() as i64, 0);
+        c.sameInt("and goes up in slot order", p.next(0) as i64, 1);
+        c.sameInt("to the end", p.next(2) as i64, -1);
+        p.clear();
+        c.sameInt("clear empties the pool", p.count() as i64, 0);
+        c.sameInt("and starts over at slot 0", p.acquire(1) as i64, 0);
+    }
+
+    static fn proxy(x : f32, y : f32, r : f32, index : i32) : Proxy {
+        return Proxy { x: x, y: y, r: r, layer: Layer::Enemy, index: index, generation: 1 };
+    }
+
+    static fn grid(c : Checks) : void {
+        let g : SpatialGrid = new SpatialGrid();
+        let found : Vec<i32> = new Vec<i32>();
+        g.insert(SelfTest::proxy(100.0, 100.0, 10.0, 0));
+        g.insert(SelfTest::proxy(120.0, 100.0, 10.0, 1));
+        g.insert(SelfTest::proxy(800.0, 500.0, 10.0, 2));
+        g.insert(SelfTest::proxy(-300.0, -300.0, 10.0, 3));
+        c.sameInt("the grid counts what was filed", g.count() as i64, 4);
+        g.query(Vec2::make(110.0, 100.0), 30.0, found);
+        c.sameInt("a query finds both neighbours", found.len() as i64, 2);
+        g.query(Vec2::make(800.0, 500.0), 5.0, found);
+        c.sameInt("a query far away finds only what is there", found.len() as i64, 1);
+        c.sameInt("and it is the right one", g.proxy(found.get(0)).index as i64, 2);
+        g.query(Vec2::make(450.0, 300.0), 5.0, found);
+        c.sameInt("an empty corner finds nothing", found.len() as i64, 0);
+        g.query(Vec2::make(0.0, 0.0), 20.0, found);
+        c.sameInt("things off the field are filed in the edge cells", found.len() as i64, 1);
+        g.clear();
+        c.sameInt("clear forgets every proxy", g.count() as i64, 0);
+        g.query(Vec2::make(100.0, 100.0), 50.0, found);
+        c.sameInt("and queries find nothing", found.len() as i64, 0);
+    }
+
+    static fn generations(c : Checks) : void {
+        let w : World = SelfTest::world(1);
+        let first : EntityId = Factory::rock(w, Vec2::make(50.0, 50.0), Vec2::zero(), 3);
+        c.that("a new entity is alive", w.entities.has(first));
+        w.remove(first);
+        c.that("a removed entity's id is stale", !w.entities.has(first));
+        let second : EntityId = Factory::rock(w, Vec2::make(60.0, 60.0), Vec2::zero(), 3);
+        c.sameInt("the slot is reused", second.index as i64, first.index as i64);
+        c.that("with a new generation", second.generation != first.generation);
+        c.that("the old id still does not name the new tenant", !w.entities.has(first));
+        Combat::hurt(w, first, 99, Vec2::zero());
+        c.that("hurting through a stale id does nothing", w.entities.has(second));
+        let drone : EntityId = Factory::drone(w, 10.0, 10.0);
+        c.that("a drone has a brain component", w.brains.has(drone.index));
+        w.remove(drone);
+        c.that("removing the entity removes its component", !w.brains.has(drone.index));
+        let gift : EntityId = Factory::pickup(w, Vec2::make(10.0, 10.0), Power::Shield);
+        c.that("a pick-up has a lifetime component", w.lifetimes.has(gift.index));
+        w.close();
+    }
+
+    static fn combat(c : Checks) : void {
+        let mut w : World = SelfTest::world(2);
+        w.ship.invuln = 0;
+        let rock : EntityId = Factory::rock(w, Vec2::make(300.0, 300.0), Vec2::zero(), 3);
+        w.bullets.acquire(Bullet { x: 300.0, y: 300.0, life: 10 });
+        Collide::run(w);
+        c.sameInt("a shot hurts a rock", w.entities.get(rock).hp as i64, 2);
+        c.sameInt("and is used up", w.bullets.count() as i64, 0);
+        Combat::destroy(w, rock);
+        c.sameInt("a large rock splits in two", w.enemyCount() as i64, 2);
+        c.that("and scored", w.score.points > 0);
+        w.ship.shield = 100;
+        Combat::hitShip(w);
+        c.sameInt("a shield absorbs a hit", w.ship.lives as i64, 3);
+        w.ship.invuln = 0;
+        Combat::hitShip(w);
+        c.sameInt("without it a life is lost", w.ship.lives as i64, 2);
+        c.that("and the ship is down", !w.ship.alive);
+        w.close();
+    }
+
+    static fn score(c : Checks) : void {
+        let s : Score = new Score();
+        c.sameInt("a new chain scores x1", s.multiplier() as i64, 1);
+        c.sameInt("a kill is worth its base", s.award(100) as i64, 100);
+        for (i of 0..3) {
+            s.award(100);
+        }
+        c.sameInt("four kills raise the multiplier", s.multiplier() as i64, 2);
+        c.sameInt("which doubles the next kill", s.award(100) as i64, 200);
+        s.breakChain();
+        c.sameInt("breaking the chain resets it", s.multiplier() as i64, 1);
+        for (i of 0..200) {
+            s.award(1);
+        }
+        c.sameInt("the multiplier is capped", s.multiplier() as i64, 10);
+    }
+
+    // The arrivals a wave plans, counted right after it begins.
+    static fn arrivals(wave : i32) : i32 {
+        let mut w : World = SelfTest::world(3);
+        w.director.wave = wave - 1;
+        w.director.clock = 1;
+        Step::tick(w, Input {});
+        let n : i32 = w.director.pending();
+        w.close();
+        return n;
+    }
+
+    static fn waves(c : Checks) : void {
+        c.sameInt("wave 1 brings four rocks", SelfTest::arrivals(1) as i64, 4);
+        c.sameInt("wave 2 adds a pack of drones", SelfTest::arrivals(2) as i64, 8);
+        c.sameInt("wave 3 adds a gunship", SelfTest::arrivals(3) as i64, 13);
+        c.that("waves keep growing", SelfTest::arrivals(6) > SelfTest::arrivals(3));
+
+        let mut d : Director = new Director();
+        let at : Vec2 = Vec2::make(0.0, 0.0);
+        d.schedule(Kind::Rock, at, 50);
+        d.schedule(Kind::Drone, at, 10);
+        d.schedule(Kind::Gunship, at, 10);
+        d.clock = 9;
+        c.that("nothing is due before its tick", !d.hasDue());
+        d.clock = 10;
+        c.that("the earliest arrival comes due", d.hasDue());
+        c.that(
+            "arrivals of one tick leave in the order they were queued",
+            d.takeNext().kind == Kind::Drone
+        );
+        c.that("then the next", d.takeNext().kind == Kind::Gunship);
+        c.that("a later arrival is not due yet", !d.hasDue());
+    }
+
+    static fn determinism(c : Checks) : void {
+        let a : Game = new Game(5, new Telemetry());
+        let b : Game = new Game(5, new Telemetry());
+        let other : Game = new Game(6, new Telemetry());
+        SelfTest::play(a);
+        SelfTest::play(b);
+        SelfTest::play(other);
+        c.sameInt("the same seed gives the same state", Checksum::stateOf(a), Checksum::stateOf(b));
+        c.that(
+            "another seed gives another state",
+            Checksum::stateOf(a) != Checksum::stateOf(other)
+        );
+        c.that("the game left the title screen", a.runs >= 1);
+        a.close();
+        b.close();
+        other.close();
+    }
+
+    // Plays the scripted pilot for a while.
+    static fn play(g : Game) : void {
+        for (t of 0..SELFTEST_TICKS) {
+            if (Bot::command(g) == Command::Confirm) {
+                g.confirm();
+            }
+            g.tick(Bot::decide(g));
+        }
+    }
+}
