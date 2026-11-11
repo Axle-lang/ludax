@@ -1,0 +1,289 @@
+// render_sparse — the sparse light of the path-lit picture: samples, the four around a pixel, who may share.
+//
+// The properties a renderer leans on: a pixel that is a sample gets its own sample back; a light that is the same
+// everywhere, or that varies linearly across the picture, is given back exactly; a sample with another key never
+// leaks into a pixel; a pixel no sample speaks for is told so; the memo gives back what it was given, for the frame
+// it was given in and for no other.
+
+use ludax::{Checks, Vec3, abs};
+use ludax::{LumenSparse, LumenLightMemo, SparseCorners, SparseLight, SPARSE_NO_KEY};
+
+const SPARSE_W : i32 = 37;
+const SPARSE_H : i32 = 22;
+const SPARSE_TOL : f32 = 0.0001;
+
+// The largest channel of the difference between two colours.
+fn sparseGap(a : Vec3, b : Vec3) : f32 {
+    let mut g : f32 = abs(a.x - b.x);
+    if (abs(a.y - b.y) > g) {
+        g = abs(a.y - b.y);
+    }
+    if (abs(a.z - b.z) > g) {
+        g = abs(a.z - b.z);
+    }
+    return g;
+}
+
+// A light that varies linearly with the pixel.
+fn sparseRamp(x : i32, y : i32) : Vec3 {
+    return Vec3 {
+        x: (x as f32) * (0.25 as f32) + (1.0 as f32),
+        y: (y as f32) * (0.5 as f32),
+        z: ((x + y) as f32) * (0.125 as f32),
+    };
+}
+
+// Fills every sample of `grid` with the ramp at its pixel, all with `key`.
+fn sparseFillRamp(mut grid : LumenSparse, key : i64) : void {
+    let s : i32 = grid.stride;
+    for (gy of 0..grid.down()) {
+        for (gx of 0..grid.across()) {
+            let lit : Vec3 = sparseRamp(gx * s, gy * s);
+            grid.put(grid.index(gx * s, gy * s), lit, lit.scale(0.5), key);
+        }
+    }
+}
+
+fn sparseShape(c : Checks) : void {
+    let grid = new LumenSparse(SPARSE_W, SPARSE_H, 2);
+    grid.setStride(4);
+    c.that("a picture 37 wide has 10 samples a row at stride 4", grid.across() == 10);
+    c.that("a picture 22 high has 6 rows of samples at stride 4", grid.down() == 6);
+    c.that("the first pixel of a block is a sample", grid.isSample(8, 12) && grid.isSample(0, 0));
+    c.that("any other pixel of the block is not", !grid.isSample(9, 12) && !grid.isSample(8, 13));
+    c.that("a pixel belongs to the sample of its block", grid.index(11, 15) == grid.index(8, 12));
+
+    let mut worst : f32 = 0.0;
+    let mut inside : bool = true;
+    for (y of 0..SPARSE_H) {
+        for (x of 0..SPARSE_W) {
+            let k : SparseCorners = grid.corners(x, y);
+            let sum : f32 = k.wa + k.wb + k.wc + k.wd;
+            if (abs(sum - (1.0 as f32)) > worst) {
+                worst = abs(sum - (1.0 as f32));
+            }
+            let last : i64 = (grid.across() * grid.down()) as i64;
+            if (k.ga < 0 || k.gb < 0 || k.gc < 0 || k.gd < 0 || k.ga >= last || k.gb >= last
+                || k.gc >= last
+                || k.gd >= last) {
+                inside = false;
+            }
+        }
+    }
+    c.that("the four weights of every pixel add to 1", worst < SPARSE_TOL);
+    c.that("the four samples of every pixel are in the grid", inside);
+
+    let k : SparseCorners = grid.corners(8, 12);
+    c.that("a sample's own weight is 1", k.wa == 1.0 && k.wb == 0.0 && k.wc == 0.0 && k.wd == 0.0);
+    c.that("a sample's first corner is its own pixel", k.a == (12 * SPARSE_W + 8) as i64);
+}
+
+fn sparseSizes(c : Checks) : void {
+    // A finest stride that is no power of two is taken down to one, and the grids are sized for that one.
+    let mut odd = new LumenSparse(12, 12, 3);
+    c.that(
+        "a finest stride of 3 is a stride of 2",
+        odd.stride == 2 && odd.across() == 6 && odd.down() == 6
+    );
+    odd.put(odd.index(10, 10), Vec3 { x: 7.0, y: 0.0, z: 0.0 }, Vec3::zero(), 1);
+    c.that("its last sample has room", odd.lightAt(odd.index(10, 10)).x == 7.0);
+
+    // A stride finer than the grids were made for is taken up to it.
+    let mut coarse = new LumenSparse(16, 16, 4);
+    coarse.setStride(1);
+    c.that("a stride finer than the grids is refused", coarse.stride == 4 && coarse.across() == 4);
+    coarse.setStride(3);
+    c.that("a stride of 3 over grids made for 4 is 4", coarse.stride == 4);
+    coarse.setStride(9);
+    c.that("a stride of 9 is 8", coarse.stride == 8 && coarse.across() == 2);
+    let k : SparseCorners = coarse.corners(15, 15);
+    c.that("the corners of the last pixel are in the grid", k.gd == 3 && k.ga == 3);
+}
+
+fn sparseExact(c : Checks) : void {
+    let grid = new LumenSparse(SPARSE_W, SPARSE_H, 2);
+    grid.setStride(4);
+    sparseFillRamp(grid, 7);
+
+    // Inside the last full block of each axis the four samples exist, and a linear light comes back exactly.
+    let mut worst : f32 = 0.0;
+    let mut fogWorst : f32 = 0.0;
+    for (y of 0..17) {
+        for (x of 0..33) {
+            let got : SparseLight = grid.blend(grid.corners(x, y), 7);
+            let want : Vec3 = sparseRamp(x, y);
+            if (!got.ok) {
+                worst = 1000.0;
+                continue;
+            }
+            let gap : f32 = sparseGap(got.light, want);
+            if (gap > worst) {
+                worst = gap;
+            }
+            let fogGap : f32 = sparseGap(got.fog, want.scale(0.5));
+            if (fogGap > fogWorst) {
+                fogWorst = fogGap;
+            }
+        }
+    }
+    c.that("a light linear in the pixel is given back exactly", worst < SPARSE_TOL * (10.0 as f32));
+    c.that("and so is its fog", fogWorst < SPARSE_TOL * (10.0 as f32));
+
+    // Past the last sample of a row the pixel holds that sample's light: nothing is extrapolated.
+    let edge : SparseLight = grid.blend(grid.corners(36, 0), 7);
+    c.that(
+        "past the last sample a pixel holds it",
+        edge.ok && sparseGap(edge.light, sparseRamp(36, 0)) < SPARSE_TOL
+    );
+
+    let lit : SparseLight = SparseLight {
+        ok: true,
+        light: Vec3 { x: 2.0, y: 3.0, z: 4.0 },
+        fog: Vec3 { x: 0.5, y: 0.25, z: 0.125 },
+    };
+    let shown : Vec3 = lit.shade(Vec3 { x: 0.5, y: 1.0, z: 0.25 });
+    c.that(
+        "radiance is albedo times light plus fog",
+        sparseGap(shown, Vec3 { x: 1.5, y: 3.25, z: 1.125 }) < SPARSE_TOL
+    );
+}
+
+fn sparseKeys(c : Checks) : void {
+    let mut grid = new LumenSparse(16, 16, 2);
+    grid.setStride(4);
+    let dark : Vec3 = Vec3 { x: 0.0, y: 0.0, z: 0.0 };
+    let red : Vec3 = Vec3 { x: 9.0, y: 0.0, z: 0.0 };
+    let blue : Vec3 = Vec3 { x: 0.0, y: 0.0, z: 5.0 };
+    // The left half of the picture is one thing (key 1, red), the right half another (key 2, blue).
+    for (gy of 0..4) {
+        for (gx of 0..4) {
+            if (gx < 2) {
+                grid.put(grid.index(gx * 4, gy * 4), red, dark, 1);
+            } else {
+                grid.put(grid.index(gx * 4, gy * 4), blue, dark, 2);
+            }
+        }
+    }
+    // Pixel (6, 5) lies between a red column of samples (x = 4) and a blue one (x = 8).
+    let k : SparseCorners = grid.corners(6, 5);
+    let asRed : SparseLight = grid.blend(k, 1);
+    let asBlue : SparseLight = grid.blend(k, 2);
+    c.that(
+        "a pixel of the first thing gets only its light",
+        asRed.ok && sparseGap(asRed.light, red) < SPARSE_TOL
+    );
+    c.that(
+        "a pixel of the second thing gets only its own",
+        asBlue.ok && sparseGap(asBlue.light, blue) < SPARSE_TOL
+    );
+    c.that("a pixel of a third thing is told no sample speaks for it", !grid.blend(k, 3).ok);
+    c.that("the plain mix does blend the two", abs(grid.mix(k).x - (4.5 as f32)) < SPARSE_TOL);
+
+    // A sample nobody may share is never given, not even to a pixel that asks with the same marker.
+    grid.put(grid.index(4, 4), red, dark, SPARSE_NO_KEY);
+    c.that(
+        "a sample without a key is shared with nobody",
+        !grid.blend(grid.corners(4, 4), SPARSE_NO_KEY).ok
+    );
+
+    // Changing the stride changes which samples a pixel reads, not what a constant light gives.
+    grid.setStride(2);
+    for (gy of 0..grid.down()) {
+        for (gx of 0..grid.across()) {
+            grid.put(grid.index(gx * 2, gy * 2), blue, red, 4);
+        }
+    }
+    let fine : SparseLight = grid.blend(grid.corners(7, 9), 4);
+    c.that(
+        "a constant light is constant at any stride",
+        fine.ok && sparseGap(fine.light, blue) < SPARSE_TOL
+    );
+    c.that("and its fog with it", sparseGap(fine.fog, red) < SPARSE_TOL);
+}
+
+fn sparseMemo(c : Checks) : void {
+    let mut memo = new LumenLightMemo(64);
+    let a : Vec3 = Vec3 { x: 1.0, y: 2.0, z: 3.0 };
+    let b : Vec3 = Vec3 { x: 4.0, y: 5.0, z: 6.0 };
+    c.that("an empty memo holds nothing", !memo.find(42, 0).ok);
+    memo.keep(42, 3, a, b);
+    let got : SparseLight = memo.find(42, 3);
+    c.that(
+        "a memo gives back what it was given",
+        got.ok && sparseGap(got.light, a) == 0.0 && sparseGap(got.fog, b) == 0.0
+    );
+    c.that("but not in another frame", !memo.find(42, 4).ok);
+    c.that("and not for another key", !memo.find(43, 3).ok);
+
+    // Many keys in few slots: whatever is found is what was kept for that very key.
+    let mut wrong : i32 = 0;
+    let mut found : i32 = 0;
+    for (k of 0..500) {
+        let key : i64 = ((k * 7919 + 13) as i64) * 1048583;
+        memo.keep(key, 9, Vec3 { x: k as f32, y: 0.0, z: 0.0 }, Vec3::zero());
+    }
+    for (k of 0..500) {
+        let key : i64 = ((k * 7919 + 13) as i64) * 1048583;
+        let hit : SparseLight = memo.find(key, 9);
+        if (hit.ok) {
+            found = found + 1;
+            if (hit.light.x != (k as f32)) {
+                wrong = wrong + 1;
+            }
+        }
+    }
+    c.that("a crowded memo never answers with another key's light", wrong == 0);
+    c.that("a crowded memo still remembers some", found > 0 && found <= 64);
+}
+
+fn sparseReach(c : Checks) : void {
+    let mut grid = new LumenSparse(16, 16, 2);
+    grid.setStride(4);
+    let dark : Vec3 = Vec3 { x: 0.0, y: 0.0, z: 0.0 };
+    // One plane (one key) whose samples lie a block apart along x: sample column gx sits at x = gx, lit gx.
+    for (gy of 0..4) {
+        for (gx of 0..4) {
+            grid.putAt(grid.index(gx * 4, gy * 4), Vec3 {
+                x: gx as f32,
+                y: 0.0,
+                z: 0.0,
+            }, dark, 5, Vec3 { x: gx as f32, y: 0.0, z: gy as f32 });
+        }
+    }
+    let k : SparseCorners = grid.corners(6, 4);
+    let here : Vec3 = Vec3 { x: 1.5, y: 0.0, z: 1.0 };
+    let wide : SparseLight = grid.blendNear(k, 5, here, 1.0);
+    c.that(
+        "within reach the samples of the key blend as they would",
+        wide.ok && abs(wide.light.x - (1.5 as f32)) < SPARSE_TOL
+    );
+    let near : Vec3 = Vec3 { x: 1.1, y: 0.0, z: 1.0 };
+    let tight : SparseLight = grid.blendNear(k, 5, near, 0.25);
+    c.that(
+        "a sample beyond the reach is left out",
+        tight.ok && abs(tight.light.x - (1.0 as f32)) < SPARSE_TOL
+    );
+    c.that(
+        "no sample within reach is no light",
+        !grid.blendNear(k, 5, Vec3 { x: 9.0, y: 0.0, z: 1.0 }, 1.0).ok
+    );
+    c.that(
+        "the reach counts along every axis",
+        !grid.blendNear(k, 5, Vec3 { x: 1.5, y: 3.0, z: 1.0 }, 1.0).ok
+    );
+    c.that("another key within reach is still another key", !grid.blendNear(k, 6, here, 1.0).ok);
+    c.that("the plain blend ignores the place", grid.blend(k, 5).ok);
+}
+
+/** The sparse light grid and its memo. */
+pub class RenderSparseSuite {
+    /** Runs the checks. */
+    pub static fn run(c : Checks) : void {
+        sparseShape(c);
+        sparseSizes(c);
+        sparseExact(c);
+        sparseKeys(c);
+        sparseReach(c);
+        sparseMemo(c);
+    }
+}

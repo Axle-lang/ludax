@@ -1,0 +1,276 @@
+// render_facecache — the light of faces kept in the world: the lattice, the epoch, flat and full, publishing.
+//
+// What a renderer leans on: the nine points come back exactly and the blend between them is continuous; a light
+// linear over the face is given back exactly; an entry answers only for its key and its epoch; a flat entry does
+// not pass for a lattice; what a batch computed is found in the batch at once and in the cache after publishing;
+// a crowded cache forgets, and never answers with another face's light.
+
+use ludax::{Checks, Vec3, abs};
+use ludax::{FACE_POINTS, FaceLight, LumenFaceBatch, LumenFaceCache, faceMix, faceStagger};
+
+const FACE_TOL : f32 = 0.0001;
+
+// The largest channel of the difference between two colours.
+fn faceGap(a : Vec3, b : Vec3) : f32 {
+    let mut g : f32 = abs(a.x - b.x);
+    if (abs(a.y - b.y) > g) {
+        g = abs(a.y - b.y);
+    }
+    if (abs(a.z - b.z) > g) {
+        g = abs(a.z - b.z);
+    }
+    return g;
+}
+
+// A light linear over the face.
+fn faceRamp(u : f32, v : f32) : Vec3 {
+    return Vec3 { x: (1.0 as f32) + u * (3.0 as f32), y: v * (2.0 as f32), z: u + v };
+}
+
+// A light with a kink at the middle of the face each way, as a volume blended between cell centres gives.
+fn faceKink(u : f32, v : f32) : Vec3 {
+    return Vec3 { x: abs(u - (0.5 as f32)), y: abs(v - (0.5 as f32)) * (2.0 as f32), z: 1.0 };
+}
+
+// Writes the lattice of `kind` (0 the ramp, 1 the kink) into the entry `slot` of `batch`.
+fn faceFill(mut batch : LumenFaceBatch, slot : i64, kind : i32) : void {
+    for (j of 0..3) {
+        for (i of 0..3) {
+            let u : f32 = (i as f32) * (0.5 as f32);
+            let v : f32 = (j as f32) * (0.5 as f32);
+            if (kind == 0) {
+                batch.set(slot, j * 3 + i, faceRamp(u, v));
+            } else {
+                batch.set(slot, j * 3 + i, faceKink(u, v));
+            }
+        }
+    }
+}
+
+// Three floats of padding, then a lattice whose nine points are 0, 1, ... 8 in every channel: its centre is 4.
+fn mixData() : f32[] {
+    let mut data : f32[] = new f32[30];
+    for (k of 0..3) {
+        data[k as i64] = -1.0;
+    }
+    for (point of 0..9) {
+        for (ch of 0..3) {
+            data[(3 + point * 3 + ch) as i64] = point as f32;
+        }
+    }
+    return data;
+}
+
+fn faceLattice(c : Checks) : void {
+    let mut batch = new LumenFaceBatch(16);
+    let ramp : i64 = batch.begin(100, 1, true);
+    faceFill(batch, ramp, 0);
+    let kink : i64 = batch.begin(200, 1, true);
+    faceFill(batch, kink, 1);
+    c.that("a lattice has nine points", FACE_POINTS == 9);
+
+    let mut rampWorst : f32 = 0.0;
+    let mut kinkWorst : f32 = 0.0;
+    let mut jump : f32 = 0.0;
+    let mut last : Vec3 = batch.read(200, 1, true, 0.0, 0.3).light;
+    for (k of 0..201) {
+        let u : f32 = (k as f32) / (200.0 as f32);
+        for (m of 0..21) {
+            let v : f32 = (m as f32) / (20.0 as f32);
+            let a : FaceLight = batch.read(100, 1, true, u, v);
+            let b : FaceLight = batch.read(200, 1, true, u, v);
+            let ga : f32 = faceGap(a.light, faceRamp(u, v));
+            let gb : f32 = faceGap(b.light, faceKink(u, v));
+            if (!a.ok || ga > rampWorst) {
+                rampWorst = ga;
+            }
+            if (!b.ok || gb > kinkWorst) {
+                kinkWorst = gb;
+            }
+        }
+        // Along one line across the face, two neighbouring places differ by no more than the slope allows.
+        let here : Vec3 = batch.read(200, 1, true, u, 0.3).light;
+        let step : f32 = faceGap(here, last);
+        if (step > jump) {
+            jump = step;
+        }
+        last = here;
+    }
+    c.that("a light linear over the face is given back exactly", rampWorst < FACE_TOL);
+    c.that("a light with a kink at the middle is given back exactly", kinkWorst < FACE_TOL);
+    c.that("the blend has no jump across the middle of the face", jump < 0.011);
+    c.that(
+        "outside the face a place is held at its border",
+        faceGap(batch.read(100, 1, true, -0.5, 1.5).light, faceRamp(0.0, 1.0)) < FACE_TOL
+    );
+    c.that(
+        "faceMix reads the same lattice",
+        faceGap(batch.read(100, 1, true, 0.5, 0.5).light, faceRamp(0.5, 0.5)) < FACE_TOL
+    );
+}
+
+fn faceEpochs(c : Checks) : void {
+    let mut batch = new LumenFaceBatch(16);
+    let lit : Vec3 = Vec3 { x: 2.0, y: 4.0, z: 8.0 };
+    c.that("an empty batch holds no face", !batch.read(7, 0, false, 0.5, 0.5).ok);
+    let flat : i64 = batch.begin(7, 3, false);
+    batch.setFlat(flat, lit);
+    c.that(
+        "a flat face has one light everywhere",
+        faceGap(batch.read(7, 3, false, 0.9, 0.1).light, lit) == 0.0
+    );
+    c.that("a flat face does not pass for a lattice", !batch.read(7, 3, true, 0.5, 0.5).ok);
+    c.that("a face is not kept for another epoch", !batch.read(7, 4, false, 0.5, 0.5).ok);
+    c.that("nor an earlier one", !batch.read(7, 2, false, 0.5, 0.5).ok);
+    c.that("a face does not answer for another key", !batch.read(8, 3, false, 0.5, 0.5).ok);
+    let full : i64 = batch.begin(7, 3, true);
+    faceFill(batch, full, 0);
+    c.that(
+        "a lattice also answers a request for a flat light",
+        batch.read(7, 3, false, 0.5, 0.5).ok
+    );
+    c.that("computing a face twice lists it once", batch.count() == 1);
+}
+
+fn facePublish(c : Checks) : void {
+    let mut cache = new LumenFaceCache(64);
+    let mut one = new LumenFaceBatch(16);
+    let mut two = new LumenFaceBatch(16);
+    let a : i64 = one.begin(11, 5, true);
+    faceFill(one, a, 0);
+    let b : i64 = two.begin(22, 5, true);
+    faceFill(two, b, 1);
+    // The same face computed by two chunks: the same numbers, published twice.
+    let b2 : i64 = one.begin(22, 5, true);
+    faceFill(one, b2, 1);
+
+    c.that("the cache knows nothing before publishing", !cache.read(11, 5, true, 0.5, 0.5).ok);
+    c.that("the batch already does", one.read(11, 5, true, 0.5, 0.5).ok);
+    c.that(
+        "publishing takes in what the batch computed",
+        cache.publish(one) == 2 && cache.publish(two) == 1
+    );
+    c.that("a published batch has nothing waiting", one.count() == 0 && cache.publish(one) == 0);
+    let got : FaceLight = cache.read(11, 5, true, 0.25, 0.75);
+    c.that(
+        "the cache gives the published face",
+        got.ok && faceGap(got.light, faceRamp(0.25, 0.75)) < FACE_TOL
+    );
+    c.that(
+        "a face two chunks computed is the same face",
+        faceGap(cache.read(22, 5, true, 0.1, 0.9).light, faceKink(0.1, 0.9)) < FACE_TOL
+    );
+    c.that("the cache counts what it took in", cache.published == 3);
+    c.that("a new epoch empties the cache for its readers", !cache.read(11, 6, true, 0.5, 0.5).ok);
+
+    // A face asked for flat by one chunk and in full by another: the lattice stays, whichever is published last.
+    let mut near = new LumenFaceBatch(16);
+    let mut far = new LumenFaceBatch(16);
+    let wide : i64 = near.begin(33, 5, true);
+    faceFill(near, wide, 1);
+    let small : i64 = far.begin(33, 5, false);
+    far.setFlat(small, Vec3 { x: 9.0, y: 9.0, z: 9.0 });
+    cache.publish(near);
+    cache.publish(far);
+    c.that(
+        "a flat light does not undo a lattice of the same face",
+        cache.read(33, 5, true, 0.5, 0.5).ok
+    );
+    c.that("an empty cache answers no epoch at all", !cache.read(0, -1, true, 0.5, 0.5).ok);
+    c.that(
+        "faceMix reads the lattice it is given",
+        faceGap(faceMix(mixData(), 3, 0.5, 0.5), Vec3 { x: 4.0, y: 4.0, z: 4.0 }) < FACE_TOL
+    );
+
+    // Far more faces than slots: whatever is found is that very face's light.
+    let mut wrong : i32 = 0;
+    let mut found : i32 = 0;
+    let mut many = new LumenFaceBatch(256);
+    for (round of 0..8) {
+        for (k of 0..200) {
+            let n : i32 = round * 200 + k;
+            let key : i64 = ((n * 7919 + 13) as i64) * 1048583;
+            let s : i64 = many.begin(key, 9, false);
+            many.setFlat(s, Vec3 { x: n as f32, y: 0.0, z: 0.0 });
+        }
+        cache.publish(many);
+    }
+    for (n of 0..1600) {
+        let key : i64 = ((n * 7919 + 13) as i64) * 1048583;
+        let hit : FaceLight = cache.read(key, 9, false, 0.5, 0.5);
+        if (hit.ok) {
+            found = found + 1;
+            if (hit.light.x != (n as f32)) {
+                wrong = wrong + 1;
+            }
+        }
+    }
+    c.that("a crowded cache never answers with another face's light", wrong == 0);
+    c.that(
+        "a crowded cache keeps as many faces as it has room for at most",
+        found > 0 && found <= 64
+    );
+}
+
+fn faceTurns(c : Checks) : void {
+    // Over 16 steps of the phase every face changes epoch exactly once, and at every step about one face in 16 does.
+    let mut once : bool = true;
+    let mut most : i32 = 0;
+    let mut least : i32 = 100000;
+    for (step of 0..16) {
+        let mut changed : i32 = 0;
+        for (n of 0..4000) {
+            let key : i64 = ((n * 7919 + 13) as i64) * 1048583;
+            if (faceStagger(key, 3, 100 + step, 16) != faceStagger(key, 3, 101 + step, 16)) {
+                changed = changed + 1;
+            }
+        }
+        if (changed > most) {
+            most = changed;
+        }
+        if (changed < least) {
+            least = changed;
+        }
+    }
+    for (n of 0..4000) {
+        let key : i64 = ((n * 7919 + 13) as i64) * 1048583;
+        let mut times : i32 = 0;
+        for (step of 0..16) {
+            if (faceStagger(key, 3, 100 + step, 16) != faceStagger(key, 3, 101 + step, 16)) {
+                times = times + 1;
+            }
+        }
+        if (times != 1) {
+            once = false;
+        }
+    }
+    c.that("a face takes its turn once in a round", once);
+    c.that(
+        "the turns are spread: no step refreshes more than twice its share",
+        most < 500 && least > 125
+    );
+    c.that(
+        "the same face at the same step has the same epoch",
+        faceStagger(77, 3, 5, 16) == faceStagger(77, 3, 5, 16)
+    );
+    c.that(
+        "an epoch is never used twice, however long the game runs",
+        faceStagger(77, 5000, 2000000000, 16) > faceStagger(77, 4999, 2000000000, 16)
+            && faceStagger(77, 5000, 2000000000, 16) > faceStagger(77, 5000, 1999999000, 16)
+    );
+    c.that(
+        "another base is another epoch whatever the phase",
+        faceStagger(77, 4, 5, 16) != faceStagger(77, 3, 5, 16)
+    );
+}
+
+/** The world-space face light cache. */
+pub class RenderFaceCacheSuite {
+    /** Runs the checks. */
+    pub static fn run(c : Checks) : void {
+        faceLattice(c);
+        faceEpochs(c);
+        facePublish(c);
+        faceTurns(c);
+    }
+}

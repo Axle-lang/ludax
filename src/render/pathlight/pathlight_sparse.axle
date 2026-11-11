@@ -1,0 +1,411 @@
+// pathlight_sparse — light sampled every few pixels and given back to every pixel.
+//
+// Shading a pixel is dear and its light is smooth; where a pixel is (its ray, its texture) is cheap and sharp. So a
+// picture shades one pixel in a block of `stride` by `stride`, the sample, and every other pixel takes its light
+// from the four samples around it, weighted bilinearly. What keeps that honest is the question "may this pixel take
+// that sample's light?", and the answer is the caller's: every sample carries a key, a pixel asks with its own, and
+// only samples with the same key count. The key is whatever two points must have in common for one light to serve
+// both: the plane they lie in, the face of the block they are on, the object, the material. A renderer of flat walls
+// can key by plane; one of leaves must key by leaf, or a leaf takes the light of the leaf beside it and the choice
+// changes with every move of the camera.
+//
+// A key alone is not always enough. Light is smooth along a floor, so the floor's samples may serve any pixel of it
+// that is near; but every leaf of a forest at one height lies in one plane too, and the leaf three trees away has
+// another light. So a sample also holds where it is, and a pixel may ask for the samples of its key within a reach
+// of its own place (`blendNear`): the distance over which the caller's light is known to be smooth, such as one
+// cell of a light volume. Near the eye the four samples are a hand's breadth apart and all of them count; far away
+// they are blocks apart and none does, and the caller lights the pixel itself.
+//
+// A sample holds two things apart: the light of the surface over its albedo (so the pixel's own albedo multiplies
+// it, and texture stays sharp), and what the air before the surface adds (which owes nothing to the surface and must
+// not be multiplied by any albedo). A pixel's radiance is `albedo * light + fog`.
+//
+// Nothing here knows what a pixel is made of, and nothing is drawn at random: the same samples give the same blend.
+// A row of samples is written by the chunk that owns its rows of the picture and read only after every chunk is
+// done, so the result does not depend on the threads.
+
+use crate::core::math::vec3::Vec3;
+
+/** The key of a sample that no pixel may share: open sky, water, a mirror, anything whose light is the view's. */
+pub const SPARSE_NO_KEY : i64 = -1;
+
+/** A blend that weighs less than this found no sample to speak for the pixel. */
+const SPARSE_EPS : f32 = 0.0001;
+
+/**
+ * The four samples around a pixel: `a` top left, `b` top right, `c` bottom left, `d` bottom right. For each, the
+ * offset of its pixel in the picture (`a`), the offset of the sample in the sparse grids (`ga`) and its bilinear
+ * weight (`wa`); the four weights add to 1.
+ */
+pub struct SparseCorners {
+    /** Pixel offset of the top left sample. */
+    pub a : i64 = 0;
+
+    /** Pixel offset of the top right sample. */
+    pub b : i64 = 0;
+
+    /** Pixel offset of the bottom left sample. */
+    pub c : i64 = 0;
+
+    /** Pixel offset of the bottom right sample. */
+    pub d : i64 = 0;
+
+    /** Sample offset of the top left sample. */
+    pub ga : i64 = 0;
+
+    /** Sample offset of the top right sample. */
+    pub gb : i64 = 0;
+
+    /** Sample offset of the bottom left sample. */
+    pub gc : i64 = 0;
+
+    /** Sample offset of the bottom right sample. */
+    pub gd : i64 = 0;
+
+    /** Weight of the top left sample. */
+    pub wa : f32 = 0.0;
+
+    /** Weight of the top right sample. */
+    pub wb : f32 = 0.0;
+
+    /** Weight of the bottom left sample. */
+    pub wc : f32 = 0.0;
+
+    /** Weight of the bottom right sample. */
+    pub wd : f32 = 0.0;
+}
+
+/** What the samples around a pixel give it. */
+pub struct SparseLight {
+    /** False when no sample with the pixel's key was among the four: the caller must light the pixel another way. */
+    pub ok : bool = false;
+
+    /** The surface's light over its albedo. */
+    pub light : Vec3 = Vec3 { x: 0.0, y: 0.0, z: 0.0 };
+
+    /** What the air before the surface adds. */
+    pub fog : Vec3 = Vec3 { x: 0.0, y: 0.0, z: 0.0 };
+
+    /** The radiance of a pixel of albedo `albedo` under this light. */
+    pub fn shade(self, albedo : Vec3) : Vec3 {
+        return self.light.times(albedo).plus(self.fog);
+    }
+}
+
+/** The samples of a `w` by `h` picture, one for each block of `stride` pixels each way. */
+pub class LumenSparse {
+    w : i32;
+    h : i32;
+
+    /** Pixels between two samples, each way, a power of two; set with `setStride`. */
+    pub stride : i32;
+
+    // The stride as a shift and a mask: every pixel asks which block it is in, and a division there was four
+    // divisions a pixel.
+    shift : i32;
+    mask  : i32;
+
+    // The finest stride the grids have room for.
+    built : i32;
+
+    // Samples a row and rows of samples at the current stride.
+    gw : i32;
+    gh : i32;
+
+    light : f32[];
+    fog   : f32[];
+    place : f32[];
+    keys  : i64[];
+
+    /**
+     * Room for the samples of a `w` by `h` picture at any stride of `finest` pixels or more; `finest` is taken down
+     * to a power of two, as every stride is.
+     */
+    constructor(w : i32, h : i32, finest : i32) {
+        self.w = w;
+        self.h = h;
+        // The grids are sized for the stride that will really be used, not for the one asked: 3 means 2, and a grid
+        // sized for 3 would be too small for it.
+        let mut shift : i32 = 0;
+        while ((2 << shift) <= finest) {
+            shift = shift + 1;
+        }
+        let side : i32 = 1 << shift;
+        self.built = side;
+        let most : i64 = (((w + side - 1) / side) as i64) * (((h + side - 1) / side) as i64);
+        self.light = new f32[most * 3];
+        self.fog = new f32[most * 3];
+        self.place = new f32[most * 3];
+        self.keys = new i64[most];
+        for (g of 0..most) {
+            self.keys[g] = SPARSE_NO_KEY;
+        }
+        self.stride = side;
+        self.shift = shift;
+        self.mask = side - 1;
+        self.gw = (w + side - 1) / side;
+        self.gh = (h + side - 1) / side;
+    }
+
+    /**
+     * Sets the distance between samples for the coming frame: the largest power of two that is no more than
+     * `stride`, and never finer than the stride the grids were made for (a finer one is taken up to it).
+     */
+    pub fn setStride(mut self, stride : i32) : void {
+        let mut shift : i32 = 0;
+        while ((2 << shift) <= stride) {
+            shift = shift + 1;
+        }
+        let mut side : i32 = 1 << shift;
+        if (side < self.built) {
+            side = self.built;
+            shift = 0;
+            while ((1 << shift) < side) {
+                shift = shift + 1;
+            }
+        }
+        self.shift = shift;
+        self.mask = side - 1;
+        self.stride = side;
+        self.gw = (self.w + side - 1) / side;
+        self.gh = (self.h + side - 1) / side;
+    }
+
+    /** Samples in a row. */
+    pub fn across(self) : i32 {
+        return self.gw;
+    }
+
+    /** Rows of samples. */
+    pub fn down(self) : i32 {
+        return self.gh;
+    }
+
+    /** True when pixel (`x`, `y`) is a sample: the first pixel of its block. */
+    pub fn isSample(self, x : i32, y : i32) : bool {
+        return ((x | y) & self.mask) == 0;
+    }
+
+    /** The offset in the grids of the sample of the block that holds pixel (`x`, `y`). */
+    pub fn index(self, x : i32, y : i32) : i64 {
+        return ((y >> self.shift) * self.gw + (x >> self.shift)) as i64;
+    }
+
+    /** Stores a sample: its light over its albedo, what the air before it adds, and who may share it. */
+    pub fn put(mut self, g : i64, light : Vec3, fog : Vec3, key : i64) : void {
+        self.light[g * 3] = light.x;
+        self.light[g * 3 + 1] = light.y;
+        self.light[g * 3 + 2] = light.z;
+        self.fog[g * 3] = fog.x;
+        self.fog[g * 3 + 1] = fog.y;
+        self.fog[g * 3 + 2] = fog.z;
+        self.keys[g] = key;
+    }
+
+    /** `put`, with where the sample is (in whatever frame the caller measures its reach in) for `blendNear`. */
+    pub fn putAt(mut self, g : i64, light : Vec3, fog : Vec3, key : i64, at : Vec3) : void {
+        self.put(g, light, fog, key);
+        self.place[g * 3] = at.x;
+        self.place[g * 3 + 1] = at.y;
+        self.place[g * 3 + 2] = at.z;
+    }
+
+    // True when sample `g` has the key `key` and lies within `reach` of `at` along every axis.
+    fn serves(self, g : i64, key : i64, at : Vec3, reach : f32) : bool {
+        if (self.keys[g] != key) {
+            return false;
+        }
+        let dx : f32 = self.place[g * 3] - at.x;
+        let dy : f32 = self.place[g * 3 + 1] - at.y;
+        let dz : f32 = self.place[g * 3 + 2] - at.z;
+        return dx <= reach && dx >= -reach && dy <= reach && dy >= -reach && dz <= reach && dz >= -reach;
+    }
+
+    /**
+     * `blend` over the samples that have the key `key` and were stored (`putAt`) within `reach` of `at` along every
+     * axis. `reach` is how far the caller's light may be taken to be smooth.
+     */
+    pub fn blendNear(self, k : SparseCorners, key : i64, at : Vec3, reach : f32) : SparseLight {
+        let mut sum : Vec3 = Vec3::zero();
+        let mut fog : Vec3 = Vec3::zero();
+        let mut weight : f32 = 0.0;
+        if (self.serves(k.ga, key, at, reach)) {
+            sum = sum.plus(self.lightAt(k.ga).scale(k.wa));
+            fog = fog.plus(self.fogAt(k.ga).scale(k.wa));
+            weight = weight + k.wa;
+        }
+        if (self.serves(k.gb, key, at, reach)) {
+            sum = sum.plus(self.lightAt(k.gb).scale(k.wb));
+            fog = fog.plus(self.fogAt(k.gb).scale(k.wb));
+            weight = weight + k.wb;
+        }
+        if (self.serves(k.gc, key, at, reach)) {
+            sum = sum.plus(self.lightAt(k.gc).scale(k.wc));
+            fog = fog.plus(self.fogAt(k.gc).scale(k.wc));
+            weight = weight + k.wc;
+        }
+        if (self.serves(k.gd, key, at, reach)) {
+            sum = sum.plus(self.lightAt(k.gd).scale(k.wd));
+            fog = fog.plus(self.fogAt(k.gd).scale(k.wd));
+            weight = weight + k.wd;
+        }
+        if (key == SPARSE_NO_KEY || weight <= SPARSE_EPS) {
+            return SparseLight {};
+        }
+        let inv : f32 = (1.0 as f32) / weight;
+        return SparseLight { ok: true, light: sum.scale(inv), fog: fog.scale(inv) };
+    }
+
+    /** The light stored for sample `g`. */
+    pub fn lightAt(self, g : i64) : Vec3 {
+        return Vec3 { x: self.light[g * 3], y: self.light[g * 3 + 1], z: self.light[g * 3 + 2] };
+    }
+
+    /** The fog stored for sample `g`. */
+    pub fn fogAt(self, g : i64) : Vec3 {
+        return Vec3 { x: self.fog[g * 3], y: self.fog[g * 3 + 1], z: self.fog[g * 3 + 2] };
+    }
+
+    /** The key stored for sample `g`. */
+    pub fn keyAt(self, g : i64) : i64 {
+        return self.keys[g];
+    }
+
+    /**
+     * The four samples around pixel (`x`, `y`) and their weights. A pixel of the last block of a row or a column,
+     * which has no sample beyond it, reads its own block's sample twice.
+     */
+    pub fn corners(self, x : i32, y : i32) : SparseCorners {
+        let s : i32 = self.stride;
+        let gx0 : i32 = x >> self.shift;
+        let gy0 : i32 = y >> self.shift;
+        let mut gx1 : i32 = gx0 + 1;
+        if (gx1 > self.gw - 1) {
+            gx1 = self.gw - 1;
+        }
+        let mut gy1 : i32 = gy0 + 1;
+        if (gy1 > self.gh - 1) {
+            gy1 = self.gh - 1;
+        }
+        let inv : f32 = (1.0 as f32) / (s as f32);
+        let tx : f32 = ((x & self.mask) as f32) * inv;
+        let ty : f32 = ((y & self.mask) as f32) * inv;
+        return SparseCorners {
+            a: (gy0 * s * self.w + gx0 * s) as i64,
+            b: (gy0 * s * self.w + gx1 * s) as i64,
+            c: (gy1 * s * self.w + gx0 * s) as i64,
+            d: (gy1 * s * self.w + gx1 * s) as i64,
+            ga: (gy0 * self.gw + gx0) as i64,
+            gb: (gy0 * self.gw + gx1) as i64,
+            gc: (gy1 * self.gw + gx0) as i64,
+            gd: (gy1 * self.gw + gx1) as i64,
+            wa: ((1.0 as f32) - tx) * ((1.0 as f32) - ty),
+            wb: tx * ((1.0 as f32) - ty),
+            wc: ((1.0 as f32) - tx) * ty,
+            wd: tx * ty,
+        };
+    }
+
+    /**
+     * The light the samples at `k` give a pixel whose key is `key`: the bilinear blend of those with that key, their
+     * weights brought back to a sum of 1. Not `ok` when none has it. A pixel beside the border of what its key
+     * names therefore holds the light of its own side instead of blending across the border.
+     */
+    pub fn blend(self, k : SparseCorners, key : i64) : SparseLight {
+        let mut sum : Vec3 = Vec3::zero();
+        let mut fog : Vec3 = Vec3::zero();
+        let mut weight : f32 = 0.0;
+        if (self.keys[k.ga] == key) {
+            sum = sum.plus(self.lightAt(k.ga).scale(k.wa));
+            fog = fog.plus(self.fogAt(k.ga).scale(k.wa));
+            weight = weight + k.wa;
+        }
+        if (self.keys[k.gb] == key) {
+            sum = sum.plus(self.lightAt(k.gb).scale(k.wb));
+            fog = fog.plus(self.fogAt(k.gb).scale(k.wb));
+            weight = weight + k.wb;
+        }
+        if (self.keys[k.gc] == key) {
+            sum = sum.plus(self.lightAt(k.gc).scale(k.wc));
+            fog = fog.plus(self.fogAt(k.gc).scale(k.wc));
+            weight = weight + k.wc;
+        }
+        if (self.keys[k.gd] == key) {
+            sum = sum.plus(self.lightAt(k.gd).scale(k.wd));
+            fog = fog.plus(self.fogAt(k.gd).scale(k.wd));
+            weight = weight + k.wd;
+        }
+        if (key == SPARSE_NO_KEY || weight <= SPARSE_EPS) {
+            return SparseLight {};
+        }
+        let inv : f32 = (1.0 as f32) / weight;
+        return SparseLight { ok: true, light: sum.scale(inv), fog: fog.scale(inv) };
+    }
+
+    /** The plain bilinear blend of the stored light of the four samples at `k`, whatever their keys. */
+    pub fn mix(self, k : SparseCorners) : Vec3 {
+        return self
+            .lightAt(k.ga)
+            .scale(k.wa)
+            .plus(self.lightAt(k.gb).scale(k.wb))
+            .plus(self.lightAt(k.gc).scale(k.wc))
+            .plus(self.lightAt(k.gd).scale(k.wd));
+    }
+}
+
+/**
+ * The light of things too small for a sample to fall on, remembered by key for one frame: a caller that must light
+ * such a thing itself (a face a few pixels wide) does it once and every pixel of the thing reads the answer. One
+ * memo belongs to one chunk of the picture; `stamp` is the frame (never negative: an empty slot is stamped -1), so
+ * nothing is cleared between frames. A slot
+ * holds one key: a second key that lands on it takes its place, which costs a recomputation and never a wrong light.
+ */
+pub class LumenLightMemo {
+    mask   : i64;
+    keys   : i64[];
+    stamps : i32[];
+    data   : f32[];
+
+    /** A memo of `slots` entries; `slots` is a power of two. */
+    constructor(slots : i32) {
+        self.mask = (slots - 1) as i64;
+        self.keys = new i64[slots as i64];
+        self.stamps = new i32[slots as i64];
+        self.data = new f32[(slots as i64) * 6];
+        for (k of 0..slots) {
+            self.stamps[k as i64] = -1;
+            self.keys[k as i64] = SPARSE_NO_KEY;
+        }
+    }
+
+    // The slot a key lands on.
+    fn slot(self, key : i64) : i64 {
+        return (key ^ (key >> 13) ^ (key >> 29)) & self.mask;
+    }
+
+    /** What was kept for `key` in frame `stamp`; not `ok` when nothing was. */
+    pub fn find(self, key : i64, stamp : i32) : SparseLight {
+        let s : i64 = self.slot(key);
+        if (self.stamps[s] != stamp || self.keys[s] != key) {
+            return SparseLight {};
+        }
+        return SparseLight {
+            ok: true,
+            light: Vec3 { x: self.data[s * 6], y: self.data[s * 6 + 1], z: self.data[s * 6 + 2] },
+            fog: Vec3 { x: self.data[s * 6 + 3], y: self.data[s * 6 + 4], z: self.data[s * 6 + 5] },
+        };
+    }
+
+    /** Keeps `light` and `fog` for `key` in frame `stamp`. */
+    pub fn keep(mut self, key : i64, stamp : i32, light : Vec3, fog : Vec3) : void {
+        let s : i64 = self.slot(key);
+        self.keys[s] = key;
+        self.stamps[s] = stamp;
+        self.data[s * 6] = light.x;
+        self.data[s * 6 + 1] = light.y;
+        self.data[s * 6 + 2] = light.z;
+        self.data[s * 6 + 3] = fog.x;
+        self.data[s * 6 + 4] = fog.y;
+        self.data[s * 6 + 5] = fog.z;
+    }
+}

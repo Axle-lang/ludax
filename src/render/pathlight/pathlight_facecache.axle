@@ -1,0 +1,268 @@
+// pathlight_facecache — the light of a surface kept where the surface is, not where the camera looks.
+//
+// The diffuse light of a point of the world depends on the point, on the way its surface faces and on the state of
+// the light (the sun, the lamps, the blocks around), and on nothing else: not on the eye, not on the pixel it falls
+// on. A renderer that works it out again for every picture, at places of the screen that slide over the world as
+// the camera turns, pays for the same answer sixty times a second and gets a slightly different one each time,
+// which is seen as edges of shadows that crawl. This cache keeps the answer with the surface.
+//
+// What is kept is the light of one *face* (a flat patch the caller names with a key: a face of a block, a tile of a
+// terrain) at nine points of it, a 3 by 3 lattice over the unit square: its corners, the middles of its sides and
+// its centre. A pixel reads its face at its own place (u, v) by blending the four lattice points around it. Three
+// points a side is not arbitrary: a light volume blended between the centres of its cells has a kink at the middle
+// of every cell, so the corners and the middle are exactly where a face's light changes slope. A face too small on
+// the screen for that to show is kept *flat*, one light for all of it.
+//
+// An entry is good for one *epoch*, a number the caller raises when the light of the world changes (the sun moved,
+// a block was placed). While the epoch stands a picture reads and computes nothing, however the camera moves.
+//
+// Threads. The cache is read by every thread while a picture is drawn and written by none: a slot can never be
+// seen half written. A thread that finds no entry computes the face itself and notes it in its own `LumenFaceBatch`
+// (one a chunk of the picture, as the job rules ask: scratch belongs to a chunk, not to a thread), where it finds
+// it again for the rest of its rows. Between two stages, on one thread, the batches are published into the cache.
+// Two chunks that computed the same face computed the same numbers, so which is published last does not matter,
+// and a picture does not depend on which thread drew which row.
+//
+// A slot holds one face. A second face that lands on it takes its place: the first is computed again when it is
+// next asked for, which costs time and never gives a wrong light.
+
+use crate::core::math::vec3::Vec3;
+
+/** Points of light an entry holds: a 3 by 3 lattice over the face. */
+pub const FACE_POINTS : i32 = 9;
+
+// Floats an entry holds, and the stamp of a slot that holds nothing: one no epoch can make.
+const FACE_FLOATS : i64 = 27;
+const FACE_EMPTY : i64 = -9223372036854775807;
+
+/** What a face gives a pixel. */
+pub struct FaceLight {
+    /** False when the face is not kept for this epoch (or only flat when its lattice was asked for). */
+    pub ok : bool = false;
+
+    /** The light at the pixel's place on the face. */
+    pub light : Vec3 = Vec3 { x: 0.0, y: 0.0, z: 0.0 };
+}
+
+// The stamp of an entry of `epoch`: the epoch and whether the entry holds the lattice (1) or one flat light (0).
+fn faceStamp(epoch : i64, full : bool) : i64 {
+    if (full) {
+        return epoch * 2 + 1;
+    }
+    return epoch * 2;
+}
+
+// True when a slot stamped `stamp` answers a request of `epoch`; a request for the lattice wants a lattice.
+fn faceServes(stamp : i64, epoch : i64, full : bool) : bool {
+    if (full) {
+        return stamp == epoch * 2 + 1;
+    }
+    return stamp == epoch * 2 || stamp == epoch * 2 + 1;
+}
+
+// The slot of `key` among `mask + 1`.
+fn faceSlot(key : i64, mask : i64) : i64 {
+    let h : i64 = key ^ (key >> 17) ^ (key >> 31) ^ (key >> 47);
+    return (h * 40503) & mask;
+}
+
+/**
+ * The light at (`u`, `v`), each in 0..1, of the lattice stored at `base` in `data`: point (i, j) of the lattice is
+ * at (i / 2, j / 2) and its three floats at `base + (j * 3 + i) * 3`. Bilinear inside each of the four quarters,
+ * so the result is continuous over the face and equal to the stored light at the nine points.
+ */
+pub fn faceMix(data : f32[], base : i64, u : f32, v : f32) : Vec3 {
+    let mut fu : f32 = u * (2.0 as f32);
+    let mut fv : f32 = v * (2.0 as f32);
+    let mut i : i64 = 0;
+    let mut j : i64 = 0;
+    if (fu >= 1.0) {
+        i = 1;
+        fu = fu - (1.0 as f32);
+    }
+    if (fv >= 1.0) {
+        j = 1;
+        fv = fv - (1.0 as f32);
+    }
+    if (fu < 0.0) {
+        fu = 0.0;
+    }
+    if (fu > 1.0) {
+        fu = 1.0;
+    }
+    if (fv < 0.0) {
+        fv = 0.0;
+    }
+    if (fv > 1.0) {
+        fv = 1.0;
+    }
+    let a : i64 = base + (j * 3 + i) * 3;
+    let b : i64 = a + 3;
+    let c : i64 = a + 9;
+    let d : i64 = a + 12;
+    let wa : f32 = ((1.0 as f32) - fu) * ((1.0 as f32) - fv);
+    let wb : f32 = fu * ((1.0 as f32) - fv);
+    let wc : f32 = ((1.0 as f32) - fu) * fv;
+    let wd : f32 = fu * fv;
+    return Vec3 {
+        x: data[a] * wa + data[b] * wb + data[c] * wc + data[d] * wd,
+        y: data[a + 1] * wa + data[b + 1] * wb + data[c + 1] * wc + data[d + 1] * wd,
+        z: data[a + 2] * wa + data[b + 2] * wb + data[c + 2] * wc + data[d + 2] * wd,
+    };
+}
+
+/**
+ * The epoch of face `key` for a light that drifts: `base` is the caller's epoch for changes that touch everything
+ * at once, `phase` a count that goes up while the light drifts (a frame, a tick), and `spread` (a power of two, 1024
+ * at most) over how many steps of `phase` the faces take turns. The result is 64 bits wide: `base` and `phase` each
+ * keep their 32, so a game left running does not come back to an epoch it has already used. `phase` is not
+ * negative and `spread` is at least 1. Each face changes epoch once every `spread` steps,
+ * and at any step one face in `spread` does: a light that moves a little all the time is worked out again a few
+ * faces at a time instead of all at once, which would be a slow picture every time it happened.
+ */
+pub fn faceStagger(key : i64, base : i32, phase : i32, spread : i32) : i64 {
+    let turn : i64 = (key ^ (key >> 16) ^ (key >> 29) ^ (key >> 42)) & ((spread - 1) as i64);
+    return (base as i64) * 4294967296 + ((phase as i64) + turn) / (spread as i64);
+}
+
+/** The faces one chunk of a picture computed and has not published yet, which it also reads back. */
+pub class LumenFaceBatch {
+    mask    : i64;
+    keys    : i64[];
+    stamps  : i64[];
+    data    : f32[];
+    pending : i32[];
+    queued  : u8[];
+    waiting : i32 = 0;
+
+    /** A batch of `slots` faces; `slots` is a power of two. */
+    constructor(slots : i32) {
+        self.mask = (slots - 1) as i64;
+        self.keys = new i64[slots as i64];
+        self.stamps = new i64[slots as i64];
+        self.data = new f32[(slots as i64) * FACE_FLOATS];
+        self.pending = new i32[slots as i64];
+        self.queued = new u8[slots as i64];
+        for (k of 0..slots) {
+            self.stamps[k as i64] = FACE_EMPTY;
+            self.queued[k as i64] = 0;
+        }
+    }
+
+    /** The light of face `key` at (`u`, `v`) if this batch holds it for `epoch`; `full` asks for its lattice. */
+    pub fn read(self, key : i64, epoch : i64, full : bool, u : f32, v : f32) : FaceLight {
+        let s : i64 = faceSlot(key, self.mask);
+        if (self.keys[s] != key || !faceServes(self.stamps[s], epoch, full)) {
+            return FaceLight {};
+        }
+        return FaceLight { ok: true, light: faceMix(self.data, s * FACE_FLOATS, u, v) };
+    }
+
+    /**
+     * Begins the entry of face `key` for `epoch` (`full`: its lattice will be given point by point with `set`;
+     * otherwise one light with `setFlat`) and returns its slot. Whatever the slot held is gone.
+     */
+    pub fn begin(mut self, key : i64, epoch : i64, full : bool) : i64 {
+        let s : i64 = faceSlot(key, self.mask);
+        // A slot already waiting to be published is not listed twice; its new content is what will be published.
+        if (self.queued[s] == 0) {
+            self.queued[s] = 1;
+            self.pending[self.waiting as i64] = s as i32;
+            self.waiting = self.waiting + 1;
+        }
+        self.keys[s] = key;
+        self.stamps[s] = faceStamp(epoch, full);
+        return s;
+    }
+
+    /** Gives point `point` (0..8: `j * 3 + i`, at (i / 2, j / 2) on the face) of the entry in `slot` its light. */
+    pub fn set(mut self, slot : i64, point : i32, light : Vec3) : void {
+        let at : i64 = slot * FACE_FLOATS + (point as i64) * 3;
+        self.data[at] = light.x;
+        self.data[at + 1] = light.y;
+        self.data[at + 2] = light.z;
+    }
+
+    /** Gives the whole face of the entry in `slot` one light. */
+    pub fn setFlat(mut self, slot : i64, light : Vec3) : void {
+        for (p of 0..FACE_POINTS) {
+            self.set(slot, p, light);
+        }
+    }
+
+    /** Hands every waiting entry to `cache` and returns how many there were; `LumenFaceCache.publish` calls this. */
+    pub(crate) fn drainInto(mut self, mut cache : LumenFaceCache) : i32 {
+        let n : i32 = self.waiting;
+        for (k of 0..n) {
+            let from : i64 = self.pending[k as i64] as i64;
+            cache.take(self.keys[from], self.stamps[from], self.data, from * FACE_FLOATS);
+            self.queued[from] = 0;
+        }
+        self.waiting = 0;
+        return n;
+    }
+
+    /** How many entries wait to be published. */
+    pub fn count(self) : i32 {
+        return self.waiting;
+    }
+}
+
+/** The light of the faces of the world, kept from one picture to the next (see the header). */
+pub class LumenFaceCache {
+    mask   : i64;
+    keys   : i64[];
+    stamps : i64[];
+    data   : f32[];
+
+    /** How many faces were published since the cache was made. */
+    pub published : i64 = 0;
+
+    /** A cache of `slots` faces; `slots` is a power of two. It takes 124 bytes a face. */
+    constructor(slots : i32) {
+        self.mask = (slots - 1) as i64;
+        self.keys = new i64[slots as i64];
+        self.stamps = new i64[slots as i64];
+        self.data = new f32[(slots as i64) * FACE_FLOATS];
+        for (k of 0..slots) {
+            self.stamps[k as i64] = FACE_EMPTY;
+        }
+    }
+
+    /**
+     * The light of face `key` at (`u`, `v`), each in 0..1, if the face is kept for `epoch`; `full` asks for an entry
+     * that holds the face's lattice and refuses one that is flat. Safe from any thread while nothing publishes.
+     */
+    pub fn read(self, key : i64, epoch : i64, full : bool, u : f32, v : f32) : FaceLight {
+        let s : i64 = faceSlot(key, self.mask);
+        if (self.keys[s] != key || !faceServes(self.stamps[s], epoch, full)) {
+            return FaceLight {};
+        }
+        return FaceLight { ok: true, light: faceMix(self.data, s * FACE_FLOATS, u, v) };
+    }
+
+    /**
+     * Takes in what `batch` computed since it was last published, and returns how many faces that was. One thread,
+     * while no other reads: between two stages of a picture.
+     */
+    pub fn publish(mut self, mut batch : LumenFaceBatch) : i32 {
+        let n : i32 = batch.drainInto(self);
+        self.published = self.published + (n as i64);
+        return n;
+    }
+
+    /** Takes in one entry: the face `key` with the stamp `stamp` and the 27 floats at `from` in `data`. */
+    pub(crate) fn take(mut self, key : i64, stamp : i64, data : f32[], from : i64) : void {
+        let to : i64 = faceSlot(key, self.mask);
+        // A lattice is not given up for one flat light of the same face and epoch: two chunks may have asked for the
+        // face at two sizes, and whichever is published last must not undo the better answer.
+        if (self.keys[to] == key && self.stamps[to] == stamp + 1 && (stamp & 1) == 0) {
+            return;
+        }
+        self.keys[to] = key;
+        self.stamps[to] = stamp;
+        for (f of 0..FACE_FLOATS) {
+            self.data[to * FACE_FLOATS + f] = data[from + f];
+        }
+    }
+}
