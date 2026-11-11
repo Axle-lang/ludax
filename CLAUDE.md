@@ -3,7 +3,10 @@
 **Ludax** is a game engine written in **Axle**: entities and worlds, physics, animation, audio, an asset pipeline
 and a renderer whose lighting is meant to be provably right, on top of the platform library
 [smalt](https://github.com/Axle-lang/smalt). Source is `src/**.axle`, config `axle.toml`. Read
-`doc/ARCHITECTURE.md` before moving or adding a file, and `doc/STYLE.md` before writing one.
+`doc/ARCHITECTURE.md` before moving or adding a file, and `doc/STYLE.md` before writing one. `doc/handbook/README.md`
+is the handbook of the heavy mechanisms (mathematics, algorithms, costs, history): read its chapter before touching
+a ray walk, the sky, the shading or the display, and its `standards/01-hot-loop-rules.md` before writing a loop that
+runs for every pixel.
 
 ## Where code goes
 
@@ -60,7 +63,7 @@ The path-lit picture (sky, shading, bloom, tone) is `src/render/pathlight`, shar
 - **No `string` elements in our generic containers** (a generic `T[]` of strings double-frees on growth in
   0.18.3): use `StringInterner`/`StringMap`, or std `ArrayList<string>`. Contract violations on a container
   (bad index, `pop` on empty) abort; ask first with `has`/`isEmpty`/`getOr`.
-- **Build for speed with `-O 3`**: the default `-O 1` is 3-4× slower. Pin the compiler (`axle --version`; the code builds with 0.19.0-dev 93b6b5e).
+- **Build for speed with `-O 3`**: `-O 1` is 3-4× slower. The game, lumen and the test packages set `[profile.dev] opt-level = 3`, so a plain `axle build` there is the fast one; a new package must do the same. Pin the compiler (`axle --version`; the code builds with 0.19.0-dev 93b6b5e).
 - **`let mut` only where the compiler asks for it**: a binding that is itself assigned (`x = …`, `x += …`, `x[i] = …`,
   `x.field = …`: E0004). A plain `let` is enough to call a `mut self` method of a class or struct, or to pass a struct to a
   `mut` parameter: the callee's `mut` is the permission. A `self` method may not call a `mut self` one (E0283).

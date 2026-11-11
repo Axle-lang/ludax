@@ -168,6 +168,64 @@ Workaround used by every caller: write all fields explicitly.
 
 **Recommendation**: partial literals must pull omitted fields' defaults through sema unchanged.
 
+### F10 — a `Shared<T>` reached through a trait-typed launch argument is counted without atomics (memory corruption)
+
+**Severity: soundness.** Found on 2026-11-10 with axle 0.20.0 in `games/blockland`: the game ended in
+`shared refcount: strong count underflow` or a segfault, almost every run with `--threads 2`, about one run in three
+with three threads on a flat world, rarely with twenty-three.
+
+**What happens.** `hir_analyses::memory::thread_locality` stamps a class's refcount traffic `Plain` (load, add,
+store) when no instance can reach a spawned thread, and leaves it `Atomic` otherwise. It seeds the escaping set from
+the *static types* of a launch's arguments and of the launched function's signature, then closes it over the field
+graph. For a trait-typed value `collect_nested_class_ids` pushes the trait's own id
+(`field_types.rs`, `HirType::TraitObject { trait_id, .. } => out.push(*trait_id)`), and `type_fields` of a trait is
+empty (`HirTypeDef::Trait { .. } => Vec::new()`). The classes that *implement* the trait are never visited, so
+nothing they hold is marked escaping. `seed_spawn_target` does walk `trait_dispatch_rows`, but only for a launch
+whose *call target* is a trait method, not for a trait-typed *argument*.
+
+**Where it bites.** Any thread pool that takes its work as a trait. `src/core/jobs/pool.axle`:
+
+```axle
+constructor(workers : i32, kernel : RangeKernel) { ... Thread::run(jobsWorker, self.gate, kernel); ... }
+```
+
+`McFrame : RangeKernel` holds `env : Shared<McEnv>`; `McEnv` holds `Shared<McView>`, `Shared<McBake>`,
+`Shared<McRenderTable>`, `Shared<McAtlas>`; they hold `Shared<McWorld>` and `Shared<McAssets>`. In the `-O 3` IR of
+the game all seven were plain: 44 plain increments and 79 plain decrements, against 12 and 11 atomic ones (worldgen
+classes, which do cross a launch under their own type). `axle build --emit decisions` says of 445 refcount nodes
+`applied(ProvenThreadConfined): no instance of the class reaches a spawned thread`. The pool's threads and the main
+thread then retain and release the same block with unsynchronised read-modify-writes; an update is lost now and
+then, the count drifts, and the object is freed while in use.
+
+**Repro.** `tools/axle_repro/shared_trait_race` (one file, no dependency). A `Work : Job` holds a `Shared<Table>`;
+a `Pool` launches `worker(gate, job : Job)`. Both threads retain and release the table in a loop.
+
+```sh
+cd tools/axle_repro/shared_trait_race
+axle build -O 1 --emit llvm -o out.ll
+grep -c "atomicrmw" out.ll                       # 0: no atomic refcount operation is left
+grep "rc.inc.* = add i32" out.ll                 # plain increments, in @main and in @"__trait_call$Job$spin"
+axle build -O 1 --emit decisions -o d.txt && grep -c ProvenThreadConfined d.txt
+axle build -O 0 --emit llvm -o out0.ll && grep -c atomicrmw out0.ll   # 7: the analysis does not run at -O 0
+```
+
+The repro does not crash on its own (a lost update is as likely to raise the count as to lower it, and it starts
+at three); the game does, because it has hundreds of sites and seven classes. The IR is the proof.
+
+**The same hole, one step sideways.** A value typed as a base class can be an instance of a subclass with more
+fields: `field_successors` walks `base_chain` (upward) but not the subclasses. Worth a test.
+
+**Recommendation.** In the seed and in the closure, a `TraitObject { trait_id }` must reach every class that
+implements `trait_id` (`trait_dispatch_rows` already lists them), and a `User(id)` every subclass of `id`. Missing a
+disqualification is a data race; missing a promotion costs one atomic. A regression test: the repro's IR at `-O 1`
+must contain `atomicrmw` on `Table`'s count.
+
+**Workaround in place.** `games/blockland/src/app/mc_env.axle` ends with a function that is never called and launches
+a thread with a `Shared<McEnv>` argument, which is what the analysis does read. With it the game's IR has 0 plain
+refcount operations and 160 atomic ones, and eight runs out of eight with `--threads 2` end normally. The library's
+other users of `JobPool` (`examples/rendering/lumen`, the voxel and fluid runners) hold their shared state the same
+way and need the compiler fix.
+
 ## Reproduction
 
 ```sh
@@ -189,3 +247,5 @@ axle build -O 3 --emit decisions                 # what sema proved and refused,
 4. **F3.1** — range-driven division-guard elision.
 5. **F4** — range-driven bounds-check elision.
 6. **F6/F7/F8** — documentation and experiments.
+
+**F10 comes before all of these**: it is the only finding that corrupts memory.
