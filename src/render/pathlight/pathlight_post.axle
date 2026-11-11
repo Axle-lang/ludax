@@ -14,10 +14,13 @@
 // pass and the first blur at half size, the composition at render size, the upscale and pack at output size.
 // The coarser bloom levels are a few thousand pixels and stay on one thread.
 
-use crate::core::math::scalar::{saturate, max};
+use crate::core::math::scalar::{saturate, max, min};
 use crate::core::math::vec3::Vec3;
 use crate::render::light::light_color::{lightToneCurve, lightSrgbEncode, LIGHT_TONE_KNEE};
 use crate::render::light::light_math::{lightLog2, lightExp2, lightPow};
+use crate::render::pathlight::pathlight_bloom::{
+    pkBilinear, pkBlurAcross, pkBlurDown, pkClamp, pkFoldRows, pkShrink
+};
 use crate::render::pathlight::pathlight_noise::{lnFloor, lnUnit};
 use crate::render::pathlight::pathlight_settings::LumenSettings;
 
@@ -56,13 +59,14 @@ const POST_LUMA_B : f32 = 0.0722;
 /** The darkest luminance the exposure meter takes the logarithm of, so a black pixel does not drag the mean to minus infinity. */
 const POST_METER_FLOOR : f32 = 0.00002;
 
+/** The exposure meter reads every this many pixels each way. */
+const POST_METER_STEP : i32 = 4;
+
+/** The side of the dither tile, a power of two. */
+const POST_DITHER_SIDE : i32 = 64;
+
 /** The seed of the dither noise that hides banding in the 8-bit output. */
 const POST_DITHER_SEED : i32 = 977;
-
-/** The blur kernel that shrinks a level: weights of the centre tap, of the taps one off it, and of those two off. */
-const POST_TAP_CENTRE : f32 = 0.375;
-const POST_TAP_NEAR : f32 = 0.25;
-const POST_TAP_FAR : f32 = 0.0625;
 
 /** How much the vignette darkens the corners, at 0.5 of the half-diagonal. */
 const POST_VIGNETTE : f32 = 0.9;
@@ -86,6 +90,12 @@ const POST_BLOOM_W2 : f32 = 0.75;
 const POST_BLOOM_W3 : f32 = 0.6;
 const POST_BLOOM_W4 : f32 = 0.5;
 
+/** The `word` table has `POST_TABLE` entries below this linear value and as many above: the sRGB transfer is steepest
+ * near black; with the split at 1/16 the nearest entry is within 0.03 of a display code below it and 0.07 above. */
+const POST_WORD_SPLIT : f32 = 0.0625;
+const POST_WORD_LOW : f32 = 65536.0;
+const POST_WORD_HIGH : f32 = 4369.0667;
+
 /** The largest exposed channel the tone table covers; brighter values map to the curve's ceiling. */
 const POST_TONE_MAX : f32 = 40.0;
 
@@ -97,6 +107,8 @@ pub enum LumenPass : i8 {
     BlurAcross,
     /** Blur the half-size level up and down. */
     BlurDown,
+    /** Fold the coarser bloom levels into the half-size one; after `coarse`. */
+    Fold,
     /** Combine picture, bloom and grade into display values at render size. */
     Compose,
     /** Scale to the output size, dither and pack into words. */
@@ -129,6 +141,15 @@ pub class LumenPost {
     tone : f32[];
     code : f32[];
 
+    // The dither as a tile: the same noise for every frame, so a still picture does not shimmer, read with two masks
+    // instead of hashed for every output pixel.
+    dither : f32[];
+
+    // The same tile and the sRGB transfer as integers with eight more bits than a display code, for `composeWords`:
+    // `word` is 256 * (255 * code + 0.5) over the linear value (see `pkWordIndex`), `grain` is 256 * dither.
+    grain : i32[];
+    word  : i32[];
+
     /** The words of the finished picture, `w * scale` by `h * scale`. */
     pub out : i32[];
 
@@ -144,6 +165,22 @@ pub class LumenPost {
         self.tmp = new f32[((w / 2) as i64) * (h / 2) * 3];
         self.disp = new f32[(w as i64) * h * 3];
         self.out = new i32[(w as i64) * scale * h * scale];
+        self.dither = new f32[(POST_DITHER_SIDE * POST_DITHER_SIDE) as i64];
+        for (ty of 0..POST_DITHER_SIDE) {
+            for (tx of 0..POST_DITHER_SIDE) {
+                self.dither[(ty * POST_DITHER_SIDE + tx) as i64] = lnUnit(tx, ty, 0, POST_DITHER_SEED)
+                    - (0.5 as f32);
+            }
+        }
+        self.grain = new i32[(POST_DITHER_SIDE * POST_DITHER_SIDE) as i64];
+        for (i of 0..(POST_DITHER_SIDE * POST_DITHER_SIDE)) {
+            self.grain[i as i64] = lnFloor(self.dither[i as i64] * (256.0 as f32));
+        }
+        self.word = new i32[(POST_TABLE * 2 + 1) as i64];
+        for (i of 0..(POST_TABLE * 2 + 1)) {
+            let code : f32 = lightSrgbEncode(pkWordValue(i));
+            self.word[i as i64] = ((code * (255.0 as f32) + (0.5 as f32)) * (256.0 as f32)) as i32;
+        }
         self.tone = new f32[(POST_TABLE + 1) as i64];
         self.code = new f32[(POST_TABLE + 1) as i64];
         // The tone table is T(m) / m over the largest channel m, so a colour is scaled by one lookup; the code
@@ -168,6 +205,8 @@ pub class LumenPost {
             self.exposure = s.exposure * lightExp2(s.exposureBias);
             return;
         }
+        // One pixel in sixteen: the mean of a logarithm over 57 000 pixels of a 720p picture is the mean over all of
+        // them to the third digit, and this runs on the thread that waits for the frame.
         let mut sum : f32 = 0.0;
         let mut n : i32 = 0;
         let mut y : i32 = 1;
@@ -178,9 +217,9 @@ pub class LumenPost {
                 let lum : f32 = POST_LUMA_R * hdr[at] + POST_LUMA_G * hdr[at + 1] + POST_LUMA_B * hdr[at + 2];
                 sum = sum + lightLog2(max(lum, POST_METER_FLOOR));
                 n = n + 1;
-                x = x + 2;
+                x = x + POST_METER_STEP;
             }
-            y = y + 2;
+            y = y + POST_METER_STEP;
         }
         let mean : f32 = lightExp2(sum / (max(n, 1) as f32));
         // Only most of the way to the key: a dark cave is not brought up to the brightness of noon, so what glows in
@@ -208,9 +247,18 @@ pub class LumenPost {
             LumenPass::Bright => self.h / 2,
             LumenPass::BlurAcross => self.h / 2,
             LumenPass::BlurDown => self.h / 2,
+            LumenPass::Fold => self.h / 2,
             LumenPass::Compose => self.h,
-            LumenPass::Pack => self.h * self.scale,
+            LumenPass::Pack => self.packRows(),
         };
+    }
+
+    // At the picture's own size `compose` writes the finished words itself, and there is nothing left to pack.
+    fn packRows(self) : i32 {
+        if (self.scale == 1 && !self.raw) {
+            return 0;
+        }
+        return self.h * self.scale;
     }
 
     /** Runs rows `begin` up to `end` of `pass` over the radiance picture `hdr`. */
@@ -219,12 +267,26 @@ pub class LumenPost {
             LumenPass::Bright => self.bright(hdr, begin, end),
             LumenPass::BlurAcross => pkBlurAcross(self.lv1, self.tmp, self.w / 2, begin, end),
             LumenPass::BlurDown => pkBlurDown(self.tmp, self.lv1, self.w / 2, self.h / 2, begin, end),
-            LumenPass::Compose => self.compose(hdr, begin, end),
+            LumenPass::Fold => pkFoldRows(
+                self.lv1,
+                self.w / 2,
+                POST_BLOOM_W1,
+                self.lv2,
+                self.w / 4,
+                self.h / 4,
+                1.0,
+                begin,
+                end
+            ),
+            LumenPass::Compose => self.composeRows(hdr, begin, end),
             LumenPass::Pack => self.pack(begin, end),
         }
     }
 
-    /** The coarser bloom levels: small enough for one thread. */
+    /**
+     * The coarser bloom levels: small enough for one thread. The pass `Fold` must follow, once: it folds them into
+     * the half-size level the picture reads, and without it the bloom is that level alone.
+     */
     pub fn coarse(mut self) : void {
         let hw : i32 = self.w / 2;
         let hh : i32 = self.h / 2;
@@ -237,6 +299,10 @@ pub class LumenPost {
         pkBlurDown(self.tmp, self.lv3, hw / 4, hh / 4, 0, hh / 4);
         pkBlurAcross(self.lv4, self.tmp, hw / 8, 0, hh / 8);
         pkBlurDown(self.tmp, self.lv4, hw / 8, hh / 8, 0, hh / 8);
+        // The coarser levels are folded each into the next finer one, weights included, so that the picture reads one
+        // level for a pixel instead of four; the last fold, into the half-size level, is the pass `Fold`.
+        pkFoldRows(self.lv3, hw / 4, POST_BLOOM_W3, self.lv4, hw / 8, hh / 8, POST_BLOOM_W4, 0, hh / 4);
+        pkFoldRows(self.lv2, hw / 2, POST_BLOOM_W2, self.lv3, hw / 4, hh / 4, 1.0, 0, hh / 2);
     }
 
     // Half-size copy of the light above white in the exposed picture: the bloom's source.
@@ -266,6 +332,149 @@ pub class LumenPost {
         }
     }
 
+    // The composition of rows `begin` up to `end`: straight to words when the picture is shown at its own size.
+    fn composeRows(mut self, hdr : f32[], begin : i32, end : i32) : void {
+        if (self.scale == 1 && !self.raw) {
+            self.composeWords(hdr, begin, end);
+        } else {
+            self.compose(hdr, begin, end);
+        }
+    }
+
+    // `compose` and `pack` in one pass, for a picture shown at its own size: sharpen, expose, bloom, vignette, grade,
+    // tone, encode, dither, pack. The same picture as the general path, written for the loop that runs it for every
+    // pixel of every frame:
+    //   - every field it reads is bound to a local before the loop (a store through `out` could change any of them for
+    //     all the compiler knows, so it would load them again for each pixel);
+    //   - the bloom is one level at exactly half the size, so a pixel's bilinear read has fixed weights (3/4 and 1/4
+    //     each way) and walks along the row: one new column of the level for every two pixels, no floor, no clamp;
+    //   - the sRGB code comes from a table over the linear value itself, as an integer with eight more bits, so the
+    //     dither is an integer add and the three channels are packed with shifts: no square root, no conversion back.
+    fn composeWords(mut self, hdr : f32[], begin : i32, end : i32) : void {
+        let w : i32 = self.w;
+        let h : i32 = self.h;
+        let hw : i32 = w / 2;
+        let hh : i32 = h / 2;
+        let lv1 : f32[] = self.lv1;
+        let tone : f32[] = self.tone;
+        let word : i32[] = self.word;
+        let grain : i32[] = self.grain;
+        let mut out : i32[] = self.out;
+        let exposure : f32 = self.exposure;
+        let bloom : bool = self.strength > 0.0;
+        let kb : f32 = self.strength * POST_BLOOM_GAIN;
+        let kNear : f32 = kb * (0.75 as f32);
+        let kFar : f32 = kb * (0.25 as f32);
+        let inv_w : f32 = (1.0 as f32) / (w as f32);
+        let inv_h : f32 = (1.0 as f32) / (h as f32);
+        let mask : i32 = POST_DITHER_SIDE - 1;
+        let row : i64 = (w * 3) as i64;
+        let toneScale : f32 = (POST_TABLE as f32) / POST_TONE_MAX;
+        for (y of begin..end) {
+            let dy : f32 = ((y as f32) + (0.5 as f32)) * inv_h - (0.5 as f32);
+            let dy2 : f32 = dy * dy;
+            let inner : bool = y > 0 && y < h - 1;
+            let ditherRow : i32 = (y & mask) * POST_DITHER_SIDE;
+
+            // The two rows of the bloom level this row lies between: its own with 3/4, the next one out with 1/4.
+            let by : i32 = y >> 1;
+            let rowA : i64 = ((pkClamp(by, hh) * hw) * 3) as i64;
+            let rowB : i64 = ((pkClamp(by + ((y & 1) * 2 - 1), hh) * hw) * 3) as i64;
+
+            // The level's columns before, at and after the pixel, each already blended down its two rows.
+            let mut pr : f32 = 0.0;
+            let mut pg : f32 = 0.0;
+            let mut pb : f32 = 0.0;
+            let mut cr : f32 = 0.0;
+            let mut cg : f32 = 0.0;
+            let mut cb : f32 = 0.0;
+            let mut nr : f32 = 0.0;
+            let mut ng : f32 = 0.0;
+            let mut nb : f32 = 0.0;
+            if (bloom) {
+                nr = lv1[rowA] * kNear + lv1[rowB] * kFar;
+                ng = lv1[rowA + 1] * kNear + lv1[rowB + 1] * kFar;
+                nb = lv1[rowA + 2] * kNear + lv1[rowB + 2] * kFar;
+                cr = nr;
+                cg = ng;
+                cb = nb;
+            }
+            let mut at : i64 = ((y * w) * 3) as i64;
+            let mut o : i64 = (y * w) as i64;
+            for (x of 0..w) {
+                let mut r : f32 = hdr[at];
+                let mut g : f32 = hdr[at + 1];
+                let mut b : f32 = hdr[at + 2];
+                if (inner && x > 0 && x < w - 1) {
+                    r = pkSharp(r, hdr[at - 3], hdr[at + 3], hdr[at - row], hdr[at + row]);
+                    g = pkSharp(g, hdr[at - 2], hdr[at + 4], hdr[at - row + 1], hdr[at + row + 1]);
+                    b = pkSharp(b, hdr[at - 1], hdr[at + 5], hdr[at - row + 2], hdr[at + row + 2]);
+                }
+                r = r * exposure;
+                g = g * exposure;
+                b = b * exposure;
+                if (bloom) {
+                    if ((x & 1) == 0) {
+                        // A new pair of pixels: the columns move on by one.
+                        pr = cr;
+                        pg = cg;
+                        pb = cb;
+                        cr = nr;
+                        cg = ng;
+                        cb = nb;
+                        let k : i64 = (pkClamp((x >> 1) + 1, hw) * 3) as i64;
+                        nr = lv1[rowA + k] * kNear + lv1[rowB + k] * kFar;
+                        ng = lv1[rowA + k + 1] * kNear + lv1[rowB + k + 1] * kFar;
+                        nb = lv1[rowA + k + 2] * kNear + lv1[rowB + k + 2] * kFar;
+                        r = r + cr * (0.75 as f32) + pr * (0.25 as f32);
+                        g = g + cg * (0.75 as f32) + pg * (0.25 as f32);
+                        b = b + cb * (0.75 as f32) + pb * (0.25 as f32);
+                    } else {
+                        r = r + cr * (0.75 as f32) + nr * (0.25 as f32);
+                        g = g + cg * (0.75 as f32) + ng * (0.25 as f32);
+                        b = b + cb * (0.75 as f32) + nb * (0.25 as f32);
+                    }
+                }
+
+                // The grade, as in `grade`.
+                let dx : f32 = ((x as f32) + (0.5 as f32)) * inv_w - (0.5 as f32);
+                let dim : f32 = (1.0 as f32) - POST_VIGNETTE * (dx * dx + dy2);
+                r = r * dim;
+                g = g * dim;
+                b = b * dim;
+                let grey : f32 = POST_LUMA_R * r + POST_LUMA_G * g + POST_LUMA_B * b;
+                let peak : f32 = max(max(r, max(g, b)), 0.0);
+                if (peak > POST_CLIP_KNEE) {
+                    // Only a highlight loses saturation, so only a highlight pays for the division.
+                    let fade : f32 = min((peak - POST_CLIP_KNEE) / (peak + POST_CLIP_RANGE), 1.0)
+                        * POST_CLIP_DESAT;
+                    r = r + (grey - r) * fade;
+                    g = g + (grey - g) * fade;
+                    b = b + (grey - b) * fade;
+                }
+                r = grey + (r - grey) * POST_GRADE;
+                g = grey + (g - grey) * POST_GRADE;
+                b = grey + (b - grey) * POST_GRADE;
+                let m : f32 = max(max(r, max(g, b)), 0.0);
+                let mut gain : f32 = 0.0;
+                if (m >= POST_TONE_MAX) {
+                    gain = lightToneCurve(m, LIGHT_TONE_KNEE) / m;
+                } else {
+                    let f : f32 = m * toneScale;
+                    let k : i32 = f as i32;
+                    let lo : f32 = tone[k as i64];
+                    gain = lo + (tone[(k + 1) as i64] - lo) * (f - k as f32);
+                }
+                let n : i32 = grain[(ditherRow + (x & mask)) as i64];
+                out[o] = (((word[pkWordIndex(r * gain) as i64] + n) >> 8) << 16)
+                    | (((word[pkWordIndex(g * gain) as i64] + n) >> 8) << 8)
+                    | ((word[pkWordIndex(b * gain) as i64] + n) >> 8);
+                at = at + 3;
+                o = o + 1;
+            }
+        }
+    }
+
     // Picture, bloom, vignette and grade into display values (encoded, 0..1) at render size.
     fn compose(mut self, hdr : f32[], begin : i32, end : i32) : void {
         let hw : i32 = self.w / 2;
@@ -290,22 +499,20 @@ pub class LumenPost {
 
                 let mut e : Vec3 = c.scale(self.exposure);
                 if (bloom) {
-                    let b : Vec3 = pkBilinear(self.lv1, hw, hh, u, v)
-                        .scale(POST_BLOOM_W1)
-                        .plus(pkBilinear(self.lv2, hw / 2, hh / 2, u, v).scale(POST_BLOOM_W2))
-                        .plus(pkBilinear(self.lv3, hw / 4, hh / 4, u, v).scale(POST_BLOOM_W3))
-                        .plus(pkBilinear(self.lv4, hw / 8, hh / 8, u, v).scale(POST_BLOOM_W4));
-                    e = e.plus(b.scale(kb));
+                    e = e.plus(pkBilinear(self.lv1, hw, hh, u, v).scale(kb));
                 }
                 let dx : f32 = u - (0.5 as f32);
-                self.grade(e, dx * dx + dy * dy, at);
+                let shown : Vec3 = self.grade(e, dx * dx + dy * dy);
+                self.disp[at] = shown.x;
+                self.disp[at + 1] = shown.y;
+                self.disp[at + 2] = shown.z;
             }
         }
     }
 
-    // Vignette, highlight roll-off, grade and tone curve of the exposed colour `e`, written at `at` in the display
-    // buffer; `edge2` is the squared distance of the pixel from the middle of the picture.
-    fn grade(mut self, e : Vec3, edge2 : f32, at : i64) : void {
+    // Vignette, highlight roll-off, grade and tone curve of the exposed colour `e`, as encoded display values in
+    // 0..1; `edge2` is the squared distance of the pixel from the middle of the picture.
+    fn grade(self, e : Vec3, edge2 : f32) : Vec3 {
         let dimmed : Vec3 = e.scale((1.0 as f32) - POST_VIGNETTE * edge2);
         let grey : f32 = POST_LUMA_R * dimmed.x + POST_LUMA_G * dimmed.y + POST_LUMA_B * dimmed.z;
         let peak : f32 = max(dimmed.maxComponent(), 0.0);
@@ -316,9 +523,11 @@ pub class LumenPost {
         let graded : Vec3 = Vec3 { x: grey, y: grey, z: grey }.lerp(rolled, POST_GRADE);
         let m : f32 = max(graded.maxComponent(), 0.0);
         let gain : f32 = self.toneGain(m);
-        self.disp[at] = self.encode(max(graded.x, 0.0) * gain);
-        self.disp[at + 1] = self.encode(max(graded.y, 0.0) * gain);
-        self.disp[at + 2] = self.encode(max(graded.z, 0.0) * gain);
+        return Vec3 {
+            x: self.encode(max(graded.x, 0.0) * gain),
+            y: self.encode(max(graded.y, 0.0) * gain),
+            z: self.encode(max(graded.z, 0.0) * gain),
+        };
     }
 
     // The picture at (x, y) with its detail brought back: the pixel plus a share of its difference from the mean
@@ -369,10 +578,11 @@ pub class LumenPost {
     fn pack(mut self, begin : i32, end : i32) : void {
         let ow : i32 = self.w * self.scale;
         let oh : i32 = self.h * self.scale;
+        let mask : i32 = POST_DITHER_SIDE - 1;
         for (oy of begin..end) {
             let v : f32 = ((oy as f32) + (0.5 as f32)) / (oh as f32);
             for (ox of 0..ow) {
-                let n : f32 = lnUnit(ox, oy, 0, POST_DITHER_SEED) - (0.5 as f32);
+                let n : f32 = self.dither[((oy & mask) * POST_DITHER_SIDE + (ox & mask)) as i64];
                 let mut c : Vec3 = Vec3::zero();
                 if (self.scale == 1) {
                     let at : i64 = ((oy * self.w + ox) * 3) as i64;
@@ -390,6 +600,33 @@ pub class LumenPost {
     }
 }
 
+// One channel sharpened: the value plus a share of its difference from the mean of its four neighbours, kept inside
+// the range of those neighbours and itself, so no edge grows a halo.
+fn pkSharp(c : f32, l : f32, r : f32, u : f32, d : f32) : f32 {
+    let lo : f32 = min(min(l, r), min(u, d));
+    let hi : f32 = max(max(l, r), max(u, d));
+    let sharp : f32 = c + (c - (l + r + u + d) * (0.25 as f32)) * POST_SHARPEN;
+    return min(max(sharp, min(lo, c)), max(hi, c));
+}
+
+// The entry of the `word` table for the linear value `x`: the nearest of 4096 over 0..1/16, where the transfer is
+// steep, or of 4096 over the rest. Anything below 0 reads the first entry and anything above 1 the last.
+fn pkWordIndex(x : f32) : i32 {
+    let c : f32 = min(max(x, 0.0), 1.0);
+    if (c < POST_WORD_SPLIT) {
+        return (c * POST_WORD_LOW + (0.5 as f32)) as i32;
+    }
+    return ((c - POST_WORD_SPLIT) * POST_WORD_HIGH + (POST_TABLE as f32) + (0.5 as f32)) as i32;
+}
+
+// The linear value the entry `i` of the `word` table stands for.
+fn pkWordValue(i : i32) : f32 {
+    if (i < POST_TABLE) {
+        return (i as f32) / POST_WORD_LOW;
+    }
+    return POST_WORD_SPLIT + ((i - POST_TABLE) as f32) / POST_WORD_HIGH;
+}
+
 // The framebuffer word of three 0..255 channels: 0x00RRGGBB.
 fn pkPack(r : i32, g : i32, b : i32) : i32 {
     return ((r & 0xFF) << 16) | ((g & 0xFF) << 8) | (b & 0xFF);
@@ -404,94 +641,4 @@ fn pkCode(v : f32, n : f32) : i32 {
         return 255;
     }
     return c;
-}
-
-// Bilinear read of a w x h picture of three channels at (u, v) in 0..1.
-fn pkBilinear(buf : f32[], w : i32, h : i32, u : f32, v : f32) : Vec3 {
-    let fx : f32 = u * (w as f32) - (0.5 as f32);
-    let fy : f32 = v * (h as f32) - (0.5 as f32);
-    let x0 : i32 = lnFloor(fx);
-    let y0 : i32 = lnFloor(fy);
-    let tx : f32 = fx - x0 as f32;
-    let ty : f32 = fy - y0 as f32;
-    let xa : i32 = pkClamp(x0, w);
-    let xb : i32 = pkClamp(x0 + 1, w);
-    let ya : i32 = pkClamp(y0, h);
-    let yb : i32 = pkClamp(y0 + 1, h);
-    let top : Vec3 = pkRead(buf, w, xa, ya).lerp(pkRead(buf, w, xb, ya), tx);
-    let bottom : Vec3 = pkRead(buf, w, xa, yb).lerp(pkRead(buf, w, xb, yb), tx);
-    return top.lerp(bottom, ty);
-}
-
-fn pkClamp(i : i32, n : i32) : i32 {
-    if (i < 0) {
-        return 0;
-    }
-    if (i >= n) {
-        return n - 1;
-    }
-    return i;
-}
-
-fn pkRead(buf : f32[], w : i32, x : i32, y : i32) : Vec3 {
-    let at : i64 = ((y * w + x) * 3) as i64;
-    return Vec3 { x: buf[at], y: buf[at + 1], z: buf[at + 2] };
-}
-
-// Halves a w x h picture by 2 x 2 boxes into `dst`.
-fn pkShrink(src : f32[], w : i32, h : i32, dst : f32[]) : void {
-    let dw : i32 = w / 2;
-    let dh : i32 = h / 2;
-    for (y of 0..dh) {
-        for (x of 0..dw) {
-            for (c of 0..3) {
-                let a : i64 = (((y * 2) * w + x * 2) * 3 + c) as i64;
-                let b : i64 = a + 3;
-                let d : i64 = a + (w * 3) as i64;
-                dst[((y * dw + x) * 3 + c) as i64] = (src[a] + src[b] + src[d] + src[d + 3]) * (0.25 as f32);
-            }
-        }
-    }
-}
-
-// The sideways half of a 1-4-6-4-1 blur of rows `begin` up to `end` of a picture `w` wide: `src` into `dst`.
-fn pkBlurAcross(src : f32[], dst : f32[], w : i32, begin : i32, end : i32) : void {
-    for (y of begin..end) {
-        for (x of 0..w) {
-            for (c of 0..3) {
-                let mut s : f32 = 0.0;
-                for (k of -2..3) {
-                    let xi : i32 = pkClamp(x + k, w);
-                    s = s + src[((y * w + xi) * 3 + c) as i64] * pkTap(k);
-                }
-                dst[((y * w + x) * 3 + c) as i64] = s;
-            }
-        }
-    }
-}
-
-// The vertical half, rows `begin` up to `end` of a picture `w` by `h`: `src` into `dst`.
-fn pkBlurDown(src : f32[], dst : f32[], w : i32, h : i32, begin : i32, end : i32) : void {
-    for (y of begin..end) {
-        for (x of 0..w) {
-            for (c of 0..3) {
-                let mut s : f32 = 0.0;
-                for (k of -2..3) {
-                    let yi : i32 = pkClamp(y + k, h);
-                    s = s + src[((yi * w + x) * 3 + c) as i64] * pkTap(k);
-                }
-                dst[((y * w + x) * 3 + c) as i64] = s;
-            }
-        }
-    }
-}
-
-fn pkTap(k : i32) : f32 {
-    if (k == 0) {
-        return POST_TAP_CENTRE;
-    }
-    if (k == 1 || k == -1) {
-        return POST_TAP_NEAR;
-    }
-    return POST_TAP_FAR;
 }
