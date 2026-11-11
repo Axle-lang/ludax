@@ -4,7 +4,7 @@
 // The sky bakes one grid per moment of the day and blurs it into coarser grids, so everything here is plain
 // array work that a job pool may run on different rows at the same time: a row is written by one job only.
 
-use crate::core::math::scalar::clamp;
+use crate::core::math::scalar::{clamp, max};
 use crate::core::math::vec2::Vec2;
 use crate::core::math::vec3::Vec3;
 use crate::render::pathlight::pathlight_noise::lnFloor;
@@ -45,30 +45,37 @@ pub class SkyGrid {
         return Vec3 { x: self.data[at], y: self.data[at + 1], z: self.data[at + 2] };
     }
 
-    /** The radiance at `place` as (u, v) in 0..1, read bilinearly: azimuth wraps around, elevation is clamped. */
+    /**
+     * The radiance at `place` as (u, v) in 0..1: linear around the azimuth, which wraps, and Catmull-Rom along the
+     * elevation, which is clamped. A plain linear blend between the rows leaves a visible band every row (a slope
+     * break each 2.8 degrees, some 25 pixels on screen); the cubic is smooth through every row.
+     *
+     * This is read for every sky pixel, every haze and every reflection, so it is written out in scalars: the wrap is
+     * a comparison (an integer remainder costs more than the eight texels), the two azimuth weights are folded into
+     * the four row weights, and each channel is one sum of eight products.
+     */
     pub fn look(self, place : Vec2) : Vec3 {
-        let fx : f32 = place.x * (self.w as f32) - (0.5 as f32);
-        let fy : f32 = clamp(place.y * (self.h as f32) - (0.5 as f32), 0.0, (self.h - 1) as f32);
+        let w : i32 = self.w;
+        let h : i32 = self.h;
+        let fx : f32 = place.x * (w as f32) - (0.5 as f32);
+        let fy : f32 = clamp(place.y * (h as f32) - (0.5 as f32), 0.0, (h - 1) as f32);
         let x0 : i32 = lnFloor(fx);
         let y0 : i32 = lnFloor(fy);
         let tx : f32 = fx - x0 as f32;
         let ty : f32 = fy - y0 as f32;
 
-        let xa : i32 = (x0 + self.w) % self.w;
-        let xb : i32 = (x0 + 1 + self.w) % self.w;
-        let mut y1 : i32 = y0 + 1;
-        if (y1 >= self.h) {
-            y1 = self.h - 1;
+        // `place.x` is in 0..1, so x0 is in -1..w - 1 and one step either way wraps it.
+        let mut xa : i32 = x0;
+        if (xa < 0) {
+            xa = xa + w;
+        } else if (xa >= w) {
+            xa = xa - w;
+        }
+        let mut xb : i32 = xa + 1;
+        if (xb >= w) {
+            xb = 0;
         }
 
-        // Catmull-Rom along the elevation: a plain linear blend between the 64 rows leaves a visible band every row (a
-        // slope break each 2.8 degrees, some 25 pixels on screen); the cubic is smooth through every row.
-        let ym : i32 = clampRow(y0 - 1, self.h);
-        let y2 : i32 = clampRow(y0 + 2, self.h);
-        let p0 : Vec3 = self.texel(xa, ym).lerp(self.texel(xb, ym), tx);
-        let p1 : Vec3 = self.texel(xa, y0).lerp(self.texel(xb, y0), tx);
-        let p2 : Vec3 = self.texel(xa, y1).lerp(self.texel(xb, y1), tx);
-        let p3 : Vec3 = self.texel(xa, y2).lerp(self.texel(xb, y2), tx);
         let t2 : f32 = ty * ty;
         let t3 : f32 = t2 * ty;
         let half : f32 = 0.5;
@@ -76,8 +83,43 @@ pub class SkyGrid {
         let w1 : f32 = half * ((3.0 as f32) * t3 - (5.0 as f32) * t2 + (2.0 as f32));
         let w2 : f32 = half * (-(3.0 as f32) * t3 + (4.0 as f32) * t2 + ty);
         let w3 : f32 = half * (t3 - t2);
-        let c : Vec3 = p0.scale(w0).plus(p1.scale(w1)).plus(p2.scale(w2)).plus(p3.scale(w3));
-        return c.componentMax(Vec3::zero());
+        let sa : f32 = (1.0 as f32) - tx;
+
+        let row0 : i64 = (clampRow(y0 - 1, h) * w) as i64;
+        let row1 : i64 = (y0 * w) as i64;
+        let row2 : i64 = (clampRow(y0 + 1, h) * w) as i64;
+        let row3 : i64 = (clampRow(y0 + 2, h) * w) as i64;
+        let a : i64 = xa as i64;
+        let b : i64 = xb as i64;
+        let a0 : i64 = (row0 + a) * 3;
+        let b0 : i64 = (row0 + b) * 3;
+        let a1 : i64 = (row1 + a) * 3;
+        let b1 : i64 = (row1 + b) * 3;
+        let a2 : i64 = (row2 + a) * 3;
+        let b2 : i64 = (row2 + b) * 3;
+        let a3 : i64 = (row3 + a) * 3;
+        let b3 : i64 = (row3 + b) * 3;
+        let d : f32[] = self.data;
+        let ka0 : f32 = w0 * sa;
+        let kb0 : f32 = w0 * tx;
+        let ka1 : f32 = w1 * sa;
+        let kb1 : f32 = w1 * tx;
+        let ka2 : f32 = w2 * sa;
+        let kb2 : f32 = w2 * tx;
+        let ka3 : f32 = w3 * sa;
+        let kb3 : f32 = w3 * tx;
+        let r : f32 = d[a0] * ka0 + d[b0] * kb0 + d[a1] * ka1 + d[b1] * kb1 + d[a2] * ka2 + d[b2] * kb2
+            + d[a3] * ka3
+            + d[b3] * kb3;
+        let g : f32 = d[a0 + 1] * ka0 + d[b0 + 1] * kb0 + d[a1 + 1] * ka1 + d[b1 + 1] * kb1 + d[a2 + 1] * ka2
+            + d[b2 + 1] * kb2
+            + d[a3 + 1] * ka3
+            + d[b3 + 1] * kb3;
+        let bl : f32 = d[a0 + 2] * ka0 + d[b0 + 2] * kb0 + d[a1 + 2] * ka1 + d[b1 + 2] * kb1 + d[a2 + 2] * ka2
+            + d[b2 + 2] * kb2
+            + d[a3 + 2] * ka3
+            + d[b3 + 2] * kb3;
+        return Vec3 { x: max(r, 0.0), y: max(g, 0.0), z: max(bl, 0.0) };
     }
 
     /** Overwrites this grid's cells with `other`'s; both must have the same size. */

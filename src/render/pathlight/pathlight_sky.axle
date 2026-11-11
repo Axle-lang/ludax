@@ -18,7 +18,7 @@ use std::lang::{IllegalStateException, InterruptedException};
 use crate::core::jobs::kernel::RangeKernel;
 use crate::core::jobs::pool::JobPool;
 use crate::core::math::scalar::{max, saturate, smoothstep, PI, TAU};
-use crate::core::math::trig::{sin, cos, asin, atan2};
+use crate::core::math::trig::{sin, cos, asinQuick, atan2Quick};
 use crate::core::math::vec2::Vec2;
 use crate::core::math::vec3::Vec3;
 use crate::render::light::light_sh::LightSh9;
@@ -27,7 +27,7 @@ use crate::render::light::light_source::LightSource;
 use crate::render::pathlight::pathlight_celestial::{
     SUN_RADIUS, MOON_RADIUS, DISC_EDGE, lumenMoonDisc, lumenStars
 };
-use crate::render::pathlight::pathlight_cloud::{CloudLight, lumenCloudOver};
+use crate::render::pathlight::pathlight_cloud::{CloudLight, CloudLayer, lumenCloudLayer, lumenCloudLayerOver};
 use crate::render::pathlight::pathlight_skygrid::SkyGrid;
 
 // ---- the grid and its blurred levels (directions: azimuth wraps, elevation is clamped)
@@ -96,8 +96,16 @@ const SKY_HAZE_DOME : f32 = 0.9;
 /** The ground beyond the world is read at this height of the horizon (the sine of an elevation just above it). */
 const SKY_GROUND_HORIZON : f32 = 0.02;
 
-/** The ground fades into the horizon colour at this rate per unit of dip below it. */
-const SKY_GROUND_FADE : f32 = 14.0;
+/**
+ * The ground beyond the world's edge takes the horizon's colour at the horizon and its own this far below it (the
+ * sine of the dip is 1 / this). Fast, it drew a second, olive horizon under the real one for an eye high above the
+ * sea, between the haze and the edge of the loaded water.
+ */
+const SKY_GROUND_FADE : f32 = 2.5;
+
+/** The far ground is the horizon's colour dimmed to this share, with this share of the earth's own colour in it. */
+const SKY_GROUND_HAZE : f32 = 0.6;
+const SKY_GROUND_EARTH : f32 = 0.25;
 
 // Moonlit air is bluer than the sun's: the tint of the moon's sky radiance.
 fn skyMoonTint() : Vec3 {
@@ -174,13 +182,17 @@ const SKYB_READY : i32 = 2;
 
 // What the baker thread shares with the sky: the time asked for in, the finished dome out (the grid is the baker's kernel's).
 class SkyBakeGate {
-    pub wake  : BoundedChannel;
+    pub wake : BoundedChannel;
+
+    // The thread says here that it has left.
+    pub gone  : BoundedChannel;
     pub state : AtomicI32;
     pub day   : f64 = 0.0;
     pub dome  : LightSh9;
 
     constructor() {
         self.wake = new BoundedChannel(2);
+        self.gone = new BoundedChannel(1);
         self.state = new AtomicI32(SKYB_IDLE);
         self.dome = LightSh9::zero();
     }
@@ -209,6 +221,7 @@ fn skyBakeWorker(gate : SkyBakeGate, kernel : SkyKernel) : void {
     } catch e : InterruptedException {
         // The channel was closed under the thread: the sky is gone, so leave quietly.
     }
+    gate.gone.trySend(SKYB_STOP);
 }
 
 /**
@@ -269,19 +282,62 @@ pub class SkyBaker {
         self.gate.state.set(SKYB_IDLE);
     }
 
-    /** Ends the thread. */
+    /**
+     * Ends the thread and waits until it has left: it writes the grid and the gate, so whoever owns them must not let
+     * them go while a bake is still running (a program that ended in the middle of one crashed on its way out).
+     */
     pub fn stop(mut self) : void {
         if (self.started) {
-            self.gate.wake.trySend(SKYB_STOP);
             self.started = false;
+            if (self.gate.wake.trySend(SKYB_STOP)) {
+                try {
+                    self.gate.gone.receive();
+                } catch e : InterruptedException {
+                    // The thread is gone already.
+                }
+            }
         }
     }
+}
+
+/**
+ * Where the mirror's lobe is cut off (past this many squared widths it holds a thousandth of its peak), what makes
+ * up for the light the cut and the polynomial leave out (the integral of `skyLobe` over 0..7 is 0.9411), and the
+ * narrowest lobe taken, radians: a narrower one is this wide.
+ */
+const SKY_LOBE_END : f32 = 7.0;
+const SKY_LOBE_WHOLE : f32 = 1.0625;
+const SKY_LOBE_NARROW : f32 = 0.005;
+
+/** How many samples of the picture wide a rippled mirror's sample of the sky is. */
+const SKY_MIRROR_BLUR : f32 = 2.0;
+
+/** The elevations (sines) between which the cloud deck comes into a mirror: none below, all of it above. */
+const SKY_MIRROR_LOW : f32 = 0.08;
+const SKY_MIRROR_CLOUDS : f32 = 0.3;
+
+// exp(-x) for x in 0..SKY_LOBE_END, as (1 - x/16)^16: within two percent of the peak everywhere, and no libm.
+fn skyLobe(x : f32) : f32 {
+    let a : f32 = (1.0 as f32) - x * (0.0625 as f32);
+    let a2 : f32 = a * a;
+    let a4 : f32 = a2 * a2;
+    let a8 : f32 = a4 * a4;
+    return a8 * a8;
 }
 
 /** The unit direction at azimuth `az` (0..tau, from +z toward +x) and elevation `elev` (-pi/2..pi/2). */
 pub fn lumenSkyDirection(az : f32, elev : f32) : Vec3 {
     let ce : f32 = cos(elev);
     return Vec3 { x: sin(az) * ce, y: sin(elev), z: cos(az) * ce };
+}
+
+/** The smooth part of the sky along one direction (see `LumenSky.veil`). */
+pub struct SkyVeil {
+    /** The radiance of the sky and of the cloud deck over it. */
+    pub color : Vec3 = Vec3 { x: 0.0, y: 0.0, z: 0.0 };
+
+    /** The share of the sun, the moon and the stars the deck lets through, 0 to 1. */
+    pub clear : f32 = 1.0;
 }
 
 /** The sky at one moment of the day. */
@@ -470,14 +526,14 @@ pub class LumenSky {
         self.night = saturate(SKY_NIGHT_ONSET - self.sunDir.y * SKY_NIGHT_RATE);
     }
 
-    // The place of `dir` on the radiance grid as (u, v) in 0..1: azimuth around, elevation up. Two inverse
-    // trigonometric calls, so a lookup that reads several levels works this out once.
+    // The place of `dir` on the radiance grid as (u, v) in 0..1: azimuth around, elevation up. The angles are the
+    // quick ones: 1e-5 radian against a cell of 0.05 radian, and this runs for every sky, haze and reflection lookup.
     fn gridPlace(self, dir : Vec3) : Vec2 {
-        let mut az : f32 = atan2(dir.x, dir.z);
+        let mut az : f32 = atan2Quick(dir.x, dir.z);
         if (az < 0.0) {
             az = az + TAU;
         }
-        let el : f32 = asin(saturate((dir.y + (1.0 as f32)) * (0.5 as f32)) * (2.0 as f32) - (1.0 as f32));
+        let el : f32 = asinQuick(dir.y);
         return Vec2 { x: az / TAU, y: el / PI + (0.5 as f32) };
     }
 
@@ -511,9 +567,63 @@ pub class LumenSky {
      * the cloud deck; and, below the horizon, the ground beyond the world's edge.
      */
     pub fn view(self, dir : Vec3, eye : Vec3) : Vec3 {
+        let veil : SkyVeil = self.veil(dir, eye);
+        return veil.color.plus(self.bodies(dir).scale(veil.clear));
+    }
+
+    /**
+     * The smooth part of the sky along `dir`: the radiance map (or the far ground) with the cloud deck over it, and
+     * how much of what lies behind the deck still shows. `view` is this colour plus `bodies` times `clear`. Both
+     * numbers vary slowly across a picture, so a renderer may sample them sparsely and interpolate; the bodies are
+     * points and discs and must be asked for every pixel.
+     */
+    pub fn veil(self, dir : Vec3, eye : Vec3) : SkyVeil {
         let backdrop : Vec3 = self.backdrop(dir);
-        let lit : Vec3 = self.addDiscs(backdrop, dir);
-        return lumenCloudOver(self.clouds, lit, dir, eye, self.time);
+        let layer : CloudLayer = lumenCloudLayer(self.clouds, dir, eye, self.time);
+        if (layer.cover <= 0.0) {
+            return SkyVeil { color: backdrop, clear: 1.0 };
+        }
+        return SkyVeil { color: backdrop.lerp(layer.lit, layer.cover), clear: (1.0 as f32) - layer.cover };
+    }
+
+    /** The sharp part of the sky along `dir`: the sun's and the moon's discs and the stars, before any cloud. */
+    pub fn bodies(self, dir : Vec3) : Vec3 {
+        return self.addDiscs(Vec3::zero(), dir);
+    }
+
+    /**
+     * The sky as a rippled mirror shows it: the smooth sky, its clouds where they are large enough, and the sun and the moon not as
+     * discs but spread over a lobe `spread` radians wide that carries the same light. Under one pixel of water the
+     * ripples tilt the mirror by more than a disc is wide, so the disc itself would be met by one pixel in two: a
+     * dotted line that jumps with every move. The lobe is what those dots add up to.
+     */
+    pub fn mirrored(self, dir : Vec3, eye : Vec3, spread : f32) : Vec3 {
+        // The deck near the horizon is a field of clouds smaller than the mirror's own blur: read one direction at a
+        // time it is one pixel white and the next one blue. It fades out of the mirror below `SKY_MIRROR_CLOUDS`.
+        let backdrop : Vec3 = self.backdrop(dir);
+        let mut v : SkyVeil = SkyVeil { color: backdrop, clear: 1.0 };
+        let near : f32 = smoothstep(SKY_MIRROR_LOW, SKY_MIRROR_CLOUDS, dir.y);
+        if (near > 0.0) {
+            let layer : CloudLayer = lumenCloudLayerOver(self.clouds, dir, eye, self.time, SKY_MIRROR_BLUR);
+            let cover : f32 = layer.cover * near;
+            if (cover > 0.0) {
+                v = SkyVeil { color: backdrop.lerp(layer.lit, cover), clear: (1.0 as f32) - cover };
+            }
+        }
+        // The cut-off polynomial `skyLobe` holds 94.1 % of what the exponential does: the lobe is scaled back up so
+        // that it carries the body's whole irradiance.
+        let wide : f32 = max(spread, SKY_LOBE_NARROW);
+        let lobe : f32 = SKY_LOBE_WHOLE / (PI * wide * wide);
+        let mut lit : Vec3 = v.color;
+        let sunOff : f32 = ((2.0 as f32) - (2.0 as f32) * dir.dot(self.sunDir)) / (wide * wide);
+        if (sunOff < SKY_LOBE_END && self.sunDir.y > 0.0) {
+            lit = lit.plus(self.sunIrr.scale(skyLobe(sunOff) * lobe * v.clear));
+        }
+        let moonOff : f32 = ((2.0 as f32) - (2.0 as f32) * dir.dot(self.moonDir)) / (wide * wide);
+        if (moonOff < SKY_LOBE_END && self.moonDir.y > 0.0 && self.night > 0.0) {
+            lit = lit.plus(self.moonIrr.scale(skyLobe(moonOff) * lobe * v.clear));
+        }
+        return lit;
     }
 
     // The sky colour with nothing in it. Below the horizon the grid answer would be discarded wholesale, so
@@ -562,14 +672,18 @@ pub class LumenSky {
         return sky.lerp(self.dome.irradiance(flat).scale(SKY_HAZE_DOME), near);
     }
 
-    // The ground below the horizon, past the rim of the valley: a dim earth lit by the sun and the dome, fading
-    // into the horizon's own colour within a few degrees. The radiance map below the horizon holds the sky mirrored
-    // (which carries the sun's glare), and drawn there it puts a halo of the sun under the horizon, where no ray
-    // can reach.
+    // The ground beyond the world's edge: the horizon's own colour at the horizon, going over some 24 degrees of dip
+    // to that colour dimmed with a quarter of the earth's in it. Far ground is seen through all the air there is.
+    // The radiance map below the horizon holds the sky mirrored (which carries the sun's glare): drawn there it put a
+    // halo under the horizon, so the map is read at the horizon only.
     fn ground(self, dir : Vec3) : Vec3 {
         let along : Vec3 = Vec3 { x: dir.x, y: SKY_GROUND_HORIZON, z: dir.z }.normalized();
         let horizon : Vec3 = self.base(along);
-        let earth : Vec3 = skyEarth().times(self.groundLit);
+        // Far ground is seen through all the air there is: mostly the horizon's own colour, dimmed, with a little of
+        // the earth's. Olive under a blue haze read as a second horizon.
+        let earth : Vec3 = horizon
+            .scale(SKY_GROUND_HAZE)
+            .lerp(skyEarth().times(self.groundLit), SKY_GROUND_EARTH);
         return horizon.lerp(earth, saturate(-dir.y * SKY_GROUND_FADE));
     }
 }

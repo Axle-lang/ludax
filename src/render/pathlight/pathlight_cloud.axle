@@ -7,9 +7,8 @@
 // does, it sped away at every turn of the head).
 
 use crate::core::math::scalar::{PI, saturate, smoothstep};
-use crate::core::math::vec2::Vec2;
 use crate::core::math::vec3::Vec3;
-use crate::render::pathlight::pathlight_noise::lnFbm2;
+use crate::render::pathlight::pathlight_noise::{lnFbm2, lnFbm2Soft};
 
 // ---- where the deck is
 
@@ -55,6 +54,12 @@ const CLOUD_MOON : f32 = 0.5;
 const CLOUD_FADE : f32 = 6.0;
 const CLOUD_OPACITY : f32 = 0.92;
 
+/**
+ * The angle between two samples of the sky when the viewer does not say (`CloudLight.sample`), radians: four pixels
+ * of a 720-line picture 70 degrees high, the spacing of a picture that samples its sky sparsely.
+ */
+pub const CLOUD_SAMPLE : f32 = 0.0068;
+
 /** What lights the deck: the sun and moon (direction and irradiance) and the zenith colour the clouds mix over. */
 pub struct CloudLight {
     /** Unit direction toward the sun, and its irradiance at the ground. */
@@ -67,6 +72,13 @@ pub struct CloudLight {
 
     /** The radiance of the zenith as the clouds are lit by it. */
     pub zenith : Vec3;
+
+    /**
+     * The angle between two samples of the sky the viewer takes, radians: the deck is averaged over that much. A
+     * picture that reads the sky for every pixel gives one pixel's angle; the default is four pixels of a 720-line
+     * picture.
+     */
+    pub sample : f32 = 0.0068;
 }
 
 // The slight blue of the lit cloud.
@@ -85,6 +97,25 @@ pub fn lumenCloudCover(x : f32, z : f32, t : f32) : f32 {
     return smoothstep(CLOUD_COVER_FROM, CLOUD_COVER_TO, n);
 }
 
+/**
+ * `lumenCloudCover` for an eye that sees the deck at (`x`, `z`) with a footprint `across` blocks wide: the cover of
+ * the noise averaged over that footprint (not the average of the cover: the threshold is applied after). Far along
+ * a grazing ray one sample of the picture covers many clouds, and the plain cover there is one sample white and the
+ * next one blue: a sky that sizzles at the horizon whenever the camera moves. Averaged, the noise goes to its mean,
+ * which is under the threshold of a cloud: far clouds thin out and, where every layer of the noise is finer than
+ * the footprint (under some 8 degrees of elevation at the default sample), there are none.
+ */
+pub fn lumenCloudCoverOver(x : f32, z : f32, t : f32, across : f32) : f32 {
+    let n : f32 = lnFbm2Soft(
+        x * CLOUD_FREQ + t * CLOUD_DRIFT_X,
+        z * CLOUD_FREQ + t * CLOUD_DRIFT_Z,
+        CLOUD_OCTAVES,
+        CLOUD_SEED,
+        (2.0 as f32) * across * CLOUD_FREQ
+    );
+    return smoothstep(CLOUD_COVER_FROM, CLOUD_COVER_TO, n);
+}
+
 /** How far up a ray from height `y` must go to meet the cloud deck, or -1 when it cannot. */
 pub fn lumenCloudDistance(y : f32, dirY : f32) : f32 {
     if (dirY < CLOUD_MIN_SLOPE || y >= CLOUD_HEIGHT) {
@@ -93,40 +124,70 @@ pub fn lumenCloudDistance(y : f32, dirY : f32) : f32 {
     return (CLOUD_HEIGHT - y) / dirY;
 }
 
+/** The cloud deck along one direction: the radiance of the cloud there and how much of the view it covers, 0 to 1. */
+pub struct CloudLayer {
+    /** The radiance of the lit cloud. */
+    pub lit : Vec3 = Vec3 { x: 0.0, y: 0.0, z: 0.0 };
+
+    /** The share of what lies behind that the cloud replaces; 0 where there is none. */
+    pub cover : f32 = 0.0;
+}
+
 /**
- * What the eye at `eye` sees of the deck along `dir` blended over the sky `behind` it, or `behind` itself when
- * the ray never meets a cloud. The deck is seen from a fixed height, not the eye's, as a plane much farther than
- * the world would be.
+ * The deck as the eye at `eye` sees it along `dir`: no cover when the ray never meets a cloud. The deck is seen from
+ * a fixed height, not the eye's, as a plane much farther than the world would be. It is lit from the sun's side:
+ * thickness toward the sun darkens it, an edge facing the sun glows (a silver lining).
  */
-pub fn lumenCloudOver(light : CloudLight, behind : Vec3, dir : Vec3, eye : Vec3, time : f32) : Vec3 {
+pub fn lumenCloudLayer(light : CloudLight, dir : Vec3, eye : Vec3, time : f32) : CloudLayer {
+    return lumenCloudLayerOver(light, dir, eye, time, 1.0);
+}
+
+/**
+ * `lumenCloudLayer` for a viewer whose sample of the sky is `blur` times as wide as a sample of the picture: a
+ * rippled mirror, which spreads every direction it shows. The deck is averaged over that much more, which is both
+ * what such a viewer sees and less noise to work out.
+ */
+pub fn lumenCloudLayerOver(light : CloudLight, dir : Vec3, eye : Vec3, time : f32, blur : f32) : CloudLayer {
     let reach : f32 = lumenCloudDistance(CLOUD_EYE, dir.y);
     if (reach <= 0.0) {
-        return behind;
+        return CloudLayer {};
     }
 
     let px : f32 = eye.x + dir.x * reach;
     let pz : f32 = eye.z + dir.z * reach;
-    let cover : f32 = lumenCloudCover(px, pz, time);
+    // What one sample of the picture covers of the deck: its angle times the distance, stretched along the ray by
+    // the slant at which the ray meets the deck.
+    let across : f32 = reach * light.sample * blur / dir.y;
+    let cover : f32 = lumenCloudCoverOver(px, pz, time, across);
     if (cover <= 0.0) {
-        return behind;
+        return CloudLayer {};
     }
-    return cloudShaded(light, behind, dir, Vec2::make(px, pz), cover, time);
-}
 
-// Shades the deck at `at` and blends it over the sky behind it. The deck is lit from the sun's side: thickness
-// toward the sun darkens it, an edge facing the sun glows (a silver lining).
-fn cloudShaded(light : CloudLight, behind : Vec3, dir : Vec3, at : Vec2, cover : f32, time : f32) : Vec3 {
-    let sunwardX : f32 = at.x + light.sunDir.x * CLOUD_PROBE;
-    let sunwardZ : f32 = at.y + light.sunDir.z * CLOUD_PROBE;
-    let toward : f32 = lumenCloudCover(sunwardX, sunwardZ, time);
-    let thick : f32 = saturate(toward - cover + CLOUD_BIAS);
+    let sunwardX : f32 = px + light.sunDir.x * CLOUD_PROBE;
+    let sunwardZ : f32 = pz + light.sunDir.z * CLOUD_PROBE;
+    // The shading of a cloud by its own thickness toward the sun is a detail a blurred view does not show: such a
+    // view takes the middle shade and saves the second reading of the noise.
+    let mut thick : f32 = CLOUD_BIAS;
+    if (blur <= 1.0) {
+        thick = saturate(lumenCloudCoverOver(sunwardX, sunwardZ, time, across) - cover + CLOUD_BIAS);
+    }
 
     let sunLit : Vec3 = light.sunIrr
         .scale(saturate(light.sunDir.y * CLOUD_RISE) / PI)
         .scale(CLOUD_SUN_BASE + CLOUD_SUN_THIN * ((1.0 as f32) - thick));
     let moonLit : Vec3 = light.moonIrr.scale(saturate(light.moonDir.y * CLOUD_RISE) / PI).scale(CLOUD_MOON);
-    let lit : Vec3 = sunLit.plus(moonLit).plus(light.zenith).times(cloudTint());
-
     let fade : f32 = saturate(dir.y * CLOUD_FADE);
-    return behind.lerp(lit, cover * fade * CLOUD_OPACITY);
+    return CloudLayer {
+        lit: sunLit.plus(moonLit).plus(light.zenith).times(cloudTint()),
+        cover: cover * fade * CLOUD_OPACITY,
+    };
+}
+
+/** The deck blended over the sky `behind` it: `behind` itself where the ray meets no cloud. */
+pub fn lumenCloudOver(light : CloudLight, behind : Vec3, dir : Vec3, eye : Vec3, time : f32) : Vec3 {
+    let layer : CloudLayer = lumenCloudLayer(light, dir, eye, time);
+    if (layer.cover <= 0.0) {
+        return behind;
+    }
+    return behind.lerp(layer.lit, layer.cover);
 }
