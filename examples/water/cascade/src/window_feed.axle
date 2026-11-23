@@ -6,7 +6,9 @@
 // turbulence), the wet flags, the ground moisture around the water (the nearest wet cell within a few cells, ramped),
 // and the level-0 pyramid of the surface the renderer marches; the serial ends (the height range before, the upper
 // levels after) are the caller's. Nothing here allocates after the constructor, and it never copies a `Shared`
-// inside a pass: the world and the window are read through `self`.
+// inside a pass: the world and the window are read through the kernel. The kernel is its own `Shared` object
+// beside the pool, because the pool's threads hold a count of what they run (E0509): a feed that were its own
+// kernel would be held by the threads it owns.
 
 use fluidview::WaterWindow;
 use ludax::{max, saturate, HydroWorld, JobPool, RangeKernel, Vec2, Vec3};
@@ -27,27 +29,19 @@ enum FeedPass : i8 {
     Pyramid,
 }
 
-/** The kernel that fills a window from a world. */
-pub class WindowFeed : RangeKernel {
-    world  : Shared<HydroWorld>;
-    window : Shared<WaterWindow>;
-    wet    : u8[];
-    dyed   : bool = false;
-    pass   : FeedPass = FeedPass::Water;
-    pool   : JobPool;
+// The rows of one pass: what the pool's threads run.
+class FeedKernel : RangeKernel {
+    pub world  : Shared<HydroWorld>;
+    pub window : Shared<WaterWindow>;
+    wet        : u8[];
+    dyed       : bool = false;
+    pub pass   : FeedPass = FeedPass::Water;
 
-    /** A feed of `window` from `world` (the same cells), on `workers` threads. */
-    constructor(world : Shared<HydroWorld>, window : Shared<WaterWindow>, workers : i32, dyed : bool) {
+    constructor(world : Shared<HydroWorld>, window : Shared<WaterWindow>, dyed : bool) {
         self.dyed = dyed;
         self.world = world;
         self.window = window;
         self.wet = new u8[(window.w as i64) * window.d];
-        self.pool = new JobPool(workers, self);
-    }
-
-    /** Stops the worker threads. */
-    pub fn close(mut self) : void {
-        self.pool.shutdown();
     }
 
     /** Does rows `begin` up to `end` of the current pass. */
@@ -57,24 +51,6 @@ pub class WindowFeed : RangeKernel {
             FeedPass::Moist => self.moist(begin, end),
             FeedPass::Pyramid => self.window.top.buildRows(begin, end),
         }
-    }
-
-    // One pass over all the window's rows.
-    fn run(mut self, which : FeedPass) : void {
-        self.pass = which;
-        let rows : i32 = self.window.d;
-        if (!self.pool.run(rows, FEED_ROWS_PER_JOB)) {
-            self.runRange(0, rows);
-        }
-    }
-
-    /** Copies the world's water into the window and rebuilds the surface's pyramid. */
-    pub fn sync(mut self) : void {
-        self.run(FeedPass::Water);
-        self.run(FeedPass::Moist);
-        self.window.top.prepare();
-        self.run(FeedPass::Pyramid);
-        self.window.top.buildUpper();
     }
 
     fn water(mut self, begin : i32, end : i32) : void {
@@ -132,5 +108,40 @@ pub class WindowFeed : RangeKernel {
                 self.window.setMoist(i, j, saturate((1.0 as f32) - near / reach));
             }
         }
+    }
+}
+
+/** Fills a window from a world every frame, on a job pool. */
+pub class WindowFeed {
+    kernel : Shared<FeedKernel>;
+    pool   : JobPool;
+
+    /** A feed of `window` from `world` (the same cells), on `workers` threads. */
+    constructor(world : Shared<HydroWorld>, window : Shared<WaterWindow>, workers : i32, dyed : bool) {
+        self.kernel = share new FeedKernel(world, window, dyed);
+        self.pool = new JobPool(workers, self.kernel);
+    }
+
+    /** Stops the worker threads. */
+    pub fn close(mut self) : void {
+        self.pool.shutdown();
+    }
+
+    // One pass over all the window's rows.
+    fn run(mut self, which : FeedPass) : void {
+        self.kernel.pass = which;
+        let rows : i32 = self.kernel.window.d;
+        if (!self.pool.run(rows, FEED_ROWS_PER_JOB)) {
+            self.kernel.runRange(0, rows);
+        }
+    }
+
+    /** Copies the world's water into the window and rebuilds the surface's pyramid. */
+    pub fn sync(mut self) : void {
+        self.run(FeedPass::Water);
+        self.run(FeedPass::Moist);
+        self.kernel.window.top.prepare();
+        self.run(FeedPass::Pyramid);
+        self.kernel.window.top.buildUpper();
     }
 }
