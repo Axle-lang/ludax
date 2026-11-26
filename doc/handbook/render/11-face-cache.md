@@ -1,6 +1,6 @@
 # 3.11 The face cache: light kept in the world
 
-[Handbook](../README.md) · previous: [3.10 Water](10-water.md) · next: [4.1 The job pool](../engine/01-job-pool.md)
+[Handbook](../README.md) · previous: [3.10 Water](10-water.md) · next: [3.12 Lux](12-lux-layers.md)
 
 ## 1. Contract
 

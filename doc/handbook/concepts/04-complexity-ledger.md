@@ -38,6 +38,12 @@ of the world, `O(F E)` instead of `O(S)` a frame.
 | 7 | Skyline: a ray above the horizon of the loaded world is not traced | `O(1)` | sky pixels free | yes |
 | 8 | The section a ray starts in remembered | saves one `resolve` a ray | not measurable | kept, free |
 | 9 | Water: full cells skipped, cubes of one fluid, uniform sections | `O(n)` with a small constant; cubes stop at section faces | 464 to 97 ms under water | yes; 115 iterations a ray remain |
+| 10 | dusk: column tops, a 2D map that says a cell is air without reading the flat world | the same `O(n)`; one load from 100 KB instead of 9.8 MB | 5.19 to 4.91 ns a step, within noise; bit-identical | yes, free ([3.13](../render/13-dusk.md)) |
+| 11 | dusk: bounds guards removed from the step (`getUnchecked`) | the same | 4.88 to 4.90 ns | no: unsafe for nothing |
+| 12 | dusk: branch-free axis choice | the same | 4.88 to 5.68 ns | no, as row 6 |
+| 13 | dusk: column ceiling, a column of 8 x 8 bricks crossed in one move by a ray above all it holds | `O(n - n_a + n_a / 8)` | primary 40 to 20 steps, water mirror 94 to 29; walk 241 to 188 ns a pixel; 0.19 % of displayed pixels differ (rounding, [3.13](../render/13-dusk.md) §3.1) | yes |
+| 14 | dusk: the jump returned as a struct every step | the same | 188 to 220 ns | no: test a boolean first, build the struct only for a jump |
+| 15 | dusk: a second level of columns, 32 x 32, tried first above the narrow ceiling | `O(n - n_a + n_a / 32)` over open ground | primary 20.5 to 11.7 steps, water mirror 29 to 12.5; walk 188 to 96 ns; trace 143 to 112 ms | yes ([3.13](../render/13-dusk.md) §3.3) |
 
 Counted on 921 600 rays: a ray crosses 24 (ground), 33 (forest) or 42 (horizon) cells, takes 0, 1 or 3 box moves,
 reads 2.5 to 2.9 texels and tests 0.5 to 1.3 models. At 2 to 3 ns a cell the walk is linear in `n` and that is the
@@ -67,6 +73,7 @@ field, expected to save a fifth to a third of `n`).
 | 1 | A march a pixel, 24 steps | `24 P` | — | no |
 | 2 | A march a 2 x 2 block, jittered, averaged over frames | `24 P / 4` + a history | 9.3 then 2.5 ms; not deterministic | no |
 | 3 | A march an 8 x 8 block over the sky averaged by the same blocks | `P` (averaging) + `24 P / 64` | 27 to 5 ms; no random number, no history | yes |
+| — | dusk/lumen per-pixel march: the border ease and the air ease answered 1 without their division where they are exactly 1 | 24 divisions a pixel fewer | shafts + resolve 27.3 to 21.9 ms a frame, one thread, 640 x 360; bit-identical | yes ([3.13](../render/13-dusk.md) §3.4) |
 
 ## 5. Display
 
@@ -85,6 +92,15 @@ field, expected to save a fifth to a third of `n`).
 | 2 | Glide from the share shown to the new one as the sun travels one step | continuous in the sun's direction; `O(entries)` a frame for the fades | yes |
 | 3 | Shadow rays test foliage texel by texel | a new random pattern each generation | no |
 | 4 | Shadow rays read foliage at its mean cover | smooth in the sun's direction | yes; the dapple is lost |
+
+## 6b. Memory of the light (dusk)
+
+| # | Way | Bytes | Measured | Kept? Why |
+|---|---|---|---|---|
+| 1 | Keep the flood's 8 planes for the session's life | `32 N` (315 MB) | 741 MB while rendering | no: nothing reads them after the copy |
+| 2 | `releaseFlood` once the volumes hold the light | 0 | 307 MB while rendering, peak 620 MB at start-up | yes ([3.13](../render/13-dusk.md) §3.7) |
+| 3 | Light volumes dense, three words a cell | `12 N` (118 MB) | — | replaced by 4 |
+| 4 | Light volumes bricked: a triplet for a uniform brick without shell cells, a 512-cell block otherwise | `6144 B_o + 16 B` (28 MB, 24 % of bricks own a block) | 222 MB while rendering, trace unchanged, bit-identical | yes ([3.13](../render/13-dusk.md) §3.8) |
 
 ## 7. Threads
 

@@ -226,6 +226,79 @@ refcount operations and 160 atomic ones, and eight runs out of eight with `--thr
 other users of `JobPool` (`examples/rendering/lumen`, the voxel and fluid runners) hold their shared state the same
 way and need the compiler fix.
 
+### F11 — `f32x8.fma` goes through the dispatch trampoline and runs 9× slower than `a * b + c`
+
+**Severity: performance.** Found on 2026-11-23 with axle 0.22.0-dev and confirmed with axle 0.23.0. A post-process
+loop over 921 600 pixels (exposure, a 3×3 matrix, `x / (1 + x)`), planar `f32[]` in and out:
+
+| form of the loop | ns a pixel, one thread |
+|---|---|
+| scalar `f32` | 1.31 |
+| `f32x8` with `.fma()` for the matrix | 3.77 |
+| `f32x8` with `*` and `+` | 0.41 |
+
+The SIMD page says the `fma` of the dispatched shapes (`f32x4`, `f32x8`, `f64x2`, `f64x4`) calls a kernel chosen at
+start-up. That call is not inlined into the loop, so every lane group pays a call and loses the registers of the
+loop. Plain `*` and `+` are left to LLVM, which contracts them into `vfmadd` anyway under F2's `contract` flag.
+**Rule in ludax until fixed:** never call `.fma()` in a loop; write `a * b + c` (`src/render/lux/simd`).
+
+### F12 — a vector `store` through a parameter does not count as writing it (E0281 asks to drop the `mut`)
+
+**Severity: soundness of the `mut` rule.** Axle 0.22 requires `mut` on an array parameter that is written through,
+and refuses a `mut` that is never used (E0281). `v.store(buf, i)` on an `f32x8` writes `buf`, yet a parameter
+written only that way is reported as "never mutated" and must be declared without `mut`, so the signature claims a
+read-only buffer that the function overwrites. Repro: `fn f(o : f32[]) { f32x8.splat(z).store(o, 0); }` builds,
+`fn f(mut o : f32[])` fails with E0281.
+
+### F13 — a struct literal of a struct declared later in the same file fails (E0016)
+
+**Severity: ergonomics.** Found on 2026-11-24 with axle 0.23.0 in `examples/rendering/dusk/src/world/scene.axle`.
+`SceneRay { ox: ox, ... }` inside a method of a class declared above `struct SceneRay` fails with `E0016 Field 'ox'
+not found on type 'SceneRay'`, for every field, whatever their visibility. Moving the struct above the class fixes it.
+The same order dependence decides `pub(file)` visibility: a class declared above another cannot call the other's
+`pub(file)` method, nor read its `pub(file)` field ("only the file declaring it reaches it"), although both are in one
+file (`examples/rendering/dusk/src/light/lightvol.axle`, `LvBlock` and `LumenLight`; worked around with free
+functions declared first). Type declarations and file visibility should be order-independent within a file, as
+functions are.
+
+### F14 — a small struct built or returned on every iteration of a hot loop is not kept in registers
+
+**Severity: performance.** Same file and date. A walk step that called a method returning a 6-field struct (`bool`,
+`f32`, three `i32`, `bool`) every iteration, or that built an empty one every iteration to mean "nothing", ran 17 %
+slower (188 → 220 ns a ray) than the same logic split into a `bool` test and a struct built only when used. Scalar
+replacement of aggregates (SROA) should make the two forms equal.
+
+### F15 — a float literal is an `f64` whenever it meets an `f32` in arithmetic; the language has no way to say otherwise
+
+**Severity: ergonomics, with a risk of silent `f64` math.** Axle 0.23.0, measured 2026-11-26 on a one-file package
+(`let a : f32 = 2.0;` then the line under test):
+
+| Line | Result |
+|---|---|
+| `let b : f32 = 0.5;` | compiles (the declared type types the literal) |
+| `half(0.5)` for a parameter `f32` | compiles (the parameter types it) |
+| `let b : bool = a > 0.5;` | compiles (a comparison widens nothing) |
+| `let b : f32 = a * 0.5;`, `0.5 * a`, `a + 1.0` | **E0001**: declared `f32`, initializer is `f64` |
+| `b = b + 1.0;` (`b : f32`) | **E0001**: cannot assign `f64` to a slot of type `f32` |
+| `a < 1.0 ? 0.0 : 1.0` | **E0001**: the arms are `f64` |
+| `0.5f32`, `0.5_f32`, `(0.5 : f32)`, `f32(0.5)` | **parse errors**: there is no literal suffix and no conversion call |
+| `0.5 as f32` | compiles: the only form |
+
+So the literal's type is decided by its own expression and not by what it is combined with, which is the opposite of
+what the first three rows suggest: the same `0.5` is an `f32` in one position and an `f64` in the next. The rule cannot
+be read from the code, only learnt by failing.
+
+**What it costs in ludax.** About 419 `(N as f32)` in `src/` and 3 300 in the programs (211 in one shading file), a
+reviewer reading `(0.5 as f32)` where `0.5` was meant, and a standing risk: a bare literal in a position that happens to
+compile (a comparison, an argument) is correct, one in an expression silently widens a neighbouring `f32` to `f64` if the
+result is bound to an untyped `let`. the typed constants of `core/math/scalar` (`PI`, `TAU`, `HALF_PI`, `EPSILON`, `HUGE`) cover only the named numbers;
+every other literal in an expression is cast by hand, or bound to an annotated `let` first (`let half : f32 = 0.5;`),
+which is the same cost in more lines.
+
+**What would fix it.** Any one of: (1) type a literal by the other operand (as Rust and C do: `a * 0.5` is `f32` when `a`
+is); (2) a literal suffix, `0.5f32`; (3) at least make the error name the literal and suggest `as f32`. (1) removes the
+casts outright and makes the first three rows and the next three rows agree.
+
 ## Reproduction
 
 ```sh
@@ -249,3 +322,6 @@ axle build -O 3 --emit decisions                 # what sema proved and refused,
 6. **F6/F7/F8** — documentation and experiments.
 
 **F10 comes before all of these**: it is the only finding that corrupts memory.
+
+**F15** costs no speed and no memory but the most keystrokes of any finding here, and a silent `f64` where a cast is
+forgotten: (1) of its list is a type-checker change only.

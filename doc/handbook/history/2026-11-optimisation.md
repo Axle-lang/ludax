@@ -105,6 +105,26 @@ On 12 workers the three views are 26, 36 to 45 and 21 ms, against 26 to 31, 30 t
 gain of the day is inside the noise there, because what was removed (compose, shafts) already ran on all the workers
 and the walk of the rays, which did not change, is what is left. Under water: 335 to 568 ms down to 53 to 86.
 
+### Day 4 (2026-11-23 and 24): dusk, the layered light's showcase
+
+A fork of lumen with a harbour world (`examples/rendering/dusk`), measured against itself. The full derivations are in
+[3.13](../render/13-dusk.md); the rows here are the steps in order.
+
+| Step | Before | After | Note |
+|---|---|---|---|
+| SIMD lanes for the light (`lux_simd`) | Beer-Lambert fog 14.0 ns/px with `lightExp` | 0.53 ns/px with `luxExpNeg8` | planar scalar loops vectorise by themselves (0.29 ns/px either way); never `.fma()` (F11) |
+| Temporal v1 | settle 20.3 | settle 10.4 | **withdrawn**: blur and lost reflections in motion ([3.13](../render/13-dusk.md) §3.6) |
+| Temporal v2 (still camera only) | settle 20.3, 29.5 % bytes > 8 | 13.2, 15.5 % | moving pictures byte-identical to before |
+| Golden gate (`--golden`) | — | 14 fingerprints, equal on 1/3/5 threads | every following row checked against it |
+| Column tops | 5.19 ns a step | 4.91 | bit-identical; within noise |
+| Shaft eases answered 1 | shafts + resolve 27.3 ms | 21.9 ms | bit-identical |
+| Branch-free axis | 4.88 ns a step | 5.68 | withdrawn |
+| Unchecked loads | 4.88 | 4.90 | withdrawn |
+| Column ceiling jumps | walk 241 ns/px, trace 160-172 ms | 188 ns/px, 143-145 ms | 0.19 % of displayed pixels differ (rounding of the hit time) |
+| `releaseFlood` after the copy | 741 MB while rendering | 307 MB | the flood's 8 planes are not read after the copy; bit-identical |
+| Bricked light volumes | 307 MB, volumes 118 MB | 222 MB, volumes 28 MB | bit-identical; trace unchanged |
+| Wide columns (32 x 32) | walk 188 ns/px, trace 143 ms | 96 ns/px, 112 ms; 75 fps on 23 threads | 0.189 % of displayed pixels differ from the inherited picture |
+
 ### Along the way
 
 | # | Found | Fixed |
