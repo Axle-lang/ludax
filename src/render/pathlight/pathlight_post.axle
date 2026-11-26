@@ -6,11 +6,11 @@
 // drift of brightness, slow enough that a flash of lantern does not pump the whole picture. Light
 // above the display's white is not thrown away: it is blurred at four scales and added back as bloom, which is
 // how a lantern or the sun reads as bright when the monitor cannot be. Ludax's tone curve and sRGB transfer do
-// the last step, through two small tables built from those very functions (the curve and the encode are
+// the last step, through small tables built from those very functions (the curve and the encode are
 // smooth, so interpolating a table of them is exact to well under one 8-bit code, and a table lookup is much
 // cheaper than a power function a million times a frame).
 //
-// Every stage that touches each pixel runs on the worker pool, one row range per job (see `frame`): the bright
+// Every stage that touches each pixel runs on the worker pool, one row range per job: the bright
 // pass and the first blur at half size, the composition at render size, the upscale and pack at output size.
 // The coarser bloom levels are a few thousand pixels and stay on one thread.
 
@@ -24,8 +24,11 @@ use crate::render::pathlight::pathlight_bloom::{
 use crate::render::pathlight::pathlight_noise::{lnFloor, lnUnit};
 use crate::render::pathlight::pathlight_settings::LumenSettings;
 
-/** How fast the exposure follows the picture, in e-foldings a second: about a tenth of a second to settle, so a turn of
- * the head is not followed by a visible drift of brightness. */
+/**
+ * How fast the exposure follows the picture: a frame moves it `seconds · POST_ADAPT` of the way (in stops), at most all
+ * of it, so it settles in about a tenth of a second and a turn of the head is not followed by a visible drift of
+ * brightness. Linear in the frame's length, not an exponential: a frame of a ninth of a second or longer snaps.
+ */
 const POST_ADAPT : f32 = 9.0;
 
 /** How much of a pixel's difference from its neighbours the sharpening adds back. */
@@ -33,10 +36,10 @@ const POST_SHARPEN : f32 = 0.6;
 
 /** How much of the picture's dimness the exposure makes up for, as a power of the ratio (1 would match the key
  * exactly): below 1 a dark place stays darker than a bright one. */
-const EXPOSURE_FOLLOW : f32 = 0.78;
+const POST_EXPOSURE_FOLLOW : f32 = 0.78;
 
 /** The exposed brightness past which a pixel adds no more to the bloom: a lamp glows, it does not flood the picture. */
-const BLOOM_CEILING : f32 = 6.0;
+const POST_BLOOM_CEILING : f32 = 6.0;
 
 /** The exposure that puts an average picture at this share of white. */
 const POST_KEY : f32 = 0.17;
@@ -61,6 +64,9 @@ const POST_METER_FLOOR : f32 = 0.00002;
 
 /** The exposure meter reads every this many pixels each way. */
 const POST_METER_STEP : i32 = 4;
+
+/** The most pixels the exposure meter reads: a 720p picture at every fourth pixel, all of it. */
+const POST_METER_SAMPLES : i32 = 60000;
 
 /** The side of the dither tile, a power of two. */
 const POST_DITHER_SIDE : i32 = 64;
@@ -96,8 +102,41 @@ const POST_WORD_SPLIT : f32 = 0.0625;
 const POST_WORD_LOW : f32 = 65536.0;
 const POST_WORD_HIGH : f32 = 4369.0667;
 
-/** The largest exposed channel the tone table covers; brighter values map to the curve's ceiling. */
+/** The largest exposed channel the tone table covers; a brighter one is computed with the curve itself. */
 const POST_TONE_MAX : f32 = 40.0;
+
+// The bloom levels: half, quarter, eighth and sixteenth of the size the bloom is taken from, and a half-size scratch.
+// Held by one object that is replaced whole when a bigger size is asked: the arrays are lent to the passes' loops, and
+// Axle frees the array a field store displaces only when its value never leaves the object (ledger §862 in the Axle
+// repository); the object a store displaces is freed with everything it holds, so growing in steps leaks nothing.
+class PostPlanes {
+    pub(file) lv1 : f32[];
+    pub(file) lv2 : f32[];
+    pub(file) lv3 : f32[];
+    pub(file) lv4 : f32[];
+    pub(file) tmp : f32[];
+
+    // Levels for a bloom taken from a `w` by `h` picture.
+    constructor(w : i32, h : i32) {
+        self.lv1 = new f32[((w / 2) as i64) * (h / 2) * 3];
+        self.lv2 = new f32[((w / 4) as i64) * (h / 4) * 3];
+        self.lv3 = new f32[((w / 8) as i64) * (h / 8) * 3];
+        self.lv4 = new f32[((w / 16) as i64) * (h / 16) * 3];
+        self.tmp = new f32[((w / 2) as i64) * (h / 2) * 3];
+    }
+}
+
+// The display picture (three floats a pixel at the picture's size) that `Pack` scales to the output. Only a display
+// that packs needs it, one at a scale other than 1 or showing the raw view: one that composes straight to words (the
+// upscaled picture, at the output's own size) never allocates it. Its own owner, for the reason `PostPlanes` has one.
+class PostDisplay {
+    pub(file) disp : f32[];
+
+    // A display picture of `floats` floats.
+    constructor(floats : i64) {
+        self.disp = new f32[floats];
+    }
+}
 
 /** The parts of the display stage that run on the pool. */
 pub enum LumenPass : i8 {
@@ -120,8 +159,17 @@ pub class LumenPost {
     w : i32;
     h : i32;
 
-    /** How many output pixels each render pixel becomes. */
+    // The size of the picture the bloom is taken from: the picture itself, or the smaller one an upscaled picture
+    // was rebuilt from (`fitUpscaled`). The bloom is blurred anyway: taking it from fewer pixels changes nothing seen.
+    bw : i32;
+    bh : i32;
+
+    /** How many output pixels each render pixel becomes, 0 when the output is not a whole multiple of the picture. */
     pub scale : i32;
+
+    /** The size of the finished picture, pixels: `w * scale` by `h * scale`, or any size `fit` was given. */
+    pub ow : i32;
+    pub oh : i32;
 
     /** The exposure the picture is shown with. */
     pub exposure : f32 = 0.6;
@@ -129,17 +177,14 @@ pub class LumenPost {
     /** Bloom strength for the coming frame. */
     pub strength : f32 = 0.5;
 
-    /** True when the coming frame shows radiance clipped at 1 (the raw debug view). */
+    /** True when the coming frame shows radiance clipped at 1 (the raw debug view); set it with `showRaw`. */
     pub raw : bool = false;
 
-    lv1  : f32[];
-    lv2  : f32[];
-    lv3  : f32[];
-    lv4  : f32[];
-    tmp  : f32[];
-    disp : f32[];
-    tone : f32[];
-    code : f32[];
+    // The bloom levels and the display picture, each replaced whole when it must grow (see `PostPlanes`).
+    planes  : PostPlanes;
+    display : PostDisplay;
+    tone    : f32[];
+    code    : f32[];
 
     // The dither as a tile: the same noise for every frame, so a still picture does not shimmer, read with two masks
     // instead of hashed for every output pixel.
@@ -150,20 +195,20 @@ pub class LumenPost {
     grain : i32[];
     word  : i32[];
 
-    /** The words of the finished picture, `w * scale` by `h * scale`. */
+    /** The words of the finished picture, `ow` by `oh` (its first `ow * oh` words: it may be larger). */
     pub out : i32[];
 
     /** A stage for `w` by `h` pictures (both multiples of 16) shown at `scale` times that size. */
     constructor(w : i32, h : i32, scale : i32) {
         self.w = w;
         self.h = h;
+        self.bw = w;
+        self.bh = h;
         self.scale = scale;
-        self.lv1 = new f32[((w / 2) as i64) * (h / 2) * 3];
-        self.lv2 = new f32[((w / 4) as i64) * (h / 4) * 3];
-        self.lv3 = new f32[((w / 8) as i64) * (h / 8) * 3];
-        self.lv4 = new f32[((w / 16) as i64) * (h / 16) * 3];
-        self.tmp = new f32[((w / 2) as i64) * (h / 2) * 3];
-        self.disp = new f32[(w as i64) * h * 3];
+        self.ow = w * scale;
+        self.oh = h * scale;
+        self.planes = new PostPlanes(w, h);
+        self.display = new PostDisplay(scale == 1 ? 1 : (w as i64) * h * 3);
         self.out = new i32[(w as i64) * scale * h * scale];
         self.dither = new f32[(POST_DITHER_SIDE * POST_DITHER_SIDE) as i64];
         for (ty of 0..POST_DITHER_SIDE) {
@@ -206,7 +251,12 @@ pub class LumenPost {
             return;
         }
         // One pixel in sixteen: the mean of a logarithm over 57 000 pixels of a 720p picture is the mean over all of
-        // them to the third digit, and this runs on the thread that waits for the frame.
+        // them to the third digit, and this runs on the thread that waits for the frame. A larger picture is read
+        // more sparsely, so the meter never reads more than `POST_METER_SAMPLES` (a 1080p picture took 1.4 ms).
+        let mut step : i32 = POST_METER_STEP;
+        while ((self.w / step) * (self.h / step) > POST_METER_SAMPLES) {
+            step = step + 1;
+        }
         let mut sum : f32 = 0.0;
         let mut n : i32 = 0;
         let mut y : i32 = 1;
@@ -217,14 +267,14 @@ pub class LumenPost {
                 let lum : f32 = POST_LUMA_R * hdr[at] + POST_LUMA_G * hdr[at + 1] + POST_LUMA_B * hdr[at + 2];
                 sum = sum + lightLog2(max(lum, POST_METER_FLOOR));
                 n = n + 1;
-                x = x + POST_METER_STEP;
+                x = x + step;
             }
-            y = y + POST_METER_STEP;
+            y = y + step;
         }
         let mean : f32 = lightExp2(sum / (max(n, 1) as f32));
         // Only most of the way to the key: a dark cave is not brought up to the brightness of noon, so what glows in
         // it still glows instead of going white.
-        let mut want : f32 = lightPow(POST_KEY / mean, EXPOSURE_FOLLOW);
+        let mut want : f32 = lightPow(POST_KEY / mean, POST_EXPOSURE_FOLLOW);
         if (want < POST_EXPOSURE_MIN) {
             want = POST_EXPOSURE_MIN;
         }
@@ -241,13 +291,95 @@ pub class LumenPost {
         self.exposure = lightExp2(current + (lightLog2(want) - current) * blend);
     }
 
-    /** How many rows of work a pass has. */
+    /**
+     * From now on the picture is `w` by `h` (multiples of 16) and the finished picture `ow` by `oh`, any size: the
+     * window was resized, or the resolution governor chose another size. The buffers only grow, to the largest size
+     * asked so far, and are reused below it: changing size in a loop allocates nothing after the first time.
+     */
+    pub fn fit(mut self, w : i32, h : i32, ow : i32, oh : i32) : void {
+        self.size(w, h, ow, oh);
+        self.levelsFor(w, h);
+        self.displayIfPacked();
+    }
+
+    /**
+     * From now on the display composes an upscaled picture of `ow` by `oh` straight to words, its bloom taken from the
+     * `bw` by `bh` picture it was rebuilt from (multiples of 16): the pass `Bright` is given that picture, whose bloom
+     * costs a ninth of the output's and looks the same (it is blurred anyway). The levels are sized for it.
+     */
+    pub fn fitUpscaled(mut self, ow : i32, oh : i32, bw : i32, bh : i32) : void {
+        self.size(ow, oh, ow, oh);
+        self.bw = bw;
+        self.bh = bh;
+        self.levelsFor(bw, bh);
+        self.displayIfPacked();
+    }
+
+    /**
+     * Takes the coming frame's bloom from a `bw` by `bh` picture (multiples of 16), the one the pass `Bright` will be
+     * given: the levels grow to it if they must. Call between frames, after `fit` or `fitUpscaled`.
+     */
+    pub fn takeBloomFrom(mut self, bw : i32, bh : i32) : void {
+        self.bw = bw;
+        self.bh = bh;
+        self.levelsFor(bw, bh);
+    }
+
+    /** Shows the raw view (radiance clipped at 1) from the coming frame on, or the finished picture. */
+    pub fn showRaw(mut self, on : bool) : void {
+        self.raw = on;
+        self.displayIfPacked();
+    }
+
+    // The sizes, and the output words, which only grow.
+    fn size(mut self, w : i32, h : i32, ow : i32, oh : i32) : void {
+        if ((ow as i64) * oh > self.out.length) {
+            self.out = new i32[(ow as i64) * oh];
+        }
+        self.w = w;
+        self.h = h;
+        self.bw = w;
+        self.bh = h;
+        self.ow = ow;
+        self.oh = oh;
+        self.scale = 0;
+        if (ow % w == 0 && oh % h == 0 && ow / w == oh / h) {
+            self.scale = ow / w;
+        }
+    }
+
+    // Bloom levels for a `bw` by `bh` source, grown (never shrunk) to the largest asked so far.
+    fn levelsFor(mut self, bw : i32, bh : i32) : void {
+        if (((bw / 2) as i64) * (bh / 2) * 3 > self.planes.lv1.length) {
+            self.planes = new PostPlanes(bw, bh);
+        }
+    }
+
+    // The display picture, when the coming frames pack (`packRows`), at the picture's size; grown, never shrunk.
+    fn displayIfPacked(mut self) : void {
+        let need : i64 = (self.w as i64) * self.h * 3;
+        if (self.packRows() > 0 && need > self.display.disp.length) {
+            self.display = new PostDisplay(need);
+        }
+    }
+
+    /** Bytes the display stage holds: the bloom levels, the display picture, the output words and the tables. */
+    pub fn bytes(self) : i64 {
+        let levels : i64 = self.planes.lv1.length + self.planes.lv2.length + self.planes.lv3.length
+            + self.planes.lv4.length
+            + self.planes.tmp.length;
+        let tables : i64 = self.tone.length + self.code.length + self.dither.length + self.grain.length
+            + self.word.length;
+        return (levels + self.display.disp.length + self.out.length + tables) * 4;
+    }
+
+    /** How many rows of work the pass `pass` has: the jobs a pool shares out. */
     pub fn rowsOf(self, pass : LumenPass) : i32 {
         return match pass {
-            LumenPass::Bright => self.h / 2,
-            LumenPass::BlurAcross => self.h / 2,
-            LumenPass::BlurDown => self.h / 2,
-            LumenPass::Fold => self.h / 2,
+            LumenPass::Bright => self.bh / 2,
+            LumenPass::BlurAcross => self.bh / 2,
+            LumenPass::BlurDown => self.bh / 2,
+            LumenPass::Fold => self.bh / 2,
             LumenPass::Compose => self.h,
             LumenPass::Pack => self.packRows(),
         };
@@ -258,22 +390,29 @@ pub class LumenPost {
         if (self.scale == 1 && !self.raw) {
             return 0;
         }
-        return self.h * self.scale;
+        return self.oh;
     }
 
     /** Runs rows `begin` up to `end` of `pass` over the radiance picture `hdr`. */
     pub fn rows(mut self, pass : LumenPass, hdr : f32[], begin : i32, end : i32) : void {
         match pass {
             LumenPass::Bright => self.bright(hdr, begin, end),
-            LumenPass::BlurAcross => pkBlurAcross(self.lv1, self.tmp, self.w / 2, begin, end),
-            LumenPass::BlurDown => pkBlurDown(self.tmp, self.lv1, self.w / 2, self.h / 2, begin, end),
+            LumenPass::BlurAcross => pkBlurAcross(self.planes.lv1, self.planes.tmp, self.bw / 2, begin, end),
+            LumenPass::BlurDown => pkBlurDown(
+                self.planes.tmp,
+                self.planes.lv1,
+                self.bw / 2,
+                self.bh / 2,
+                begin,
+                end
+            ),
             LumenPass::Fold => pkFoldRows(
-                self.lv1,
-                self.w / 2,
+                self.planes.lv1,
+                self.bw / 2,
                 POST_BLOOM_W1,
-                self.lv2,
-                self.w / 4,
-                self.h / 4,
+                self.planes.lv2,
+                self.bw / 4,
+                self.bh / 4,
                 1.0,
                 begin,
                 end
@@ -288,46 +427,60 @@ pub class LumenPost {
      * the half-size level the picture reads, and without it the bloom is that level alone.
      */
     pub fn coarse(mut self) : void {
-        let hw : i32 = self.w / 2;
-        let hh : i32 = self.h / 2;
-        pkShrink(self.lv1, hw, hh, self.lv2);
-        pkShrink(self.lv2, hw / 2, hh / 2, self.lv3);
-        pkShrink(self.lv3, hw / 4, hh / 4, self.lv4);
-        pkBlurAcross(self.lv2, self.tmp, hw / 2, 0, hh / 2);
-        pkBlurDown(self.tmp, self.lv2, hw / 2, hh / 2, 0, hh / 2);
-        pkBlurAcross(self.lv3, self.tmp, hw / 4, 0, hh / 4);
-        pkBlurDown(self.tmp, self.lv3, hw / 4, hh / 4, 0, hh / 4);
-        pkBlurAcross(self.lv4, self.tmp, hw / 8, 0, hh / 8);
-        pkBlurDown(self.tmp, self.lv4, hw / 8, hh / 8, 0, hh / 8);
+        let hw : i32 = self.bw / 2;
+        let hh : i32 = self.bh / 2;
+        pkShrink(self.planes.lv1, hw, hh, self.planes.lv2);
+        pkShrink(self.planes.lv2, hw / 2, hh / 2, self.planes.lv3);
+        pkShrink(self.planes.lv3, hw / 4, hh / 4, self.planes.lv4);
+        pkBlurAcross(self.planes.lv2, self.planes.tmp, hw / 2, 0, hh / 2);
+        pkBlurDown(self.planes.tmp, self.planes.lv2, hw / 2, hh / 2, 0, hh / 2);
+        pkBlurAcross(self.planes.lv3, self.planes.tmp, hw / 4, 0, hh / 4);
+        pkBlurDown(self.planes.tmp, self.planes.lv3, hw / 4, hh / 4, 0, hh / 4);
+        pkBlurAcross(self.planes.lv4, self.planes.tmp, hw / 8, 0, hh / 8);
+        pkBlurDown(self.planes.tmp, self.planes.lv4, hw / 8, hh / 8, 0, hh / 8);
         // The coarser levels are folded each into the next finer one, weights included, so that the picture reads one
         // level for a pixel instead of four; the last fold, into the half-size level, is the pass `Fold`.
-        pkFoldRows(self.lv3, hw / 4, POST_BLOOM_W3, self.lv4, hw / 8, hh / 8, POST_BLOOM_W4, 0, hh / 4);
-        pkFoldRows(self.lv2, hw / 2, POST_BLOOM_W2, self.lv3, hw / 4, hh / 4, 1.0, 0, hh / 2);
+        pkFoldRows(
+            self.planes.lv3,
+            hw / 4,
+            POST_BLOOM_W3,
+            self.planes.lv4,
+            hw / 8,
+            hh / 8,
+            POST_BLOOM_W4,
+            0,
+            hh / 4
+        );
+        pkFoldRows(self.planes.lv2, hw / 2, POST_BLOOM_W2, self.planes.lv3, hw / 4, hh / 4, 1.0, 0, hh / 2);
     }
 
     // Half-size copy of the light above white in the exposed picture: the bloom's source.
     fn bright(mut self, hdr : f32[], begin : i32, end : i32) : void {
-        let hw : i32 = self.w / 2;
+        let bw : i32 = self.bw;
+        let hw : i32 = bw / 2;
+        let exposure : f32 = self.exposure;
+        let mut lv1 : f32[] = self.planes.lv1;
         for (y of begin..end) {
             for (x of 0..hw) {
                 let mut r : f32 = 0.0;
                 let mut g : f32 = 0.0;
                 let mut b : f32 = 0.0;
                 for (k of 0..4) {
-                    let at : i64 = (((y * 2 + k / 2) * self.w + x * 2 + k % 2) * 3) as i64;
-                    let c : Vec3 = Vec3 { x: hdr[at], y: hdr[at + 1], z: hdr[at + 2] }
-                        .scale(self.exposure)
-                        .componentMin(Vec3::splat(BLOOM_CEILING));
-                    let m : f32 = c.maxComponent();
+                    let at : i64 = (((y * 2 + k / 2) * bw + x * 2 + k % 2) * 3) as i64;
+                    // Exposed and held under the ceiling, as scalars (the same operations as a Vec3 would do).
+                    let cr : f32 = min(hdr[at] * exposure, POST_BLOOM_CEILING);
+                    let cg : f32 = min(hdr[at + 1] * exposure, POST_BLOOM_CEILING);
+                    let cb : f32 = min(hdr[at + 2] * exposure, POST_BLOOM_CEILING);
+                    let m : f32 = max(cr, max(cg, cb));
                     let keep : f32 = max(m - (1.0 as f32), 0.0) / max(m, 0.0001);
-                    r = r + c.x * keep;
-                    g = g + c.y * keep;
-                    b = b + c.z * keep;
+                    r = r + cr * keep;
+                    g = g + cg * keep;
+                    b = b + cb * keep;
                 }
                 let o : i64 = ((y * hw + x) * 3) as i64;
-                self.lv1[o] = r * (0.25 as f32);
-                self.lv1[o + 1] = g * (0.25 as f32);
-                self.lv1[o + 2] = b * (0.25 as f32);
+                lv1[o] = r * (0.25 as f32);
+                lv1[o + 1] = g * (0.25 as f32);
+                lv1[o + 2] = b * (0.25 as f32);
             }
         }
     }
@@ -353,9 +506,14 @@ pub class LumenPost {
     fn composeWords(mut self, hdr : f32[], begin : i32, end : i32) : void {
         let w : i32 = self.w;
         let h : i32 = self.h;
-        let hw : i32 = w / 2;
-        let hh : i32 = h / 2;
-        let lv1 : f32[] = self.lv1;
+        let hw : i32 = self.bw / 2;
+        let hh : i32 = self.bh / 2;
+        // A bloom of exactly half the picture is walked with fixed weights; one from a smaller picture is read
+        // bilinearly at each pixel.
+        let half : bool = self.bw == w && self.bh == h;
+        let bx : f32 = (hw as f32) / (w as f32);
+        let byScale : f32 = (hh as f32) / (h as f32);
+        let lv1 : f32[] = self.planes.lv1;
         let tone : f32[] = self.tone;
         let word : i32[] = self.word;
         let grain : i32[] = self.grain;
@@ -378,8 +536,16 @@ pub class LumenPost {
 
             // The two rows of the bloom level this row lies between: its own with 3/4, the next one out with 1/4.
             let by : i32 = y >> 1;
-            let rowA : i64 = ((pkClamp(by, hh) * hw) * 3) as i64;
-            let rowB : i64 = ((pkClamp(by + ((y & 1) * 2 - 1), hh) * hw) * 3) as i64;
+            let mut rowA : i64 = ((pkClamp(by, hh) * hw) * 3) as i64;
+            let mut rowB : i64 = ((pkClamp(by + ((y & 1) * 2 - 1), hh) * hw) * 3) as i64;
+            let mut ty : f32 = 0.0;
+            if (!half) {
+                let fy : f32 = max(((y as f32) + (0.5 as f32)) * byScale - (0.5 as f32), 0.0);
+                let y0 : i32 = fy as i32;
+                ty = fy - y0 as f32;
+                rowA = ((pkClamp(y0, hh) * hw) * 3) as i64;
+                rowB = ((pkClamp(y0 + 1, hh) * hw) * 3) as i64;
+            }
 
             // The level's columns before, at and after the pixel, each already blended down its two rows.
             let mut pr : f32 = 0.0;
@@ -391,7 +557,7 @@ pub class LumenPost {
             let mut nr : f32 = 0.0;
             let mut ng : f32 = 0.0;
             let mut nb : f32 = 0.0;
-            if (bloom) {
+            if (bloom && half) {
                 nr = lv1[rowA] * kNear + lv1[rowB] * kFar;
                 ng = lv1[rowA + 1] * kNear + lv1[rowB + 1] * kFar;
                 nb = lv1[rowA + 2] * kNear + lv1[rowB + 2] * kFar;
@@ -413,7 +579,23 @@ pub class LumenPost {
                 r = r * exposure;
                 g = g * exposure;
                 b = b * exposure;
-                if (bloom) {
+                if (bloom && !half) {
+                    let fx : f32 = max(((x as f32) + (0.5 as f32)) * bx - (0.5 as f32), 0.0);
+                    let x0 : i32 = fx as i32;
+                    let tx : f32 = fx - x0 as f32;
+                    let ka : i64 = (pkClamp(x0, hw) * 3) as i64;
+                    let kc : i64 = (pkClamp(x0 + 1, hw) * 3) as i64;
+                    let w00 : f32 = ((1.0 as f32) - tx) * ((1.0 as f32) - ty) * kb;
+                    let w10 : f32 = tx * ((1.0 as f32) - ty) * kb;
+                    let w01 : f32 = ((1.0 as f32) - tx) * ty * kb;
+                    let w11 : f32 = tx * ty * kb;
+                    r = r + lv1[rowA + ka] * w00 + lv1[rowA + kc] * w10 + lv1[rowB + ka] * w01
+                        + lv1[rowB + kc] * w11;
+                    g = g + lv1[rowA + ka + 1] * w00 + lv1[rowA + kc + 1] * w10 + lv1[rowB + ka + 1] * w01
+                        + lv1[rowB + kc + 1] * w11;
+                    b = b + lv1[rowA + ka + 2] * w00 + lv1[rowA + kc + 2] * w10 + lv1[rowB + ka + 2] * w01
+                        + lv1[rowB + kc + 2] * w11;
+                } else if (bloom) {
                     if ((x & 1) == 0) {
                         // A new pair of pixels: the columns move on by one.
                         pr = cr;
@@ -477,8 +659,8 @@ pub class LumenPost {
 
     // Picture, bloom, vignette and grade into display values (encoded, 0..1) at render size.
     fn compose(mut self, hdr : f32[], begin : i32, end : i32) : void {
-        let hw : i32 = self.w / 2;
-        let hh : i32 = self.h / 2;
+        let hw : i32 = self.bw / 2;
+        let hh : i32 = self.bh / 2;
         let bloom : bool = self.strength > 0.0;
         let kb : f32 = self.strength * POST_BLOOM_GAIN;
         let inv_w : f32 = (1.0 as f32) / (self.w as f32);
@@ -491,21 +673,21 @@ pub class LumenPost {
                 let at : i64 = ((y * self.w + x) * 3) as i64;
                 let c : Vec3 = self.sharpened(hdr, x, y);
                 if (self.raw) {
-                    self.disp[at] = saturate(c.x);
-                    self.disp[at + 1] = saturate(c.y);
-                    self.disp[at + 2] = saturate(c.z);
+                    self.display.disp[at] = saturate(c.x);
+                    self.display.disp[at + 1] = saturate(c.y);
+                    self.display.disp[at + 2] = saturate(c.z);
                     continue;
                 }
 
                 let mut e : Vec3 = c.scale(self.exposure);
                 if (bloom) {
-                    e = e.plus(pkBilinear(self.lv1, hw, hh, u, v).scale(kb));
+                    e = e.plus(pkBilinear(self.planes.lv1, hw, hh, u, v).scale(kb));
                 }
                 let dx : f32 = u - (0.5 as f32);
                 let shown : Vec3 = self.grade(e, dx * dx + dy * dy);
-                self.disp[at] = shown.x;
-                self.disp[at + 1] = shown.y;
-                self.disp[at + 2] = shown.z;
+                self.display.disp[at] = shown.x;
+                self.display.disp[at + 1] = shown.y;
+                self.display.disp[at + 2] = shown.z;
             }
         }
     }
@@ -576,25 +758,29 @@ pub class LumenPost {
 
     // Output rows: the display values bilinearly scaled to the output size, dithered under one code and packed.
     fn pack(mut self, begin : i32, end : i32) : void {
-        let ow : i32 = self.w * self.scale;
-        let oh : i32 = self.h * self.scale;
+        let ow : i32 = self.ow;
+        let oh : i32 = self.oh;
+        let w : i32 = self.w;
+        let h : i32 = self.h;
+        let same : bool = self.scale == 1;
+        let disp : f32[] = self.display.disp;
+        let dither : f32[] = self.dither;
+        let mut out : i32[] = self.out;
         let mask : i32 = POST_DITHER_SIDE - 1;
         for (oy of begin..end) {
             let v : f32 = ((oy as f32) + (0.5 as f32)) / (oh as f32);
+            let ditherRow : i32 = (oy & mask) * POST_DITHER_SIDE;
             for (ox of 0..ow) {
-                let n : f32 = self.dither[((oy & mask) * POST_DITHER_SIDE + (ox & mask)) as i64];
+                let n : f32 = dither[(ditherRow + (ox & mask)) as i64];
                 let mut c : Vec3 = Vec3::zero();
-                if (self.scale == 1) {
-                    let at : i64 = ((oy * self.w + ox) * 3) as i64;
-                    c = Vec3 { x: self.disp[at], y: self.disp[at + 1], z: self.disp[at + 2] };
+                if (same) {
+                    let at : i64 = ((oy * w + ox) * 3) as i64;
+                    c = Vec3 { x: disp[at], y: disp[at + 1], z: disp[at + 2] };
                 } else {
-                    c = pkBilinear(self.disp, self.w, self.h, ((ox as f32) + (0.5 as f32)) / (ow as f32), v);
+                    // Divided, not multiplied by a reciprocal: the same sample positions to the last bit.
+                    c = pkBilinear(disp, w, h, ((ox as f32) + (0.5 as f32)) / (ow as f32), v);
                 }
-                self.out[(oy * ow + ox) as i64] = pkPack(
-                    pkCode(c.x, n),
-                    pkCode(c.y, n),
-                    pkCode(c.z, n)
-                );
+                out[(oy * ow + ox) as i64] = pkPack(pkCode(c.x, n), pkCode(c.y, n), pkCode(c.z, n));
             }
         }
     }

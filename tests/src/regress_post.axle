@@ -1,0 +1,219 @@
+// regress_post — golden fingerprints of the display stage: `LumenPost` turning a fixed HDR picture into words, by
+// every path the programs take, and the exposure its meter settles on.
+//
+// The passes run as dusk's `show` runs them (bright, blur across, blur down, the coarse levels, fold, compose, pack),
+// in chunks of four rows as the pool hands them out. The paths: the picture at its native size (straight to words),
+// twice its size (compose then pack), an upscaled picture with its bloom from the smaller computed one, a size that is
+// no whole multiple, the raw view, and no bloom at a fixed exposure.
+
+use ludax::{Checks, LumenPass, LumenPost, LumenSettings, LumenView};
+
+use crate::regress_support::RegressHash;
+
+const RGP_NATIVE_SIZE : i64 = 6196729492318532124;
+const RGP_TWICE : i64 = -496769125663457484;
+const RGP_UPSCALED : i64 = -5163344233822347558;
+const RGP_ODD_SIZE : i64 = 1626943778675490276;
+const RGP_RAW : i64 = -6241891647404590920;
+const RGP_NO_BLOOM : i64 = -687988592471601225;
+const RGP_ADAPT : i64 = -6184632733512245179;
+const RGP_WORD_AT : i64 = 16354678;
+const RGP_EXPOSURE_AT : i64 = 1054834736;
+
+/** Golden fingerprints of `render/pathlight/pathlight_post`. */
+pub class RegressPostSuite {
+    /** Runs every check of the suite. */
+    pub static fn run(mut c : Checks) : void {
+        rgpPaths(c);
+        rgpAdapt(c);
+    }
+}
+
+// A synthetic radiance picture of `w` by `h`: a sky ramp, coloured stripes, a sun far above white and a dark corner.
+fn rgpPicture(w : i32, h : i32, gain : f32) : f32[] {
+    let mut hdr : f32[] = new f32[(w * h * 3) as i64];
+    for (y of 0..h) {
+        for (x of 0..w) {
+            let at : i64 = ((y * w + x) * 3) as i64;
+            let u : f32 = (x as f32) / (w as f32);
+            let v : f32 = (y as f32) / (h as f32);
+            let mut r : f32 = (0.2 as f32) + u * (0.8 as f32);
+            let mut g : f32 = (0.3 as f32) + v * (0.5 as f32);
+            let mut b : f32 = (1.2 as f32) - v;
+            if ((x / 3) % 4 == 1) {
+                r = r * (2.5 as f32);
+                b = b * (0.3 as f32);
+            }
+            let dx : i32 = x - w * 3 / 4;
+            let dy : i32 = y - h / 4;
+            if (dx * dx + dy * dy < 10) {
+                r = 60.0;
+                g = 55.0;
+                b = 40.0;
+            }
+            if (x < w / 8 && y > h * 3 / 4) {
+                r = 0.001;
+                g = 0.0005;
+                b = 0.0;
+            }
+            hdr[at] = r * gain;
+            hdr[at + 1] = g * gain;
+            hdr[at + 2] = b * gain;
+        }
+    }
+    return hdr;
+}
+
+// One display pass over all its rows, four rows at a time.
+fn rgpPass(mut post : LumenPost, pass : LumenPass, hdr : f32[]) : void {
+    let rows : i32 = post.rowsOf(pass);
+    let mut begin : i32 = 0;
+    while (begin < rows) {
+        let end : i32 = begin + 4 < rows ? begin + 4 : rows;
+        post.rows(pass, hdr, begin, end);
+        begin = end;
+    }
+}
+
+// The display as dusk's `show` runs it: `computed` feeds the bloom's bright pass, `shown` every other one.
+fn rgpShow(
+    mut post : LumenPost,
+    computed : f32[],
+    shown : f32[],
+    s : LumenSettings,
+    seconds : f32,
+    instant : bool
+) : void {
+    post.adapt(shown, s, seconds, instant);
+    post.showRaw(s.view == LumenView::Raw);
+    if (s.bloom > 0.0 && !post.raw) {
+        rgpPass(post, LumenPass::Bright, computed);
+        rgpPass(post, LumenPass::BlurAcross, shown);
+        rgpPass(post, LumenPass::BlurDown, shown);
+        post.coarse();
+        rgpPass(post, LumenPass::Fold, shown);
+    }
+    rgpPass(post, LumenPass::Compose, shown);
+    rgpPass(post, LumenPass::Pack, shown);
+}
+
+fn rgpWords(post : LumenPost) : RegressHash {
+    let h : RegressHash = new RegressHash();
+    h.int(post.ow as i64);
+    h.int(post.oh as i64);
+    h.int(post.scale as i64);
+    h.real(post.exposure);
+    h.ints(post.out, (post.ow * post.oh) as i64);
+    return h;
+}
+
+fn rgpPaths(mut c : Checks) : void {
+    let hdr : f32[] = rgpPicture(64, 32, 1.0);
+    let s : LumenSettings = new LumenSettings();
+
+    // At its native size, four frames as the exposure adapts and the light changes.
+    let native : LumenPost = new LumenPost(64, 32, 1);
+    let frames : RegressHash = new RegressHash();
+    for (f of 0..4) {
+        let picture : f32[] = f == 0 ? hdr : rgpPicture(
+            64,
+            32,
+            (1.0 as f32) + (f as f32) * (0.4 as f32)
+        );
+        rgpShow(native, picture, picture, s, 0.016, f == 0);
+        frames.int(rgpWords(native).value());
+    }
+    c.sameInt(
+        "regress post: 64 x 32 at its native size, 4 frames [RGP_NATIVE_SIZE]",
+        frames.value(),
+        RGP_NATIVE_SIZE
+    );
+    c.sameInt(
+        "regress post: the word at (40, 9) [RGP_WORD_AT]",
+        native.out[9 * 64 + 40] as i64,
+        RGP_WORD_AT
+    );
+
+    let twice : LumenPost = new LumenPost(64, 32, 2);
+    rgpShow(twice, hdr, hdr, s, 0.016, true);
+    c.sameInt(
+        "regress post: 64 x 32 shown at 128 x 64 [RGP_TWICE]",
+        rgpWords(twice).value(),
+        RGP_TWICE
+    );
+
+    // Upscaled: the display runs at the output's size, its bloom taken from the computed picture.
+    let shown : f32[] = rgpPicture(96, 48, 1.0);
+    let upscaled : LumenPost = new LumenPost(64, 32, 1);
+    upscaled.fitUpscaled(96, 48, 64, 32);
+    rgpShow(upscaled, hdr, shown, s, 0.016, true);
+    c.sameInt(
+        "regress post: 96 x 48 with its bloom from 64 x 32 [RGP_UPSCALED]",
+        rgpWords(upscaled).value(),
+        RGP_UPSCALED
+    );
+
+    let odd : LumenPost = new LumenPost(64, 32, 1);
+    odd.fit(64, 32, 100, 50);
+    rgpShow(odd, hdr, hdr, s, 0.016, true);
+    c.sameInt(
+        "regress post: 64 x 32 fitted to 100 x 50 [RGP_ODD_SIZE]",
+        rgpWords(odd).value(),
+        RGP_ODD_SIZE
+    );
+
+    let mut rawView : LumenSettings = new LumenSettings();
+    rawView.view = LumenView::Raw;
+    let raw : LumenPost = new LumenPost(64, 32, 1);
+    rgpShow(raw, hdr, hdr, rawView, 0.016, true);
+    c.sameInt("regress post: the raw view [RGP_RAW]", rgpWords(raw).value(), RGP_RAW);
+
+    let mut fixed : LumenSettings = new LumenSettings();
+    fixed.bloom = 0.0;
+    fixed.autoExposure = false;
+    fixed.exposure = 1.7;
+    fixed.exposureBias = 0.5;
+    let plain : LumenPost = new LumenPost(64, 32, 1);
+    rgpShow(plain, hdr, hdr, fixed, 0.016, true);
+    c.sameInt(
+        "regress post: no bloom at a fixed exposure [RGP_NO_BLOOM]",
+        rgpWords(plain).value(),
+        RGP_NO_BLOOM
+    );
+}
+
+// The meter over pictures from a cave to noon, with biases, at several frame times, and instantly.
+fn rgpAdapt(mut c : Checks) : void {
+    let post : LumenPost = new LumenPost(64, 32, 1);
+    let mut s : LumenSettings = new LumenSettings();
+    let h : RegressHash = new RegressHash();
+    for (k of 0..24) {
+        let gain : f32 = match k % 6 {
+            0 => 1.0 as f32,
+            1 => 0.002 as f32,
+            2 => 40.0 as f32,
+            3 => 0.3 as f32,
+            4 => 1000.0 as f32,
+            _ => 0.00001 as f32,
+        };
+        s.exposureBias = (k % 3) as f32 * (0.5 as f32) - (0.5 as f32);
+        let hdr : f32[] = rgpPicture(64, 32, gain);
+        post.adapt(hdr, s, (k % 4) as f32 * (0.03 as f32), k % 7 == 0);
+        h.real(post.exposure);
+        h.real(post.strength);
+    }
+    c.sameInt(
+        "regress post: the exposure the meter follows over 24 frames [RGP_ADAPT]",
+        h.value(),
+        RGP_ADAPT
+    );
+
+    let once : LumenPost = new LumenPost(64, 32, 1);
+    let plainSettings : LumenSettings = new LumenSettings();
+    once.adapt(rgpPicture(64, 32, 1.0), plainSettings, 0.016, true);
+    c.sameInt(
+        "regress post: the instant exposure of the test picture bits [RGP_EXPOSURE_AT]",
+        RegressHash::bits(once.exposure),
+        RGP_EXPOSURE_AT
+    );
+}

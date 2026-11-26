@@ -1,0 +1,170 @@
+// regress_budget — golden fingerprints of the light graph's decisions: the governor's scale over a fixed sequence of
+// frame costs, the keys caches are compared on, the tiles of a picture and the double-buffered cache.
+//
+// The governor is fed back its own scale (a frame's cost grows with the square of it), through phases of heavy,
+// even and light load and a stretch where the scale is held, so the whole sequence of its choices is pinned.
+
+use ludax::{
+    Checks, DVec3, LUX_FRAME_60, LUX_IN_ALL, LUX_IN_CAMERA, LUX_IN_SUN, LUX_IN_WORLD, LuxBudget,
+    LuxCache
+};
+use ludax::{LuxKey, LuxTile, LuxTiles, LuxView, Pcg32, Vec3, luxFloorI64};
+
+use crate::regress_support::RegressHash;
+
+const RGB_SCALES : i64 = 1986844449874188351;
+const RGB_MEANS : i64 = 7852008638112126050;
+const RGB_SCALE_AT : i64 = 1061158912;
+const RGB_KEYS : i64 = 9092054748742511844;
+const RGB_FLOOR : i64 = -4258706367380137489;
+const RGB_TILES : i64 = 4330361722145938333;
+const RGB_CACHE : i64 = 1572370756637627014;
+
+/** Golden fingerprints of `render/lux/graph`. */
+pub class RegressBudgetSuite {
+    /** Runs every check of the suite. */
+    pub static fn run(mut c : Checks) : void {
+        rgbGovernor(c);
+        rgbKeys(c);
+        rgbTiles(c);
+    }
+}
+
+// 2400 frames whose cost follows the scale the governor chose, through four loads and a held stretch.
+fn rgbGovernor(mut c : Checks) : void {
+    let budget : LuxBudget = new LuxBudget(3, LUX_FRAME_60, 0.4);
+    let rng : Pcg32 = new Pcg32(60, 1);
+    let scales : RegressHash = new RegressHash();
+    let means : RegressHash = new RegressHash();
+    let mut atFrame : f32 = 0.0;
+    for (f of 0..2400) {
+        let load : f64 = match (f / 300) % 4 {
+            0 => 22000000.0,
+            1 => 12000000.0,
+            2 => 30000000.0,
+            _ => 7000000.0,
+        };
+        if (f == 1500) {
+            budget.holdScale(0.75);
+        }
+        if (f == 1700) {
+            budget.release();
+        }
+        let s : f64 = budget.scaleNow() as f64;
+        let jitter : f64 = 0.9 + 0.2 * rng.nextF64();
+        let total : i64 = (load * s * s * jitter) as i64;
+        budget.record(0, total / 2);
+        budget.record(1, total / 3);
+        budget.record(2, total - total / 2 - total / 3);
+        budget.endFrame(total);
+        scales.real(budget.scaleNow());
+        scales.int(budget.lastFrame());
+        if (f % 50 == 49) {
+            means.wide(budget.meanOf(0));
+            means.wide(budget.meanOf(1));
+            means.wide(budget.meanOf(2));
+        }
+        if (f == 1000) {
+            atFrame = budget.scaleNow();
+        }
+    }
+    c.sameInt(
+        "regress budget: the governor's scale over 2400 frames [RGB_SCALES]",
+        scales.value(),
+        RGB_SCALES
+    );
+    c.sameInt("regress budget: the layers' running means [RGB_MEANS]", means.value(), RGB_MEANS);
+    c.sameInt(
+        "regress budget: the scale at frame 1000 bits [RGB_SCALE_AT]",
+        RegressHash::bits(atFrame),
+        RGB_SCALE_AT
+    );
+}
+
+fn rgbFoldKey(mut h : RegressHash, k : LuxKey) : void {
+    h.int(k.world);
+    h.int(k.sun);
+    h.int(k.camera);
+    h.int(k.timecycle);
+    h.int(k.settings);
+    h.int(k.frame);
+}
+
+// Views walking through the world and the day: their keys, what changed from one to the next, the sun's blend.
+fn rgbKeys(mut c : Checks) : void {
+    let rng : Pcg32 = new Pcg32(1440, 3);
+    let keys : RegressHash = new RegressHash();
+    let mut last : LuxKey = LuxKey {};
+    for (k of 0..1000) {
+        let view : LuxView = LuxView {
+            frame: k as i64,
+            eye: DVec3 {
+                x: rng.nextF64() * 4000.0 - 2000.0,
+                y: rng.nextF64() * 300.0 - 64.0,
+                z: (k as f64) * 3.7 - 1500.0,
+            },
+            forward: Vec3::make(0.0, 0.0, -1.0),
+            dayTime: (k as f64) * 0.00113,
+            worldEpoch: (k / 37) as i64,
+            timecycleEpoch: (k / 400) as i64,
+            settingsEpoch: (k / 250) as i64,
+        };
+        let key : LuxKey = view.key();
+        rgbFoldKey(keys, key);
+        keys.real(view.sunBlend());
+        keys.int(key.changes(last) as i64);
+        keys.int(key.differsIn(last, LUX_IN_WORLD | LUX_IN_SUN) ? 1 : 0);
+        keys.int(key.differsIn(last, LUX_IN_CAMERA) ? 1 : 0);
+        keys.int(key.differsIn(last, LUX_IN_ALL) ? 1 : 0);
+        last = key;
+    }
+    c.sameInt("regress budget: LuxView keys and their changes [RGB_KEYS]", keys.value(), RGB_KEYS);
+
+    let floors : RegressHash = new RegressHash();
+    for (k of 0..1000) {
+        floors.int(luxFloorI64(rng.nextF64() * 2000000.0 - 1000000.0));
+        floors.int(luxFloorI64((k as f64) - 500.0));
+    }
+    c.sameInt("regress budget: luxFloorI64 [RGB_FLOOR]", floors.value(), RGB_FLOOR);
+}
+
+// The tiles of pictures of several sizes, and a cache carried, rewritten in part and published.
+fn rgbTiles(mut c : Checks) : void {
+    let tiles : RegressHash = new RegressHash();
+    for (k of 0..12) {
+        let cover : LuxTiles = LuxTiles::cover(k * 97 - 50, k * 53 + 7);
+        tiles.int(cover.count() as i64);
+        for (i of 0..cover.count()) {
+            let t : LuxTile = cover.tile(i);
+            tiles.int(t.x0 as i64);
+            tiles.int(t.y0 as i64);
+            tiles.int(t.x1 as i64);
+            tiles.int(t.y1 as i64);
+        }
+    }
+    c.sameInt("regress budget: LuxTiles over twelve sizes [RGB_TILES]", tiles.value(), RGB_TILES);
+
+    let cache : LuxCache = new LuxCache(3, 64);
+    let fold : RegressHash = new RegressHash();
+    for (g of 0..5) {
+        cache.carry();
+        let mut back : f32[] = cache.write();
+        for (i of 0..(cache.planeCount() as i64) * cache.planeSize()) {
+            if ((i + g) % 3 == 0) {
+                back[i] = ((i * 7 + g as i64) % 101) as f32 * (0.01 as f32);
+            }
+        }
+        cache.publish(LuxKey { world: g as i64, frame: (g * 10) as i64 });
+        fold.int(cache.versionOf());
+        rgbFoldKey(fold, cache.key());
+        fold.reals(cache.read(), (cache.planeCount() as i64) * cache.planeSize());
+        for (p of 0..cache.planeCount()) {
+            fold.int(cache.planeAt(p));
+        }
+    }
+    c.sameInt(
+        "regress budget: LuxCache carried and published five times [RGB_CACHE]",
+        fold.value(),
+        RGB_CACHE
+    );
+}

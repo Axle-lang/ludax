@@ -13,7 +13,7 @@
 // It reads a `LumenPoint`, a `LumenLightSample` and a `LumenSky` and nothing of the world: lamps and mirrors that need
 // the world are the caller's to add.
 
-use crate::core::math::scalar::{saturate, max, PI};
+use crate::core::math::scalar::max;
 use crate::core::math::trig::sin;
 use crate::core::math::vec3::Vec3;
 use crate::render::light::light_brdf::{lightPrepare, lightBrdf};
@@ -34,7 +34,7 @@ pub const SHADE_FLOOD : f32 = 0.3;
 /** The share of the dome that reaches a point whose sky access is zero: a fully enclosed place still sees some. */
 const SHADE_ACCESS_FLOOR : f32 = 0.35;
 
-/** The sky body is above the horizon by more than this (a body below it lights nothing). */
+/** How far below the horizon a sky body still lights (its height may dip to this); lower, it lights nothing. */
 pub const SHADE_HORIZON : f32 = -0.04;
 
 /** What the densest cloud deck removes from a sky body's light. */
@@ -63,7 +63,7 @@ pub struct LumenLit {
     }
 }
 
-// The share of the dome a probe sees: its flooded sky above the floor that no wall can remove.
+/** The share of the dome a probe sees: its flooded sky above the floor that no wall can remove. */
 pub fn shSkyShare(l : LumenLightSample) : f32 {
     return l.sky * (SHADE_ACCESS_FLOOR + ((1.0 as f32) - SHADE_ACCESS_FLOOR) * l.access);
 }
@@ -114,7 +114,7 @@ pub fn lumenCloudShade(from : Vec3, toward : Vec3, deck : f32) : f32 {
  * `time`; `water` is true for a point under water, whose sun is modulated by the caustics. Shared by the valley
  * and the Minecraft game, which differ only in where `baked` comes from.
  */
-pub fn lumenBody(
+fn lumenBody(
     light : LightSource,
     pt : LumenPoint,
     prepared : LightPrepared,
@@ -150,7 +150,7 @@ pub struct LumenMirror {
     pub radiance : Vec3 = Vec3 { x: 0.0, y: 0.0, z: 0.0 };
 }
 
-// The material of a point prepared for the BRDF: the split-sum terms at its N.V.
+/** The material of a point prepared for the BRDF: the split-sum terms at its N.V. */
 pub fn lumenPrepare(dfg : LightDfgTable, pt : LumenPoint, view : Vec3) : LightPrepared {
     let material : LightMaterial = LightMaterial {
         baseColor: pt.albedo,
@@ -164,10 +164,28 @@ pub fn lumenPrepare(dfg : LightDfgTable, pt : LumenPoint, view : Vec3) : LightPr
     return lightPrepare(material, dfg.lookup(nv, pt.rough));
 }
 
+/** Which parts of the light a shading adds up: the traced bounce's tint, the sun and the moon, the sky. */
+pub struct LumenParts {
+    /** True: the ambient light takes the colour of what the bounce rays met; false: it is white. */
+    pub bounce : bool = true;
+
+    /** True: the sun and the moon light the point directly. */
+    pub sun : bool = true;
+
+    /** True: the dome lights the point and the sky is mirrored in it. */
+    pub sky : bool = true;
+
+    /** True: the light the lamps flooded through the world lights the point. */
+    pub flood : bool = true;
+
+    /** True: the point's own emission is added. */
+    pub emission : bool = true;
+}
+
 /**
  * The light on a point from the sky and the baked terms alone: each sky body through its baked shadow, the dome
  * through the sky light, access and bounce tint, the flooded block light and what the surface emits. The valley adds
- * its lamps to this; the Minecraft game, whose emitters are all in the flood, shades with exactly this.
+ * its lamps to this; blockland, whose emitters are all in the flood, shades with exactly this.
  */
 pub fn lumenShadeCore(
     sky : LumenSky,
@@ -180,22 +198,46 @@ pub fn lumenShadeCore(
     mirror : LumenMirror,
     probe : LumenLightSample
 ) : LumenLit {
-    let prepared : LightPrepared = lumenPrepare(dfg, pt, view);
+    return lumenShadeCorePrepared(
+        sky,
+        LumenParts { bounce: bounce, sun: true, sky: true, flood: true, emission: true },
+        time,
+        water,
+        pt,
+        view,
+        mirror,
+        probe,
+        lumenPrepare(dfg, pt, view)
+    );
+}
+
+/**
+ * `lumenShadeCore` with the split-sum terms `prepared` (`lumenPrepare` of the same table, point and view) already
+ * computed: for a caller that needs them again, for its lamps, and would otherwise prepare them twice.
+ */
+pub fn lumenShadeCorePrepared(
+    sky : LumenSky,
+    parts : LumenParts,
+    time : f32,
+    water : bool,
+    pt : LumenPoint,
+    view : Vec3,
+    mirror : LumenMirror,
+    probe : LumenLightSample,
+    prepared : LightPrepared
+) : LumenLit {
     let nv : f32 = max(pt.n.dot(view), 0.0001);
     let mut lit : LumenLit = LumenLit {};
-    lit.emitted = pt.emissive;
+    if (parts.emission) {
+        lit.emitted = pt.emissive;
+    }
 
     // Direct: each sky body through its own baked shadow.
-    let mut direct : Vec3 = lumenBody(
-        sky.sun,
-        pt,
-        prepared,
-        view,
-        lumenBodyShare(probe, LumenBody::Sun),
-        time,
-        water
-    );
-    if (sky.night > SHADE_NIGHT) {
+    let mut direct : Vec3 = Vec3::zero();
+    if (parts.sun) {
+        direct = lumenBody(sky.sun, pt, prepared, view, lumenBodyShare(probe, LumenBody::Sun), time, water);
+    }
+    if (parts.sun && sky.night > SHADE_NIGHT) {
         direct = direct.plus(lumenBody(
             sky.moon,
             pt,
@@ -210,21 +252,26 @@ pub fn lumenShadeCore(
 
     // Ambient: the dome through the sky light and the access, in the colour of what the sky rays hit.
     let mut tint : Vec3 = Vec3::splat(1.0);
-    if (bounce) {
+    if (parts.bounce) {
         tint = probe.tint;
     }
-    let domeLight : Vec3 = sky.dome.irradiance(pt.n).scale(shSkyShare(probe)).times(tint);
+    let mut domeLight : Vec3 = Vec3::zero();
+    if (parts.sky) {
+        domeLight = sky.dome.irradiance(pt.n).scale(shSkyShare(probe)).times(tint);
+    }
     let open : f32 = probe.sky * probe.access;
     let mut ambient : Vec3 = prepared.diffuse.times(domeLight);
     // The spec input is the dome itself through the sky occlusion, once: `open` is already sky times access.
     // When the mirror ray was traced, its radiance replaces the dome's answer, so the lookup is not even made.
     let mut specularIn : Vec3 = mirror.radiance;
-    if (!mirror.traced) {
+    if (!mirror.traced && parts.sky) {
         let dir : Vec3 = pt.n.scale((2.0 as f32) * nv).minus(view).normalized();
         specularIn = sky.prefiltered(dir, pt.rough).scale(open);
     }
     ambient = ambient.plus(prepared.specularAlbedo.times(specularIn));
-    ambient = ambient.plus(prepared.diffuse.times(probe.block).scale(SHADE_FLOOD));
+    if (parts.flood) {
+        ambient = ambient.plus(prepared.diffuse.times(probe.block).scale(SHADE_FLOOD));
+    }
     lit.ambient = ambient;
     return lit;
 }

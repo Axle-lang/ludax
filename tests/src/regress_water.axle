@@ -1,0 +1,220 @@
+// regress_water — golden fingerprints of the water: the Fourier transform both ways, the ocean's slopes over a grid
+// at fixed times and winds (round and elongated footprints), its slope variance, and the optics of the surface and
+// the water below it.
+//
+// Two winds and two seeds, two times each, so a change to the spectrum, the cascades' update, the gusts or the fade
+// shows in one fingerprint or another.
+
+use ludax::{
+    Checks, LUX_WATER_INDEX, LuxFft, LuxFootprint, LuxOcean, LuxRefraction, LuxMedium,
+    LuxWaterSample
+};
+use ludax::{
+    LuxWind, Pcg32, Vec3, cos, luxFresnel, luxRefract, luxMediumGlow, luxMediumTransmit, sin
+};
+
+use crate::regress_support::RegressHash;
+
+const RGW_FFT_FORWARD : i64 = 5527542795271314060;
+const RGW_FFT_INVERSE : i64 = 4554845163101948543;
+const RGW_FFT_DC : i64 = -1061255778;
+const RGW_OCEAN : i64 = -8589115419866820673;
+// Four taps spread over what the short axis does not cover (`luxTapPlan`).
+const RGW_OCEAN_FOOTPRINT : i64 = 4904351174909956220;
+const RGW_OCEAN_MSS : i64 = -2687966017449606544;
+const RGW_OCEAN_AT : i64 = -1098069777;
+const RGW_REFRACT : i64 = 1431160156221935290;
+const RGW_FRESNEL : i64 = 1492510252139613839;
+const RGW_MEDIUM : i64 = -4849275637898683263;
+const RGW_FRESNEL_AT : i64 = 1028715132;
+
+/** Golden fingerprints of `render/lux/water`. */
+pub class RegressWaterSuite {
+    /** Runs every check of the suite. */
+    pub static fn run(mut c : Checks) : void {
+        rgwFft(c);
+        rgwOcean(c);
+        rgwOptics(c);
+    }
+}
+
+// A 32 x 32 grid of fixed values forward, then back.
+fn rgwFft(mut c : Checks) : void {
+    let n : i64 = 32;
+    let mut re : f32[] = new f32[n * n];
+    let mut im : f32[] = new f32[n * n];
+    let rng : Pcg32 = new Pcg32(5150, 2);
+    for (i of 0..(n * n)) {
+        re[i] = rng.rangeF32(-1.0, 1.0);
+        im[i] = (i % 3 == 0) ? 0.0 as f32 : rng.rangeF32(-0.5, 0.5);
+    }
+    let fft : LuxFft = new LuxFft(32);
+    fft.grid(re, im, false);
+    let forward : RegressHash = new RegressHash();
+    forward.reals(re, n * n);
+    forward.reals(im, n * n);
+    c.sameInt(
+        "regress water: LuxFft forward on 32 x 32 [RGW_FFT_FORWARD]",
+        forward.value(),
+        RGW_FFT_FORWARD
+    );
+    c.sameInt(
+        "regress water: the forward transform's DC term bits [RGW_FFT_DC]",
+        RegressHash::bits(re[0]),
+        RGW_FFT_DC
+    );
+
+    fft.grid(re, im, true);
+    let inverse : RegressHash = new RegressHash();
+    inverse.reals(re, n * n);
+    inverse.reals(im, n * n);
+    c.sameInt(
+        "regress water: LuxFft inverse of it [RGW_FFT_INVERSE]",
+        inverse.value(),
+        RGW_FFT_INVERSE
+    );
+}
+
+fn rgwWind(speed : f32, angle : f32, shelter : f32, fetch : f32) : LuxWind {
+    return LuxWind {
+        speed: speed,
+        angle: angle,
+        spread: 2.0,
+        against: 0.07,
+        shelter: shelter,
+        fetch: fetch,
+    };
+}
+
+// Two oceans, two times each, sampled over a 40 x 40 grid at three footprints and along elongated footprints.
+fn rgwOcean(mut c : Checks) : void {
+    let calm : LuxOcean = new LuxOcean(rgwWind(6.0, 0.0, 1.0, 300.0), 7);
+    let gale : LuxOcean = new LuxOcean(rgwWind(11.0, 0.6, 0.6, 120.0), 19);
+    let slopes : RegressHash = new RegressHash();
+    let along : RegressHash = new RegressHash();
+    let mss : RegressHash = new RegressHash();
+    for (o of 0..2) {
+        let ocean : LuxOcean = o == 0 ? calm : gale;
+        mss.real(ocean.meanSquareSlope());
+        for (ti of 0..2) {
+            ocean.update(ti == 0 ? 0.5 as f32 : 3.25 as f32);
+            for (j of 0..40) {
+                for (i of 0..40) {
+                    let x : f32 = (i as f32) * (1.37 as f32) - (11.0 as f32);
+                    let z : f32 = (j as f32) * (0.91 as f32) + (3.0 as f32);
+                    for (f of 0..3) {
+                        let fp : f32 = f == 0 ? 0.0 as f32 : (f == 1 ? 0.05 as f32 : 0.8 as f32);
+                        let s : LuxWaterSample = ocean.sample(x, z, fp);
+                        slopes.real(s.slopeX);
+                        slopes.real(s.slopeZ);
+                        slopes.real(s.lost);
+                    }
+                }
+            }
+            let rng : Pcg32 = new Pcg32(88, (o * 2 + ti) as u64);
+            for (k of 0..300) {
+                let across : f32 = rng.rangeF32(0.001, 0.3);
+                let angle : f32 = rng.rangeF32(0.0, 6.28);
+                let fp : LuxFootprint = LuxFootprint {
+                    across: across,
+                    along: across * rng.rangeF32(1.0, 30.0),
+                    dirX: cos(angle),
+                    dirZ: sin(angle),
+                };
+                let s : LuxWaterSample = ocean.sampleFootprint(
+                    rng.rangeF32(-200.0, 200.0),
+                    rng.rangeF32(-200.0, 200.0),
+                    fp
+                );
+                along.real(s.slopeX);
+                along.real(s.slopeZ);
+                along.real(s.lost);
+            }
+        }
+    }
+    c.sameInt("regress water: LuxOcean.sample over a grid [RGW_OCEAN]", slopes.value(), RGW_OCEAN);
+    c.sameInt(
+        "regress water: LuxOcean.sampleFootprint, elongated [RGW_OCEAN_FOOTPRINT]",
+        along.value(),
+        RGW_OCEAN_FOOTPRINT
+    );
+    c.sameInt(
+        "regress water: meanSquareSlope of both winds [RGW_OCEAN_MSS]",
+        mss.value(),
+        RGW_OCEAN_MSS
+    );
+    calm.update(2.0);
+    c.sameInt(
+        "regress water: the calm sea's slope x at (13, 21) bits [RGW_OCEAN_AT]",
+        RegressHash::bits(calm.sample(13.0, 21.0, 0.0).slopeX),
+        RGW_OCEAN_AT
+    );
+}
+
+fn rgwRefraction(mut h : RegressHash, r : LuxRefraction) : void {
+    h.vec(r.dir);
+    h.int(r.total ? 1 : 0);
+    h.real(r.fresnel);
+}
+
+// Refraction into and out of the water at every angle, Schlick's curve, and Beer-Lambert with single scattering.
+fn rgwOptics(mut c : Checks) : void {
+    let refract : RegressHash = new RegressHash();
+    let rng : Pcg32 = new Pcg32(61, 3);
+    let up : Vec3 = Vec3::make(0.0, 1.0, 0.0);
+    let down : Vec3 = Vec3::make(0.0, -1.0, 0.0);
+    for (k of 0..600) {
+        let theta : f32 = (k as f32) * (0.0026 as f32);
+        let phi : f32 = rng.rangeF32(0.0, 6.28);
+        let s : f32 = sin(theta);
+        let d : Vec3 = Vec3::make(s * cos(phi), cos(theta), s * sin(phi));
+        // From the air down into the water, and from below up toward the air (with the total reflections past 48.6°).
+        rgwRefraction(refract, luxRefract(Vec3::make(d.x, -d.y, d.z), up, 1.0, LUX_WATER_INDEX));
+        rgwRefraction(refract, luxRefract(d, down, LUX_WATER_INDEX, 1.0));
+        let tilted : Vec3 = Vec3::make(
+            rng.rangeF32(-0.3, 0.3),
+            1.0,
+            rng.rangeF32(-0.3, 0.3)
+        ).normalized();
+        rgwRefraction(
+            refract,
+            luxRefract(Vec3::make(d.x, -d.y, d.z), tilted, 1.0, LUX_WATER_INDEX)
+        );
+    }
+    c.sameInt("regress water: luxRefract both ways [RGW_REFRACT]", refract.value(), RGW_REFRACT);
+
+    let fresnel : RegressHash = new RegressHash();
+    for (k of -10..1011) {
+        fresnel.real(luxFresnel((k as f32) * (0.001 as f32)));
+    }
+    c.sameInt(
+        "regress water: luxFresnel over [-0.01, 1.01] [RGW_FRESNEL]",
+        fresnel.value(),
+        RGW_FRESNEL
+    );
+    c.sameInt(
+        "regress water: luxFresnel(0.5) bits [RGW_FRESNEL_AT]",
+        RegressHash::bits(luxFresnel(0.5)),
+        RGW_FRESNEL_AT
+    );
+
+    let medium : RegressHash = new RegressHash();
+    let clear : LuxMedium = LuxMedium {};
+    let murky : LuxMedium = LuxMedium {
+        absorb: Vec3::make(0.9, 0.3, 0.2),
+        scatter: Vec3::make(0.4, 0.5, 0.3),
+    };
+    let light : Vec3 = Vec3::make(3.0, 2.5, 2.0);
+    for (k of -2..400) {
+        let d : f32 = (k as f32) * (0.137 as f32);
+        medium.vec(luxMediumTransmit(clear, d));
+        medium.vec(luxMediumTransmit(murky, d));
+        medium.vec(luxMediumGlow(clear, d, light));
+        medium.vec(luxMediumGlow(murky, d, light));
+    }
+    c.sameInt(
+        "regress water: luxMediumTransmit and luxMediumGlow [RGW_MEDIUM]",
+        medium.value(),
+        RGW_MEDIUM
+    );
+}

@@ -1,0 +1,290 @@
+// regress_light — golden fingerprints of the light library's hot functions: the deterministic exponentials and
+// logarithms, the tone curve and the sRGB transfer, the BRDF and its albedo table, the physical sky, and the path-lit
+// picture's moon and stars.
+//
+// These functions sit under every shaded pixel and every displayed one; an optimisation of the series behind
+// `lightExp2` or of the transfer moves one of these fingerprints.
+
+use ludax::{
+    Checks, LIGHT_TONE_KNEE, LightDfg, LightDfgTable, LightGauss, LightMaterial, LightPrepared,
+    LightSky
+};
+use ludax::{
+    LightBrdfTerms, LightDiffuseModel, Pcg32, Vec3, cosD, lightBrdf, lightChapman, lightDisplay,
+    lightExp
+};
+use ludax::{
+    lightExp2, lightExp2D, lightFresnelWeight, lightGgxD, lightLog2, lightPow, lightPrepare,
+    lightSmithV
+};
+use ludax::{
+    lightSrgbDecode, lightSrgbDecode8, lightSrgbEncode, lightSrgbEncode8, lightToneCurve,
+    lightToneMap
+};
+use ludax::{lumenMoonDisc, lumenSkyDirection, lumenStars, sinD};
+
+use crate::regress_support::RegressHash;
+
+const RGK_EXP : i64 = 8604876054858915841;
+const RGK_LOG_POW : i64 = -9044943121683861650;
+const RGK_TONE : i64 = -1002872810773020340;
+const RGK_SRGB : i64 = 2769155040378724141;
+const RGK_SRGB8 : i64 = 3093035688366163434;
+const RGK_DISPLAY : i64 = -5906582946938177515;
+const RGK_BRDF : i64 = -6371755437990823054;
+const RGK_DFG : i64 = -4630379437270576120;
+const RGK_SKY : i64 = -5471223763549714754;
+const RGK_CHAPMAN : i64 = -3631213865908982987;
+const RGK_CELESTIAL : i64 = -8723227962243374851;
+const RGK_TONE_AT : i64 = 1065150565;
+const RGK_SRGB_AT : i64 = 1055667934;
+const RGK_SRGB_WHITE : i64 = 1065353215;
+const RGK_EXP2_AT : i64 = 1037037510;
+
+/** Golden fingerprints of `render/light` and of the path-lit picture's celestial bodies. */
+pub class RegressLightSuite {
+    /** Runs every check of the suite. */
+    pub static fn run(mut c : Checks) : void {
+        rgkMath(c);
+        rgkDisplay(c);
+        rgkBrdf(c);
+        rgkSky(c);
+    }
+}
+
+fn rgkMath(mut c : Checks) : void {
+    let exp : RegressHash = new RegressHash();
+    for (k of -1600..1600) {
+        let x : f32 = (k as f32) * (0.0917 as f32);
+        exp.real(lightExp2(x));
+        exp.real(lightExp(x));
+        exp.wide(lightExp2D((k as f64) * 0.6631));
+    }
+    c.sameInt("regress light: lightExp2, lightExp, lightExp2D [RGK_EXP]", exp.value(), RGK_EXP);
+
+    let logs : RegressHash = new RegressHash();
+    let rng : Pcg32 = new Pcg32(4242, 1);
+    for (k of 0..3000) {
+        let x : f32 = k < 10 ? (k as f32) - (5.0 as f32) : rng.nextF32()
+            * rng.rangeF32(0.0, 1000.0);
+        logs.real(lightLog2(x));
+        logs.real(lightPow(x, rng.rangeF32(-3.0, 3.0)));
+        logs.real(lightPow(x, (1.0 as f32) / (2.4 as f32)));
+    }
+    c.sameInt("regress light: lightLog2 and lightPow [RGK_LOG_POW]", logs.value(), RGK_LOG_POW);
+    c.sameInt(
+        "regress light: lightExp2(-3.3) bits [RGK_EXP2_AT]",
+        RegressHash::bits(lightExp2(-3.3)),
+        RGK_EXP2_AT
+    );
+}
+
+fn rgkDisplay(mut c : Checks) : void {
+    let tone : RegressHash = new RegressHash();
+    let rng : Pcg32 = new Pcg32(17, 2);
+    for (q of 0..5) {
+        let knee : f32 = match q {
+            0 => LIGHT_TONE_KNEE,
+            1 => 0.0 as f32,
+            2 => 0.3 as f32,
+            3 => 0.9 as f32,
+            _ => 1.5 as f32,
+        };
+        for (k of -5..1200) {
+            tone.real(lightToneCurve((k as f32) * (0.033 as f32), knee));
+        }
+        for (k of 0..200) {
+            tone.vec(lightToneMap(
+                Vec3::make(rng.rangeF32(0.0, 20.0), rng.rangeF32(0.0, 5.0), rng.nextF32()),
+                knee
+            ));
+        }
+    }
+    c.sameInt(
+        "regress light: lightToneCurve and lightToneMap at five knees [RGK_TONE]",
+        tone.value(),
+        RGK_TONE
+    );
+
+    let srgb : RegressHash = new RegressHash();
+    for (k of -16..4113) {
+        let x : f32 = (k as f32) / (4096.0 as f32);
+        srgb.real(lightSrgbEncode(x));
+        srgb.real(lightSrgbDecode(x));
+        srgb.real(lightSrgbDecode(lightSrgbEncode(x)));
+    }
+    c.sameInt(
+        "regress light: lightSrgbEncode and lightSrgbDecode [RGK_SRGB]",
+        srgb.value(),
+        RGK_SRGB
+    );
+
+    let bytes : RegressHash = new RegressHash();
+    for (code of -3..260) {
+        bytes.real(lightSrgbDecode8(code));
+    }
+    for (k of -4..2100) {
+        bytes.int(lightSrgbEncode8((k as f32) * (0.0005 as f32)) as i64);
+    }
+    c.sameInt(
+        "regress light: lightSrgbEncode8 and lightSrgbDecode8 [RGK_SRGB8]",
+        bytes.value(),
+        RGK_SRGB8
+    );
+
+    let display : RegressHash = new RegressHash();
+    for (k of 0..1000) {
+        let radiance : Vec3 = Vec3::make(
+            rng.rangeF32(0.0, 50.0),
+            rng.rangeF32(0.0, 10.0),
+            rng.rangeF32(0.0, 2.0)
+        );
+        display.vec(lightDisplay(radiance, rng.rangeF32(0.01, 4.0), LIGHT_TONE_KNEE));
+    }
+    c.sameInt("regress light: lightDisplay [RGK_DISPLAY]", display.value(), RGK_DISPLAY);
+
+    c.sameInt(
+        "regress light: lightToneCurve(2.0, knee) bits [RGK_TONE_AT]",
+        RegressHash::bits(lightToneCurve(2.0, LIGHT_TONE_KNEE)),
+        RGK_TONE_AT
+    );
+    c.sameInt(
+        "regress light: lightSrgbEncode(0.18) bits [RGK_SRGB_AT]",
+        RegressHash::bits(lightSrgbEncode(0.18)),
+        RGK_SRGB_AT
+    );
+    c.sameInt(
+        "regress light: lightSrgbEncode(1.0) bits, a hair under 1 [RGK_SRGB_WHITE]",
+        RegressHash::bits(lightSrgbEncode(1.0)),
+        RGK_SRGB_WHITE
+    );
+    c.sameInt("regress light: the 8-bit code of white is 255", lightSrgbEncode8(1.0) as i64, 255);
+    c.sameInt(
+        "regress light: the 8-bit code of mid grey 0.18 is 118",
+        lightSrgbEncode8(0.18) as i64,
+        118
+    );
+}
+
+fn rgkUnit(mut rng : Pcg32) : Vec3 {
+    return Vec3::make(
+        rng.rangeF32(-1.0, 1.0),
+        rng.rangeF32(0.05, 1.0),
+        rng.rangeF32(-1.0, 1.0)
+    ).normalized();
+}
+
+// The GGX terms, the albedo table and the whole BRDF of two materials over random views and lights.
+fn rgkBrdf(mut c : Checks) : void {
+    let table : LightDfgTable = new LightDfgTable(16, 32);
+    let dfg : RegressHash = new RegressHash();
+    for (j of 0..16) {
+        for (i of 0..16) {
+            let node : LightDfg = table.node(i, j);
+            dfg.real(node.a);
+            dfg.real(node.b);
+        }
+    }
+    for (k of 0..400) {
+        let e : LightDfg = table.lookup(
+            (k % 20) as f32 * (0.0526 as f32),
+            (k / 20) as f32 * (0.0526 as f32)
+        );
+        dfg.real(e.a);
+        dfg.real(e.b);
+    }
+    c.sameInt(
+        "regress light: LightDfgTable(16, 32) nodes and lookups [RGK_DFG]",
+        dfg.value(),
+        RGK_DFG
+    );
+
+    let rng : Pcg32 = new Pcg32(808, 9);
+    let brdf : RegressHash = new RegressHash();
+    let n : Vec3 = Vec3::make(0.0, 1.0, 0.0);
+    for (m of 0..4) {
+        let material : LightMaterial = LightMaterial {
+            baseColor: Vec3::make(0.8, 0.5, 0.3),
+            metallic: m % 2 == 0 ? 0.0 as f32 : 1.0 as f32,
+            roughness: (m as f32) * (0.3 as f32) + (0.05 as f32),
+            diffuseModel: m < 2 ? LightDiffuseModel::Lambert : LightDiffuseModel::Burley,
+        };
+        for (k of 0..250) {
+            let v : Vec3 = rgkUnit(rng);
+            let l : Vec3 = rgkUnit(rng);
+            let p : LightPrepared = lightPrepare(material, table.lookup(v.y, material.roughness));
+            let terms : LightBrdfTerms = lightBrdf(p, n, v, l);
+            brdf.vec(p.f0);
+            brdf.vec(p.diffuse);
+            brdf.vec(p.compensation);
+            brdf.vec(terms.diffuse);
+            brdf.vec(terms.specular);
+            brdf.real(lightGgxD(rng.nextF32(), p.alpha));
+            brdf.real(lightSmithV(rng.nextF32(), rng.nextF32(), p.alpha));
+            brdf.real(lightFresnelWeight(rng.nextF32()));
+        }
+    }
+    c.sameInt(
+        "regress light: lightPrepare, lightBrdf, GGX D, Smith V, Fresnel [RGK_BRDF]",
+        brdf.value(),
+        RGK_BRDF
+    );
+}
+
+// The physical sky at four sun elevations, the Chapman function, the moon's disc and the stars.
+fn rgkSky(mut c : Checks) : void {
+    let sky : RegressHash = new RegressHash();
+    for (s of 0..4) {
+        let e : f64 = ((s as f64) * 22.0 - 6.0) * 0.017453292519943295;
+        let model : LightSky = new LightSky(
+            Vec3::make(cosD(e) as f32, sinD(e) as f32, 0.0),
+            2.0,
+            0.25
+        );
+        sky.vec(model.sunIrradiance());
+        sky.vec(model.moonIrradiance());
+        for (k of 0..24) {
+            let dir : Vec3 = lumenSkyDirection(
+                (k as f32) * (0.79 as f32),
+                (k as f32) * (0.13 as f32) - (0.4 as f32)
+            );
+            sky.vec(dir);
+            sky.vec(model.skyRadianceWith(dir, 16));
+            sky.vec(model.transmittanceToward(dir));
+        }
+    }
+    c.sameInt(
+        "regress light: LightSky radiance and transmittance at four suns [RGK_SKY]",
+        sky.value(),
+        RGK_SKY
+    );
+
+    let rule : LightGauss = new LightGauss(16);
+    let chapman : RegressHash = new RegressHash();
+    for (k of 0..200) {
+        let chi : f64 = (k as f64) * 0.0157;
+        chapman.wide(lightChapman(rule, 800.0 + (k as f64), sinD(chi), cosD(chi), 795.0));
+    }
+    c.sameInt("regress light: lightChapman [RGK_CHAPMAN]", chapman.value(), RGK_CHAPMAN);
+
+    let bodies : RegressHash = new RegressHash();
+    let moon : Vec3 = Vec3::make(0.3, 0.6, -0.74).normalized();
+    let moonIrr : Vec3 = Vec3::make(0.002, 0.0021, 0.0025);
+    let rng : Pcg32 = new Pcg32(31337, 7);
+    for (k of 0..800) {
+        let near : Vec3 = moon
+            .plus(Vec3::make(
+                rng.rangeF32(-0.016, 0.016),
+                rng.rangeF32(-0.016, 0.016),
+                rng.rangeF32(-0.016, 0.016)
+            ))
+            .normalized();
+        bodies.vec(lumenMoonDisc(near, moon, moonIrr));
+        bodies.vec(lumenStars(rgkUnit(rng), (k as f32) * (0.37 as f32)));
+    }
+    c.sameInt(
+        "regress light: lumenMoonDisc and lumenStars [RGK_CELESTIAL]",
+        bodies.value(),
+        RGK_CELESTIAL
+    );
+}

@@ -6,9 +6,11 @@
 // landscape. "Light-blocking" is any block that stops any of any channel, not only the fully opaque ones: a
 // tree's leaves, a pane of glass and the surface of a lake shade the cells beside them too, and a shell that
 // left those out would read the unbaked default (full sun, full sky) exactly where the shade is.
-// This table keeps exactly those, in cell-id order, five bytes each, plus one `i32` per grid cell that says
-// which entry a cell has (-1: none). Cells outside the shell are not stored; the reader bakes them on demand
-// (see world), so storing less never means answering wrong.
+// This table keeps exactly those, in cell-id order, five bytes each. Which entry a cell has is a rank: one bit per
+// grid cell says whether it is in the shell, and every word of 64 bits keeps the entry of its first shell cell, so
+// the entry of a cell is that number plus a population count of the bits before it. A dense `i32` per grid cell said
+// the same in 21 times the room (39 MB of a 320 x 96 x 320 world against 1.8 MB). Cells outside the shell are not
+// stored; the reader bakes them on demand (see world), so storing less never means answering wrong.
 //
 // Unlike voxel-axle's surface tables this one is never touched by two threads at once: the bake jobs write
 // disjoint entries of one flat array (job i writes entry i), the shell is rebuilt on the calling thread
@@ -17,6 +19,8 @@
 //
 // An entry also carries two flags that say its sun term or sky term has not been baked since the cell
 // entered the shell, so an edit that grows the shell can bake exactly the new cells.
+
+use std::core::bits::popcount64;
 
 use crate::core::collections::vec::Vec;
 use crate::voxel::light::block::BlockLightTable;
@@ -45,8 +49,9 @@ const VOX_SURFACE_AT_TINT : i64 = 2;
 // Bookkeeping bytes one shell entry is charged for: cell id, the five bytes, and the flag.
 const VOX_SURFACE_ENTRY_BYTES : i64 = 10;
 
-// The index holds one `i32` per grid cell.
-const VOX_SURFACE_INDEX_BYTES : i64 = 4;
+// The index packs the shell's cells 64 to a word: a cell id's word, and its bit in the word.
+const VOX_SURFACE_WORD_SHIFT : i32 = 6;
+const VOX_SURFACE_WORD_MASK : i32 = 63;
 
 // Strides of the local index inside a chunk (x + z * 16 + y * 256).
 const VOX_LOCAL_Z : i32 = 16;
@@ -69,7 +74,10 @@ pub struct VoxSkyBytes {
 
 /** The shell of air cells at the surface, with the baked terms. */
 pub class VoxLightSurface {
-    index : i32[];
+    // Bit (id & 63) of word id >> 6 is set for a cell of the shell; `first` is, per word, the entry of its first
+    // shell cell. The entry of a cell is then one population count away, for a bit and a half a grid cell.
+    shell : i64[];
+    first : i32[];
     room  : i32 = 0;
     cells : Vec<i32>;
     data  : i8[];
@@ -77,7 +85,8 @@ pub class VoxLightSurface {
 
     /** An empty surface. */
     constructor() {
-        self.index = new i32[1];
+        self.shell = new i64[1];
+        self.first = new i32[1];
         self.cells = new Vec<i32>();
         self.data = new i8[1];
         self.flags = new i8[1];
@@ -93,18 +102,27 @@ pub class VoxLightSurface {
         return self.cells.get(ordinal);
     }
 
-    /** The entry of cell id `id`, or -1 when the cell is not in the shell. */
+    /**
+     * The entry of cell id `id`, or -1 when the cell is not in the shell: the ordinal of the first shell cell of its
+     * word, plus the shell cells before it in the word.
+     */
     pub fn ordinalOf(self, id : i32) : i32 {
         if (id < 0 || id >= self.room * VOX_CHUNK_CELLS) {
             return -1;
         }
-        return self.index[id];
+        let w : i64 = (id >> VOX_SURFACE_WORD_SHIFT) as i64;
+        let bit : i64 = (id & VOX_SURFACE_WORD_MASK) as i64;
+        let word : i64 = self.shell[w];
+        if (((word >> bit) & 1) == 0) {
+            return -1;
+        }
+        return self.first[w] + popcount64(word & (((1 as i64) << bit) - 1));
     }
 
-    /** Bytes of memory the table holds: the entries, the flags and the index. */
+    /** Bytes of memory the table holds: the entries and their flags, and the index (bits and word ranks). */
     pub fn bytes(self) : i64 {
-        return self.cells.len() as i64 * VOX_SURFACE_ENTRY_BYTES
-            + self.room as i64 * VOX_CHUNK_CELLS as i64 * VOX_SURFACE_INDEX_BYTES;
+        return self.cells.len() as i64 * VOX_SURFACE_ENTRY_BYTES + self.shell.length * 8
+            + self.first.length * 4;
     }
 
     /** Sun visibility 0..255 of entry `ordinal`. */
@@ -160,12 +178,19 @@ pub class VoxLightSurface {
 
         let mark : i8[] = VoxLightSurface::markShell(grid, table, slots);
 
+        // One bit a cell for the shell, and per word of 64 cells the ordinal of its first shell cell.
+        let words : i64 = (total + VOX_SURFACE_WORD_MASK as i64) >> (VOX_SURFACE_WORD_SHIFT as i64);
         let fresh : Vec<i32> = new Vec<i32>();
-        let mut index : i32[] = new i32[total + 1];
+        let mut shell : i64[] = new i64[words + 1];
+        let mut first : i32[] = new i32[words + 1];
         for (id of 0..total) {
-            index[id] = -1;
+            let w : i64 = id >> (VOX_SURFACE_WORD_SHIFT as i64);
+            let bit : i64 = id & (VOX_SURFACE_WORD_MASK as i64);
+            if (bit == 0) {
+                first[w] = fresh.len();
+            }
             if (mark[id] == 1 && !table.isSolid(grid.blockOfId(id as i32))) {
-                index[id] = fresh.len();
+                shell[w] = shell[w] | ((1 as i64) << bit);
                 fresh.push(id as i32);
             }
         }
@@ -189,7 +214,8 @@ pub class VoxLightSurface {
             }
         }
 
-        self.index = index;
+        self.shell = shell;
+        self.first = first;
         self.room = slots;
         self.cells = fresh;
         self.data = data;

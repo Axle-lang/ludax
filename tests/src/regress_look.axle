@@ -1,0 +1,243 @@
+// regress_look — golden fingerprints of the looks and the particles: `LuxFx.shade` for looks that use every op, and
+// a particle effect with every op of its stack, emitted and stepped for 200 ticks.
+//
+// The looks are shaded at points, footprints and clocks drawn from a fixed stream; the particles fold their whole
+// state (positions, velocities, ages, colours, sizes, ids) and their count every 20 ticks, so a change that only
+// shows late in an effect's life still moves the fingerprint.
+
+use ludax::{
+    Checks, LuxField, LuxFieldTape, LuxFx, LuxLookBank, LuxNoise, LuxRamp, LuxSurface, Pcg32
+};
+use ludax::{PtcEffect, PtcSpawn, Vec3};
+
+use crate::regress_support::RegressHash;
+
+const RGL_SHADE : i64 = 1112509559899394783;
+const RGL_SHADE_AT : i64 = 1070461397;
+const RGL_BANK : i64 = 4353407377443400021;
+const RGL_PARTICLES : i64 = -3026573030021810677;
+const RGL_PARTICLES_COUNT : i64 = 146;
+const RGL_PARTICLES_AT : i64 = -1078367052;
+const RGL_PARTICLES_BORN : i64 = 258;
+
+/** Golden fingerprints of `render/lux/look` and `sim/particles`. */
+pub class RegressLookSuite {
+    /** Runs every check of the suite. */
+    pub static fn run(mut c : Checks) : void {
+        rglLooks(c);
+        rglParticles(c);
+    }
+}
+
+fn rglRamp(strength : f32) : LuxRamp {
+    return LuxRamp {
+        at0: 0.1,
+        c0: Vec3::make(0.1, 0.02, 0.3),
+        at1: 0.45,
+        c1: Vec3::make(0.6, 0.25, 0.9),
+        at2: 0.9,
+        c2: Vec3::make(1.0, 0.85, 0.7),
+        strength: strength,
+    };
+}
+
+fn rglFold(mut h : RegressHash, s : LuxSurface) : void {
+    h.real(s.slopeU);
+    h.real(s.slopeV);
+    h.real(s.bendU);
+    h.real(s.bendV);
+    h.vec(s.albedo);
+    h.vec(s.emit);
+    h.real(s.rough);
+}
+
+// Three looks: one with every op (two normals), one sheet with a short history, one built in another order.
+fn rglLooks(mut c : Checks) : void {
+    let fx : LuxFx = new LuxFx(16);
+    let t : LuxFieldTape = fx.fields;
+    let here : LuxField = t.here();
+    let a : LuxField = t.fbm(t.scroll(here, 0.3, 0.1), LuxNoise {
+        freq: 1.0,
+        octaves: 3,
+        gain: 0.5,
+        seed: 31,
+    });
+    let b : LuxField = t.fbm(here, LuxNoise { freq: 3.0, octaves: 2, gain: 0.6, seed: 32 });
+    let warped : LuxField = t.fbm(t.warp(t.scale(here, 1.7), a, b, 0.5), LuxNoise {
+        freq: 0.9,
+        octaves: 2,
+        gain: 0.5,
+        seed: 33,
+    });
+    let cells : LuxField = t.remap(
+        t.fbm(t.pixelate(here, 4.0), LuxNoise {
+            freq: 1.0,
+            octaves: 1,
+            gain: 0.5,
+            seed: 34,
+        }),
+        0.2,
+        0.8
+    );
+    let bank : LuxLookBank = fx.looks;
+
+    let every : i32 = bank.look();
+    bank.albedo(every, a, rglRamp(1.0));
+    bank.normal(every, b, 0.4);
+    bank.normal(every, warped, 0.15);
+    bank.rough(every, cells, 0.6);
+    bank.emit(every, warped, rglRamp(2.5));
+    bank.bend(every, t.add(a, b), 0.08);
+
+    let glass : i32 = bank.look();
+    bank.thin(glass, Vec3::make(0.7, 0.9, 1.0));
+    bank.history(glass, 4.0);
+    bank.bend(glass, warped, 0.05);
+    bank.emit(glass, t.mul(a, cells), rglRamp(0.5));
+
+    let other : i32 = bank.look();
+    bank.emit(other, b, rglRamp(1.5));
+    bank.rough(other, a, 0.3);
+    bank.albedo(other, cells, rglRamp(1.0));
+    fx.bind(2, every);
+    fx.bind(5, glass);
+    fx.bind(9, other);
+
+    let r : f32[] = t.registers();
+    let h : RegressHash = new RegressHash();
+    for (ti of 0..3) {
+        fx.prepare((ti as f64) * 2.25);
+        let rng : Pcg32 = new Pcg32(401, ti as u64);
+        for (k of 0..400) {
+            let u : f32 = rng.rangeF32(-8.0, 8.0);
+            let v : f32 = rng.rangeF32(-8.0, 8.0);
+            let fp : f32 = (k % 4) as f32 * (0.07 as f32);
+            rglFold(h, fx.shade(fx.lookOf(2), u, v, fp, r));
+            rglFold(h, fx.shade(fx.lookOf(5), u, v, fp, r));
+            rglFold(h, fx.shade(fx.lookOf(9), u, v, fp, r));
+        }
+    }
+    c.sameInt("regress look: three looks over every op, shaded [RGL_SHADE]", h.value(), RGL_SHADE);
+
+    fx.prepare(1.0);
+    let at : LuxSurface = fx.shade(every, 0.5, 0.25, 0.0, r);
+    c.sameInt(
+        "regress look: the full look's emitted red at (0.5, 0.25) bits [RGL_SHADE_AT]",
+        RegressHash::bits(at.emit.x),
+        RGL_SHADE_AT
+    );
+
+    let kept : RegressHash = new RegressHash();
+    for (look of 0..bank.count()) {
+        kept.int(bank.interfaceOf(look).code() as i64);
+        kept.vec(bank.tintOf(look));
+        kept.real(bank.historyOf(look));
+    }
+    for (block of -1..17) {
+        kept.int(fx.lookOf(block) as i64);
+    }
+    c.sameInt(
+        "regress look: interfaces, tints, histories, bindings [RGL_BANK]",
+        kept.value(),
+        RGL_BANK
+    );
+}
+
+// An effect with every op of the stack.
+fn rglEffect() : PtcEffect {
+    let e : PtcEffect = new PtcEffect(400, 13);
+    e.gravity(0.0, -2.5, 0.3);
+    e.drag(0.8);
+    e.wind(Vec3::make(1.5, 0.0, -0.5), 0.6);
+    e.attract(Vec3::make(0.0, 2.0, 0.0), 1.2, 1.7);
+    e.rise(1.1);
+    e.wobble(0.9, 3.0);
+    e.colour(Vec3::make(1.8, 0.7, 0.2), Vec3::make(0.2, 0.1, 0.6));
+    e.sized(0.15, 0.03);
+    e.flicker(0.35, 8.0);
+    return e;
+}
+
+fn rglFoldEffect(mut h : RegressHash, e : PtcEffect) : void {
+    h.int(e.count as i64);
+    for (i of 0..e.count) {
+        h.real(e.px[i]);
+        h.real(e.py[i]);
+        h.real(e.pz[i]);
+        h.real(e.vx[i]);
+        h.real(e.vy[i]);
+        h.real(e.vz[i]);
+        h.real(e.age[i]);
+        h.real(e.life[i]);
+        h.real(e.r[i]);
+        h.real(e.g[i]);
+        h.real(e.b[i]);
+        h.real(e.size[i]);
+        h.int(e.id[i] as i64);
+    }
+}
+
+// Two emitters (two keys) feed the effect for 200 ticks; the state is folded every 20 ticks.
+fn rglParticles(mut c : Checks) : void {
+    let e : PtcEffect = rglEffect();
+    let dt : f32 = 0.0166666667;
+    let near : PtcSpawn = PtcSpawn {
+        x: -1.0,
+        y: 0.0,
+        z: -0.5,
+        sx: 2.0,
+        sy: 0.5,
+        sz: 1.0,
+        rate: 55.0,
+        vx: 0.2,
+        vy: 1.0,
+        vz: 0.0,
+        spread: 0.7,
+        life: 1.1,
+        lifeSpread: 0.9,
+    };
+    let far : PtcSpawn = PtcSpawn {
+        x: 4.0,
+        y: 1.0,
+        z: 2.0,
+        sx: 0.5,
+        sy: 0.5,
+        sz: 0.5,
+        rate: 23.0,
+        vx: -1.0,
+        vy: 0.0,
+        vz: 0.5,
+        spread: 0.2,
+        life: 2.5,
+        lifeSpread: 0.3,
+    };
+    let h : RegressHash = new RegressHash();
+    for (tick of 0..200) {
+        e.emit(near, 0, tick as i64, dt);
+        e.emit(far, 1, tick as i64, dt);
+        e.step(dt, tick as i64);
+        if (tick % 20 == 19) {
+            rglFoldEffect(h, e);
+        }
+    }
+    c.sameInt(
+        "regress particles: every op over 200 ticks, the state every 20 [RGL_PARTICLES]",
+        h.value(),
+        RGL_PARTICLES
+    );
+    c.sameInt(
+        "regress particles: alive after 200 ticks [RGL_PARTICLES_COUNT]",
+        e.count as i64,
+        RGL_PARTICLES_COUNT
+    );
+    c.sameInt(
+        "regress particles: the first particle's x bits [RGL_PARTICLES_AT]",
+        RegressHash::bits(e.px[0]),
+        RGL_PARTICLES_AT
+    );
+    c.sameInt(
+        "regress particles: the youngest particle's id [RGL_PARTICLES_BORN]",
+        e.id[e.count - 1] as i64,
+        RGL_PARTICLES_BORN
+    );
+}
