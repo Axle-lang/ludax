@@ -48,7 +48,7 @@ include building the albedo table of the lighting library). That is a measuremen
 ## What it does not do
 
 - **There is no GPU backend.** The CPU backend is the reference the GPU backend will be tested against; the command
-  stream and the graph are the contract (see `doc/RENDERING.md`). Nothing here talks to a window or a GPU.
+  stream and the graph are the contract (see `doc/spec/rendering.md`). Nothing here talks to a window or a GPU.
 - Shadows are hard: one ray per light towards its centre, whatever the light's radius. Soft penumbrae from sized
   lights, shadow maps and baked shadows are not implemented.
 - Reflections are an environment lookup (sky above, one ground colour below, blended by roughness), not reflections of

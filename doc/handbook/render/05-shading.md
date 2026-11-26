@@ -169,4 +169,4 @@ All `O(1)` a sample except the rays.
 `games/blockland/src/app/mc_worker.axle` (`radiance`, `radianceOf`, `surface`, `water`, `fromBelow`, `fogUnder`),
 `mc_shade.axle`, `games/blockland/src/render/render_bake.axle`, `render_light.axle`;
 `src/render/pathlight/pathlight_shade.axle`, `src/render/light/light_brdf.axle`, `light_sh.axle`, `light_dfg.axle`.
-See also `doc/LIGHTING.md` and `doc/LIGHTING_MATH.md`.
+See also `doc/spec/lighting.md` and `doc/spec/lighting-math.md`.

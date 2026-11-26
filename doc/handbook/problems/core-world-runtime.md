@@ -8,8 +8,8 @@ the expression in the source, not measured. Nothing was built or run for this gl
 Docs referred to by short name: `job-pool` = `doc/handbook/engine/01-job-pool.md`; `determinism` =
 `doc/handbook/concepts/02-determinism.md`; `hot-loop` = `doc/handbook/standards/01-hot-loop-rules.md`; `sky` =
 `doc/handbook/render/06-sky.md`; `view-layers` = `doc/handbook/render/15-view-layers.md`; `shapes` =
-`doc/handbook/render/18-shapes.md`; `REVIEW_CORE` = `doc/REVIEW_CORE.md` (a review log with measurements, not a
-mechanism chapter); `CORE_EXTRACTION` = `doc/CORE_EXTRACTION.md` (a move log).
+`doc/handbook/render/18-shapes.md`; `REVIEW_CORE` = `doc/handbook/history/core-review.md` (a review log with measurements, not a
+mechanism chapter); `CORE_EXTRACTION` = `doc/handbook/history/core-extraction.md` (a move log).
 
 ---
 
@@ -98,7 +98,7 @@ mechanism chapter); `CORE_EXTRACTION` = `doc/CORE_EXTRACTION.md` (a move log).
 - **Cost:** O(1), 12 bytes (`Vec3`), copied by value, stored inline in arrays.
 - **Why this and not another:** value types so "never aliased"; `*In` forms for hot loops (C-10).
 - **Where:** `src/core/math/vec3.axle:57-127`, `src/core/math/vec2.axle:47-120`, `src/core/math/vec4.axle:47-90`.
-- **Docs:** MISSING (conventions: `doc/STYLE.md` and the file header).
+- **Docs:** MISSING (conventions: `doc/guide/style.md` and the file header).
 
 ### C-10. I want to reflect, project and build a perpendicular frame
 - **Means:** closed forms in `Vec3`.
@@ -255,7 +255,7 @@ mechanism chapter); `CORE_EXTRACTION` = `doc/CORE_EXTRACTION.md` (a move log).
 - **Cost:** none at run time. `frustum`, `trig`, `scalar` and `convert` are not generated (UNVERIFIED for scalar/trig: they hold their own f64 versions).
 - **Why this and not another:** the script header: Axle "has no generics over number types".
 - **Where:** `tools/gen_math_f64.sh:1-20`; outputs `src/core/math/dvec2.axle` ... `dintersect.axle`.
-- **Docs:** CLAUDE.md and `doc/ARCHITECTURE.md` mention the rule; the mechanism chapter is MISSING.
+- **Docs:** CLAUDE.md and `doc/guide/architecture.md` mention the rule; the mechanism chapter is MISSING.
 
 ---
 
@@ -321,7 +321,7 @@ mechanism chapter); `CORE_EXTRACTION` = `doc/CORE_EXTRACTION.md` (a move log).
 - **Cost:** FNV O(bytes); mix O(1), about 6 ops. No memory. No measured figure.
 - **Why this and not another:** "fixed by their definition" so a content hash on disk and a simulation both need them; used by `Map` for integer keys.
 - **Where:** `src/core/id/hash.axle:10-56`.
-- **Docs:** MISSING (`doc/design/exact-optimisation.md` mentions SplitMix; not a chapter).
+- **Docs:** MISSING.
 
 ### C-33. I want a generational handle so a stale reference can be detected
 - **Means:** `EntityId {index, generation}`, 64-bit packable with `bits()`/`fromBits`.
@@ -415,7 +415,7 @@ mechanism chapter); `CORE_EXTRACTION` = `doc/CORE_EXTRACTION.md` (a move log).
 - **Cost:** O(log n) push/pop, O(1) peek; memory `16 + sizeof(T)` bytes per element (keys + serials + values, derived).
 - **Why this and not another:** closures capture only scalars and traits cannot be called through a generic free function, so ordering is data (header). The serial makes the pop order independent of heap layout.
 - **Where:** `src/core/collections/heap.axle:17-144`.
-- **Docs:** MISSING (`doc/NAMES.md` lists the name only).
+- **Docs:** MISSING (`doc/guide/names.md` lists the name only).
 
 ### C-43. I want a set of small integers with fast bulk operations
 - **Means:** `BitSet` over `Vec<i64>` words (64 bits each): `set`/`unset`/`has`, `count` by `popcount64`, `nextSet` by `trailingZeros64`, `unionWith`/`intersectWith`/`subtract` a word at a time.
@@ -430,7 +430,7 @@ mechanism chapter); `CORE_EXTRACTION` = `doc/CORE_EXTRACTION.md` (a move log).
 - **Means:** `PackedCells`: `bits` per entry in `u64` words; entries never span two words.
 - **Mathematics:** `per = 64 / bits`; cell `i` is in word `i / per` at shift `(i mod per) * bits`; mask `(1<<bits) - 1`. 4 bits: 16 per word; 5 bits: 12 (4 bits of padding); 15 bits: 4. `bitsFor(n, minBits)`: the smallest `bits >= minBits` with `2^bits >= n`.
 - **Instructions:** `get`: three integer divisions by a runtime value (`64 / bits`, `i / per`, `i % per`; `REVIEW_CORE:191`), shift, mask; `set`: the same plus a read-modify-write of the word (`& ~(mask << shift) | v << shift`). C-45 removes the divisions.
-- **Cost:** O(1) per cell; memory `ceil(cells / per) * 8` bytes. Measured (`REVIEW_CORE`): "PackedCells.get/set with a constant width 2490 / 1035 Mcells/s ... LLVM folds the division when the width is a constant" (`doc/REVIEW_CORE.md:304`).
+- **Cost:** O(1) per cell; memory `ceil(cells / per) * 8` bytes. Measured (`REVIEW_CORE`): "PackedCells.get/set with a constant width 2490 / 1035 Mcells/s ... LLVM folds the division when the width is a constant" (`doc/handbook/history/core-review.md:304`).
 - **Why this and not another:** one definition of the layout "so they cannot disagree about where entry `i` lives" (header).
 - **Where:** `src/core/collections/packed_cells.axle:45-92`.
 - **Docs:** MISSING as a chapter; measurements only in `REVIEW_CORE` and `CORE_EXTRACTION`.
@@ -439,7 +439,7 @@ mechanism chapter); `CORE_EXTRACTION` = `doc/CORE_EXTRACTION.md` (a move log).
 - **Means:** a precomputed reciprocal `PackedLayout.magic = floor(2^32 / per) + 1`; `word = (i * magic) >> 32`.
 - **Mathematics:** `i / per == (i * (floor(2^32/per) + 1)) >> 32` for every `i < 2^26` (`PACKED_FAST_LIMIT = 67108864`); above that the code divides. The limit is stated in the code; the proof is not written down. Derived here: `magic = 2^32/per + e` with `0 < e <= 1`, so `i*magic/2^32 = i/per + i e/2^32`, and the floor stays right while `i e/2^32 < 1/per`, i.e. `i < 2^32/per`; with `per <= 64` (1-bit entries) that is `i < 2^26`, matching the constant. The shift is `(i - word*per) * bits`.
 - **Instructions:** one 64-bit multiply, one shift, one multiply-subtract; branch on `i < limit`.
-- **Cost:** O(1). Measured (`REVIEW_CORE`): `PalettedPool.get` 5-bit palette 1020 -> 1390 Mcells/s with `PackedLayout` ("multiply instead of divide, exact below 2^26 cells, divide above") (`doc/REVIEW_CORE.md:300`).
+- **Cost:** O(1). Measured (`REVIEW_CORE`): `PalettedPool.get` 5-bit palette 1020 -> 1390 Mcells/s with `PackedLayout` ("multiply instead of divide, exact below 2^26 cells, divide above") (`doc/handbook/history/core-review.md:300`).
 - **Why this and not another:** `hot-loop` R1: an integer divide is "20 to 40 cycles, more than a ray step"; "a division by a constant is fine: the compiler turns it into a multiplication" - here the width is a runtime value so the constant is built once.
 - **Where:** `src/core/collections/packed_cells.axle:30-42`, `:66-75`, `:94-115`.
 - **Docs:** `hot-loop` R1 explains the rule; the magic-number construction is MISSING.
@@ -448,7 +448,7 @@ mechanism chapter); `CORE_EXTRACTION` = `doc/CORE_EXTRACTION.md` (a move log).
 - **Means:** word-at-a-time loops: `packRun` (through a palette map), `packValues` (raw), `unpackRun`.
 - **Mathematics:** for each destination word, OR `per` entries shifted by `k * bits`; `unpackRun` peels `bits` at a time from each word with `word >>= bits`.
 - **Instructions:** one shift per entry, one store per word; no divide.
-- **Cost:** O(cells). Measured (`REVIEW_CORE`): `PalettedPool.pack` 1380 -> 1790 Mcells/s with `packValues` (`doc/REVIEW_CORE.md:302`); `expand` 2020 vs 1800 Mcells/s (slower, "not understood", `:303`).
+- **Cost:** O(cells). Measured (`REVIEW_CORE`): `PalettedPool.pack` 1380 -> 1790 Mcells/s with `packValues` (`doc/handbook/history/core-review.md:302`); `expand` 2020 vs 1800 Mcells/s (slower, "not understood", `:303`).
 - **Why this and not another:** the same bytes `set` would write, without `set`'s division (header).
 - **Where:** `src/core/collections/packed_cells.axle:117-199`.
 - **Docs:** `REVIEW_CORE` only.
@@ -612,7 +612,7 @@ mechanism chapter); `CORE_EXTRACTION` = `doc/CORE_EXTRACTION.md` (a move log).
 - **Cost:** memory `frames x samplesPerFrame x 28` bytes (i32 + 3 i64, derived); `summarise` O(samples + scopes); insertion O(scopes^2) worst. The game loop's profiler: 8 scopes, 8 frames, 16 samples = 3584 B (derived from `game_loop.axle:33-35`).
 - **Why this and not another:** "profiling never allocates and the history of the last N frames is always there" (header).
 - **Where:** `src/core/profile/profiler.axle:29-273`, `src/core/profile/names.axle:10-60`, `src/core/profile/entry.axle`.
-- **Docs:** `doc/RENDERING.md` mentions `Profiler` (UNVERIFIED depth); the mechanism chapter is MISSING.
+- **Docs:** `doc/spec/rendering.md` mentions `Profiler` (UNVERIFIED depth); the mechanism chapter is MISSING.
 
 ### C-64. I want leveled logs I can read back in-engine, with no wall-clock stamps
 - **Means:** `Logger<S : LogSink>` with a threshold, a record sequence number and a frame number; sinks `StdoutSink`, `MemorySink` (ring), `TeeSink`.
@@ -643,7 +643,7 @@ mechanism chapter); `CORE_EXTRACTION` = `doc/CORE_EXTRACTION.md` (a move log).
 - **Cost:** O(1) per op; `sweep` O(n); memory two sparse sets: about `4 x (maxIndex+1) x 2 + (4+4+sizeof(T)+4) x n` bytes (derived).
 - **Why this and not another:** a destroyed entity's component stays until `sweep`, but `has`/`getOr` already refuse it (header).
 - **Where:** `src/world/store.axle:14-109`.
-- **Docs:** MISSING (`doc/RENDERING.md` mentions it; UNVERIFIED depth).
+- **Docs:** MISSING (`doc/spec/rendering.md` mentions it; UNVERIFIED depth).
 
 ### C-67. I want every entity that has components A and B (and C)
 - **Means:** `Join2`/`Join3`: walk the smaller store's dense array and test the other(s) with `has`.
@@ -728,7 +728,7 @@ mechanism chapter); `CORE_EXTRACTION` = `doc/CORE_EXTRACTION.md` (a move log).
 - **Cost:** O(steps) per frame; the module is a type parameter, so there is no virtual call.
 - **Why this and not another:** a class cannot be stored in a trait-typed field (E0709), so the loop takes the module as an argument of each `frame` call (`game_module.axle` header).
 - **Where:** `src/runtime/game_loop.axle:68-185`, `src/runtime/game_module.axle:13-25`.
-- **Docs:** MISSING (`doc/design/runtime-planner.md` discusses plans; not a chapter).
+- **Docs:** MISSING.
 
 ### C-76. I want pause, single-step and slow motion that keep replays exact
 - **Means:** `setPaused`, `requestStep` (while paused, each request banks exactly one step), `setTimeScale` in thousandths.
@@ -746,7 +746,7 @@ mechanism chapter); `CORE_EXTRACTION` = `doc/CORE_EXTRACTION.md` (a move log).
 - **Cost:** `resolve` O(n^2 + n E) (derived); `run` O(n); the order is a function of the declarations alone.
 - **Why this and not another:** "lets a module add a system without knowing the others" (header); a class cannot be stored in a trait field, so the scheduler holds names and the caller a `match` on the number.
 - **Where:** `src/runtime/scheduler.axle:43-342`.
-- **Docs:** `doc/design/runtime-planner.md` and `doc/design/core-review-2026-11-26.md` mention it (UNVERIFIED depth); chapter MISSING.
+- **Docs:** MISSING.
 
 ### C-78. I want one frame of input as comparable, hashable plain data
 - **Means:** `InputState`: 320 digital codes in ten 32-bit words (keys 0..255, mouse 256..271, pad 272..319), previous-frame words for edges, 8 analog axes and two mouse deltas as integers in 1/4096 units.
@@ -764,7 +764,7 @@ mechanism chapter); `CORE_EXTRACTION` = `doc/CORE_EXTRACTION.md` (a move log).
 - **Cost:** O(snapshots x 20); size about `4 + 4 x changedFields` bytes a snapshot (derived), in memory 80 bytes a snapshot (20 `i32`).
 - **Why this and not another:** a bug report "carries its own reproduction" (header).
 - **Where:** `src/runtime/input_tape.axle:42-231`.
-- **Docs:** `doc/design/runtime-planner.md` mentions `InputTape` (UNVERIFIED depth).
+- **Docs:** MISSING.
 
 ### C-80. I want "jump" and "steer" to mean what the player means, across keys, chords and sticks
 - **Means:** `ActionMap`: named actions fed by key, chord, axis (with dead zone and scale) and key-pair bindings; the strongest binding wins.
@@ -924,12 +924,12 @@ Nothing of this zone is covered by a dedicated handbook chapter except the job p
 | Camera-relative f64 to f32 | `convert.axle` | the precision argument ("centimetres at ten kilometres") is a comment; no chapter says how renderers must use `relativeVec3` |
 | Geometry and intersection | `geom.axle`, `intersect.axle` | slab, sphere and Moeller-Trumbore formulas and their tolerances (`1e-10`); only the sub-cell slab test is documented (`shapes`) |
 | Frustum culling | `frustum.axle` | the row combinations (Gribb-Hartmann), the three-state verdict and why it is conservative |
-| Hashing | `id/hash.axle` | FNV-1a and SplitMix64 constants, `hashCombine`, and which structures use which hash; mentioned only in `doc/design/exact-optimisation.md` and `doc/NAMES.md` |
+| Hashing | `id/hash.axle` | FNV-1a and SplitMix64 constants, `hashCombine`, and which structures use which hash |
 | Insertion-ordered `Map`, `StringMap` | `collections/map.axle`, `string_map.axle` | the probe/tombstone/rebuild policy, memory per entry, the `clear` cost |
 | `Vec`, `Ring`, `Slab`, `SparseSet`, `Heap`, `BitSet` | `collections/*.axle` | complexity and memory tables; the `Heap` tie-break by push serial; where each is used (`Heap<i32>` in navigation; `Ring<i64>` in the voxel light queue) |
 | `PackedCells` and the division-free index | `collections/packed_cells.axle` | the proof that `(i * magic) >> 32` equals `i / per` below `2^26`; padding waste per width |
-| `PalettedPool` | `collections/paletted_pool.axle` | the three forms, growth, compaction trigger (`garbage >= 256` and half the used pool), bytes per container and per width; measurements exist only in `doc/REVIEW_CORE.md` |
-| `Arena` | `mem/arena.axle` | its role; `doc/REVIEW_CORE.md:241` says it has no user besides its test |
+| `PalettedPool` | `collections/paletted_pool.axle` | the three forms, growth, compaction trigger (`garbage >= 256` and half the used pool), bytes per container and per width; measurements exist only in `doc/handbook/history/core-review.md` |
+| `Arena` | `mem/arena.axle` | its role; `doc/handbook/history/core-review.md:241` says it has no user besides its test |
 | Entity ids and the allocator | `id/entity_id.axle`, `id/id_allocator.axle` | generation rules (starts at 1, wrap skips 0, last-freed-first reuse) |
 | `Pcg32` | `rng/pcg32.axle` | the output function, stream selection, rejection sampling; `doc/handbook/concepts/02-determinism.md` states policy only |
 | Value noise with exact gradient | `field/lux_noise.axle` | the corner hash constants (`73856093`, `19349663`, `2654435761`) and the `1.5` slope bound |
@@ -960,7 +960,7 @@ Nothing of this zone is covered by a dedicated handbook chapter except the job p
 8. **Scheduler failure message.** `scheduler.axle:123-126` says after a failed `resolve` "the old order (if any) stays", but `resolved` was cleared by `add`/`before` (`:87`, `:115`), so `run` returns false while `orderAt` still returns the stale order.
 9. **`settings_text` and `mission_text` read quadratically.** Both call `TextScan.lineAt(text, n)` per line (`settings_text.axle:56`, `mission_text.axle:380`), and `lineAt` scans from the start (`text.axle:139-153`). Harmless for small files.
 10. **Exponent overflow in the number parser.** `TextScan.readExponent` accumulates `e = e * 10 + digit` in an `i32` with no limit (`text.axle:356-378`); a long exponent wraps. Also `toDecimal` is exact only for up to 15 significant digits (its own doc comment, `:304-307`).
-11. **Stale statements in `doc/REVIEW_CORE.md`.** Lines 191-195 describe `PackedCells.get/set` as three divisions with a reciprocal exact "for `i < 4096`"; the code now has `PackedLayout` exact below `2^26` (`packed_cells.axle:15-19`) and the measured table at `REVIEW_CORE.md:300` shows it. Line 241 says `Arena` is used only by its test: still true (a search finds it only in `src/core/mem`, `src/lib.axle` and `tests/src/mem.axle`), so the recommendation to delete it is open.
+11. **Stale statements in `doc/handbook/history/core-review.md`.** Lines 191-195 describe `PackedCells.get/set` as three divisions with a reciprocal exact "for `i < 4096`"; the code now has `PackedLayout` exact below `2^26` (`packed_cells.axle:15-19`) and the measured table at `doc/handbook/history/core-review.md:300` shows it. Line 241 says `Arena` is used only by its test: still true (a search finds it only in `src/core/mem`, `src/lib.axle` and `tests/src/mem.axle`), so the recommendation to delete it is open.
 12. **`LuxFieldTape.pack` computes a normaliser for every node.** `lux_field.axle:465` reads `konst[1]`, `konst[2]` as octaves and gain for every node, not only noise nodes; harmless (unused values) but a latent surprise if a new op uses those slots. The warp widening under-estimates the footprint by up to sqrt 2, which the header admits (`:17-21`).
 13. **`loadWide` allocates a large scratch per call.** `paletted_pool.axle:563-586` builds a `PalettedScratch(1 << directBits, cells)` (a `65536`-entry `i32` map plus three arrays of `cells`) for every container read in a non-native width; and `grow` allocates `u16[cells]` per call (`:390-428`, `REVIEW_CORE:310`).
 14. **`Heap` keys.** `Heap` keys are `i64` only; the header says floats must be quantised by the caller, so two float keys closer than the quantum tie and fall back to push order (by design, not a defect).
@@ -968,4 +968,4 @@ Nothing of this zone is covered by a dedicated handbook chapter except the job p
 
 ## Summary
 
-The glossary has 93 entries (C-01 to C-93) over scalars and trigonometry, vectors, rotations and matrices, geometry and culling, hashing and ids, collections (including packed and paletted storage), random numbers and noise (including the field graph), jobs, time, profiling and logging, the world (entities, stores, joins, hierarchy, scene transforms, spatial grid, shape bank), the runtime (loop, scheduler, input, settings, text) and the open world (partition, streamer, sky clock, weather, vehicle, missions). Every file group in the zone was read: `src/core/math` except the generated `d*.axle` twins (checked through their generator script and the `dgeom` header, not diffed line by line), `core/collections`, `core/id`, `core/rng`, `core/jobs`, `core/time`, `core/mem`, `core/profile`, `core/log`, `core/field`, `world/**`, `runtime/**` and `openworld/**`; for the larger mission, settings and scene-JSON files the read covered the headers and the algorithmic functions, not every accessor. Not verified: anything that needs running (no build, no test, no timing); the Axle string-concatenation cost, whether `std` shares string bytes between a `HashMap` key and an `ArrayList` entry, and the reason for several design choices (marked `UNVERIFIED` or `not documented`). Measured numbers are quoted only from `doc/handbook/engine/01-job-pool.md`, `doc/handbook/render/15-view-layers.md`, `doc/REVIEW_CORE.md` and source comments; all other costs are counted from the code and labelled "derived". Existing coverage is thin: the job pool, the field graph, the shapes and the quick trigonometry have chapters; almost everything else lacks a mechanism chapter.
+The glossary has 93 entries (C-01 to C-93) over scalars and trigonometry, vectors, rotations and matrices, geometry and culling, hashing and ids, collections (including packed and paletted storage), random numbers and noise (including the field graph), jobs, time, profiling and logging, the world (entities, stores, joins, hierarchy, scene transforms, spatial grid, shape bank), the runtime (loop, scheduler, input, settings, text) and the open world (partition, streamer, sky clock, weather, vehicle, missions). Every file group in the zone was read: `src/core/math` except the generated `d*.axle` twins (checked through their generator script and the `dgeom` header, not diffed line by line), `core/collections`, `core/id`, `core/rng`, `core/jobs`, `core/time`, `core/mem`, `core/profile`, `core/log`, `core/field`, `world/**`, `runtime/**` and `openworld/**`; for the larger mission, settings and scene-JSON files the read covered the headers and the algorithmic functions, not every accessor. Not verified: anything that needs running (no build, no test, no timing); the Axle string-concatenation cost, whether `std` shares string bytes between a `HashMap` key and an `ArrayList` entry, and the reason for several design choices (marked `UNVERIFIED` or `not documented`). Measured numbers are quoted only from `doc/handbook/engine/01-job-pool.md`, `doc/handbook/render/15-view-layers.md`, `doc/handbook/history/core-review.md` and source comments; all other costs are counted from the code and labelled "derived". Existing coverage is thin: the job pool, the field graph, the shapes and the quick trigonometry have chapters; almost everything else lacks a mechanism chapter.

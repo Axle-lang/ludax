@@ -12,8 +12,7 @@ an effect by hand:
 | **Particles** `PtcEffect` | `src/sim/particles` (layer 4) | a pool of plain arrays moved by a stack of closed ops, spawned deterministically |
 
 The fields sit in the core so that the simulation (particles, wind, later physics) reads the same functions as the
-renderer. The design and its alternatives are in `doc/design/view-layers.md`, `doc/design/particles-wind.md` and
-`doc/design/effect-layers-research.md`; this chapter is what was built.
+renderer. This chapter is what was built.
 
 ## 2. Why
 
@@ -132,7 +131,7 @@ looks if they changed. Per tick (60 a second): `emit`, then `step`. Per frame: `
 
 | Date | Change | Measured | Kept? |
 |---|---|---|---|
-| 2026-11-24 | design by three agents: architecture, research with patents, particles and wind (`doc/design/*`) | — | yes |
+| 2026-11-24 | design by three agents: architecture, research with patents, particles and wind | — | yes |
 | 2026-11-24 | fields in `core/field` with forward gradients and footprint fade; looks and bindings in `render/lux/look`; particles in `sim/particles`; 21 checks | portal look 112 ns a hit | yes |
 | 2026-11-24 | dusk: obsidian, the portal on the pier, its look, its lamp, its motes; `--shot 5` | — | yes |
 

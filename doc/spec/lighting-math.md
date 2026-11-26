@@ -1,6 +1,6 @@
 # Lighting mathematics
 
-The authoritative formulas behind `doc/LIGHTING.md`. Rule: **a formula enters the engine only with an independent
+The authoritative formulas behind `doc/spec/lighting.md`. Rule: **a formula enters the engine only with an independent
 check** — a deterministic numerical integral in f64 (compensated summation), a closed form derived a second way, or
 a conservation law. f32 code is then checked against the f64 code with a stated ULP/relative error budget.
 

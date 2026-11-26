@@ -20,7 +20,7 @@ the limits of each part are written next to it, and in the part's own README or 
 4. **Render abstraction** (layer 5): [done, with limits] scene data and extraction, a byte-serialisable command stream,
    a render graph (validation, culling, ordering, lifetimes, aliasing, report), a deterministic tile-rasterising CPU
    backend with PBR through the lighting library, ray shadows, mip-mapped textures in linear light and
-   `LightExplain`; see `doc/RENDERING.md`. Limits: hard shadows only, no anti-aliasing, reflections are a sky lookup;
+   `LightExplain`; see `doc/spec/rendering.md`. Limits: hard shadows only, no anti-aliasing, reflections are a sky lookup;
    a path-tracing reference for shortcuts is not written.
 5. **GPU**: Vulkan backend on smalt, lighting v2, shadow maps. [not started: blocked on offscreen render targets in
    smalt, which are an upstream change. The command stream and the render graph are the interface it will implement.]

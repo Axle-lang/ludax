@@ -7,11 +7,11 @@ are given in symbols (defined per entry); measured figures are quoted with their
 in comments appear). Paths are relative to the repository root; `src/data/...` is layer 2, `src/voxel/...` layer 7.
 
 Existing documents referred to in the `Docs` lines:
-`doc/CORE_EXTRACTION.md` (API table of the extracted generic modules, lines 34-37), `doc/REVIEW_CORE.md` (review of
+`doc/handbook/history/core-extraction.md` (API table of the extracted generic modules, lines 34-37), `doc/handbook/history/core-review.md` (review of
 those modules with before/after timings, lines 285-308), `doc/handbook/render/02-visibility.md` (the ray walk of
 the renderer), `doc/handbook/render/09-baked-shadows.md` (the baked shell of the blockland renderer),
 `doc/handbook/render/13-dusk.md` and `doc/handbook/concepts/04-complexity-ledger.md` (memory of the flood),
-`doc/LIGHTING.md` and `doc/LIGHTING_MATH.md` (the plan of the lighting library). No chapter of the handbook is
+`doc/spec/lighting.md` and `doc/spec/lighting-math.md` (the plan of the lighting library). No chapter of the handbook is
 dedicated to `src/data` or to `src/voxel/light`; those entries say `MISSING` unless a document is named.
 
 ---------------------------------------------------------------------------------------------------------------
@@ -99,18 +99,18 @@ dedicated to `src/data` or to `src/voxel/light`; those entries say `MISSING` unl
 - **Mathematics:** a canonical code: with `count[l]` codes of length `l`, `first_l = (first_{l-1} + count_{l-1}) << 1`; a code `c` of length `l` is symbol `symbol[index_l + (c - first_l)]` when `c - first_l < count[l]` (`decode`). Over-subscription test `left = (left << 1) - count[l] < 0` (`construct`). Header: method `CMF & 15 == 8`, `(CMF*256 + FLG) % 31 == 0`, no preset dictionary; the trailer Adler-32 is checked.
 - **Instructions:** `bits(1)` per code bit (each a `ByteBuf.get`); every match is copied one byte at a time through `out.push(out.get(...))` (correct for overlapping matches); `zlib()` allocates a private copy of the input and a fresh output buffer; `maxOutput` caps the output.
 - **Cost:** O(n_out + total code bits); up to 15 `bits(1)` calls per symbol; allocation per call. No measured figure in code.
-- **Why this and not another:** the header: "short enough to check against the specification line by line". `doc/REVIEW_CORE.md:285-291` says it is kept only for `src/voxel/world/region.axle`, a game importer and two test checks until they migrate to `FastInflater::zlibVerified`.
+- **Why this and not another:** the header: "short enough to check against the specification line by line". `doc/handbook/history/core-review.md:285-291` says it is kept only for `src/voxel/world/region.axle`, a game importer and two test checks until they migrate to `FastInflater::zlibVerified`.
 - **Where:** `src/data/image/inflate.axle:159` (`zlib`), `:267` (`construct`), `:304` (`decode`).
-- **Docs:** `doc/REVIEW_CORE.md:285-291` (status only).
+- **Docs:** `doc/handbook/history/core-review.md:285-291` (status only).
 
 ### D-10. I want to decompress deflate data at hundreds of MB/s with no allocation once warm
 - **Means:** `FastInflater`: a 64-bit bit buffer, a 10-bit direct lookup table per code, a hot loop on locals entered only when 8 input bytes and 258 output bytes are certain.
 - **Mathematics:** table entry `(symbol << 4) | length` stored at index `reverse(code, l) + k * 2^l` for all `k` (the stream is LSB-first and codes MSB-first, so the code is bit-reversed and replicated over the unused high index bits); codes longer than 10 bits (`FAST_INFLATER_FAST_BITS`) fall back to the canonical walk `decodeSlow`. Bit budget of one symbol in the fast loop: at most 48 of the 57 bits a refill gives (comment at `:644-649`).
 - **Instructions:** refill loop `while bc <= 56: bb |= byte << bc`; literal: one table load, store, `outLen++`; match: length base + extra bits, distance table load, `dist > outLen` check, then `memcpy` when `len <= dist && len >= 24` else a forward byte loop; a symbol it must give up (long code, little room) is un-read and passed to the careful `step`; three 1024-entry `i32` tables (literal, distance, code-length); the fixed-Huffman tables are kept between blocks (`fixedBuilt`).
-- **Cost:** O(n_out + n_in). Memory: 3 x 4 KiB tables, `input`/`output` work arrays of 64 KiB each at start (output doubles up to `maxOutput`, clamped to 2^30), plus one `memcpy` of input in and one of output out. Measured (`doc/REVIEW_CORE.md:296-297`): 515-530 MB/s on 4 MiB of text-like data (was 440 MB/s), 11 GB/s on long matches; `ZipReader` 2000 entries 312 MB/s (`:307`).
+- **Cost:** O(n_out + n_in). Memory: 3 x 4 KiB tables, `input`/`output` work arrays of 64 KiB each at start (output doubles up to `maxOutput`, clamped to 2^30), plus one `memcpy` of input in and one of output out. Measured (`doc/handbook/history/core-review.md:296-297`): 515-530 MB/s on 4 MiB of text-like data (was 440 MB/s), 11 GB/s on long matches; `ZipReader` 2000 entries 312 MB/s (`:307`).
 - **Why this and not another:** `inflate_fast.axle:3-9` ("right for a PNG and wrong for a game that loads thousands of 100 KB chunks"); the `i8[]` of a `ByteBuf` cannot be stored in a field (double free), hence the two copies (`:252-254`).
 - **Where:** `src/data/image/inflate_fast.axle:650` (`codesFast`), `:499` (`decode`), `:389` (`construct`), `:435` (`fillTables`), `:284` (`refill`), `:312` (`room`).
-- **Docs:** `doc/REVIEW_CORE.md:285-308` (figures), `doc/CORE_EXTRACTION.md:45-46`; the algorithm itself MISSING.
+- **Docs:** `doc/handbook/history/core-review.md:285-308` (figures), `doc/handbook/history/core-extraction.md:45-46`; the algorithm itself MISSING.
 
 ### D-11. I want raw deflate, zlib and gzip streams decoded by one core, with the checksum optional
 - **Means:** three thin wrappers (`raw`, `zlib`, `gzip`) over `begin` / `blocks` / `finish`, plus `zlibVerified` that adds the Adler check.
@@ -134,10 +134,10 @@ dedicated to `src/data` or to `src/voxel/light`; those entries say `MISSING` unl
 - **Means:** forward byte loop when `len > dist` (the source runs into freshly written bytes), `memcpy` when the ranges cannot overlap.
 - **Mathematics:** the copy `out[p + k] = out[p - dist + k]` for `k = 0..len-1` read in increasing `k` gives the repeated pattern of period `dist`; `memcpy` is correct only when `len <= dist`.
 - **Instructions:** the threshold `len >= 24` (`FAST_INFLATER_BLOCK_COPY`; `LZ4_BLOCK_COPY = 16` for LZ4) decides when the call overhead pays.
-- **Cost:** O(len); the compiler already vectorises the byte loop on long runs (`doc/REVIEW_CORE.md:297`: 11 GB/s on long matches).
+- **Cost:** O(len); the compiler already vectorises the byte loop on long runs (`doc/handbook/history/core-review.md:297`: 11 GB/s on long matches).
 - **Why this and not another:** comments at `inflate_fast.axle:729`, `lz4.axle:143`, `:180`.
 - **Where:** `src/data/image/inflate_fast.axle:729-737`; `src/data/codec/lz4.axle:180-188`.
-- **Docs:** `doc/REVIEW_CORE.md:296-299` (figures only).
+- **Docs:** `doc/handbook/history/core-review.md:296-299` (figures only).
 
 ### D-14. I want to compress bytes into a valid zlib stream without a table to transmit
 - **Means:** `Deflater`: greedy LZ77 over a 32 KiB window with a 3-byte hash and a bounded chain, coded with the fixed Huffman tables of RFC 1951; falls back to stored blocks.
@@ -161,19 +161,19 @@ dedicated to `src/data` or to `src/voxel/light`; those entries say `MISSING` unl
 - **Means:** `Lz4::decode`: parse the block framing, then a token loop copying literals and matches.
 - **Mathematics:** block header 21 bytes: magic `LZ4Block`, token (`0x10` stored, `0x20` LZ4), compressed length, plain length (both little-endian), 4-byte checksum; a block of plain length 0 ends the stream. Token: high nibble = literal length, low nibble = match length - 4, each extended by bytes of 255 while the nibble is 15; then literals, a 2-byte little-endian offset (`offset == 0` or `> op` is damage).
 - **Instructions:** literal runs `>= 16` bytes by `memcpy`, shorter by a loop; overlapping match forward loop, `len <= offset && len >= 16` by `memcpy`; checksums are not verified.
-- **Cost:** O(n_out); no allocation (output `reserve`d from the declared plain length after `blockFits`). Measured (`doc/REVIEW_CORE.md:298-299`): text decode 650-720 MB/s, long-match decode 22-24 GB/s.
+- **Cost:** O(n_out); no allocation (output `reserve`d from the declared plain length after `blockFits`). Measured (`doc/handbook/history/core-review.md:298-299`): text decode 650-720 MB/s, long-match decode 22-24 GB/s.
 - **Why this and not another:** header: checksums skipped for the same reason as `FastInflater`; a stream without the end block is refused as cut.
 - **Where:** `src/data/codec/lz4.axle:59` (`decode`), `:121` (`block`), `:97` (`blockFits`).
-- **Docs:** `doc/CORE_EXTRACTION.md:36`, `doc/REVIEW_CORE.md:298-299` (figures); the format MISSING.
+- **Docs:** `doc/handbook/history/core-extraction.md:36`, `doc/handbook/history/core-review.md:298-299` (figures); the format MISSING.
 
 ### D-17. I want to compress with LZ4 several times faster than zlib, at a larger size
 - **Means:** greedy matcher over a 4096-entry hash of 4-byte prefixes, 64 KiB blocks, raw block when it does not shrink.
 - **Mathematics:** hash `(word * -1640531535) >>> 20` (the signed form of 2654435761, 12 bits); a match needs `ip - ref <= 65535` and equal 4-byte words, extended while `ip + len < end - 5`; the last 12 bytes (`LZ4_MF_LIMIT`) are literals; sequence = token, literal extension, literals, 2-byte offset, match extension.
 - **Instructions:** the table (16 KiB `i32[4096]`) is caller scratch, reset to -1 per block; on a miss `ip + 1` (no skip acceleration); positions inside a matched run are not inserted; a block is compressed straight into `out` behind its header and the length patched afterwards; XXH32 per block written (D-18).
-- **Cost:** O(n) with one table probe per position; no allocation. Measured (`doc/REVIEW_CORE.md:298`): text encode 440-520 MB/s ("noise level: the loop is branch-bound"). Region comment: "several times faster for a file about a third larger" (`region_file.axle:551-553`).
+- **Cost:** O(n) with one table probe per position; no allocation. Measured (`doc/handbook/history/core-review.md:298`): text encode 440-520 MB/s ("noise level: the loop is branch-bound"). Region comment: "several times faster for a file about a third larger" (`region_file.axle:551-553`).
 - **Why this and not another:** the checksum is written because "readers of the format (the JVM's among them) verify" it (`lz4.axle:7-8`).
 - **Where:** `src/data/codec/lz4.axle:348` (`encode`), `:302` (`compressBlock`), `:263` (`sequence`).
-- **Docs:** `doc/CORE_EXTRACTION.md:36`, `doc/REVIEW_CORE.md:298`.
+- **Docs:** `doc/handbook/history/core-extraction.md:36`, `doc/handbook/history/core-review.md:298`.
 
 ### D-18. I want the XXH32 hash of a byte range
 - **Means:** the XXH32 algorithm (four lanes of 16 bytes, then 4-byte and 1-byte tails, avalanche).
@@ -277,19 +277,19 @@ dedicated to `src/data` or to `src/voxel/light`; those entries say `MISSING` unl
 - **Means:** `ZipReader`: read only the central directory (found by scanning back from the end), then one positional read plus one inflate per entry.
 - **Mathematics:** the end record `0x06054b50` is searched backwards in the last `22 + 65535` bytes; a central record is 46 fixed bytes + name + extra + comment; entry offsets, packed and plain sizes are `i32`; names interned (`StringInterner`), numbers in flat arrays.
 - **Instructions:** every directory number is checked against the directory and file length; zip64, encryption and methods other than 0 and 8 are refused (a read of such an entry fails); a duplicated name keeps its own index and `find` answers the first; `read` reads the 30-byte local header to get its real name and extra lengths, then the data.
-- **Cost:** open O(file tail <= 64 KiB + directory + entries); about 2 MB for 30 000 entries (`zip_reader.axle:15-16`); read O(packed + out). Measured (`doc/REVIEW_CORE.md:307`): 2000 deflated entries, 133 000 entries/s, 312 MB/s.
+- **Cost:** open O(file tail <= 64 KiB + directory + entries); about 2 MB for 30 000 entries (`zip_reader.axle:15-16`); read O(packed + out). Measured (`doc/handbook/history/core-review.md:307`): 2000 deflated entries, 133 000 entries/s, 312 MB/s.
 - **Why this and not another:** header lines 1-9.
 - **Where:** `src/data/archive/zip_reader.axle:105` (`readDirectory`), `:167` (`readRecord`), `:199` (`read`).
-- **Docs:** `doc/CORE_EXTRACTION.md:45-46` (suite names), `doc/REVIEW_CORE.md:307` (figure).
+- **Docs:** `doc/handbook/history/core-extraction.md:45-46` (suite names), `doc/handbook/history/core-review.md:307` (figure).
 
 ### D-29. I want to find one chunk among 1024 in a region file and read it
 - **Means:** a location table (3-byte sector offset, 1-byte sector count) indexed by `(z & mask) << sideBits | (x & mask)`, then one seek.
 - **Mathematics:** `slot = ((cz & 31) << 5) | (cx & 31)`; `loc = first << 8 | count`; byte offset `first << 12`; record = 4-byte big-endian length, 1-byte compression type, payload. Header = 2 tables of `1024 * 4` bytes, each rounded to sectors (`headerSectors = 2 * ceil(4096 / 4096) = 2`). External flag `0x80` in the type byte.
 - **Instructions:** `readPayload` does the only disk access (one `fread` of `count << 12` bytes, clamped to the file length) and copies the payload with `pushRange`; `read` then decompresses with the caller's `RegionScratch`. The split lets a loader read on one thread and decompress on many (`:365-369`).
-- **Cost:** O(record) per read, nothing allocated once `scratch` and the output are warm; per open file 2 x 1024 `i32` (8 KiB) + a body buffer of 16 KiB. Measured (`doc/REVIEW_CORE.md:306`): 100 KB chunk read 160 us (was 225-240), write 2150 us (was 2300-2500).
+- **Cost:** O(record) per read, nothing allocated once `scratch` and the output are warm; per open file 2 x 1024 `i32` (8 KiB) + a body buffer of 16 KiB. Measured (`doc/handbook/history/core-review.md:306`): 100 KB chunk read 160 us (was 225-240), write 2150 us (was 2300-2500).
 - **Why this and not another:** the layout is a parameter (`RegionFormat`: side bits, sector bits, max sectors, flag, type numbers, extensions); the entry layout 24-bit/8-bit is fixed (`region_file.axle:9-13`).
 - **Where:** `src/data/archive/region_file.axle:331` (`slotOfAs`), `:370` (`readPayload`), `:461` (`decompressAs`).
-- **Docs:** `doc/CORE_EXTRACTION.md:37`, `doc/REVIEW_CORE.md:306`.
+- **Docs:** `doc/handbook/history/core-extraction.md:37`, `doc/handbook/history/core-review.md:306`.
 
 ### D-30. I want to choose how a chunk is compressed per write (zlib, gzip, stored, LZ4)
 - **Means:** `RegionFile::compress` / `decompressAs` dispatch on the type number held in the `RegionFormat`.
@@ -298,7 +298,7 @@ dedicated to `src/data` or to `src/voxel/light`; those entries say `MISSING` unl
 - **Cost:** see D-10, D-14, D-16, D-17; the comment ranks them: zlib smallest, LZ4 "several times faster for a file about a third larger", stored fastest and biggest (`region_file.axle:550-554`). The convenience `write` always uses zlib.
 - **Why this and not another:** same comment.
 - **Where:** `src/data/archive/region_file.axle:555` (`compress`), `:461` (`decompressAs`), `:105` (`RegionScratch`).
-- **Docs:** `doc/CORE_EXTRACTION.md:37`.
+- **Docs:** `doc/handbook/history/core-extraction.md:37`.
 
 ### D-31. I want to rewrite a chunk in a region file so a crash leaves the old one intact
 - **Means:** sector map + first-fit allocation; a moved record is written to its new run while the old run stays reserved, and the old run is freed only after the write.
@@ -307,7 +307,7 @@ dedicated to `src/data` or to `src/voxel/light`; those entries say `MISSING` unl
 - **Cost:** `allocate` O(S) sectors scanned; the sector map costs 1 byte per sector; a rewrite in place has no crash protection (`:22-25`).
 - **Why this and not another:** header lines 15-25.
 - **Where:** `src/data/archive/region_file.axle:581` (`writePayload`), `:524` (`allocate`), `:495` (`buildSectorMap`), `:509` (`mark`), `:617` (`storeRecord`), `:682` (`flush`).
-- **Docs:** `doc/REVIEW_CORE.md:37` (the earlier finding about crash safety); the mechanism MISSING.
+- **Docs:** `doc/handbook/history/core-review.md:37` (the earlier finding about crash safety); the mechanism MISSING.
 
 ### D-32. I want a chunk bigger than the region file may hold to be stored beside it
 - **Means:** external flag: when `count > maxSectors` (255, about 1 MiB) the record in the region is 1 sector with length 1 and `type | 0x80`, and the payload goes to `c.<cx>.<cz>.mcc`.
@@ -322,17 +322,17 @@ dedicated to `src/data` or to `src/voxel/light`; those entries say `MISSING` unl
 - **Means:** `NbtReader`, a pull parser over a `ByteBuf`: `readRoot`, `while next() { if nameIs(..) read.. else skipValue() }`.
 - **Mathematics:** none: plain arithmetic. All numbers big-endian; strings read as plain UTF-8 (Modified UTF-8 differs only for NUL and outside the basic plane).
 - **Instructions:** `nameIs` compares bytes in place (no string); fixed-size lists and arrays are skipped in one step (`size = fixedSize(type)`, cursor `+= count * size`); compounds and lists recurse with depth `<= 512` (`NBT_NESTING_LIMIT`); a read past the end sets `failed` and answers 0.
-- **Cost:** O(bytes visited); skipping a fixed array is O(1). Measured (`doc/REVIEW_CORE.md:308`): 3-4 us for a 66 KB walk at `-O 3`.
+- **Cost:** O(bytes visited); skipping a fixed array is O(1). Measured (`doc/handbook/history/core-review.md:308`): 3-4 us for a 66 KB walk at `-O 3`.
 - **Why this and not another:** header: "building the tree would allocate a node per tag".
 - **Where:** `src/data/serial/nbt_reader.axle:189` (`next`), `:212` (`nameIs`), `:256` (`skipOf`), `:307` (`skipList`).
-- **Docs:** `doc/CORE_EXTRACTION.md:34`, `doc/REVIEW_CORE.md:308`.
+- **Docs:** `doc/handbook/history/core-extraction.md:34`, `doc/handbook/history/core-review.md:308`.
 
 ### D-34. I want a hostile NBT count to fail instead of wrapping to a small number
 - **Means:** sizes are checked by division against the bytes left; the product is never formed unless it fits.
 - **Mathematics:** accept `count` items of `size` bytes only if `0 <= count <= (end - cursor) / size`; a single `n` bytes only if `n <= end - cursor`.
 - **Instructions:** `need` and `needItems` set `damaged` and answer false; every loop of the reader ends when the buffer does.
 - **Cost:** one division per array header.
-- **Why this and not another:** header: "so a hostile count cannot wrap around 32 bits into a small number"; `doc/REVIEW_CORE.md:66` records the earlier overflow.
+- **Why this and not another:** header: "so a hostile count cannot wrap around 32 bits into a small number"; `doc/handbook/history/core-review.md:66` records the earlier overflow.
 - **Where:** `src/data/serial/nbt_reader.axle:139` (`need`), `:150` (`needItems`).
 - **Docs:** MISSING.
 
@@ -352,16 +352,16 @@ dedicated to `src/data` or to `src/voxel/light`; those entries say `MISSING` unl
 - **Cost:** O(bytes written).
 - **Why this and not another:** header.
 - **Where:** `src/data/serial/nbt_writer.axle:64`, `:143`, `:176`; `src/data/serial/nbt_reader.axle:230` (`entryStart`), `:562` (`copyRaw`).
-- **Docs:** `doc/CORE_EXTRACTION.md:35`.
+- **Docs:** `doc/handbook/history/core-extraction.md:35`.
 
 ### D-37. I want names looked up as integers from many threads at once with no allocation
 - **Means:** `NameTable`: immutable flat arrays (a name blob, an offset array, an open-addressing table of indices); lookup hashes the bytes where they sit.
 - **Mathematics:** FNV-1a 32-bit (`offset 2166136261`, `prime 16777619`) `h = (h ^ byte) * prime`; slot `= h & mask`, linear probe `slot = (slot + 1) & mask`; the table doubles when `(count + 1) * 2 > table.length`, so the load factor stays `<= 1/2`; indices in insertion order.
 - **Instructions:** `findBytes(buf, from, to)` takes a range of a decoded buffer; `same` compares bytes; `add` is single-threaded.
-- **Cost:** lookup O(name length) with O(1) expected probes; memory `blob` + 4 bytes per name for `offsets` + at least 8 bytes per name for `table`. Measured (`doc/REVIEW_CORE.md:305`): 40 Mlookups/s on 10 000 names.
+- **Cost:** lookup O(name length) with O(1) expected probes; memory `blob` + 4 bytes per name for `offsets` + at least 8 bytes per name for `table`. Measured (`doc/handbook/history/core-review.md:305`): 40 Mlookups/s on 10 000 names.
 - **Why this and not another:** header lines 1-12: an interner's reference counts are not atomic ("corrupts them") in Axle 0.18.3, so several threads cannot share a `StringMap`.
 - **Where:** `src/data/serial/name_table.axle:57` (`hashRaw`), `:93` (`findBytes`), `:115` (`addBytes`), `:169` (`rehash`).
-- **Docs:** `doc/REVIEW_CORE.md:305`, `doc/CORE_EXTRACTION.md:45`.
+- **Docs:** `doc/handbook/history/core-review.md:305`, `doc/handbook/history/core-extraction.md:45`.
 
 ### D-38. I want to parse JSON exactly as RFC 8259 defines it, with a line and column in the error
 - **Means:** recursive-descent parser into a `JsonDoc` arena.
@@ -634,14 +634,14 @@ dedicated to `src/data` or to `src/voxel/light`; those entries say `MISSING` unl
 - **Cost:** a save is "three chunks long" for three edited chunks (`persist.axle:3-6`); edit-layer memory is the sum of encoded chunks (`editBytes`).
 - **Why this and not another:** header lines 1-11.
 - **Where:** `src/voxel/world/world.axle:99` (`loadBatch`), `:196` (`unloadChunk`), `:212` (`setBlock`), `:252` (`commitEdits`).
-- **Docs:** `doc/ROADMAP.md:40-41` (one-line status); the mechanism MISSING.
+- **Docs:** `doc/roadmap.md:40-41` (one-line status); the mechanism MISSING.
 
 ### D-67. I want the world's edits saved in one checksummed file and loaded all or nothing
 - **Means:** `VoxRegion` ("VXRG" v1): header, a table of 28-byte entries, a CRC-32 of the table, then one zlib stream per chunk.
 - **Mathematics:** entry = cx, cy, cz, payload offset, payload length, raw length, CRC-32 of the payload (all `i32` little-endian); file size `12 + 28 N + 4 + sum(payload)`; `load` checks magic, version, `N <= 1 000 000`, the table CRC, every payload range and CRC, no duplicate key; a payload is inflated only when read, with its length compared to the table.
 - **Instructions:** `add` deflates with `Deflater` (D-14); `read` inflates with the bit-at-a-time `Inflater` (D-09); a damaged region is rejected whole.
 - **Cost:** load O(file) for the CRCs; read O(chunk).
-- **Why this and not another:** header lines 1-17; the choice of `Inflater` over `FastInflater` here is not explained (see Doubts and `doc/REVIEW_CORE.md:285-291`).
+- **Why this and not another:** header lines 1-17; the choice of `Inflater` over `FastInflater` here is not explained (see Doubts and `doc/handbook/history/core-review.md:285-291`).
 - **Where:** `src/voxel/world/region.axle:105` (`add`), `:132` (`read`), `:150` (`toBytes`), `:193` (`load`); `src/voxel/world/persist.axle:16-37`.
 - **Docs:** MISSING.
 
@@ -789,9 +789,9 @@ dedicated to `src/data` or to `src/voxel/light`; those entries say `MISSING` unl
 - **Mathematics:** `raw(d) = 1 / (1 + (d/r)^2)`, `S(d) = (raw(d) - raw(R)) / (1 - raw(R))` for `d < R`, `0` from `d = R`; `S(0) = 1`, strictly decreasing, `~ r^2/d^2` for `r << d << R`; level `= (E * m * S16(d) + 2^31) >> 32` where `E` is the strength and `m` a 16.16 transmittance product (`VOX_MULT_ONE = 65536`). The standard torch is `r = 2`, `R = 32` cells.
 - **Instructions:** the table is computed in `f64` with divisions only (no libm), so bit-identical everywhere; one table shared by the channels.
 - **Cost:** 256 `i32` (1 KiB); `level` is one multiply-add-shift.
-- **Why this and not another:** header lines 1-12 (the earlier straight line of 16 levels is replaced). `doc/LIGHTING_MATH.md:30` describes a different window `sat(1 - (d/R)^4)^2`, "off by default for voxel flood calibration".
+- **Why this and not another:** header lines 1-12 (the earlier straight line of 16 levels is replaced). `doc/spec/lighting-math.md:30` describes a different window `sat(1 - (d/R)^4)^2`, "off by default for voxel flood calibration".
 - **Where:** `src/voxel/light/curve.axle:49` (constructor), `:77` (`ideal`), `:98` (`level`).
-- **Docs:** `doc/LIGHTING_MATH.md:30`, `:69-70` (one line each); the formula itself is only in the code header.
+- **Docs:** `doc/spec/lighting-math.md:30`, `:69-70` (one line each); the formula itself is only in the code header.
 
 ### D-84. I want the light of every cell from every lamp, as a plain sum that an edit can undo exactly
 - **Means:** block light = integer sum over lamps of each lamp's own field, each field a breadth-first flood.
@@ -800,7 +800,7 @@ dedicated to `src/data` or to `src/voxel/light`; those entries say `MISSING` unl
 - **Cost:** per lamp per channel O(cells within path length < R) x 6 neighbour tests (in open air about `4 R^3 / 3` cells: derived, the L1 ball); 8 `i32` planes = 32 bytes per cell for the whole flood (315 MB for 9.8 M cells, `world.axle:190-191`).
 - **Why this and not another:** header lines 3-34: a per-cell "brightest wins" flood (the first design) is wrong with an inverse-square curve because "which of two states is better depends on how far the light still has to go", so incremental removal could not restore what a rebuild gives; superposition and integer addition are exactly invertible.
 - **Where:** `src/voxel/light/flood.axle:435` (`spread`), `:412` (`floodLamp`), `:219` (`rebuild`).
-- **Docs:** MISSING (the reasoning is only in the file header; `doc/LIGHTING.md` section 5 names the idea).
+- **Docs:** MISSING (the reasoning is only in the file header; `doc/spec/lighting.md` section 5 names the idea).
 
 ### D-85. I want to place or remove a block or lamp without re-flooding the world
 - **Means:** `beginEdit` / `endEdit`: subtract the fields of every lamp the cell can reach, change the scene, add them back.
@@ -849,12 +849,12 @@ dedicated to `src/data` or to `src/voxel/light`; those entries say `MISSING` unl
 
 ### D-90. I want an even, repeatable fan of directions over a disc (the sun) or a hemisphere (the sky)
 - **Means:** Vogel's golden-angle sunflower spiral (named in the header), 16 turned copies chosen by a hash of the cell.
-- **Mathematics:** disc point `i` of `n`: `r = sqrt((i + 0.5) / n)`, `angle = 2.39996322972865332 i + turn`, `(r cos, r sin)` (equal area each); hemisphere direction `(r cos, sqrt(1 - u), r sin)` with `u = (i + 0.5)/n`, `r = sqrt(u)`: cosine weighted (`doc/LIGHTING_MATH.md:71` names this Malley's method); `turn = 2 pi k / 16`; copy `k = hashCombine(hashCombine(hashMix x, hashMix y), hashMix z) & 15`.
+- **Mathematics:** disc point `i` of `n`: `r = sqrt((i + 0.5) / n)`, `angle = 2.39996322972865332 i + turn`, `(r cos, r sin)` (equal area each); hemisphere direction `(r cos, sqrt(1 - u), r sin)` with `u = (i + 0.5)/n`, `r = sqrt(u)`: cosine weighted (`doc/spec/lighting-math.md:71` names this Malley's method); `turn = 2 pi k / 16`; copy `k = hashCombine(hashCombine(hashMix x, hashMix y), hashMix z) & 15`.
 - **Instructions:** all `16 n` rays precomputed in an `f64[]` (3 per ray); copy 0 is the unturned fan used by analytic tests.
 - **Cost:** `384 n` bytes (`n = 64` gives 24 576 bytes per fan); lookup O(1).
 - **Why this and not another:** header: "a fan of n rays on a plain spiral gives n+1 visible shades of penumbra and bands"; a hash of position (never of time) means a cell's answer never flickers while neighbours do not share their bands.
 - **Where:** `src/voxel/light/pattern.axle:33` (`disc`), `:50` (`hemisphere`), `:102` (`copyFor`).
-- **Docs:** `doc/LIGHTING_MATH.md:71` (names the hemisphere method only).
+- **Docs:** `doc/spec/lighting-math.md:71` (names the hemisphere method only).
 
 ### D-91. I want soft sun shadows from a fan of rays over the sun's disc
 - **Means:** `VoxBakeKernel::sunAt`: the mean survival of `n` rays from the cell centre towards points of the sun's disc.
@@ -863,7 +863,7 @@ dedicated to `src/data` or to `src/voxel/light`; those entries say `MISSING` unl
 - **Cost:** `n * k` cells per baked cell (`k` cells walked per ray, up to `reach`).
 - **Why this and not another:** header: "a shadow edge is as wide as the disc says"; no shadow map.
 - **Where:** `src/voxel/light/bake.axle:247` (`sunAt`), `:182` (`buildSunFrame`), `:154` (`configure`).
-- **Docs:** `doc/LIGHTING_MATH.md:25-27` (the penumbra rule, not this code).
+- **Docs:** `doc/spec/lighting-math.md:25-27` (the penumbra rule, not this code).
 
 ### D-92. I want the share of the sky a cell sees and the colour the sky rays met (bounce tint)
 - **Means:** `skyAt`: mean survival and mean colour of a cosine-weighted hemisphere fan from the cell centre.
@@ -872,7 +872,7 @@ dedicated to `src/data` or to `src/voxel/light`; those entries say `MISSING` unl
 - **Cost:** `n * k` per baked cell, default `n = 64`.
 - **Why this and not another:** not documented.
 - **Where:** `src/voxel/light/bake.axle:271` (`skyAt`), `:299` (`voxByte`).
-- **Docs:** `doc/LIGHTING_MATH.md:71-72`.
+- **Docs:** `doc/spec/lighting-math.md:71-72`.
 
 ### D-93. I want sky light that is 255 under open sky, dims through leaves and glass, and spreads sideways into overhangs
 - **Means:** per-column seeds found by scanning down, then a "brightest wins" flood losing `skyStep` per cell.
@@ -988,11 +988,11 @@ dedicated to `src/data` or to `src/voxel/light`; those entries say `MISSING` unl
 
 | Mechanism | File | What is not written down anywhere in `doc/` |
 |---|---|---|
-| Light as a sum of per-lamp fields, the order "shorter then brighter" and why a per-cell maximum fails | `src/voxel/light/flood.axle:1-38` | Only in the file header: no handbook chapter (`doc/LIGHTING.md` section 5 names the idea without the reasoning); the cost per lamp, the lamp-reach test, the 32 bytes per cell |
-| Windowed inverse-square table `S(d)`, the 16.16 level formula, the standard `r = 2`, `R = 32` | `src/voxel/light/curve.axle` | Formula only in the header; `doc/LIGHTING_MATH.md:30` shows a different window |
+| Light as a sum of per-lamp fields, the order "shorter then brighter" and why a per-cell maximum fails | `src/voxel/light/flood.axle:1-38` | Only in the file header: no handbook chapter (`doc/spec/lighting.md` section 5 names the idea without the reasoning); the cost per lamp, the lamp-reach test, the 32 bytes per cell |
+| Windowed inverse-square table `S(d)`, the 16.16 level formula, the standard `r = 2`, `R = 32` | `src/voxel/light/curve.axle` | Formula only in the header; `doc/spec/lighting-math.md:30` shows a different window |
 | Sky light seeds, two-pass removal and its supportedness invariant | `src/voxel/light/flood.axle:544-606` | Invariant only in a code comment |
 | Brick/chunk "ever filled" flags and the region skip in `VoxRayTracer` | `src/voxel/light/grid.axle`, `trace.axle` | `doc/handbook/render/02-visibility.md` documents the renderer's skips, not these |
-| Sunflower fans, the 16 turned copies, the penumbra rule as implemented | `src/voxel/light/pattern.axle`, `bake.axle` | Only comments; `doc/LIGHTING_MATH.md:25-27` gives the rule for the plan |
+| Sunflower fans, the 16 turned copies, the penumbra rule as implemented | `src/voxel/light/pattern.axle`, `bake.axle` | Only comments; `doc/spec/lighting-math.md:25-27` gives the rule for the plan |
 | Surface shell with a popcount rank and stale flags | `src/voxel/light/surface.axle` | Only the renderer's shell is documented (`render/09-baked-shadows.md`); the 1.8 MB versus 39 MB figure lives only in a comment |
 | Light bridge: window, journal feed, rebuild-on-slide | `src/voxel/world/bridge.axle` | Header only |
 | Palette-packed chunk storage (0/4/8/16 bits), widening and compaction | `src/voxel/world/chunk.axle` | Header only; no bytes-per-cell table |
@@ -1000,12 +1000,12 @@ dedicated to `src/data` or to `src/voxel/light`; those entries say `MISSING` unl
 | Streamer: counting-sorted disc, hysteresis, budgets | `src/voxel/world/streamer.axle` | Header only |
 | Terrain constants (heights, thresholds, tree cell 6, reach 2) | `src/voxel/world/terrain.axle:26-130` | Nothing in `doc/` for this generator |
 | Edit-layer region file "VXRG" layout | `src/voxel/world/region.axle:1-17` | Header only |
-| Fast inflate: table construction, bit budget of the hot loop, copy thresholds | `src/data/image/inflate_fast.axle` | Figures in `doc/REVIEW_CORE.md:296-308`; the algorithm only in comments |
+| Fast inflate: table construction, bit budget of the hot loop, copy thresholds | `src/data/image/inflate_fast.axle` | Figures in `doc/handbook/history/core-review.md:296-308`; the algorithm only in comments |
 | Greedy deflate encoder (chain 24, window 32 KiB, fixed codes, stored fallback) | `src/data/image/deflate.axle` | Header only |
-| LZ4 framing and encoder choices (4096-entry table, no skip acceleration, raw fallback) | `src/data/codec/lz4.axle` | Only API rows in `doc/CORE_EXTRACTION.md:36` |
-| Region file sector allocation, crash-safe move, external chunks | `src/data/archive/region_file.axle` | `doc/CORE_EXTRACTION.md:37` (API); `doc/REVIEW_CORE.md:37` (a finding already acted on) |
-| NBT pull parser protocol and hostile-count rules | `src/data/serial/nbt_reader.axle` | `doc/CORE_EXTRACTION.md:34`; the protocol only in a header |
-| `NameTable` hash, load factor and thread-safety argument | `src/data/serial/name_table.axle` | Header only; 40 Mlookups/s in `doc/REVIEW_CORE.md:305` |
+| LZ4 framing and encoder choices (4096-entry table, no skip acceleration, raw fallback) | `src/data/codec/lz4.axle` | Only API rows in `doc/handbook/history/core-extraction.md:36` |
+| Region file sector allocation, crash-safe move, external chunks | `src/data/archive/region_file.axle` | `doc/handbook/history/core-extraction.md:37` (API); `doc/handbook/history/core-review.md:37` (a finding already acted on) |
+| NBT pull parser protocol and hostile-count rules | `src/data/serial/nbt_reader.axle` | `doc/handbook/history/core-extraction.md:34`; the protocol only in a header |
+| `NameTable` hash, load factor and thread-safety argument | `src/data/serial/name_table.axle` | Header only; 40 Mlookups/s in `doc/handbook/history/core-review.md:305` |
 | glTF accessor validation chain and normalised-integer rule | `src/data/model/gltf_file.axle` | Header only |
 | Animation sampling (Hermite, slerp, key search) | `src/data/model/model_anim.axle` | Header only |
 | `.bbmodel` rotation baking and uv corner rotation | `src/data/model/bbmodel_import.axle` | Header only |
@@ -1018,7 +1018,7 @@ dedicated to `src/data` or to `src/voxel/light`; those entries say `MISSING` unl
 
 1. `src/data/model/ieee.axle:3-5` says "Axle has no reinterpreting cast", but `src/data/serial/nbt_reader.axle:425-440` (`readFloat`, `readDouble`) reinterprets bits with an `unsafe` pointer cast. One of the two is stale or the second path was added later; `Ieee::bitsOf` also costs a loop of `pow2` calls per value (`ieee.axle:68-93`) where a cast would be O(1).
 2. `src/voxel/light/flood.axle:431-433` describes leaving "the cells in `touched`, the lengths in `reached` and the shares in `through`"; no `reached` or `through` field exists (the path state is in the packed `path` plane).
-3. `src/voxel/world/region.axle:71` and `:138` use the bit-at-a-time `Inflater` (D-09) for every chunk read, although `FastInflater` exists and `doc/REVIEW_CORE.md:285-291` already names this site as pending migration.
+3. `src/voxel/world/region.axle:71` and `:138` use the bit-at-a-time `Inflater` (D-09) for every chunk read, although `FastInflater` exists and `doc/handbook/history/core-review.md:285-291` already names this site as pending migration.
 4. `src/voxel/light/grid.axle:170-198`: a cell id is `slot * 4096 + local` in an `i32` (so at most 524 288 slots) while the chunk key allows 21 bits per axis; `ensureChunk` does not guard the slot count, so a grid past 2^31 cells would wrap silently.
 5. `src/voxel/world/world.axle:281-308` (`applyRegion`) re-reads loaded chunks from a region and marks them edited, but records no journal entry, so `VoxLightBridge::sync` (`bridge.axle:165-188`) never sees those changes in the light (the mesh is marked dirty by `restore`, `chunk.axle:439`).
 6. `src/voxel/world/region.axle:132-147` (`VoxRegion::read`) appends to `out` (`pushRange`) without clearing it, unlike the other readers that "replace" the output; callers must pass an empty buffer (`world.axle:287` does).
@@ -1028,10 +1028,10 @@ dedicated to `src/data` or to `src/voxel/light`; those entries say `MISSING` unl
 10. `src/data/vfs/vfs_listing.axle:85-99`: an insertion sort over the names of a directory is O(m^2); only a problem for very large directories.
 11. `src/voxel/world/terrain.axle:299-330` computes the temperature and humidity noises before the early returns for Ocean, Mountain and Beach, and `columnsOf` is recomputed by each of the 8 vertical chunks of a column (D-73): redundant work, not a wrong result.
 12. `src/data/bytes.axle:224-231` (`grow`) copies byte by byte in a scalar loop although `bytesCopy` exists in the same file; `adler32` (`:265`) takes two `%` per byte without deferring the reduction. Both are unmeasured and could matter for large buffers (UNVERIFIED).
-13. `doc/LIGHTING_MATH.md:30` documents a finite-range window `sat(1 - (d/R)^4)^2` "off by default for voxel flood calibration"; the voxel curve uses a different window (`curve.axle:8-9`). The document does not say which window the flood uses.
+13. `doc/spec/lighting-math.md:30` documents a finite-range window `sat(1 - (d/R)^4)^2` "off by default for voxel flood calibration"; the voxel curve uses a different window (`curve.axle:8-9`). The document does not say which window the flood uses.
 14. `src/voxel/world/codec.axle:3-4` says "a uniform chunk is five bytes"; by the layout in the same comment and by `decode` (`:46`, `5 + 4 * count + packedLen`) a uniform chunk is 9 bytes (5-byte head + one 4-byte entry).
 15. The memory comment `src/voxel/light/world.axle:190-191` ("eight planes ... 315 MB for 9.8 million cells") equals `32 * 9.8e6 = 313.6 MB`, so it is consistent within rounding; the eight planes are red, green, blue, skySeed, path, stamp, emitters, passMasks (`flood.axle:150-155`), not the grid (1 further byte per cell).
 
 ## Summary
 
-The glossary has 104 entries across eight areas: bytes and checksums (D-01 to D-08), compression (D-09 to D-18: puff-style and table-driven inflate, the greedy deflate encoder, the derived code tables, LZ4 decode/encode, XXH32), images and audio (D-19 to D-27), archives and serialisation (D-28 to D-40: zip, region files with sector allocation and external chunks, NBT reader/writer, the lock-free name table, JSON), the VFS and asset database (D-41 to D-48), models (D-49 to D-61: glTF/GLB, `.bbmodel`, normals, tangents, animation), the voxel world (D-62 to D-79: palette chunks, store, edit layer and region file, journal, streamer, noise, terrain, mesher, ray cast, light bridge) and the light engine (D-80 to D-104: grid, block table, falloff curve, per-lamp sum-of-fields flood with exact incremental edit, emitters, sky light with two-pass removal, DDA, ray tracer with region skips, sunflower fans, sun and sky bakes, the popcount-ranked surface shell, parallel bakes, corner and trilinear samples, `releaseFlood`). Formulas, constants and complexities were taken from the code; measured figures are only those already written in `doc/REVIEW_CORE.md` and `doc/handbook/` (nothing was run). Not verified: per-node memory of `JsonDoc`; whether `f64.toString` is the shortest round-trip form (D-40); the exact sampler checks of `gltf_scene` (D-55) and the material and texture paths of `gltf_import` and `bbmodel_import` (read at header and key-function level only); `vfs_mount` disk paths and the `Vfs` write rules beyond their headers; the L1-ball cell count of a lamp field (derived, not measured); worst-case timings of the encoders (no figures exist). Constants-only files, enum files and trivial accessors have no entry because they hold no mechanism a user would want something from.
+The glossary has 104 entries across eight areas: bytes and checksums (D-01 to D-08), compression (D-09 to D-18: puff-style and table-driven inflate, the greedy deflate encoder, the derived code tables, LZ4 decode/encode, XXH32), images and audio (D-19 to D-27), archives and serialisation (D-28 to D-40: zip, region files with sector allocation and external chunks, NBT reader/writer, the lock-free name table, JSON), the VFS and asset database (D-41 to D-48), models (D-49 to D-61: glTF/GLB, `.bbmodel`, normals, tangents, animation), the voxel world (D-62 to D-79: palette chunks, store, edit layer and region file, journal, streamer, noise, terrain, mesher, ray cast, light bridge) and the light engine (D-80 to D-104: grid, block table, falloff curve, per-lamp sum-of-fields flood with exact incremental edit, emitters, sky light with two-pass removal, DDA, ray tracer with region skips, sunflower fans, sun and sky bakes, the popcount-ranked surface shell, parallel bakes, corner and trilinear samples, `releaseFlood`). Formulas, constants and complexities were taken from the code; measured figures are only those already written in `doc/handbook/history/core-review.md` and `doc/handbook/` (nothing was run). Not verified: per-node memory of `JsonDoc`; whether `f64.toString` is the shortest round-trip form (D-40); the exact sampler checks of `gltf_scene` (D-55) and the material and texture paths of `gltf_import` and `bbmodel_import` (read at header and key-function level only); `vfs_mount` disk paths and the `Vfs` write rules beyond their headers; the L1-ball cell count of a lamp field (derived, not measured); worst-case timings of the encoders (no figures exist). Constants-only files, enum files and trivial accessors have no entry because they hold no mechanism a user would want something from.

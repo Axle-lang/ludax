@@ -1,5 +1,9 @@
 # Core extraction: generic mechanisms that lived inside the Minecraft module
 
+> **Historical record.** The extraction described below is finished: `src/minecraft` no longer exists, and the
+> game lives in `games/blockland`. The status lines that mention an uncommitted working tree and the `stv` branch
+> describe the day it was written. For where a mechanism lives now, read [the module pages](../../modules/README.md).
+
 Rule: a mechanism that is a general algorithm, format or data structure belongs in the engine's lower layers, with a
 Minecraft-agnostic name and its knobs as parameters. The game package `games/blockland` keeps what only makes sense for the game:
 the block registry and state tables of 26.1, vanilla data (biomes, features, tags), and behaviours that exist to

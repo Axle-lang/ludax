@@ -1,6 +1,6 @@
 # 4.1 The job pool
 
-[Handbook](../README.md) · previous: [3.8 Display](../render/08-display.md) · next: [5.1 Optimisation log](../history/2026-11-optimisation.md)
+[Handbook](../README.md) · previous: [3.8 Display](../render/08-display.md) · next: [5.1 What was tried, by technique](../history/techniques.md)
 
 ## 1. Contract
 

@@ -5,11 +5,11 @@ constant and complexity below was read in the file named in **Where**; a claim t
 `UNVERIFIED`. Symbols: N bodies, C contact points, M manifolds, J joints, P particles, K cells of a grid. Line numbers are those
 of the working tree when this file was written.
 
-Existing prose for this zone: `doc/FLUID.md` (the water engines; the only chapter of its kind), `doc/handbook/render/15-view-layers.md`
-section 3.6 (particles) with `doc/design/particles-wind.md`, and one-line summaries in `doc/ROADMAP.md:28-35`. There is no handbook
+Existing prose for this zone: `doc/spec/fluid.md` (the water engines; the only chapter of its kind), `doc/handbook/render/15-view-layers.md`
+section 3.6 (particles), and one-line summaries in `doc/roadmap.md:28-35`. There is no handbook
 chapter yet for kinetic, animation, audio or navigation: those entries say `MISSING`.
 
-`src/sim` holds six directories (`animation audio fluid kinetic navigation particles`); `doc/ARCHITECTURE.md:10` also lists
+`src/sim` holds six directories (`animation audio fluid kinetic navigation particles`); `doc/guide/architecture.md:10` also lists
 "gameplay", which does not exist (see Doubts).
 
 ---
@@ -30,7 +30,7 @@ chapter yet for kinetic, animation, audio or navigation: those entries say `MISS
   wants a shorter substep" (`physics_settings.axle:1-6`); a variable step is not offered (header `physics_world.axle:1-8`: "never changes, so
   the same inputs give the same state"). `advance()` exists for callers that pace themselves with a `FixedStep`.
 - **Where:** `src/sim/kinetic/physics_world.axle:423` (`step`), `:440` (`advance`), `src/sim/kinetic/physics_settings.axle:10`.
-- **Docs:** MISSING (`doc/ROADMAP.md:28-31` has one line).
+- **Docs:** MISSING (`doc/roadmap.md:28-31` has one line).
 
 ### S-02. I want bodies to fall, be pushed, drag and spin, and to push a body with an impulse at a point
 - **Means:** semi-implicit Euler on velocities with implicit damping; positions advance with the mean of start and end velocity.
@@ -280,70 +280,70 @@ chapter yet for kinetic, animation, audio or navigation: those entries say `MISS
 
 ## Water on a heightfield: `HydroWorld` (`src/sim/fluid/hydro_*`)
 
-`HydroWorld` is the engine for new work (`doc/FLUID.md:1-12`): metres, seconds, f32, a regular grid of square cells over a bed the game hands in as a plain `f32[]`.
+`HydroWorld` is the engine for new work (`doc/spec/fluid.md:1-12`): metres, seconds, f32, a regular grid of square cells over a bed the game hands in as a plain `f32[]`.
 
 ### S-25. I want a river, lake or flood over terrain, that is stable and does not need a huge time step budget
 - **Means:** second-order finite-volume shallow-water solver on a collocated grid: Audusse hydrostatic reconstruction on the surface bed + h, minmod-limited slopes, HLL flux with Davis speeds and Toro's dry-side speeds ("Audusse et al. 2004/2005 on a Kurganov-Petrova footing", the file's own words, `hydro_flux.axle:3-4`).
-- **Mathematics:** unknowns per cell: depth h, discharge per metre qx, qz (= h u, h w). Per face: HLL mass flux F = (S_R m_L - S_L m_R + S_L S_R (h_R - h_L)) / (S_R - S_L), m = h u_n, same form for normal and tangential momentum (`hydro_flux.axle:238-244`); S_L = min(u_L - c_L, u_R - c_R), S_R = max(u_L + c_L, u_R + c_R), c = sqrt(g h); dry side: S_L = u_R - 2 c_R, S_R = u_R + c_R (and mirrored) (`:208-221`); S_L and S_R are clipped to <= 0 and >= 0. Momentum flux per side adds the hydrostatic correction (1/2) g (h_rec^2 - h_face^2) (`:187-189`). Time stepping: forward Euler; the unsplit scheme is positive below Courant 0.5 (`doc/FLUID.md:50`). Forward Euler means first order in time.
-- **Instructions:** four passes over the active tiles, a barrier after each: `faces` (flux of the west and north face of every cell, stored in two views of the face), `scale` (positivity factor), `update` (cells), then boundary/lips/sources/particles/drifters (serial), then `surface` and `settleFoam` (`hydro_world.axle:567-604`, `hydro_passes.axle:1-21`). Struct-of-arrays, padded by a 2-cell ghost ring so the 4-cell stencil needs no bounds tests (`hydro_grid.axle:1-10`); array bases hoisted into locals in `update` (`hydro_passes.axle:245-266`); the flux function is the one non-inlined call and holds 26 bounds checks (`doc/FLUID.md:180-182`).
-- **Cost:** O(active cells) per substep; per cell about 57 ns single-threaded (`doc/FLUID.md:128`); measured: 512 x 512 grid with 47 104 cells awake (18 %): 2.72 ms per substep and 64 ms per million cell-steps on 1 worker, 0.58 ms and 13.8 ms on 8 workers (`doc/FLUID.md:118-124`). Memory 94 bytes a cell without dye, 142 with the default 4 tracers; 512 x 512 is 24.6 MB (37 MB with tracers), 1024 x 1024 is 98 MB (149 MB) (`doc/FLUID.md:98-116`). The code comment in `hydro_grid.axle:18` says 90 bytes; the listed items sum to 94 (see Doubts).
-- **Why this and not another:** `doc/FLUID.md:37-47`: "Chosen over keeping the linearised pipe model because it is the cheapest scheme that has all of" well-balanced, positive, sharp but monotone, robust. Stated price: a sudden bed step loses head (broad-crested weir with a sharp upstream edge passes 0.78 of the ideal Q = 1.705 b H^1.5; a ramped edge 0.996, test `weir`, `doc/FLUID.md:53-56,176-179`).
+- **Mathematics:** unknowns per cell: depth h, discharge per metre qx, qz (= h u, h w). Per face: HLL mass flux F = (S_R m_L - S_L m_R + S_L S_R (h_R - h_L)) / (S_R - S_L), m = h u_n, same form for normal and tangential momentum (`hydro_flux.axle:238-244`); S_L = min(u_L - c_L, u_R - c_R), S_R = max(u_L + c_L, u_R + c_R), c = sqrt(g h); dry side: S_L = u_R - 2 c_R, S_R = u_R + c_R (and mirrored) (`:208-221`); S_L and S_R are clipped to <= 0 and >= 0. Momentum flux per side adds the hydrostatic correction (1/2) g (h_rec^2 - h_face^2) (`:187-189`). Time stepping: forward Euler; the unsplit scheme is positive below Courant 0.5 (`doc/spec/fluid.md:50`). Forward Euler means first order in time.
+- **Instructions:** four passes over the active tiles, a barrier after each: `faces` (flux of the west and north face of every cell, stored in two views of the face), `scale` (positivity factor), `update` (cells), then boundary/lips/sources/particles/drifters (serial), then `surface` and `settleFoam` (`hydro_world.axle:567-604`, `hydro_passes.axle:1-21`). Struct-of-arrays, padded by a 2-cell ghost ring so the 4-cell stencil needs no bounds tests (`hydro_grid.axle:1-10`); array bases hoisted into locals in `update` (`hydro_passes.axle:245-266`); the flux function is the one non-inlined call and holds 26 bounds checks (`doc/spec/fluid.md:180-182`).
+- **Cost:** O(active cells) per substep; per cell about 57 ns single-threaded (`doc/spec/fluid.md:128`); measured: 512 x 512 grid with 47 104 cells awake (18 %): 2.72 ms per substep and 64 ms per million cell-steps on 1 worker, 0.58 ms and 13.8 ms on 8 workers (`doc/spec/fluid.md:118-124`). Memory 94 bytes a cell without dye, 142 with the default 4 tracers; 512 x 512 is 24.6 MB (37 MB with tracers), 1024 x 1024 is 98 MB (149 MB) (`doc/spec/fluid.md:98-116`). The code comment in `hydro_grid.axle:18` says 90 bytes; the listed items sum to 94 (see Doubts).
+- **Why this and not another:** `doc/spec/fluid.md:37-47`: "Chosen over keeping the linearised pipe model because it is the cheapest scheme that has all of" well-balanced, positive, sharp but monotone, robust. Stated price: a sudden bed step loses head (broad-crested weir with a sharp upstream edge passes 0.78 of the ideal Q = 1.705 b H^1.5; a ramped edge 0.996, test `weir`, `doc/spec/fluid.md:53-56,176-179`).
 - **Where:** `src/sim/fluid/hydro_flux.axle:127` (`flux`), `:201` (`solve`), `src/sim/fluid/hydro_passes.axle:63,194,234,387`, `src/sim/fluid/hydro_world.axle:567` (`substep`).
-- **Docs:** `doc/FLUID.md` ("HydroWorld: design", "Scheme and why", "Memory budget", "Measured").
+- **Docs:** `doc/spec/fluid.md` ("HydroWorld: design", "Scheme and why", "Memory budget", "Measured").
 
 ### S-26. I want a lake at rest to stay perfectly still over a rough bed, a cliff or a thin shoreline (well balancing)
 - **Means:** reconstruct the face states from the surface (bed + h), not from h, with the bed under the face taken as the higher of the two cell beds (Audusse hydrostatic reconstruction); limited slopes vanish on a flat surface.
-- **Mathematics:** surface slope in a cell = minmod(d_low, d_mid) with d = (bed_i - bed_j) + (h_i - h_j); face depth = max(h_cell +- slope/2, 0) minus the part under the sill, sill = bed_R - bed_L (`hydro_flux.axle:143-178`). At rest all slopes are exactly 0, both face states are equal, so the momentum balance of a cell is a difference of equal numbers. Checked "over a rough bed with a 2 m step (surface error 0 after 20 forced-awake steps)" and over a rim with islands and thin films (`doc/FLUID.md:40-43`).
+- **Mathematics:** surface slope in a cell = minmod(d_low, d_mid) with d = (bed_i - bed_j) + (h_i - h_j); face depth = max(h_cell +- slope/2, 0) minus the part under the sill, sill = bed_R - bed_L (`hydro_flux.axle:143-178`). At rest all slopes are exactly 0, both face states are equal, so the momentum balance of a cell is a difference of equal numbers. Checked "over a rough bed with a 2 m step (surface error 0 after 20 forced-awake steps)" and over a rim with islands and thin films (`doc/spec/fluid.md:40-43`).
 - **Instructions:** slopes are used only when the whole stencil is at least `slopeDepth` = 4 x `dryDepth` (0.004 m) deep, else first order (`hydro_flux.axle:147-148`, `hydro_world.axle:557`); bed ghosts repeat the edge (`hydro_grid.axle:268-286`). The surface is never formed as an absolute elevation, only differences of bed + h, so a lake 500 m above the datum is as quiet as at sea level (`hydro_grid.axle:12-16`).
 - **Cost:** included in S-25 (no extra pass).
-- **Why this and not another:** `doc/FLUID.md:37-47` (the pipe model has no hydrostatic reconstruction: "no wet/dry well-balancing over a bed step", audit paragraph).
+- **Why this and not another:** `doc/spec/fluid.md:37-47` (the pipe model has no hydrostatic reconstruction: "no wet/dry well-balancing over a bed step", audit paragraph).
 - **Where:** `src/sim/fluid/hydro_flux.axle:127-198`.
-- **Docs:** `doc/FLUID.md` ("Scheme and why").
+- **Docs:** `doc/spec/fluid.md` ("Scheme and why").
 
 ### S-27. I want water fronts and bores that stay sharp without overshoot or negative depth
 - **Means:** minmod slope limiter (total-variation diminishing) on surface and velocities, HLL Riemann solver, and a per-cell positivity scale.
-- **Mathematics:** minmod(a, b) = 0 if a b <= 0, else the one of smaller magnitude (`hydro_flux.axle:104-112`). Positivity: each cell sums the outflow its four faces want, W = (E + W + S + N) dt/dx, and uses s = min(1, h/W); a face is paid by its donor, so both cells use the donor's factor and the water that leaves one cell is exactly the water that arrives in the other (`hydro_passes.axle:194-218,280-300`). Volume is conserved to rounding (`doc/FLUID.md:43-45`).
+- **Mathematics:** minmod(a, b) = 0 if a b <= 0, else the one of smaller magnitude (`hydro_flux.axle:104-112`). Positivity: each cell sums the outflow its four faces want, W = (E + W + S + N) dt/dx, and uses s = min(1, h/W); a face is paid by its donor, so both cells use the donor's factor and the water that leaves one cell is exactly the water that arrives in the other (`hydro_passes.axle:194-218,280-300`). Volume is conserved to rounding (`doc/spec/fluid.md:43-45`).
 - **Instructions:** the limiter is switched off (first order) in and next to dry cells; the scale pass also stores each tracer's concentration (`hydro_passes.axle:220-228`).
 - **Cost:** one extra O(active cells) pass per substep.
-- **Why this and not another:** not documented beyond "second order in space where the stencil is wet, first order at rims" (`doc/FLUID.md:43-45`).
+- **Why this and not another:** not documented beyond "second order in space where the stencil is wet, first order at rims" (`doc/spec/fluid.md:43-45`).
 - **Where:** `src/sim/fluid/hydro_flux.axle:104`, `src/sim/fluid/hydro_passes.axle:194` (`scale`), `:234` (`update`).
-- **Docs:** `doc/FLUID.md` ("Scheme and why").
+- **Docs:** `doc/spec/fluid.md` ("Scheme and why").
 
 ### S-28. I want the time step to adapt so the water never outruns the grid
 - **Means:** Courant-limited substeps: the requested time is cut into equal substeps, each below cfl x cell / (fastest signal speed).
 - **Mathematics:** limit = cfl x cellSize / max(fastest, 1 m/s), fastest = max over wet cells of |u| + sqrt(g h) (stored per tile, `hydro_passes.axle:360`, `hydro_grid.axle:419`); pieces = ceil(remaining / limit), slice = remaining / pieces (`hydro_world.axle:533-538`). cfl default 0.25, values outside (0, 0.45] are reset to 0.25 (`hydro_params.axle:139-141,228-230`). At most `maxSubsteps` = 64 per `step`; time that does not fit is dropped and counted (`lostSeconds`) (`hydro_world.axle:519-545`).
 - **Instructions:** the 1 m/s floor (`HYDRO_QUIET_SPEED`, `:42`) bounds the substep of a world with only sources; a world with nothing awake, no particles and no active source/vent returns at once (`:522-530`).
 - **Cost:** substeps per step = ceil(dt c_max / (cfl dx)); work scales with it.
-- **Why this and not another:** `doc/FLUID.md:50-51`; the legacy pipe model instead caps its push and slows waves in deep water (`fluid_pipes.axle`, see S-43).
+- **Why this and not another:** `doc/spec/fluid.md:50-51`; the legacy pipe model instead caps its push and slows waves in deep water (`fluid_pipes.axle`, see S-43).
 - **Where:** `src/sim/fluid/hydro_world.axle:519` (`step`), `:548` (`scheme`).
-- **Docs:** `doc/FLUID.md` ("Scheme and why"); the 1 m/s floor is not mentioned there (see Doubts).
+- **Docs:** `doc/spec/fluid.md` ("Scheme and why"); the 1 m/s floor is not mentioned there (see Doubts).
 
 ### S-29. I want rivers with bed friction and eddy viscosity that cannot destabilise the scheme
 - **Means:** Manning friction applied semi-implicitly on discharge; viscosity as a conservative momentum flux limited to its explicit stability bound.
 - **Mathematics:** q' = q / (1 + dt g n^2 |u| / h^(4/3)): code `ease = 1 / (1 + drag |u| (1/h) / cbrt(h))` with drag = dt g n^2 (`hydro_passes.axle:243,338-346`); n = Manning roughness, default 0.03 s/m^(1/3). Cube root without libm: a fourth root as the guess and 3 Newton steps y <- (2y + x/y^2)/3 (`:51-58`). Viscous flux -nu h min(.) du/dx per face (`hydro_flux.axle:190-193`), nu limited to 0.5 dx^2/(4 dt) (`hydro_world.axle:46-47,551-552`). Speed cap `maxSpeed` 40 m/s and momentum under `restSpeed` 1e-5 m/s dropped (`:347-357`).
-- **Instructions:** friction skipped when the cell is at rest; the cube root is skipped at rest ("skipping the friction cube root at rest gained about 5 %", `doc/FLUID.md:180-182`).
+- **Instructions:** friction skipped when the cell is at rest; the cube root is skipped at rest ("skipping the friction cube root at rest gained about 5 %", `doc/spec/fluid.md:180-182`).
 - **Cost:** O(1) per cell per substep.
 - **Why this and not another:** semi-implicit "so it is stable at any depth" (`hydro_params.axle:131-133`).
 - **Where:** `src/sim/fluid/hydro_passes.axle:234-384`, `src/sim/fluid/hydro_params.axle:127`.
-- **Docs:** `doc/FLUID.md` ("Scheme and why", "robust").
+- **Docs:** `doc/spec/fluid.md` ("Scheme and why", "robust").
 
 ### S-30. I want a calm lake to cost nothing, and a localised flood to cost only what moves
 - **Means:** activity tiles of 32 x 8 cells with a flag; a flagged tile runs with its eight neighbours; a tile clears its flag when its speeds and surface jumps are below the rest thresholds.
 - **Mathematics:** none: plain arithmetic. Rest when all speeds < `restSpeed` and every relative surface jump < `restJump` 1e-4 (`hydro_passes.axle:379-383`, `hydro_flux.axle:196`); water cannot cross more than one cell per substep so it cannot leave the dilated set (`hydro_grid.axle:22-26`).
 - **Instructions:** a face next to a sleeping tile is sealed: no mass, no along-face momentum, but the hydrostatic push stays, written by the running tile alone so each face has one writer (`hydro_passes.axle:97-152`); anything adding water or momentum calls `wake`; `buildActive` lists flagged tiles and neighbours in tile order (`hydro_grid.axle:381`).
-- **Cost:** a calm world costs one flag scan over the tiles per substep; tile memory 24 bytes (`doc/FLUID.md:115-116`); measured "zero cells awake" for a calm lake (test, `doc/FLUID.md:70-76`).
+- **Cost:** a calm world costs one flag scan over the tiles per substep; tile memory 24 bytes (`doc/spec/fluid.md:115-116`); measured "zero cells awake" for a calm lake (test, `doc/spec/fluid.md:70-76`).
 - **Why this and not another:** not compared; the legacy engine uses a per-column awake list (S-44).
 - **Where:** `src/sim/fluid/hydro_grid.axle:381`, `src/sim/fluid/hydro_passes.axle:99`.
-- **Docs:** `doc/FLUID.md` ("Activity and sleeping").
+- **Docs:** `doc/spec/fluid.md` ("Activity and sleeping").
 
 ### S-31. I want the same water on one thread or on eight, bit for bit
 - **Means:** fixed-grain index-based chunking on a `JobPool`; each pass writes only what its own tile or particle owns and reads what no other item writes; whole-grid reductions are serial between passes.
 - **Mathematics:** none: plain arithmetic.
-- **Instructions:** `HydroKernel` is a dispatcher kernel (a pool serves one kernel for life) with stages Faces, Scale, Update, Surface, SettleFoam, Fly; grain 4 tiles (about 1000 cells) or 2048 particles per chunk (`hydro_runner.axle:18-22,25-43`). Rule learned in the doc: never copy a `Shared<...>` into a local inside worker code (the count is not atomic; it crashed once) (`doc/FLUID.md:66-69`).
-- **Cost:** speed-up measured 64 -> 13.8 ms per million cell-steps from 1 to 8 workers (4.6x) (`doc/FLUID.md:122-123`).
+- **Instructions:** `HydroKernel` is a dispatcher kernel (a pool serves one kernel for life) with stages Faces, Scale, Update, Surface, SettleFoam, Fly; grain 4 tiles (about 1000 cells) or 2048 particles per chunk (`hydro_runner.axle:18-22,25-43`). Rule learned in the doc: never copy a `Shared<...>` into a local inside worker code (the count is not atomic; it crashed once) (`doc/spec/fluid.md:66-69`).
+- **Cost:** speed-up measured 64 -> 13.8 ms per million cell-steps from 1 to 8 workers (4.6x) (`doc/spec/fluid.md:122-123`).
 - **Why this and not another:** the contract is the job library's (`core/jobs/kernel`), cited at `hydro_runner.axle:5-9`.
 - **Where:** `src/sim/fluid/hydro_runner.axle:46` (`HydroKernel`), `:95` (`HydroRunner`).
-- **Docs:** `doc/FLUID.md` ("Passes of a substep"); `doc/handbook/engine/01-job-pool.md` for the pool itself (not read for this file).
+- **Docs:** `doc/spec/fluid.md` ("Passes of a substep"); `doc/handbook/engine/01-job-pool.md` for the pool itself (not read for this file).
 
 ### S-32. I want walls, open outfalls and water edits (pour, fill a basin, inflows, sinks)
 - **Means:** ghost cells (wall = mirror with normal velocity flipped; open side = dry ghost at the edge's bed level, a free outfall); direct edits that keep a ledger; inflow and sink ports that spread a discharge over a block of cells.
@@ -352,25 +352,25 @@ chapter yet for kinetic, animation, audio or navigation: those entries say `MISS
 - **Cost:** O(perimeter) per substep for ghosts; O(K) for `fillBasin`; inflow O(block) per port per substep.
 - **Why this and not another:** not documented.
 - **Where:** `src/sim/fluid/hydro_grid.axle:291-362`, `src/sim/fluid/hydro_sources.axle:133`, `src/sim/fluid/hydro_world.axle:336,427,445,465`.
-- **Docs:** `doc/FLUID.md` ("HydroWorld: design" call list); formulas MISSING.
+- **Docs:** `doc/spec/fluid.md` ("HydroWorld: design" call list); formulas MISSING.
 
 ### S-33. I want water that is accounted for: where every cubic metre is
 - **Means:** an f64 ledger over an f32 grid: grid + airborne (particles and lip carries) + outflow + sunk + soaked = poured + inflow; deposits use error feedback.
-- **Mathematics:** `addDepth` adds amount + credit, stores the part the f32 sum could not hold back in `credit` and adds it to the next deposit: "a depth of a metre has a resolution of 1e-7, a landing parcel adds a few 1e-5" so repeated tiny deposits lose water without it (`hydro_grid.axle:109-111,444-454`). Measured: waterfall (1152 m3 in): residual 1.7e-4 m3 (1.5e-7 relative); closed world with a curtain and a jet (62 000 particles, 120 s): 2.4e-8 relative drift; before error feedback a still pool lost 0.2 % (`doc/FLUID.md:93-96,174-175,204`).
+- **Mathematics:** `addDepth` adds amount + credit, stores the part the f32 sum could not hold back in `credit` and adds it to the next deposit: "a depth of a metre has a resolution of 1e-7, a landing parcel adds a few 1e-5" so repeated tiny deposits lose water without it (`hydro_grid.axle:109-111,444-454`). Measured: waterfall (1152 m3 in): residual 1.7e-4 m3 (1.5e-7 relative); closed world with a curtain and a jet (62 000 particles, 120 s): 2.4e-8 relative drift; before error feedback a still pool lost 0.2 % (`doc/spec/fluid.md:93-96,174-175,204`).
 - **Instructions:** `ledger()` returns a `HydroLedger` with `residual()`; sums are f64; parcels keep the remainder of an f32 rounding in an f64 carry (`hydro_lips.axle:23-26`).
 - **Cost:** O(K) to sum the grid (`volume()`); the other terms are running sums.
 - **Why this and not another:** not documented.
 - **Where:** `src/sim/fluid/hydro_world.axle:1006-1030`, `src/sim/fluid/hydro_grid.axle:434-470`.
-- **Docs:** `doc/FLUID.md` ("Books", "Deposits").
+- **Docs:** `doc/spec/fluid.md` ("Books", "Deposits").
 
 ### S-34. I want a waterfall: water that leaves a cliff as a falling curtain and lands in a pool
 - **Means:** lip detection on the bed; the grid flux across a lip is the free-overfall discharge, hidden from the receiving cell and accumulated in an f64 carry per lip; the carry is launched as layers of particles.
 - **Mathematics:** a lip is a face whose bed drops by more than `dropThreshold` 1.5 m (or a cliff spread over up to 3 cells of slope >= 1) (`hydro_lips.axle:41`, `hydro_params.axle:26-32`). Mean discharge per metre q = carry / (cell x wait); exit speed v_e = max((g q)^(1/3), 0.5) m/s; landing speed v_L = sqrt(v_e^2 + 2 g H) with H the fall height found when the bed was loaded; layer period = curtainSpacing / v_L; layers = ceil(wait/period) (at most 8); particles across the crest = ceil(cellSize/curtainSpacing) (`hydro_lips.axle:310-345`). A lip passing less than `minDischarge` 0.002 m2/s, or a full pool, pours its carry into the cell below. Hidden flux: `storeX/storeZ` give the donor's view the flux and the receiver 0 (`hydro_passes.axle:155-172`).
 - **Instructions:** `detect` scans every face once (O(K), allocates the lip arrays) on bed change; `launch` runs every substep over the lips; each layer is flown for the time it has been due, so the curtain has no hole whatever the step (`hydro_lips.axle:21-23`).
-- **Cost:** particles alive per metre of crest ~ fallTime x landingSpeed / spacing^2: about 580 for a 10 m fall at 0.5 m (9.2 k for a 16 m crest) (`doc/FLUID.md:85-91`); 93 761 particles falling cost 0.47 ms per substep on 8 workers (grid included), 5.2 ms per million particle-steps; 38 bytes a particle (`doc/FLUID.md:124-128,114-115`). `setBedAt` re-detects every lip: fine for edits, not per frame (`doc/FLUID.md:266`).
+- **Cost:** particles alive per metre of crest ~ fallTime x landingSpeed / spacing^2: about 580 for a 10 m fall at 0.5 m (9.2 k for a 16 m crest) (`doc/spec/fluid.md:85-91`); 93 761 particles falling cost 0.47 ms per substep on 8 workers (grid included), 5.2 ms per million particle-steps; 38 bytes a particle (`doc/spec/fluid.md:124-128,114-115`). `setBedAt` re-detects every lip: fine for edits, not per frame (`doc/spec/fluid.md:266`).
 - **Why this and not another:** "A heightfield cannot make a falling sheet of water" (`hydro_lips.axle:3`).
 - **Where:** `src/sim/fluid/hydro_lips.axle:91` (`detect`), `:261` (`launch`), `:310` (`release`), `:348` (`launchLayers`).
-- **Docs:** `doc/FLUID.md` ("Overfall").
+- **Docs:** `doc/spec/fluid.md` ("Overfall").
 
 ### S-35. I want falling drops that slow in the air, break into spray and never lose water
 - **Means:** ballistic particles under gravity with implicit quadratic drag; gas Weber number decides instability; a parcel unstable for a time of order the aerodynamic time splits in two exact halves.
@@ -379,7 +379,7 @@ chapter yet for kinetic, animation, audio or navigation: those entries say `MISS
 - **Cost:** O(P) per substep, f32; the pool is allocated once at `capacity` (100 000 default).
 - **Why this and not another:** not documented; the legacy engine uses the same drag law in f64 (S-49).
 - **Where:** `src/sim/fluid/hydro_particles.axle:259` (`fly`), `src/sim/fluid/hydro_air.axle:346` (`split`).
-- **Docs:** `doc/FLUID.md` ("Overfall").
+- **Docs:** `doc/spec/fluid.md` ("Overfall").
 
 ### S-36. I want a falling parcel to land as a splash, a current and foam, with volume conserved
 - **Means:** landing deposits depth and a share of horizontal momentum; fast parcels throw a crown of smaller drops (volume taken exactly); foam and turbulence are written into the cell.
@@ -388,43 +388,43 @@ chapter yet for kinetic, animation, audio or navigation: those entries say `MISS
 - **Cost:** O(landings) per substep; a crown makes O(children) new parcels (bounded by the pool).
 - **Why this and not another:** not documented.
 - **Where:** `src/sim/fluid/hydro_air.axle:163` (`land`), `:293` (`crown`).
-- **Docs:** `doc/FLUID.md` ("Overfall").
+- **Docs:** `doc/spec/fluid.md` ("Overfall").
 
 ### S-37. I want white froth at the foot of a fall, without losing water
 - **Means:** a conservative aeration emitter: a hard landing hands a share of its water to short-lived light parcels that pour back to the grid.
-- **Mathematics:** speed above `aerationSpeed` 6 m/s: `aerationShare` 4 % of the parcel's volume goes to up to 32 aerated parcels of 5e-5 m3, launched at up to 0.6 of the impact speed, life 0.5 to 1.5 x 2 s, braked as if of density 100 kg/m3, never breaking up (`hydro_air.axle:232-291`, `doc/FLUID.md:237-250`). A parcel at the end of its life or touching water pours volume, dye and a share of momentum back into the cell under it (`hydro_air.axle:210`).
+- **Mathematics:** speed above `aerationSpeed` 6 m/s: `aerationShare` 4 % of the parcel's volume goes to up to 32 aerated parcels of 5e-5 m3, launched at up to 0.6 of the impact speed, life 0.5 to 1.5 x 2 s, braked as if of density 100 kg/m3, never breaking up (`hydro_air.axle:232-291`, `doc/spec/fluid.md:237-250`). A parcel at the end of its life or touching water pours volume, dye and a share of momentum back into the cell under it (`hydro_air.axle:210`).
 - **Instructions:** scatter from a stateless hash of the landing number and the parcel (so 1 and N workers agree); `aerationPerStep` 60 000 launches per substep and `aerationCapacity` 150 000 parcels bound the cost; at the cap the landing simply keeps its water.
-- **Cost:** 38 + 4 (life) + 4 per tracer bytes per parcel, pooled once (150 000 parcels about 6 MB, 8 MB with 4 tracers); measured on the 12 m fall (12 m3/s, 8 workers): up to 10 517 aerated parcels, 0.459 ms per substep against 0.359 without the emitter; ledger residual 3.9e-6 m3 of 528 (`doc/FLUID.md:250-255`).
+- **Cost:** 38 + 4 (life) + 4 per tracer bytes per parcel, pooled once (150 000 parcels about 6 MB, 8 MB with 4 tracers); measured on the 12 m fall (12 m3/s, 8 workers): up to 10 517 aerated parcels, 0.459 ms per substep against 0.359 without the emitter; ledger residual 3.9e-6 m3 of 528 (`doc/spec/fluid.md:250-255`).
 - **Why this and not another:** the 4 % is "the order of the air a plunging jet entrains" (`hydro_params.axle:92-96`, citing Chanson's measurements of plunge pools).
 - **Where:** `src/sim/fluid/hydro_air.axle:210`, `:232` (`aerate`).
-- **Docs:** `doc/FLUID.md` ("Aerated parcels").
+- **Docs:** `doc/spec/fluid.md` ("Aerated parcels").
 
 ### S-38. I want a jet, geyser or fountain that throws water in a cone and the water comes back
 - **Means:** a vent turns a discharge into liquid parcels launched from a disc along a tilted axis inside a cone; draws from the grid by default so the ledger needs no new term.
-- **Mathematics:** owed volume per substep = discharge x power x pulse x dt; parcel volume = max(minParcel 2e-5 m3, discharge / maxRate 20 000 per s); launches = floor(owed/parcel); axis = (sin(tilt) cos(az), cos(tilt), sin(tilt) sin(az)); apex = speed^2/(2g) less air drag (`hydro_vents.axle:3-20,231-271,334-336`). Measured: apex 10.2 m for 15 m/s (v^2/2g = 11.5, drag takes 11 %), 2.72 m at 4g (2.87), ratio 3.74; discharge 0.50 m3/s drawn; books close to 6e-5 m3 of 1600; a pulsed vent 1.004 m3 for 1.0 expected (`doc/FLUID.md:160-163`).
+- **Mathematics:** owed volume per substep = discharge x power x pulse x dt; parcel volume = max(minParcel 2e-5 m3, discharge / maxRate 20 000 per s); launches = floor(owed/parcel); axis = (sin(tilt) cos(az), cos(tilt), sin(tilt) sin(az)); apex = speed^2/(2g) less air drag (`hydro_vents.axle:3-20,231-271,334-336`). Measured: apex 10.2 m for 15 m/s (v^2/2g = 11.5, drag takes 11 %), 2.72 m at 4g (2.87), ratio 3.74; discharge 0.50 m3/s drawn; books close to 6e-5 m3 of 1600; a pulsed vent 1.004 m3 for 1.0 expected (`doc/spec/fluid.md:160-163`).
 - **Instructions:** `draw` takes water from the cells around the vent limited by what they hold; `launch` flies each parcel for the time since it left (`hydro_vents.axle:290,322`).
 - **Cost:** at most `maxRate` x flightTime parcels alive per vent (flightTime = 2 speed/g for a vertical jet): about 60 k alive at 0.5 m3/s by default.
-- **Why this and not another:** a vent in the legacy engine builds a dense lattice with a dome (S-52); the doc plans to migrate the old geyser to `addVent` (`doc/FLUID.md:8-10,160-163`).
+- **Why this and not another:** a vent in the legacy engine builds a dense lattice with a dome (S-52); the doc plans to migrate the old geyser to `addVent` (`doc/spec/fluid.md:8-10,160-163`).
 - **Where:** `src/sim/fluid/hydro_vents.axle:221` (`run`), `:322` (`launch`), `src/sim/fluid/hydro_world.axle:485`.
-- **Docs:** `doc/FLUID.md` ("Jets, edges and the readout").
+- **Docs:** `doc/spec/fluid.md` ("Jets, edges and the readout").
 
 ### S-39. I want to colour water by origin (dye, pollution, a tributary) and track where it goes
 - **Means:** passive tracers: depth of dyed water per cell advected with the same fluxes, first-order upwind; particles carry fractions and give them back.
-- **Mathematics:** concentration c = dye/h in 0..1 (stored in `conc` by the positivity pass); dye flux = water flux x donor's concentration with the donor's scale factor; update dye' = max(dye + (dt/dx) sum of face dye fluxes, 0) (`hydro_passes.axle:221-228,302-325`). Bounded and positive "by construction"; "fronts smear by about a cell" (first order) (`doc/FLUID.md:185-198`). Measured: dam break 5e-8 relative dye residual; steady-channel front 1.40 m/s vs 1.45 m/s of water.
+- **Mathematics:** concentration c = dye/h in 0..1 (stored in `conc` by the positivity pass); dye flux = water flux x donor's concentration with the donor's scale factor; update dye' = max(dye + (dt/dx) sum of face dye fluxes, 0) (`hydro_passes.axle:221-228,302-325`). Bounded and positive "by construction"; "fronts smear by about a cell" (first order) (`doc/spec/fluid.md:185-198`). Measured: dam break 5e-8 relative dye residual; steady-channel front 1.40 m/s vs 1.45 m/s of water.
 - **Instructions:** tracers 0 to 8 (`HYDRO_TRACERS_MAX`); infiltration removes water without its dye so dye books are then not exact.
-- **Cost:** 12 bytes a cell and 4 a particle per tracer; "about 20 % more per cell-step with 4 tracers" (`doc/FLUID.md:114-115,198`).
+- **Cost:** 12 bytes a cell and 4 a particle per tracer; "about 20 % more per cell-step with 4 tracers" (`doc/spec/fluid.md:114-115,198`).
 - **Why this and not another:** no limited second-order dye (a stated trade-off).
 - **Where:** `src/sim/fluid/hydro_passes.axle:221,302-325`, `src/sim/fluid/hydro_world.axle:283,943-999`.
-- **Docs:** `doc/FLUID.md` ("Dye tracers and compartments").
+- **Docs:** `doc/spec/fluid.md` ("Dye tracers and compartments").
 
 ### S-40. I want floating objects (leaves, boats, markers) that ride the flow, fall over weirs and show trails
 - **Means:** Lagrangian drifters moved by the engine's velocity readout with the explicit midpoint rule plus a stateless random-walk eddy diffusion.
-- **Mathematics:** x_{n+1} = x_n + dt u(x_n + dt/2 u(x_n)) x factor, surface factor 1.2 (the surface of a turbulent stream runs 1.15 to 1.3 of the mean); diffusion displacement sqrt(2 D dt) N(0,1) per axis with D = alpha h (u* + turb sqrt(g h)), u* = sqrt(g) n |u| / h^(1/6) (`hydro_drifters.axle:329-346,367-378`; the normal is four stateless hash uniforms summed, keyed by marker id, substep and axis). Crossing a lip a marker becomes a ballistic parcel with the local speed (at least 0.5 m/s) and the same drag, in micro-steps of at most 20 ms (`:78,56-80`). Measured: 1.4437 m/s on a channel vs 1.4437 mean surface velocity; 200 markers 1.7312 m/s against 1.2 x 1.4444 = 1.7333 (0.1 %); falls 11.91 m in 1.570 s over the 12 m lip (sqrt(2H/g) = 1.558 s) (`doc/FLUID.md:218-221,232`).
+- **Mathematics:** x_{n+1} = x_n + dt u(x_n + dt/2 u(x_n)) x factor, surface factor 1.2 (the surface of a turbulent stream runs 1.15 to 1.3 of the mean); diffusion displacement sqrt(2 D dt) N(0,1) per axis with D = alpha h (u* + turb sqrt(g h)), u* = sqrt(g) n |u| / h^(1/6) (`hydro_drifters.axle:329-346,367-378`; the normal is four stateless hash uniforms summed, keyed by marker id, substep and axis). Crossing a lip a marker becomes a ballistic parcel with the local speed (at least 0.5 m/s) and the same drag, in micro-steps of at most 20 ms (`:78,56-80`). Measured: 1.4437 m/s on a channel vs 1.4437 mean surface velocity; 200 markers 1.7312 m/s against 1.2 x 1.4444 = 1.7333 (0.1 %); falls 11.91 m in 1.570 s over the 12 m lip (sqrt(2H/g) = 1.558 s) (`doc/spec/fluid.md:218-221,232`).
 - **Instructions:** serial in index order on the calling thread; a ring of 128 positions per marker sampled every 0.25 s (`HYDRO_TRAIL_POINTS`).
 - **Cost:** O(drifters) per substep; about 1.6 kB per marker (trail 1536 B + 49 B), 3.3 MB for the default 2048 (`hydro_drifters.axle:25-29`).
 - **Why this and not another:** serial stepping is chosen because drifters are few: the result is trivially the same for any worker count (`:29-31`).
 - **Where:** `src/sim/fluid/hydro_drifters.axle:249` (`step`), `:329` (`normal`), `:337` (`diffusivity`), `src/sim/fluid/hydro_world.axle:863-932`.
-- **Docs:** `doc/FLUID.md` ("Drifters").
+- **Docs:** `doc/spec/fluid.md` ("Drifters").
 
 ### S-41. I want turbulence and foam fields to colour rapids and wakes
 - **Means:** shear of the velocity field -> turbulence; foam made where turbulence is above an onset, advected semi-Lagrangian and decaying.
@@ -433,38 +433,38 @@ chapter yet for kinetic, animation, audio or navigation: those entries say `MISS
 - **Cost:** O(active cells) per substep, 12 bytes a cell (foam x2 + turbulence).
 - **Why this and not another:** not documented (constants have no derivation).
 - **Where:** `src/sim/fluid/hydro_passes.axle:387` (`surface`), `:436` (`carry`), `:460`.
-- **Docs:** MISSING (the constants and the shear formula are in no doc; `doc/FLUID.md` lists foam only as a feature).
+- **Docs:** MISSING (the constants and the shear formula are in no doc; `doc/spec/fluid.md` lists foam only as a feature).
 
 ### S-42. I want to read depth, surface, velocity, foam anywhere between cell centres
 - **Means:** bilinear blend of the four cell centres around the point; the surface elevation is blended only over wet cells so it does not sag across a rim.
-- **Mathematics:** depth = plain bilinear; surface = sum over wet cells of bilinear weight x (bed + h) / sum of those weights, bed when no wet cell; velocity at a point from face discharges (staggered mean of the two faces over the depth, `surfaceVelocityAt`) (`hydro_sample.axle:1-12,106-195`; `doc/FLUID.md:170`). Cells whose water is more than a cell above or below the nearest one are ignored (the far side of a cliff).
+- **Mathematics:** depth = plain bilinear; surface = sum over wet cells of bilinear weight x (bed + h) / sum of those weights, bed when no wet cell; velocity at a point from face discharges (staggered mean of the two faces over the depth, `surfaceVelocityAt`) (`hydro_sample.axle:1-12,106-195`; `doc/spec/fluid.md:170`). Cells whose water is more than a cell above or below the nearest one are ignored (the far side of a cliff).
 - **Instructions:** no allocation; points outside read the nearest edge cell.
 - **Cost:** O(1) per query.
 - **Why this and not another:** not documented.
 - **Where:** `src/sim/fluid/hydro_sample.axle:36,106,158`, `src/sim/fluid/hydro_world.axle:721-780`.
-- **Docs:** `doc/FLUID.md` ("Velocity readout").
+- **Docs:** `doc/spec/fluid.md` ("Velocity readout").
 
 ## Water in columns with particles: the legacy `FluidWorld` (`src/sim/fluid/fluid_*`)
 
-Cell units, f64. `doc/FLUID.md:1-12` marks it frozen: "`HydroWorld` is the engine for new work"; `fluid_*` is to be deleted once the geyser, river and intermittent examples migrate.
+Cell units, f64. `doc/spec/fluid.md:1-12` marks it frozen: "`HydroWorld` is the engine for new work"; `fluid_*` is to be deleted once the geyser, river and intermittent examples migrate.
 
 ### S-43. I want a cheap water surface from columns that slosh (virtual pipes)
 - **Means:** linearised shallow water on a staggered grid, written as "virtual pipes": a velocity per frontier between two columns, driven by the head difference.
 - **Mathematics:** head h = ground + water (+ external `load`, + a pressure term over `maxLevel` in `Pressure` overflow) (`fluid_field.axle:1-9`). Per frontier: u' = (u + pull (head_a - head_b) dt) / (1 + drag dt), pull = min(conductivity g, 0.25 / (depth dt^2)) where depth is the water above the sill (higher of the two grounds) on the donor side (`fluid_pipes.axle:107-138`; `FLUID_STABILITY` 0.25 `:37`); viscosity: u += min(visc dt, 0.2) sum(u_neighbours - u) (`:140-168`, `FLUID_VISCOUS_SHARE` `:45`); transfer volume = min(|u| dt, 0.5) x depth, then limited by what the donor holds and in `Keep` mode by half the receiver's room (`:170-205`, `FLUID_COURANT` 0.5, `FLUID_ROOM_SHARE` 0.5). Wave speed is the physical sqrt(g h) while the stability cap is not reached.
 - **Instructions:** two passes over a snapshot ("every velocity is computed from the same levels before any water moves, so the scan order cannot bias the flow"); every transfer subtracts from one column exactly what it adds to the other, so volume is conserved to rounding (`fluid_pipes.axle:1-34`). Levels are f64 "on purpose: conservation here is exact cancellation" (`fluid_field.axle:11-14`).
 - **Cost:** O(awake frontiers) per tick; one tick = `rules.dt` = 0.05 s by default (`fluid_rules.axle:41`). Phase order per tick: particles, vents, sources, pipes accelerate, diffuse, limit, apply, sinks, spills, infiltration, surface analysis (`fluid_world.axle:465-495`). No measured figure in the files read.
-- **Why this and not another:** the audit in `doc/FLUID.md:145-150` lists its weaknesses: "linearised ... no hydrostatic reconstruction", "waves in deep water are slowed by the stability cap instead of substepping" (S-28 replaces it).
+- **Why this and not another:** the audit in `doc/spec/fluid.md:145-150` lists its weaknesses: "linearised ... no hydrostatic reconstruction", "waves in deep water are slowed by the stability cap instead of substepping" (S-28 replaces it).
 - **Where:** `src/sim/fluid/fluid_pipes.axle:56,107,140,170,271`, `src/sim/fluid/fluid_world.axle:483` (`flowColumns`).
-- **Docs:** `doc/FLUID.md` ("Audit of the legacy FluidWorld").
+- **Docs:** `doc/spec/fluid.md` ("Audit of the legacy FluidWorld").
 
 ### S-44. I want a settled column world to cost almost nothing
 - **Means:** an `ActiveSet` strategy: only columns woken by the previous tick (plus sources, drains, pours, ground edits and kicks) and the frontiers around them are visited; `FullSweep` visits everything.
 - **Mathematics:** none: plain arithmetic. A frontier whose per-tick transfer falls under `sleepThreshold` stops waking its columns, "which freezes a surface gap of a few `sleepThreshold` across it" (`fluid_tick.axle:1-24`).
-- **Instructions:** frontier ids are array indices (all east frontiers row by row, then all south ones), so a frontier's two columns are arithmetic; awake lists are `Vec<i32>` rebuilt each tick (`doc/FLUID.md:147-149`); stamps use `i64` where `i32` would do (same audit).
+- **Instructions:** frontier ids are array indices (all east frontiers row by row, then all south ones), so a frontier's two columns are arithmetic; awake lists are `Vec<i32>` rebuilt each tick (`doc/spec/fluid.md:147-149`); stamps use `i64` where `i32` would do (same audit).
 - **Cost:** a settled world is "one list walk per tick".
 - **Why this and not another:** the stated trade: "sub-threshold water is left unpriced rather than simulated".
 - **Where:** `src/sim/fluid/fluid_tick.axle`, `src/sim/fluid/fluid_pipes.axle:56-105`.
-- **Docs:** `doc/FLUID.md` (audit only).
+- **Docs:** `doc/spec/fluid.md` (audit only).
 
 ### S-45. I want springs, drains, overflows, pistons and soaking ground in a column world
 - **Means:** sources and drains on blocks of columns with an exact ledger; a spill pass that hands surplus above `maxLevel` to the lowest neighbour at once; loads as extra head; infiltration.
@@ -491,7 +491,7 @@ Cell units, f64. `doc/FLUID.md:1-12` marks it frozen: "`HydroWorld` is the engin
 - **Cost:** O(iterations x P x 48) neighbour work per tick; pool default capacity 30 000 liquid, 200 000 spray (`fluid_particle_params.axle:28,80`); pool arrays are f64, 68 bytes a particle (six position/velocity, radius, age, fate) before solver scratch (`fluid_pool.axle:41-50`). No measured figure in the files read.
 - **Why this and not another:** SPH needs a time step bounded by the speed of sound ("a geyser throws water at 30 cells per second on a world that ticks at 20 Hz: SPH would need a dozen substeps or a soft, spongy fluid"); FLIP "needs a background grid of the whole volume ... which fights a world of columns"; PBF is "unconditionally stable at any speed, one parameter (the iteration count) trades stiffness for cost" (`fluid_liquid.axle:1-14`).
 - **Where:** `src/sim/fluid/fluid_liquid.axle:253` (`predict`), `:333` (`multipliers`), `:387` (`deltas`), `:437` (`displace`), `:463` (`settle`), `:510` (`soften`), `:584` (`decide`).
-- **Docs:** `doc/FLUID.md` (audit mentions it only); formulas MISSING.
+- **Docs:** `doc/spec/fluid.md` (audit mentions it only); formulas MISSING.
 
 ### S-48. I want to find the neighbours of a particle in constant time without a hash map's order dependence
 - **Means:** a spatial hash with cubes of the kernel support, addresses wrapped into a fixed 64 x 64 x 32 block of buckets, built by counting sort.
@@ -536,7 +536,7 @@ Cell units, f64. `doc/FLUID.md:1-12` marks it frozen: "`HydroWorld` is the engin
 - **Cost:** O(particles born per tick); bounded by the liquid pool.
 - **Why this and not another:** "A geyser is not a faster fountain." The doc plans to replace it by `HydroWorld::addVent` (S-38).
 - **Where:** `src/sim/fluid/fluid_vent.axle:215` (`apply`), `:244` (`dome`).
-- **Docs:** `doc/FLUID.md` ("Jets, edges and the readout" names the planned migration).
+- **Docs:** `doc/spec/fluid.md` ("Jets, edges and the readout" names the planned migration).
 
 ### S-53. I want random numbers in a parallel kernel that do not depend on which thread draws
 - **Means:** a stateless hash of (seed, tick, particle, purpose); serial phases use a `Pcg32` drawn in a fixed particle order.
@@ -681,7 +681,7 @@ Cell units, f64. `doc/FLUID.md:1-12` marks it frozen: "`HydroWorld` is the engin
 
 ## Audio (`src/sim/audio`)
 
-The engine has no device: it renders blocks of stereo f32 into a buffer; a test, an offline bounce or a device callback drive it identically (`audio_engine.axle:1-8`; ROADMAP: "offline only, nothing drives an audio device", `doc/ROADMAP.md:34`).
+The engine has no device: it renders blocks of stereo f32 into a buffer; a test, an offline bounce or a device callback drive it identically (`audio_engine.axle:1-8`; ROADMAP: "offline only, nothing drives an audio device", `doc/roadmap.md:34`).
 
 ### S-68. I want to mix many voices into stereo without clipping
 - **Means:** add the voices, multiply by the master gain, run a soft limiter that cannot exceed 1.
@@ -957,9 +957,9 @@ The engine has no device: it renders blocks of stereo f32 into a buffer; a test,
 - **Mathematics:** Gravity v += g dt; Drag v *= max(1 - k dt, 0) (the header writes exp(-k dt) approx 1 - k dt, the code uses the linear form); Wind v += (w - v) min(k dt, 1); Attract v += (c - p) k dt + (up x (c - p)) s dt, i.e. dv_x = (dx k + dz s) dt, dv_z = (dz k - dx s) dt; Rise v_y += k dt; Colour and Size lerp over age/life; positions then p += v dt (semi-implicit Euler) (`particles.axle:300-391`, header `:1-16`).
 - **Instructions:** one loop per op over `count` particles; the op code and 8 parameters per op stored in two `Vec`s; no allocation per tick.
 - **Cost:** O(n x ops) per step; memory 13 arrays x capacity x 4 bytes (12 f32 + 1 i32) = 52 bytes a particle; 600 motes 31 KB (`doc/handbook/render/15-view-layers.md:119`). No measured time in the file ("microseconds" in the handbook).
-- **Why this and not another:** "a new op is one value, one loop, one builder" (`particles.axle:25`); design in `doc/design/particles-wind.md` (not read for this file).
+- **Why this and not another:** "a new op is one value, one loop, one builder" (`particles.axle:25`).
 - **Where:** `src/sim/particles/particles.axle:158` (`PtcEffect`), `:300` (`step`).
-- **Docs:** `doc/handbook/render/15-view-layers.md` section 3.6 (and `doc/design/particles-wind.md`).
+- **Docs:** `doc/handbook/render/15-view-layers.md` section 3.6.
 
 ### S-98. I want particle births that are the same in every replay, reference picture and thread count
 - **Means:** births per tick as a function of the tick alone, draws from a `Pcg32` seeded by (effect seed, emitter key, tick).
@@ -994,7 +994,7 @@ The engine has no device: it renders blocks of stereo f32 into a buffer; a test,
 
 | mechanism | file | what is not written down anywhere in `doc/` |
 |---|---|---|
-| Rigid-body step order, 10 + 6 iterations, 120 Hz, 64-step cap | `src/sim/kinetic/physics_world.axle:37-473`, `physics_settings.axle` | the whole kinetic pipeline: only one line in `doc/ROADMAP.md:28` |
+| Rigid-body step order, 10 + 6 iterations, 120 Hz, 64-step cap | `src/sim/kinetic/physics_world.axle:37-473`, `physics_settings.axle` | the whole kinetic pipeline: only one line in `doc/roadmap.md:28` |
 | Sweep and prune on X, pair keys, merge sorts | `broad_phase.axle`, `kinetic_sort.axle` | complexity and why X only |
 | Box-box SAT, clipping, bias constants 0.98 / 0.95 / 0.0005 | `narrow_box.axle:19-54` | derivation of the biases; feature id layout (64 / 4 / 100 / 4096 spans) |
 | Sequential impulses, effective masses, friction cone, pushFactor 0.4, slop 5 mm, maxPush 4 m/s | `contact_solver.axle`, `physics_settings.axle` | the formulas and why friction is solved before the normal row |
@@ -1034,8 +1034,8 @@ The engine has no device: it renders blocks of stereo f32 into a buffer; a test,
 
 ## Doubts
 
-- `src/sim/fluid/hydro_grid.axle:18-19` says "90 bytes" per cell; the items listed in the same comment sum to 94 (bed 4, depth 4, credit 4, discharge 8, velocity 8, 12 face-flux arrays 48, lip flags 2, scale 4, foam 8, turbulence 4), which is what `doc/FLUID.md:98-112` says.
-- `doc/FLUID.md:50` gives the substep as `cfl * cellSize / max(|u| + sqrt(g h))`; the code bounds the maximum from below by 1 m/s (`hydro_world.axle:42,533`), so the doc formula is incomplete.
+- `src/sim/fluid/hydro_grid.axle:18-19` says "90 bytes" per cell; the items listed in the same comment sum to 94 (bed 4, depth 4, credit 4, discharge 8, velocity 8, 12 face-flux arrays 48, lip flags 2, scale 4, foam 8, turbulence 4), which is what `doc/spec/fluid.md:98-112` says.
+- `doc/spec/fluid.md:50` gives the substep as `cfl * cellSize / max(|u| + sqrt(g h))`; the code bounds the maximum from below by 1 m/s (`hydro_world.axle:42,533`), so the doc formula is incomplete.
 - `src/sim/kinetic/joint_solver.axle:1-6` says the joint position error is "fed back as a velocity (Baumgarte)"; in the code the bias enters only `iteratePosition` on the pseudo velocities (`:181-204`), never `iterate` (`:153-178`): a split-impulse form, not classical Baumgarte on real velocities.
 - `src/sim/kinetic/physics_query.axle:1-6` says a ray cast tests the ray against every body's shape "after a cheap box test"; `raycast` (`:51-82`) calls `rayShape` for every live body with no box test (only `overlapInto` has one, `:244-260`).
 - `src/sim/kinetic/physics_world.axle:485-503` applies the torque but no gyroscopic term (w x I w); for bodies with unequal principal inertias spin about a non-principal axis is then not angular-momentum conserving (verified by reading only; no test run).
@@ -1045,11 +1045,11 @@ The engine has no device: it renders blocks of stereo f32 into a buffer; a test,
 - `src/sim/audio/audio_voice.axle:360-364` wraps a looping position by subtracting one loop length once; if the step per frame is longer than the loop (very short loop, high pitch) the position stays beyond the loop end: UNVERIFIED consequence (reads are folded by modulo in `fold`, `:287-301`, but `position` itself keeps growing).
 - `src/sim/navigation/navmesh.axle:229-250` links an edge when exactly two polygons share it; a third polygon sharing the same edge becomes a new "owner" of it (the key was removed after the second) and is never linked to the other two; the file says "exactly two" but does not reject three.
 - `src/sim/navigation/navmesh.axle:1-17` and `grid_pathfinder.axle:253-254` differ: the grid finder reuses stamped arrays so "a query costs what it explores", but `NavMesh::findPath` allocates `NavSearch` arrays of size portals + 1 and `locate` scans every polygon on each query (`:334-341,366`).
-- `doc/ARCHITECTURE.md:10` and `doc/NAMES.md:30` list "gameplay" under `src/sim`; there is no such directory (`animation audio fluid kinetic navigation particles`).
+- `doc/guide/architecture.md:10` and `doc/guide/names.md:30` list "gameplay" under `src/sim`; there is no such directory (`animation audio fluid kinetic navigation particles`).
 - `src/sim/particles/particles.axle:5` header writes `Drag v *= exp(-k dt) ≈ 1 - k dt`; the code (`:320`) and the handbook (`15-view-layers.md:90`) use the linear form clamped at zero, which differs from the exponential for k dt not small (it zeroes the velocity at k dt >= 1).
 - `src/sim/fluid/hydro_params.axle:139-141` documents the CFL limit as "positive below one half", while `checked()` replaces any value above 0.45 by 0.25 (`:228-230`).
 - `src/sim/kinetic/body_store.axle:289-298`: `remove` does not call `wakeIsland` on the removed body's island or clear its contacts; whether stale manifolds are harmless relies on the next `collide` rebuilding them: UNVERIFIED (not traced through `Sleeper.update` of a sleeping island that contained the removed body).
 
 ## Summary of coverage
 
-All 100 entries come from the source files of `src/sim` that exist today: kinetic (S-01 to S-24: stepping, shapes, broad and narrow phase, contacts, joints, sleeping, queries, hash), `HydroWorld` (S-25 to S-42), the legacy `FluidWorld` (S-43 to S-54), animation (S-55 to S-67), audio (S-68 to S-83), navigation (S-84 to S-96) and particles (S-97 to S-100). Every file in the zone was opened; kinetic (except `debug_draw` and `joint_set`, read as headers and field lists), animation (all but the bodies of `pose`, `skeleton`, `bone_mask`, `event_buffer`, read in part), audio, navigation, particles, `hydro_flux`, `hydro_passes`, `hydro_runner` and `hydro_params` were read line by line, `hydro_grid` in part; for the large `hydro_world`, `hydro_lips`, `hydro_air`, `hydro_vents`, `hydro_drifters`, `hydro_sources`, `hydro_sample` and all `fluid_*` files I read the headers in full and the main kernels (`fluid_pipes`, `fluid_liquid`, `fluid_grid`, the substep and step of `hydro_world`, `fly`/`release`/`land`) but not every function: their constants and formulas are quoted from the places read, and the rest is attributed to the file headers and `doc/FLUID.md` (whose measured figures are quoted with their line numbers and were not re-measured; nothing was built or run). Not verified: sizes of `Shape`, `Vec<bool>`, `Transform` and `Mat4`; the internals of `Quat::slerp`, `Transform::lerp` and `hashCombine` (outside the zone); the WAV codec (`src/data/audio/wav.axle`); the "gameplay" area named in `doc/ARCHITECTURE.md`, which has no files; and any claim marked `UNVERIFIED` above. No test files were read, so "tested" statements come from `doc/FLUID.md`.
+All 100 entries come from the source files of `src/sim` that exist today: kinetic (S-01 to S-24: stepping, shapes, broad and narrow phase, contacts, joints, sleeping, queries, hash), `HydroWorld` (S-25 to S-42), the legacy `FluidWorld` (S-43 to S-54), animation (S-55 to S-67), audio (S-68 to S-83), navigation (S-84 to S-96) and particles (S-97 to S-100). Every file in the zone was opened; kinetic (except `debug_draw` and `joint_set`, read as headers and field lists), animation (all but the bodies of `pose`, `skeleton`, `bone_mask`, `event_buffer`, read in part), audio, navigation, particles, `hydro_flux`, `hydro_passes`, `hydro_runner` and `hydro_params` were read line by line, `hydro_grid` in part; for the large `hydro_world`, `hydro_lips`, `hydro_air`, `hydro_vents`, `hydro_drifters`, `hydro_sources`, `hydro_sample` and all `fluid_*` files I read the headers in full and the main kernels (`fluid_pipes`, `fluid_liquid`, `fluid_grid`, the substep and step of `hydro_world`, `fly`/`release`/`land`) but not every function: their constants and formulas are quoted from the places read, and the rest is attributed to the file headers and `doc/spec/fluid.md` (whose measured figures are quoted with their line numbers and were not re-measured; nothing was built or run). Not verified: sizes of `Shape`, `Vec<bool>`, `Transform` and `Mat4`; the internals of `Quat::slerp`, `Transform::lerp` and `hashCombine` (outside the zone); the WAV codec (`src/data/audio/wav.axle`); the "gameplay" area named in `doc/guide/architecture.md`, which has no files; and any claim marked `UNVERIFIED` above. No test files were read, so "tested" statements come from `doc/spec/fluid.md`.

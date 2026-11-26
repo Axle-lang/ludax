@@ -16,8 +16,8 @@ scene_material 92, scene_mesh 170, scene_shapes 267; `texture/` texture 276. Not
 (Mat3/Mat4, Frustum, Aabb, DQuat, trig `sin`/`cos`/`sqrt`), `data/bytes` (`Crc32`, `ByteBuf`), `core/jobs`, `core/profile`,
 `data/image`.
 
-Existing prose: `doc/RENDERING.md` (94 lines: data flow, command stream table, graph rules, backend contract, one paragraph on the
-CPU backend), `doc/LIGHTING_MATH.md` (105 lines: formulas of sections 1-9), `doc/LIGHTING.md` (contract; section 9 is the
+Existing prose: `doc/spec/rendering.md` (94 lines: data flow, command stream table, graph rules, backend contract, one paragraph on the
+CPU backend), `doc/spec/lighting-math.md` (105 lines: formulas of sections 1-9), `doc/spec/lighting.md` (contract; section 9 is the
 explainer), `doc/handbook/render/05-shading.md` (the split-sum table, BRDF and SH9 as used by the path-lit picture),
 `06-sky.md` (the baked sky; quotes the cost of `light_sky.axle`), `08-display.md` (tone curve and sRGB as tables in the path-lit
 display), `12-lux-layers.md:105` (one line on `GraphCompiler`). There is no handbook chapter for the CPU rasteriser, the BVH, the
@@ -38,7 +38,7 @@ nr resources, E read/write declarations, B total (triangle, tile) overlaps.
 - **Cost:** push amortised O(1); growth copies at most 2n elements in total over n pushes (derived). Memory 4 + 12 + 16 = 32 B per command; initial room 64 commands. `equals`/`describe` O(n). No measured figure in the files read.
 - **Why this and not another:** header: "rendering is data ... so a GPU backend and the CPU oracle execute the same commands" (design rule 6). Alternative (a command object per draw) is not discussed.
 - **Where:** `cmd/cmd_stream.axle:1-19,62-65,84-88,101-135,247-288`.
-- **Docs:** `doc/RENDERING.md:33-50` (table of opcodes, same slot meanings).
+- **Docs:** `doc/spec/rendering.md:33-50` (table of opcodes, same slot meanings).
 
 ### R-02. I want to save, send or replay a recorded frame as bytes and refuse a damaged file instead of half-building a stream
 - **Means:** `CmdCodec::encode/decode`: magic "LXCS", version, count n, n records of 8 little-endian words, CRC-32 of everything before it. Decode checks, in order: length >= 16, magic, version, `n in [0, 1e8]` and `len == 12 + 32n + 4`, checksum, then every opcode; on any failure the target stream is left empty and a reason string is returned.
@@ -47,7 +47,7 @@ nr resources, E read/write declarations, B total (triangle, tile) overlaps.
 - **Cost:** O(n) time and 32 n + 16 bytes (the encoder reserves 4 spare bytes: `12 + 32n + 4 + 4`). No measured figure.
 - **Why this and not another:** header: a frame "can be saved, diffed, sent to another process or replayed against a different backend". Alternatives (text, no checksum) not discussed.
 - **Where:** `cmd/cmd_codec.axle:1-12,66-129`.
-- **Docs:** `doc/RENDERING.md:48-50` (layout, one sentence); the checks and the 1e8 cap are not written down outside the code.
+- **Docs:** `doc/spec/rendering.md:48-50` (layout, one sentence); the checks and the 1e8 cap are not written down outside the code.
 
 ### R-03. I want f32 values written to bytes and read back bit for bit without a float-to-bits cast
 - **Means:** `floatBits` takes the number apart by repeated halving or doubling until the mantissa is in [1, 2); `bitsFloat` rebuilds it by repeated multiplication by 2 or 0.5. Exact for finite normal numbers and zero; -0 reads back as 0, denormals flush to 0, NaN becomes 0, infinity becomes the largest finite number.
@@ -56,7 +56,7 @@ nr resources, E read/write declarations, B total (triangle, tile) overlaps.
 - **Cost:** O(|e|) per float, up to about 127 multiplications; 4 floats per command (derived).
 - **Why this and not another:** header: "Axle has no float-to-bits cast". Lost cases (-0, denormals) are justified as "no command has any reason to hold one".
 - **Where:** `cmd/cmd_codec.axle:9-12,44-61,132-192`.
-- **Docs:** `doc/RENDERING.md:49-50` (the -0 caveat only).
+- **Docs:** `doc/spec/rendering.md:49-50` (the -0 caveat only).
 
 ### R-04. I want per-pass counts that reproduce exactly, with the (non-reproducible) time kept apart
 - **Means:** `PassCosts`: slot arrays indexed by pass id (draw calls, triangles submitted, triangles rasterised, pixels shaded; nanoseconds and call count copied from the `Profiler` by `absorbProfile`). Counts are part of the render's identity; time is reported separately.
@@ -65,7 +65,7 @@ nr resources, E read/write declarations, B total (triangle, tile) overlaps.
 - **Cost:** per pass 8 + 4 + 4 + 8 + 8 + 8 = 40 B (derived from the field types); O(passes) to reset or absorb.
 - **Why this and not another:** header: "Design rule 8: per-pass cost is observable ... Those counts are deterministic ... Time is not".
 - **Where:** `cmd/cmd_costs.axle:1-8,14-123`.
-- **Docs:** `doc/RENDERING.md:62-63,77`; `doc/LIGHTING.md` section 9 for the rule.
+- **Docs:** `doc/spec/rendering.md:62-63,77`; `doc/spec/lighting.md` section 9 for the rule.
 
 ---
 
@@ -78,7 +78,7 @@ nr resources, E read/write declarations, B total (triangle, tile) overlaps.
 - **Cost:** O(I * T_mesh) transforms; every submitted triangle is counted in `submitted`. Memory per stored triangle: snap 6 x i32 + zinv 6 x f32 + attr 24 x f32 + geo 3 x f32 + meta 5 x i32 = 24 + 24 + 96 + 12 + 20 = 176 B (derived from `CTRI_*`); arrays start at 256 triangles and double, copying the stored part.
 - **Why this and not another:** not documented (header gives the pipeline, not alternatives).
 - **Where:** `cpu/cpu_tris.axle:80-105,351-430`.
-- **Docs:** `doc/RENDERING.md:83-88` (one paragraph); MISSING for the record layout.
+- **Docs:** `doc/spec/rendering.md:83-88` (one paragraph); MISSING for the record layout.
 
 ### R-06. I want triangles that cross the near plane, or reach far outside the screen, drawn correctly
 - **Means:** Sutherland-Hodgman clipping of the clip-space polygon against five planes: near (z >= 0) and the four sides of a guard band 4 screen sizes wide. A triangle wholly inside all five planes takes a fast path with no copying. Survivors (a polygon of up to ten slots) are emitted as a triangle fan.
@@ -87,7 +87,7 @@ nr resources, E read/write declarations, B total (triangle, tile) overlaps.
 - **Cost:** fast path 15 comparisons; slow path O(5 * n_vertices * 12) floats per triangle (derived). No far-plane clip: depth outside 0..1 is rejected per pixel (R-13). The reason for a 4x guard band (rather than clipping to the screen) is not stated; the snapped coordinates are stored as `i32`, so some bound is needed (`UNVERIFIED` inference).
 - **Why this and not another:** not documented beyond the header ("exact for attributes that are later interpolated perspective-correctly").
 - **Where:** `cpu/cpu_tris.axle:62-75,433-534`.
-- **Docs:** `doc/RENDERING.md:83` (one sentence).
+- **Docs:** `doc/spec/rendering.md:83` (one sentence).
 
 ### R-07. I want coverage decided in exact integer arithmetic, so two triangles sharing an edge agree about every pixel
 - **Means:** after the divide by w, vertices are snapped to a grid of 1/256 pixel; from there all coverage maths is integer (R-12).
@@ -96,7 +96,7 @@ nr resources, E read/write declarations, B total (triangle, tile) overlaps.
 - **Cost:** O(1) per emitted triangle; a pixel centre is at 128 on the snapped grid.
 - **Why this and not another:** header: "coverage is exact, two triangles sharing an edge agree on which side of it every pixel centre is, and the top-left rule leaves no pixel covered twice or not at all".
 - **Where:** `cpu/cpu_tris.axle:35-42,74-78,560-585,650-656`.
-- **Docs:** `doc/RENDERING.md:83-86`.
+- **Docs:** `doc/spec/rendering.md:83-86`.
 
 ### R-08. I want back faces dropped (or shaded as the back) using the same arithmetic that decides coverage
 - **Means:** the sign of the snapped signed area is the facing test; stored triangles are put in canonical orientation (positive area) and a flag says which side they showed.
@@ -105,7 +105,7 @@ nr resources, E read/write declarations, B total (triangle, tile) overlaps.
 - **Cost:** O(1) per triangle.
 - **Why this and not another:** not documented.
 - **Where:** `cpu/cpu_tris.axle:12-15,127-130,538-557,588-594,610-648`.
-- **Docs:** `doc/RENDERING.md:70` states the front-face convention only.
+- **Docs:** `doc/spec/rendering.md:70` states the front-face convention only.
 
 ### R-09. I want triangles wholly off the picture rejected before they cost any memory
 - **Means:** test the snapped bounding box against the target after rounding.
@@ -123,7 +123,7 @@ nr resources, E read/write declarations, B total (triangle, tile) overlaps.
 - **Cost:** O(T + B) time with B the total number of overlaps; memory 4 (B + 1) bytes for the list + 4 (tiles + 1) for the starts + the temporary cursors. A long thin triangle overlaps many tiles (B grows with the bounding box, not the area): derived.
 - **Why this and not another:** header: it "keeps that order inside every tile, which is what makes the picture independent of thread count".
 - **Where:** `cpu/cpu_tris.axle:12-15,659-719`.
-- **Docs:** `doc/RENDERING.md:83-84`.
+- **Docs:** `doc/spec/rendering.md:83-84`.
 
 ---
 
@@ -136,7 +136,7 @@ nr resources, E read/write declarations, B total (triangle, tile) overlaps.
 - **Cost:** parallel over ceil(W/32) * ceil(H/32) tiles. Serial parts per flush: `copyIn` and `copyOut` copy 3 + 1 floats per pixel each (16 B/pixel each way, derived), plus `bin`. Memory in the kernel per pixel: vis 4 B + cover 4 B + colour 12 B + depth 4 B = 24 B; each target resource adds colour 12 B, depth 4 B and an `Image` (storage format `UNVERIFIED`). No measured scaling in the files read.
 - **Why this and not another:** header and `CpuSettings.workers` doc: "The picture does not depend on it".
 - **Where:** `cpu/cpu_kernel.axle:1-13,37-38,63-107,154-158,214-224`; `cpu/cpu_renderer.axle:42-46,52-55,70-87,110-131,289-311`.
-- **Docs:** `doc/RENDERING.md:86-87`.
+- **Docs:** `doc/spec/rendering.md:86-87`.
 
 ### R-12. I want exact coverage, with no pixel drawn twice or missed along a shared edge
 - **Means:** integer edge functions evaluated at pixel centres and the top-left fill rule. Edge i is opposite vertex i; the inside is positive; a pixel centre exactly on an edge belongs to the triangle only when that edge is a top edge (horizontal, pointing right) or a left edge (pointing up).
@@ -145,7 +145,7 @@ nr resources, E read/write declarations, B total (triangle, tile) overlaps.
 - **Cost:** O(bounding-box pixels inside the tile) per (triangle, tile), 3 edge tests per pixel; there is no skipping of empty spans inside the box (derived). The suite proves "every pixel of a mesh is covered exactly once" with `debugCover` (header); no timing is quoted.
 - **Why this and not another:** header: "exact, no pixel twice, none missed along a shared edge". Float edge functions are not discussed.
 - **Where:** `cpu/cpu_kernel.axle:1-17,259-336`.
-- **Docs:** `doc/RENDERING.md:84-85`.
+- **Docs:** `doc/spec/rendering.md:84-85`.
 
 ### R-13. I want the depth of a covered pixel, a far-plane test, and a deterministic winner on ties
 - **Means:** interpolate the per-vertex depth z/w (linear in screen space after the divide) with the edge values; keep a fragment when 0 <= depth <= 1 and depth < stored depth.
@@ -163,7 +163,7 @@ nr resources, E read/write declarations, B total (triangle, tile) overlaps.
 - **Cost:** O(S * (L lights + shadow queries + texture reads)) for the shading (R-27, R-19, R-61); the visibility pass costs coverage only. Reported to `PassCosts.pixels`.
 - **Why this and not another:** header: "so a covered pixel costs one shading however many triangles overlapped". Forward shading per fragment is the implicit alternative.
 - **Where:** `cpu/cpu_kernel.axle:3-13,181-224`.
-- **Docs:** `doc/RENDERING.md:84-85`.
+- **Docs:** `doc/spec/rendering.md:84-85`.
 
 ### R-15. I want cut-out materials (fences, leaves) whose holes are decided before the depth is written
 - **Means:** in the visibility pass, a `Mask` material samples its alpha at the fragment and drops the pixel below the cutoff, before storing depth and id.
@@ -172,7 +172,7 @@ nr resources, E read/write declarations, B total (triangle, tile) overlaps.
 - **Cost:** one surface sample per candidate fragment of a masked triangle; overdraw of masked geometry is therefore not free (derived).
 - **Why this and not another:** not documented.
 - **Where:** `cpu/cpu_kernel.axle:346-357`; `cpu/cpu_surface.axle:302-347`.
-- **Docs:** `doc/RENDERING.md:85`.
+- **Docs:** `doc/spec/rendering.md:85`.
 
 ### R-16. I want translucent surfaces mixed over the opaque picture in a stable order
 - **Means:** blended triangles are rasterised after the shading pass, in submission order (the extractor sorted the instances far to near); a fragment is depth-tested without writing depth, shaded and mixed; fully clear texels (alpha <= 0) cost nothing further.
@@ -181,7 +181,7 @@ nr resources, E read/write declarations, B total (triangle, tile) overlaps.
 - **Cost:** O(blended covered pixels * shading), counted as shaded pixels (derived).
 - **Why this and not another:** not documented (order-independent transparency is not discussed).
 - **Where:** `cpu/cpu_kernel.axle:9-11,365-378`; sort in `scene/scene_extract.axle:190-202`.
-- **Docs:** `doc/RENDERING.md:30-31,67-69`.
+- **Docs:** `doc/spec/rendering.md:30-31,67-69`.
 
 ### R-17. I want to check the fill rule on a real mesh
 - **Means:** `debugCover` counts, before the depth test, how many triangles cover each pixel.
@@ -203,7 +203,7 @@ nr resources, E read/write declarations, B total (triangle, tile) overlaps.
 - **Cost:** 3 weight sets per surface sample (3 divisions each plus one for the sum); 8 floats per vertex interpolated (position 3, normal 3, uv 2): derived.
 - **Why this and not another:** not documented.
 - **Where:** `cpu/cpu_surface.axle:160-217,302-347`.
-- **Docs:** `doc/RENDERING.md:83-86` (the fact, not the formula); MISSING.
+- **Docs:** `doc/spec/rendering.md:83-86` (the fact, not the formula); MISSING.
 
 ### R-19. I want textures that neither shimmer when minified nor blur along a floor seen at a grazing angle
 - **Means:** the pixel's footprint in uv comes from the weights at the pixel centre, one pixel right and one pixel down. The two footprint vectors measured in texels give a major and a minor axis; up to 8 trilinear taps are spread along the major axis, each with the major length divided by the tap count as its own footprint.
@@ -221,7 +221,7 @@ nr resources, E read/write declarations, B total (triangle, tile) overlaps.
 - **Cost:** O(1) per pixel on top of the tap loop of R-19.
 - **Why this and not another:** the 0.05 floor: "so the shading normal never turns to the back of its own surface". The re-encode is a workaround for `Texture` always decoding sRGB (see Doubts).
 - **Where:** `cpu/cpu_surface.axle:43-47,375-421`.
-- **Docs:** `doc/RENDERING.md:73-75` (convention "tangent space with green up" only).
+- **Docs:** `doc/spec/rendering.md:73-75` (convention "tangent space with green up" only).
 
 ### R-21. I want a double-sided surface lit correctly from behind, and a view vector right for both camera kinds
 - **Means:** a stored triangle carries a back flag; both normals are negated for it; the view vector is the normalised negated position for a perspective camera and the constant -forward for an orthographic one.
@@ -275,7 +275,7 @@ nr resources, E read/write declarations, B total (triangle, tile) overlaps.
 - **Cost:** O(1) plus the fetches of R-19.
 - **Why this and not another:** header: "Colours are linear. `toLight` hands the constant part to the lighting library".
 - **Where:** `scene/scene_material.axle:1-6,76-91`; `cpu/cpu_surface.axle:349-381`.
-- **Docs:** `doc/LIGHTING.md` section 3.
+- **Docs:** `doc/spec/lighting.md` section 3.
 
 ---
 
@@ -288,7 +288,7 @@ nr resources, E read/write declarations, B total (triangle, tile) overlaps.
 - **Cost:** per shaded pixel and Ray light: one BVH query, O(log n) expected for a balanced tree and O(n) worst (derived, no measurement in the files read).
 - **Why this and not another:** header: "One ray means a hard shadow edge whatever the light's radius: the soft penumbra of a sized light is future work".
 - **Where:** `cpu/cpu_shadow.axle:1-34,62-131`.
-- **Docs:** `doc/RENDERING.md:75-76,92`; `doc/LIGHTING_MATH.md:74-81` (planned penumbra maths, not implemented here).
+- **Docs:** `doc/spec/rendering.md:75-76,92`; `doc/spec/lighting-math.md:74-81` (planned penumbra maths, not implemented here).
 
 ### R-28. I want a triangle BVH built identically on every run, every frame
 - **Means:** median split: at each node the triangles are ordered by the centroid coordinate along the axis of widest centroid spread (stable merge sort on a fixed-point key), cut in half, the children take two adjacent node slots; leaves hold at most 4; depth capped at 48.
@@ -297,7 +297,7 @@ nr resources, E read/write declarations, B total (triangle, tile) overlaps.
 - **Cost:** time O(n log^2 n): a full sort of the node's range at every level, about log2(n/4) levels (derived). Memory: 36 B per triangle + up to (2n + 2) * (24 B box + 4 + 4) = 32 B per node slot; build scratch: order 4 B and centroids 12 B per triangle, plus keys 8 B and two index arrays during each sort. No measured build time in the files read.
 - **Why this and not another:** header: "No random number, hash or thread takes part, so the same triangles always give the same tree". A surface-area-heuristic build is not discussed (not documented).
 - **Where:** `cpu/cpu_bvh.axle:1-16,24-56,102-127,171-253`.
-- **Docs:** `doc/RENDERING.md:87` (one sentence "median-split BVH"); MISSING for the rest.
+- **Docs:** `doc/spec/rendering.md:87` (one sentence "median-split BVH"); MISSING for the rest.
 
 ### R-29. I want a fast yes/no ray-box test
 - **Means:** the slab test on a precomputed reciprocal direction.
@@ -333,7 +333,7 @@ nr resources, E read/write declarations, B total (triangle, tile) overlaps.
 - **Cost:** O(total caster triangles) plus the build of R-28, at every BuildAccel; memory 36 B per triangle for the corner array (the BVH constructor keeps its own copy).
 - **Why this and not another:** comment: "a blended surface lets light through, and the rays never test alpha". Masked (cut-out) casters are included as solid triangles, so a shadow ray ignores the mask (derived).
 - **Where:** `cpu/cpu_renderer.axle:12-13,313-356`.
-- **Docs:** `doc/RENDERING.md:87`.
+- **Docs:** `doc/spec/rendering.md:87`.
 
 ---
 
@@ -346,7 +346,7 @@ nr resources, E read/write declarations, B total (triangle, tile) overlaps.
 - **Cost:** O(1) per declaration (the cost of `StringInterner::find` is in `core/id`, not read: `UNVERIFIED`); memory per resource about 4 + 4 + 4 + 4 + 8 + 1 + 1 B, per edge 4 + 4 + 1 B (derived).
 - **Why this and not another:** header: ids are "the same on every run, and every tie in the compiler is broken by those ids".
 - **Where:** `graph/graph_graph.axle:1-12,73-139,152-164`; `graph/graph_types.axle:20-30,65-67,158-165`.
-- **Docs:** `doc/RENDERING.md:52-57`.
+- **Docs:** `doc/spec/rendering.md:52-57`.
 
 ### R-34. I want mistakes in a frame description reported by name before anything runs
 - **Means:** `GraphCompiler::compile` validates: duplicate names, unknown resources, a read nobody writes (unless imported), read-before-write for a pass that reads and writes one resource, a cycle (naming the passes), no output, and a pass given resources of the wrong kind (build-accel without an accel write, forward without a colour write, resolve without a colour read and a colour or texture write). Problems go to a fixed 128-entry log; later ones are only counted, and `isValid` is false if any were dropped.
@@ -355,7 +355,7 @@ nr resources, E read/write declarations, B total (triangle, tile) overlaps.
 - **Cost:** table memory 4 (2 np nr + np^2) bytes (derived); validation O(E + np nr).
 - **Why this and not another:** `graph_types` header: the log "never grows, because a generic container of strings is not safe in the compiler we pin".
 - **Where:** `graph/graph_plan.axle:1-15,69-71,158-215,220-295`; `graph/graph_types.axle:1-6,44-93`.
-- **Docs:** `doc/RENDERING.md:57-59`.
+- **Docs:** `doc/spec/rendering.md:57-59`.
 
 ### R-35. I want to know which pass must run before which
 - **Means:** writers of one resource chain in pass-id order; a pure reader depends on the last writer; a pass that reads and writes depends on the last earlier writer; a missing earlier writer is an error unless the resource is imported.
@@ -364,7 +364,7 @@ nr resources, E read/write declarations, B total (triangle, tile) overlaps.
 - **Cost:** O(nr * np + (read-and-write pairs) * np), worst O(nr np^2) (derived).
 - **Why this and not another:** the header states the semantics "in one place" (`graph_graph.axle:9-12`); alternatives are not discussed.
 - **Where:** `graph/graph_plan.axle:1-15,298-338`; `graph/graph_graph.axle:9-12`.
-- **Docs:** `doc/RENDERING.md:54-57`.
+- **Docs:** `doc/spec/rendering.md:54-57`.
 
 ### R-36. I want passes nothing visible depends on to cost nothing
 - **Means:** roots are passes that write an output or an imported resource; liveness spreads to every pass a live pass depends on, to a fixed point; the rest are culled (not run, not recorded, no memory for their private resources).
@@ -373,7 +373,7 @@ nr resources, E read/write declarations, B total (triangle, tile) overlaps.
 - **Cost:** O(np nr + np^2 * rounds), rounds <= np, so O(np^3) worst case (derived); frames have a handful of passes.
 - **Why this and not another:** not documented.
 - **Where:** `graph/graph_plan.axle:9-10,398-426`.
-- **Docs:** `doc/RENDERING.md:59-60`.
+- **Docs:** `doc/spec/rendering.md:59-60`.
 
 ### R-37. I want a deterministic order of execution that respects the dependencies
 - **Means:** Kahn's algorithm with the lowest pass id first among the ready passes, so independent passes keep the order they were added in; passes on a cycle stay unplaced and are named in a `Cycle` issue; the run order is that order restricted to live passes.
@@ -382,7 +382,7 @@ nr resources, E read/write declarations, B total (triangle, tile) overlaps.
 - **Cost:** O(np^2) time (the textbook Kahn is O(V + E) with a queue; this version scans), memory 2 np ints (derived).
 - **Why this and not another:** header: "Kahn's algorithm with the lowest pass id first among the ready ones, so independent passes keep the order they were added in". A priority queue is not discussed.
 - **Where:** `graph/graph_plan.axle:11-12,341-381,429-443`.
-- **Docs:** `doc/RENDERING.md:60-61`; `doc/handbook/render/12-lux-layers.md:105`.
+- **Docs:** `doc/spec/rendering.md:60-61`; `doc/handbook/render/12-lux-layers.md:105`.
 
 ### R-38. I want to know, for every resource, when it is first and last needed
 - **Means:** first and last run position over the live passes that touch it; outputs and imports are kept alive to the last pass.
@@ -391,7 +391,7 @@ nr resources, E read/write declarations, B total (triangle, tile) overlaps.
 - **Cost:** O(E + nr).
 - **Why this and not another:** not documented.
 - **Where:** `graph/graph_plan.axle:13-14,446-472`.
-- **Docs:** `doc/RENDERING.md:61-62`.
+- **Docs:** `doc/spec/rendering.md:61-62`.
 
 ### R-39. I want transient targets to share memory when they are never alive together
 - **Means:** greedy interval colouring: transient resources (used, not imported, not output) are taken in order of first use; each takes the first existing block of the same size and the same class (image or acceleration structure) that is free by then, else a new block. The report gives bytes with and without sharing and the persistent bytes (non-imported outputs, never shared).
@@ -400,7 +400,7 @@ nr resources, E read/write declarations, B total (triangle, tile) overlaps.
 - **Cost:** O(nr^2 + nr * blocks) time (derived); the compiler only plans bytes and allocates nothing. Example size: a 1920 x 1080 `Hdr` target is 16 B x 2,073,600 pixels = 33,177,600 B (derived from `GFMT_BYTES_HDR`). The CPU backend allocates one buffer set per target id on demand and does not consume the aliasing plan (derived from `CpuRenderer::target`).
 - **Why this and not another:** header: "a greedy interval assignment by first use". Alternatives are not discussed.
 - **Where:** `graph/graph_plan.axle:13-15,474-542`; `graph/graph_types.axle:65-67,158-165`; `cpu/cpu_renderer.axle:140-149`.
-- **Docs:** `doc/RENDERING.md:61-62`.
+- **Docs:** `doc/spec/rendering.md:61-62`.
 
 ### R-40. I want a frame turned into commands with as few state changes as possible
 - **Means:** `FrameRecorder::record` walks the live passes in order and emits BeginPass, the commands of the pass kind, EndPass. A Forward pass sets the colour and depth target, clears both, then draws the instance list as runs of equal (mesh, material): `BindMaterial` only when the material changes, one `DrawMesh` per run. An invalid plan records nothing.
@@ -409,7 +409,7 @@ nr resources, E read/write declarations, B total (triangle, tile) overlaps.
 - **Cost:** O(I) per Forward pass; draw calls = number of runs, which is the number of distinct (material, mesh) groups plus the splits caused by blended instances (derived).
 - **Why this and not another:** not documented (batching is the stated purpose of the sort in `scene_extract`).
 - **Where:** `graph/graph_record.axle:1-12,38-120`.
-- **Docs:** `doc/RENDERING.md:17-22`.
+- **Docs:** `doc/spec/rendering.md:17-22`.
 
 ### R-41. I want to read a frame plan and its cost as text that compares byte for byte across runs
 - **Means:** `GraphReport::text`: problems, passes in order with reads and writes, culled passes, every resource with kind, size, flags, lifetime and block, and the memory summary; per-pass counters when the backend filled `PassCosts`; times only on request.
@@ -418,7 +418,7 @@ nr resources, E read/write declarations, B total (triangle, tile) overlaps.
 - **Cost:** O(np * E) for the listing (derived); not on a hot path.
 - **Why this and not another:** header: a report "without [times] can be compared byte for byte".
 - **Where:** `graph/graph_report.axle:1-8,27-140`.
-- **Docs:** `doc/RENDERING.md:62-63`.
+- **Docs:** `doc/spec/rendering.md:62-63`.
 
 ---
 
@@ -431,7 +431,7 @@ nr resources, E read/write declarations, B total (triangle, tile) overlaps.
 - **Cost:** O(L) per explained pixel, plus the full `lightShade` again for the independent result.
 - **Why this and not another:** `light_explain` header: "so the gap is exactly 0 and a test fails the moment either path is changed alone".
 - **Where:** `light/light_explain.axle:1-98`; `cpu/cpu_explain.axle:1-35,92-135`.
-- **Docs:** `doc/LIGHTING.md` section 9; `doc/RENDERING.md:87-88`.
+- **Docs:** `doc/spec/lighting.md` section 9; `doc/spec/rendering.md:87-88`.
 
 ---
 
@@ -444,7 +444,7 @@ nr resources, E read/write declarations, B total (triangle, tile) overlaps.
 - **Cost:** O(M) matrix builds for M mesh entities; no measured figure.
 - **Why this and not another:** `scene_camera` header (design rule 5): "keeps its precision ten kilometres from the world's centre"; RENDERING.md quotes a check at 5000 km (`prism`).
 - **Where:** `scene/scene_camera.axle:1-8,159-161,189-191`; `scene/scene_extract.axle:1-10,165-187`; `scene/scene_frame.axle:1-8`.
-- **Docs:** `doc/RENDERING.md:25-28`.
+- **Docs:** `doc/spec/rendering.md:25-28`.
 
 ### R-44. I want instances outside the camera's view dropped before they reach any backend
 - **Means:** the mesh's local AABB is transformed by the camera-relative model matrix and tested against the frustum built from the view-projection product; "wholly outside" instances are dropped and counted (`considered`, `rejected`). A dead entity, or an unknown mesh or material id, is skipped.
@@ -453,7 +453,7 @@ nr resources, E read/write declarations, B total (triangle, tile) overlaps.
 - **Cost:** O(M) per frame; the frustum is built once.
 - **Why this and not another:** not documented. No spatial index is used (RENDERING.md "Not done" lists "culling of lights"; ROADMAP.md:18 notes no BVH or octree for the world).
 - **Where:** `scene/scene_extract.axle:122-162`; `scene/scene_camera.axle:184-186`.
-- **Docs:** `doc/RENDERING.md:11-12,30-31`.
+- **Docs:** `doc/spec/rendering.md:11-12,30-31`.
 
 ### R-45. I want the draw list in an order that depends on the data alone, with equal state adjacent
 - **Means:** opaque and masked instances are sorted by (material, mesh, entity slot); the sort is a stable bottom-up merge sort over an `i64` key; no hash and no library order enters.
@@ -462,7 +462,7 @@ nr resources, E read/write declarations, B total (triangle, tile) overlaps.
 - **Cost:** O(n log n) comparisons, 8 n bytes of index arrays (derived). Ids above 2^20 - 1 wrap inside the key (only the order is affected).
 - **Why this and not another:** header: "ordered by a key that depends on the data alone, so two runs hand the backend the same list". The same `sortedOrder` is reused by the BVH build (R-28).
 - **Where:** `scene/scene_extract.axle:1-10,48-56,107-119,190-239`.
-- **Docs:** `doc/RENDERING.md:30-31`.
+- **Docs:** `doc/spec/rendering.md:30-31`.
 
 ### R-46. I want blended instances drawn far to near
 - **Means:** blended instances get a key above every opaque one, falling with view depth.
@@ -471,7 +471,7 @@ nr resources, E read/write declarations, B total (triangle, tile) overlaps.
 - **Cost:** O(1) per blended instance on top of R-45.
 - **Why this and not another:** per-instance (bounds centre) sort rather than per triangle; not discussed.
 - **Where:** `scene/scene_extract.axle:1-10,48-56,190-202`.
-- **Docs:** `doc/RENDERING.md:30-31`.
+- **Docs:** `doc/spec/rendering.md:30-31`.
 
 ### R-47. I want a camera that is placed in f64, looks along -Z and projects to Vulkan clip space
 - **Means:** `Camera`: position DVec3, rotation DQuat, perspective or orthographic; `lookAt` builds a basis and converts it to a quaternion; `viewProjection = projection * view`.
@@ -480,7 +480,7 @@ nr resources, E read/write declarations, B total (triangle, tile) overlaps.
 - **Cost:** O(1) per matrix; per frame once.
 - **Why this and not another:** header: "the projection is Vulkan's (depth 0 near to 1 far, +Y down in NDC)".
 - **Where:** `scene/scene_camera.axle:1-8,19,96-114,159-186`.
-- **Docs:** `doc/RENDERING.md:70` (conventions).
+- **Docs:** `doc/spec/rendering.md:70` (conventions).
 
 ### R-48. I want lights and assets addressed by small stable ids, lights placed by their entity
 - **Means:** `LightComp` (lux for a directional light, candela for point and spot, cd/m^2 for an emissive disc) is turned into a `LightSource` by `toSource` at the entity's camera-relative position and direction (local -Z rotated by the entity's rotation); `RenderAssets` hands out ids in insertion order for meshes, materials and textures.
@@ -489,7 +489,7 @@ nr resources, E read/write declarations, B total (triangle, tile) overlaps.
 - **Cost:** O(1) amortised per insertion; lookups O(1).
 - **Why this and not another:** `scene_assets` header: ids are "the same on every run that inserts in the same order"; generic containers of ours "cannot hold classes".
 - **Where:** `scene/scene_light.axle:1-8,113-152`; `scene/scene_extract.axle:165-177`; `scene/scene_assets.axle:1-65`.
-- **Docs:** `doc/RENDERING.md:14-16`; `doc/LIGHTING.md` section 2.
+- **Docs:** `doc/spec/rendering.md:14-16`; `doc/spec/lighting.md` section 2.
 
 ---
 
@@ -502,7 +502,7 @@ nr resources, E read/write declarations, B total (triangle, tile) overlaps.
 - **Cost:** about 14 multiply-adds + 11 loop steps of squaring for `exp2`; about 11 divisions-by-constant + the folding loop for `log2`; `pow` = both. All in f64. No measured figure in the files read.
 - **Why this and not another:** subset rule 7: "their bodies here are the CPU definition and are computed in f64 from IEEE additions and multiplications, so the same bits come out on every machine. They are the one place a GPU result may differ (by a few ulp)". `CLAUDE.md` forbids libm `sin`/`cos` where determinism matters.
 - **Where:** `light/light_math.axle:1-24,28-165`.
-- **Docs:** `doc/LIGHTING_MATH.md:85-91` (one line, no term counts); the subset rules appear only in the file header.
+- **Docs:** `doc/spec/lighting-math.md:85-91` (one line, no term counts); the subset rules appear only in the file header.
 
 ### R-50. I want integrals over directions done exactly and reproducibly, without a pasted table of nodes
 - **Means:** `LightGauss`: Gauss-Legendre nodes and weights computed by Newton's method on the Legendre polynomial.
@@ -511,7 +511,7 @@ nr resources, E read/write declarations, B total (triangle, tile) overlaps.
 - **Cost:** O(n^2) per rule (n roots, a few steps, an O(n) recurrence each; derived). Measured by the suite (header): the weights sum to 2 within 4e-16; x^k integrates exactly up to degree 2n - 1 for n up to 64, error below 1e-14.
 - **Why this and not another:** header: "A node table pasted from a book is a table that can have a typo".
 - **Where:** `light/light_quadrature.axle:1-61`.
-- **Docs:** `doc/LIGHTING_MATH.md:88-89` says the nodes are "tabulated" (see Doubts).
+- **Docs:** `doc/spec/lighting-math.md:88-89` says the nodes are "tabulated" (see Doubts).
 
 ---
 
@@ -522,27 +522,27 @@ nr resources, E read/write declarations, B total (triangle, tile) overlaps.
 - **Mathematics:** alpha = max(roughness^2, 0.045), h = normalize(l + v); D = alpha^2 / (pi ((n.h)^2 (alpha^2 - 1) + 1)^2) with the invariant integral D (n.h) dw_h = 1; V = 0.5 / ( n.l sqrt(n.v^2 (1 - alpha^2) + alpha^2) + n.v sqrt(n.l^2 (1 - alpha^2) + alpha^2) ) = G2 / (4 n.l n.v); F = F0 + (1 - F0)(1 - v.h)^5, F0 = lerp(0.04, baseColor, metallic); f_s(l, v) = f_s(v, l).
 - **Instructions:** (1 - x)^5 by three multiplications (x2 = x*x, x2*x2*x); one reciprocal in D, one in V with the denominator floored at 1e-9; the half vector uses `normalizedOr(n)`; n.v is floored at 1e-4; the whole function returns zero below the horizon (n.l <= 0). f64 twins exist for D, V and the Fresnel weight.
 - **Cost:** per light per shaded pixel: 1 normalisation, 2 square roots, 2 divisions, about 40 flops (derived). Error budget asserted by the suite: D, V, F f32 versus f64 relative error <= 4e-6 (header). Documented deviation: alpha >= 0.045 (roughness 0.21) because "below it D is a spike that neither f32 nor a shadow map can represent and a real light is never a point".
-- **Why this and not another:** the floors are documented deviations (header); the choice of GGX/Smith/Schlick follows glTF (`LIGHTING_MATH.md` section 3 title).
+- **Why this and not another:** the floors are documented deviations (header); the choice of GGX/Smith/Schlick follows glTF (`doc/spec/lighting-math.md` section 3 title).
 - **Where:** `light/light_brdf.axle:1-25,28-40,54-106,148-170`.
-- **Docs:** `doc/LIGHTING_MATH.md:35-44`; `doc/handbook/render/05-shading.md:50-64`.
+- **Docs:** `doc/spec/lighting-math.md:35-44`; `doc/handbook/render/05-shading.md:50-64`.
 
 ### R-52. I want a rough surface not to lose energy, and diffuse plus specular never to exceed what arrives
 - **Means:** the Kulla-Conty / Fdez-Aguera multiple-scattering factor, and a diffuse albedo that is only what the (compensated) specular lobe leaves over, derived once per pixel by `lightPrepare`.
 - **Mathematics:** with (A, B) = dfg(n.v, roughness) and E = max(A + B, 0.001): compensation = 1 + F0 (1/E - 1); specular albedo = (F0 A + B) * compensation; diffuse albedo = baseColor (1 - metallic) max(1 - specular albedo, 0). Invariant (header of light_shade): a uniform environment L on a white material adds up to exactly L (the white furnace).
 - **Instructions:** done once per pixel, not per light; a floor on E (a hole in the table cannot blow up the compensation); channel-wise `Vec3` arithmetic.
 - **Cost:** one table lookup (R-53) plus about 30 flops per shaded pixel (derived).
-- **Why this and not another:** `LIGHTING_MATH.md:45-47`: the albedo is "tabulated by a tool through deterministic quadrature (not Monte Carlo noise)".
+- **Why this and not another:** `doc/spec/lighting-math.md:45-47`: the albedo is "tabulated by a tool through deterministic quadrature (not Monte Carlo noise)".
 - **Where:** `light/light_brdf.axle:42,118-142`; `light/light_shade.axle:14-17`; `light/light_material.axle:90-111`.
-- **Docs:** `doc/LIGHTING_MATH.md:45-47`; `doc/handbook/render/05-shading.md:36-48`.
+- **Docs:** `doc/spec/lighting-math.md:45-47`; `doc/handbook/render/05-shading.md:36-48`.
 
 ### R-53. I want the directional albedo of the specular lobe as a table, computed exactly instead of sampled
 - **Means:** `LightDfgTable`: a size x size table of (A, B) over (view cosine, roughness), each entry a Gauss-Legendre double integral in f64 over the half-vector domain; lookup is bilinear in sqrt(n.v) and roughness.
 - **Mathematics:** E(mu, alpha) = integral over l of D V (n.l) dl; A = integral D V (1 - w) n.l dl, B = integral D V w n.l dl, w = (1 - v.h)^5, so albedo(F0) = F0 A + B. Change of domain to the half vector: dl = 4 (v.h) dh and D (n.h) dh = du dphi / (2 pi) with n.h^2 = (1 - u)/(1 + (alpha^2 - 1) u), giving A + B = (1/pi) integral_0^1 du integral_0^phi0 dphi 4 V (n.l)(v.h)/(n.h). The upper limit phi0 = pi where the circle of half-vectors is wholly above the horizon, otherwise phi0 = acos( n.v (1 - 2 n.h^2) / (2 n.h sin theta_v sin theta_h) ) (the lobe is symmetric in phi). The u range is cut at the two values where the horizon starts and stops clipping (theta_h between (pi/2 - theta_v)/2 and (pi/2 + theta_v)/2); inside that band a square-root singularity at the end of the phi range is tamed by u = lo + (hi - lo)(1 - cos(pi t))/2. Column i holds n.v = (i/(n-1))^2 (not below 1e-3), row j roughness j/(n-1).
 - **Instructions:** all f64; per entry two u-segments x `order` u-nodes x `order` phi-nodes; a fresh `LightGauss(order)` is built for every entry; the table is stored as `f32`.
 - **Cost:** default size 24, order 48 (`CpuSettings`): at most 2 * 48 * 48 = 4,608 integrand evaluations per entry, 576 entries, so at most 2,654,208 evaluations plus 576 rule builds at construction of every `CpuRenderer` (derived; no timing in the files read). Memory 24 * 24 * 2 * 4 = 4,608 B. Measured by the suite (header): order 32 versus 96 agree to 3e-7 for A and B at every node; the half-vector integral agrees with a brute-force midpoint integral over l to 1e-3 at alpha >= 0.09; bilinear lookup between nodes is within 2e-3 of direct quadrature.
-- **Why this and not another:** header: the half-vector domain "where the GGX lobe is wide for every alpha" gives "no horizon kink, no noise" and geometric convergence; a Monte Carlo estimate is rejected in `LIGHTING_MATH.md:45-47`.
+- **Why this and not another:** header: the half-vector domain "where the GGX lobe is wide for every alpha" gives "no horizon kink, no noise" and geometric convergence; a Monte Carlo estimate is rejected in `doc/spec/lighting-math.md:45-47`.
 - **Where:** `light/light_dfg.axle:1-24,26-207`; `cpu/cpu_renderer.axle:58-64,110-115`.
-- **Docs:** `doc/LIGHTING_MATH.md:45-47`; `doc/handbook/render/05-shading.md:44`.
+- **Docs:** `doc/spec/lighting-math.md:45-47`; `doc/handbook/render/05-shading.md:44`.
 
 ### R-54. I want a diffuse lobe choice between plain Lambert and a retro-reflective one that never gains energy
 - **Means:** `LightDiffuseModel`: Lambert `albedo / pi`, or the normalised Disney/Burley lobe (Lagarde and de Rousiers 2014, as cited in the code).
@@ -551,7 +551,7 @@ nr resources, E read/write declarations, B total (triangle, tile) overlaps.
 - **Cost:** about 15 extra flops per light when selected. The header says there is no f64 twin of the Burley lobe; its energy is checked by quadrature instead.
 - **Why this and not another:** selectable per material; the reason for the energy factor is "keeps the lobe from gaining energy" (comment).
 - **Where:** `light/light_brdf.axle:49-51,108-116,157-163`; `light/light_material.axle:21-27`.
-- **Docs:** `doc/LIGHTING_MATH.md:44`.
+- **Docs:** `doc/spec/lighting-math.md:44`.
 
 ### R-55. I want to draw microfacet normals the viewer can actually see, for a reference path tracer
 - **Means:** `lightVndfSample`: Heitz 2018 visible-normal sampling in tangent space, with its density `lightVndfPdf` and the Smith G1/G2.
@@ -560,7 +560,7 @@ nr resources, E read/write declarations, B total (triangle, tile) overlaps.
 - **Cost:** about 60 flops per sample (derived). Checks (header): the density integrates to 1 over the hemisphere (quadrature error below 1e-4); the mean n.h over 200,000 seeded samples agrees with its quadrature value within four standard errors; the mean G2/G1 agrees with the table's E(mu, alpha).
 - **Why this and not another:** header: "wastes no samples on back-facing microfacets" compared with sampling D(h) n.h. The caller (a path tracer) is not in the files read: `UNVERIFIED` who uses it.
 - **Where:** `light/light_vndf.axle:1-71`.
-- **Docs:** `doc/LIGHTING_MATH.md:48-49` (one line).
+- **Docs:** `doc/spec/lighting-math.md:48-49` (one line).
 
 ---
 
@@ -573,7 +573,7 @@ nr resources, E read/write declarations, B total (triangle, tile) overlaps.
 - **Cost:** about 1 division and 3 transcendentals per light per pixel in the clipped band, otherwise a handful of flops (derived). Error budget (header): f32 versus f64 relative 2e-5 away from the horizon cusp (suite, Pcg32 sweep); the f64 twin versus a quadrature of the spherical cap 1e-9 relative.
 - **Why this and not another:** header: "no hot spot at the light, no shadow-terminator error at the horizon and no tuning". The earlier engine had a sizeless sun and `0.8^(15-level)` falloff.
 - **Where:** `light/light_irradiance.axle:1-53,96-140,201-220`.
-- **Docs:** `doc/LIGHTING_MATH.md:16-23`; `doc/LIGHTING.md` section 2.
+- **Docs:** `doc/spec/lighting-math.md:16-23`; `doc/spec/lighting.md` section 2.
 
 ### R-57. I want the sun to have a disc, so the terminator and shadow penumbra have a physical width
 - **Means:** a directional light with angular diameter delta is the same sphere at infinity.
@@ -582,25 +582,25 @@ nr resources, E read/write declarations, B total (triangle, tile) overlaps.
 - **Cost:** as R-56; one `sin` per light.
 - **Why this and not another:** not documented beyond the header.
 - **Where:** `light/light_irradiance.axle:15-17,146-153`; `light/light_source.axle:69-70,94-107`.
-- **Docs:** `doc/LIGHTING_MATH.md:24-26`.
+- **Docs:** `doc/spec/lighting-math.md:24-26`.
 
 ### R-58. I want a small emitting disc (a lit window, a screen) as a light
 - **Means:** the cone formula with the disc seen face on, scaled by the cosine at the emitter.
 - **Mathematics:** sin^2 sigma = r^2 / (r^2 + d^2); E = L S(cos theta, sin^2 sigma) * saturate(cos at emitter); exact on the axis, "the usual disc approximation off it" (header).
 - **Instructions:** one `lightSphereIlluminance` call.
 - **Cost:** as R-56.
-- **Why this and not another:** not documented (linearly transformed cosines for true area lights are planned in `LIGHTING_MATH.md:31-32`, not implemented in the files read).
+- **Why this and not another:** not documented (linearly transformed cosines for true area lights are planned in `doc/spec/lighting-math.md:31-32`, not implemented in the files read).
 - **Where:** `light/light_irradiance.axle:19-20,159-164`.
-- **Docs:** `doc/LIGHTING_MATH.md:31-33`.
+- **Docs:** `doc/spec/lighting-math.md:31-33`.
 
 ### R-59. I want a lamp's reach to end smoothly and a spot's cone to have a soft edge
 - **Means:** a finite-range window and the glTF spot cone, both applied on top of the physical falloff.
-- **Mathematics:** window w = saturate(1 - (d/range)^4)^2 (1 at the light, exactly 0 with zero slope at the range; range 0 = unlimited). Cone: scale = 1/max(1e-3, cos_inner - cos_outer); a = saturate(cos_angle * scale - cos_outer * scale); factor a^2: 1 inside the inner cone, 0 at and beyond the outer, C1 at the outer edge but only C0 at the inner edge (the slope jumps from 2 scale to 0: the code comment says `LIGHTING_MATH.md` is wrong to call it C1 there).
+- **Mathematics:** window w = saturate(1 - (d/range)^4)^2 (1 at the light, exactly 0 with zero slope at the range; range 0 = unlimited). Cone: scale = 1/max(1e-3, cos_inner - cos_outer); a = saturate(cos_angle * scale - cos_outer * scale); factor a^2: 1 inside the inner cone, 0 at and beyond the outer, C1 at the outer edge but only C0 at the inner edge (the slope jumps from 2 scale to 0: the code comment says `doc/spec/lighting-math.md` is wrong to call it C1 there).
 - **Instructions:** two squarings for the window (no pow); the cone is one multiply-add and a square.
 - **Cost:** a few flops per light.
 - **Why this and not another:** "a deliberate artistic deviation, off when range is 0" (header).
 - **Where:** `light/light_irradiance.axle:22-24,167-187,250-293`.
-- **Docs:** `doc/LIGHTING_MATH.md:27-30` (see Doubts for the C1 claim).
+- **Docs:** `doc/spec/lighting-math.md:27-30` (see Doubts for the C1 claim).
 
 ### R-60. I want to know whether a light reaches a point and, if not, why, with layers and per-object exclusion
 - **Means:** `lightIncidence` returns a reason and the irradiance; tests in the order excluded layer or object, include mask, range (not for directional), spot cone, wholly behind the geometric surface; the shadow is decided by the caller afterwards.
@@ -609,7 +609,7 @@ nr resources, E read/write declarations, B total (triangle, tile) overlaps.
 - **Cost:** O(1) per light.
 - **Why this and not another:** header of `lightIncidence`: "a normal-mapped surface must still not be lit from behind its triangle".
 - **Where:** `light/light_irradiance.axle:56-71,73-89,224-243,250-293`; `light/light_source.axle:43-60,181-184`.
-- **Docs:** `doc/LIGHTING.md` section 12; `cpu/cpu_explain.axle:36-50` words the reasons.
+- **Docs:** `doc/spec/lighting.md` section 12; `cpu/cpu_explain.axle:36-50` words the reasons.
 
 ### R-61. I want to shade one surface point with many lights and keep every term separable
 - **Means:** `lightShade` = emissive + ambient (diffuse, specular) + the sum over lights of `lightContribution`, each with its own shadow factor from a `LightShadowQuery`; terms are kept apart (direct diffuse, direct specular, ambient diffuse, ambient specular, emissive) so a shadow or a cloud can recombine them.
@@ -618,7 +618,7 @@ nr resources, E read/write declarations, B total (triangle, tile) overlaps.
 - **Cost:** O(L) per shaded pixel, each light costing R-56..R-60 + R-51 + a shadow query (R-27). `LightNoShadows` answers 1.
 - **Why this and not another:** header: "ONE CODE PATH ... The explainer therefore cannot disagree with the renderer, and the suite checks the sums bit for bit".
 - **Where:** `light/light_shade.axle:1-20,35-237`.
-- **Docs:** `doc/LIGHTING_MATH.md:7-11`; `doc/LIGHTING.md` sections 1 and 9.
+- **Docs:** `doc/spec/lighting-math.md:7-11`; `doc/spec/lighting.md` sections 1 and 9.
 
 ---
 
@@ -626,12 +626,12 @@ nr resources, E read/write declarations, B total (triangle, tile) overlaps.
 
 ### R-62. I want the diffuse light of a whole sky dome in 27 numbers
 - **Means:** `LightSh9::project`: nine real spherical-harmonic coefficients per colour channel by a deterministic product rule.
-- **Mathematics:** c_i = integral L(w) Y_i(w) dw by Gauss-Legendre in cos(theta) (`bands` nodes, so no clustering at the poles) times a uniform trapezoid of 2 * bands azimuths, each sample weighted w_i * 2pi/(2 bands). Exact for a degree-2 basis times a polynomial environment in cos(theta) and for the trigonometric degree of the basis in phi. The suite measured (header) a constant to 1e-6 with 32 bands, against 3e-4 for the equal-area midpoint rule that `LIGHTING_MATH.md` names.
+- **Mathematics:** c_i = integral L(w) Y_i(w) dw by Gauss-Legendre in cos(theta) (`bands` nodes, so no clustering at the poles) times a uniform trapezoid of 2 * bands azimuths, each sample weighted w_i * 2pi/(2 bands). Exact for a degree-2 basis times a polynomial environment in cos(theta) and for the trigonometric degree of the basis in phi. The suite measured (header) a constant to 1e-6 with 32 bands, against 3e-4 for the equal-area midpoint rule that `doc/spec/lighting-math.md` names.
 - **Instructions:** one environment query per sample through a trait object (`LightEnvironment`); each sample adds 9 basis values x 3 channels.
 - **Cost:** 2 bands^2 samples: 2,048 for 32 bands, each a full environment evaluation (for the analytic sky about 15,700 `exp2` series, R-71; derived). Memory 9 x Vec3 = 108 B.
 - **Why this and not another:** header: "(LIGHTING_MATH.md names an equal-area grid; its midpoint rule measured 3e-4 off on a constant, this rule 1e-6, so this is what ships.)"
 - **Where:** `light/light_sh.axle:1-17,86-113,150-188`.
-- **Docs:** `doc/LIGHTING_MATH.md:63-65` (names the rejected grid); `doc/handbook/render/05-shading.md:71`.
+- **Docs:** `doc/spec/lighting-math.md:63-65` (names the rejected grid); `doc/handbook/render/05-shading.md:71`.
 
 ### R-63. I want the diffuse light on a surface from the dome without integrating anything per pixel
 - **Means:** `LightSh9::irradiance(n)`: the cosine-lobe convolution of the nine coefficients, divided by pi.
@@ -640,7 +640,7 @@ nr resources, E read/write declarations, B total (triangle, tile) overlaps.
 - **Cost:** about 60 flops per shaded pixel; 108 B of coefficients.
 - **Why this and not another:** header: replaces voxel-axle's single scalar `skyView(n.y)` and keeps colour and direction of the dome.
 - **Where:** `light/light_sh.axle:19-33,190-223`.
-- **Docs:** `doc/LIGHTING_MATH.md:63-65`; `doc/handbook/render/05-shading.md:68-75`.
+- **Docs:** `doc/spec/lighting-math.md:63-65`; `doc/handbook/render/05-shading.md:68-75`.
 
 ### R-64. I want specular reflections of a sky above a ground without a probe
 - **Means:** the kernel blends the radiance of the sky and the ground along the reflection vector over a band that widens with roughness (a rough lobe averages a wide part of the sky); with one radiance for both it is constant, the furnace.
@@ -658,7 +658,7 @@ nr resources, E read/write declarations, B total (triangle, tile) overlaps.
 - **Cost:** O(1).
 - **Why this and not another:** header: "Every conversion below follows from this single choice; nothing else in the lighting code may mention lux or candela".
 - **Where:** `light/light_units.axle:1-40,63-81`.
-- **Docs:** `doc/LIGHTING_MATH.md:7-14` (see Doubts: the 683 lm/W constant is not in the code).
+- **Docs:** `doc/spec/lighting-math.md:7-14` (see Doubts: the 683 lm/W constant is not in the code).
 
 ### R-66. I want an exposure chosen the way a camera or a light meter would, in stops
 - **Means:** EV100 from aperture, shutter and ISO, a saturation-based exposure multiplier, and a reflected-light-meter exposure for a measured average.
@@ -667,7 +667,7 @@ nr resources, E read/write declarations, B total (triangle, tile) overlaps.
 - **Cost:** O(1) per frame.
 - **Why this and not another:** header cites the saturation-based exposure of Lagarde and de Rousiers 2014 (Frostbite).
 - **Where:** `light/light_units.axle:21-28,85-118`; `scene/scene_frame.axle:70`.
-- **Docs:** `doc/LIGHTING_MATH.md:100-105` (differs from the code: see Doubts).
+- **Docs:** `doc/spec/lighting-math.md:100-105` (differs from the code: see Doubts).
 
 ### R-67. I want bright light to roll off to white without changing the colour of mid-tones
 - **Means:** a tone curve applied to the largest channel, the other channels following with the same scale, so hue and saturation are kept and no channel exceeds 1.
@@ -676,7 +676,7 @@ nr resources, E read/write declarations, B total (triangle, tile) overlaps.
 - **Cost:** about 14 + 11 loop steps per pixel (R-49). The path-lit display replaces this by a 4097-entry table over m in 0..40 read linearly (`08-display.md:76-86`), because this version is the exact reference.
 - **Why this and not another:** header: "below the knee the picture is untouched, which keeps mid-tones linear".
 - **Where:** `light/light_color.axle:1-40,43-62`.
-- **Docs:** `doc/LIGHTING_MATH.md:93-98`; `doc/handbook/render/08-display.md:76-86`.
+- **Docs:** `doc/spec/lighting-math.md:93-98`; `doc/handbook/render/08-display.md:76-86`.
 
 ### R-68. I want the exact sRGB transfer, round-trip safe at 8 bits
 - **Means:** IEC 61966-2-1 piecewise encode/decode with `lightPow` for the 2.4 power; 8-bit pair rounds to nearest.
@@ -685,7 +685,7 @@ nr resources, E read/write declarations, B total (triangle, tile) overlaps.
 - **Cost:** 3 `lightPow` per output pixel in `Resolve` plus 3 `lightPow` per decoded texel at texture load (a LUT of 256 hides the latter at runtime). The pathlight display uses a table indexed by sqrt(x) instead (`08-display.md:88-100`).
 - **Why this and not another:** header: "Differences from voxel-axle: its `gamma` used a table and a global power; here the maths is closed form."
 - **Where:** `light/light_color.axle:1-18,70-102`; `cpu/cpu_renderer.axle:359-384`.
-- **Docs:** `doc/LIGHTING_MATH.md:93-98`; `doc/handbook/render/08-display.md:88-100`.
+- **Docs:** `doc/spec/lighting-math.md:93-98`; `doc/handbook/render/08-display.md:88-100`.
 
 ---
 
@@ -698,7 +698,7 @@ nr resources, E read/write declarations, B total (triangle, tile) overlaps.
 - **Cost:** 5 x 16 = 80 integrand evaluations (an `exp2` series and a square root) per call. Measured elsewhere: the radiance integral over this model costs 0.16 ms a direction, 1.3 s for a 128 x 64 grid on one thread (`doc/handbook/render/06-sky.md:25-27`). Checks (suite, header): Chapman against a million-step trapezoid, secant law at small angles, the right-angle asymptotic series, continuity across the identity of R-70.
 - **Why this and not another:** header: "evaluated by Gauss-Legendre quadrature of that integral on panels that follow its decay, with no march and no noise".
 - **Where:** `light/light_sky.axle:1-26,38-62,152-179`.
-- **Docs:** `doc/LIGHTING_MATH.md:66-68`; `doc/handbook/render/06-sky.md:25-27` (the consumer, not the maths).
+- **Docs:** `doc/spec/lighting-math.md:66-68`; `doc/handbook/render/06-sky.md:25-27` (the consumer, not the maths).
 
 ### R-70. I want the optical depth along a ray that first descends (past the horizon) and a test for rays the ground blocks
 - **Means:** an exact identity reduces a downward ray to two upward integrals; a ray whose lowest point is below the ground is blocked.
@@ -707,7 +707,7 @@ nr resources, E read/write declarations, B total (triangle, tile) overlaps.
 - **Cost:** 160 integrand evaluations for a descending ray (derived).
 - **Why this and not another:** not documented beyond the header.
 - **Where:** `light/light_sky.axle:8-12,181-200,248-259`.
-- **Docs:** `doc/LIGHTING_MATH.md:66-68` (names the Chapman function only).
+- **Docs:** `doc/spec/lighting-math.md:66-68` (names the Chapman function only).
 
 ### R-71. I want the colour of the sky along a view ray, with the right blue, red and extinction
 - **Means:** single scattering integrated along the view ray with a fixed Gauss-Legendre rule and cubic spacing; each sample takes the body's light attenuated on the way in, the scattering at that altitude and the loss on the way to the eye.
@@ -716,7 +716,7 @@ nr resources, E read/write declarations, B total (triangle, tile) overlaps.
 - **Cost:** default 24 samples (`LSKY_VIEW_SAMPLES`), so about 24 x 4 x 80 = 7,680 + 160 integrand evaluations per body, and `skyRadianceWith` integrates the sun and the moon: about 15,700 (derived). Measured: 0.16 ms a direction (`06-sky.md:25-27`). Hence the sky is baked, not evaluated per pixel.
 - **Why this and not another:** the cubic spacing "packs the samples where the air is thick, near the eye" (comment).
 - **Where:** `light/light_sky.axle:1-26,110-150,292-364,371-380`.
-- **Docs:** `doc/LIGHTING_MATH.md:66-68`; `doc/handbook/render/06-sky.md:25-30` (see Doubts for the sample count).
+- **Docs:** `doc/spec/lighting-math.md:66-68`; `doc/handbook/render/06-sky.md:25-30` (see Doubts for the sample count).
 
 ### R-72. I want the sun and the moon as lights whose strength and tint follow from the same atmosphere
 - **Means:** the sun's top-of-atmosphere irradiance is normalised so that the overhead sun delivers exactly the reference sun; its tint at the eye is the transmittance (sunsets redden by construction); the moon is the same model at a fixed ratio with a cool tint, always opposite the sun; a floor of starlight.
@@ -725,7 +725,7 @@ nr resources, E read/write declarations, B total (triangle, tile) overlaps.
 - **Cost:** O(1) per frame.
 - **Why this and not another:** header: "the sky, the sun disc and the `LightSource` for the sun are one consistent model".
 - **Where:** `light/light_sky.axle:14-19,52-58,70-78,211-289`.
-- **Docs:** `doc/LIGHTING_MATH.md:66-68`; `doc/handbook/render/06-sky.md` (consumer).
+- **Docs:** `doc/spec/lighting-math.md:66-68`; `doc/handbook/render/06-sky.md` (consumer).
 
 ### R-73. I want a ground seen below the horizon and visible sun and moon discs that integrate to the right irradiance
 - **Means:** a Lambertian ground lit by the sun and by the sky at a flattened mirrored direction; discs added to the radiance with a scale that returns the irradiance when integrated.
@@ -743,7 +743,7 @@ nr resources, E read/write declarations, B total (triangle, tile) overlaps.
 - **Cost:** 2 bands^2 sky evaluations: 2,048 x 0.16 ms, about 0.33 s for 32 bands (derived from the measured figure of R-69; not measured as a whole).
 - **Why this and not another:** header of the method.
 - **Where:** `light/light_sky.axle:428-448`.
-- **Docs:** `doc/LIGHTING_MATH.md:61-68`.
+- **Docs:** `doc/spec/lighting-math.md:61-68`.
 
 ---
 
@@ -751,20 +751,20 @@ nr resources, E read/write declarations, B total (triangle, tile) overlaps.
 
 | mechanism | file | what is not written down |
 |---|---|---|
-| CPU rasteriser setup: clip planes, guard band, 1/256 snap, record layout (176 B per triangle), counting-sort binning | `cpu/cpu_tris.axle` | only one paragraph (`RENDERING.md:83-88`); no formulas, memory, or reason for the 4x guard band |
-| Tile kernel: edge-function stepping, top-left rule, depth interpolation, deferred shading, mask and blend paths | `cpu/cpu_kernel.axle` | one sentence each in `RENDERING.md:84-86`; no costs, no per-pixel memory |
+| CPU rasteriser setup: clip planes, guard band, 1/256 snap, record layout (176 B per triangle), counting-sort binning | `cpu/cpu_tris.axle` | only one paragraph (`doc/spec/rendering.md:83-88`); no formulas, memory, or reason for the 4x guard band |
+| Tile kernel: edge-function stepping, top-left rule, depth interpolation, deferred shading, mask and blend paths | `cpu/cpu_kernel.axle` | one sentence each in `doc/spec/rendering.md:84-86`; no costs, no per-pixel memory |
 | Perspective-correct weights, footprint finite differences, up-to-8-tap anisotropic filter, normal-map tangent frame | `cpu/cpu_surface.axle` | nothing outside the header |
-| BVH: median split on a fixed-point key, build complexity, slab and Moller-Trumbore tests, stack bounds | `cpu/cpu_bvh.axle` | one clause "median-split BVH" (`RENDERING.md:87`) |
+| BVH: median split on a fixed-point key, build complexity, slab and Moller-Trumbore tests, stack bounds | `cpu/cpu_bvh.axle` | one clause "median-split BVH" (`doc/spec/rendering.md:87`) |
 | Shadow bias formula, 1e9 directional length, -0.05 horizon margin | `cpu/cpu_shadow.axle` | header only |
-| Command codec: field checks, 1e8 cap, float round-trip rules | `cmd/cmd_codec.axle` | `RENDERING.md:48-50` gives layout and -0 only |
-| Graph compiler: complexities, strict `<` aliasing rule, equal-size class sharing, 128-issue cap | `graph/graph_plan.axle` | `RENDERING.md:52-63` states rules, no costs, no memory table |
+| Command codec: field checks, 1e8 cap, float round-trip rules | `cmd/cmd_codec.axle` | `doc/spec/rendering.md:48-50` gives layout and -0 only |
+| Graph compiler: complexities, strict `<` aliasing rule, equal-size class sharing, 128-issue cap | `graph/graph_plan.axle` | `doc/spec/rendering.md:52-63` states rules, no costs, no memory table |
 | Mip chain: alpha-weighted mean, odd sizes, 21.3 B per texel, trilinear level selection | `texture/texture.axle` | nothing |
-| Extraction sort key layout (20-bit fields, 2^62 blend flag, 1/16-unit depth steps) | `scene/scene_extract.axle` | `RENDERING.md:30-31` states the order, not the key |
-| Deterministic exp2/log2/pow: series lengths, error bounds, the "shading subset" rules | `light/light_math.axle` | `LIGHTING_MATH.md:90-91` one line; the 8 subset rules only in the header |
-| DFG derivation (half-vector domain, horizon band, cosine substitution), build cost, accuracy figures | `light/light_dfg.axle` | `LIGHTING_MATH.md:45-47` gives the idea; figures only in the header |
-| Gauss-Legendre rule computed by Newton | `light/light_quadrature.axle` | `LIGHTING_MATH.md:88` says tabulated |
-| Chapman panels and cut, view-ray rule, sun normalisation, ground model | `light/light_sky.axle` | `LIGHTING_MATH.md:66-68` names the method; `06-sky.md` only quotes cost |
-| VNDF sampling and its checks | `light/light_vndf.axle` | `LIGHTING_MATH.md:48-49` one line |
+| Extraction sort key layout (20-bit fields, 2^62 blend flag, 1/16-unit depth steps) | `scene/scene_extract.axle` | `doc/spec/rendering.md:30-31` states the order, not the key |
+| Deterministic exp2/log2/pow: series lengths, error bounds, the "shading subset" rules | `light/light_math.axle` | `doc/spec/lighting-math.md:90-91` one line; the 8 subset rules only in the header |
+| DFG derivation (half-vector domain, horizon band, cosine substitution), build cost, accuracy figures | `light/light_dfg.axle` | `doc/spec/lighting-math.md:45-47` gives the idea; figures only in the header |
+| Gauss-Legendre rule computed by Newton | `light/light_quadrature.axle` | `doc/spec/lighting-math.md:88` says tabulated |
+| Chapman panels and cut, view-ray rule, sun normalisation, ground model | `light/light_sky.axle` | `doc/spec/lighting-math.md:66-68` names the method; `06-sky.md` only quotes cost |
+| VNDF sampling and its checks | `light/light_vndf.axle` | `doc/spec/lighting-math.md:48-49` one line |
 | Specular ambient blend of sky and ground by roughness | `cpu/cpu_kernel.axle` | nothing |
 | Procedural mesh counts and layouts | `scene/scene_shapes.axle` | nothing |
 
@@ -772,12 +772,12 @@ nr resources, E read/write declarations, B total (triangle, tile) overlaps.
 
 - `light/light_sky.axle:15` says the view ray uses "a fixed Gauss-Legendre rule (32 nodes, cubic spacing)", but `LSKY_VIEW_SAMPLES` is 24 (`:68`) and the method doc says "order 24" (`:391`) and "16..48" (`:369`); 32 is not the default.
 - `light/light_irradiance.axle:55-71` documents `LightReason` as "Tested in this order" with the enum order None, Range, Mask, Excluded, Backface, Cone, Shadow; the code tests excluded, mask, range (`:224-236`), then cone, then backface (`:278-293`), and the doc of `lightIncidence` (`:245-249`) says "excluded, mask, range, cone, backface". The enum comment is stale (range, mask and excluded are in the wrong order and cone and backface are swapped).
-- `light/light_irradiance.axle:178-182` records that `doc/LIGHTING_MATH.md:28` ("C1 at the inner edge") is contradicted by the maths; the doc was not corrected.
-- `doc/LIGHTING_MATH.md:63-65` says SH projection is by "an equal-area grid"; `light/light_sh.axle:5-7` states the shipped rule is Gauss-Legendre x trapezoid because the midpoint rule on that grid measured 3e-4 off.
-- `doc/LIGHTING_MATH.md:88-89` says Gauss-Legendre "nodes tabulated"; `light/light_quadrature.axle:1-11` computes them by Newton's method and says tabulated nodes are the thing to avoid.
-- `doc/LIGHTING_MATH.md:45-47` says the albedo table is "stored as an asset"; `cpu/cpu_renderer.axle:114` builds it by quadrature at construction (24 x 24, order 48 by default) and `light/light_dfg.axle:13` says shaders "receive it as a texture".
-- `doc/LIGHTING_MATH.md:12-13` promises a 683 lm/W constant "kept in one constant"; `light/light_units.axle` has none (the scale is pi / 100,000, `:17,38-40`).
-- `doc/LIGHTING_MATH.md:100-105` gives `exposure = 1/(1.2 * 2^EV100)` and a q = 0.65 derivation; `light/light_units.axle:97-100` computes `(100000/pi) / (1.2 * 2^EV)`, so the documented value differs by the scale factor 31,831; the auto-exposure histogram of the same section is not in this zone.
+- `light/light_irradiance.axle:178-182` records that `doc/spec/lighting-math.md:28` ("C1 at the inner edge") is contradicted by the maths; the doc was not corrected.
+- `doc/spec/lighting-math.md:63-65` says SH projection is by "an equal-area grid"; `light/light_sh.axle:5-7` states the shipped rule is Gauss-Legendre x trapezoid because the midpoint rule on that grid measured 3e-4 off.
+- `doc/spec/lighting-math.md:88-89` says Gauss-Legendre "nodes tabulated"; `light/light_quadrature.axle:1-11` computes them by Newton's method and says tabulated nodes are the thing to avoid.
+- `doc/spec/lighting-math.md:45-47` says the albedo table is "stored as an asset"; `cpu/cpu_renderer.axle:114` builds it by quadrature at construction (24 x 24, order 48 by default) and `light/light_dfg.axle:13` says shaders "receive it as a texture".
+- `doc/spec/lighting-math.md:12-13` promises a 683 lm/W constant "kept in one constant"; `light/light_units.axle` has none (the scale is pi / 100,000, `:17,38-40`).
+- `doc/spec/lighting-math.md:100-105` gives `exposure = 1/(1.2 * 2^EV100)` and a q = 0.65 derivation; `light/light_units.axle:97-100` computes `(100000/pi) / (1.2 * 2^EV)`, so the documented value differs by the scale factor 31,831; the auto-exposure histogram of the same section is not in this zone.
 - `scene/scene_material.axle:40` says the normal map is "stored linearly in 0..1", but `Texture` decodes every texture as sRGB (`texture/texture.axle:1-8,95-110`) and `cpu/cpu_surface.axle:383-390` re-encodes; the chain of mips is therefore averaged after an sRGB decode, which is not the average of the encoded vectors, and no comment says this is accepted.
 - `texture/texture.axle:112-131`: a level has size `n/2` (integer division) and averages the blocks at 2x..2x+1, so the last row or column of an odd-sized level never contributes to the next level (for 5 texels the fifth is dropped); the header says only "averaging 2 x 2 texels".
 - `scene/scene_extract.axle:48-56,190-193`: material, mesh and entity slot are masked to 20 bits in the sort key, so ids at or above 1,048,576 alias silently (only the order is affected); not mentioned in the header.

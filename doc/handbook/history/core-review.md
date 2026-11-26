@@ -1,5 +1,9 @@
 # Review of the engine core changes (may be deleted later)
 
+> **Historical record.** A review of the core as it stood when it was written, kept for the tests that failed before
+> each fix and for the measurements the glossary cites. "The compiler is blocked" and the line numbers belong to that day;
+> the findings marked resolved are fixed.
+
 Status: the findings of `src/core` and `src/data` are applied; see "Resolved" at the end for each one, with the test that
 failed before the fix. The text between is the review as written (by reading, with the compiler blocked), kept for the
 reasons.
@@ -27,8 +31,8 @@ new modules has one (the only gaps are grouped struct fields in `hydro_world.axl
    `runtime`, allowed).
    Fix (cleanest): move the file to `src/data/serial/name_table.axle` (layer 2, next to the NBT reader that is its main
    client; it is a byte-range lookup, not a generic collection), rename the prefix nothing (constants are already
-   `NAME_TABLE_*`), update `src/lib.axle:190` and the `use` lines in `src/minecraft` (grep `name_table`), `ARCHITECTURE.md`
-   row 1, `CORE_EXTRACTION.md` ("Layer" column says 1). Moving `ByteBuf` and `DataText` into core instead is a far larger
+   `NAME_TABLE_*`), update `src/lib.axle:190` and the `use` lines in `src/minecraft` (grep `name_table`), `doc/guide/architecture.md`
+   row 1, `doc/handbook/history/core-extraction.md` ("Layer" column says 1). Moving `ByteBuf` and `DataText` into core instead is a far larger
    churn and ByteBuf is used by every data module.
 2. **`FastInflater.gzip` aborts on a bad header.** `inflate_fast.axle:153-155`: `begin(data, start, ...)` runs before the
    `start < 0` test, so for a corrupt gzip header (`start == -1`) the copy loop reads `raw[from + i]` with `from = -1`
@@ -110,14 +114,14 @@ new modules has one (the only gaps are grouped struct fields in `hydro_world.axl
     all `pub` (the whole scratch is a public bag of buffers: acceptable since it is a per-thread scratch, say so in the doc).
     The layer-7 comment lists `minecraft/*` blocks of 100 lines in the library export: a game does not need
     `McBlock`-level names; that is for the Minecraft owner.
-17. Docs. `ARCHITECTURE.md:43` said `axle fmt --check` (a bare format that CLAUDE.md forbids because it rewrites
-    `vendor/smalt`): **fixed** to `tools/fmt.sh --check`. Still to do: `ARCHITECTURE.md` layer 1 row should list
+17. Docs. `doc/guide/architecture.md:43` said `axle fmt --check` (a bare format that CLAUDE.md forbids because it rewrites
+    `vendor/smalt`): **fixed** to `tools/fmt.sh --check`. Still to do: `doc/guide/architecture.md` layer 1 row should list
     "packed and paletted containers" (name table is layer 2 after fix 1); `CLAUDE.md` layer 7 row lists only voxel and
-    openworld although `ARCHITECTURE.md` adds `minecraft`; `CORE_EXTRACTION.md` "Done" table gives `NameTable` layer 1 (wrong,
+    openworld although `doc/guide/architecture.md` adds `minecraft`; `doc/handbook/history/core-extraction.md` "Done" table gives `NameTable` layer 1 (wrong,
     fix 1) and says tests "still live in `tests/src/minecraft_*`": no test names `NameTable` or `RandomFile` at all.
 18. `src/lib.axle` order: the two new blocks (`Layer 1`, `Layer 2`) are appended after layer 4 audio and before layer 7, out
     of layer order; fine for the compiler, confusing for readers.
-19. Fluid. Two engines coexist on purpose (`doc/FLUID.md` says `FluidWorld` is legacy until the three examples migrate);
+19. Fluid. Two engines coexist on purpose (`doc/spec/fluid.md` says `FluidWorld` is legacy until the three examples migrate);
     both are in the export list. Keep, but do not let new code use `FluidWorld`. `hydro_runner.axle:105-112` builds a `JobPool`
     and shuts it down at once when `threads <= 1` (starts workers just to stop them): create the pool only when threaded.
     `hydro_world.axle` is 1065 lines (limit about 700): the header names the jobs, split along them: (a) construction and
@@ -251,7 +255,7 @@ fits (nothing needs untyped lifetimes), so delete it with its test and export, b
 In order: 2, 3, 6, 4, 7, 8 (correctness, each with the tests listed above); 1 (move `name_table`, update imports, `lib.axle`, docs);
 13, 14, 10, 11, 16, 5 (headers, names, `lib.axle`); 15 (dead code); 19 (split `hydro_world.axle`, pool only when threaded);
 then the performance items 1-8 with a `measured:` line each; then the missing tests; then format `tests/src/main.axle`.
-Applied now: `doc/ARCHITECTURE.md` (bare `axle fmt --check` replaced by `tools/fmt.sh --check`), and this file.
+Applied now: `doc/guide/architecture.md` (bare `axle fmt --check` replaced by `tools/fmt.sh --check`), and this file.
 
 ## Resolved (compiler `axle 0.19.0-dev (93b6b5e)`, tests `tests/src/{core_packed*,data_*}.axle`)
 

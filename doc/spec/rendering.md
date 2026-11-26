@@ -2,7 +2,7 @@
 
 Design rule 6: *rendering is data*. A frame is extracted from the world into a snapshot, planned as a graph of passes,
 recorded as a command stream and executed by a backend. The CPU backend is deterministic and is the oracle a GPU backend
-is tested against. This page is the contract between the layers; `doc/LIGHTING.md` is the contract of the shading.
+is tested against. This page is the contract between the layers; `doc/spec/lighting.md` is the contract of the shading.
 Code: `src/render/{scene,cmd,graph,cpu}`; example: `examples/engine/prism`.
 
 ## Data flow

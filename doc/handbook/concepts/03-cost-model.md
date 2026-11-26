@@ -114,7 +114,7 @@ The primary ray is half the frame, the display a quarter.
 4. **Count before timing.** The tracer was instrumented once to count steps, box moves, section changes and texels a
    ray (9.3, 0.19, 0.37, 1.2 on the ground). The counts said the brick skip was almost never used; no timing would
    have.
-5. **Keep the failed experiment.** It is in [5.1](../history/2026-11-optimisation.md) with its number, so nobody
+5. **Keep the failed experiment.** It is in [5.1](../history/techniques.md) with its number, so nobody
    tries it again.
 
 ## 5. Observations

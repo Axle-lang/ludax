@@ -5,9 +5,9 @@ asset pipeline (glTF first) and a renderer whose lighting is designed to be veri
 
 > Status: early. The foundations (layers, formatter, test harness) are in place; the core layer is being built.
 
-- [Architecture](doc/ARCHITECTURE.md)
-- [Style](doc/STYLE.md)
-- [Roadmap](doc/ROADMAP.md)
+- [Architecture](doc/guide/architecture.md)
+- [Style](doc/guide/style.md)
+- [Roadmap](doc/roadmap.md)
 - [Contributing norms](CLAUDE.md)
 
 ```sh

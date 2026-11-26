@@ -303,4 +303,3 @@ shaded by the slope towards the sun), and only to the eye: nothing reflects it.
   `examples/rendering/dusk/src/app/options.axle`.
 - Tests: `tests/src/lux_ocean.axle` (the transform against the plain sum, the inverse, the Cox-Munk scale, the wind's
   direction, no period at 97.3 m, the footprint fade, determinism, the time; a `measured:` line).
-- The quality ladder and its research: `doc/design/water-ladder.md`.

@@ -1,7 +1,7 @@
 # The ludax handbook
 
 How the engine's heavy mechanisms work: the mathematics, the algorithms, what each costs, and how each came to be
-the way it is. `doc/ARCHITECTURE.md` says where code goes and `doc/STYLE.md` how it is written; this says **why a
+the way it is. `doc/guide/architecture.md` says where code goes and `doc/guide/style.md` how it is written; this says **why a
 mechanism computes what it computes**.
 
 Every chapter follows the same plan, so a reader knows where to look:
@@ -44,7 +44,7 @@ Every chapter follows the same plan, so a reader knows where to look:
 | 3 | `render/` | [3.17 Media, interfaces, immersion, thin surfaces](render/17-media-and-interfaces.md) | Any medium's light (Beer-Lambert, scattering, Snell, Fresnel), a rough boundary, the eye inside, a perforated surface: the engine plans, the program traces |
 | 3 | `render/` | [3.18 Small things](render/18-shapes.md) | Shapes of a few boxes inside a cell: exact rays and shadows, diffuse light by the share they leave open, emitters |
 | 4 | `engine/` | [4.1 The job pool](engine/01-job-pool.md) | Chunks, scaling, why one worker a core |
-| 5 | `history/` | [5.1 The November 2026 optimisation log](history/2026-11-optimisation.md) | Every step, its measurement, the experiments that failed |
+| 5 | `history/` | [5.1 What was tried, by technique](history/techniques.md) | Every procedure tried, grouped by the problem it solves: the Axle it was built with, its measured cost, why it stayed or went |
 
 Chapters 3.x describe the path-lit voxel picture: the engine's `src/render/pathlight` (sky, shading, display) and the
 frame of `games/blockland` that drives it. `examples/rendering/lumen` uses the same sky, shading and display.
@@ -81,8 +81,8 @@ against a source. Fix a doubt in the file where it is listed, in the same change
 
 - `games/blockland/doc/RENDERER.md` — the one-page summary of chapters 3.x, with the commands.
 - `AXLE_COMPILER_FINDINGS.md` — what the compiler does to this code (F1 to F14), with repros.
-- `doc/LIGHTING.md`, `doc/LIGHTING_MATH.md` — the lighting library (`src/render/light`) on which chapter 3.5 rests.
-- `doc/RENDERING.md` — the rasterising and command-stream side of the engine, which this handbook does not cover.
+- `doc/spec/lighting.md`, `doc/spec/lighting-math.md` — the lighting library (`src/render/light`) on which chapter 3.5 rests.
+- `doc/spec/rendering.md` — the rasterising and command-stream side of the engine, which this handbook does not cover.
 
 ## Keeping it true
 

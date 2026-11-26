@@ -7,8 +7,8 @@ Ludax is one crate organised in layers. A module imports from its own layer or b
 | 1 | `src/core` | maths, memory, containers (packed and paletted ones included), ids, random numbers, time, log, jobs, profiler, test harness |
 | 2 | `src/data` | virtual file system, asset database, importers (glTF, `.bbmodel`, images, audio), serialisation (NBT, name tables), codecs (LZ4, inflate/deflate), sector region files, zip archives, random-access files |
 | 3 | `src/world` | sparse-set ECS, scenes, transform hierarchy, spatial indices |
-| 4 | `src/sim` | `kinetic` physics, `fluid` water, animation, audio, navigation, gameplay |
-| 5 | `src/render` | scene extraction, render graph, command stream, backends, lighting |
+| 4 | `src/sim` | `kinetic` physics, `fluid` water, animation, audio, navigation, particles |
+| 5 | `src/render` | scene extraction, render graph, command stream, CPU backend, the lighting library, the path-lit picture (`pathlight`) and the layered light (`lux`) |
 | 6 | `src/runtime` | main loop, game modules, settings |
 | 7 | `src/voxel`, `src/openworld` | content modules; independent of each other |
 
@@ -22,6 +22,8 @@ core `lumenShadeCore`, the frame filter) is `src/render/pathlight`, layer 5, use
 
 The platform (windowing, GPU) is [smalt](https://github.com/Axle-lang/smalt); the editor, Ludax Studio, is built
 on [zaffre](https://github.com/Axle-lang/zaffre) and lives outside the runtime.
+
+What each module does, file by file, is in [the module pages](../modules/README.md), generated from the file headers.
 
 ## Design rules
 
