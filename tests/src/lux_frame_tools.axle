@@ -1,0 +1,315 @@
+// lux_frame_tools — checks for the small tools of a frame: the sizes a picture is shown and computed at, the governor that
+// moves the scale, the sprites drawn into a finished picture and the motion vector an upscaler reads.
+
+use ludax::{
+    Checks, LUX_FRAME_60, LUX_MOTION_STRIDE, LumenCamera, LuxBudget, LuxSize, LuxSpriteStyle,
+    PtcEffect, Vec3, LuxSpriteUndo, luxComputedSize, luxDrawSprites, luxMotionWrite, luxShownSize,
+    luxSpriteTexel, luxStartScale
+};
+
+/** Checks the budget's sizes and governor, the sprite texels and drawing, and the motion write. */
+pub class LuxFrameToolsSuite {
+    /** Runs every check of the suite. */
+    pub static fn run(mut c : Checks) : void {
+        lftSizes(c);
+        lftGovernor(c);
+        lftTexels(c);
+        lftSprites(c);
+        lftUndo(c);
+        lftMotion(c);
+    }
+}
+
+fn lftSizes(mut c : Checks) : void {
+    let shown : LuxSize = luxShownSize(1921, 1080);
+    c.that("lux budget: 1921 x 1080 is shown at 1920 x 1072", shown.w == 1920 && shown.h == 1072);
+    let tiny : LuxSize = luxShownSize(5, 0);
+    c.that("lux budget: a tiny window is shown at 16 x 16 at least", tiny.w == 16 && tiny.h == 16);
+    let exact : LuxSize = luxShownSize(640, 368);
+    c.that("lux budget: a multiple of 16 is kept", exact.w == 640 && exact.h == 368);
+
+    let whole : LuxSize = luxComputedSize(shown, 1.0);
+    c.that(
+        "lux budget: a scale of 1 computes at the shown size",
+        whole.w == shown.w && whole.h == shown.h
+    );
+    let half : LuxSize = luxComputedSize(shown, 0.5);
+    c.sameInt("lux budget: half the width is 960", half.w, 960);
+    c.that(
+        "lux budget: half the height is a nearest multiple of 16 (536 is a tie)",
+        half.h == 544 || half.h == 528
+    );
+    let odd : LuxSize = luxComputedSize(shown, 0.55);
+    c.that("lux budget: 0.55 rounds each side to the nearest 16", odd.w == 1056 && odd.h == 592);
+    let mut nearest : bool = true;
+    for (k of 1..21) {
+        let s : f32 = (k as f32) * (0.05 as f32);
+        let z : LuxSize = luxComputedSize(shown, s);
+        let dw : f32 = (z.w as f32) - (shown.w as f32) * s;
+        let dh : f32 = (z.h as f32) - (shown.h as f32) * s;
+        if (z.w % 16 != 0 || z.h % 16 != 0 || dw > 8.0001 || dw < -8.0001 || dh > 8.0001
+            || dh < -8.0001) {
+            nearest = false;
+        }
+    }
+    c.that(
+        "lux budget: every computed side is a multiple of 16 within 8 pixels of the exact one",
+        nearest
+    );
+    let floor : LuxSize = luxComputedSize(shown, 0.0);
+    c.that("lux budget: a scale of 0 still computes 16 x 16", floor.w == 16 && floor.h == 16);
+
+    let full : f32 = (shown.w as f32) * (shown.h as f32);
+    let s : f32 = luxStartScale(shown, 500000);
+    c.that("lux budget: the start scale is below 1 for a smaller budget", s < 1.0 && s > 0.0);
+    c.near("lux budget: ... and holds the asked pixels", (s * s * full) as f64, 500000.0, 5.0);
+    c.that("lux budget: the start scale is never above 1", luxStartScale(shown, 100000000) == 1.0);
+}
+
+// A governor at scale 0.5 (below 1, so it may rise), fed `frames` frames of `nanos` ns of which `scaled` grow with pixels.
+fn lftFed(target : i64, nanos : i64, scaled : i64, frames : i32) : LuxBudget {
+    let b : LuxBudget = new LuxBudget(1, target, 0.25);
+    b.holdScale(0.5);
+    b.release();
+    for (f of 0..frames) {
+        b.endFrameSplit(nanos, scaled);
+    }
+    return b;
+}
+
+fn lftGovernor(mut c : Checks) : void {
+    let ms : i64 = 1000000;
+    // 12 ms of a 16.7 ms frame: all of it growing, the next step would cost 15.2 ms (91 %): no rise. With 1 ms growing
+    // the next step costs 12.3 ms (74 %): the scale rises after its patience of 30 frames.
+    let fixedHeavy : LuxBudget = lftFed(LUX_FRAME_60, 12 * ms, 1 * ms, 40);
+    let allScaled : LuxBudget = lftFed(LUX_FRAME_60, 12 * ms, 12 * ms, 40);
+    c.that(
+        "lux budget: a frame heavy only in its fixed part lets the scale rise",
+        fixedHeavy.scaleNow() > 0.55
+    );
+    c.near(
+        "lux budget: the same total, all of it scaled, does not",
+        allScaled.scaleNow() as f64,
+        0.5,
+        0.000001
+    );
+
+    let over : LuxBudget = lftFed(LUX_FRAME_60, 20 * ms, 20 * ms, 3);
+    c.near(
+        "lux budget: three frames over the target step the scale down",
+        over.scaleNow() as f64,
+        0.4375,
+        0.000001
+    );
+    c.that("lux budget: the last frame is kept", over.lastFrame() == 20 * ms);
+
+    // A retargeted governor judges the same frames against its new target.
+    let slow : LuxBudget = new LuxBudget(1, LUX_FRAME_60, 0.25);
+    slow.holdScale(0.5);
+    slow.release();
+    slow.retarget(33333333);
+    for (f of 0..5) {
+        slow.endFrame(20 * ms);
+    }
+    c.near(
+        "lux budget: retarget moves the target (20 ms is fine at 30 fps)",
+        slow.scaleNow() as f64,
+        0.5,
+        0.000001
+    );
+
+    let held : LuxBudget = new LuxBudget(1, LUX_FRAME_60, 0.25);
+    held.holdScale(0.1);
+    c.near(
+        "lux budget: a held scale is kept above the floor",
+        held.scaleNow() as f64,
+        0.25,
+        0.000001
+    );
+    for (f of 0..10) {
+        held.endFrame(100 * ms);
+    }
+    c.near("lux budget: a held governor does not move", held.scaleNow() as f64, 0.25, 0.000001);
+
+    let m : LuxBudget = new LuxBudget(2, LUX_FRAME_60, 0.25);
+    m.record(0, 100);
+    m.record(0, 200);
+    c.near("lux budget: the running mean weighs a new frame by 1/8", m.meanOf(0), 112.5, 0.000001);
+    c.near("lux budget: a layer not yet measured costs 0", m.meanOf(1), 0.0, 0.0);
+}
+
+fn lftTexels(mut c : Checks) : void {
+    c.that(
+        "lux sprite: the four corners are empty",
+        luxSpriteTexel(0, 0) == 0.0 && luxSpriteTexel(3, 0) == 0.0 && luxSpriteTexel(0, 3) == 0.0
+            && luxSpriteTexel(3, 3) == 0.0
+    );
+    c.that(
+        "lux sprite: the middle four are whole",
+        luxSpriteTexel(1, 1) == 1.0 && luxSpriteTexel(2, 1) == 1.0 && luxSpriteTexel(1, 2) == 1.0
+            && luxSpriteTexel(2, 2) == 1.0
+    );
+    let edge : f32 = 0.45;
+    c.that(
+        "lux sprite: the edges are 0.45",
+        luxSpriteTexel(1, 0) == edge && luxSpriteTexel(0, 2) == edge && luxSpriteTexel(3, 1) == edge
+            && luxSpriteTexel(2, 3) == edge
+    );
+    c.that(
+        "lux sprite: outside the 4 x 4 is empty",
+        luxSpriteTexel(-1, 1) == 0.0 && luxSpriteTexel(1, 4) == 0.0
+    );
+}
+
+// A picture of `n` pixels all at (x, y, z).
+fn lftFill(n : i32, x : f32, y : f32, z : f32) : f32[] {
+    let mut buf : f32[] = new f32[n * 3];
+    for (i of 0..n) {
+        buf[i * 3] = x;
+        buf[i * 3 + 1] = y;
+        buf[i * 3 + 2] = z;
+    }
+    return buf;
+}
+
+fn lftSum(buf : f32[], n : i32, channel : i32) : f64 {
+    let mut s : f64 = 0.0;
+    for (i of 0..n) {
+        s = s + (buf[i * 3 + channel] as f64);
+    }
+    return s;
+}
+
+// One glowing particle (colour 1, 2, 3; 0.5 m) at (x, y, z), drawn from the origin looking along -z into a 128 x 128
+// picture whose surface under every pixel is at (0, 0, `surfaceZ`). Returns the picture.
+fn lftDrawn(x : f32, y : f32, z : f32, surfaceZ : f32) : f32[] {
+    let mut e : PtcEffect = new PtcEffect(4, 1);
+    e.px[0] = x;
+    e.py[0] = y;
+    e.pz[0] = z;
+    e.r[0] = 1.0;
+    e.g[0] = 2.0;
+    e.b[0] = 3.0;
+    e.size[0] = 0.5;
+    e.count = 1;
+    let cam : LumenCamera = new LumenCamera(0.0, 0.0, 0.0, 0.0, 0.0, 1.0);
+    cam.aim(1.0);
+    let mut target : f32[] = lftFill(16384, 0.0, 0.0, 0.0);
+    let pos : f32[] = lftFill(16384, 0.0, 0.0, surfaceZ);
+    luxDrawSprites(e, cam, LuxSpriteStyle {}, target, 128, 128, pos, 128, 128, new LuxSpriteUndo());
+    return target;
+}
+
+// Particles drawn into a picture, then given back: the picture is the one before them, to the bit, even where two
+// sprites crossed (each covered pixel is put back, the last drawn first).
+fn lftUndo(mut c : Checks) : void {
+    let mut e : PtcEffect = new PtcEffect(4, 1);
+    for (k of 0..2) {
+        e.px[k] = (k as f32) * (0.02 as f32);
+        e.py[k] = 0.0;
+        e.pz[k] = -5.0;
+        e.r[k] = 1.0;
+        e.g[k] = 2.0;
+        e.b[k] = 3.0;
+        e.size[k] = 0.5;
+    }
+    e.count = 2;
+    let cam : LumenCamera = new LumenCamera(0.0, 0.0, 0.0, 0.0, 0.0, 1.0);
+    cam.aim(1.0);
+    let mut target : f32[] = lftFill(16384, 0.25, 0.5, 0.75);
+    let pos : f32[] = lftFill(16384, 0.0, 0.0, -100.0);
+    let undo : LuxSpriteUndo = new LuxSpriteUndo();
+    luxDrawSprites(e, cam, LuxSpriteStyle {}, target, 128, 128, pos, 128, 128, undo);
+    let mut lit : i32 = 0;
+    for (i of 0..16384) {
+        if (target[(i * 3) as i64] != (0.25 as f32)) {
+            lit = lit + 1;
+        }
+    }
+    c.that(
+        "lux sprite undo: the particles were drawn (${lit} pixels) and written down",
+        lit > 0 && undo.pending()
+    );
+    undo.restore(target);
+    let mut off : i32 = 0;
+    for (i of 0..16384) {
+        let at : i64 = (i * 3) as i64;
+        if (target[at] != (0.25 as f32) || target[at + 1] != (0.5 as f32)
+            || target[at + 2] != (0.75 as f32)) {
+            off = off + 1;
+        }
+    }
+    c.sameInt("... and given back, the picture is the one before them (pixels off)", off, 0);
+    c.that("... with nothing left to give back", !undo.pending());
+}
+
+fn lftSprites(mut c : Checks) : void {
+    let open : f32[] = lftDrawn(0.0, 0.0, -5.0, -100.0);
+    c.that(
+        "lux sprite: a particle in front adds light where nothing is nearer",
+        lftSum(open, 16384, 0) > 0.0
+    );
+    c.near(
+        "lux sprite: ... in its own colour",
+        lftSum(open, 16384, 1) / lftSum(open, 16384, 0),
+        2.0,
+        0.00001
+    );
+    c.that(
+        "lux sprite: ... at the middle of the picture",
+        open[(64 * 128 + 64) * 3] > 0.0 && open[0] == 0.0
+    );
+
+    let hidden : f32[] = lftDrawn(0.0, 0.0, -5.0, -2.0);
+    c.near(
+        "lux sprite: behind a nearer surface it adds nothing",
+        lftSum(hidden, 16384, 0),
+        0.0,
+        0.0
+    );
+
+    let behindEye : f32[] = lftDrawn(0.0, 0.0, 5.0, -100.0);
+    c.near("lux sprite: behind the eye it adds nothing", lftSum(behindEye, 16384, 0), 0.0, 0.0);
+
+    let touching : f32[] = lftDrawn(0.0, 0.0, -0.2, -100.0);
+    c.near(
+        "lux sprite: nearer than the fade distance it is invisible",
+        lftSum(touching, 16384, 0),
+        0.0,
+        0.0
+    );
+}
+
+fn lftMotion(mut c : Checks) : void {
+    let mut motion : f32[] = new f32[LUX_MOTION_STRIDE * 3];
+    for (i of 0..LUX_MOTION_STRIDE * 3) {
+        motion[i] = 0.0;
+    }
+    let p : Vec3 = Vec3::make(3.0, 4.0, 0.0);
+    let prev : Vec3 = Vec3::make(0.25, 0.75, 2.0);
+    let prevEye : Vec3 = Vec3::make(0.0, 0.0, 0.0);
+    let eye : Vec3 = Vec3::make(3.0, 0.0, 0.0);
+    luxMotionWrite(motion, 1, p, prev, prevEye, eye, 8.0);
+    let at : i32 = LUX_MOTION_STRIDE;
+    c.that(
+        "lux motion: the previous u and v are written",
+        motion[at] == 0.25 && motion[at + 1] == 0.75
+    );
+    c.near(
+        "lux motion: the previous distance is from the previous eye",
+        motion[at + 2] as f64,
+        5.0,
+        0.000001
+    );
+    c.near("lux motion: the distance now is from the eye", motion[at + 3] as f64, 4.0, 0.000001);
+    c.that("lux motion: the sample cap is written", motion[at + 4] == 8.0);
+    c.that("lux motion: its neighbours are untouched", motion[0] == 0.0 && motion[at * 2] == 0.0);
+
+    luxMotionWrite(motion, 2, p, Vec3::make(0.25, 0.75, -1.0), prevEye, eye, 4.0);
+    c.that(
+        "lux motion: behind the previous eye the previous distance is -1",
+        motion[at * 2 + 2] == -1.0
+    );
+    luxMotionWrite(motion, 0, p, Vec3::make(0.25, 0.75, 0.0), prevEye, eye, 4.0);
+    c.that("lux motion: a depth of 0 is behind too", motion[2] == -1.0);
+}

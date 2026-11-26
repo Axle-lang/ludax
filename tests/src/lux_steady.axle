@@ -1,0 +1,334 @@
+// lux_steady — the upscaler on a still view: the offset cycle, the ripple it leaves, and what bounds it.
+//
+// A still view is the case that matters most to the eye: nothing moves, so every frame-to-frame change is a defect. The
+// upscaler keeps an exponential mean of samples taken at a cycle of sub-pixel offsets; a mean of a signal with period T
+// keeps a ripple of about 1 / (2 sin(pi / T)) of its weight (measured here, not assumed), which on a bright window two
+// pixels wide was a 3.75 Hz shimmer. These checks fix the numbers: the ripple falls with the cycle and with the memory,
+// the phase of the cycle is always in range, and the colour clamp keeps a long memory from lagging on a flat region.
+
+use ludax::{
+    Checks, LUX_MOTION_STRIDE, LuxChange, LuxUpscale, LuxUpscalePolicy, luxHaltonX, luxHaltonY
+};
+use ludax::{luxUpscaleOffsetX, luxUpscaleOffsetY};
+
+/** The still-view checks of the temporal upscaler. */
+pub class LuxSteadySuite {
+    /** Runs every check of the suite. */
+    pub static fn run(mut c : Checks) : void {
+        lxsPhase(c);
+        lxsRipple(c);
+        lxsFlatFollows(c);
+        lxsContrast(c);
+        lxsClock(c);
+        lxsMemory(c);
+    }
+}
+
+// Computed size and enlargement of the rigs below: 24 by 12 computed pixels shown at 48 by 24.
+const LXS_W : i32 = 24;
+const LXS_H : i32 = 12;
+const LXS_SCALE : i32 = 2;
+
+// The motion of a still camera: every sample where it was, one distance, and the memory `cap` samples long.
+fn lxsStill(mut motion : f32[], jx : f32, jy : f32, cap : f32) : void {
+    for (j of 0..LXS_H) {
+        for (i of 0..LXS_W) {
+            let m : i64 = ((j * LXS_W + i) as i64) * (LUX_MOTION_STRIDE as i64);
+            motion[m] = ((i as f32) + (0.5 as f32) + jx) / (LXS_W as f32);
+            motion[m + 1] = ((j as f32) + (0.5 as f32) + jy) / (LXS_H as f32);
+            motion[m + 2] = 10.0;
+            motion[m + 3] = 10.0;
+            motion[m + 4] = cap;
+        }
+    }
+}
+
+// The scene: bright vertical bars 3 output pixels wide on a dark ground, seen at output coordinate `x` (a lit window row).
+fn lxsBars(x : f32) : f32 {
+    let phase : f32 = x - ((x / (6.0 as f32)) as i32 as f32) * (6.0 as f32);
+    return phase < (3.0 as f32) ? (0.9 as f32) : (0.1 as f32);
+}
+
+// Fills the computed picture with the scene sampled at the offsets (`jx`, `jy`) of the frame, as the renderer does:
+// computed pixel (i, j) looks at its centre plus the offset, in output pixels (the enlargement is `LXS_SCALE`).
+fn lxsSample(mut low : f32[], jx : f32) : void {
+    for (j of 0..LXS_H) {
+        for (i of 0..LXS_W) {
+            let x : f32 = ((i as f32) + (0.5 as f32) + jx) * (LXS_SCALE as f32);
+            let v : f32 = lxsBars(x);
+            let k : i64 = ((j * LXS_W + i) as i64) * 3;
+            low[k] = v;
+            low[k + 1] = v;
+            low[k + 2] = v;
+        }
+    }
+}
+
+// The mean peak-to-peak change of an output pixel over the last `window` of `frames` frames of a still view of the
+// bars, with the offset cycle `cycle` and the memory `cap`: the ripple.
+fn lxsRipple_(cycle : i32, cap : f32, frames : i32, window : i32, band : i32) : f64 {
+    let up : LuxUpscale = new LuxUpscale();
+    let ow : i32 = LXS_W * LXS_SCALE;
+    let oh : i32 = LXS_H * LXS_SCALE;
+    up.fit(ow, oh);
+    let policy : LuxUpscalePolicy = LuxUpscalePolicy { cycle: cycle };
+    let mut low : f32[] = new f32[(LXS_W * LXS_H * 3) as i64];
+    let mut motion : f32[] = new f32[((LXS_W * LXS_H) as i64) * (LUX_MOTION_STRIDE as i64)];
+    let mut lo : f32[] = new f32[(ow * oh) as i64];
+    let mut hi : f32[] = new f32[(ow * oh) as i64];
+    for (k of 0..(ow * oh)) {
+        lo[k as i64] = 1000.0;
+        hi[k as i64] = -1000.0;
+    }
+    for (frame of 0..frames) {
+        let jx : f32 = luxUpscaleOffsetX(policy, frame);
+        let jy : f32 = luxUpscaleOffsetY(policy, frame);
+        lxsStill(motion, jx, jy, cap);
+        lxsSample(low, jx);
+        up.rows(low, motion, LXS_W, LXS_H, jx, jy, 0, oh);
+        up.swap();
+        if (frame >= frames - window) {
+            let out : f32[] = up.latest();
+            for (k of 0..(ow * oh)) {
+                let v : f32 = out[(k * 3) as i64];
+                if (v < lo[k as i64]) {
+                    lo[k as i64] = v;
+                }
+                if (v > hi[k as i64]) {
+                    hi[k as i64] = v;
+                }
+            }
+        }
+    }
+    // Away from the picture's edge, where the 3 x 3 colour boxes are whole: at the edge they are cut short, and the clamp
+    // they make moves the history by itself.
+    let mut sum : f64 = 0.0;
+    let mut count : i32 = 0;
+    for (y of 0..oh) {
+        for (x of 0..ow) {
+            let inner : bool = x >= 4 && x < ow - 4 && y >= 4 && y < oh - 4;
+            let ring : bool = x < 2 || x >= ow - 2 || y < 2 || y >= oh - 2;
+            if (band == 0 ? inner : ring) {
+                let k : i64 = (y * ow + x) as i64;
+                sum = sum + ((hi[k] - lo[k]) as f64);
+                count = count + 1;
+            }
+        }
+    }
+    return sum / (count as f64);
+}
+
+// The phase of the cycle: every frame, negative or not, lands on one of `cycle` offsets, all inside the pixel, and a
+// cycle repeats exactly; a cycle under 1 is a cycle of 1 and does not trap.
+fn lxsPhase(mut c : Checks) : void {
+    let mut inside : i32 = 0;
+    let mut repeats : i32 = 0;
+    for (cycle of 1..17) {
+        let p : LuxUpscalePolicy = LuxUpscalePolicy { cycle: cycle };
+        for (frame of -40..40) {
+            let x : f32 = luxUpscaleOffsetX(p, frame);
+            let y : f32 = luxUpscaleOffsetY(p, frame);
+            if (x > (-0.5 as f32) && x < (0.5 as f32) && y > (-0.5 as f32) && y < (0.5 as f32)) {
+                inside = inside + 1;
+            }
+            if (luxUpscaleOffsetX(p, frame + cycle) == x
+                && luxUpscaleOffsetY(p, frame + cycle) == y) {
+                repeats = repeats + 1;
+            }
+        }
+    }
+    c.sameInt(
+        "lux steady: every offset of every cycle (1 to 16, frames -40 to 39) is inside the pixel",
+        inside,
+        16 * 80
+    );
+    c.sameInt("... and the cycle repeats exactly after its length", repeats, 16 * 80);
+
+    let eight : LuxUpscalePolicy = LuxUpscalePolicy { cycle: 8 };
+    c.that(
+        "... a negative frame counts back from the end of the cycle",
+        luxUpscaleOffsetX(eight, -1) == luxUpscaleOffsetX(eight, 7)
+    );
+    let none : LuxUpscalePolicy = LuxUpscalePolicy { cycle: 0 };
+    c.that(
+        "... a cycle of 0 is the first offset and does not trap",
+        luxUpscaleOffsetX(none, 5) == luxHaltonX(0)
+    );
+    c.that("... for y as well", luxUpscaleOffsetY(none, 5) == luxHaltonY(0));
+
+    let mut distinct : i32 = 0;
+    for (a of 0..8) {
+        for (b of (a + 1)..8) {
+            if (luxHaltonX(a) != luxHaltonX(b) || luxHaltonY(a) != luxHaltonY(b)) {
+                distinct = distinct + 1;
+            }
+        }
+    }
+    c.sameInt("... the 8 offsets of a cycle are 8 different points (pairs distinct)", distinct, 28);
+}
+
+// The ripple of a still view: it falls with the memory (1 / cap) and with the cycle (shorter is faster and smaller). The
+// numbers are what was measured on the bars; the bounds are loose enough for a change of kernel and tight enough to see
+// the regression (a cycle of 16 with a memory of 48 shimmered on windows).
+fn lxsRipple(mut c : Checks) : void {
+    let slow16 : f64 = lxsRipple_(16, 48.0, 400, 32, 0);
+    let slow8 : f64 = lxsRipple_(8, 48.0, 400, 32, 0);
+    let long8 : f64 = lxsRipple_(8, 192.0, 600, 32, 0);
+    let long16 : f64 = lxsRipple_(16, 192.0, 600, 32, 0);
+    println("measured: cycle 1 cap 48 ${lxsRipple_(1, 48.0, 400, 32, 0)}, cycle 1 cap 192 ${lxsRipple_(1, 192.0, 600, 32, 0)}, cycle 2 cap 192 ${lxsRipple_(2, 192.0, 600, 32, 0)}, cycle 8 cap 12 ${lxsRipple_(8, 12.0, 400, 32, 0)}, cycle 8 cap 1000 ${lxsRipple_(8, 1000.0, 1500, 32, 0)}");
+    println("measured: ripple (mean peak to peak, bars 0.1 to 0.9) cycle 16 cap 48 ${slow16}, cycle 8 cap 48 ${slow8}, cycle 8 cap 192 ${long8}, cycle 16 cap 192 ${long16}");
+    let ring : f64 = lxsRipple_(8, 192.0, 600, 32, 1);
+    println("measured: the outer ring of 2 pixels ripples ${ring}, the interior ${long8}");
+    c.that(
+        "lux steady: a cycle of 8 ripples less than a cycle of 16 at the same memory (${slow8} < ${slow16})",
+        slow8 < slow16
+    );
+    c.that(
+        "... a memory of 192 ripples less than half of one of 48 (cycle 8: ${long8} < ${slow8})",
+        long8 < slow8 * (0.5 as f64)
+    );
+    c.that("... and at cycle 16 as well (${long16} < ${slow16})", long16 < slow16 * (0.6 as f64));
+    c.that(
+        "... the ripple of the shipped setting stays under 0.003 of a contrast of 0.8 (${long8})",
+        long8 < 0.003
+    );
+    c.that(
+        "... and the outer ring of the picture ripples no more than 4 times the interior (${ring})",
+        ring < long8 * (4.0 as f64) + 0.002
+    );
+}
+
+// A flat region follows a change of light at once whatever its memory: the colour clamp pulls a history into the box of
+// the present samples, so a long memory costs no lag where nothing detailed stands (a lamp switched on, a cloud's shade).
+fn lxsFlatFollows(mut c : Checks) : void {
+    let up : LuxUpscale = new LuxUpscale();
+    let ow : i32 = LXS_W * LXS_SCALE;
+    let oh : i32 = LXS_H * LXS_SCALE;
+    up.fit(ow, oh);
+    let mut low : f32[] = new f32[(LXS_W * LXS_H * 3) as i64];
+    let mut motion : f32[] = new f32[((LXS_W * LXS_H) as i64) * (LUX_MOTION_STRIDE as i64)];
+    let policy : LuxUpscalePolicy = LuxUpscalePolicy {};
+    for (frame of 0..140) {
+        let jx : f32 = luxUpscaleOffsetX(policy, frame);
+        let jy : f32 = luxUpscaleOffsetY(policy, frame);
+        lxsStill(motion, jx, jy, 192.0);
+        let level : f32 = frame < 100 ? (0.2 as f32) : (0.8 as f32);
+        for (i of 0..(LXS_W * LXS_H * 3)) {
+            low[i as i64] = level;
+        }
+        up.rows(low, motion, LXS_W, LXS_H, jx, jy, 0, oh);
+        up.swap();
+        if (frame == 102) {
+            let out : f32[] = up.latest();
+            let mid : f32 = out[((oh / 2 * ow + ow / 2) * 3) as i64];
+            c.that(
+                "lux steady: a flat region with a memory of 192 is at the new light 3 frames after the change (${mid})",
+                mid > (0.75 as f32)
+            );
+        }
+    }
+}
+
+// The contrast is not lost to the long memory: the mean of the bars is the mean of the scene (0.5), and the mean of their
+// difference to the ideal bars (the scene at the output's pixels) is bounded, still view, shipped setting.
+fn lxsContrast(mut c : Checks) : void {
+    let up : LuxUpscale = new LuxUpscale();
+    let ow : i32 = LXS_W * LXS_SCALE;
+    let oh : i32 = LXS_H * LXS_SCALE;
+    up.fit(ow, oh);
+    let policy : LuxUpscalePolicy = LuxUpscalePolicy {};
+    let mut low : f32[] = new f32[(LXS_W * LXS_H * 3) as i64];
+    let mut motion : f32[] = new f32[((LXS_W * LXS_H) as i64) * (LUX_MOTION_STRIDE as i64)];
+    for (frame of 0..600) {
+        let jx : f32 = luxUpscaleOffsetX(policy, frame);
+        let jy : f32 = luxUpscaleOffsetY(policy, frame);
+        lxsStill(motion, jx, jy, 192.0);
+        lxsSample(low, jx);
+        up.rows(low, motion, LXS_W, LXS_H, jx, jy, 0, oh);
+        up.swap();
+    }
+    let out : f32[] = up.latest();
+    let mut error : f64 = 0.0;
+    let mut mean : f64 = 0.0;
+    let mut count : i32 = 0;
+    // Away from the picture's edge, where the 3 x 3 boxes are whole.
+    for (y of 4..(oh - 4)) {
+        for (x of 4..(ow - 4)) {
+            let ideal : f32 = lxsBars(((x as f32) + (0.5 as f32)));
+            let v : f32 = out[((y * ow + x) * 3) as i64];
+            error = error + ((v - ideal) as f64).abs();
+            mean = mean + (v as f64);
+            count = count + 1;
+        }
+    }
+    error = error / (count as f64);
+    mean = mean / (count as f64);
+    println("measured: bars at 2x, mean ${mean}, mean error to the ideal bars ${error}");
+    c.that(
+        "lux steady: the bars keep their mean light, 0.5 within 0.02 (${mean})",
+        mean > 0.48 && mean < 0.52
+    );
+    c.that(
+        "... and resolve to within 0.2 of the ideal bars on average, a contrast of 0.8 (${error})",
+        error < 0.2
+    );
+}
+
+// The world's clock must be summed in f64. A frame's dt added to an f32 clock is rounded to the clock's spacing (0.0078 s
+// at 100 000 s, a day and a quarter), so ten frames of 1/60 s add 0.1406 or 0.1719 instead of 0.1667; the f64 sum is
+// exact to 1e-9 and is cast to f32 only where the time is read.
+fn lxsClock(mut c : Checks) : void {
+    let dt : f32 = (1.0 as f32) / (60.0 as f32);
+    let start : f32 = 100000.0;
+    let mut narrow : f32 = start;
+    let mut wide : f64 = start as f64;
+    for (k of 0..10) {
+        narrow = narrow + dt;
+        wide = wide + (dt as f64);
+    }
+    let want : f64 = (dt as f64) * 10.0;
+    let narrowError : f64 = ludax::absD((narrow as f64) - (start as f64) - want);
+    let wideError : f64 = ludax::absD(wide - (start as f64) - want);
+    c.that(
+        "lux steady: ten frames added to an f32 clock at 100 000 s are off by ${narrowError} s",
+        narrowError > 0.005
+    );
+    c.that("... added to an f64 clock they are exact (${wideError} s)", wideError < 0.000000001);
+}
+
+// The memory a pixel keeps follows what its rays met, still or moving: steady the longest, slow in between, restless the
+// shortest, and never more than the view allows (a moving view keeps `moving` at most, whatever the pixel).
+fn lxsMemory(mut c : Checks) : void {
+    let p : LuxUpscalePolicy = LuxUpscalePolicy {};
+    c.that(
+        "lux steady: still, a steady pixel keeps the policy's long memory",
+        p.cap(LuxChange::Steady, false) == p.still
+    );
+    c.that(
+        "... a slow pixel less and a restless pixel less again (${p.cap(LuxChange::Slow, false)}, ${p.cap(LuxChange::Restless, false)})",
+        p.cap(LuxChange::Steady, false) > p.cap(LuxChange::Slow, false)
+            && p.cap(LuxChange::Slow, false) > p.cap(LuxChange::Restless, false)
+    );
+    c.that(
+        "... moving, no pixel keeps more than the moving memory",
+        p.cap(LuxChange::Steady, true) == p.moving && p.cap(LuxChange::Slow, true) <= p.moving
+            && p.cap(LuxChange::Restless, true) <= p.moving
+    );
+    c.that(
+        "... and a moving restless pixel (the sea) keeps the shortest memory of all",
+        p.cap(LuxChange::Restless, true) < p.cap(LuxChange::Restless, false)
+            && p.cap(LuxChange::Restless, true) <= p.cap(LuxChange::Steady, true)
+    );
+    c.that(
+        "... a pixel's change is the fastest thing met: slow then restless is restless",
+        LuxChange::Slow.orMore(LuxChange::Restless) == LuxChange::Restless
+    );
+    c.that(
+        "... and restless then slow stays restless",
+        LuxChange::Restless.orMore(LuxChange::Slow) == LuxChange::Restless
+    );
+    c.that(
+        "... steady then steady stays steady",
+        LuxChange::Steady.orMore(LuxChange::Steady) == LuxChange::Steady
+    );
+}

@@ -1,0 +1,110 @@
+// lux_simd — eight pixels at a time: the lane helpers the light layers are written with.
+//
+// The layers of `lux` that run for every pixel (exposure, fog, absorption, grading) read planar `f32[]` buffers, one
+// plane per channel. Layout is most of the gain: measured on 2026-11-23 (Ryzen 9 9900X, one thread, 921 600 pixels),
+// a plain scalar loop of exposure, a 3x3 matrix and `x / (1 + x)` over planar buffers is vectorised by the compiler
+// and costs 0.32 ns a pixel, exactly what the same loop written in `f32x8` costs; written to interleaved RGB it stays
+// scalar and costs 1.31 ns (the `measured:` lines of `tests/src/lux_simd.axle` repeat it; the figures of
+// AXLE_COMPILER_FINDINGS F11 are for another loop, through a dispatched shape). Lanes written by hand are for what the vectoriser will not do: the exponential below (a
+// call to a scalar `exp` stops it: Beer-Lambert fog costs 14.0 ns a pixel with `lightExp`, 0.53 ns with
+// `luxExpNeg8`, 26 times less), branch-free selections, and loops whose bodies are too long for it to see through.
+//
+// Two compiler facts shape this file (AXLE_COMPILER_FINDINGS.md):
+//   - F11: `.fma()` on a dispatched shape is a call through a start-up trampoline and made the same loop 9 times
+//     slower (3.77 ns). Never call it; write `a * b + c`, which LLVM contracts into `vfmadd` by itself.
+//   - Lanes have no float-to-integer conversion (`convert` is for integer lanes), so the exponential below rounds by
+//     the magic-number trick: adding 1.5 * 2^23 leaves the rounded integer in the low mantissa bits, read back with
+//     `reinterpret`.
+//
+// A splat of a literal needs an `f32` binding first (a bare `0.5` is an `f64`); `luxSplat` takes the binding's place.
+
+/** The lane count of the vectors the light layers use. */
+pub const LUX_LANES : i32 = 8;
+
+// 1.5 * 2^23: added to a float of magnitude below 2^22, it leaves round(x) in the low 23 bits of the mantissa.
+const LUXS_ROUNDER : f32 = 12582912.0;
+// The bits of `LUXS_ROUNDER` itself, subtracted to read the rounded integer.
+const LUXS_ROUNDER_BITS : i32 = 1262485504;
+// 1 / ln 2: e^x = 2^(x / ln 2).
+const LUXS_LOG2E : f32 = 1.44269504088896340736;
+// Below this power of two the answer is under the smallest normal f32 and is returned as zero.
+const LUXS_EXP2_FLOOR : f32 = -126.0;
+// The exponent bias of an f32 and the shift that places an exponent in its field.
+const LUXS_BIAS : i32 = 127;
+const LUXS_MANTISSA : i32 = 23;
+// Taylor coefficients of 2^f = e^(f ln 2) up to f^6; on |f| <= 0.5 the truncation is under 1.3e-7 relative.
+const LUXS_C1 : f32 = 0.69314718055994530942;
+const LUXS_C2 : f32 = 0.24022650695910071233;
+const LUXS_C3 : f32 = 0.05550410866482157995;
+const LUXS_C4 : f32 = 0.00961812910762847716;
+const LUXS_C5 : f32 = 0.00133335581464284434;
+const LUXS_C6 : f32 = 0.00015403530393381609;
+
+/** Every lane set to `v`; the way to splat a constant, since a literal next to `f32` is an `f64`. */
+pub fn luxSplat(v : f32) : f32x8 {
+    return f32x8.splat(v);
+}
+
+/** `a` toward `b` by `t` in every lane: `a + (b - a) t`. */
+pub fn luxMix8(a : f32x8, b : f32x8, t : f32x8) : f32x8 {
+    return a + (b - a) * t;
+}
+
+/** The smaller of `a` and `b` in every lane. */
+pub fn luxMin8(a : f32x8, b : f32x8) : f32x8 {
+    return f32x8.select(a.lt(b), a, b);
+}
+
+/** The larger of `a` and `b` in every lane. */
+pub fn luxMax8(a : f32x8, b : f32x8) : f32x8 {
+    return f32x8.select(a.gt(b), a, b);
+}
+
+/** `x` held inside `[lo, hi]` in every lane; a NaN lane comes out as `hi`, never as NaN. */
+pub fn luxClamp8(x : f32x8, lo : f32x8, hi : f32x8) : f32x8 {
+    let low : f32x8 = f32x8.select(x.lt(lo), lo, x);
+    return f32x8.select(low.lt(hi), low, hi);
+}
+
+/**
+ * 2 raised to `y` in every lane, for `y <= 0`: the decay of light through a medium and of fog. Lanes above zero
+ * answer 1 and lanes below -126 answer 0, so the result is always in `[0, 1]`. Relative error under 2e-7.
+ */
+pub fn luxExp2Neg8(y : f32x8) : f32x8 {
+    let floor : f32x8 = luxSplat(LUXS_EXP2_FLOOR);
+    let zero : f32 = 0.0;
+    let top : f32x8 = luxSplat(zero);
+    let held : f32x8 = luxClamp8(y, floor, top);
+
+    let rounder : f32x8 = luxSplat(LUXS_ROUNDER);
+    let shifted : f32x8 = held + rounder;
+    let whole : f32x8 = shifted - rounder;
+    let part : f32x8 = held - whole;
+    let n : i32x8 = i32x8.reinterpret(shifted) - i32x8.splat(LUXS_ROUNDER_BITS);
+    let scale : f32x8 = f32x8.reinterpret((n + i32x8.splat(LUXS_BIAS)) << LUXS_MANTISSA);
+
+    let poly : f32x8 = luxExp2Fraction8(part);
+    let answer : f32x8 = poly * scale;
+    return f32x8.select(y.lt(floor), top, answer);
+}
+
+/**
+ * e raised to `x` in every lane, for `x <= 0`, through `luxExp2Neg8`; the Beer-Lambert transmittance `e^-tau`. The
+ * product `x / ln 2` is rounded to f32, which adds about `|x| * 6e-8` to the relative error: under 2e-6 down to
+ * `x = -20` (a transmittance of 2e-9), under 1e-5 down to -80.
+ */
+pub fn luxExpNeg8(x : f32x8) : f32x8 {
+    return luxExp2Neg8(x * luxSplat(LUXS_LOG2E));
+}
+
+// 2^f for |f| <= 0.5, by Horner on the Taylor series.
+fn luxExp2Fraction8(f : f32x8) : f32x8 {
+    let one : f32 = 1.0;
+    let mut p : f32x8 = luxSplat(LUXS_C6);
+    p = p * f + luxSplat(LUXS_C5);
+    p = p * f + luxSplat(LUXS_C4);
+    p = p * f + luxSplat(LUXS_C3);
+    p = p * f + luxSplat(LUXS_C2);
+    p = p * f + luxSplat(LUXS_C1);
+    return p * f + luxSplat(one);
+}

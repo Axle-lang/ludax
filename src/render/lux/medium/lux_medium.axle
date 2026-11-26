@@ -1,0 +1,143 @@
+// lux_medium — what light does in a participating medium and at its boundary: Beer-Lambert, single scattering, Snell,
+// Fresnel. Water, ice, glass, smoke and fog are values of one struct.
+//
+// A medium absorbs and scatters per metre and per channel and has a refractive index. A ray that crosses `d` metres of
+// it sees `T(d) L_behind + G(d)`:
+//
+//   transmittance  T(d) = exp(-σ_t d),  σ_t = σ_a + σ_s                   Beer-Lambert, per channel
+//   glow           G(d) = (σ_s / σ_t)(1 - T(d)) J                          single scattering of the light J that
+//                                                                         reached the medium, averaged over directions
+//   source         J    = deep · σ_t / σ_s                                 calibrated so a medium of no end shows `deep`
+//
+// At a boundary between indices n1 and n2 (η = n1 / n2):
+//
+//   Snell          t = η i + (η cos θ1 - sqrt(k)) n,  k = 1 - η² (1 - cos² θ1);  k ≤ 0: total internal reflection
+//   Fresnel        F(θ) = F0 + (1 - F0)(1 - cos θ)^5                       Schlick, θ in the less dense medium
+//
+// Both terms are continuous in the distance, so depth grades smoothly. Handbook 3.14 §3.8 and 3.17.
+
+use crate::core::math::scalar::max;
+use crate::core::math::trig::sqrt;
+use crate::core::math::vec3::Vec3;
+use crate::render::lux::simd::lux_simd::luxExpNeg8;
+
+/** The refractive index of water against air. */
+pub const LUX_WATER_INDEX : f32 = 1.333;
+
+/** Schlick's F0 for air against water: ((1.333 - 1) / (1.333 + 1))^2, rounded as the renderers have always used it. */
+pub const LUX_WATER_F0 : f32 = 0.0204;
+
+/** A participating medium: what it absorbs and scatters per metre and per channel, and its refractive index. The defaults are a clear bay. */
+pub struct LuxMedium {
+    /** Absorption, 1/m, red green blue: pure water's (Pope and Fry 1997) with some dissolved matter. */
+    pub absorb : Vec3 = Vec3 { x: 0.40, y: 0.07, z: 0.05 };
+
+    /** Scattering, 1/m, red green blue: a clear bay, about eight metres of visibility in green and blue. */
+    pub scatter : Vec3 = Vec3 { x: 0.05, y: 0.06, z: 0.07 };
+
+    /** The refractive index against air. */
+    pub index : f32 = 1.333;
+}
+
+/** A direction through a boundary: refracted, or reflected when Snell's law has no answer. */
+pub struct LuxRefraction {
+    /** The new direction, unit length. */
+    pub dir : Vec3 = Vec3 { x: 0.0, y: 1.0, z: 0.0 };
+
+    /** True when the light could not leave: total internal reflection, `dir` is the reflection. */
+    pub total : bool = false;
+
+    /** The Fresnel reflectance at this crossing, 1 for a total reflection. */
+    pub fresnel : f32 = 1.0;
+}
+
+/** Schlick's reflectance for a cosine `c` of the angle in the less dense medium and a reflectance `f0` at normal incidence. */
+pub fn luxSchlick(c : f32, f0 : f32) : f32 {
+    let one : f32 = 1.0;
+    let m : f32 = one - max(c, 0.0 as f32);
+    let m2 : f32 = m * m;
+    return f0 + (one - f0) * m2 * m2 * m;
+}
+
+/** Schlick's reflectance of water for a cosine `c` of the angle in the air, 0 to 1. */
+pub fn luxFresnel(c : f32) : f32 {
+    return luxSchlick(c, LUX_WATER_F0);
+}
+
+/**
+ * The direction `i` (unit, travelling toward the boundary) takes through a boundary of unit normal `n` (on the side `i`
+ * comes from, so `i · n < 0`), going from index `from` into index `into`, with water's Fresnel reflectance.
+ */
+pub fn luxRefract(i : Vec3, n : Vec3, from : f32, into : f32) : LuxRefraction {
+    return luxRefractF0(i, n, from, into, LUX_WATER_F0);
+}
+
+/** `luxRefract` for a boundary whose reflectance at normal incidence is `f0`. */
+pub fn luxRefractF0(i : Vec3, n : Vec3, from : f32, into : f32, f0 : f32) : LuxRefraction {
+    let eta : f32 = from / into;
+    let cosI : f32 = max(-(i.dot(n)), 0.0 as f32);
+    let one : f32 = 1.0;
+    let k : f32 = one - eta * eta * (one - cosI * cosI);
+    let reflected : Vec3 = i.minus(n.scale((2.0 as f32) * i.dot(n)));
+    if (k <= 0.0) {
+        return LuxRefraction { dir: reflected, total: true, fresnel: 1.0 };
+    }
+    let cosT : f32 = sqrt(k);
+    let dir : Vec3 = i.scale(eta).plus(n.scale(eta * cosI - cosT)).normalized();
+    // Schlick takes the cosine in the less dense medium: the incident one going in, the transmitted one coming out.
+    let lighter : f32 = from <= into ? cosI : cosT;
+    return LuxRefraction { dir: dir, total: false, fresnel: luxSchlick(lighter, f0) };
+}
+
+/** What `d` metres of the medium let through, per channel: exp(-(σ_a + σ_s) d). */
+pub fn luxMediumTransmit(m : LuxMedium, d : f32) : Vec3 {
+    let t : Vec3 = m.absorb.plus(m.scatter).scale(max(d, 0.0 as f32));
+    return luxmExp(t);
+}
+
+/**
+ * What `d` metres of the medium add of their own, lit by `light` (the radiance that reached the medium, averaged over
+ * directions): single scattering, (σ_s / σ_t)(1 - exp(-σ_t d)) light, per channel.
+ */
+pub fn luxMediumGlow(m : LuxMedium, d : f32, light : Vec3) : Vec3 {
+    return luxMediumGlowKept(m, luxMediumTransmit(m, d), light);
+}
+
+/** `luxMediumGlow` for a caller that already holds the transmittance `keep` of the same distance: one exponential, not two. */
+pub fn luxMediumGlowKept(m : LuxMedium, keep : Vec3, light : Vec3) : Vec3 {
+    let st : Vec3 = m.absorb.plus(m.scatter);
+    return Vec3 {
+        x: m.scatter.x / max(st.x, 0.000001 as f32) * ((1.0 as f32) - keep.x) * light.x,
+        y: m.scatter.y / max(st.y, 0.000001 as f32) * ((1.0 as f32) - keep.y) * light.y,
+        z: m.scatter.z / max(st.z, 0.000001 as f32) * ((1.0 as f32) - keep.z) * light.z,
+    };
+}
+
+/**
+ * The light the medium scatters, chosen so that a medium of no end (single-scattering albedo σ_s / σ_t times it) shows
+ * exactly the colour `deep`: the art-directed colour of deep water becomes a physical source.
+ */
+pub fn luxMediumSource(m : LuxMedium, deep : Vec3) : Vec3 {
+    let st : Vec3 = m.absorb.plus(m.scatter);
+    return Vec3 {
+        x: deep.x * st.x / max(m.scatter.x, 0.000001 as f32),
+        y: deep.y * st.y / max(m.scatter.y, 0.000001 as f32),
+        z: deep.z * st.z / max(m.scatter.z, 0.000001 as f32),
+    };
+}
+
+/** A segment of `t` metres of the medium in front of `behind`: `T(t) behind + G(t)`, lit by `source`. */
+pub fn luxMediumSegment(m : LuxMedium, behind : Vec3, t : f32, source : Vec3) : Vec3 {
+    let keep : Vec3 = luxMediumTransmit(m, t);
+    return behind.times(keep).plus(luxMediumGlowKept(m, keep, source));
+}
+
+// e^-t per channel for t >= 0, the three channels in one vector of lanes (no allocation, no scalar exp calls): the
+// lanes' exponential is within 2e-6 relative down to e^-20.
+fn luxmExp(t : Vec3) : Vec3 {
+    let x : f32 = -t.x;
+    let y : f32 = -t.y;
+    let z : f32 = -t.z;
+    let e : f32x8 = luxExpNeg8(f32x8(x, y, z, z, z, z, z, z));
+    return Vec3 { x: e[0], y: e[1], z: e[2] };
+}

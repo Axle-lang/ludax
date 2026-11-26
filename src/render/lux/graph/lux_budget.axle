@@ -1,0 +1,197 @@
+// lux_budget — what each layer of light costs, and the resolution that keeps a frame inside its time.
+//
+// Two jobs, both fed by measured nanoseconds:
+//   - the meter keeps, per layer, a running mean of its cost (an exponential mean of weight 1/8, about the last eight
+//     frames), so a report can set each layer's measured cost beside the budget it declared;
+//   - the governor keeps the frame inside its target (16.6 ms for 60 frames a second) by choosing the scale at which
+//     the picture is computed, from 1 (full) down to a floor, in steps of 1/16 of the full size. It steps down after
+//     `LUXB_OVER_FRAMES` frames in a row above 95 % of the target, and up after a patience of frames in a row whose
+//     cost, scaled to the next step's pixels (cost ∝ scale²), would stay under 85 %: falling is quick, so a heavy
+//     view does not drop frames for long; rising only where the next step fits, so the scale does not hunt. A drop
+//     right after a rise (the sign of hunting) doubles the patience, from 30 frames up to 480. Rising on "under 75 %"
+//     alone hunted on the first try: 560 x 320 cost 72 %, 640 x 368 cost 97 %, and the picture restarted every second.
+//
+// The governor reads wall-clock measurements, so the scale it chooses depends on the machine and the moment. A run that
+// must be reproducible (a `--check`, a reference picture) fixes the scale with `holdScale` and the governor is not
+// consulted: determinism of the picture is kept, only the adaptive choice is given up.
+
+use crate::core::collections::vec::Vec;
+
+/** The frame time for 60 frames a second, nanoseconds. */
+pub const LUX_FRAME_60 : i64 = 16666667;
+
+// The governor moves the scale by sixteenths of the full size.
+const LUXB_STEP : f32 = 0.0625;
+// Frames in a row over 95 % of the target before stepping down; light frames in a row before stepping up, at first
+// (the patience then doubles after each reversal, up to `LUXB_PATIENCE_MAX`).
+const LUXB_OVER_FRAMES : i32 = 3;
+const LUXB_UNDER_FRAMES : i32 = 30;
+const LUXB_PATIENCE_MAX : i32 = 480;
+// The share of the target the next step's predicted cost must stay under for the scale to rise, in percent.
+const LUXB_RISE_FIT : f64 = 85.0;
+// The weight of a new measurement in a layer's running mean.
+const LUXB_MEAN_WEIGHT : f64 = 0.125;
+
+/** Measured cost per layer, and the scale of the picture that keeps a frame inside its target time. */
+pub class LuxBudget {
+    mean   : Vec<f64>;
+    target : i64;
+    floor  : f32;
+    scale  : f32 = 1.0;
+    held   : bool = false;
+    over   : i32 = 0;
+    under  : i32 = 0;
+    lastNs : i64 = 0;
+    // Light frames in a row needed to rise, and the last move (+1 up, -1 down, 0 none yet).
+    patience : i32 = LUXB_UNDER_FRAMES;
+    lastMove : i32 = 0;
+
+    /** A budget for `layers` layers, a frame target of `target` nanoseconds, and a scale never below `floor`. */
+    constructor(layers : i32, target : i64, floor : f32) {
+        self.mean = new Vec<f64>();
+        for (l of 0..layers) {
+            self.mean.push(0.0);
+        }
+        self.target = target;
+        // A floor of zero would let the prediction divide by a zero scale (which traps): it is held above a sixteenth.
+        self.floor = floor > LUXB_STEP ? floor : LUXB_STEP;
+    }
+
+    /** Records that layer `l` took `nanos` nanoseconds this frame. */
+    pub fn record(mut self, l : i32, nanos : i64) : void {
+        let old : f64 = self.mean.get(l);
+        let now : f64 = nanos as f64;
+        if (old == 0.0) {
+            self.mean.set(l, now);
+            return;
+        }
+        self.mean.set(l, old + (now - old) * LUXB_MEAN_WEIGHT);
+    }
+
+    /** The running mean of layer `l`'s cost, nanoseconds; 0 before its first measurement. */
+    pub fn meanOf(self, l : i32) : f64 {
+        return self.mean.get(l);
+    }
+
+    /** Ends a frame that took `nanos` nanoseconds in all, all of it growing with the picture's pixels. */
+    pub fn endFrame(mut self, nanos : i64) : void {
+        self.endFrameSplit(nanos, nanos);
+    }
+
+    /**
+     * Ends a frame that took `nanos` nanoseconds, of which `scaled` grow with the picture's pixels (the rest, a display
+     * at a fixed output size, does not), and lets the governor move the scale. The next step's cost is predicted as
+     * `(nanos - scaled) + scaled · (next / now)²`: taking all of it as growing (as at first) kept an upscaled 1080p
+     * picture at its floor of 384 × 208, where 9 of its 13 ms were the output's own.
+     */
+    pub fn endFrameSplit(mut self, nanos : i64, scaled : i64) : void {
+        self.lastNs = nanos;
+        if (self.held) {
+            return;
+        }
+
+        let next : f64 = (self.scale + LUXB_STEP) as f64;
+        let now : f64 = self.scale as f64;
+        let growing : f64 = (scaled < nanos ? scaled : nanos) as f64;
+        let predicted : f64 = ((nanos as f64) - growing) + growing * (next * next) / (now * now);
+        if (nanos * 100 > self.target * 95) {
+            self.over = self.over + 1;
+            self.under = 0;
+        } else if (predicted * 100.0 < (self.target as f64) * LUXB_RISE_FIT) {
+            self.under = self.under + 1;
+            self.over = 0;
+        } else {
+            self.over = 0;
+            self.under = 0;
+        }
+
+        if (self.over >= LUXB_OVER_FRAMES) {
+            self.scale = LuxBudget::within(self.scale - LUXB_STEP, self.floor);
+            self.over = 0;
+            if (self.lastMove > 0) {
+                self.patience = self.patience * 2;
+                if (self.patience > LUXB_PATIENCE_MAX) {
+                    self.patience = LUXB_PATIENCE_MAX;
+                }
+            }
+            self.lastMove = -1;
+        }
+        if (self.under >= self.patience && self.scale < (1.0 as f32)) {
+            self.scale = LuxBudget::within(self.scale + LUXB_STEP, self.floor);
+            self.under = 0;
+            self.lastMove = 1;
+        }
+    }
+
+    /** Holds frames to `target` nanoseconds from now on: a frame rate chosen while playing. */
+    pub fn retarget(mut self, target : i64) : void {
+        self.target = target;
+        self.over = 0;
+        self.under = 0;
+    }
+
+    /** Fixes the scale at `scale` and stops the governor: for runs that must give the same picture every time. */
+    pub fn holdScale(mut self, scale : f32) : void {
+        self.scale = LuxBudget::within(scale, self.floor);
+        self.held = true;
+    }
+
+    /** Lets the governor move the scale again. */
+    pub fn release(mut self) : void {
+        self.held = false;
+    }
+
+    /** The scale at which to compute the picture, from the floor up to 1. */
+    pub fn scaleNow(self) : f32 {
+        return self.scale;
+    }
+
+    /** The total time of the last frame, nanoseconds. */
+    pub fn lastFrame(self) : i64 {
+        return self.lastNs;
+    }
+
+    static fn within(s : f32, floor : f32) : f32 {
+        let one : f32 = 1.0;
+        if (s > one) {
+            return one;
+        }
+        if (s < floor) {
+            return floor;
+        }
+        return s;
+    }
+}
+
+/** A picture's size in pixels. */
+pub struct LuxSize {
+    pub w : i32 = 16;
+    pub h : i32 = 16;
+}
+
+/** The size a picture is shown at for a window of `w` by `h`: rounded down to the 16 pixels the stages want (at least 16). */
+pub fn luxShownSize(w : i32, h : i32) : LuxSize {
+    return LuxSize { w: luxbFloor16(w), h: luxbFloor16(h) };
+}
+
+/** The size a picture is computed at for one shown at `shown`, at the share `scale` of its resolution: each side the nearest multiple of 16. */
+pub fn luxComputedSize(shown : LuxSize, scale : f32) : LuxSize {
+    return LuxSize { w: luxbNearest16((shown.w as f32) * scale), h: luxbNearest16((shown.h as f32) * scale) };
+}
+
+/** The share of `shown`'s resolution at which a computed picture holds about `pixels`, never above 1. */
+pub fn luxStartScale(shown : LuxSize, pixels : i32) : f32 {
+    let full : f32 = (shown.w as f32) * (shown.h as f32);
+    let share : f32 = ((pixels as f32) / (full > 1.0 ? full : 1.0 as f32)).sqrt();
+    return share < (1.0 as f32) ? share : 1.0 as f32;
+}
+
+fn luxbFloor16(n : i32) : i32 {
+    let m : i32 = (n / 16) * 16;
+    return m < 16 ? 16 : m;
+}
+
+fn luxbNearest16(x : f32) : i32 {
+    let n : i32 = ((x + (8.0 as f32)) / (16.0 as f32)) as i32;
+    return n < 1 ? 16 : n * 16;
+}

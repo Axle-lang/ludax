@@ -1,0 +1,124 @@
+// lux_clip — how far a pixel's history may be trusted: the colour box of its neighbourhood this frame.
+//
+// A picture accumulated over frames is only stable if a pixel keeps its history while the camera moves; a history
+// thrown away on every move (what lumen did: three frames while moving, then a burst of new samples on the stop) is
+// what makes a picture shimmer for a second after the camera stops and makes water reflections "reset" when it
+// starts again. Keeping the history while moving needs a guard against ghosts: where the reprojected history
+// belongs to something else (a surface uncovered by the motion, a light that changed), it must not be blended in.
+//
+// The guard is the one temporal anti-aliasing has used since Karis (Unreal Engine 4, SIGGRAPH 2014) and Salvi
+// (GDC 2016): the samples of the pixel's 3x3 neighbourhood in the current frame give, per channel of the YCoCg
+// space, a mean and a deviation; the history is trusted inside the box `mean +- gamma * deviation` and, outside it,
+// pulled along the line toward the mean until it reaches the box's surface. YCoCg separates brightness from
+// colour, so a box around a grey neighbourhood stays narrow in colour and wide in brightness, which is the shape
+// real neighbourhoods have. A small `gamma` (about 1) rejects ghosts fast and lets some noise through; a large one
+// keeps more history. A still camera needs no clip at all: the history is exact.
+//
+// All in f32, no division by a possibly-zero deviation: a box of zero size is the mean itself.
+
+use crate::core::math::vec3::Vec3;
+
+/** The usual box size while the camera moves: a deviation and a quarter around the mean. */
+pub const LUX_CLIP_GAMMA : f32 = 1.25;
+
+// A box narrower than this per channel is taken as a point, so the clip never divides by nothing.
+const LUXC_TINY : f32 = 0.000001;
+
+/** The first two moments of the colours of a neighbourhood, in YCoCg, built one sample at a time. */
+pub struct LuxMoments {
+    /** The sum of the samples, Y in x, Co in y, Cg in z. */
+    pub sum : Vec3 = Vec3 { x: 0.0, y: 0.0, z: 0.0 };
+
+    /** The sum of their squares, per channel. */
+    pub squares : Vec3 = Vec3 { x: 0.0, y: 0.0, z: 0.0 };
+
+    /** How many samples were added. */
+    pub count : f32 = 0.0;
+
+    /** These moments with the linear RGB colour `rgb` added. */
+    pub fn plus(self, rgb : Vec3) : LuxMoments {
+        let c : Vec3 = luxToYCoCg(rgb);
+        return LuxMoments {
+            sum: self.sum.plus(c),
+            squares: self.squares.plus(Vec3 { x: c.x * c.x, y: c.y * c.y, z: c.z * c.z }),
+            count: self.count + (1.0 as f32),
+        };
+    }
+
+    /**
+     * `history` (linear RGB) held inside the box of these moments widened by `gamma` deviations: unchanged when it
+     * is inside, otherwise moved toward the mean until it meets the box. With no sample added, `history` itself.
+     */
+    pub fn clip(self, history : Vec3, gamma : f32) : Vec3 {
+        if (self.count < (1.0 as f32)) {
+            return history;
+        }
+        let inv : f32 = (1.0 as f32) / self.count;
+        let mean : Vec3 = self.sum.scale(inv);
+        let spread : Vec3 = Vec3 {
+            x: luxDeviation(self.squares.x * inv, mean.x) * gamma,
+            y: luxDeviation(self.squares.y * inv, mean.y) * gamma,
+            z: luxDeviation(self.squares.z * inv, mean.z) * gamma,
+        };
+
+        let h : Vec3 = luxToYCoCg(history);
+        let off : Vec3 = h.minus(mean);
+        let reach : f32 = luxReach(off, spread);
+        if (reach <= (1.0 as f32)) {
+            return history;
+        }
+        return luxFromYCoCg(mean.plus(off.scale((1.0 as f32) / reach)));
+    }
+}
+
+/** Linear RGB to YCoCg: Y the brightness, Co the orange-blue axis, Cg the green-magenta one. */
+pub fn luxToYCoCg(c : Vec3) : Vec3 {
+    let quarter : f32 = 0.25;
+    let half : f32 = 0.5;
+    return Vec3 {
+        x: c.x * quarter + c.y * half + c.z * quarter,
+        y: c.x * half - c.z * half,
+        z: -c.x * quarter + c.y * half - c.z * quarter,
+    };
+}
+
+/** YCoCg back to linear RGB; the exact inverse of `luxToYCoCg`. */
+pub fn luxFromYCoCg(c : Vec3) : Vec3 {
+    return Vec3 { x: c.x + c.y - c.z, y: c.x + c.z, z: c.x - c.y - c.z };
+}
+
+// The deviation from a mean square and a mean; never the root of a negative rounding residue.
+fn luxDeviation(meanSquare : f32, mean : f32) : f32 {
+    let v : f32 = meanSquare - mean * mean;
+    if (v <= (0.0 as f32)) {
+        return 0.0;
+    }
+    return v.sqrt();
+}
+
+// How many times the box's half-size the offset `off` reaches along its worst channel: at most 1 inside the box.
+// A channel whose box has no width reaches infinitely far as soon as the offset has any length on it.
+fn luxReach(off : Vec3, spread : Vec3) : f32 {
+    let mut worst : f32 = 0.0;
+    worst = luxReachOne(off.x, spread.x, worst);
+    worst = luxReachOne(off.y, spread.y, worst);
+    return luxReachOne(off.z, spread.z, worst);
+}
+
+fn luxReachOne(off : f32, half : f32, worst : f32) : f32 {
+    let mut a : f32 = off;
+    if (a < (0.0 as f32)) {
+        a = -a;
+    }
+    if (a <= LUXC_TINY) {
+        return worst;
+    }
+    if (half <= LUXC_TINY) {
+        return 1000000.0 as f32;
+    }
+    let r : f32 = a / half;
+    if (r > worst) {
+        return r;
+    }
+    return worst;
+}

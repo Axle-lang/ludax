@@ -1,0 +1,519 @@
+// lux_look — how a surface responds to fields: colour, glow, tilt, roughness, and how it bends what is seen through it.
+//
+// A look is a short stack of ops, each driven by a field of the world's `LuxFieldTape` (handbook 3.15):
+//
+//   Albedo   the material's colour times ramp(field)                    stage 1, material: products
+//   Normal   the normal tilted by strength · ∇field                     stage 2, shape: slopes add (∇ is linear)
+//   Rough    roughness plus strength · field                            stage 3, response: sums
+//   Emit     emission plus ramp(field), scene radiance                  stage 3
+//   Bend     what is seen through bent by strength · ∇field             stage 4, interface: bends add
+//
+// The ops run in that order of stages whatever order they were added in, and within a stage in the order added, so
+// stacking is predictable and, where the physics makes ops commute, independent of the order of declaration. A look
+// also says what it does with the ray (`LuxInterface`: nothing, or a thin perforated surface the ray goes through, tinted and bent) and
+// how much history its pixels may keep.
+//
+// `compile` lists, per look, the nodes of the tape its ops need (each after its children) and its ops in stage order,
+// into flat arrays; `shade` evaluates those nodes once at the hit and runs the ops: no allocation, one `LuxSurface` per
+// hit. A look never traces a ray: the program reads the surface, traces what it asks, and combines (§3.2 of the design),
+// which is what makes looks nest safely (a portal seen in water seen through a portal).
+//
+// `LuxFx` bundles a world's fields, looks and the binding from block ids to looks: the one object a program hands its
+// workers. A block bound to no look is drawn exactly as before.
+
+use crate::core::collections::vec::Vec;
+use crate::core::field::lux_field::{LUX_FIELD_SLOT, LuxField, LuxFieldTape};
+use crate::core::math::scalar::max;
+use crate::core::math::vec3::Vec3;
+
+/** What a look does with a field at a hit. The codes are the stages' order. */
+pub enum LuxLookOp : i8 {
+    /** The albedo times ramp(field). */
+    Albedo = 0,
+    /** The normal tilted by strength times the field's gradient; the slopes of every `Normal` add. */
+    Normal = 1,
+    /** Roughness plus strength times the field. */
+    Rough = 2,
+    /** Emission plus ramp(field), scene radiance. */
+    Emit = 3,
+    /** The rays seen through bent by strength times the field's gradient, radians per unit of slope. */
+    Bend = 4,
+
+    /** The number a bank stores. */
+    pub fn code(self) : i32 {
+        return self as i32;
+    }
+
+    /** The op stored as `n`; `Bend` for anything past the others. */
+    pub static fn fromCode(n : i32) : LuxLookOp {
+        return match n {
+            0 => LuxLookOp::Albedo,
+            1 => LuxLookOp::Normal,
+            2 => LuxLookOp::Rough,
+            3 => LuxLookOp::Emit,
+            _ => LuxLookOp::Bend,
+        };
+    }
+}
+
+/** What a surface does with the ray that struck it. */
+pub enum LuxInterface : i8 {
+    /** Nothing: shaded where it is. */
+    None = 0,
+    /** A thin, perforated surface: the ray goes on through it, bent by the look's `Bend` and tinted (a portal, a stained pane, a curtain of leaves; `lux_thin`). */
+    Thin = 1,
+
+    /** The number a bank stores. */
+    pub fn code(self) : i32 {
+        return self as i32;
+    }
+
+    /** The interface stored as `n`. */
+    pub static fn fromCode(n : i32) : LuxInterface {
+        if (n == 1) {
+            return LuxInterface::Thin;
+        }
+        return LuxInterface::None;
+    }
+}
+
+/** A colour ramp of three stops over a field's value, times a strength. Below the first stop its colour, above the last its colour. */
+pub struct LuxRamp {
+    /** The first stop's position in the field's value, and its colour (also below it). */
+    pub at0 : f32 = 0.0;
+    pub c0  : Vec3 = Vec3 { x: 0.0, y: 0.0, z: 0.0 };
+
+    /** The middle stop's position and colour. */
+    pub at1 : f32 = 0.5;
+    pub c1  : Vec3 = Vec3 { x: 0.5, y: 0.5, z: 0.5 };
+
+    /** The last stop's position and colour (also above it). */
+    pub at2 : f32 = 1.0;
+    pub c2  : Vec3 = Vec3 { x: 1.0, y: 1.0, z: 1.0 };
+
+    /** The whole ramp times this. */
+    pub strength : f32 = 1.0;
+}
+
+/**
+ * What a look made of a hit. Slopes and bends are in the hit's two face coordinates (the `u`, `v` the program passed
+ * to `shade`): the program turns them into a normal and a direction on its own axes.
+ */
+pub struct LuxSurface {
+    /** The tilt of the normal: the normal becomes n - slopeU · û - slopeV · v̂, renormalised. */
+    pub slopeU : f32 = 0.0;
+    pub slopeV : f32 = 0.0;
+
+    /** The bend of the ray seen through: its direction plus bendU · û + bendV · v̂, renormalised. */
+    pub bendU : f32 = 0.0;
+    pub bendV : f32 = 0.0;
+
+    /** What the material's colour is multiplied by. */
+    pub albedo : Vec3 = Vec3 { x: 1.0, y: 1.0, z: 1.0 };
+
+    /** Emission, scene radiance. */
+    pub emit : Vec3 = Vec3 { x: 0.0, y: 0.0, z: 0.0 };
+
+    /** Added to the material's roughness. */
+    pub rough : f32 = 0.0;
+}
+
+// The floats a ramp keeps: three stops of a position and a colour, and the strength.
+const LUXL_RAMP : i32 = 13;
+
+/** The looks of a world: built once, compiled against the world's tape, then read by every worker. */
+pub class LuxLookBank {
+    opLook     : Vec<i32>;
+    opKind     : Vec<i32>;
+    opField    : Vec<i32>;
+    opRamp     : Vec<i32>;
+    opStrength : Vec<f32>;
+    ramps      : Vec<f32>;
+
+    iface : Vec<i32>;
+    tint  : Vec<f32>;
+    cap   : Vec<f32>;
+
+    // Compiled: per look, its nodes and its ops in stage order, as ranges into flat arrays.
+    nodes     : i32[];
+    nodeFrom  : i32[];
+    nodeTo    : i32[];
+    order     : i32[];
+    orderFrom : i32[];
+    orderTo   : i32[];
+    fKind     : i32[];
+    fField    : i32[];
+    fRamp     : i32[];
+    fStrength : f32[];
+    fRamps    : f32[];
+    compiled  : bool = false;
+
+    /** No looks yet. */
+    constructor() {
+        self.opLook = new Vec<i32>();
+        self.opKind = new Vec<i32>();
+        self.opField = new Vec<i32>();
+        self.opRamp = new Vec<i32>();
+        self.opStrength = new Vec<f32>();
+        self.ramps = new Vec<f32>();
+        self.iface = new Vec<i32>();
+        self.tint = new Vec<f32>();
+        self.cap = new Vec<f32>();
+        self.nodes = new i32[1];
+        self.nodeFrom = new i32[1];
+        self.nodeTo = new i32[1];
+        self.order = new i32[1];
+        self.orderFrom = new i32[1];
+        self.orderTo = new i32[1];
+        self.fKind = new i32[1];
+        self.fField = new i32[1];
+        self.fRamp = new i32[1];
+        self.fStrength = new f32[1];
+        self.fRamps = new f32[LUXL_RAMP as i64];
+    }
+
+    /** How many looks there are. */
+    pub fn count(self) : i32 {
+        return self.iface.len();
+    }
+
+    /** A new look with no ops: shaded as the material is, no interface, unlimited history. Answers its handle. */
+    pub fn look(mut self) : i32 {
+        let id : i32 = self.iface.len();
+        self.iface.push(LuxInterface::None.code());
+        self.tint.push(1.0);
+        self.tint.push(1.0);
+        self.tint.push(1.0);
+        self.cap.push(1000000.0);
+        self.compiled = false;
+        return id;
+    }
+
+    /** The albedo of `look` times `ramp` of field `f`. */
+    pub fn albedo(mut self, look : i32, f : LuxField, ramp : LuxRamp) : void {
+        self.add(look, LuxLookOp::Albedo, f, self.keepRamp(ramp), 0.0);
+    }
+
+    /** The normal of `look` tilted by `strength` times the gradient of `f`. */
+    pub fn normal(mut self, look : i32, f : LuxField, strength : f32) : void {
+        self.add(look, LuxLookOp::Normal, f, -1, strength);
+    }
+
+    /** The roughness of `look` plus `strength` times `f`. */
+    pub fn rough(mut self, look : i32, f : LuxField, strength : f32) : void {
+        self.add(look, LuxLookOp::Rough, f, -1, strength);
+    }
+
+    /** The emission of `look` plus `ramp` of field `f`. */
+    pub fn emit(mut self, look : i32, f : LuxField, ramp : LuxRamp) : void {
+        self.add(look, LuxLookOp::Emit, f, self.keepRamp(ramp), 0.0);
+    }
+
+    /** What is seen through `look` bent by `strength` times the gradient of `f`. */
+    pub fn bend(mut self, look : i32, f : LuxField, strength : f32) : void {
+        self.add(look, LuxLookOp::Bend, f, -1, strength);
+    }
+
+    /** `look` is a thin, perforated surface the ray goes through, tinted by `tint`. */
+    pub fn thin(mut self, look : i32, tint : Vec3) : void {
+        self.iface.set(look, LuxInterface::Thin.code());
+        self.tint.set(look * 3, tint.x);
+        self.tint.set(look * 3 + 1, tint.y);
+        self.tint.set(look * 3 + 2, tint.z);
+    }
+
+    /** The pixels of `look` keep at most `frames` frames of history: an animated look keeps a short one. */
+    pub fn history(mut self, look : i32, frames : f32) : void {
+        self.cap.set(look, max(frames, 1.0 as f32));
+    }
+
+    /** What `look` does with the ray. */
+    pub fn interfaceOf(self, look : i32) : LuxInterface {
+        return LuxInterface::fromCode(self.iface.get(look));
+    }
+
+    /** The tint of a thin surface. */
+    pub fn tintOf(self, look : i32) : Vec3 {
+        return Vec3 {
+            x: self.tint.get(look * 3),
+            y: self.tint.get(look * 3 + 1),
+            z: self.tint.get(look * 3 + 2),
+        };
+    }
+
+    /** The most frames of history a pixel of `look` may keep. */
+    pub fn historyOf(self, look : i32) : f32 {
+        return self.cap.get(look);
+    }
+
+    /** True once `compile` ran after the last change. */
+    pub fn isCompiled(self) : bool {
+        return self.compiled;
+    }
+
+    /** Lists, per look, the nodes of `tape` its ops need and its ops in stage order. Call after building, before drawing. */
+    pub fn compile(mut self, tape : LuxFieldTape) : void {
+        let looks : i32 = self.count();
+        let ops : i32 = self.opLook.len();
+        let nodesOf : i32 = tape.count();
+        let mut mark : bool[] = new bool[(max(nodesOf as f32, 1.0 as f32)) as i64];
+        let mut stack : i32[] = new i32[(max(nodesOf as f32, 1.0 as f32) as i64) * 3 + 8];
+        let mut listed : Vec<i32> = new Vec<i32>();
+        let mut sorted : Vec<i32> = new Vec<i32>();
+        self.nodeFrom = new i32[(max(looks as f32, 1.0 as f32)) as i64];
+        self.nodeTo = new i32[(max(looks as f32, 1.0 as f32)) as i64];
+        self.orderFrom = new i32[(max(looks as f32, 1.0 as f32)) as i64];
+        self.orderTo = new i32[(max(looks as f32, 1.0 as f32)) as i64];
+        for (l of 0..looks) {
+            for (i of 0..nodesOf) {
+                mark[i] = false;
+            }
+            for (o of 0..ops) {
+                if (self.opLook.get(o) == l) {
+                    luxlMark(tape, self.opField.get(o), mark, stack);
+                }
+            }
+            self.nodeFrom[l] = listed.len();
+            for (i of 0..nodesOf) {
+                if (mark[i]) {
+                    listed.push(i);
+                }
+            }
+            self.nodeTo[l] = listed.len();
+            self.orderFrom[l] = sorted.len();
+            for (stage of 0..5) {
+                for (o of 0..ops) {
+                    if (self.opLook.get(o) == l && self.opKind.get(o) == stage) {
+                        sorted.push(o);
+                    }
+                }
+            }
+            self.orderTo[l] = sorted.len();
+        }
+        self.nodes = new i32[(max(listed.len() as f32, 1.0 as f32)) as i64];
+        for (i of 0..listed.len()) {
+            self.nodes[i] = listed.get(i);
+        }
+        self.order = new i32[(max(sorted.len() as f32, 1.0 as f32)) as i64];
+        for (i of 0..sorted.len()) {
+            self.order[i] = sorted.get(i);
+        }
+        let opsAt : i64 = (max(ops as f32, 1.0 as f32)) as i64;
+        self.fKind = new i32[opsAt];
+        self.fField = new i32[opsAt];
+        self.fRamp = new i32[opsAt];
+        for (o of 0..ops) {
+            self.fKind[o] = self.opKind.get(o);
+            self.fField[o] = self.opField.get(o);
+            self.fRamp[o] = self.opRamp.get(o);
+        }
+        self.fStrength = new f32[(max(ops as f32, 1.0 as f32)) as i64];
+        for (o of 0..ops) {
+            self.fStrength[o] = self.opStrength.get(o);
+        }
+        let rampFloats : i32 = self.ramps.len();
+        self.fRamps = new f32[(max(rampFloats as f32, 1.0 as f32)) as i64];
+        for (i of 0..rampFloats) {
+            self.fRamps[i] = self.ramps.get(i);
+        }
+        self.compiled = true;
+    }
+
+    /**
+     * The surface `look` makes at a hit whose face coordinates are (`u`, `v`) metres, seen with a footprint of `fp`
+     * metres, using the worker's registers `r` (`LuxFieldTape.registers`). The tape must be prepared for the frame.
+     */
+    pub fn shade(
+        self,
+        look : i32,
+        tape : LuxFieldTape,
+        u : f32,
+        v : f32,
+        fp : f32,
+        mut r : f32[]
+    ) : LuxSurface {
+        tape.evaluate(self.nodes, self.nodeFrom[look], self.nodeTo[look], u, v, fp, r);
+        let mut s : LuxSurface = LuxSurface {};
+        for (k of self.orderFrom[look]..self.orderTo[look]) {
+            let o : i32 = self.order[k];
+            let at : i64 = (self.fField[o] as i64) * LUX_FIELD_SLOT;
+            let strength : f32 = self.fStrength[o];
+            s = match LuxLookOp::fromCode(self.fKind[o]) {
+                LuxLookOp::Albedo => luxlTint(s, luxlRamp(self.fRamps, self.fRamp[o], r[at])),
+                LuxLookOp::Normal => luxlTilt(s, strength * r[at + 1], strength * r[at + 2]),
+                LuxLookOp::Rough => luxlRoughen(s, strength * r[at]),
+                LuxLookOp::Emit => luxlGlow(s, luxlRamp(self.fRamps, self.fRamp[o], r[at])),
+                LuxLookOp::Bend => luxlBend(s, strength * r[at + 1], strength * r[at + 2]),
+            };
+        }
+        return s;
+    }
+
+    fn add(mut self, look : i32, kind : LuxLookOp, f : LuxField, ramp : i32, strength : f32) : void {
+        self.opLook.push(look);
+        self.opKind.push(kind.code());
+        self.opField.push(f.id);
+        self.opRamp.push(ramp);
+        self.opStrength.push(strength);
+        self.compiled = false;
+    }
+
+    fn keepRamp(mut self, ramp : LuxRamp) : i32 {
+        let id : i32 = self.ramps.len() / LUXL_RAMP;
+        self.ramps.push(ramp.at0);
+        self.ramps.push(ramp.c0.x);
+        self.ramps.push(ramp.c0.y);
+        self.ramps.push(ramp.c0.z);
+        self.ramps.push(ramp.at1);
+        self.ramps.push(ramp.c1.x);
+        self.ramps.push(ramp.c1.y);
+        self.ramps.push(ramp.c1.z);
+        self.ramps.push(ramp.at2);
+        self.ramps.push(ramp.c2.x);
+        self.ramps.push(ramp.c2.y);
+        self.ramps.push(ramp.c2.z);
+        self.ramps.push(ramp.strength);
+        return id;
+    }
+}
+
+/**
+ * The fields, looks and block bindings of one world: what a program builds once and its workers read. A block bound to
+ * no look (-1) is drawn exactly as it was before looks existed.
+ */
+pub class LuxFx {
+    /** The world's fields. */
+    pub fields : LuxFieldTape;
+
+    /** The world's looks. */
+    pub looks : LuxLookBank;
+
+    binding : i32[];
+
+    /** Fields, looks and bindings for blocks of ids 0 to `blocks` - 1, all unbound. */
+    constructor(blocks : i32) {
+        self.fields = new LuxFieldTape();
+        self.looks = new LuxLookBank();
+        self.binding = new i32[(max(blocks as f32, 1.0 as f32)) as i64];
+        for (i of 0..blocks) {
+            self.binding[i] = -1;
+        }
+    }
+
+    /** Blocks of id `block` are drawn with `look`. */
+    pub fn bind(mut self, block : i32, look : i32) : void {
+        self.binding[block] = look;
+    }
+
+    /** The look of blocks of id `block`, -1 for none. */
+    pub fn lookOf(self, block : i32) : i32 {
+        if (block < 0 || (block as i64) >= self.binding.length) {
+            return -1;
+        }
+        return self.binding[block];
+    }
+
+    /** Readies the frame at animation time `seconds`: compiles the looks if they changed, moves the fields' clock. */
+    pub fn prepare(mut self, seconds : f64) : void {
+        self.fields.prepare(seconds);
+        if (!self.looks.isCompiled()) {
+            self.looks.compile(self.fields);
+        }
+    }
+
+    /** The surface `look` makes at face coordinates (`u`, `v`) with footprint `fp`, in the worker's registers `r`. */
+    pub fn shade(self, look : i32, u : f32, v : f32, fp : f32, mut r : f32[]) : LuxSurface {
+        return self.looks.shade(look, self.fields, u, v, fp, r);
+    }
+}
+
+// Marks the node of `root` and every node under it.
+fn luxlMark(tape : LuxFieldTape, root : i32, mut mark : bool[], mut stack : i32[]) : void {
+    if (root < 0) {
+        return;
+    }
+    let mut top : i32 = 0;
+    stack[0] = root;
+    top = 1;
+    while (top > 0) {
+        top = top - 1;
+        let n : i32 = stack[top];
+        if (n < 0 || mark[n]) {
+            continue;
+        }
+        mark[n] = true;
+        for (which of 0..3) {
+            let c : i32 = tape.childOf(n, which);
+            if (c >= 0 && !mark[c]) {
+                stack[top] = c;
+                top = top + 1;
+            }
+        }
+    }
+}
+
+// The surface with its albedo times `c`, its normal tilted, its roughness raised, its glow raised, its bend added: one
+// per op, each returning the surface it was given with one thing changed.
+fn luxlTint(s : LuxSurface, c : Vec3) : LuxSurface {
+    let mut out : LuxSurface = s;
+    out.albedo = s.albedo.times(c);
+    return out;
+}
+
+fn luxlTilt(s : LuxSurface, du : f32, dv : f32) : LuxSurface {
+    let mut out : LuxSurface = s;
+    out.slopeU = s.slopeU + du;
+    out.slopeV = s.slopeV + dv;
+    return out;
+}
+
+fn luxlRoughen(s : LuxSurface, k : f32) : LuxSurface {
+    let mut out : LuxSurface = s;
+    out.rough = s.rough + k;
+    return out;
+}
+
+fn luxlGlow(s : LuxSurface, c : Vec3) : LuxSurface {
+    let mut out : LuxSurface = s;
+    out.emit = s.emit.plus(c);
+    return out;
+}
+
+fn luxlBend(s : LuxSurface, du : f32, dv : f32) : LuxSurface {
+    let mut out : LuxSurface = s;
+    out.bendU = s.bendU + du;
+    out.bendV = s.bendV + dv;
+    return out;
+}
+
+// The ramp stored at `ramp` read at `x`: linear between the stops, held beyond them, times the strength.
+fn luxlRamp(ramps : f32[], ramp : i32, x : f32) : Vec3 {
+    let at : i64 = (ramp as i64) * (LUXL_RAMP as i64);
+    let a0 : f32 = ramps[at];
+    let a1 : f32 = ramps[at + 4];
+    let a2 : f32 = ramps[at + 8];
+    let k : f32 = ramps[at + 12];
+    let mut lo : i64 = at + 1;
+    let mut hi : i64 = at + 1;
+    let mut t : f32 = 0.0;
+    if (x <= a0) {
+        lo = at + 1;
+        hi = at + 1;
+    } else if (x < a1) {
+        lo = at + 1;
+        hi = at + 5;
+        t = (x - a0) / max(a1 - a0, 0.000001 as f32);
+    } else if (x < a2) {
+        lo = at + 5;
+        hi = at + 9;
+        t = (x - a1) / max(a2 - a1, 0.000001 as f32);
+    } else {
+        lo = at + 9;
+        hi = at + 9;
+    }
+    return Vec3 {
+        x: (ramps[lo] + (ramps[hi] - ramps[lo]) * t) * k,
+        y: (ramps[lo + 1] + (ramps[hi + 1] - ramps[lo + 1]) * t) * k,
+        z: (ramps[lo + 2] + (ramps[hi + 2] - ramps[lo + 2]) * t) * k,
+    };
+}

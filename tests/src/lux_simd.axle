@@ -1,0 +1,277 @@
+// lux_simd — checks for the eight-lane helpers: exactness against the scalar references, and the speed they buy.
+//
+// `luxExpNeg8` stands for `exp(-tau)` in every fog and absorption loop, so it is compared with the double-precision
+// exponential of the lighting library over the whole range a transmittance takes. The `measured:` line times the loop
+// the SIMD decision was made on (exposure, a 3x3 matrix, a filmic curve) in scalar and in lanes, so a compiler change
+// that loses the vectors shows up in the test log.
+
+use ludax::{Checks, lightExp, lightExp2D, nowNanos};
+use ludax::{luxClamp8, luxExp2Neg8, luxExpNeg8, luxMax8, luxMin8, luxMix8, luxSplat};
+
+/** Checks the SIMD lane helpers of the light layers. */
+pub class LuxSimdSuite {
+    /** Runs every check of the suite. */
+    pub static fn run(mut c : Checks) : void {
+        lxvExp(c);
+        lxvLanes(c);
+        lxvMeasure(c);
+    }
+}
+
+const LXV_LOG2E : f64 = 1.44269504088896340736;
+const LXV_PIXELS : i32 = 92160;
+const LXV_ROUNDS : i32 = 10;
+
+// Relative error of the lanes' e^x against the f64 reference, x from 0 down to -80 (transmittances down to 1e-35).
+fn lxvExp(mut c : Checks) : void {
+    let mut input : f32[] = new f32[8];
+    let out : f32[] = new f32[8];
+    let mut worst : f64 = 0.0;
+    let mut at : f64 = 0.0;
+    let mut worstNear : f64 = 0.0;
+    for (k of 0..2000) {
+        for (j of 0..8) {
+            input[j] = (-0.04 * (k as f64) - 0.005 * (j as f64)) as f32;
+        }
+        luxExpNeg8(f32x8.load(input, 0)).store(out, 0);
+        for (j of 0..8) {
+            let x : f64 = input[j] as f64;
+            let want : f64 = lightExp2D(x * LXV_LOG2E);
+            let error : f64 = lxvRelative(out[j] as f64, want);
+            if (error > worst) {
+                worst = error;
+                at = x;
+            }
+            if (x >= -20.0 && error > worstNear) {
+                worstNear = error;
+            }
+        }
+    }
+    c.that(
+        "lux simd: e^x in lanes within 2e-6 of f64 from 0 to -20 (worst ${worstNear})",
+        worstNear < 0.000002
+    );
+    c.that("lux simd: ... and within 1e-5 down to -80 (worst ${worst} at ${at})", worst < 0.00001);
+
+    let one : f32 = 1.0;
+    let deep : f32 = -500.0;
+    luxExp2Neg8(luxSplat(one)).store(out, 0);
+    c.that("lux simd: 2^y above zero answers 1, never more", out[0] == 1.0);
+    luxExp2Neg8(luxSplat(deep)).store(out, 0);
+    c.that("lux simd: 2^y far below the f32 range answers 0", out[0] == 0.0);
+}
+
+fn lxvRelative(got : f64, want : f64) : f64 {
+    let diff : f64 = got - want;
+    let size : f64 = want;
+    if (size < 0.000000000000000000000000000000000000001) {
+        return 0.0;
+    }
+    if (diff < 0.0) {
+        return -diff / size;
+    }
+    return diff / size;
+}
+
+fn lxvLanes(mut c : Checks) : void {
+    let out : f32[] = new f32[8];
+    let a : f32x8 = lxvLanesOf(1.0, -2.0, 3.0, 0.5, 9.0, -1.0, 0.0, 4.0);
+    let b : f32x8 = lxvLanesOf(2.0, -3.0, 1.0, 0.5, 8.0, 1.0, -0.0, 5.0);
+
+    luxMin8(a, b).store(out, 0);
+    c.that(
+        "lux simd: min per lane",
+        out[0] == 1.0 && out[1] == -3.0 && out[2] == 1.0 && out[7] == 4.0
+    );
+    luxMax8(a, b).store(out, 0);
+    c.that(
+        "lux simd: max per lane",
+        out[0] == 2.0 && out[1] == -2.0 && out[4] == 9.0 && out[5] == 1.0
+    );
+
+    let half : f32 = 0.5;
+    luxMix8(a, b, luxSplat(half)).store(out, 0);
+    c.that("lux simd: mix halfway", out[0] == 1.5 && out[1] == -2.5 && out[3] == 0.5);
+
+    let lo : f32 = 0.0;
+    let hi : f32 = 2.0;
+    luxClamp8(a, luxSplat(lo), luxSplat(hi)).store(out, 0);
+    c.that(
+        "lux simd: clamp per lane",
+        out[0] == 1.0 && out[1] == 0.0 && out[2] == 2.0 && out[3] == 0.5
+    );
+
+    let zeros : f32x8 = luxSplat(lo);
+    let nan : f32x8 = zeros / zeros;
+    luxClamp8(nan, luxSplat(lo), luxSplat(hi)).store(out, 0);
+    c.that("lux simd: a NaN lane is clamped to the top, never left NaN", out[0] == 2.0);
+}
+
+// Eight lanes from eight f64 literals, narrowed one by one (a lane literal must be f32).
+fn lxvLanesOf(
+    v0 : f64,
+    v1 : f64,
+    v2 : f64,
+    v3 : f64,
+    v4 : f64,
+    v5 : f64,
+    v6 : f64,
+    v7 : f64
+) : f32x8 {
+    let mut held : f32[] = new f32[8];
+    held[0] = v0 as f32;
+    held[1] = v1 as f32;
+    held[2] = v2 as f32;
+    held[3] = v3 as f32;
+    held[4] = v4 as f32;
+    held[5] = v5 as f32;
+    held[6] = v6 as f32;
+    held[7] = v7 as f32;
+    return f32x8.load(held, 0);
+}
+
+// The loop the SIMD decision was made on; asserts that both forms agree, prints both speeds.
+fn lxvMeasure(mut c : Checks) : void {
+    let mut r : f32[] = new f32[LXV_PIXELS];
+    let mut g : f32[] = new f32[LXV_PIXELS];
+    let mut b : f32[] = new f32[LXV_PIXELS];
+    let mut scalar : f32[] = new f32[LXV_PIXELS];
+    let lanes : f32[] = new f32[LXV_PIXELS];
+    for (i of 0..LXV_PIXELS) {
+        r[i] = ((i % 97) as f32) * (0.01 as f32);
+        g[i] = ((i % 89) as f32) * (0.02 as f32);
+        b[i] = ((i % 83) as f32) * (0.015 as f32);
+    }
+
+    let exposure : f32 = 1.3;
+    let mut bestScalar : i64 = 9223372036854775807;
+    let mut bestLanes : i64 = 9223372036854775807;
+    for (round of 0..LXV_ROUNDS) {
+        let t0 : i64 = nowNanos();
+        lxvScalarPass(r, g, b, scalar, exposure);
+        let t1 : i64 = nowNanos();
+        lxvLanePass(r, g, b, lanes, exposure);
+        let t2 : i64 = nowNanos();
+        if (t1 - t0 < bestScalar) {
+            bestScalar = t1 - t0;
+        }
+        if (t2 - t1 < bestLanes) {
+            bestLanes = t2 - t1;
+        }
+    }
+
+    let mut agree : bool = true;
+    for (i of 0..LXV_PIXELS) {
+        let d : f32 = scalar[i] - lanes[i];
+        if (d > (0.000001 as f32) || d < (-0.000001 as f32)) {
+            agree = false;
+        }
+    }
+    c.that("lux simd: the lane loop computes what the scalar loop computes", agree);
+
+    let ns : f64 = LXV_PIXELS as f64;
+    let perScalar : f64 = (bestScalar as f64) / ns;
+    let perLanes : f64 = (bestLanes as f64) / ns;
+    let gain : f64 = (bestScalar as f64) / ((bestLanes + 1) as f64);
+    println("measured: exposure + 3x3 + filmic over ${LXV_PIXELS} px: scalar ${perScalar} ns/px, f32x8 ${perLanes} ns/px, x${gain}");
+    lxvMeasureFog(c, r, g);
+}
+
+// Beer-Lambert fog over a picture: light times e^(-density * depth). The scalar form calls `lightExp`, which the
+// vectoriser cannot enter; the lane form calls `luxExpNeg8`.
+fn lxvMeasureFog(mut c : Checks, light : f32[], depth : f32[]) : void {
+    let mut scalar : f32[] = new f32[LXV_PIXELS];
+    let lanes : f32[] = new f32[LXV_PIXELS];
+    let density : f32 = 0.7;
+    let mut bestScalar : i64 = 9223372036854775807;
+    let mut bestLanes : i64 = 9223372036854775807;
+    for (round of 0..3) {
+        let t0 : i64 = nowNanos();
+        for (i of 0..LXV_PIXELS) {
+            scalar[i] = light[i] * lightExp(-density * depth[i]);
+        }
+        let t1 : i64 = nowNanos();
+        lxvFogLanes(light, depth, lanes, density);
+        let t2 : i64 = nowNanos();
+        if (t1 - t0 < bestScalar) {
+            bestScalar = t1 - t0;
+        }
+        if (t2 - t1 < bestLanes) {
+            bestLanes = t2 - t1;
+        }
+    }
+
+    let mut worst : f64 = 0.0;
+    for (i of 0..LXV_PIXELS) {
+        let error : f64 = lxvRelative(lanes[i] as f64, scalar[i] as f64);
+        if (error > worst) {
+            worst = error;
+        }
+    }
+    c.that(
+        "lux simd: fog in lanes matches the scalar fog within 1e-5 (worst ${worst})",
+        worst < 0.00001
+    );
+
+    let ns : f64 = LXV_PIXELS as f64;
+    let perScalar : f64 = (bestScalar as f64) / ns;
+    let perLanes : f64 = (bestLanes as f64) / ns;
+    let gain : f64 = (bestScalar as f64) / ((bestLanes + 1) as f64);
+    println("measured: Beer-Lambert fog over ${LXV_PIXELS} px: lightExp ${perScalar} ns/px, luxExpNeg8 ${perLanes} ns/px, x${gain}");
+}
+
+fn lxvFogLanes(light : f32[], depth : f32[], out : f32[], density : f32) : void {
+    let k : f32x8 = luxSplat(-density);
+    let mut i : i32 = 0;
+    while (i < LXV_PIXELS) {
+        let tau : f32x8 = f32x8.load(depth, i) * k;
+        (f32x8.load(light, i) * luxExpNeg8(tau)).store(out, i);
+        i += 8;
+    }
+}
+
+fn lxvScalarPass(r : f32[], g : f32[], b : f32[], mut out : f32[], e : f32) : void {
+    let one : f32 = 1.0;
+    let m00 : f32 = 1.1;
+    let m01 : f32 = 0.05;
+    let m02 : f32 = -0.02;
+    let m20 : f32 = -0.03;
+    let m21 : f32 = 0.02;
+    let m22 : f32 = 0.85;
+    for (i of 0..LXV_PIXELS) {
+        let x : f32 = r[i] * e;
+        let y : f32 = g[i] * e;
+        let z : f32 = b[i] * e;
+        let wr : f32 = m00 * x + m01 * y + m02 * z;
+        let wb : f32 = m20 * x + m21 * y + m22 * z;
+        out[i] = wr / (one + wr) + wb / (one + wb);
+    }
+}
+
+fn lxvLanePass(r : f32[], g : f32[], b : f32[], out : f32[], e : f32) : void {
+    let one : f32 = 1.0;
+    let m00 : f32 = 1.1;
+    let m01 : f32 = 0.05;
+    let m02 : f32 = -0.02;
+    let m20 : f32 = -0.03;
+    let m21 : f32 = 0.02;
+    let m22 : f32 = 0.85;
+    let ev : f32x8 = luxSplat(e);
+    let onev : f32x8 = luxSplat(one);
+    let a00 : f32x8 = luxSplat(m00);
+    let a01 : f32x8 = luxSplat(m01);
+    let a02 : f32x8 = luxSplat(m02);
+    let a20 : f32x8 = luxSplat(m20);
+    let a21 : f32x8 = luxSplat(m21);
+    let a22 : f32x8 = luxSplat(m22);
+    let mut i : i32 = 0;
+    while (i < LXV_PIXELS) {
+        let x : f32x8 = f32x8.load(r, i) * ev;
+        let y : f32x8 = f32x8.load(g, i) * ev;
+        let z : f32x8 = f32x8.load(b, i) * ev;
+        let wr : f32x8 = a00 * x + a01 * y + a02 * z;
+        let wb : f32x8 = a20 * x + a21 * y + a22 * z;
+        (wr / (onev + wr) + wb / (onev + wb)).store(out, i);
+        i += 8;
+    }
+}

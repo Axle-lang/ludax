@@ -1,0 +1,170 @@
+// lux_graph — checks for the graph of light layers: order, liveness, feeds, fused groups, and errors.
+//
+// The frame used here is the shape of a real one: sky tables, then a screen chain (shade, fog) that fuses, a bloom
+// that reads around its pixel and so starts a new group, a grade that joins the bloom's group, a temporal history
+// cache read and written by one layer, and a probe layer whose cache nobody reads, which must not run.
+
+use ludax::{Checks, GraphIssueKind, GraphIssues, LuxDomain, LuxGraph, LuxLayerDesc, luxLayer};
+use ludax::{LUX_IN_FRAME, LUX_IN_SUN};
+
+/** Checks the graph of light layers. */
+pub class LuxGraphSuite {
+    /** Runs every check of the suite. */
+    pub static fn run(mut c : Checks) : void {
+        lxgOrderAndLiveness(c);
+        lxgFeeds(c);
+        lxgGroups(c);
+        lxgErrors(c);
+        lxgDeterministic(c);
+    }
+}
+
+// The ids are the order of `addLayer`: sky 0, shade 1, fog 2, bloom 3, grade 4, temporal 5, probe 6.
+fn lxgFrame() : LuxGraph {
+    let g : LuxGraph = new LuxGraph();
+    g.addCache("sky.lut", 4096);
+    g.addTransient("lit", 1000);
+    g.addTransient("fogged", 1000);
+    g.addTransient("glow", 1000);
+    g.addTransient("picture", 1000);
+    g.addCache("history", 1000);
+    g.addCache("probe.cache", 1000);
+    g.markOutput("picture");
+
+    let sky : i32 = g.addLayer("sky", luxLayer(LuxDomain::SkyDirections, 1, LUX_IN_SUN, 1));
+    g.writes(sky, "sky.lut");
+    let shade : i32 = g.addLayer("shade", luxLayer(LuxDomain::Screen, 1, LUX_IN_FRAME, 1));
+    g.reads(shade, "sky.lut");
+    g.readsPrevious(shade, "history");
+    g.writes(shade, "lit");
+    let fog : i32 = g.addLayer("fog", luxLayer(LuxDomain::Screen, 1, LUX_IN_FRAME, 1));
+    g.reads(fog, "lit");
+    g.writes(fog, "fogged");
+    let bloom : i32 = g.addLayer("bloom", luxLayer(LuxDomain::Screen, 1, LUX_IN_FRAME, 1));
+    g.readsAround(bloom, "fogged", 8);
+    g.writes(bloom, "glow");
+    let grade : i32 = g.addLayer("grade", luxLayer(LuxDomain::Screen, 1, LUX_IN_FRAME, 1));
+    g.reads(grade, "glow");
+    g.reads(grade, "fogged");
+    g.writes(grade, "picture");
+    let temporal : i32 = g.addLayer("temporal", luxLayer(LuxDomain::Screen, 1, LUX_IN_FRAME, 1));
+    g.reads(temporal, "fogged");
+    g.reads(temporal, "history");
+    g.writes(temporal, "history");
+    let probe : i32 = g.addLayer("probe", luxLayer(LuxDomain::World, 1, LUX_IN_SUN, 8));
+    g.writes(probe, "probe.cache");
+    return g;
+}
+
+fn lxgOrderAndLiveness(mut c : Checks) : void {
+    let g : LuxGraph = lxgFrame();
+    c.that("lux graph: a sound frame compiles", g.compile());
+    c.sameInt("lux graph: seven layers were added", g.layerTotal() as i64, 7);
+    c.sameInt("lux graph: six layers run, the probe nobody reads does not", g.runCount() as i64, 6);
+    c.that("lux graph: the probe is not live", !g.isLive(6));
+    c.that("lux graph: the history writer is live: shade reads its cache", g.isLive(5));
+
+    let mut before : bool = true;
+    let mut seenSky : bool = false;
+    for (i of 0..g.runCount()) {
+        let l : i32 = g.layerAt(i);
+        if (l == 0) {
+            seenSky = true;
+        }
+        if (l == 1 && !seenSky) {
+            before = false;
+        }
+    }
+    c.that("lux graph: the sky runs before the shading that reads it", before);
+    c.that("lux graph: names are kept", g.name(3) == "bloom" && g.name(0) == "sky");
+}
+
+fn lxgFeeds(mut c : Checks) : void {
+    let g : LuxGraph = lxgFrame();
+    g.compile();
+    c.sameInt(
+        "lux graph: shade is fed by the sky and by the history writer",
+        g.feedCount(1) as i64,
+        2
+    );
+    c.that("lux graph: ... in id order", g.feedAt(1, 0) == 0 && g.feedAt(1, 1) == 5);
+    c.sameInt(
+        "lux graph: the history layer is fed by fog only, not by itself",
+        g.feedCount(5) as i64,
+        1
+    );
+    c.sameInt("lux graph: ... fog", g.feedAt(5, 0) as i64, 2);
+    c.sameInt("lux graph: the sky has no feed", g.feedCount(0) as i64, 0);
+}
+
+fn lxgGroups(mut c : Checks) : void {
+    let g : LuxGraph = lxgFrame();
+    g.compile();
+    c.sameInt("lux graph: the sky is in no screen group", g.groupOf(0) as i64, -1);
+    c.that("lux graph: shade and fog fuse", g.groupOf(1) >= 0 && g.groupOf(1) == g.groupOf(2));
+    c.that(
+        "lux graph: the bloom reads fog around its pixel, so it starts a group",
+        g.groupOf(3) != g.groupOf(2)
+    );
+    c.that(
+        "lux graph: the grade reads at its pixel and joins the bloom",
+        g.groupOf(4) == g.groupOf(3)
+    );
+    c.that("lux graph: the probe, not live, is in no group", g.groupOf(6) == -1);
+    c.sameInt("lux graph: two groups", g.groupCount() as i64, 2);
+
+    let h : LuxGraph = new LuxGraph();
+    h.addTransient("a", 10);
+    h.addTransient("b", 10);
+    h.markOutput("b");
+    let full : i32 = h.addLayer("full", luxLayer(LuxDomain::Screen, 1, LUX_IN_FRAME, 1));
+    h.writes(full, "a");
+    let half : i32 = h.addLayer("half", luxLayer(LuxDomain::Screen, 2, LUX_IN_FRAME, 1));
+    h.reads(half, "a");
+    h.writes(half, "b");
+    h.compile();
+    c.that("lux graph: layers of different scales do not fuse", h.groupOf(full) != h.groupOf(half));
+}
+
+fn lxgErrors(mut c : Checks) : void {
+    let g : LuxGraph = new LuxGraph();
+    g.addTransient("never.written", 10);
+    g.addTransient("out", 10);
+    g.markOutput("out");
+    let a : i32 = g.addLayer("a", luxLayer(LuxDomain::Screen, 1, LUX_IN_FRAME, 1));
+    let again : i32 = g.addLayer("a", luxLayer(LuxDomain::Screen, 1, LUX_IN_FRAME, 1));
+    c.sameInt("lux graph: a second layer of the same name is refused", again as i64, -1);
+    g.reads(a, "never.written");
+    g.writes(a, "out");
+    c.that("lux graph: reading a transient nobody writes does not compile", !g.compile());
+    let issues : GraphIssues = g.issues();
+    c.that("lux graph: ... and says so", issues.countOf(GraphIssueKind::UnwrittenRead) == 1);
+    c.sameInt("lux graph: ... nothing runs", g.runCount() as i64, 0);
+
+    let h : LuxGraph = new LuxGraph();
+    h.addTransient("frame.only", 10);
+    h.markOutput("frame.only");
+    let t : i32 = h.addLayer("t", luxLayer(LuxDomain::Screen, 1, LUX_IN_FRAME, 1));
+    h.readsPrevious(t, "frame.only");
+    h.writes(t, "frame.only");
+    c.that("lux graph: only a cache can be read from the previous frame", !h.compile());
+    let wrong : GraphIssues = h.issues();
+    c.that("lux graph: ... and says so", wrong.countOf(GraphIssueKind::WrongKind) == 1);
+}
+
+fn lxgDeterministic(mut c : Checks) : void {
+    let a : LuxGraph = lxgFrame();
+    let b : LuxGraph = lxgFrame();
+    a.compile();
+    b.compile();
+    let mut same : bool = a.runCount() == b.runCount();
+    for (i of 0..a.runCount()) {
+        if (a.layerAt(i) != b.layerAt(i) || a.groupOf(a.layerAt(i)) != b.groupOf(b.layerAt(i))) {
+            same = false;
+        }
+    }
+    c.that("lux graph: the same declarations give the same order and groups", same);
+
+    let desc : LuxLayerDesc = a.desc(6);
+    c.that("lux graph: a layer keeps its description", desc.slices == 8);
+}

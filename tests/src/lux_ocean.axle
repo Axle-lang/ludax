@@ -1,0 +1,331 @@
+// lux_ocean — checks for the water surface: the Fourier transform against the plain sum, the spectrum's response to
+// the wind, the slope variance against Cox and Munk, the absence of a period, the footprint fade, and determinism.
+
+use ludax::{
+    Checks, LuxFft, LuxFootprint, LuxOcean, LuxTapPlan, LuxWaterSample, LuxWind, abs, cosD,
+    luxTapPlan, max, nowNanos, sinD
+};
+use ludax::{
+    LUX_WATER_INDEX, LuxRefraction, LuxMedium, Vec3, luxFresnel, luxRefract, luxMediumGlow,
+    luxMediumTransmit
+};
+
+/** Checks the Fourier transform and the wind-driven water surface. */
+pub class LuxOceanSuite {
+    /** Runs every check of the suite. */
+    pub static fn run(mut c : Checks) : void {
+        lxoFft(c);
+        lxoSurface(c);
+        lxoMeasure(c);
+        lxoOptics(c);
+        lxoTapPlan(c);
+        lxoVarianceKept(c);
+    }
+}
+
+const LXO_N : i32 = 16;
+
+fn lxoWind(speed : f32, angle : f32) : LuxWind {
+    return LuxWind {
+        speed: speed,
+        angle: angle,
+        spread: 2.0,
+        against: 0.07,
+        shelter: 1.0,
+        fetch: 300.0,
+    };
+}
+
+// The transform of a 16 x 16 grid against the plain double sum, and the inverse of the forward.
+fn lxoFft(mut c : Checks) : void {
+    let n : i64 = LXO_N as i64;
+    let mut re : f32[] = new f32[n * n];
+    let mut im : f32[] = new f32[n * n];
+    let mut keepR : f32[] = new f32[n * n];
+    let mut keepI : f32[] = new f32[n * n];
+    for (i of 0..(n * n)) {
+        re[i] = ((i * 37 % 23) as f32) * (0.1 as f32) - (1.0 as f32);
+        im[i] = ((i * 11 % 17) as f32) * (0.05 as f32);
+        keepR[i] = re[i];
+        keepI[i] = im[i];
+    }
+
+    let fft : LuxFft = new LuxFft(LXO_N);
+    fft.grid(re, im, false);
+    let mut worst : f64 = 0.0;
+    for (ky of 0..n) {
+        for (kx of 0..n) {
+            let mut sr : f64 = 0.0;
+            let mut si : f64 = 0.0;
+            for (y of 0..n) {
+                for (x of 0..n) {
+                    let angle : f64 = -6.283185307179586 * (((kx * x + ky * y) % n) as f64)
+                        / (n as f64);
+                    let a : f64 = keepR[y * n + x] as f64;
+                    let b : f64 = keepI[y * n + x] as f64;
+                    sr = sr + a * cosD(angle) - b * sinD(angle);
+                    si = si + a * sinD(angle) + b * cosD(angle);
+                }
+            }
+            let dr : f64 = sr - (re[ky * n + kx] as f64);
+            let di : f64 = si - (im[ky * n + kx] as f64);
+            let e : f64 = dr * dr + di * di;
+            if (e > worst) {
+                worst = e;
+            }
+        }
+    }
+    c.that(
+        "lux ocean: the 2D transform equals the plain sum (worst squared error ${worst})",
+        worst < 0.000001
+    );
+
+    fft.grid(re, im, true);
+    let mut back : f64 = 0.0;
+    let scale : f32 = (1.0 as f32) / ((n * n) as f32);
+    for (i of 0..(n * n)) {
+        let d : f64 = ((re[i] * scale - keepR[i]) as f64);
+        let e : f64 = ((im[i] * scale - keepI[i]) as f64);
+        if (d * d + e * e > back) {
+            back = d * d + e * e;
+        }
+    }
+    c.that("lux ocean: inverse of forward is the grid times n^2 (worst ${back})", back < 0.0000001);
+}
+
+fn lxoSurface(mut c : Checks) : void {
+    let ocean : LuxOcean = new LuxOcean(lxoWind(6.0, 0.0), 7);
+    ocean.update(3.0);
+
+    // The realised slope variance over a wide patch, against the variance the spectrum was scaled to.
+    let mut sumXX : f64 = 0.0;
+    let mut sumZZ : f64 = 0.0;
+    let mut count : f64 = 0.0;
+    for (j of 0..200) {
+        for (i of 0..200) {
+            let s : LuxWaterSample = ocean.sample(
+                (i as f32) * (0.97 as f32),
+                (j as f32) * (0.97 as f32),
+                0.0
+            );
+            sumXX = sumXX + (s.slopeX * s.slopeX) as f64;
+            sumZZ = sumZZ + (s.slopeZ * s.slopeZ) as f64;
+            count = count + 1.0;
+        }
+    }
+    let realised : f64 = (sumXX + sumZZ) / count;
+    let want : f64 = ocean.meanSquareSlope() as f64;
+    let cox : f64 = 0.003 + 0.00512 * 6.0;
+    c.near("lux ocean: the spectrum is scaled to Cox and Munk's slope variance", want, cox, 0.0001);
+    c.that(
+        "lux ocean: the surface's slope variance is near it (${realised} for ${want})",
+        realised > want * 0.4 && realised < want * 2.5
+    );
+    c.that(
+        "lux ocean: the waves follow the wind: steeper along it (x) than across (${sumXX} > ${sumZZ})",
+        sumXX > sumZZ * 1.3
+    );
+
+    let a : LuxWaterSample = ocean.sample(13.0, 21.0, 0.0);
+    let b : LuxWaterSample = ocean.sample(13.0 + 97.3, 21.0, 0.0);
+    let d : f32 = (a.slopeX - b.slopeX) * (a.slopeX - b.slopeX)
+        + (a.slopeZ - b.slopeZ) * (a.slopeZ - b.slopeZ);
+    c.that(
+        "lux ocean: the surface does not repeat at the coarse grid's size (difference ${d})",
+        d > (0.000001 as f32)
+    );
+
+    let sharp : LuxWaterSample = ocean.sample(5.0, 5.0, 0.01);
+    let blurred : LuxWaterSample = ocean.sample(5.0, 5.0, 10.0);
+    c.that("lux ocean: a tiny footprint loses nothing", sharp.lost < (0.0000001 as f32));
+    c.that(
+        "lux ocean: a footprint wider than every grid keeps no slope and loses all the variance",
+        blurred.slopeX == 0.0 && blurred.slopeZ == 0.0 && blurred.lost > (0.001 as f32)
+    );
+
+    let again : LuxOcean = new LuxOcean(lxoWind(6.0, 0.0), 7);
+    again.update(3.0);
+    let s1 : LuxWaterSample = ocean.sample(40.5, 7.25, 0.05);
+    let s2 : LuxWaterSample = again.sample(40.5, 7.25, 0.05);
+    c.that(
+        "lux ocean: the same wind and seed give the same water",
+        s1.slopeX == s2.slopeX && s1.slopeZ == s2.slopeZ
+    );
+
+    again.update(3.5);
+    let s3 : LuxWaterSample = again.sample(40.5, 7.25, 0.05);
+    c.that("lux ocean: the water moves with time", s3.slopeX != s1.slopeX);
+}
+
+// What the water costs: one update (three cascades moved and transformed) and one sample, best of several rounds.
+// The filter must change continuously with the view's angle. The ratio of the footprint's axes is 1 over the sine of the
+// elevation: swept from 1 to 5 at a fixed short axis, neither the spread of the taps nor the slope they give may jump,
+// where a count of taps that went from one to two moved the sampling points at once.
+fn lxoTapPlan(mut c : Checks) : void {
+    let ocean : LuxOcean = new LuxOcean(lxoWind(6.0, 0.0), 7);
+    ocean.update(3.0);
+    let across : f32 = 0.05;
+    let rise : f32 = 0.01;
+    let one : f32 = 1.0;
+    let spanLimit : f32 = 0.001;
+    let slopeLimit : f32 = 0.004;
+    let mut prev : LuxWaterSample = LuxWaterSample { slopeX: 0.0, slopeZ: 0.0, lost: 0.0 };
+    let mut prevSpan : f32 = 0.0;
+    let mut maxSpan : f32 = 0.0;
+    let mut maxSlope : f32 = 0.0;
+    let mut firstSpan : f32 = 0.0;
+    for (i of 0..400) {
+        let along : f32 = across * (one + (i as f32) * rise);
+        let fp : LuxFootprint = LuxFootprint { across: across, along: along, dirX: 1.0, dirZ: 0.0 };
+        let plan : LuxTapPlan = luxTapPlan(fp);
+        let s : LuxWaterSample = ocean.sampleFootprint(10.0, 20.0, fp);
+        if (i == 0) {
+            firstSpan = plan.span;
+        } else {
+            maxSpan = max(maxSpan, abs(plan.span - prevSpan));
+            maxSlope = max(maxSlope, max(abs(s.slopeX - prev.slopeX), abs(s.slopeZ - prev.slopeZ)));
+        }
+        prevSpan = plan.span;
+        prev = s;
+    }
+    println("measured: filter sweep, ratio 1 to 5 in steps of 0.01: span step ${maxSpan} m, slope step ${maxSlope}");
+    c.near(
+        "lux ocean: a footprint as wide as long spreads its taps over nothing",
+        firstSpan,
+        0.0,
+        0.000001
+    );
+    c.that(
+        "... the spread changes continuously with the ratio (largest step ${maxSpan} m)",
+        maxSpan < spanLimit
+    );
+    c.that("... and so does the slope it gives (largest step ${maxSlope})", maxSlope < slopeLimit);
+}
+
+// Averaging the taps flattens the slope; the variance it removes must reappear as `lost`, so that the total of a pixel (its
+// resolved slope squared plus its lost variance) is the mean of its four taps' own totals.
+fn lxoVarianceKept(mut c : Checks) : void {
+    let ocean : LuxOcean = new LuxOcean(lxoWind(6.0, 0.0), 7);
+    ocean.update(3.0);
+    let across : f32 = 0.3;
+    let three : f32 = 3.0;
+    let taps : i32 = 4;
+    let half : f32 = 0.5;
+    let fp : LuxFootprint = LuxFootprint {
+        across: across,
+        along: across * three,
+        dirX: 1.0,
+        dirZ: 0.0,
+    };
+    let plan : LuxTapPlan = luxTapPlan(fp);
+    let s : LuxWaterSample = ocean.sampleFootprint(10.0, 20.0, fp);
+    let mut mean : f32 = 0.0;
+    for (k of 0..taps) {
+        let offset : f32 = (((k as f32) + half) / (taps as f32) - half) * plan.span;
+        let tap : LuxWaterSample = ocean.sample(10.0 + offset, 20.0, plan.fade);
+        mean = mean
+            + (tap.slopeX * tap.slopeX + tap.slopeZ * tap.slopeZ + tap.lost) / (taps as f32);
+    }
+    let total : f32 = s.slopeX * s.slopeX + s.slopeZ * s.slopeZ + s.lost;
+    c.that(
+        "lux ocean: the taps keep the slope variance of their own (${total} for ${mean})",
+        abs(total - mean) < 0.000001
+    );
+}
+
+fn lxoMeasure(mut c : Checks) : void {
+    let ocean : LuxOcean = new LuxOcean(lxoWind(6.0, 0.0), 7);
+    let mut bestUpdate : i64 = 9223372036854775807;
+    for (k of 0..20) {
+        let t0 : i64 = nowNanos();
+        ocean.update(1.0 + (k as f32) * (0.016 as f32));
+        let spent : i64 = nowNanos() - t0;
+        if (spent < bestUpdate) {
+            bestUpdate = spent;
+        }
+    }
+    let mut sink : f32 = 0.0;
+    let t1 : i64 = nowNanos();
+    for (i of 0..100000) {
+        let s : LuxWaterSample = ocean.sample(
+            (i % 977) as f32 * (0.37 as f32),
+            (i / 977) as f32 * (0.41 as f32),
+            0.05
+        );
+        sink = sink + s.slopeX;
+    }
+    let perSample : f64 = ((nowNanos() - t1) as f64) / 100000.0;
+    let updateMs : f64 = (bestUpdate as f64) / 1000000.0;
+    c.that("lux ocean: the measured loops ran to a finite sum (sink ${sink})", sink.isFinite());
+    println("measured: ocean update ${updateMs} ms (3 cascades of 64 x 64), sample ${perSample} ns");
+}
+
+// Fresnel, Snell's window and total reflection, Beer-Lambert and single scattering.
+fn lxoOptics(mut c : Checks) : void {
+    c.near(
+        "lux water: Fresnel at normal incidence is F0 = 0.0204",
+        luxFresnel(1.0) as f64,
+        0.0204,
+        0.0001
+    );
+    c.near("lux water: Fresnel at grazing incidence is 1", luxFresnel(0.0) as f64, 1.0, 0.0001);
+
+    let up : Vec3 = Vec3::make(0.0, 1.0, 0.0);
+    let down : Vec3 = Vec3::make(0.0, -1.0, 0.0);
+    let straight : LuxRefraction = luxRefract(down, up, 1.0, LUX_WATER_INDEX);
+    c.that(
+        "lux water: light falling straight in goes straight on",
+        !straight.total && straight.dir.y < (-0.9999 as f32)
+    );
+
+    // From below at 45 degrees (inside the 48.6 degree window) the light leaves, bent away from the normal.
+    let s45 : f32 = 0.70710678;
+    let inside : LuxRefraction = luxRefract(Vec3::make(s45, s45, 0.0), down, LUX_WATER_INDEX, 1.0);
+    c.that("lux water: from below at 45 degrees the light leaves the water", !inside.total);
+    let sinOut : f64 = inside.dir.x as f64;
+    c.near(
+        "lux water: ... bent by Snell's law (sin out = 1.333 sin in)",
+        sinOut,
+        1.333 * 0.70710678,
+        0.0005
+    );
+    c.that(
+        "lux water: ... and some of it reflects (${inside.fresnel})",
+        inside.fresnel > (0.0204 as f32) && inside.fresnel < (1.0 as f32)
+    );
+
+    // At 50 degrees (outside the window) it cannot leave: the surface is a mirror.
+    let outside : LuxRefraction = luxRefract(
+        Vec3::make(0.76604444, 0.64278761, 0.0),
+        down,
+        LUX_WATER_INDEX,
+        1.0
+    );
+    c.that(
+        "lux water: from below at 50 degrees the light is totally reflected",
+        outside.total && outside.fresnel == 1.0
+    );
+    c.that("lux water: ... back down into the water", outside.dir.y < 0.0);
+
+    let m : LuxMedium = LuxMedium {};
+    let t0 : Vec3 = luxMediumTransmit(m, 0.0);
+    let t5 : Vec3 = luxMediumTransmit(m, 5.0);
+    c.that("lux water: nothing is lost over no water", t0.x == 1.0 && t0.y == 1.0 && t0.z == 1.0);
+    c.near(
+        "lux water: Beer-Lambert over 5 m of red: exp(-0.45 x 5)",
+        t5.x as f64,
+        0.105399,
+        0.00002
+    );
+    c.that("lux water: red dies first, blue last", t5.x < t5.y && t5.y < t5.z);
+    let white : Vec3 = Vec3::splat(1.0);
+    let deep : Vec3 = luxMediumGlow(m, 10000.0, white);
+    c.near(
+        "lux water: infinitely deep water glows with the single-scattering albedo (blue)",
+        deep.z as f64,
+        0.07 / 0.12,
+        0.0001
+    );
+    let shallow : Vec3 = luxMediumGlow(m, 0.0, white);
+    c.that("lux water: no water adds no glow", shallow.x == 0.0 && shallow.z == 0.0);
+}

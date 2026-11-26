@@ -1,0 +1,386 @@
+// lux_schedule — checks for what keeps cached light whole: keys, the frame's view, two-copy caches, the scheduler,
+// the budget's governor, and tiles.
+//
+// The scheduler is driven frame by frame through a scripted day: a sky that follows the sun, a shadow cache refreshed
+// over four frames, a shading layer that runs every frame, and a cloud layer forced every third frame. The property
+// that matters most is checked directly: while a slow refresh is under way, readers see the previous generation in
+// full, and the new one appears whole, between two frames, never in part.
+
+use ludax::{
+    Checks, DVec3, LUX_CAMERA_CELL, LUX_FRAME_60, LUX_IN_FRAME, LUX_IN_SUN, LUX_IN_WORLD,
+    LUX_TILE_H, LUX_TILE_W
+};
+use ludax::{
+    LuxBudget, LuxCache, LuxDomain, LuxGraph, LuxKey, LuxLayerDesc, LuxScheduler, LuxTile, LuxTiles,
+    LuxView, luxLayer
+};
+
+/** Checks keys, views, caches, the scheduler, the budget and tiles. */
+pub class LuxScheduleSuite {
+    /** Runs every check of the suite. */
+    pub static fn run(mut c : Checks) : void {
+        lxsKeys(c);
+        lxsView(c);
+        lxsCache(c);
+        lxsSlicedRefresh(c);
+        lxsRefreshFinishes(c);
+        lxsPeriod(c);
+        lxsSameRuns(c);
+        lxsBudget(c);
+        lxsTiles(c);
+    }
+}
+
+fn lxsKey(world : i64, sun : i64, frame : i64) : LuxKey {
+    return LuxKey { world: world, sun: sun, camera: 0, timecycle: 0, settings: 0, frame: frame };
+}
+
+fn lxsKeys(mut c : Checks) : void {
+    let a : LuxKey = lxsKey(1, 720, 5);
+    let b : LuxKey = lxsKey(1, 721, 6);
+    c.that("lux key: a sun step is seen by a layer that reads the sun", a.differsIn(b, LUX_IN_SUN));
+    c.that("lux key: ... and not by one that reads only the world", !a.differsIn(b, LUX_IN_WORLD));
+    c.that("lux key: equal keys never differ", !a.differsIn(a, 63));
+    c.sameInt(
+        "lux key: the changes are the sun and the frame",
+        a.changes(b) as i64,
+        (LUX_IN_SUN | LUX_IN_FRAME) as i64
+    );
+}
+
+fn lxsViewAt(dayTime : f64, frame : i64) : LuxView {
+    let mut v : LuxView = LuxView {};
+    v.dayTime = dayTime;
+    v.frame = frame;
+    return v;
+}
+
+fn lxsView(mut c : Checks) : void {
+    let noon : LuxView = lxsViewAt(0.5, 0);
+    c.sameInt("lux view: noon is step 720 of 1440", noon.sunStep(), 720);
+    c.near("lux view: ... exactly on the step", noon.sunBlend() as f64, 0.0, 0.000001);
+
+    let half : f64 = 0.5 + 0.5 / 1440.0;
+    let later : LuxView = lxsViewAt(half, 0);
+    c.sameInt("lux view: half a step later is the same step", later.sunStep(), 720);
+    c.near("lux view: ... half blended", later.sunBlend() as f64, 0.5, 0.0001);
+
+    let before : LuxView = lxsViewAt(-0.0001, 0);
+    c.sameInt("lux view: a moment before day 0 is step -1", before.sunStep(), -1);
+
+    let mut here : LuxView = LuxView {};
+    here.eye = DVec3::make(1.0, 2.0, 3.0);
+    let mut near : LuxView = LuxView {};
+    near.eye = DVec3::make(LUX_CAMERA_CELL - 0.5, 2.0, 3.0);
+    let mut across : LuxView = LuxView {};
+    across.eye = DVec3::make(LUX_CAMERA_CELL + 0.5, 2.0, 3.0);
+    let mut behind : LuxView = LuxView {};
+    behind.eye = DVec3::make(-0.5, 2.0, 3.0);
+    c.that("lux view: moving inside a cell keeps the cell", here.cameraCell() == near.cameraCell());
+    c.that("lux view: crossing a cell changes it", here.cameraCell() != across.cameraCell());
+    c.that("lux view: just below zero is another cell", here.cameraCell() != behind.cameraCell());
+    c.that("lux view: the key carries the step and the cell", later.key().sun == 720);
+}
+
+fn lxsCache(mut c : Checks) : void {
+    let cache : LuxCache = new LuxCache(2, 4);
+    let mut back : f32[] = cache.write();
+    back[cache.planeAt(1) + 2] = 7.0;
+    let front : f32[] = cache.read();
+    c.that(
+        "lux cache: what the refresh writes is not seen before publication",
+        front[cache.planeAt(1) + 2] == 0.0
+    );
+    c.sameInt("lux cache: no generation yet", cache.versionOf(), 0);
+
+    cache.publish(lxsKey(3, 9, 1));
+    let seen : f32[] = cache.read();
+    c.that("lux cache: after publication readers see it", seen[cache.planeAt(1) + 2] == 7.0);
+    c.sameInt("lux cache: one generation", cache.versionOf(), 1);
+    c.that(
+        "lux cache: the generation keeps its key",
+        cache.key().world == 3 && cache.key().sun == 9
+    );
+
+    cache.carry();
+    let carried : f32[] = cache.write();
+    c.that(
+        "lux cache: carrying starts the next refresh from what readers see",
+        carried[cache.planeAt(1) + 2] == 7.0
+    );
+}
+
+// Layers: sky 0 (sun, one slice), shadow 1 (sun and world, four slices), shade 2 (every frame), clouds 3 (every third
+// frame, no input).
+fn lxsDayGraph() : LuxGraph {
+    let g : LuxGraph = new LuxGraph();
+    g.addCache("sky", 100);
+    g.addCache("shadow", 100);
+    g.addCache("clouds", 100);
+    g.addTransient("picture", 100);
+    g.markOutput("picture");
+
+    let sky : i32 = g.addLayer("sky", luxLayer(LuxDomain::SkyDirections, 1, LUX_IN_SUN, 1));
+    g.writes(sky, "sky");
+    let shadow : i32 = g.addLayer(
+        "shadow",
+        luxLayer(LuxDomain::SunSpace, 1, LUX_IN_SUN | LUX_IN_WORLD, 4)
+    );
+    g.writes(shadow, "shadow");
+    let shade : i32 = g.addLayer("shade", luxLayer(LuxDomain::Screen, 1, LUX_IN_FRAME, 1));
+    g.reads(shade, "sky");
+    g.readsPrevious(shade, "shadow");
+    g.reads(shade, "clouds");
+    g.writes(shade, "picture");
+    let clouds : LuxLayerDesc = LuxLayerDesc {
+        domain: LuxDomain::SkyDirections,
+        scale: 1,
+        inputs: 0,
+        every: 3,
+        slices: 1,
+        budget: 0,
+    };
+    let cl : i32 = g.addLayer("clouds", clouds);
+    g.writes(cl, "clouds");
+    g.compile();
+    return g;
+}
+
+fn lxsRuns(s : LuxScheduler, layer : i32) : bool {
+    for (i of 0..s.runCount()) {
+        if (s.runAt(i) == layer) {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn lxsSliceOf(s : LuxScheduler, layer : i32) : i32 {
+    for (i of 0..s.runCount()) {
+        if (s.runAt(i) == layer) {
+            return s.sliceAt(i);
+        }
+    }
+    return -1;
+}
+
+fn lxsSlicedRefresh(mut c : Checks) : void {
+    let s : LuxScheduler = new LuxScheduler(lxsDayGraph());
+    let shadowCache : LuxCache = new LuxCache(1, 4);
+    let mut wholeUntilDone : bool = true;
+    let mut slicesInOrder : bool = true;
+
+    for (f of 0..4) {
+        s.plan(lxsViewAt(0.5, f as i64));
+        if (lxsSliceOf(s, 1) != f) {
+            slicesInOrder = false;
+        }
+        let mut back : f32[] = shadowCache.write();
+        back[f as i64] = 1.0;
+        let front : f32[] = shadowCache.read();
+        for (k of 0..4) {
+            if (front[k] != 0.0) {
+                wholeUntilDone = false;
+            }
+        }
+        s.endFrame();
+        s.swapIfDue(1, shadowCache);
+    }
+    c.that(
+        "lux scheduler: a four-slice refresh does slices 0, 1, 2, 3 on frames 0 to 3",
+        slicesInOrder
+    );
+    c.that(
+        "lux scheduler: readers see the old generation whole until the last slice",
+        wholeUntilDone
+    );
+    let done : f32[] = shadowCache.read();
+    c.that(
+        "lux scheduler: after the last slice the new generation appears whole",
+        done[0] == 1.0 && done[1] == 1.0 && done[2] == 1.0 && done[3] == 1.0
+    );
+    c.sameInt("lux scheduler: the shadow published once", s.versionOf(1), 1);
+
+    s.plan(lxsViewAt(0.5, 4));
+    c.that("lux scheduler: the sky does not rerun while the sun keeps its step", !lxsRuns(s, 0));
+    c.that("lux scheduler: nor does the finished shadow", !lxsRuns(s, 1));
+    c.that("lux scheduler: the shading runs every frame", lxsRuns(s, 2));
+    s.endFrame();
+}
+
+fn lxsRefreshFinishes(mut c : Checks) : void {
+    let s : LuxScheduler = new LuxScheduler(lxsDayGraph());
+    for (f of 0..4) {
+        s.plan(lxsViewAt(0.5, f as i64));
+        s.endFrame();
+    }
+
+    let step : f64 = 1.0 / 1440.0;
+    let mut finishedFirst : bool = true;
+    for (f of 4..8) {
+        let day : f64 = 0.5 + step * (((f - 3) as f64) + 0.5);
+        s.plan(lxsViewAt(day, f as i64));
+        c.that("lux scheduler: the sky follows every sun step (frame ${f})", lxsRuns(s, 0));
+        if (lxsSliceOf(s, 1) != f - 4) {
+            finishedFirst = false;
+        }
+        s.endFrame();
+    }
+    c.that(
+        "lux scheduler: a refresh is never restarted by a newer step, it finishes",
+        finishedFirst
+    );
+    c.sameInt("lux scheduler: ... and publishes", s.versionOf(1), 2);
+    c.sameInt("lux scheduler: ... made from the step it started at", s.madeFrom(1).sun, 721);
+
+    s.plan(lxsViewAt(0.5 + step * 4.5, 8));
+    c.that(
+        "lux scheduler: a step that moved during the refresh starts the next one",
+        lxsSliceOf(s, 1) == 0
+    );
+    s.endFrame();
+}
+
+fn lxsPeriod(mut c : Checks) : void {
+    let s : LuxScheduler = new LuxScheduler(lxsDayGraph());
+    let mut frames : i64 = 0;
+    let mut pattern : i64 = 0;
+    for (f of 0..9) {
+        s.plan(lxsViewAt(0.5, f as i64));
+        if (lxsRuns(s, 3)) {
+            frames = frames + 1;
+            pattern = pattern | (1 << (f as i64));
+        }
+        s.endFrame();
+    }
+    c.sameInt("lux scheduler: a layer of period 3 runs three times in nine frames", frames, 3);
+    c.sameInt("lux scheduler: ... on frames 0, 3 and 6", pattern, 1 + 8 + 64);
+}
+
+fn lxsSameRuns(mut c : Checks) : void {
+    let a : LuxScheduler = new LuxScheduler(lxsDayGraph());
+    let b : LuxScheduler = new LuxScheduler(lxsDayGraph());
+    let mut same : bool = true;
+    for (f of 0..40) {
+        let day : f64 = 0.5 + ((f / 3) as f64) / 1440.0;
+        a.plan(lxsViewAt(day, f as i64));
+        b.plan(lxsViewAt(day, f as i64));
+        if (a.runCount() != b.runCount()) {
+            same = false;
+        }
+        for (i of 0..a.runCount()) {
+            if (i < b.runCount() && (a.runAt(i) != b.runAt(i) || a.sliceAt(i) != b.sliceAt(i))) {
+                same = false;
+            }
+        }
+        a.endFrame();
+        b.endFrame();
+    }
+    c.that("lux scheduler: the same frames give the same runs, slice for slice", same);
+}
+
+fn lxsBudget(mut c : Checks) : void {
+    let floor : f32 = 0.5;
+    let b : LuxBudget = new LuxBudget(2, LUX_FRAME_60, floor);
+    for (f of 0..3) {
+        b.endFrame(LUX_FRAME_60);
+    }
+    c.near(
+        "lux budget: three frames over the target step the scale down",
+        b.scaleNow() as f64,
+        0.9375,
+        0.00001
+    );
+    for (f of 0..29) {
+        b.endFrame(LUX_FRAME_60 / 2);
+    }
+    c.near(
+        "lux budget: ... and 29 light frames are not enough to step back up",
+        b.scaleNow() as f64,
+        0.9375,
+        0.00001
+    );
+    b.endFrame(LUX_FRAME_60 / 2);
+    c.near("lux budget: the thirtieth is", b.scaleNow() as f64, 1.0, 0.00001);
+
+    for (f of 0..100) {
+        b.endFrame(LUX_FRAME_60 * 2);
+    }
+    c.near("lux budget: the scale never goes below its floor", b.scaleNow() as f64, 0.5, 0.00001);
+
+    // Hunting: a rise followed by a drop doubles the patience; a light frame whose cost would not fit the next step
+    // does not count toward rising.
+    let h : LuxBudget = new LuxBudget(1, LUX_FRAME_60, floor);
+    for (f of 0..3) {
+        h.endFrame(LUX_FRAME_60);
+    }
+    for (f of 0..30) {
+        h.endFrame(LUX_FRAME_60 / 2);
+    }
+    for (f of 0..3) {
+        h.endFrame(LUX_FRAME_60);
+    }
+    for (f of 0..30) {
+        h.endFrame(LUX_FRAME_60 / 2);
+    }
+    c.near(
+        "lux budget: after a rise and a drop, 30 light frames no longer rise",
+        h.scaleNow() as f64,
+        0.9375,
+        0.00001
+    );
+    for (f of 0..30) {
+        h.endFrame(LUX_FRAME_60 / 2);
+    }
+    c.near("lux budget: ... 60 do", h.scaleNow() as f64, 1.0, 0.00001);
+    let tight : LuxBudget = new LuxBudget(1, LUX_FRAME_60, floor);
+    tight.holdScale(0.5);
+    tight.release();
+    for (f of 0..200) {
+        tight.endFrame((LUX_FRAME_60 * 70) / 100);
+    }
+    c.near(
+        "lux budget: frames at 70 % do not rise when the next step would cost 89 %",
+        tight.scaleNow() as f64,
+        0.5,
+        0.00001
+    );
+
+    let held : f32 = 0.75;
+    b.holdScale(held);
+    for (f of 0..100) {
+        b.endFrame(LUX_FRAME_60 * 2);
+    }
+    c.near("lux budget: a held scale does not move", b.scaleNow() as f64, 0.75, 0.00001);
+
+    b.record(1, 1000);
+    b.record(1, 1800);
+    c.near("lux budget: a layer's mean moves an eighth of the way", b.meanOf(1), 1100.0, 0.001);
+}
+
+fn lxsTiles(mut c : Checks) : void {
+    let hd : LuxTiles = LuxTiles::cover(1280, 720);
+    c.sameInt("lux tiles: 1280 x 720 is 20 x 45 tiles", hd.count() as i64, 900);
+
+    let odd : LuxTiles = LuxTiles::cover(1000, 37);
+    c.sameInt("lux tiles: 1000 x 37 is 16 across", odd.across as i64, 16);
+    c.sameInt("lux tiles: ... and 3 down", odd.down as i64, 3);
+    let mut area : i64 = 0;
+    let mut inside : bool = true;
+    for (i of 0..odd.count()) {
+        let t : LuxTile = odd.tile(i);
+        area = area + ((t.x1 - t.x0) as i64) * ((t.y1 - t.y0) as i64);
+        if (t.x0 < 0 || t.y0 < 0 || t.x1 > 1000 || t.y1 > 37 || t.x1 <= t.x0 || t.y1 <= t.y0) {
+            inside = false;
+        }
+    }
+    c.that("lux tiles: every tile lies inside the picture and is not empty", inside);
+    c.sameInt("lux tiles: the tiles cover every pixel once", area, 37000);
+    let last : LuxTile = odd.tile(odd.count() - 1);
+    c.that(
+        "lux tiles: the last tile is clipped",
+        last.x1 == 1000 && last.y1 == 37 && last.x0 == 15 * LUX_TILE_W
+    );
+    c.that("lux tiles: its rows start on a tile row", last.y0 == 2 * LUX_TILE_H);
+    c.sameInt("lux tiles: an empty picture has no tiles", LuxTiles::cover(0, 10).count() as i64, 0);
+}

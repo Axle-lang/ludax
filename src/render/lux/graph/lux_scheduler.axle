@@ -1,0 +1,218 @@
+// lux_scheduler — which layers of light run this frame, which slice of a long refresh each does, and when a cache
+// becomes visible.
+//
+// Each frame the program hands the scheduler the frame's `LuxView`; the scheduler walks the live layers of a
+// compiled `LuxGraph` in order and decides, for each, from integers only:
+//   - a layer in the middle of a refresh does its next slice, whatever else happened: a refresh always finishes, so
+//     a cache keyed on something that changes every frame still gets published (it is then refreshed again);
+//   - otherwise the layer is stale when it never ran, when the frame's key differs from the key of its last refresh
+//     in one of the inputs it declared, when a layer feeding it published something since (the sum of its feeds'
+//     versions changed: versions only grow, so the sum changes exactly when one of them does), or when its period
+//     has elapsed. A stale layer starts a refresh; a fresh one is skipped.
+//
+// When results become visible is what keeps the picture whole:
+//   - a layer done in one slice publishes in the frame it runs: its version is raised when it is scheduled, so the
+//     layers after it in the same frame see it as new and run on what it writes this frame;
+//   - a layer spread over slices publishes at `endFrame`, after its last slice, between two frames: its readers see
+//     the previous generation until then, and the new one from the next frame on;
+//   - a layer's `LuxCache` is swapped after `endFrame` of the frame the layer published in, in both cases: during the
+//     frame the layer writes the back copy while everyone else reads the front one. The program owns its caches (a
+//     container of ours cannot hold classes) and hands each to `swapIfDue` after `endFrame`.
+//
+// The scheduler runs on the main thread, between the pool's loops; it never runs a layer itself. The program asks for
+// the run list (`runCount`, `runAt`, `sliceAt`) and dispatches each entry to its kernel.
+
+use crate::core::collections::vec::Vec;
+use crate::render::lux::graph::lux_cache::LuxCache;
+use crate::render::lux::graph::lux_graph::LuxGraph;
+use crate::render::lux::graph::lux_key::LuxKey;
+use crate::render::lux::graph::lux_layer::LuxLayerDesc;
+use crate::render::lux::graph::lux_view::LuxView;
+
+/** Decides, frame by frame, which layers of a compiled graph run and when their caches are published. */
+pub class LuxScheduler {
+    graph      : LuxGraph;
+    made       : Vec<LuxKey>;
+    seen       : Vec<i64>;
+    version    : Vec<i64>;
+    ran        : Vec<bool>;
+    refreshing : Vec<bool>;
+    slice      : Vec<i32>;
+    idle       : Vec<i32>;
+    published  : Vec<bool>;
+    swap       : Vec<bool>;
+    runLayer   : Vec<i32>;
+    runSlice   : Vec<i32>;
+    frameKey   : LuxKey;
+
+    /** A scheduler for `graph`, which must be compiled and is kept by the scheduler; no layer has run yet. */
+    constructor(own graph : LuxGraph) {
+        self.graph = graph;
+        self.made = new Vec<LuxKey>();
+        self.seen = new Vec<i64>();
+        self.version = new Vec<i64>();
+        self.ran = new Vec<bool>();
+        self.refreshing = new Vec<bool>();
+        self.slice = new Vec<i32>();
+        self.idle = new Vec<i32>();
+        self.published = new Vec<bool>();
+        self.swap = new Vec<bool>();
+        self.runLayer = new Vec<i32>();
+        self.runSlice = new Vec<i32>();
+        self.frameKey = LuxKey { world: 0, sun: 0, camera: 0, timecycle: 0, settings: 0, frame: 0 };
+        for (l of 0..self.graph.layerTotal()) {
+            self.made.push(self.frameKey);
+            self.seen.push(0);
+            self.version.push(0);
+            self.ran.push(false);
+            self.refreshing.push(false);
+            self.slice.push(0);
+            self.idle.push(0);
+            self.published.push(false);
+            self.swap.push(false);
+        }
+    }
+
+    /** The compiled graph the scheduler runs. */
+    pub fn graph(self) : LuxGraph {
+        return self.graph;
+    }
+
+    /**
+     * Publishes `cache`, the cache layer `l` writes, when the layer published during the frame just ended: the copy
+     * it wrote becomes the one readers see. Call it after `endFrame`, once per cache, with no worker running.
+     */
+    pub fn swapIfDue(mut self, l : i32, mut cache : LuxCache) : void {
+        if (!self.swap.get(l)) {
+            return;
+        }
+        self.swap.set(l, false);
+        cache.publish(self.made.get(l));
+    }
+
+    /** Decides this frame's runs from the frame's inputs; the list replaces the previous frame's. */
+    pub fn plan(mut self, view : LuxView) : void {
+        self.frameKey = view.key();
+        self.runLayer.clear();
+        self.runSlice.clear();
+        for (l of 0..self.published.len()) {
+            self.published.set(l, false);
+        }
+
+        for (i of 0..self.graph.runCount()) {
+            self.consider(self.graph.layerAt(i));
+        }
+    }
+
+    /**
+     * Ends the frame: advances every refresh that ran a slice, publishes those that are complete, and swaps their
+     * caches. Call it on the main thread after the frame's last loop.
+     */
+    pub fn endFrame(mut self) : void {
+        for (i of 0..self.runLayer.len()) {
+            let l : i32 = self.runLayer.get(i);
+            if (!self.refreshing.get(l)) {
+                continue;
+            }
+            let next : i32 = self.slice.get(l) + 1;
+            self.slice.set(l, next);
+            if (next < self.graph.desc(l).slices) {
+                continue;
+            }
+            self.refreshing.set(l, false);
+            self.publish(l);
+        }
+    }
+
+    /** How many layers run this frame. */
+    pub fn runCount(self) : i32 {
+        return self.runLayer.len();
+    }
+
+    /** The `i`-th layer to run this frame, in order. */
+    pub fn runAt(self, i : i32) : i32 {
+        return self.runLayer.get(i);
+    }
+
+    /** Which slice of its refresh the `i`-th run does: 0 for a layer done in one slice. */
+    pub fn sliceAt(self, i : i32) : i32 {
+        return self.runSlice.get(i);
+    }
+
+    /** How many generations layer `l` has published. */
+    pub fn versionOf(self, l : i32) : i64 {
+        return self.version.get(l);
+    }
+
+    /** The key layer `l`'s current or last refresh was made from. */
+    pub fn madeFrom(self, l : i32) : LuxKey {
+        return self.made.get(l);
+    }
+
+    /** True when layer `l` is in the middle of a refresh spread over several frames. */
+    pub fn isRefreshing(self, l : i32) : bool {
+        return self.refreshing.get(l);
+    }
+
+    /** True when layer `l` published during the frame just planned or ended. */
+    pub fn publishedNow(self, l : i32) : bool {
+        return self.published.get(l);
+    }
+
+    // Schedules `l` if it is refreshing or stale.
+    fn consider(mut self, l : i32) : void {
+        let d : LuxLayerDesc = self.graph.desc(l);
+        if (self.refreshing.get(l)) {
+            self.runLayer.push(l);
+            self.runSlice.push(self.slice.get(l));
+            return;
+        }
+
+        let stamp : i64 = self.feedStamp(l);
+        if (!self.isStale(l, d, stamp)) {
+            self.idle.set(l, self.idle.get(l) + 1);
+            return;
+        }
+
+        self.made.set(l, self.frameKey);
+        self.seen.set(l, stamp);
+        self.ran.set(l, true);
+        self.idle.set(l, 0);
+        self.runLayer.push(l);
+        self.runSlice.push(0);
+        if (d.slices <= 1) {
+            self.publish(l);
+            return;
+        }
+        self.refreshing.set(l, true);
+        self.slice.set(l, 0);
+    }
+
+    fn isStale(self, l : i32, d : LuxLayerDesc, stamp : i64) : bool {
+        if (!self.ran.get(l)) {
+            return true;
+        }
+        if (self.frameKey.differsIn(self.made.get(l), d.inputs)) {
+            return true;
+        }
+        if (stamp != self.seen.get(l)) {
+            return true;
+        }
+        return d.every > 0 && self.idle.get(l) + 1 >= d.every;
+    }
+
+    // The sum of the versions of the layers feeding `l`.
+    fn feedStamp(self, l : i32) : i64 {
+        let mut sum : i64 = 0;
+        for (k of 0..self.graph.feedCount(l)) {
+            sum = sum + self.version.get(self.graph.feedAt(l, k));
+        }
+        return sum;
+    }
+
+    fn publish(mut self, l : i32) : void {
+        self.version.set(l, self.version.get(l) + 1);
+        self.published.set(l, true);
+        self.swap.set(l, true);
+    }
+}

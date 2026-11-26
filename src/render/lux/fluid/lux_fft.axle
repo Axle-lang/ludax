@@ -1,0 +1,138 @@
+// lux_fft — the fast Fourier transform of a square grid, for the ocean's waves.
+//
+// The ocean (`lux_ocean`) is built in the frequency domain, one complex amplitude per wave vector, and brought to the
+// surface by an inverse transform every frame. A grid of `n x n` (a power of two) is transformed by rows, then by
+// columns, each a radix-2 Cooley-Tukey transform done in place:
+//
+//   X[k] = sum over j of x[j] e^{s 2 pi i j k / n}        s = -1 forward, +1 inverse (no 1/n: the ocean's
+//                                                         amplitudes already carry their scale)
+//
+// in `log2 n` passes of `n / 2` butterflies after a bit-reversal permutation, so `O(n log n)` a row and
+// `O(n^2 log n)` a grid instead of the `O(n^3)` of the plain sum. The twiddle factors `e^{-2 pi i m / n}` and the
+// bit-reversal table are computed once, with the deterministic `cosD`/`sinD`, so a transform gives the same bits on
+// every machine. Real and imaginary parts are kept in two `f32` arrays (structure of arrays): the butterflies of one
+// pass then read and write contiguous floats.
+
+use crate::core::math::scalar::TAU_D;
+use crate::core::math::trig::{cosD, sinD};
+
+/** A Fourier transform of `n x n` grids, `n` a power of two: its twiddles and its bit-reversal table. */
+pub class LuxFft {
+    n    : i32;
+    bits : i32;
+    cosT : f32[];
+    sinT : f32[];
+    rev  : i32[];
+    rowR : f32[];
+    rowI : f32[];
+
+    /** A transform of `n x n` grids; `n` must be a power of two, at least 2. */
+    constructor(n : i32) {
+        self.n = n;
+        self.bits = 0;
+        while ((1 << self.bits) < n) {
+            self.bits = self.bits + 1;
+        }
+        let half : i64 = (n / 2) as i64;
+        self.cosT = new f32[half + 1];
+        self.sinT = new f32[half + 1];
+        for (m of 0..half) {
+            let angle : f64 = -TAU_D * (m as f64) / (n as f64);
+            self.cosT[m] = cosD(angle) as f32;
+            self.sinT[m] = sinD(angle) as f32;
+        }
+        self.rev = new i32[n as i64];
+        for (j of 0..n) {
+            self.rev[j] = LuxFft::reversed(j, self.bits);
+        }
+        self.rowR = new f32[n as i64];
+        self.rowI = new f32[n as i64];
+    }
+
+    /** The size of a side of the grids this transform takes. */
+    pub fn size(self) : i32 {
+        return self.n;
+    }
+
+    /**
+     * Transforms the `n x n` grid (`re`, `im`, row by row) in place: inverse (`e^{+...}`) when `inverse`, forward
+     * otherwise. No division by `n` either way.
+     */
+    pub fn grid(mut self, mut re : f32[], mut im : f32[], inverse : bool) : void {
+        let n : i64 = self.n as i64;
+        for (y of 0..n) {
+            for (x of 0..n) {
+                self.rowR[x] = re[y * n + x];
+                self.rowI[x] = im[y * n + x];
+            }
+            self.line(inverse);
+            for (x of 0..n) {
+                re[y * n + x] = self.rowR[x];
+                im[y * n + x] = self.rowI[x];
+            }
+        }
+        for (x of 0..n) {
+            for (y of 0..n) {
+                self.rowR[y] = re[y * n + x];
+                self.rowI[y] = im[y * n + x];
+            }
+            self.line(inverse);
+            for (y of 0..n) {
+                re[y * n + x] = self.rowR[y];
+                im[y * n + x] = self.rowI[y];
+            }
+        }
+    }
+
+    // Transforms the scratch line (`rowR`, `rowI`) in place.
+    fn line(mut self, inverse : bool) : void {
+        let n : i32 = self.n;
+        for (j of 0..n) {
+            let r : i32 = self.rev[j];
+            if (r > j) {
+                let tr : f32 = self.rowR[j];
+                let ti : f32 = self.rowI[j];
+                self.rowR[j] = self.rowR[r];
+                self.rowI[j] = self.rowI[r];
+                self.rowR[r] = tr;
+                self.rowI[r] = ti;
+            }
+        }
+
+        // Butterflies of span 2, 4, ... n: each pairs a value with the one `half` further and its twiddle.
+        let sign : f32 = inverse ? -1.0 as f32 : 1.0 as f32;
+        let mut span : i32 = 2;
+        while (span <= n) {
+            let half : i32 = span / 2;
+            let stride : i32 = n / span;
+            let mut start : i32 = 0;
+            while (start < n) {
+                for (m of 0..half) {
+                    let wr : f32 = self.cosT[m * stride];
+                    let wi : f32 = sign * self.sinT[m * stride];
+                    let a : i32 = start + m;
+                    let b : i32 = a + half;
+                    let br : f32 = self.rowR[b] * wr - self.rowI[b] * wi;
+                    let bi : f32 = self.rowR[b] * wi + self.rowI[b] * wr;
+                    self.rowR[b] = self.rowR[a] - br;
+                    self.rowI[b] = self.rowI[a] - bi;
+                    self.rowR[a] = self.rowR[a] + br;
+                    self.rowI[a] = self.rowI[a] + bi;
+                }
+                start = start + span;
+            }
+            span = span * 2;
+        }
+    }
+
+    // `j` with its lowest `bits` bits in reverse order.
+    static fn reversed(j : i32, bits : i32) : i32 {
+        let mut r : i32 = 0;
+        let mut v : i32 = j;
+        for (b of 0..bits) {
+            r = (r << 1) | (v & 1);
+            v = v >> 1;
+        }
+        return r;
+    }
+}

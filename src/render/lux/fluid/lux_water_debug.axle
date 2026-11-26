@@ -1,0 +1,176 @@
+// lux_water_debug — colours that show what the water's rendering computes, instead of how it looks.
+//
+// A wave's look is the sum of many things (the slope, the reflection, what is seen through, the fade of the cascades), and
+// judging one of them in the finished picture is guesswork. Each mode of `LuxWaterDebug` paints the surface with one of
+// those quantities as a flat colour, so a ring where something changes with the distance, a patch where the reflection is
+// blocked or a cascade that appears too soon can be seen at a glance. All of it is a pure function of numbers the
+// renderer already has: no buffer, no state.
+
+use crate::core::math::scalar::{max, min, saturate};
+use crate::core::math::vec3::Vec3;
+use crate::render::lux::fluid::lux_ocean::LuxTapPlan;
+use crate::render::lux::medium::lux_interface::LuxMicrosurface;
+
+/** What the water is painted with. */
+pub enum LuxWaterDebug : i8 {
+    /** The water as it is rendered. */
+    Off = 0,
+    /** The resolved normal as a colour: flat water is green, a slope towards +x reddens it, towards +z blues it. */
+    Normal = 1,
+    /** The share of the waves the pixel cannot resolve, from blue (none) to red (all). */
+    Unresolved = 2,
+    /** The Fresnel reflectance, blue (0) to red (1). */
+    Fresnel = 3,
+    /** The share of the reflection blocked by the next wave, blue (none) to red (all of it). */
+    Blocked = 4,
+    /** How far the taps spread along the footprint, in short axes: blue for none, red from three up. */
+    Span = 5,
+    /** How much of each cascade the pixel keeps: coarse red, middle green, fine blue. */
+    Cascades = 6,
+    /** A black and magenta checker anchored in the world and bent by the slope: the waves seen as a lens. */
+    Checker = 7,
+    /** How much each pixel of water changes over its recent frames, blue (still) to red (most): see `luxWaterMotionColor`. */
+    Motion = 8,
+
+    /** The mode called `name`; `Off` for anything else. */
+    static fn fromName(name : string) : LuxWaterDebug {
+        if (name == "normal") {
+            return LuxWaterDebug::Normal;
+        }
+        if (name == "unresolved") {
+            return LuxWaterDebug::Unresolved;
+        }
+        if (name == "fresnel") {
+            return LuxWaterDebug::Fresnel;
+        }
+        if (name == "blocked") {
+            return LuxWaterDebug::Blocked;
+        }
+        if (name == "span") {
+            return LuxWaterDebug::Span;
+        }
+        if (name == "cascades") {
+            return LuxWaterDebug::Cascades;
+        }
+        if (name == "checker") {
+            return LuxWaterDebug::Checker;
+        }
+        if (name == "motion") {
+            return LuxWaterDebug::Motion;
+        }
+        return LuxWaterDebug::Off;
+    }
+
+    /** True for the modes the water's own shading paints; `Motion` is painted by the temporal stage, which has the history. */
+    pub fn paintedByShading(self) : bool {
+        return self != LuxWaterDebug::Off && self != LuxWaterDebug::Motion;
+    }
+}
+
+/** The names a debug mode may have, for a message. */
+pub const LUX_WATER_DEBUG_NAMES : string = "normal, unresolved, fresnel, blocked, span, cascades, checker, motion";
+
+/** What the colour of a debug mode is made from: everything the renderer knows about one water pixel. */
+pub struct LuxWaterDebugInput {
+    /** The surface's microsurface at the pixel. */
+    pub micro : LuxMicrosurface = LuxMicrosurface {};
+
+    /** The Fresnel reflectance of the view against the resolved normal. */
+    pub fresnel : f32 = 0.0;
+
+    /** The share of the reflection that leaves the water (`luxReflectOpen`). */
+    pub open : f32 = 1.0;
+
+    /** The footprint's short axis, metres. */
+    pub across : f32 = 1.0;
+
+    /** How the footprint was sampled. */
+    pub plan : LuxTapPlan = LuxTapPlan {};
+
+    /** How much of each cascade the pixel keeps, as x, y, z. */
+    pub keeps : Vec3 = Vec3 { x: 1.0, y: 1.0, z: 1.0 };
+
+    /** The water's world position, x. */
+    pub x : f32 = 0.0;
+
+    /** The water's world position, z. */
+    pub z : f32 = 0.0;
+}
+
+// The spread of the taps, in short axes, at which `Span` is fully red.
+const LUXD_SPAN_FULL : f32 = 3.0;
+
+// The relative deviation of a pixel's luminance over its history at which `Motion` is fully red.
+const LUXD_MOTION_FULL : f32 = 0.5;
+
+// A ramp from blue through cyan, green and yellow to red, for `t` in 0..1.
+fn luxdHeat(t : f32) : Vec3 {
+    let u : f32 = saturate(t);
+    let four : f32 = 4.0;
+    let q : f32 = 0.25;
+    let zero : f32 = 0.0;
+    let one : f32 = 1.0;
+    if (u < q) {
+        return Vec3 { x: zero, y: four * u, z: one };
+    }
+    if (u < q + q) {
+        return Vec3 { x: zero, y: one, z: one - four * (u - q) };
+    }
+    if (u < q + q + q) {
+        return Vec3 { x: four * (u - q - q), y: one, z: zero };
+    }
+    return Vec3 { x: one, y: one - four * (u - q - q - q), z: zero };
+}
+
+// Black or magenta by the cell of a checker of `cell` metres that (u, v) falls in.
+fn luxdChecker(u : f32, v : f32, cell : f32) : f32 {
+    let lift : f32 = 4096.0;
+    let a : i32 = (u / cell + lift) as i32;
+    let b : i32 = (v / cell + lift) as i32;
+    if (((a + b) & 1) == 0) {
+        return 0.0;
+    }
+    return 1.0;
+}
+
+/** The colour of water pixel `d` in debug mode `mode`: linear, 0 to 1 a channel. `Off` gives black. */
+pub fn luxWaterDebugColor(mode : LuxWaterDebug, d : LuxWaterDebugInput) : Vec3 {
+    let n : Vec3 = d.micro.normal;
+    let half : f32 = 0.5;
+    return match mode {
+        LuxWaterDebug::Normal => Vec3 {
+            x: half + half * n.x,
+            y: half + half * n.y,
+            z: half + half * n.z,
+        },
+        LuxWaterDebug::Unresolved => luxdHeat(d.micro.unresolved),
+        LuxWaterDebug::Fresnel => luxdHeat(d.fresnel),
+        LuxWaterDebug::Blocked => luxdHeat((1.0 as f32) - d.open),
+        LuxWaterDebug::Span => luxdHeat(d.plan.span / (LUXD_SPAN_FULL * max(d.across, 0.000001 as f32))),
+        LuxWaterDebug::Cascades => d.keeps,
+        LuxWaterDebug::Checker => luxdCheckerColor(d),
+        _ => Vec3::zero(),
+    };
+}
+
+/**
+ * The `Motion` colour of a water pixel whose luminance deviates from its mean by `deviation` (the standard deviation of
+ * the history over its mean): blue where the water holds still, red from half its brightness up.
+ */
+pub fn luxWaterMotionColor(deviation : f32) : Vec3 {
+    return luxdHeat(deviation / LUXD_MOTION_FULL);
+}
+
+// A coarse checker (a metre a cell) over a fine one (a quarter), both read where the slope has moved the point: a ripple
+// bends the pattern like a lens, so the waves are seen without any lighting.
+fn luxdCheckerColor(d : LuxWaterDebugInput) : Vec3 {
+    let bend : f32 = 1.5;
+    let metre : f32 = 1.0;
+    let quarter : f32 = 0.25;
+    let u : f32 = d.x + bend * d.micro.normal.x;
+    let v : f32 = d.z + bend * d.micro.normal.z;
+    let big : f32 = luxdChecker(u, v, metre);
+    let fine : f32 = luxdChecker(u, v, quarter);
+    let shade : f32 = max(big * (0.5 as f32) + fine * (0.5 as f32), 0.0 as f32);
+    return Vec3 { x: min(shade, 1.0 as f32), y: 0.0, z: min(shade, 1.0 as f32) };
+}

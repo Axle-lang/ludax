@@ -1,0 +1,609 @@
+// lux_ocean — a wind-driven water surface without a visible pattern: Tessendorf's spectral ocean in three cascades.
+//
+// A water surface is a sum of travelling waves. Tessendorf ("Simulating Ocean Water", SIGGRAPH course 2001) draws
+// their complex amplitudes once from a wind spectrum and lets each wave move at the speed deep water gives it; an
+// inverse Fourier transform (`LuxFft`) then turns the amplitudes into the surface, any time, in `O(n^2 log n)`:
+//
+//   S(ω)     = ω^-5 exp(-5/4 (ω_p / ω)^4) γ^r,                        JONSWAP (Hasselmann et al. 1973): the sea a
+//              r = exp(-(ω - ω_p)^2 / (2 σ^2 ω_p^2))                     wind of speed U raises over a fetch F, peaked
+//   ω_p      = 22 (g^2 / (U F))^(1/3)                                 at ω_p, γ = 3.3, σ = 0.07 below the peak and
+//   P(k)     = S(ω) (dω/dk) / k · |k̂·ŵ|^p · exp(-(k l)^2)              0.09 above; turned into a spectrum over wave
+//                                                                     vectors with ω = sqrt(g k), ŵ the wind's
+//                                                                     direction, l the shortest ripple; waves that
+//                                                                     run against the wind keep `against` of it
+//   h0(k)    = (ξ_r + i ξ_i) sqrt(P(k) / 2)                             ξ standard Gaussian draws, from a seed
+//   ω(k)     = sqrt(g |k|)                                              deep-water dispersion
+//   h(k, t)  = h0(k) e^{iωt} + conj(h0(-k)) e^{-iωt}                    real surface: h(-k) = conj(h(k))
+//   slope    = IFFT(i k h(k, t))                                         x and z slopes in one complex transform
+//
+// Only the slopes are computed: they are what tilts the normal and so what the reflections and the Fresnel term see.
+//
+// **Fetch.** A bay is not an ocean: the wind blows over a few hundred metres of water, not over thousands of
+// kilometres, and the waves it can raise are short. Phillips's spectrum (the usual choice) describes a fully developed
+// sea, where a strong wind piles its energy into long swells; over a bay that turned a gale into a slow, smooth
+// heave. JONSWAP was measured on fetch-limited seas: its peak moves with `U F`, and over 300 m a wind of 12 m/s
+// raises waves of about a metre: choppy water, rougher as the wind rises.
+//
+// **No pattern.** One grid repeats every `L` metres, which the eye catches at once on open water. Three grids of
+// incommensurate sizes (97.3, 23.9 and 6.1 m, no one a rational multiple of another) each carry their own band of
+// wave numbers, and each is turned by its own angle (0, 31 and 67 degrees), so their repeat lattices never line up
+// and their sum repeats nowhere a picture can show (n periodic patterns repeat only at the least common multiple of
+// their periods: Dupuy and Bruneton 2012). The finest band is modulated by a gust field that drifts with the wind,
+// as cat's-paws darken patches of a bay: a fractal noise baked once into a 128 x 128 table of 8 m texels that tiles
+// without a seam (period 1 024 m, three times the world), read with one bilinear lookup.
+//
+// **Physical amplitude.** The spectrum's scale is not a free knob: it is set so that the mean square slope of the
+// whole surface matches Cox and Munk's measurement of the sea (1954), `σ² = 0.003 + 0.00512 U` for a wind of `U` m/s,
+// times `shelter` (1 on open sea, less in a bay where the fetch is short).
+//
+// **No sparkle.** A wave shorter than a pixel cannot be drawn, only aliased into speckles. The sample is told the
+// pixel's footprint; a cascade whose grid spacing is under the footprint fades out smoothly (fully at four times it), and
+// the slope variance it would have added is returned (`lost`). Those waves are not gone: a pixel far away still sees
+// thousands of them, which blur and stretch what the water reflects. Bruneton, Neyret and Holzschuch (2010) hand them
+// to the BRDF: by the central limit theorem their slopes are Gaussian with variance `lost`, a Beckmann roughness of
+// alpha^2 = lost. The renderer blends its reflection toward a sky prefiltered at that roughness by the unresolved share
+// (handbook 3.14 §3.6): a continuous function of the distance, so near and far water meet with no border, and nothing
+// drawn at random, so nothing grains. A cascade faded out entirely is not read at all, so far water costs less.
+//
+// **Cost** (measured, one thread): an update (three cascades moved and transformed) 0.26 ms a frame; memory 7 arrays of
+// 64 x 64 floats a cascade and a 128 x 128 gust table, 0.4 MB in all.
+
+use crate::core::math::scalar::{TAU, max, min, smoothstep};
+use crate::core::math::trig::{sin, cos, sqrt};
+use crate::core::math::vec3::Vec3;
+use crate::core::rng::pcg32::Pcg32;
+use crate::render::light::light_math::{lightExp2, lightLog2};
+use crate::render::lux::fluid::lux_fft::LuxFft;
+use crate::render::pathlight::pathlight_noise::{lnFbm2, lnFloor};
+
+/** Gravity, metres a second squared. */
+pub const LUX_GRAVITY : f32 = 9.81;
+
+/** Cells of a side of each cascade's grid. */
+pub const LUX_OCEAN_GRID : i32 = 64;
+
+// The cascades' sizes in metres and the wave numbers (rad/m) where one hands over to the next.
+const LUXO_SIZE_0 : f32 = 97.3;
+const LUXO_SIZE_1 : f32 = 23.9;
+const LUXO_SIZE_2 : f32 = 6.1;
+const LUXO_CUT_01 : f32 = 1.0;
+const LUXO_CUT_12 : f32 = 4.0;
+
+// JONSWAP: the peak enhancement γ, the peak widths below and above the peak, and the 22 of the peak frequency.
+const LUXO_GAMMA : f32 = 3.3;
+const LUXO_SIGMA_LOW : f32 = 0.07;
+const LUXO_SIGMA_HIGH : f32 = 0.09;
+const LUXO_PEAK : f32 = 22.0;
+
+// The most taps an anisotropic sample spreads along the long axis of a footprint.
+const LUXO_TAPS : i32 = 4;
+
+// The shortest ripple the spectrum keeps, metres; below it the exp(-(k l)^2) factor removes the waves.
+const LUXO_RIPPLE : f32 = 0.08;
+
+// Cox and Munk's mean square slope: a floor for a calm sea and the growth per metre a second of wind.
+const LUXO_COX_CALM : f32 = 0.003;
+const LUXO_COX_RATE : f32 = 0.00512;
+
+// A cascade is whole while the footprint is under its spacing and gone at this many times it.
+const LUXO_FADE_END : f32 = 4.0;
+
+// The cascades' turns, radians: 0, 31 and 67 degrees, so no two repeat lattices line up.
+const LUXO_TURN_1 : f32 = 0.5410521;
+const LUXO_TURN_2 : f32 = 1.1693706;
+
+// The gust field: its scale (cycles a metre), how fast it drifts as a share of the wind, its range around 1, its
+// seed, and the table it is baked into: cells a side and metres a cell.
+const LUXO_GUST_SCALE : f32 = 0.018;
+const LUXO_GUST_DRIFT : f32 = 0.35;
+const LUXO_GUST_DEPTH : f32 = 1.1;
+const LUXO_GUST_SEED : i32 = 907;
+const LUXO_GUST_CELLS : i32 = 128;
+const LUXO_GUST_CELL : f32 = 8.0;
+
+/** The wind that raises the water, and how the water answers it. */
+pub struct LuxWind {
+    /** Speed, metres a second. */
+    pub speed : f32 = 6.0;
+
+    /** The direction the wind blows toward, radians in the xz plane: 0 is +x, a quarter turn is +z. */
+    pub angle : f32 = 0.6;
+
+    /** How tightly the waves follow the wind: the power of `|k̂·ŵ|` (2 is Phillips's). */
+    pub spread : f32 = 2.0;
+
+    /** The share of a wave's energy kept when it runs against the wind. */
+    pub against : f32 = 0.07;
+
+    /** The share of Cox and Munk's open-sea slope a sheltered water has: 1 open sea, less in a bay. */
+    pub shelter : f32 = 0.6;
+
+    /** The fetch: how far the wind has blown over the water, metres. A bay is a few hundred. */
+    pub fetch : f32 = 300.0;
+}
+
+/**
+ * The patch of water a pixel covers: an ellipse `across` metres wide and `along` metres long, its long axis along the
+ * unit direction (`dirX`, `dirZ`) on the water (the view's direction, projected).
+ */
+pub struct LuxFootprint {
+    /** The short axis, metres: the pixel's angle times the distance. */
+    pub across : f32 = 0.0;
+
+    /** The long axis, metres: `across` divided by the cosine of the view against the vertical. */
+    pub along : f32 = 0.0;
+
+    /** The long axis's direction on the water, x component. */
+    pub dirX : f32 = 1.0;
+
+    /** Its z component. */
+    pub dirZ : f32 = 0.0;
+}
+
+/** How a footprint is sampled: how far the taps spread along its long axis and the footprint the cascades fade by. */
+pub struct LuxTapPlan {
+    /** The length, metres, the `LUXO_TAPS` taps are spread over along the long axis; 0 when the footprint is round. */
+    pub span : f32 = 0.0;
+
+    /** The footprint the cascades fade by, metres: the short axis, or the spacing of the taps when they are wider apart. */
+    pub fade : f32 = 0.0;
+}
+
+/**
+ * The sampling plan of footprint `fp`. The taps always number `LUXO_TAPS`; what grows with the elongation is how far they
+ * are spread, the part of the long axis the short axis does not already cover. A round footprint spreads them over
+ * nothing, so they are one sample; a long one spreads them over what it covers. Nothing in it is a whole number that can
+ * change by a step, so the filter changes continuously with the view's angle: a count of taps that went from one to two
+ * moved the sampling points at once and the ripples with them, a ring round the camera at a fixed angle of view. The
+ * fade is the larger of the short axis and the taps' spacing, so the cascades the taps cannot sample are the ones faded.
+ */
+pub fn luxTapPlan(fp : LuxFootprint) : LuxTapPlan {
+    let span : f32 = max(fp.along - fp.across, 0.0 as f32);
+    return LuxTapPlan { span: span, fade: max(fp.across, span / (LUXO_TAPS as f32)) };
+}
+
+/** The slope of the water at a point, as a pixel of a given footprint can see it. */
+pub struct LuxWaterSample {
+    /** dh/dx: how the surface rises along +x. */
+    pub slopeX : f32 = 0.0;
+
+    /** dh/dz: how the surface rises along +z. */
+    pub slopeZ : f32 = 0.0;
+
+    /** The slope variance of the waves too small for the footprint, faded out: what a highlight should widen by. */
+    pub lost : f32 = 0.0;
+}
+
+// A pair of numbers: two Gaussian draws, or the two slopes of a sample.
+struct LuxGauss {
+    pub(file) a : f32 = 0.0;
+    pub(file) b : f32 = 0.0;
+}
+
+// One grid of waves: its band of wave numbers, its amplitudes, its slopes at the last update.
+class LuxOceanCascade {
+    size               : f32;
+    n                  : i32;
+    turnCos            : f32;
+    turnSin            : f32;
+    h0R                : f32[];
+    h0I                : f32[];
+    omega              : f32[];
+    kx                 : f32[];
+    kz                 : f32[];
+    pub(file) slopeX   : f32[];
+    pub(file) slopeZ   : f32[];
+    pub(file) variance : f32 = 0.0;
+    raw                : f32 = 0.0;
+
+    // A cascade of `size` metres turned by `turn` radians, keeping wave numbers in [kLow, kHigh), drawn from `seed`;
+    // amplitudes unscaled. Its grid is laid in its own turned frame, where the wind blows at `wind.angle - turn`.
+    constructor(n : i32, size : f32, turn : f32, kLow : f32, kHigh : f32, wind : LuxWind, seed : i64) {
+        self.size = size;
+        self.n = n;
+        self.turnCos = cos(turn);
+        self.turnSin = sin(turn);
+        let cells : i64 = (n as i64) * (n as i64);
+        self.h0R = new f32[cells];
+        self.h0I = new f32[cells];
+        self.omega = new f32[cells];
+        self.kx = new f32[cells];
+        self.kz = new f32[cells];
+        self.slopeX = new f32[cells];
+        self.slopeZ = new f32[cells];
+
+        let rng : Pcg32 = new Pcg32(seed as u64, 54);
+        let wx : f32 = cos(wind.angle - turn);
+        let wz : f32 = sin(wind.angle - turn);
+        let peak : f32 = luxoPeak(wind);
+        let mut raw : f32 = 0.0;
+        for (row of 0..n) {
+            for (col of 0..n) {
+                let at : i64 = (row as i64) * (n as i64) + (col as i64);
+                let kx : f32 = TAU * (luxoSigned(col, n) as f32) / size;
+                let kz : f32 = TAU * (luxoSigned(row, n) as f32) / size;
+                let k : f32 = sqrt(kx * kx + kz * kz);
+                self.kx[at] = kx;
+                self.kz[at] = kz;
+                self.omega[at] = sqrt(LUX_GRAVITY * k);
+
+                let mut p : f32 = 0.0;
+                if (k >= kLow && k < kHigh && k > 0.0) {
+                    p = luxoJonswap(kx, kz, k, wx, wz, peak, wind);
+                }
+                let amp : f32 = sqrt(p * (0.5 as f32));
+                let g : LuxGauss = luxoGaussPair(rng);
+                self.h0R[at] = g.a * amp;
+                self.h0I[at] = g.b * amp;
+                raw = raw + k * k * p;
+            }
+        }
+        // Both h0(k) and conj(h0(-k)) feed h(k, t): the expected slope variance of the grid is twice this sum.
+        self.raw = raw * (2.0 as f32);
+    }
+
+    // Scales the amplitudes by `factor` (applied to the energy, so the amplitudes take its root).
+    pub(file) fn scale(mut self, factor : f32) : void {
+        let a : f32 = sqrt(factor);
+        for (i of 0..((self.n as i64) * (self.n as i64))) {
+            self.h0R[i] = self.h0R[i] * a;
+            self.h0I[i] = self.h0I[i] * a;
+        }
+        self.variance = self.raw * factor;
+    }
+
+    // The expected slope variance of the unscaled grid.
+    pub(file) fn rawVariance(self) : f32 {
+        return self.raw;
+    }
+
+    // The slopes at time `t`: the spectrum moved by each wave's own frequency, then one inverse transform.
+    pub(file) fn update(mut self, t : f32, mut fft : LuxFft) : void {
+        let n : i32 = self.n;
+        for (row of 0..n) {
+            for (col of 0..n) {
+                let at : i64 = (row as i64) * (n as i64) + (col as i64);
+                let mirror : i64 = (((n - row) & (n - 1)) as i64) * (n as i64)
+                    + (((n - col) & (n - 1)) as i64);
+                let c : f32 = cos(self.omega[at] * t);
+                let s : f32 = sin(self.omega[at] * t);
+                // h = h0 e^{iωt} + conj(h0(-k)) e^{-iωt}
+                let ar : f32 = self.h0R[at];
+                let ai : f32 = self.h0I[at];
+                let br : f32 = self.h0R[mirror];
+                let bi : f32 = -self.h0I[mirror];
+                let hr : f32 = ar * c - ai * s + br * c + bi * s;
+                let hi : f32 = ar * s + ai * c - br * s + bi * c;
+                // i kx h for the x slope (real part out), i kz h for the z slope (packed as the imaginary part)
+                let kx : f32 = self.kx[at];
+                let kz : f32 = self.kz[at];
+                self.slopeX[at] = -kx * hi - kz * hr;
+                self.slopeZ[at] = kx * hr - kz * hi;
+            }
+        }
+        fft.grid(self.slopeX, self.slopeZ, true);
+    }
+
+    // The slopes at world point (x, z), bilinear between grid points, the grid repeating every `size` metres in its
+    // turned frame; the slopes are turned back into the world's frame.
+    pub(file) fn sample(self, x : f32, z : f32) : LuxGauss {
+        let n : i32 = self.n;
+        let lx : f32 = x * self.turnCos + z * self.turnSin;
+        let lz : f32 = z * self.turnCos - x * self.turnSin;
+        let u : f32 = lx / self.size * (n as f32);
+        let v : f32 = lz / self.size * (n as f32);
+        let i0 : i32 = lnFloor(u);
+        let j0 : i32 = lnFloor(v);
+        let fu : f32 = u - i0 as f32;
+        let fv : f32 = v - j0 as f32;
+        let mask : i32 = n - 1;
+        let x0 : i64 = (i0 & mask) as i64;
+        let x1 : i64 = ((i0 + 1) & mask) as i64;
+        let z0 : i64 = ((j0 & mask) as i64) * (n as i64);
+        let z1 : i64 = (((j0 + 1) & mask) as i64) * (n as i64);
+        let one : f32 = 1.0;
+        let w00 : f32 = (one - fu) * (one - fv);
+        let w10 : f32 = fu * (one - fv);
+        let w01 : f32 = (one - fu) * fv;
+        let w11 : f32 = fu * fv;
+        let su : f32 = self.slopeX[z0 + x0] * w00 + self.slopeX[z0 + x1] * w10 + self.slopeX[z1 + x0] * w01
+            + self.slopeX[z1 + x1] * w11;
+        let sv : f32 = self.slopeZ[z0 + x0] * w00 + self.slopeZ[z0 + x1] * w10 + self.slopeZ[z1 + x0] * w01
+            + self.slopeZ[z1 + x1] * w11;
+        return LuxGauss {
+            a: su * self.turnCos - sv * self.turnSin,
+            b: su * self.turnSin + sv * self.turnCos,
+        };
+    }
+
+    // The spacing of the grid, metres: a footprint above it cannot see this cascade's shortest waves.
+    // Bytes the cascade's spectrum and slope fields hold.
+    pub(file) fn bytes(self) : i64 {
+        return (self.h0R.length + self.h0I.length + self.omega.length + self.kx.length + self.kz.length
+            + self.slopeX.length
+            + self.slopeZ.length)
+            * 4;
+    }
+
+    pub(file) fn spacing(self) : f32 {
+        return self.size / (self.n as f32);
+    }
+}
+
+/** A water surface raised by a wind: three cascades of waves, a gust field, sampled with a pixel's footprint. */
+pub class LuxOcean {
+    fft    : LuxFft;
+    coarse : LuxOceanCascade;
+    middle : LuxOceanCascade;
+    fine   : LuxOceanCascade;
+    gusts  : f32[];
+    wind   : LuxWind;
+    time   : f32 = -1.0;
+
+    /** The surface the wind `wind` raises, its waves drawn from `seed`; call `update` before sampling. */
+    constructor(wind : LuxWind, seed : i64) {
+        self.wind = wind;
+        self.fft = new LuxFft(LUX_OCEAN_GRID);
+        let big : f32 = 1000000.0;
+        let none : f32 = 0.0;
+        self.coarse = new LuxOceanCascade(LUX_OCEAN_GRID, LUXO_SIZE_0, none, none, LUXO_CUT_01, wind, seed);
+        self.middle = new LuxOceanCascade(
+            LUX_OCEAN_GRID,
+            LUXO_SIZE_1,
+            LUXO_TURN_1,
+            LUXO_CUT_01,
+            LUXO_CUT_12,
+            wind,
+            seed + 1
+        );
+        self.fine = new LuxOceanCascade(
+            LUX_OCEAN_GRID,
+            LUXO_SIZE_2,
+            LUXO_TURN_2,
+            LUXO_CUT_12,
+            big,
+            wind,
+            seed + 2
+        );
+        self.gusts = luxoGustTable();
+
+        // One factor for the three, so that their summed slope variance is Cox and Munk's for this wind.
+        let raw : f32 = self.coarse.rawVariance() + self.middle.rawVariance() + self.fine.rawVariance();
+        let want : f32 = wind.shelter * (LUXO_COX_CALM + LUXO_COX_RATE * wind.speed);
+        let mut factor : f32 = 0.0;
+        if (raw > 0.0) {
+            factor = want / raw;
+        }
+        self.coarse.scale(factor);
+        self.middle.scale(factor);
+        self.fine.scale(factor);
+    }
+
+    /** Moves the waves to time `seconds`; nothing is done when the time has not changed. */
+    pub fn update(mut self, seconds : f32) : void {
+        if (seconds == self.time) {
+            return;
+        }
+        self.time = seconds;
+        self.coarse.update(seconds, self.fft);
+        self.middle.update(seconds, self.fft);
+        self.fine.update(seconds, self.fft);
+    }
+
+    /** Bytes the surface holds: its three cascades and the gust field (the transform's tables are small). */
+    pub fn bytes(self) : i64 {
+        return self.coarse.bytes() + self.middle.bytes() + self.fine.bytes() + self.gusts.length * 4;
+    }
+
+    /** The mean square slope the surface was scaled to: Cox and Munk's for the wind, times its shelter. */
+    pub fn meanSquareSlope(self) : f32 {
+        return self.coarse.variance + self.middle.variance + self.fine.variance;
+    }
+
+    /**
+     * The slope of the water at world point (x, z) as a pixel covering the elongated patch `fp` sees it: anisotropic
+     * filtering, as a texture seen edge on is filtered. Along the long axis, `LUXO_TAPS` samples spread over what the short
+     * axis does not cover are averaged, and the slope variance that averaging removes is added to `lost`; the cascades fade
+     * by the larger of the short axis and the spacing of those taps. A single sample of an ellipse 20 times longer
+     * than wide aliases the long waves along the view into a moiré that slides across the water as the camera turns; one
+     * fade by the long axis flattens distant water into a mirror.
+     */
+    pub fn sampleFootprint(self, x : f32, z : f32, fp : LuxFootprint) : LuxWaterSample {
+        let plan : LuxTapPlan = luxTapPlan(fp);
+        let half : f32 = 0.5;
+        let mut sum : LuxWaterSample = LuxWaterSample { slopeX: 0.0, slopeZ: 0.0, lost: 0.0 };
+        let mut squares : f32 = 0.0;
+        for (k of 0..LUXO_TAPS) {
+            let offset : f32 = (((k as f32) + half) / (LUXO_TAPS as f32) - half) * plan.span;
+            let s : LuxWaterSample = self.sample(x + fp.dirX * offset, z + fp.dirZ * offset, plan.fade);
+            sum = LuxWaterSample {
+                slopeX: sum.slopeX + s.slopeX,
+                slopeZ: sum.slopeZ + s.slopeZ,
+                lost: sum.lost + s.lost,
+            };
+            squares = squares + s.slopeX * s.slopeX + s.slopeZ * s.slopeZ;
+        }
+        let inv : f32 = (1.0 as f32) / (LUXO_TAPS as f32);
+        let meanX : f32 = sum.slopeX * inv;
+        let meanZ : f32 = sum.slopeZ * inv;
+        // Averaging the slopes flattens them: the variance it removes (the mean of the squares less the square of the
+        // mean) is slope the pixel still covers, so it joins `lost`.
+        let removed : f32 = max(squares * inv - meanX * meanX - meanZ * meanZ, 0.0 as f32);
+        return LuxWaterSample { slopeX: meanX, slopeZ: meanZ, lost: sum.lost * inv + removed };
+    }
+
+    /**
+     * The slope of the water at world point (x, z), as a pixel whose footprint on the water is `footprint` metres
+     * sees it: the cascades it can resolve, and the variance of those it cannot, in `lost`.
+     */
+    pub fn sample(self, x : f32, z : f32, footprint : f32) : LuxWaterSample {
+        let mut out : LuxWaterSample = LuxWaterSample { slopeX: 0.0, slopeZ: 0.0, lost: 0.0 };
+
+        let wc : f32 = luxoKeep(footprint, self.coarse.spacing());
+        out = luxoAdd(out, self.coarse, x, z, wc, 1.0);
+        let wm : f32 = luxoKeep(footprint, self.middle.spacing());
+        out = luxoAdd(out, self.middle, x, z, wm, 1.0);
+
+        // The finest waves are the wind's: the gust field raises and lowers them patch by patch.
+        let wf : f32 = luxoKeep(footprint, self.fine.spacing());
+        return luxoAdd(out, self.fine, x, z, wf, self.gust(x, z));
+    }
+
+    /** How much of each cascade a footprint of `footprint` metres keeps, 0 to 1: coarse, middle, fine as x, y, z. */
+    pub fn cascadeKeeps(self, footprint : f32) : Vec3 {
+        return Vec3 {
+            x: luxoKeep(footprint, self.coarse.spacing()),
+            y: luxoKeep(footprint, self.middle.spacing()),
+            z: luxoKeep(footprint, self.fine.spacing()),
+        };
+    }
+
+    // The gust field at (x, z): around 1, from about 0.45 to 1.55, drifting downwind with the time; one bilinear read
+    // of the baked table.
+    fn gust(self, x : f32, z : f32) : f32 {
+        let drift : f32 = self.time * self.wind.speed * LUXO_GUST_DRIFT;
+        let u : f32 = (x - cos(self.wind.angle) * drift) / LUXO_GUST_CELL;
+        let v : f32 = (z - sin(self.wind.angle) * drift) / LUXO_GUST_CELL;
+        return luxoBilinear(self.gusts, LUXO_GUST_CELLS, u, v);
+    }
+}
+
+// The frequency index of grid position `i`: 0..n/2 - 1, then -n/2..-1.
+fn luxoSigned(i : i32, n : i32) : i32 {
+    return i < n / 2 ? i : i - n;
+}
+
+// The angular frequency of the JONSWAP peak for the wind's speed and fetch: 22 (g^2 / (U F))^(1/3).
+fn luxoPeak(wind : LuxWind) : f32 {
+    let u : f32 = wind.speed < (0.5 as f32) ? 0.5 as f32 : wind.speed;
+    let f : f32 = wind.fetch < (1.0 as f32) ? 1.0 as f32 : wind.fetch;
+    let ratio : f32 = LUX_GRAVITY * LUX_GRAVITY / (u * f);
+    return LUXO_PEAK * luxoPow(ratio, (1.0 as f32) / (3.0 as f32));
+}
+
+// The JONSWAP spectrum over wave vectors at (kx, kz), of length k, for a wind along (wx, wz) peaked at `peak` (rad/s),
+// up to a constant (the ocean is scaled to Cox and Munk's slope afterwards).
+fn luxoJonswap(kx : f32, kz : f32, k : f32, wx : f32, wz : f32, peak : f32, wind : LuxWind) : f32 {
+    let omega : f32 = sqrt(LUX_GRAVITY * k);
+    let ratio : f32 = peak / omega;
+    let r2 : f32 = ratio * ratio;
+    let sigma : f32 = omega <= peak ? LUXO_SIGMA_LOW : LUXO_SIGMA_HIGH;
+    let off : f32 = (omega - peak) / (sigma * peak);
+    let shape : f32 = luxoPow(LUXO_GAMMA, luxoExp(-(0.5 as f32) * off * off));
+    let o2 : f32 = omega * omega;
+    let s : f32 = luxoExp(-(1.25 as f32) * r2 * r2) / (o2 * o2 * omega) * shape;
+
+    // From frequency to wave vectors: S(ω) dω/dk over the circle of radius k, dω/dk = g / (2 ω).
+    let mut p : f32 = s * LUX_GRAVITY / ((2.0 as f32) * omega) / k;
+    let along : f32 = (kx * wx + kz * wz) / k;
+    p = p * luxoPow(along < 0.0 ? -along : along, wind.spread);
+    p = p * luxoExp(-k * k * LUXO_RIPPLE * LUXO_RIPPLE);
+    if (along < 0.0) {
+        p = p * wind.against;
+    }
+    return p;
+}
+
+// Two independent standard Gaussian draws (Box-Muller), from two uniform draws of `rng`.
+fn luxoGaussPair(mut rng : Pcg32) : LuxGauss {
+    let u : f32 = rng.nextF32();
+    let v : f32 = rng.nextF32();
+    return luxoGaussOf(u, v);
+}
+
+// Two independent standard Gaussian numbers from two uniform ones in [0, 1) (Box-Muller): r = sqrt(-2 ln u),
+// angle 2 pi v. `u` is held above zero, where the logarithm has no value.
+fn luxoGaussOf(u : f32, v : f32) : LuxGauss {
+    let floor : f32 = 0.0000001;
+    let held : f32 = u < floor ? floor : u;
+    // ln u = log2 u · ln 2
+    let r : f32 = sqrt(-(2.0 as f32) * lightLog2(held) * (0.69314718 as f32));
+    return LuxGauss { a: r * cos(TAU * v), b: r * sin(TAU * v) };
+}
+
+// `out` with cascade `c` added at (x, z), kept by `keep` and scaled by `gain`; the variance it loses goes to `lost`.
+// A cascade kept not at all is not read.
+fn luxoAdd(
+    out : LuxWaterSample,
+    c : LuxOceanCascade,
+    x : f32,
+    z : f32,
+    keep : f32,
+    gain : f32
+) : LuxWaterSample {
+    let lost : f32 = out.lost + ((1.0 as f32) - keep * keep) * c.variance * gain * gain;
+    if (keep <= 0.0) {
+        return LuxWaterSample { slopeX: out.slopeX, slopeZ: out.slopeZ, lost: lost };
+    }
+    let g : LuxGauss = c.sample(x, z);
+    let k : f32 = keep * gain;
+    return LuxWaterSample { slopeX: out.slopeX + g.a * k, slopeZ: out.slopeZ + g.b * k, lost: lost };
+}
+
+// The gust field baked into a table of `LUXO_GUST_CELLS` square cells that tiles without a seam: each cell blends the
+// noise at its place with the noise one period to the left, above, and both, by how far the cell is into the period,
+// so the left and right edges (and the top and bottom) carry the same values.
+fn luxoGustTable() : f32[] {
+    let n : i32 = LUXO_GUST_CELLS;
+    let period : f32 = (n as f32) * LUXO_GUST_CELL;
+    let mut table : f32[] = new f32[(n as i64) * (n as i64)];
+    for (j of 0..n) {
+        for (i of 0..n) {
+            let x : f32 = (i as f32) * LUXO_GUST_CELL;
+            let z : f32 = (j as f32) * LUXO_GUST_CELL;
+            let a : f32 = (i as f32) / (n as f32);
+            let b : f32 = (j as f32) / (n as f32);
+            let one : f32 = 1.0;
+            let here : f32 = luxoGustNoise(x, z) * (one - a) * (one - b);
+            let left : f32 = luxoGustNoise(x - period, z) * a * (one - b);
+            let up : f32 = luxoGustNoise(x, z - period) * (one - a) * b;
+            let both : f32 = luxoGustNoise(x - period, z - period) * a * b;
+            table[(j as i64) * (n as i64) + (i as i64)] = (one
+                + (here + left + up + both - (0.5 as f32)) * LUXO_GUST_DEPTH);
+        }
+    }
+    return table;
+}
+
+fn luxoGustNoise(x : f32, z : f32) : f32 {
+    return lnFbm2(x * LUXO_GUST_SCALE, z * LUXO_GUST_SCALE, 3, LUXO_GUST_SEED);
+}
+
+// A bilinear read of the `n x n` table that repeats in both directions, at (u, v) in cells.
+fn luxoBilinear(table : f32[], n : i32, u : f32, v : f32) : f32 {
+    let i0 : i32 = lnFloor(u);
+    let j0 : i32 = lnFloor(v);
+    let fu : f32 = u - i0 as f32;
+    let fv : f32 = v - j0 as f32;
+    let mask : i32 = n - 1;
+    let x0 : i64 = (i0 & mask) as i64;
+    let x1 : i64 = ((i0 + 1) & mask) as i64;
+    let z0 : i64 = ((j0 & mask) as i64) * (n as i64);
+    let z1 : i64 = (((j0 + 1) & mask) as i64) * (n as i64);
+    let top : f32 = table[z0 + x0] + (table[z0 + x1] - table[z0 + x0]) * fu;
+    let bottom : f32 = table[z1 + x0] + (table[z1 + x1] - table[z1 + x0]) * fu;
+    return top + (bottom - top) * fv;
+}
+
+// How much of a cascade of grid `spacing` a footprint keeps: all of it up to the spacing, none from four times it.
+//
+// The fade spans two octaves, from the spacing to four times it. The cascades' sizes step by about four (97.3, 23.9,
+// 6.1 m), so each cascade starts to fade where the next coarser one has faded in completely: together they fall off as
+// one continuous slope. A fade of one octave (spacing to twice it) left the three as three visible bands, the water
+// changing look three times with the distance.
+fn luxoKeep(footprint : f32, spacing : f32) : f32 {
+    return (1.0 as f32) - smoothstep(1.0 as f32, LUXO_FADE_END, footprint / spacing);
+}
+
+// e^x for the spectrum, deterministic, through the lighting library's base-2 power.
+fn luxoExp(x : f32) : f32 {
+    return lightExp2(x * (1.44269504 as f32));
+}
+
+// x^y for x > 0, 0 for x <= 0.
+fn luxoPow(x : f32, y : f32) : f32 {
+    if (x <= 0.0) {
+        return 0.0;
+    }
+    return lightExp2(y * lightLog2(x));
+}

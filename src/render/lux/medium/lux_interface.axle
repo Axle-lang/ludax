@@ -1,0 +1,191 @@
+// lux_interface — a rough boundary between two media seen from the lighter one: a lake from the air, ice, wet ground.
+//
+// What a renderer needs at such a boundary is the same whatever fills it, so it is here once (handbook 3.17):
+//
+//   footprint      the patch a pixel covers on the boundary's plane: `a = t θ_px (1 + depth)` across the view and
+//                  `a / cos v` along it, its long axis the view's direction on the plane (`LuxFootprint`)
+//   microsurface   the normal of the slopes the footprint resolves, the variance of those it cannot (`lost`) and its
+//                  share of the whole (`unresolved`); the unresolved slopes are a Beckmann roughness α² = lost
+//   reflection     the mirror of the resolved normal, held above the plane at no less than a share of the flat
+//                  reflection's rise, so a wave never sends it into the boundary it leaves
+//   Fresnel        Schlick's, at the view's cosine against the resolved normal, floored at 0.001
+//   sky            a reflection that reached the sky reads it blurred by the unresolved slopes, by their share:
+//                  `lerp(traced, sky_prefiltered(lost^(1/4)), unresolved)`; one that struck the world is kept
+//   mix            `F · reflected + (1 - F) · transmitted`
+//
+// The library plans and combines; the program traces the rays the plan asks for (the reflection, the refraction into
+// the medium) with its own world, so the boundary nests with any other surface the rays meet. `LuxFluidQuality` holds
+// every number that trades cost for quality, so a game sets its budget in one place.
+
+use crate::core::math::scalar::{max, min, saturate};
+use crate::core::math::trig::sqrt;
+use crate::core::math::vec3::Vec3;
+use crate::render::light::light_math::lightPow;
+use crate::render::lux::fluid::lux_ocean::LuxFootprint;
+
+/** Every number of a fluid's rendering that trades cost against quality. The defaults are the bay's. */
+pub struct LuxFluidQuality {
+    /** The smallest cosine of the view against the plane a footprint is stretched by: grazing views keep some waves. */
+    pub graze : f32 = 0.08;
+
+    /** A reflection is held above the plane at no less than this share of the flat reflection's rise ... */
+    pub riseShare : f32 = 0.5;
+
+    /** ... and never below this rise. */
+    pub riseMin : f32 = 0.002;
+
+    /** How fast the share of a skimming reflection that leaves the boundary falls: the power of rise over floor (1 linear, 2 quadratic). */
+    pub openPower : f32 = 2.0;
+
+    /** A slope variance below this is a flat surface: the share a pixel resolves of it is taken as whole. */
+    pub varianceFloor : f32 = 0.000001;
+
+    /** The reflectance at normal incidence the boundary's Fresnel starts from. */
+    pub f0 : f32 = 0.02;
+
+    /** How many bounces deep a reflection is traced; past them it reads the prefiltered sky. */
+    pub mirrorDepth : i32 = 3;
+
+    /** How far a ray refracted into the medium looks for what is behind, metres. */
+    pub throughReach : f32 = 90.0;
+
+    /** How far a ray is nudged off the boundary it leaves, metres. */
+    pub offset : f32 = 0.02;
+
+    /** How far an eye inside the medium sees, metres. */
+    pub immersedReach : f32 = 64.0;
+
+    /** The least upward slope a ray from inside is taken to reach the boundary with. */
+    pub immersedLevel : f32 = 0.0001;
+
+    /** How many times a view from inside follows the boundary's underside reflection back into the medium. */
+    pub immersedBounces : i32 = 1;
+}
+
+/** The boundary under a pixel: the normal of the slopes it resolves, and what it cannot resolve. */
+pub struct LuxMicrosurface {
+    /** The normal of the resolved slopes, unit length, pointing into the lighter medium. */
+    pub normal : Vec3 = Vec3 { x: 0.0, y: 1.0, z: 0.0 };
+
+    /** The share of the surface's slope variance the pixel cannot resolve, 0 to 1. */
+    pub unresolved : f32 = 0.0;
+
+    /** That variance itself: the Beckmann α² of the unresolved slopes. */
+    pub lost : f32 = 0.0;
+
+    /** False for a face with no slopes at all (the side of a water cell): its roughness is zero. */
+    pub wavy : bool = false;
+}
+
+/** A plane's flat microsurface of normal `n`: no slope, nothing unresolved. */
+pub fn luxFlatMicrosurface(n : Vec3) : LuxMicrosurface {
+    return LuxMicrosurface { normal: n, unresolved: 0.0, lost: 0.0, wavy: false };
+}
+
+/**
+ * The microsurface of resolved slopes (`slopeX`, `slopeZ`) on a horizontal boundary, `lost` the variance the pixel
+ * cannot resolve out of the surface's whole `meanSquare`.
+ */
+pub fn luxMicrosurfaceOf(
+    slopeX : f32,
+    slopeZ : f32,
+    lost : f32,
+    meanSquare : f32,
+    q : LuxFluidQuality
+) : LuxMicrosurface {
+    let total : f32 = max(meanSquare, q.varianceFloor);
+    return LuxMicrosurface {
+        normal: Vec3 { x: -slopeX, y: 1.0, z: -slopeZ }.normalized(),
+        unresolved: saturate(lost / total),
+        lost: lost,
+        wavy: true,
+    };
+}
+
+/**
+ * The patch a pixel covers on a horizontal plane `t` metres along the view `d`: `pixel` is the angle of a pixel, `depth`
+ * the bounce the ray is at (each one coarsens the footprint), `facing` the cosine of the view against the plane's normal
+ * on the side the eye is (`-d.y` from above, `d.y` from below).
+ */
+pub fn luxPlaneFootprint(
+    t : f32,
+    pixel : f32,
+    depth : i32,
+    d : Vec3,
+    facing : f32,
+    q : LuxFluidQuality
+) : LuxFootprint {
+    let across : f32 = t * pixel * (1.0 as f32 + depth as f32);
+    let flat : f32 = max((d.x * d.x + d.z * d.z).sqrt(), 0.000001 as f32);
+    return LuxFootprint {
+        across: across,
+        along: across / max(facing, q.graze),
+        dirX: d.x / flat,
+        dirZ: d.z / flat,
+    };
+}
+
+/** The perceptual roughness of the unresolved slopes, lost^(1/4); none for a face with no slopes. */
+pub fn luxMicroRoughness(m : LuxMicrosurface) : f32 {
+    if (!m.wavy) {
+        return 0.0;
+    }
+    return lightPow(m.lost, 0.25 as f32);
+}
+
+/**
+ * The direction a view `d` reflects to off a horizontal boundary of resolved normal `n`, held above the plane: a wave
+ * may tilt the reflection down, but no lower than about `riseShare` of the flat reflection's rise (-d.y) and `riseMin`
+ * (the floor is set before the direction is renormalised, so its rise ends a few per cent under it). A
+ * fixed floor lifted the grazing reflections of distant water above the foot of what they mirror (handbook 3.14
+ * §3.6.1).
+ */
+pub fn luxReflectAbove(d : Vec3, n : Vec3, q : LuxFluidQuality) : Vec3 {
+    let r : Vec3 = d.reflect(n);
+    let floor : f32 = max(-d.y * q.riseShare, q.riseMin);
+    if (r.y >= floor) {
+        return r;
+    }
+    return Vec3 { x: r.x, y: floor, z: r.z }.normalized();
+}
+
+/**
+ * The share of a reflection off the resolved normal `n` that leaves the boundary instead of running into the next wave:
+ * 1 when the reflected ray rises at least as much as `luxReflectAbove`'s floor, falling to 0 as it flattens to the
+ * plane, as the `openPower` of its rise over the floor (a quadratic keeps a quarter of it at half the floor). A wave tilts a grazing reflection down, and a ray that skims below its neighbours' crests strikes one: it
+ * sees the water, not the sky or the city. `luxReflectAbove` alone gave that ray the sky's colour (handbook 3.14 §3.6.1);
+ * the rest of the reflection (1 minus this share) is the water's own colour where the ray struck it, so energy is kept.
+ */
+pub fn luxReflectOpen(d : Vec3, n : Vec3, q : LuxFluidQuality) : f32 {
+    let rise : f32 = d.reflect(n).y;
+    let floor : f32 = max(-d.y * q.riseShare, q.riseMin);
+    return lightPow(saturate(rise / floor), q.openPower);
+}
+
+/**
+ * The reflectance of a dielectric boundary seen along `d` against the normal `n`, the cosine floored at 0.001: the
+ * exact Fresnel equations averaged over both polarisations, for the index of refraction that gives `f0` at normal
+ * incidence (`f0 = ((n - 1) / (n + 1))^2`, 0.02 for water): 0.722 at 3 degrees above the surface, 0.348 at 10. Schlick's
+ * approximation is 6 to 10 % higher at those grazing angles.
+ */
+pub fn luxViewFresnel(n : Vec3, d : Vec3, f0 : f32) : f32 {
+    let cosI : f32 = max(n.negated().dot(d), 0.001);
+    let root : f32 = sqrt(min(max(f0, 0.0 as f32), 0.98 as f32));
+    let index : f32 = ((1.0 as f32) + root) / ((1.0 as f32) - root);
+    // Snell: the sine of the refracted angle, and its cosine (the square cannot go below zero going into the denser medium).
+    let sinT : f32 = sqrt(max((1.0 as f32) - cosI * cosI, 0.0 as f32)) / index;
+    let cosT : f32 = sqrt(max((1.0 as f32) - sinT * sinT, 0.0 as f32));
+    let rs : f32 = (cosI - index * cosT) / (cosI + index * cosT);
+    let rp : f32 = (cosT - index * cosI) / (cosT + index * cosI);
+    return (rs * rs + rp * rp) * (0.5 as f32);
+}
+
+/** A reflection that reached the sky, `traced`, blurred toward the sky prefiltered at the unresolved slopes, `sky`. */
+pub fn luxSkyBlur(traced : Vec3, sky : Vec3, m : LuxMicrosurface) : Vec3 {
+    return traced.lerp(sky, m.unresolved);
+}
+
+/** What the boundary shows: `fresnel` of the reflection and the rest of what came through it. */
+pub fn luxFresnelMix(reflected : Vec3, transmitted : Vec3, fresnel : f32) : Vec3 {
+    return reflected.scale(fresnel).plus(transmitted.scale((1.0 as f32) - fresnel));
+}

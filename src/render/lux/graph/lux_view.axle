@@ -1,0 +1,113 @@
+// lux_view — the frozen inputs of one frame: what every light layer reads instead of live state.
+//
+// A frame of light is computed by many layers on many threads, some of them over several frames. If one of them read
+// the camera or the clock while another was moving it, the picture would tear: a shadow made for one sun beside a sky
+// made for the next. So the program fills one `LuxView` at the start of a frame and every layer reads that copy; the
+// next frame gets a new one. It is a struct, copied whole into whoever holds it, so nothing can change it behind a
+// worker's back.
+//
+// The view also turns the two continuous inputs into the steps caches are keyed on:
+//   - the sun moves with `dayTime` (in days; 0.5 is noon of day 0, 1.5 noon of day 1). `sunStep` counts
+//     `LUX_SUN_STEPS` steps a day, one every 0.25 degrees of the sun's turn (one minute of the day), and `sunBlend`
+//     is how far the day is past that step, the weight with which a layer blends the generation made for this step
+//     into the one made for the next;
+//   - the camera's cell is its position divided by `LUX_CAMERA_CELL` metres and floored, three signed 21-bit fields
+//     in one integer, so a world-space cache centred on the camera is re-centred when, and only when, the camera
+//     crosses a cell.
+
+use crate::core::math::dvec3::DVec3;
+use crate::core::math::vec3::Vec3;
+use crate::render::lux::graph::lux_key::LuxKey;
+
+/** Steps of the sun in one day: one every 0.25 degrees of its turn. */
+pub const LUX_SUN_STEPS : i64 = 1440;
+
+/** The edge of the camera's cell, metres: world-space caches centred on the camera move by this much. */
+pub const LUX_CAMERA_CELL : f64 = 16.0;
+
+// Each packed cell coordinate keeps 21 bits: +-1 048 575 cells, 16 000 km either way at 16 m a cell.
+const LUXV_CELL_BITS : i64 = 21;
+const LUXV_CELL_MASK : i64 = 2097151;
+
+/** The inputs of one frame, copied whole: the camera, the time of day, the sun and the epochs of what can change. */
+pub struct LuxView {
+    /** The frame number, counted by the program from 0. */
+    pub frame : i64 = 0;
+
+    /** The camera's position in the world, metres. */
+    pub eye : DVec3 = DVec3 { x: 0.0, y: 0.0, z: 0.0 };
+
+    /** The direction the camera looks along, unit length. */
+    pub forward : Vec3 = Vec3 { x: 0.0, y: 0.0, z: -1.0 };
+
+    /** The camera's right, unit length, perpendicular to `forward`. */
+    pub right : Vec3 = Vec3 { x: 1.0, y: 0.0, z: 0.0 };
+
+    /** The camera's up, unit length, perpendicular to both. */
+    pub up : Vec3 = Vec3 { x: 0.0, y: 1.0, z: 0.0 };
+
+    /** The vertical field of view, radians. */
+    pub fov : f32 = 1.0;
+
+    /** The picture's width in pixels, at the resolution the light is computed at. */
+    pub width : i32 = 1;
+
+    /** The picture's height in pixels. */
+    pub height : i32 = 1;
+
+    /** The time, in days since the start of day 0. */
+    pub dayTime : f64 = 0.5;
+
+    /** The direction toward the sun, unit length. */
+    pub sun : Vec3 = Vec3 { x: 0.0, y: 1.0, z: 0.0 };
+
+    /** The world's edit epoch: raised by the program whenever blocks change. */
+    pub worldEpoch : i64 = 0;
+
+    /** The epoch of the timecycle table: raised when the art direction is edited. */
+    pub timecycleEpoch : i64 = 0;
+
+    /** The epoch of the settings: raised when resolution or quality changes. */
+    pub settingsEpoch : i64 = 0;
+
+    /** The sun's step along its day: `floor(dayTime * LUX_SUN_STEPS)`. */
+    pub fn sunStep(self) : i64 {
+        return luxFloorI64(self.dayTime * (LUX_SUN_STEPS as f64));
+    }
+
+    /** How far the day is past `sunStep`, in `[0, 1)`: the weight of the next step's generation. */
+    pub fn sunBlend(self) : f32 {
+        let at : f64 = self.dayTime * (LUX_SUN_STEPS as f64);
+        let part : f64 = at - (self.sunStep() as f64);
+        return part as f32;
+    }
+
+    /** The camera's cell, packed: three signed 21-bit fields, x low, then y, then z. */
+    pub fn cameraCell(self) : i64 {
+        let cx : i64 = luxFloorI64(self.eye.x / LUX_CAMERA_CELL) & LUXV_CELL_MASK;
+        let cy : i64 = luxFloorI64(self.eye.y / LUX_CAMERA_CELL) & LUXV_CELL_MASK;
+        let cz : i64 = luxFloorI64(self.eye.z / LUX_CAMERA_CELL) & LUXV_CELL_MASK;
+        return cx | (cy << LUXV_CELL_BITS) | (cz << (2 * LUXV_CELL_BITS));
+    }
+
+    /** The key this frame's caches are compared on. */
+    pub fn key(self) : LuxKey {
+        return LuxKey {
+            world: self.worldEpoch,
+            sun: self.sunStep(),
+            camera: self.cameraCell(),
+            timecycle: self.timecycleEpoch,
+            settings: self.settingsEpoch,
+            frame: self.frame,
+        };
+    }
+}
+
+/** The largest integer not above `v`; `v` must lie within the range of `i64`. */
+pub fn luxFloorI64(v : f64) : i64 {
+    let t : i64 = v as i64;
+    if ((t as f64) > v) {
+        return t - 1;
+    }
+    return t;
+}

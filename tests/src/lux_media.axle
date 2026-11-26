@@ -1,0 +1,385 @@
+// lux_media — checks for thin surfaces, the boundary between two media and the view from inside one: the axes of a face,
+// the ray that goes on behind a sheet, Schlick's reflectance, the footprint of a pixel on a plane, the microsurface under
+// it, the reflection held above the plane, the medium's transmittance, glow and source, Snell's window and the sun
+// refracted into the medium.
+
+use ludax::{
+    Checks, LuxExit, LuxFaceAxes, LuxFluidQuality, LuxFootprint, LuxMedium, LuxMicrosurface,
+    LuxSunInside, Vec3, luxAcrossBoundary, luxBoundaryDistance, luxExit, luxFaceAxes, luxMediumGlow,
+    luxMediumSegment, luxMediumSource, luxMediumTransmit, luxMicrosurfaceOf, luxPlaneFootprint,
+    luxReflectAbove, luxSchlick, luxSunInside, luxSunPath, luxThinOnward, luxThinSeen,
+    luxViewFresnel, luxReflectOpen, cosD, sinD
+};
+
+/** Checks thin surfaces, interfaces and immersion. */
+pub class LuxMediaSuite {
+    /** Runs every check of the suite. */
+    pub static fn run(mut c : Checks) : void {
+        ltmFaceAxes(c);
+        ltmThin(c);
+        ltmFresnel(c);
+        ltmReflect(c);
+        ltmFootprint(c);
+        ltmMedium(c);
+        ltmExit(c);
+        ltmSun(c);
+    }
+}
+
+fn ltmAbs(a : f32) : f32 {
+    return a < 0.0 ? -a : a;
+}
+
+fn ltmSame(a : Vec3, b : Vec3, tol : f32) : bool {
+    return ltmAbs(a.x - b.x) <= tol && ltmAbs(a.y - b.y) <= tol && ltmAbs(a.z - b.z) <= tol;
+}
+
+// For one face normal: u and v are unit, orthogonal to each other and to the normal.
+fn ltmAxesOf(mut c : Checks, name : string, n : Vec3) : void {
+    let a : LuxFaceAxes = luxFaceAxes(n);
+    c.near("lux thin: ${name}: u is unit", a.u.length() as f64, 1.0, 0.000001);
+    c.near("lux thin: ${name}: v is unit", a.v.length() as f64, 1.0, 0.000001);
+    c.near("lux thin: ${name}: u is orthogonal to v", a.u.dot(a.v) as f64, 0.0, 0.000001);
+    c.near("lux thin: ${name}: u is orthogonal to the normal", a.u.dot(n) as f64, 0.0, 0.000001);
+    c.near("lux thin: ${name}: v is orthogonal to the normal", a.v.dot(n) as f64, 0.0, 0.000001);
+}
+
+fn ltmFaceAxes(mut c : Checks) : void {
+    ltmAxesOf(c, "+x face", Vec3::make(1.0, 0.0, 0.0));
+    ltmAxesOf(c, "-x face", Vec3::make(-1.0, 0.0, 0.0));
+    ltmAxesOf(c, "+y face", Vec3::make(0.0, 1.0, 0.0));
+    ltmAxesOf(c, "-y face", Vec3::make(0.0, -1.0, 0.0));
+    ltmAxesOf(c, "+z face", Vec3::make(0.0, 0.0, 1.0));
+    ltmAxesOf(c, "-z face", Vec3::make(0.0, 0.0, -1.0));
+}
+
+fn ltmThin(mut c : Checks) : void {
+    let axes : LuxFaceAxes = luxFaceAxes(Vec3::make(0.0, 0.0, 1.0));
+    let d : Vec3 = Vec3::make(0.6, 0.0, 0.8).normalized();
+    c.that(
+        "lux thin: no bend continues the ray",
+        ltmSame(luxThinOnward(d, axes, 0.0, 0.0), d.normalized(), 0.000001)
+    );
+    let bent : Vec3 = luxThinOnward(d, axes, 0.2, -0.1);
+    c.near("lux thin: a bent ray is unit", bent.length() as f64, 1.0, 0.000001);
+    c.that("lux thin: a bend moves the ray", !ltmSame(bent, d, 0.01));
+    let behind : Vec3 = Vec3::make(0.3, 0.5, 0.7);
+    let seen : Vec3 = luxThinSeen(behind, Vec3::make(1.0, 1.0, 1.0), Vec3::make(0.0, 0.0, 0.0));
+    c.that(
+        "lux thin: a white tint without emission shows what is behind",
+        seen.x == behind.x && seen.y == behind.y && seen.z == behind.z
+    );
+    let lit : Vec3 = luxThinSeen(behind, Vec3::make(0.5, 0.5, 0.5), Vec3::make(0.1, 0.0, 0.0));
+    c.near("lux thin: a tint scales and the emission adds", lit.x as f64, 0.25, 0.000001);
+}
+
+fn ltmFresnel(mut c : Checks) : void {
+    let n : Vec3 = Vec3::make(0.0, 1.0, 0.0);
+    let f0 : f32 = 0.02;
+    c.near(
+        "lux interface: Fresnel at normal incidence is f0 (the index it implies, to f32 rounding)",
+        luxViewFresnel(n, n.negated(), f0) as f64,
+        0.02,
+        0.000002
+    );
+    c.that("lux interface: Schlick at a cosine of 1 is f0", luxSchlick(1.0, f0) == f0);
+    c.near("lux interface: Schlick at grazing is 1", luxSchlick(0.0, f0) as f64, 1.0, 0.000001);
+    let grazing : Vec3 = Vec3::make(1.0, -0.01, 0.0).normalized();
+    ltmFresnelExact(c);
+    ltmReflectOpen(c);
+    c.that(
+        "lux interface: the view Fresnel rises toward grazing",
+        luxViewFresnel(n, grazing, f0)
+            > luxViewFresnel(n, Vec3::make(0.5, -1.0, 0.0).normalized(), f0)
+    );
+}
+fn ltmReflect(mut c : Checks) : void {
+    let q : LuxFluidQuality = LuxFluidQuality {};
+    let up : Vec3 = Vec3::make(0.0, 1.0, 0.0);
+    // A tilt that would send the reflection into the plane, at three heights of the view.
+    let tilted : Vec3 = Vec3::make(0.6, 0.8, 0.0);
+    let a : Vec3 = Vec3::make(0.99, -0.141, 0.0).normalized();
+    let b : Vec3 = Vec3::make(0.6, -0.8, 0.0);
+    let g : Vec3 = Vec3::make(1.0, 0.0, 0.0);
+    c.that(
+        "lux interface: a reflection is held above the rise of a low view",
+        ltmHeld(a, tilted, q)
+    );
+    c.that("lux interface: ... of a steep view", ltmHeld(b, tilted, q));
+    c.that(
+        "lux interface: ... and at least riseMin for a view along the plane",
+        ltmHeld(g, tilted, q)
+    );
+    let flat : Vec3 = luxReflectAbove(b, up, q);
+    c.that(
+        "lux interface: a flat plane's reflection is the mirror",
+        ltmSame(flat, b.reflect(up), 0.000001)
+    );
+}
+
+// True when the reflection of `d` off `n` is a unit direction held at or above max(riseShare (-d.y), riseMin).
+fn ltmHeld(d : Vec3, n : Vec3, q : LuxFluidQuality) : bool {
+    let want : f32 = ltmMax(-d.y * q.riseShare, q.riseMin);
+    let r : Vec3 = luxReflectAbove(d, n, q);
+    return r.y >= want * (0.98 as f32) && ltmAbs(r.length() - (1.0 as f32)) < 0.00001;
+}
+
+fn ltmMax(a : f32, b : f32) : f32 {
+    return a > b ? a : b;
+}
+
+fn ltmFootprint(mut c : Checks) : void {
+    let q : LuxFluidQuality = LuxFluidQuality {};
+    let d : Vec3 = Vec3::make(0.6, -0.5, 0.2).normalized();
+    let fp : LuxFootprint = luxPlaneFootprint(10.0, 0.001, 2, d, 0.5, q);
+    c.near(
+        "lux interface: the footprint across is t pixel (1 + depth)",
+        fp.across as f64,
+        0.03,
+        0.000001
+    );
+    c.that("lux interface: the footprint along is not shorter than across", fp.along >= fp.across);
+    c.near(
+        "lux interface: ... and across / facing at a gentle angle",
+        fp.along as f64,
+        0.06,
+        0.000001
+    );
+    c.near(
+        "lux interface: the footprint's direction is unit",
+        (fp.dirX * fp.dirX + fp.dirZ * fp.dirZ) as f64,
+        1.0,
+        0.00001
+    );
+    let grazing : LuxFootprint = luxPlaneFootprint(10.0, 0.001, 0, d, 0.0, q);
+    c.near(
+        "lux interface: grazing views stretch by 1 / graze at most",
+        grazing.along as f64,
+        ((0.01 as f32) / q.graze) as f64,
+        0.00001
+    );
+
+    let flat : LuxMicrosurface = luxMicrosurfaceOf(0.0, 0.0, 0.0001, 0.0004, q);
+    c.that(
+        "lux interface: no resolved slope gives the up normal",
+        ltmSame(flat.normal, Vec3::make(0.0, 1.0, 0.0), 0.000001)
+    );
+    c.near(
+        "lux interface: the unresolved share is lost / mean square",
+        flat.unresolved as f64,
+        0.25,
+        0.000001
+    );
+    c.that("lux interface: a microsurface of slopes is wavy", flat.wavy);
+    let over : LuxMicrosurface = luxMicrosurfaceOf(0.1, -0.2, 0.01, 0.0004, q);
+    c.that("lux interface: the unresolved share is capped at 1", over.unresolved == 1.0);
+    let none : LuxMicrosurface = luxMicrosurfaceOf(0.1, -0.2, 0.0, 0.0004, q);
+    c.that("lux interface: nothing lost leaves nothing unresolved", none.unresolved == 0.0);
+    c.that(
+        "lux interface: the normal of resolved slopes leans against them",
+        over.normal.x < 0.0 && over.normal.z > 0.0
+    );
+}
+
+fn ltmMedium(mut c : Checks) : void {
+    let m : LuxMedium = LuxMedium {};
+    let behind : Vec3 = Vec3::make(0.8, 0.6, 0.4);
+    let source : Vec3 = Vec3::make(0.2, 0.5, 0.9);
+    let t : f32 = 3.7;
+    let seg : Vec3 = luxMediumSegment(m, behind, t, source);
+    let want : Vec3 = behind.times(luxMediumTransmit(m, t)).plus(luxMediumGlow(m, t, source));
+    c.that(
+        "lux medium: a segment is behind T + glow, bit for bit",
+        seg.x == want.x && seg.y == want.y && seg.z == want.z
+    );
+    let none : Vec3 = luxMediumSegment(m, behind, 0.0, source);
+    c.that("lux medium: no distance shows what is behind", ltmSame(none, behind, 0.00001));
+
+    let deep : Vec3 = Vec3::make(0.1, 0.3, 0.4);
+    let far : Vec3 = luxMediumGlow(m, 10000.0, luxMediumSource(m, deep));
+    c.that(
+        "lux medium: the calibrated source shows deep for a medium of no end",
+        ltmSame(far, deep, 0.0001)
+    );
+}
+
+fn ltmExit(mut c : Checks) : void {
+    let m : LuxMedium = LuxMedium {};
+    let up : Vec3 = Vec3::make(0.0, 1.0, 0.0);
+
+    let inside : LuxExit = luxExit(ltmFromVertical(30.0), up, m);
+    c.that("lux exit: 30 degrees from the vertical leaves the medium", !inside.total);
+    c.that("lux exit: ... and goes on upward", inside.dir.y > 0.0);
+    c.that("lux exit: ... with the underside's mirror pointing down", inside.mirror.y < 0.0);
+    let edge : LuxExit = luxExit(ltmFromVertical(48.0), up, m);
+    c.that("lux exit: 48 degrees is still inside Snell's window", !edge.total);
+    let past : LuxExit = luxExit(ltmFromVertical(49.0), up, m);
+    c.that("lux exit: 49 degrees is total internal reflection", past.total);
+    let out : LuxExit = luxExit(ltmFromVertical(60.0), up, m);
+    c.that("lux exit: 60 degrees is total", out.total);
+    c.that("lux exit: a total reflection goes back down", out.dir.y < 0.0 && out.mirror.y < 0.0);
+    c.that("lux exit: a total reflection has Fresnel 1", out.fresnel == 1.0);
+
+    let beyond : Vec3 = Vec3::make(1.0, 0.0, 0.0);
+    let under : Vec3 = Vec3::make(0.0, 0.0, 1.0);
+    let mirror : Vec3 = luxAcrossBoundary(beyond, under, out);
+    c.that(
+        "lux exit: outside the window the boundary shows the underside",
+        mirror.x == 0.0 && mirror.z == 1.0
+    );
+    let mixed : Vec3 = luxAcrossBoundary(beyond, under, inside);
+    c.that(
+        "lux exit: inside it, the world beyond and the underside by Fresnel",
+        ltmSame(mixed, beyond.lerp(under, inside.fresnel), 0.000001)
+    );
+
+    let q : LuxFluidQuality = LuxFluidQuality {};
+    let o : Vec3 = Vec3::make(0.0, 1.0, 0.0);
+    let rising : Vec3 = Vec3::make(0.0, 0.8, 0.6);
+    c.near(
+        "lux exit: a rising ray meets the boundary at (top - y) / dy",
+        luxBoundaryDistance(o, rising, 5.0, q) as f64,
+        5.0,
+        0.00001
+    );
+    c.that(
+        "lux exit: a level ray reaches as far as the medium is seen",
+        luxBoundaryDistance(o, Vec3::make(1.0, 0.0, 0.0), 5.0, q) == q.immersedReach
+    );
+}
+
+fn ltmSun(mut c : Checks) : void {
+    let m : LuxMedium = LuxMedium {};
+
+    let low : LuxSunInside = luxSunInside(ltmFromHorizon(5.0), m);
+    let window : f32 = ((1.0 as f32) - (1.0 as f32) / (m.index * m.index)).sqrt();
+    c.that(
+        "lux sun: a sun at 5 degrees is refracted into Snell's window",
+        low.toSun.y >= window - 0.0001
+    );
+    c.near("lux sun: the refracted direction is unit", low.toSun.length() as f64, 1.0, 0.00001);
+    c.that("lux sun: a share of it crosses, not all", low.crossed > 0.0 && low.crossed < 1.0);
+    let high : LuxSunInside = luxSunInside(Vec3::make(0.0, 1.0, 0.0), m);
+    c.near("lux sun: an overhead sun goes straight down", high.toSun.y as f64, 1.0, 0.000001);
+    let mut longer : bool = true;
+    for (k of 0..5) {
+        let depth : f32 = (0.5 as f32) + (k as f32) * (2.0 as f32);
+        if (luxSunPath(low, depth) < depth || luxSunPath(high, depth) < depth - 0.00001) {
+            longer = false;
+        }
+    }
+    c.that("lux sun: the path through the medium is at least the depth", longer);
+}
+
+// A unit direction `deg` degrees from the vertical, in the x-y plane, going up.
+fn ltmFromVertical(deg : f64) : Vec3 {
+    let a : f64 = deg * 0.017453292519943295;
+    return Vec3 { x: sinD(a) as f32, y: cosD(a) as f32, z: 0.0 };
+}
+
+// A unit direction `deg` degrees above the horizon, in the x-y plane.
+fn ltmFromHorizon(deg : f64) : Vec3 {
+    let a : f64 = deg * 0.017453292519943295;
+    return Vec3 { x: cosD(a) as f32, y: sinD(a) as f32, z: 0.0 };
+}
+
+// The exact Fresnel reflectance of water (index 1.333, F0 0.02) at the grazing angles a camera at the water's edge sees:
+// the numbers of the unpolarised Fresnel equations, worked out independently (angle from the normal -> reflectance), to
+// a thousandth; and below Schlick's approximation there, which was 6 to 10 % too high.
+fn ltmFresnelExact(mut c : Checks) : void {
+    let n : Vec3 = Vec3::make(0.0, 1.0, 0.0);
+    let f0 : f32 = 0.02;
+    c.near(
+        "lux interface: Fresnel of water at 60 degrees from the normal is 0.060",
+        ltmFresnelAt(n, 60.0, f0),
+        0.060,
+        0.002
+    );
+    c.near("... at 75 degrees 0.212", ltmFresnelAt(n, 75.0, f0), 0.212, 0.002);
+    c.near("... at 80 degrees 0.348", ltmFresnelAt(n, 80.0, f0), 0.348, 0.002);
+    c.near("... at 85 degrees 0.584", ltmFresnelAt(n, 85.0, f0), 0.584, 0.002);
+    c.near(
+        "... at 87 degrees (3 above the surface) 0.722",
+        ltmFresnelAt(n, 87.0, f0),
+        0.722,
+        0.002
+    );
+    c.near("... at 89 degrees 0.896", ltmFresnelAt(n, 89.0, f0), 0.896, 0.003);
+    c.that(
+        "... and below Schlick's 0.769 at 87 degrees",
+        ltmFresnelAt(n, 87.0, f0) < luxSchlick(cosD(87.0 * 0.017453292519943295) as f32, f0)
+    );
+}
+
+// The share of a skimming reflection that leaves the water: whole on a flat surface, none when a wave tilts it into the
+// next crest, never more as the ray flattens, and the lifted direction of `luxReflectAbove` always rises.
+fn ltmReflectOpen(mut c : Checks) : void {
+    let q : LuxFluidQuality = LuxFluidQuality {};
+    let a : f64 = 3.0 * 0.017453292519943295;
+    let view : Vec3 = Vec3::make(cosD(a) as f32, -(sinD(a) as f32), 0.0);
+    let flat : Vec3 = Vec3::make(0.0, 1.0, 0.0);
+    c.near(
+        "lux interface: a flat surface lets the whole reflection out",
+        luxReflectOpen(view, flat, q),
+        1.0,
+        0.0001
+    );
+    let mut last : f32 = 1.0;
+    let mut falling : bool = true;
+    let mut lifted : bool = true;
+    let step : f32 = 0.01;
+    let top : f32 = 0.25;
+    let slack : f32 = 0.000001;
+    let mut tilt : f32 = 0.0;
+    while (tilt <= top) {
+        let n : Vec3 = Vec3::make(tilt, 1.0, 0.0).normalized();
+        let open : f32 = luxReflectOpen(view, n, q);
+        if (open > last + slack) {
+            falling = false;
+        }
+        if (luxReflectAbove(view, n, q).y <= 0.0) {
+            lifted = false;
+        }
+        last = open;
+        tilt = tilt + step;
+    }
+    c.that(
+        "... falls as a wave tilts the reflection toward the plane, never rising again",
+        falling
+    );
+    c.near("... and is nothing when the wave sends the ray into the surface", last, 0.0, 0.0001);
+    c.that("... while the direction that is still drawn always rises", lifted);
+    // The floor is half the flat reflection's rise (sin 3 degrees = 0.052336); a ray at half of it keeps a quarter.
+    let halfFloor : f32 = 0.013084;
+    c.near(
+        "... and a reflection at half the floor keeps a quarter of its light",
+        ltmOpenAtRise(view, q, halfFloor),
+        0.25,
+        0.01
+    );
+}
+
+// The open share for a reflection that rises `rise`: the normal, tilted away from the viewer, that gives it that rise, found by bisection.
+fn ltmOpenAtRise(view : Vec3, q : LuxFluidQuality, rise : f32) : f32 {
+    let two : f32 = 2.0;
+    let mut lo : f32 = 0.0;
+    let mut hi : f32 = 0.5;
+    for (i of 0..40) {
+        let mid : f32 = (lo + hi) / two;
+        let t : Vec3 = Vec3::make(mid, 1.0, 0.0).normalized();
+        if (view.reflect(t).y > rise) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    let m : Vec3 = Vec3::make(lo, 1.0, 0.0).normalized();
+    return luxReflectOpen(view, m, q);
+}
+
+// The reflectance seen at `degrees` from the normal `n`.
+fn ltmFresnelAt(n : Vec3, degrees : f64, f0 : f32) : f64 {
+    let a : f64 = degrees * 0.017453292519943295;
+    let view : Vec3 = Vec3::make(sinD(a) as f32, -(cosD(a) as f32), 0.0);
+    return luxViewFresnel(n, view, f0) as f64;
+}

@@ -1,0 +1,163 @@
+// lux_sprites — particles drawn into a finished picture as square pixel-art sprites, hidden behind nearer surfaces.
+//
+// A particle is a point with a size (`PtcEffect`); on screen it is a square `size / (distance · pixel)` pixels wide,
+// at least `minSide`, at most `maxShare` of the picture's height, made of 4 × 4 texels shaped as a diamond (whole in the
+// middle four, half on the rim, nothing at the corners). It fades in over [`fadeFrom`, `fadeTo`] metres from the eye,
+// so a mote brushing the eye never fills the screen. Its light is added: the sprites glow (handbook 3.15).
+//
+// It is drawn into the finished picture before the display, so bloom takes the bright ones, and every pixel it covers
+// is first written down (`LuxSpriteUndo`): the program puts them back before that picture is read as a history (an
+// upscaler's output is the next frame's history). A sprite never enters a history, so it leaves no trail and the light
+// behind it is the scene's as soon as it has passed. The depth test reads the computed picture's surface position
+// under each pixel, which may be smaller than the picture drawn into (upscaled).
+
+use crate::core::collections::vec::Vec;
+use crate::core::math::scalar::{max, min, smoothstep};
+use crate::core::math::vec3::Vec3;
+use crate::render::pathlight::pathlight_camera::LumenCamera;
+use crate::render::pathlight::pathlight_pixels::{pixelAt, pixelPut};
+use crate::sim::particles::particles::PtcEffect;
+
+/**
+ * The pixels sprites covered and what they held before, so the picture can be given back without them: draw, show,
+ * then `restore` before the picture is read again (as a history, or drawn into anew).
+ */
+pub class LuxSpriteUndo {
+    at  : Vec<i64>;
+    was : Vec<f32>;
+
+    /** Nothing to give back. */
+    constructor() {
+        self.at = new Vec<i64>();
+        self.was = new Vec<f32>();
+    }
+
+    /** True when sprites were drawn since the last `restore`. */
+    pub fn pending(self) : bool {
+        return !self.at.isEmpty();
+    }
+
+    /** Drops what is written down without giving it back: for a picture that was thrown away or resized. */
+    pub fn forget(mut self) : void {
+        self.at.clear();
+        self.was.clear();
+    }
+
+    /** Puts every covered pixel of `target` back as it was, last drawn first (a pixel two sprites crossed included). */
+    pub fn restore(mut self, mut target : f32[]) : void {
+        let mut k : i32 = self.at.len();
+        while (k > 0) {
+            k = k - 1;
+            let at : i64 = self.at.get(k) * 3;
+            target[at] = self.was.get(k * 3);
+            target[at + 1] = self.was.get(k * 3 + 1);
+            target[at + 2] = self.was.get(k * 3 + 2);
+        }
+        self.at.clear();
+        self.was.clear();
+    }
+
+    // Writes down pixel `at` of `target` before a sprite adds to it.
+    pub(file) fn note(mut self, target : f32[], at : i64) : void {
+        self.at.push(at);
+        self.was.push(target[at * 3]);
+        self.was.push(target[at * 3 + 1]);
+        self.was.push(target[at * 3 + 2]);
+    }
+}
+
+/** How sprites are drawn: their smallest and largest size on screen and the distances they fade in over. */
+pub struct LuxSpriteStyle {
+    /** The smallest a sprite is drawn, pixels: one, so a far spark still shows. */
+    pub minSide : f32 = 1.0;
+
+    /** The largest, as a share of the picture's height. */
+    pub maxShare : f32 = 0.025;
+
+    /** A sprite is invisible nearer than this to the eye, metres ... */
+    pub fadeFrom : f32 = 0.4;
+
+    /** ... and whole from this distance on. */
+    pub fadeTo : f32 = 2.0;
+}
+
+/**
+ * Adds the particles of `e`, seen by `cam`, into `target` (`tw` by `th`, three floats a pixel), each hidden where the
+ * surface of the computed picture under it (`pos`, `w` by `h` world positions) is nearer than the particle; every
+ * pixel covered is written down in `undo` first, for the picture to be given back without them.
+ */
+pub fn luxDrawSprites(
+    e : PtcEffect,
+    cam : LumenCamera,
+    style : LuxSpriteStyle,
+    mut target : f32[],
+    tw : i32,
+    th : i32,
+    pos : f32[],
+    w : i32,
+    h : i32,
+    mut undo : LuxSpriteUndo
+) : void {
+    let eye : Vec3 = cam.eye();
+    let pixel : f32 = cam.fov / (th as f32);
+    for (i of 0..e.count) {
+        let p : Vec3 = Vec3 { x: e.px[i], y: e.py[i], z: e.pz[i] };
+        let q : Vec3 = cam.project(p);
+        if (q.z <= 0.0) {
+            continue;
+        }
+        let dist : f32 = p.minus(eye).length();
+        let near : f32 = smoothstep(style.fadeFrom, style.fadeTo, dist);
+        if (near <= 0.0) {
+            continue;
+        }
+        let largest : f32 = (th as f32) * style.maxShare;
+        let side : f32 = min(max(e.size[i] / max(dist * pixel, 0.0001 as f32), style.minSide), largest);
+        let x0 : f32 = q.x * (tw as f32) - side * (0.5 as f32);
+        let y0 : f32 = q.y * (th as f32) - side * (0.5 as f32);
+        let colour : Vec3 = Vec3 { x: e.r[i], y: e.g[i], z: e.b[i] }.scale(near);
+        let fromX : i32 = max(x0, 0.0 as f32) as i32;
+        let fromY : i32 = max(y0, 0.0 as f32) as i32;
+        let mut toX : i32 = ((x0 + side) as i32) + 1;
+        let mut toY : i32 = ((y0 + side) as i32) + 1;
+        if (toX > tw) {
+            toX = tw;
+        }
+        if (toY > th) {
+            toY = th;
+        }
+        for (y of fromY..toY) {
+            for (x of fromX..toX) {
+                // The computed pixel under this one: the same pixel, or the one it was upscaled from.
+                let under : i64 = ((((y * h) / th) * w) + ((x * w) / tw)) as i64;
+                if (pixelAt(pos, under).minus(eye).length() < dist) {
+                    continue;
+                }
+                let tx : i32 = ((((x as f32) + (0.5 as f32) - x0) / side) * (4.0 as f32)) as i32;
+                let ty : i32 = ((((y as f32) + (0.5 as f32) - y0) / side) * (4.0 as f32)) as i32;
+                let shine : f32 = luxSpriteTexel(tx, ty);
+                if (shine > 0.0) {
+                    let at : i64 = (y as i64) * (tw as i64) + (x as i64);
+                    undo.note(target, at);
+                    pixelPut(target, at, pixelAt(target, at).plus(colour.scale(shine)));
+                }
+            }
+        }
+    }
+}
+
+/** The 4 × 4 texels of a sprite: a diamond, whole in the middle four, half on the edges, nothing at the corners. */
+pub fn luxSpriteTexel(tx : i32, ty : i32) : f32 {
+    if (tx < 0 || ty < 0 || tx > 3 || ty > 3) {
+        return 0.0;
+    }
+    let edgeX : bool = tx == 0 || tx == 3;
+    let edgeY : bool = ty == 0 || ty == 3;
+    if (edgeX && edgeY) {
+        return 0.0;
+    }
+    if (edgeX || edgeY) {
+        return 0.45;
+    }
+    return 1.0;
+}

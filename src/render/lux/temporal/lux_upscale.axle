@@ -1,0 +1,550 @@
+// lux_upscale — temporal super-resolution: a picture computed small, rebuilt at the window's size from frame to frame.
+//
+// A CPU path tracer holds 60 frames a second at about 300 000 pixels; a 1080p screen has two million. Each frame is
+// therefore computed at a fraction of the output (the governor chooses it), every frame with the whole picture shifted
+// by a different sub-pixel offset (a Halton (2, 3) sequence), and this stage accumulates those samples into a history
+// at the output's own size, as TAAU, FSR 2 and DLSS do on a GPU (handbook 3.16):
+//
+//   current   c(X) = Σ wᵢ Lᵢ / Σ wᵢ over the 2 × 2 samples round the output pixel X,
+//             wᵢ = (1 - d²/r²)²  (d in render pixels): a sample that lands on X counts fully. r narrows from one
+//             computed pixel (an empty history: no hole) to about one output pixel as the history fills (FSR 2's
+//             rule): each sample then counts where it was taken, and the output resolves finer than the computed
+//             picture
+//   history   H(X) = the output history at X moved by the motion of the nearest sample (its previous screen position
+//             minus its present one), read bilinearly; refused when the surface there was at another distance from
+//             the previous eye (disocclusion), or when it falls off the picture
+//   clamp     H clamped to the box [min, max] of the 3 × 3 samples round the nearest one, widened a little: history
+//             that the present does not support (a ghost, a stale reflection) cannot survive. A job computes the
+//             boxes of the computed rows its output rows read, once per computed pixel of that band (at three times
+//             the size nine output pixels share each), and keeps none: no box buffer the size of the picture
+//   blend     n' = min(n + Σ wᵢ, cap),  out = H + (c - H) Σ wᵢ / n'
+//             each output pixel is the mean of up to `cap` samples, weighted by how close each fell
+//
+// Still, every output pixel collects samples from every sub-pixel position and converges to the full resolution in
+// cap / (Σ wᵢ) frames; moving, the history is reprojected and clamped, so the picture stays sharp without trailing.
+// The program gives, per computed pixel, its previous screen position, its distance to the previous and present eye,
+// and its cap (short for water, whose light moves); the stage knows nothing of cameras or scenes.
+
+use crate::core::math::scalar::{max, min};
+use crate::core::math::vec3::Vec3;
+
+/** The floats per computed pixel of the motion buffer the program fills: previous u and v (0..1), previous distance (negative: none), present distance, cap. */
+pub const LUX_MOTION_STRIDE : i32 = 5;
+
+// The widening of the clamp box, as a share of its size: a little, so that the history's own noise is not cut.
+const LUXU_BOX_SLACK : f32 = 0.15;
+
+// The same for a steady pixel (one that has not moved on the screen and whose memory is the long one): its history is
+// exact and nothing in its rays moves with the time, so there is no ghost to cut, and a box made of this frame's samples
+// alone only cuts what it should keep: a detail smaller than a pixel whenever the offset leaves it out of the 3 x 3 (a
+// lit window far down a street blinked), and the lit windows of a whole facade whenever the computed grid changes (the
+// governor's step: 2281 pixels of a facade changed by more than 20 levels in one frame, 14 without the clamp). A share
+// this large is no clamp. A pixel whose light moves (water, a reflection of it) keeps the close clamp: it bounds the lag.
+const LUXU_STILL_SLACK : f32 = 1000.0;
+
+// The memory from which a pixel counts as steady for the clamp above: the policy's `still` is 192, `slow` 96.
+const LUXU_STEADY_FROM : f32 = 64.0;
+
+// The samples a pixel must hold before its gather is narrowest, and the narrow kernel's radius: this many computed
+// pixels per output pixel (about an output pixel), never under this many computed pixels.
+const LUXU_SHARP_AFTER : f32 = 8.0;
+const LUXU_NARROW : f32 = 1.6;
+const LUXU_NARROW_MIN : f32 = 0.55;
+
+// A history whose distance differs from the present surface's by more than this share (plus a fixed margin, metres)
+// belongs to another surface.
+const LUXU_DEPTH_SHARE : f32 = 0.06;
+
+// A sample within this share of a computed pixel of where it was last frame has not moved: its history is kept.
+const LUXU_STILL_SHARE : f32 = 0.05;
+const LUXU_DEPTH_MARGIN : f32 = 0.2;
+
+// The two histories of `n` output pixels, written in turn: colour (3 floats) and count with distance (2 floats) a pixel.
+// Held by one object replaced whole when the output grows: Axle frees the array a field store displaces only when its
+// value never leaves the object (ledger §862 in the Axle repository), and these are lent to the loops every frame;
+// the old object is freed with its arrays.
+class LuxuHistory {
+    pub(file) colourA : f32[];
+    pub(file) colourB : f32[];
+    pub(file) stateA  : f32[];
+    pub(file) stateB  : f32[];
+
+    constructor(n : i64) {
+        self.colourA = new f32[n * 3];
+        self.colourB = new f32[n * 3];
+        self.stateA = new f32[n * 2];
+        self.stateB = new f32[n * 2];
+    }
+}
+
+/** The output history and the pass that rebuilds it each frame from a small, jittered picture. */
+pub class LuxUpscale {
+    // The two histories, written in turn, held by an object replaced whole when it must grow (see `LuxuHistory`).
+    history : LuxuHistory;
+    flip    : bool = false;
+
+    /** The output size, pixels. */
+    pub ow : i32 = 0;
+    pub oh : i32 = 0;
+
+    /** True until a frame was written: the first frame takes no history. */
+    pub fresh : bool = true;
+
+    /** An upscaler with no size yet: `fit` gives it one. */
+    constructor() {
+        self.history = new LuxuHistory(1);
+    }
+
+    /**
+     * Outputs `ow` by `oh` from now on. The buffers only grow. The history starts over only when the output's size
+     * changes: a new computed size keeps it, which is what lets the computed size follow the load without a seam.
+     */
+    pub fn fit(mut self, ow : i32, oh : i32) : void {
+        if (ow != self.ow || oh != self.oh) {
+            self.fresh = true;
+        }
+        let n : i64 = (ow as i64) * oh;
+        if (n * 3 > self.history.colourA.length) {
+            self.history = new LuxuHistory(n);
+        }
+        self.ow = ow;
+        self.oh = oh;
+    }
+
+    /** Bytes the upscaler holds: its two histories at the output's size. */
+    pub fn bytes(self) : i64 {
+        return (self.history.colourA.length + self.history.colourB.length + self.history.stateA.length
+            + self.history.stateB.length)
+            * 4;
+    }
+
+    /**
+     * The buffer `rows` writes this frame: `ow` by `oh`, three floats a pixel. After `swap` it is the other one, the
+     * next frame's to write: read the finished picture through `latest`.
+     */
+    pub fn output(self) : f32[] {
+        return self.flip ? self.history.colourB : self.history.colourA;
+    }
+
+    /** The picture the last finished frame wrote (after `swap`): the one to show, and the next frame's history. */
+    pub fn latest(self) : f32[] {
+        return self.flip ? self.history.colourA : self.history.colourB;
+    }
+
+    /** Makes the picture just written the history of the next frame. Call once a frame, after every row. */
+    pub fn swap(mut self) : void {
+        self.flip = !self.flip;
+        self.fresh = false;
+    }
+
+    /**
+     * Rebuilds output rows `begin` up to `end` from the computed picture `low` (`w` by `h`, three floats a pixel,
+     * every sample taken at its pixel's centre plus (`jx`, `jy`) pixels) and its `motion` (`LUX_MOTION_STRIDE` floats
+     * a pixel). Reads the history, writes the output; rows may run on any threads.
+     */
+    pub fn rows(
+        mut self,
+        low : f32[],
+        motion : f32[],
+        w : i32,
+        h : i32,
+        jx : f32,
+        jy : f32,
+        begin : i32,
+        end : i32
+    ) : void {
+        let mut out : f32[] = self.output();
+        let mut outState : f32[] = self.flip ? self.history.stateB : self.history.stateA;
+        let past : f32[] = self.flip ? self.history.colourA : self.history.colourB;
+        let pastState : f32[] = self.flip ? self.history.stateA : self.history.stateB;
+        let sx : f32 = (w as f32) / (self.ow as f32);
+        let sy : f32 = (h as f32) / (self.oh as f32);
+        // Every division of the loop is a multiplication by one of these.
+        let invW : f32 = (1.0 as f32) / (w as f32);
+        let invH : f32 = (1.0 as f32) / (h as f32);
+        let invOw : f32 = (1.0 as f32) / (self.ow as f32);
+        let invOh : f32 = (1.0 as f32) / (self.oh as f32);
+        let invSharp : f32 = (1.0 as f32) / LUXU_SHARP_AFTER;
+        // How far a sample may be from where it was last frame and still count as not having moved: a share of a
+        // computed pixel, which a still camera's samples stay well within (their reprojection is exact but for rounding).
+        let stillU : f32 = invW * LUXU_STILL_SHARE;
+        let stillV : f32 = invH * LUXU_STILL_SHARE;
+        // The fields the loop reads, bound once: a store through `out` could change them for all the compiler knows,
+        // and it would load them again for every pixel (hot-loop rule R4).
+        let ow : i32 = self.ow;
+        let oh : i32 = self.oh;
+        let fresh : bool = self.fresh;
+        // The kernel's radius takes two values for nearly every pixel: an empty history (trust 0) and a full one
+        // (trust 1). Both are computed by the loop's own expression, once; only 0 < count < 8 divides per pixel.
+        let narrow : f32 = max(sx * LUXU_NARROW, LUXU_NARROW_MIN);
+        let one0 : f32 = 1.0;
+        let reachFull : f32 = one0 + (narrow * narrow - one0) * one0;
+        let invEmpty : f32 = one0 / (one0 + (narrow * narrow - one0) * (0.0 as f32));
+        let invFull : f32 = one0 / reachFull;
+        let one : f32 = 1.0;
+        let half : f32 = 0.5;
+        // The clamp boxes of the computed rows these output rows read, and only those: the nearest computed row of
+        // an output row grows with it, so the band runs from the first row's to the last's.
+        let bandFrom : i32 = luxuNearest(((begin as f32) + half) * sy - jy, h);
+        let bandTo : i32 = luxuNearest(((end - 1) as f32 + half) * sy - jy, h) + 1;
+        let mut box : f32[] = new f32[((bandTo - bandFrom) as i64) * w * 6];
+        luxuBoxBand(low, w, h, bandFrom, bandTo, box);
+        for (oy of begin..end) {
+            let ry : f32 = ((oy as f32) + half) * sy;
+            for (ox of 0..ow) {
+                let rx : f32 = ((ox as f32) + half) * sx;
+                // The sample nearest the output pixel: sample (i, j) was taken at (i + 1/2 + jx, j + 1/2 + jy).
+                let ci : i32 = luxuNearest(rx - jx, w);
+                let cj : i32 = luxuNearest(ry - jy, h);
+                let o : i64 = ((oy * ow + ox) as i64) * 3;
+                let os : i64 = ((oy * ow + ox) as i64) * 2;
+                let m : i64 = ((cj * w + ci) as i64) * (LUX_MOTION_STRIDE as i64);
+                let cap : f32 = motion[m + 4];
+                let nowDist : f32 = motion[m + 3];
+                let centre : i64 = ((cj * w + ci) as i64) * 3;
+
+                // The history first: the output pixel moved as its nearest sample moved since the last frame. How
+                // many samples it holds decides how sharp this frame's gather may be.
+                let mut count : f32 = 0.0;
+                let mut unmoved : bool = false;
+                let mut hr : f32 = 0.0;
+                let mut hg : f32 = 0.0;
+                let mut hb : f32 = 0.0;
+                let prevDist : f32 = motion[m + 2];
+                if (!fresh && prevDist >= 0.0) {
+                    let su : f32 = ((ci as f32) + half + jx) * invW;
+                    let sv : f32 = ((cj as f32) + half + jy) * invH;
+                    let pu : f32 = ((ox as f32) + half) * invOw + motion[m] - su;
+                    let pv : f32 = ((oy as f32) + half) * invOh + motion[m + 1] - sv;
+                    let px : f32 = pu * (ow as f32) - half;
+                    let py : f32 = pv * (oh as f32) - half;
+                    // The history's place is inside the picture when its pixel centre is: a place on the last row or
+                    // column, or a hair off the first by rounding, is read with its edge repeated. Asking for
+                    // 0 <= px < ow - 1 refused them, and a pixel on the picture's edge then never had a history and
+                    // showed each frame's raw samples (the outer rows and columns shimmered at the offset cycle).
+                    if (px >= -half && py >= -half && px <= ((ow - 1) as f32) + half
+                        && py <= ((oh - 1) as f32) + half) {
+                        let cx : f32 = min(max(px, 0.0 as f32), (ow - 1) as f32);
+                        let cy : f32 = min(max(py, 0.0 as f32), (oh - 1) as f32);
+                        let x0 : i32 = cx as i32;
+                        let y0 : i32 = cy as i32;
+                        let x1 : i32 = x0 + 1 < ow ? x0 + 1 : x0;
+                        let y1 : i32 = y0 + 1 < oh ? y0 + 1 : y0;
+                        let fx : f32 = cx - x0 as f32;
+                        let fy : f32 = cy - y0 as f32;
+                        let near : i64 = ((((cy + half) as i32) * ow + ((cx + half) as i32)) as i64) * 2;
+                        let was : f32 = pastState[near + 1];
+                        // A sample that has not moved on the screen cannot have revealed anything, so its history is
+                        // kept whatever distance it was taken at; the colour clamp still cuts what the present no
+                        // longer supports. Asking the distance there threw away, every frame, the history of a wall
+                        // seen edge on (a sub-pixel offset moves its distance by tens of metres) and of a silhouette
+                        // (the nearest sample is the tower on one frame, the sky on the next): a still view blinked
+                        // there. A sample that moved keeps the test of its own distance.
+                        let still : bool = luxuAbs(motion[m] - su) < stillU
+                            && luxuAbs(motion[m + 1] - sv) < stillV;
+                        unmoved = still;
+                        if (still
+                            || luxuAbs(was - prevDist) <= prevDist * LUXU_DEPTH_SHARE + LUXU_DEPTH_MARGIN) {
+                            let a00 : i64 = ((y0 * ow + x0) as i64) * 3;
+                            let a10 : i64 = ((y0 * ow + x1) as i64) * 3;
+                            let a01 : i64 = ((y1 * ow + x0) as i64) * 3;
+                            let a11 : i64 = ((y1 * ow + x1) as i64) * 3;
+                            let w00 : f32 = (one - fx) * (one - fy);
+                            let w10 : f32 = fx * (one - fy);
+                            let w01 : f32 = (one - fx) * fy;
+                            let w11 : f32 = fx * fy;
+                            hr = past[a00] * w00 + past[a10] * w10 + past[a01] * w01 + past[a11] * w11;
+                            hg = past[a00 + 1] * w00 + past[a10 + 1] * w10 + past[a01 + 1] * w01
+                                + past[a11 + 1] * w11;
+                            hb = past[a00 + 2] * w00 + past[a10 + 2] * w10 + past[a01 + 2] * w01
+                                + past[a11 + 2] * w11;
+                            count = pastState[near];
+                        }
+                    }
+                }
+
+                // The gather: a wide kernel (a computed pixel) while the pixel holds little, so no hole shows; a
+                // narrow one (about an output pixel) once its history is full, so each sample counts where it was
+                // taken and the output resolves what the computed picture cannot.
+                let trust : f32 = min(count * invSharp, one);
+                let mut invReach : f32 = invFull;
+                if (trust <= 0.0) {
+                    invReach = invEmpty;
+                } else if (trust < one) {
+                    invReach = one / (one + (narrow * narrow - one) * trust);
+                }
+                let mut sum : f32 = 0.0;
+                let mut r : f32 = 0.0;
+                let mut g : f32 = 0.0;
+                let mut b : f32 = 0.0;
+                // The four samples round the output pixel: sample (i, j) sits at (i + 1/2 + jx, j + 1/2 + jy).
+                let fi : f32 = rx - jx - half;
+                let fj : f32 = ry - jy - half;
+                let i0 : i32 = luxuFloor(fi);
+                let j0 : i32 = luxuFloor(fj);
+                for (dj of 0..2) {
+                    let j : i32 = j0 + dj;
+                    if (j < 0 || j >= h) {
+                        continue;
+                    }
+                    for (di of 0..2) {
+                        let i : i32 = i0 + di;
+                        if (i < 0 || i >= w) {
+                            continue;
+                        }
+                        let dx : f32 = (i as f32) - fi;
+                        let dy : f32 = (j as f32) - fj;
+                        let t : f32 = one - (dx * dx + dy * dy) * invReach;
+                        if (t > 0.0) {
+                            let at : i64 = ((j * w + i) as i64) * 3;
+                            let wgt : f32 = t * t;
+                            sum = sum + wgt;
+                            r = r + wgt * low[at];
+                            g = g + wgt * low[at + 1];
+                            b = b + wgt * low[at + 2];
+                        }
+                    }
+                }
+                let bx : i64 = (((cj - bandFrom) * w + ci) as i64) * 6;
+                let loR : f32 = box[bx];
+                let loG : f32 = box[bx + 1];
+                let loB : f32 = box[bx + 2];
+                let hiR : f32 = box[bx + 3];
+                let hiG : f32 = box[bx + 4];
+                let hiB : f32 = box[bx + 5];
+                if (sum > 0.0) {
+                    let inv : f32 = one / sum;
+                    r = r * inv;
+                    g = g * inv;
+                    b = b * inv;
+                } else {
+                    r = low[centre];
+                    g = low[centre + 1];
+                    b = low[centre + 2];
+                }
+                if (count > 0.0) {
+                    // What the present samples round this pixel do not support is cut away: closely for a history that
+                    // moved (a ghost is possible), loosely for one that did not.
+                    let share : f32 = unmoved && cap >= LUXU_STEADY_FROM ? LUXU_STILL_SLACK : LUXU_BOX_SLACK;
+                    let slackR : f32 = (hiR - loR) * share;
+                    let slackG : f32 = (hiG - loG) * share;
+                    let slackB : f32 = (hiB - loB) * share;
+                    hr = min(max(hr, loR - slackR), hiR + slackR);
+                    hg = min(max(hg, loG - slackG), hiG + slackG);
+                    hb = min(max(hb, loB - slackB), hiB + slackB);
+                }
+                let total : f32 = min(count + sum, max(cap, one));
+                let k : f32 = count > 0.0 ? min(sum / max(total, 0.0001 as f32), one) : one;
+                out[o] = hr + (r - hr) * k;
+                out[o + 1] = hg + (g - hg) * k;
+                out[o + 2] = hb + (b - hb) * k;
+                outState[os] = count > 0.0 ? total : max(sum, 0.0001 as f32);
+                outState[os + 1] = nowDist;
+            }
+        }
+    }
+}
+
+/**
+ * How fast the light of a pixel changes with the time, as the program that traced it knows: nothing its rays met moves
+ * (`Steady`: the long memory, the loose clamp), only what it reflects does (`Slow`: a window onto the sea), or its own
+ * light does (`Restless`: water, a flickering lamp, a portal). `LuxUpscalePolicy.cap` turns it into a number of samples.
+ */
+pub enum LuxChange : i8 {
+    /** Nothing in the pixel's rays moves with the time. */
+    Steady,
+    /** Only what the pixel reflects or refracts moves. */
+    Slow,
+    /** The pixel's own light moves. */
+    Restless,
+
+    /** Its place in the order Steady, Slow, Restless: 0, 1, 2. */
+    fn rank(self) : i32 {
+        return match self {
+            LuxChange::Steady => 0,
+            LuxChange::Slow => 1,
+            LuxChange::Restless => 2,
+        };
+    }
+
+    /** The faster-changing of this and `other`: a pixel's change is the fastest thing its rays met. */
+    pub fn orMore(self, other : LuxChange) : LuxChange {
+        return other.rank() > self.rank() ? other : self;
+    }
+}
+
+/**
+ * How the upscaler is fed, frame by frame: the cycle of sub-pixel offsets and the most samples an output pixel keeps
+ * while the view changes, while it is still, and inside a medium whose light moves (water under waves).
+ */
+pub struct LuxUpscalePolicy {
+    /**
+     * Frames in a cycle of Halton (2, 3) offsets. The history is an exponential mean, and a mean of a signal with period
+     * T keeps a ripple of about 1 / (2 sin(pi / T)) of its weight: 16 left a visible 3.75 Hz shimmer on fine
+     * detail, 8 halves it for an enlargement up to 2 (measured: 0.145 to 0.102, for 0.26 dB), 4 loses 1.3 dB.
+     */
+    pub cycle : i32 = 8;
+
+    /** The most samples kept while the view changes: few, so nothing trails. */
+    pub moving : f32 = 8.0;
+
+    /**
+     * The most samples kept while it is still: many, so the output converges to its full resolution and the ripple of
+     * the offset cycle (an exponential mean of a 16-periodic signal, about 1 / still of its contrast) disappears. Only
+     * for light that does not change with time: the program gives `restless` to the rest.
+     */
+    pub still : f32 = 192.0;
+
+    /**
+     * The most samples kept where the pixel's own light moves with the time (water, a flickering lamp): a short memory,
+     * but not shorter than the ripple allows (about 1 / restless of the contrast). 32 keeps the sea as sharp (its
+     * gradient energy falls 1.4 % against 12) and a lit window's shimmer 25 % lower.
+     */
+    pub restless : f32 = 32.0;
+
+    /**
+     * The same while the view changes. A restless pixel moving is mostly the sea, and what it shows (the buildings'
+     * reflection) is a virtual image that does not move with the surface the history is reprojected by: the longer the
+     * memory, the longer the reflection slides behind the camera. Short, so it does not.
+     */
+    pub restlessMoving : f32 = 4.0;
+
+    /**
+     * The most samples a pixel of change `change` keeps while the view is still (`moving` false) or changing: the
+     * policy's base memory, cut to `slow` for a slow pixel and to `restless` (`restlessMoving` moving) for a restless one.
+     */
+
+    /** The most samples kept where only what the pixel reflects moves (a window onto the sea): in between. */
+    pub slow : f32 = 96.0;
+
+    pub fn cap(self, change : LuxChange, moving : bool) : f32 {
+        let base : f32 = moving ? self.moving : self.still;
+        return match change {
+            LuxChange::Steady => base,
+            LuxChange::Slow => min(base, self.slow),
+            LuxChange::Restless => min(base, moving ? self.restlessMoving : self.restless),
+        };
+    }
+}
+
+/** The sub-pixel offset of frame `index` of `p`'s cycle, x then y, each in (-1/2, 1/2). */
+pub fn luxUpscaleOffsetX(p : LuxUpscalePolicy, index : i32) : f32 {
+    return luxHaltonX(luxuPhase(index, p.cycle));
+}
+
+/** The second coordinate of `luxUpscaleOffsetX`'s offset. */
+pub fn luxUpscaleOffsetY(p : LuxUpscalePolicy, index : i32) : f32 {
+    return luxHaltonY(luxuPhase(index, p.cycle));
+}
+
+/**
+ * Writes computed pixel `i`'s entry of the `motion` buffer: its surface `p` was at `prev` on the previous picture (u, v
+ * in 0..1, z its depth, not positive when behind the previous eye `prevEye`), it is seen from `eye`, and its output
+ * pixels keep at most `cap` samples.
+ */
+pub fn luxMotionWrite(
+    mut motion : f32[],
+    i : i64,
+    p : Vec3,
+    prev : Vec3,
+    prevEye : Vec3,
+    eye : Vec3,
+    cap : f32
+) : void {
+    let at : i64 = i * (LUX_MOTION_STRIDE as i64);
+    motion[at] = prev.x;
+    motion[at + 1] = prev.y;
+    motion[at + 2] = prev.z > 0.0 ? p.minus(prevEye).length() : -1.0;
+    motion[at + 3] = p.minus(eye).length();
+    motion[at + 4] = cap;
+}
+
+/** The `n`-th point of the Halton (2, 3) sequence, centred: a sub-pixel offset in (-1/2, 1/2)² for frame `n`. */
+pub fn luxHaltonX(n : i32) : f32 {
+    return luxuRadical(n + 1, 2) - (0.5 as f32);
+}
+
+/** The second coordinate of `luxHaltonX`'s point. */
+pub fn luxHaltonY(n : i32) : f32 {
+    return luxuRadical(n + 1, 3) - (0.5 as f32);
+}
+
+// The radical inverse of `n` in base `b`: its digits mirrored about the point.
+fn luxuRadical(n : i32, b : i32) : f32 {
+    let mut f : f32 = 1.0;
+    let mut r : f32 = 0.0;
+    let mut i : i32 = n;
+    let inv : f32 = (1.0 as f32) / (b as f32);
+    while (i > 0) {
+        f = f * inv;
+        r = r + f * ((i % b) as f32);
+        i = i / b;
+    }
+    return r;
+}
+
+// The integer at or below `v`.
+fn luxuFloor(v : f32) : i32 {
+    let t : i32 = v as i32;
+    return (t as f32) > v ? t - 1 : t;
+}
+
+fn luxuAbs(x : f32) : f32 {
+    return x < 0.0 ? -x : x;
+}
+
+// The nearest computed row (or column) of an output position `v` (computed pixels, sample offset taken off): the
+// index `rows` reads, clamped to the picture's `n` rows.
+fn luxuNearest(v : f32, n : i32) : i32 {
+    return min(max(v, 0.0 as f32), (n - 1) as f32) as i32;
+}
+
+// The clamp boxes of computed rows `from` up to `to` of `low` (`w` by `h`), into `band` (row `from` first): per pixel
+// the min then the max of each channel over its 3 x 3 neighbours, the edges clamped. Separable: the min and max over
+// the three rows, column by column, then over three columns. min and max are exact, so the box is the one a 3 x 3
+// loop finds; six reads a pixel instead of twenty-seven.
+fn luxuBoxBand(low : f32[], w : i32, h : i32, from : i32, to : i32, mut band : f32[]) : void {
+    let mut column : f32[] = new f32[(w as i64) * 6];
+    for (j of from..to) {
+        let r0 : i64 = ((j > 0 ? j - 1 : 0) as i64) * w * 3;
+        let r1 : i64 = (j as i64) * w * 3;
+        let r2 : i64 = ((j + 1 < h ? j + 1 : h - 1) as i64) * w * 3;
+        for (i of 0..w) {
+            let c : i64 = (i as i64) * 3;
+            let o : i64 = (i as i64) * 6;
+            column[o] = min(min(min(1000000000.0 as f32, low[r0 + c]), low[r1 + c]), low[r2 + c]);
+            column[o + 1] = min(
+                min(min(1000000000.0 as f32, low[r0 + c + 1]), low[r1 + c + 1]),
+                low[r2 + c + 1]
+            );
+            column[o + 2] = min(
+                min(min(1000000000.0 as f32, low[r0 + c + 2]), low[r1 + c + 2]),
+                low[r2 + c + 2]
+            );
+            column[o + 3] = max(max(max(-1.0 as f32, low[r0 + c]), low[r1 + c]), low[r2 + c]);
+            column[o + 4] = max(max(max(-1.0 as f32, low[r0 + c + 1]), low[r1 + c + 1]), low[r2 + c + 1]);
+            column[o + 5] = max(max(max(-1.0 as f32, low[r0 + c + 2]), low[r1 + c + 2]), low[r2 + c + 2]);
+        }
+        let row : i64 = ((j - from) as i64) * w * 6;
+        for (i of 0..w) {
+            let a : i64 = ((i > 0 ? i - 1 : 0) as i64) * 6;
+            let b : i64 = (i as i64) * 6;
+            let c : i64 = ((i + 1 < w ? i + 1 : w - 1) as i64) * 6;
+            let o : i64 = row + b;
+            band[o] = min(min(column[a], column[b]), column[c]);
+            band[o + 1] = min(min(column[a + 1], column[b + 1]), column[c + 1]);
+            band[o + 2] = min(min(column[a + 2], column[b + 2]), column[c + 2]);
+            band[o + 3] = max(max(column[a + 3], column[b + 3]), column[c + 3]);
+            band[o + 4] = max(max(column[a + 4], column[b + 4]), column[c + 4]);
+            band[o + 5] = max(max(column[a + 5], column[b + 5]), column[c + 5]);
+        }
+    }
+}
+
+// The place of frame `index` in a cycle of `cycle` frames, always in 0..cycle: a negative index counts back from the
+// end (`%` keeps the sign of its left side), and a cycle under 1 is a cycle of 1.
+fn luxuPhase(index : i32, cycle : i32) : i32 {
+    let n : i32 = cycle < 1 ? 1 : cycle;
+    let r : i32 = index % n;
+    return r < 0 ? r + n : r;
+}

@@ -1,0 +1,372 @@
+// lux_graph — the layers of light and the buffers between them: who depends on whom, what runs, what runs together.
+//
+// The light of a frame is declared as a graph before it is computed: layers (`LuxLayerDesc`) and the buffers they
+// read and write, by name. Two kinds of buffer:
+//   - a transient buffer lives within one frame (the G-buffer, the lit picture before grading);
+//   - a cache survives from frame to frame (the sky's tables, the shadow pages, the history of the picture). Several
+//     layers reading one cache is a shared cache; one layer reading what it writes is a private one.
+//
+// Two kinds of read:
+//   - `reads`: this frame's result. The reader runs after every writer of the buffer;
+//   - `readsPrevious`: a cache as the previous frame left it (the history a temporal layer blends into). This creates
+//     no ordering at all, so the shading can read last frame's history at the start of the frame while the temporal
+//     layer rewrites it at the end. Only a cache can be read this way.
+//
+// Ordering and validation are the render graph's (`RenderGraph` + `GraphCompiler`, deterministic by declaration
+// order); caches are declared to it as imported resources, so a layer may read what it is the first to write. What
+// the render graph cannot say for light, this file adds:
+//   - liveness. A layer is live when it writes an output of the frame, or a buffer a live layer reads (either way).
+//     A cache that no live layer reads does not keep its writer alive (the render graph keeps every writer of an
+//     imported resource);
+//   - feeds: the layers whose results a layer reads, this frame's or the previous one's. The scheduler re-runs a
+//     layer when a feed has published something new;
+//   - fusion. Consecutive live screen layers of one scale form a group that the program runs in one walk over tiles,
+//     each tile going through every layer of the group while its pixels are still in the processor's cache. A layer
+//     that reads a buffer of its own group around a pixel (`readsAround`: a blur, a gradient) needs that buffer
+//     finished on the neighbouring tiles too, so it starts a new group.
+//
+// Every query walks the edge lists, which is quadratic in the edges; a frame has tens of layers and is compiled once,
+// not every frame.
+
+use crate::core::collections::vec::Vec;
+use crate::render::graph::graph_graph::RenderGraph;
+use crate::render::graph::graph_plan::{GraphPlan, GraphCompiler};
+use crate::render::graph::graph_types::{GraphResKind, GraphIssueKind, GraphIssues, PassKind};
+use crate::render::lux::graph::lux_layer::{LuxDomain, LuxLayerDesc};
+
+/** Layers of light, their buffers, and the order, liveness, feeds and fused groups compiled from them. */
+pub class LuxGraph {
+    graph     : RenderGraph;
+    plan      : GraphPlan;
+    problems  : GraphIssues;
+    declared  : GraphIssues;
+    descs     : Vec<LuxLayerDesc>;
+    edgeReach : Vec<i32>;
+    prevLayer : Vec<i32>;
+    prevRes   : Vec<i32>;
+    live      : Vec<bool>;
+    order     : Vec<i32>;
+    feedStart : Vec<i32>;
+    feedList  : Vec<i32>;
+    group     : Vec<i32>;
+    groups    : i32 = 0;
+    compiled  : bool = false;
+
+    /** An empty graph. */
+    constructor() {
+        self.graph = new RenderGraph();
+        self.plan = GraphCompiler::compile(self.graph);
+        self.problems = new GraphIssues();
+        self.declared = new GraphIssues();
+        self.descs = new Vec<LuxLayerDesc>();
+        self.edgeReach = new Vec<i32>();
+        self.prevLayer = new Vec<i32>();
+        self.prevRes = new Vec<i32>();
+        self.live = new Vec<bool>();
+        self.order = new Vec<i32>();
+        self.feedStart = new Vec<i32>();
+        self.feedList = new Vec<i32>();
+        self.group = new Vec<i32>();
+    }
+
+    /** Adds a layer; returns its id (the order layers were added in), or -1 when the name is taken. */
+    pub fn addLayer(mut self, name : string, desc : LuxLayerDesc) : i32 {
+        let id : i32 = self.graph.addPass(name, PassKind::Custom);
+        if (id >= 0) {
+            self.descs.push(desc);
+        }
+        return id;
+    }
+
+    /** Declares a buffer that lives within one frame, of about `bytes` bytes. */
+    pub fn addTransient(mut self, name : string, bytes : i64) : void {
+        self.graph.addBuffer(name, GraphResKind::Texture, bytes, false);
+    }
+
+    /** Declares a cache: a buffer kept from frame to frame, of about `bytes` bytes. */
+    pub fn addCache(mut self, name : string, bytes : i64) : void {
+        self.graph.addBuffer(name, GraphResKind::Texture, bytes, true);
+    }
+
+    /** Marks buffer `name` as a result of the frame: the layers it needs are live. */
+    pub fn markOutput(mut self, name : string) : void {
+        self.graph.markOutput(name);
+    }
+
+    /** Declares that `layer` reads this frame's buffer `name` at the pixel it computes. */
+    pub fn reads(mut self, layer : i32, name : string) : void {
+        self.readsAround(layer, name, 0);
+    }
+
+    /** Declares that `layer` reads this frame's buffer `name` up to `reach` pixels around the pixel it computes. */
+    pub fn readsAround(mut self, layer : i32, name : string, reach : i32) : void {
+        let before : i32 = self.graph.edgeTotal();
+        self.graph.reads(layer, name);
+        if (self.graph.edgeTotal() > before) {
+            self.edgeReach.push(reach);
+        }
+    }
+
+    /** Declares that `layer` reads cache `name` as the previous frame left it; no ordering follows from it. */
+    pub fn readsPrevious(mut self, layer : i32, name : string) : void {
+        let r : i32 = self.graph.findResource(name);
+        if (r < 0 || !self.graph.isImported(r)) {
+            self.declared.add(
+                GraphIssueKind::WrongKind,
+                "layer ${layer} reads '${name}' from the previous frame, but it is not a declared cache"
+            );
+            return;
+        }
+        self.prevLayer.push(layer);
+        self.prevRes.push(r);
+    }
+
+    /** Declares that `layer` writes buffer `name`. */
+    pub fn writes(mut self, layer : i32, name : string) : void {
+        let before : i32 = self.graph.edgeTotal();
+        self.graph.writes(layer, name);
+        if (self.graph.edgeTotal() > before) {
+            self.edgeReach.push(0);
+        }
+    }
+
+    /**
+     * Validates and orders the layers, then works out liveness, feeds and fused groups. Answers whether the graph
+     * is valid; when it is not, `issues` says why and nothing runs.
+     */
+    pub fn compile(mut self) : bool {
+        self.plan = GraphCompiler::compile(self.graph);
+        self.problems = new GraphIssues();
+        let found : GraphIssues = self.plan.problems();
+        for (i of 0..found.count()) {
+            self.problems.add(found.kind(i), found.text(i));
+        }
+        for (i of 0..self.declared.count()) {
+            self.problems.add(self.declared.kind(i), self.declared.text(i));
+        }
+
+        self.compiled = self.problems.count() == 0;
+        self.order.clear();
+        self.feedStart.clear();
+        self.feedList.clear();
+        self.group.clear();
+        self.groups = 0;
+        if (!self.compiled) {
+            return false;
+        }
+
+        self.findLive();
+        for (i of 0..self.plan.runCount()) {
+            let l : i32 = self.plan.passAt(i);
+            if (self.live.get(l)) {
+                self.order.push(l);
+            }
+        }
+        self.findFeeds();
+        self.findGroups();
+        return true;
+    }
+
+    /** What validation found; empty when the graph compiled. */
+    pub fn issues(self) : GraphIssues {
+        return self.problems;
+    }
+
+    /** How many layers were added. */
+    pub fn layerTotal(self) : i32 {
+        return self.descs.len();
+    }
+
+    /** The name layer `l` was added under. */
+    pub fn name(self, l : i32) : string {
+        return self.graph.passName(l);
+    }
+
+    /** The description of layer `l`. */
+    pub fn desc(self, l : i32) : LuxLayerDesc {
+        return self.descs.get(l);
+    }
+
+    /** How many layers run each frame they are stale: the live ones. */
+    pub fn runCount(self) : i32 {
+        return self.order.len();
+    }
+
+    /** The `i`-th live layer in the order they run. */
+    pub fn layerAt(self, i : i32) : i32 {
+        return self.order.get(i);
+    }
+
+    /** True when layer `l` is needed by an output of the frame. */
+    pub fn isLive(self, l : i32) : bool {
+        return self.compiled && self.live.get(l);
+    }
+
+    /** How many layers feed layer `l`. */
+    pub fn feedCount(self, l : i32) : i32 {
+        return self.feedStart.get(l + 1) - self.feedStart.get(l);
+    }
+
+    /** The `k`-th layer that feeds layer `l`, in id order. */
+    pub fn feedAt(self, l : i32, k : i32) : i32 {
+        return self.feedList.get(self.feedStart.get(l) + k);
+    }
+
+    /** The fused group of layer `l`, or -1 when it is not a live screen layer. */
+    pub fn groupOf(self, l : i32) : i32 {
+        return self.group.get(l);
+    }
+
+    /** How many fused groups the live screen layers form. */
+    pub fn groupCount(self) : i32 {
+        return self.groups;
+    }
+
+    // A layer is live when it writes an output, or a buffer some live layer reads; repeated until nothing changes,
+    // at most once per layer.
+    fn findLive(mut self) : void {
+        let n : i32 = self.descs.len();
+        self.live.clear();
+        for (l of 0..n) {
+            self.live.push(self.writesOutput(l));
+        }
+
+        let mut grew : bool = true;
+        while (grew) {
+            grew = false;
+            for (l of 0..n) {
+                if (self.live.get(l) || !self.feedsLiveLayer(l)) {
+                    continue;
+                }
+                self.live.set(l, true);
+                grew = true;
+            }
+        }
+    }
+
+    fn writesOutput(self, l : i32) : bool {
+        for (e of 0..self.graph.edgeTotal()) {
+            let r : i32 = self.graph.edgeResourceOf(e);
+            if (self.graph.edgePassOf(e) == l && self.graph.edgeIsWrite(e) && r >= 0
+                && self.graph.isOutput(r)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // True when layer `l` writes a buffer that another live layer reads.
+    fn feedsLiveLayer(self, l : i32) : bool {
+        for (e of 0..self.graph.edgeTotal()) {
+            if (self.graph.edgePassOf(e) != l || !self.graph.edgeIsWrite(e)) {
+                continue;
+            }
+            let r : i32 = self.graph.edgeResourceOf(e);
+            for (p of 0..self.descs.len()) {
+                if (p != l && self.live.get(p) && self.layerReads(p, r)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    // For every layer, the other layers that write what it reads, in id order, without repeats.
+    fn findFeeds(mut self) : void {
+        let n : i32 = self.descs.len();
+        for (l of 0..n) {
+            self.feedStart.push(self.feedList.len());
+            for (q of 0..n) {
+                if (q != l && self.readsFrom(l, q)) {
+                    self.feedList.push(q);
+                }
+            }
+        }
+        self.feedStart.push(self.feedList.len());
+    }
+
+    // True when layer `l` reads (either way) a buffer that layer `q` writes.
+    fn readsFrom(self, l : i32, q : i32) : bool {
+        for (e of 0..self.graph.edgeTotal()) {
+            let r : i32 = self.graph.edgeResourceOf(e);
+            if (self.graph.edgePassOf(e) == q && self.graph.edgeIsWrite(e) && self.layerReads(l, r)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // True when layer `l` reads resource `r`, this frame's or the previous one's.
+    fn layerReads(self, l : i32, r : i32) : bool {
+        for (e of 0..self.graph.edgeTotal()) {
+            let p : i32 = self.graph.edgePassOf(e);
+            if (p == l && !self.graph.edgeIsWrite(e) && self.graph.edgeResourceOf(e) == r) {
+                return true;
+            }
+        }
+        for (k of 0..self.prevLayer.len()) {
+            if (self.prevLayer.get(k) == l && self.prevRes.get(k) == r) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    fn layerWrites(self, q : i32, r : i32) : bool {
+        for (e of 0..self.graph.edgeTotal()) {
+            if (self.graph.edgePassOf(e) == q && self.graph.edgeIsWrite(e)
+                && self.graph.edgeResourceOf(e) == r) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Walks the live layers in order; a screen layer joins the open group when it has the group's scale and reads
+    // nothing of the group around its pixel; anything else closes the group.
+    fn findGroups(mut self) : void {
+        for (l of 0..self.descs.len()) {
+            self.group.push(-1);
+        }
+
+        let mut open : i32 = -1;
+        let mut openScale : i32 = 0;
+        for (i of 0..self.order.len()) {
+            let l : i32 = self.order.get(i);
+            let d : LuxLayerDesc = self.descs.get(l);
+            if (!LuxGraph::isScreen(d)) {
+                open = -1;
+                continue;
+            }
+            if (open < 0 || d.scale != openScale || self.readsGroupAround(l, open)) {
+                open = self.groups;
+                openScale = d.scale;
+                self.groups = self.groups + 1;
+            }
+            self.group.set(l, open);
+        }
+    }
+
+    // True when layer `l` reads, around its pixel, a buffer written by a layer already in group `g`.
+    fn readsGroupAround(self, l : i32, g : i32) : bool {
+        for (e of 0..self.graph.edgeTotal()) {
+            if (self.graph.edgePassOf(e) != l || self.graph.edgeIsWrite(e) || self.edgeReach.get(e) == 0) {
+                continue;
+            }
+            let r : i32 = self.graph.edgeResourceOf(e);
+            for (q of 0..self.descs.len()) {
+                if (self.group.get(q) == g && self.layerWrites(q, r)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    static fn isScreen(d : LuxLayerDesc) : bool {
+        return match d.domain {
+            LuxDomain::Screen => true,
+            _ => false,
+        };
+    }
+}
