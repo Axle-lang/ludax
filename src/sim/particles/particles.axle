@@ -1,0 +1,449 @@
+// particles — sparks, motes, embers and leaves: a pool of plain arrays moved by a stack of closed ops.
+//
+// An effect is a pool (one `f32[]` per attribute, fixed capacity, no allocation per tick) and a stack of ops built by
+// the program in a few lines (design: `doc/design/particles-wind.md`, handbook 3.15):
+//
+//   Gravity  v += g dt                                  Drag    v *= exp(-k dt) ≈ 1 - k dt
+//   Wind     v += (w - v) k dt                          the particle relaxes toward the air's velocity
+//   Attract  v += (c - p) k dt + (axis × (c - p)) s dt  pulled toward a point and swirled round it: a portal's motes
+//   Rise     v.y += k dt                                buoyancy: embers and sparks
+//   Wobble   v += k (hash(id, slot) - 1/2) dt           a push that differs from mote to mote, changing `often` times a second
+//   Colour   colour = lerp(start, end, age / life)      Size  size = lerp(start, end, age / life)
+//   Flicker  colour *= 1 - k + k hash(id, slot)          a spark's twinkle, `often` times a second
+//
+// Each op runs as one flat loop over the pool, in the order of the stack, so forces compose by addition and a new op
+// is one value, one loop, one builder. Spawning is deterministic: an emitter draws from a `Pcg32` seeded by the
+// effect's seed, the emitter's key and the tick, so a replay, a reference picture and any thread count give the same
+// particles. A dead particle is replaced by the last one (swap-remove) in index order: also deterministic.
+
+use crate::core::collections::vec::Vec;
+use crate::core::field::lux_noise::luxNoiseCorner;
+use crate::core::math::scalar::{max, min};
+use crate::core::math::vec3::Vec3;
+use crate::core::rng::pcg32::Pcg32;
+
+/** The ops of a particle stack. A new op is one value, one loop in `PtcEffect.step`, one builder. */
+enum PtcOp : i8 {
+    /** Constant acceleration (gx, gy, gz). */
+    Gravity = 0,
+    /** Velocity damped by `k` a second. */
+    Drag = 1,
+    /** Velocity relaxed toward the wind (wx, wy, wz) at rate `k`. */
+    Wind = 2,
+    /** Pulled toward a point at rate `k` and swirled round a vertical axis through it at rate `s`. */
+    Attract = 3,
+    /** Upward acceleration `k`: buoyancy. */
+    Rise = 4,
+    /** A per-particle wandering push of strength `k`, changing `f` times a second. */
+    Wobble = 5,
+    /** The colour from `start` to `end` over the particle's life. */
+    Colour = 6,
+    /** The size from `start` to `end` over the particle's life. */
+    Size = 7,
+    /** The brightness flickers by up to `k`, `f` times a second. */
+    Flicker = 8,
+
+    /** The number a stack stores. */
+    pub fn code(self) : i32 {
+        return self as i32;
+    }
+
+    /** The op stored as `n`. */
+    pub static fn fromCode(n : i32) : PtcOp {
+        return match n {
+            0 => PtcOp::Gravity,
+            1 => PtcOp::Drag,
+            2 => PtcOp::Wind,
+            3 => PtcOp::Attract,
+            4 => PtcOp::Rise,
+            5 => PtcOp::Wobble,
+            6 => PtcOp::Colour,
+            7 => PtcOp::Size,
+            _ => PtcOp::Flicker,
+        };
+    }
+}
+
+/** Where and how an emitter makes particles, written whole. */
+pub struct PtcSpawn {
+    /** The box particles are born in: its lower corner and its size, metres. */
+    pub x  : f32 = 0.0;
+    pub y  : f32 = 0.0;
+    pub z  : f32 = 0.0;
+    pub sx : f32 = 1.0;
+    pub sy : f32 = 1.0;
+    pub sz : f32 = 1.0;
+
+    /** Particles born per second. */
+    pub rate : f32 = 10.0;
+
+    /** The initial velocity, and how far each component may vary either way. */
+    pub vx     : f32 = 0.0;
+    pub vy     : f32 = 0.0;
+    pub vz     : f32 = 0.0;
+    pub spread : f32 = 0.5;
+
+    /** The life, seconds, from `life` to `life + lifeSpread`. */
+    pub life       : f32 = 1.0;
+    pub lifeSpread : f32 = 0.5;
+}
+
+/** The ticks a `PtcClock` asks to run this frame: from `from` up to `to`, after clearing the pool when `clear`. */
+pub struct PtcTicks {
+    /** The first tick to run. */
+    pub from : i64 = 0;
+
+    /** One past the last. */
+    pub to : i64 = 0;
+
+    /** True when the clock went back: the pool must be emptied before the ticks run. */
+    pub clear : bool = false;
+}
+
+/**
+ * A fixed-tick clock for an effect, driven by a frame clock in seconds: the same ticks for the same times on every
+ * machine. The first call lives the effect's first `warm` ticks at once (a picture never shows an empty fountain); a
+ * clock that went back starts the effect over; once particles are alive, a long pause runs at most `catchUp` ticks, so
+ * it does not stall a frame (an empty effect runs every tick it missed: that is how its first call warms it up).
+ */
+pub class PtcClock {
+    /** Ticks a second. */
+    pub rate : i32 = 60;
+
+    /** The most ticks one frame runs once the effect is alive. */
+    pub catchUp : i64 = 6;
+
+    /** The ticks the first frame runs at once. */
+    pub warm : i64 = 180;
+
+    tick   : i64 = 0;
+    warmed : bool = false;
+
+    /** A clock of the default rate, catch-up and warm-up. */
+    constructor() {}
+
+    /** The length of a tick, seconds. */
+    pub fn dt(self) : f32 {
+        return (1.0 as f32) / (self.rate as f32);
+    }
+
+    /** The ticks to run to reach `seconds`, for an effect holding `alive` particles; the clock then stands at their end. */
+    pub fn advance(mut self, seconds : f64, alive : i32) : PtcTicks {
+        let target : i64 = (seconds * (self.rate as f64)) as i64;
+        let mut clear : bool = false;
+        if (!self.warmed) {
+            self.warmed = true;
+            self.tick = target - self.warm;
+        }
+        if (target < self.tick) {
+            clear = true;
+            self.tick = target;
+        }
+        if (target - self.tick > self.catchUp && alive > 0) {
+            self.tick = target - self.catchUp;
+        }
+        let from : i64 = self.tick;
+        self.tick = target;
+        return PtcTicks { from: from, to: target, clear: clear };
+    }
+}
+
+// The floats each op keeps: its parameters.
+const PTC_PARAMS : i32 = 8;
+
+/**
+ * One effect: a pool of particles, the stack of ops that moves them and the look they are drawn with. Built once,
+ * stepped at a fixed tick by the simulation, read by the renderer.
+ */
+pub class PtcEffect {
+    /** Positions, metres. */
+    pub px : f32[];
+    pub py : f32[];
+    pub pz : f32[];
+
+    /** Velocities, metres a second. */
+    pub vx : f32[];
+    pub vy : f32[];
+    pub vz : f32[];
+
+    /** Age and life, seconds. */
+    pub age  : f32[];
+    pub life : f32[];
+
+    /** Colour (scene radiance when the effect glows, albedo when it does not) and size, metres. */
+    pub r    : f32[];
+    pub g    : f32[];
+    pub b    : f32[];
+    pub size : f32[];
+
+    /** A number per particle for the hashed ops: its birth order. */
+    pub id : i32[];
+
+    /** How many particles are alive, and how many can be. */
+    pub count    : i32 = 0;
+    pub capacity : i32;
+
+    /** True when the particles give light (drawn added to the picture), false when they are lit. */
+    pub glows : bool = true;
+
+    ops    : Vec<i32>;
+    params : Vec<f32>;
+    seed   : i32;
+    born   : i32 = 0;
+
+    /** An effect of at most `capacity` particles, its random streams seeded by `seed`. */
+    constructor(capacity : i32, seed : i32) {
+        let n : i64 = max(capacity as f32, 1.0 as f32) as i64;
+        self.capacity = capacity;
+        self.seed = seed;
+        self.px = new f32[n];
+        self.py = new f32[n];
+        self.pz = new f32[n];
+        self.vx = new f32[n];
+        self.vy = new f32[n];
+        self.vz = new f32[n];
+        self.age = new f32[n];
+        self.life = new f32[n];
+        self.r = new f32[n];
+        self.g = new f32[n];
+        self.b = new f32[n];
+        self.size = new f32[n];
+        self.id = new i32[n];
+        self.ops = new Vec<i32>();
+        self.params = new Vec<f32>();
+    }
+
+    /** Adds constant acceleration (gx, gy, gz), metres a second squared. */
+    pub fn gravity(mut self, gx : f32, gy : f32, gz : f32) : void {
+        self.push(PtcOp::Gravity, gx, gy, gz, 0.0, 0.0, 0.0, 0.0, 0.0);
+    }
+
+    /** Damps the velocity by `k` a second. */
+    pub fn drag(mut self, k : f32) : void {
+        self.push(PtcOp::Drag, k, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    }
+
+    /** Relaxes the velocity toward the wind `w` at rate `k` a second. */
+    pub fn wind(mut self, w : Vec3, k : f32) : void {
+        self.push(PtcOp::Wind, w.x, w.y, w.z, k, 0.0, 0.0, 0.0, 0.0);
+    }
+
+    /** Pulls toward `centre` at rate `k` and swirls round the vertical through it at `swirl` radians a second. */
+    pub fn attract(mut self, centre : Vec3, k : f32, swirl : f32) : void {
+        self.push(PtcOp::Attract, centre.x, centre.y, centre.z, k, swirl, 0.0, 0.0, 0.0);
+    }
+
+    /** Accelerates upward by `k`: buoyancy. */
+    pub fn rise(mut self, k : f32) : void {
+        self.push(PtcOp::Rise, k, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    }
+
+    /** Pushes each particle its own way with strength `k`, changing `often` times a second. */
+    pub fn wobble(mut self, k : f32, often : f32) : void {
+        self.push(PtcOp::Wobble, k, often, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    }
+
+    /** Colours from `start` to `end` over the life. */
+    pub fn colour(mut self, start : Vec3, end : Vec3) : void {
+        self.push(PtcOp::Colour, start.x, start.y, start.z, end.x, end.y, end.z, 0.0, 0.0);
+    }
+
+    /** Sizes from `start` to `end` metres over the life. */
+    pub fn sized(mut self, start : f32, end : f32) : void {
+        self.push(PtcOp::Size, start, end, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    }
+
+    /** Flickers the brightness by up to `k`, `often` times a second. */
+    pub fn flicker(mut self, k : f32, often : f32) : void {
+        self.push(PtcOp::Flicker, k, often, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    }
+
+    /**
+     * Births for tick `tick` (of `dt` seconds) from the emitter `key` described by `s`: how many is a function of the
+     * tick alone (no carried remainder), and every draw comes from a stream seeded by the effect, the key and the tick.
+     */
+    pub fn emit(mut self, s : PtcSpawn, key : i32, tick : i64, dt : f32) : void {
+        let before : i64 = ((tick as f64) * ((s.rate * dt) as f64)) as i64;
+        let after : i64 = (((tick + 1) as f64) * ((s.rate * dt) as f64)) as i64;
+        let n : i32 = (after - before) as i32;
+        if (n <= 0) {
+            return;
+        }
+        let rng : Pcg32 = new Pcg32(
+            ((self.seed as i64) * 1000003 + (key as i64)) as u64,
+            (tick as u64) * 2 + 1
+        );
+        for (k of 0..n) {
+            if (self.count >= self.capacity) {
+                return;
+            }
+            let i : i32 = self.count;
+            self.px[i] = s.x + rng.nextF32() * s.sx;
+            self.py[i] = s.y + rng.nextF32() * s.sy;
+            self.pz[i] = s.z + rng.nextF32() * s.sz;
+            self.vx[i] = s.vx + (rng.nextF32() * (2.0 as f32) - (1.0 as f32)) * s.spread;
+            self.vy[i] = s.vy + (rng.nextF32() * (2.0 as f32) - (1.0 as f32)) * s.spread;
+            self.vz[i] = s.vz + (rng.nextF32() * (2.0 as f32) - (1.0 as f32)) * s.spread;
+            self.age[i] = 0.0;
+            self.life[i] = s.life + rng.nextF32() * s.lifeSpread;
+            self.r[i] = 1.0;
+            self.g[i] = 1.0;
+            self.b[i] = 1.0;
+            self.size[i] = 0.1;
+            self.id[i] = self.born;
+            self.born = self.born + 1;
+            self.count = self.count + 1;
+        }
+    }
+
+    /** Advances every particle by `dt` seconds at tick `tick`: ages and removes the dead, runs the stack, moves. */
+    pub fn step(mut self, dt : f32, tick : i64) : void {
+        self.cull(dt);
+        let n : i32 = self.count;
+        for (o of 0..self.ops.len()) {
+            let at : i32 = o * PTC_PARAMS;
+            let a : f32 = self.params.get(at);
+            let b : f32 = self.params.get(at + 1);
+            let c : f32 = self.params.get(at + 2);
+            let d : f32 = self.params.get(at + 3);
+            let e : f32 = self.params.get(at + 4);
+            let f : f32 = self.params.get(at + 5);
+            match PtcOp::fromCode(self.ops.get(o)) {
+                PtcOp::Gravity => {
+                    for (i of 0..n) {
+                        self.vx[i] = self.vx[i] + a * dt;
+                        self.vy[i] = self.vy[i] + b * dt;
+                        self.vz[i] = self.vz[i] + c * dt;
+                    }
+                },
+                PtcOp::Drag => {
+                    let keep : f32 = max((1.0 as f32) - a * dt, 0.0 as f32);
+                    for (i of 0..n) {
+                        self.vx[i] = self.vx[i] * keep;
+                        self.vy[i] = self.vy[i] * keep;
+                        self.vz[i] = self.vz[i] * keep;
+                    }
+                },
+                PtcOp::Wind => {
+                    let k : f32 = min(d * dt, 1.0 as f32);
+                    for (i of 0..n) {
+                        self.vx[i] = self.vx[i] + (a - self.vx[i]) * k;
+                        self.vy[i] = self.vy[i] + (b - self.vy[i]) * k;
+                        self.vz[i] = self.vz[i] + (c - self.vz[i]) * k;
+                    }
+                },
+                PtcOp::Attract => {
+                    for (i of 0..n) {
+                        let dx : f32 = a - self.px[i];
+                        let dy : f32 = b - self.py[i];
+                        let dz : f32 = c - self.pz[i];
+                        // Toward the point, and round the vertical axis through it: (0, 1, 0) × (dx, dy, dz).
+                        self.vx[i] = self.vx[i] + (dx * d + dz * e) * dt;
+                        self.vy[i] = self.vy[i] + dy * d * dt;
+                        self.vz[i] = self.vz[i] + (dz * d - dx * e) * dt;
+                    }
+                },
+                PtcOp::Rise => {
+                    for (i of 0..n) {
+                        self.vy[i] = self.vy[i] + a * dt;
+                    }
+                },
+                PtcOp::Wobble => {
+                    let slot : i32 = ((tick as f64) * ((b * dt) as f64)) as i32;
+                    for (i of 0..n) {
+                        let id : i32 = self.id[i];
+                        let half : f32 = 0.5;
+                        self.vx[i] = self.vx[i] + a * (luxNoiseCorner(id, slot, self.seed) - half) * dt;
+                        self.vy[i] = self.vy[i] + a * (luxNoiseCorner(id, slot, self.seed + 1) - half) * dt;
+                        self.vz[i] = self.vz[i] + a * (luxNoiseCorner(id, slot, self.seed + 2) - half) * dt;
+                    }
+                },
+                PtcOp::Colour => {
+                    for (i of 0..n) {
+                        let t : f32 = min(self.age[i] / max(self.life[i], 0.0001 as f32), 1.0 as f32);
+                        self.r[i] = a + (d - a) * t;
+                        self.g[i] = b + (e - b) * t;
+                        self.b[i] = c + (f - c) * t;
+                    }
+                },
+                PtcOp::Size => {
+                    for (i of 0..n) {
+                        let t : f32 = min(self.age[i] / max(self.life[i], 0.0001 as f32), 1.0 as f32);
+                        self.size[i] = a + (b - a) * t;
+                    }
+                },
+                PtcOp::Flicker => {
+                    let slot : i32 = ((tick as f64) * ((b * dt) as f64)) as i32;
+                    for (i of 0..n) {
+                        let k : f32 = (1.0 as f32) - a + a * luxNoiseCorner(self.id[i], slot, self.seed + 3);
+                        self.r[i] = self.r[i] * k;
+                        self.g[i] = self.g[i] * k;
+                        self.b[i] = self.b[i] * k;
+                    }
+                },
+            }
+        }
+        for (i of 0..n) {
+            self.px[i] = self.px[i] + self.vx[i] * dt;
+            self.py[i] = self.py[i] + self.vy[i] * dt;
+            self.pz[i] = self.pz[i] + self.vz[i] * dt;
+        }
+    }
+
+    /** Removes every particle. */
+    pub fn clear(mut self) : void {
+        self.count = 0;
+    }
+
+    // Ages every particle by `dt` and removes those past their life: the last one takes the dead one's place, the
+    // pool is walked from the start, so which particle lands where depends on nothing but the pool.
+    fn cull(mut self, dt : f32) : void {
+        let mut i : i32 = 0;
+        while (i < self.count) {
+            self.age[i] = self.age[i] + dt;
+            if (self.age[i] < self.life[i]) {
+                i = i + 1;
+                continue;
+            }
+            let last : i32 = self.count - 1;
+            self.px[i] = self.px[last];
+            self.py[i] = self.py[last];
+            self.pz[i] = self.pz[last];
+            self.vx[i] = self.vx[last];
+            self.vy[i] = self.vy[last];
+            self.vz[i] = self.vz[last];
+            // The particle from the end has not been visited yet: the loop stays on this index and ages it once.
+            self.age[i] = self.age[last];
+            self.life[i] = self.life[last];
+            self.r[i] = self.r[last];
+            self.g[i] = self.g[last];
+            self.b[i] = self.b[last];
+            self.size[i] = self.size[last];
+            self.id[i] = self.id[last];
+            self.count = last;
+        }
+    }
+
+    fn push(
+        mut self,
+        op : PtcOp,
+        a : f32,
+        b : f32,
+        c : f32,
+        d : f32,
+        e : f32,
+        f : f32,
+        g : f32,
+        h : f32
+    ) : void {
+        self.ops.push(op.code());
+        self.params.push(a);
+        self.params.push(b);
+        self.params.push(c);
+        self.params.push(d);
+        self.params.push(e);
+        self.params.push(f);
+        self.params.push(g);
+        self.params.push(h);
+    }
+}

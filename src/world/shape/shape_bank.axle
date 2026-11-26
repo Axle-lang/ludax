@@ -1,0 +1,244 @@
+// shape_bank — the small solid parts a cell may hold instead of filling it: a flower's stem and bloom, a torch's stick
+// and flame, a button, a lever's base and handle, a fence post, a lantern on its chain.
+//
+// A shape is a handful of axis-aligned boxes inside the unit cell, given in sixteenths as block models are. Two things
+// follow from it, and both are exact (handbook 3.18):
+//
+//   rays        a ray that enters a shaped cell is tested against its boxes (the slab test: for each axis the interval
+//               where the ray is inside the box's slab, intersected; the box is hit where the last slab is entered).
+//               It stops at the nearest box face, with that face's normal, or goes on through the cell: a flower hides
+//               what it covers and nothing else, and its shadow (from a lamp's ray) is its own outline.
+//   diffuse     the light a cell lets through when it is crossed in no particular direction (the baked flood, the sky):
+//               `open = 1 - (a_x + a_y + a_z) / 3`, where a_k is the share of the cell's face the boxes cover seen along
+//               axis k. A flower lets most of it through, a lever a little less, a full cube none.
+//
+// Boxes are taken as disjoint (a model's parts do not overlap): their volumes and their covers add.
+
+use crate::core::collections::vec::Vec;
+use crate::core::math::scalar::{max, min};
+use crate::core::math::vec3::Vec3;
+
+// The floats each box keeps: its lower and upper corner in the unit cell.
+const SHAPE_FLOATS : i32 = 6;
+
+// A ray direction component smaller than this is parallel to its slabs.
+const SHAPE_PARALLEL : f32 = 0.0000001;
+
+/** Where a ray meets a shape: the distance along it and the face's normal, one axis of ±1. */
+pub struct ShapeHit {
+    /** True when the ray meets a box of the shape before it leaves the cell. */
+    pub hit : bool = false;
+
+    /** The distance along the ray, in the units of its direction. */
+    pub t : f32 = 0.0;
+
+    /** The normal of the face struck: one component ±1, the others 0. */
+    pub nx : i32 = 0;
+    pub ny : i32 = 0;
+    pub nz : i32 = 0;
+}
+
+/** The shapes of a world's blocks: which blocks are made of boxes, the boxes, and how much light their cells let through. */
+pub class ShapeBank {
+    boxes : Vec<f32>;
+    owner : Vec<i32>;
+
+    // Per block id, built by `seal`: its first box and how many, its volume and the diffuse light its cell lets through.
+    first  : i32[];
+    count  : i32[];
+    volume : f32[];
+    open   : f32[];
+    flat   : f32[];
+    blocks : i32;
+
+    /** No shapes yet, for blocks of ids 0 to `blocks` - 1. */
+    constructor(blocks : i32) {
+        self.blocks = blocks;
+        self.boxes = new Vec<f32>();
+        self.owner = new Vec<i32>();
+        let n : i64 = max(blocks as f32, 1.0 as f32) as i64;
+        self.first = new i32[n];
+        self.count = new i32[n];
+        self.volume = new f32[n];
+        self.open = new f32[n];
+        self.flat = new f32[SHAPE_FLOATS as i64];
+        for (i of 0..blocks) {
+            self.first[i] = 0;
+            self.count[i] = 0;
+            self.volume[i] = 1.0;
+            self.open[i] = 0.0;
+        }
+    }
+
+    /** Adds to block `id`'s shape the box from (`x0`, `y0`, `z0`) to (`x1`, `y1`, `z1`), in sixteenths of the cell. */
+    pub fn box(mut self, id : i32, x0 : i32, y0 : i32, z0 : i32, x1 : i32, y1 : i32, z1 : i32) : void {
+        let k : f32 = 0.0625;
+        self.boxes.push((x0 as f32) * k);
+        self.boxes.push((y0 as f32) * k);
+        self.boxes.push((z0 as f32) * k);
+        self.boxes.push((x1 as f32) * k);
+        self.boxes.push((y1 as f32) * k);
+        self.boxes.push((z1 as f32) * k);
+        self.owner.push(id);
+    }
+
+    /** Groups the boxes by block and works out each shape's volume and openness. Call after the last `box`, before use. */
+    pub fn seal(mut self) : void {
+        let n : i32 = self.owner.len();
+        let mut flat : f32[] = new f32[(max(n as f32, 1.0 as f32) as i64) * (SHAPE_FLOATS as i64)];
+        let mut at : i32 = 0;
+        for (id of 0..self.blocks) {
+            self.first[id] = at;
+            self.count[id] = 0;
+            let mut vol : f32 = 0.0;
+            let mut ax : f32 = 0.0;
+            let mut ay : f32 = 0.0;
+            let mut az : f32 = 0.0;
+            for (b of 0..n) {
+                if (self.owner.get(b) != id) {
+                    continue;
+                }
+                for (k of 0..SHAPE_FLOATS) {
+                    flat[(at * SHAPE_FLOATS + k) as i64] = self.boxes.get(b * SHAPE_FLOATS + k);
+                }
+                let sx : f32 = self.boxes.get(b * SHAPE_FLOATS + 3) - self.boxes.get(b * SHAPE_FLOATS);
+                let sy : f32 = self.boxes.get(b * SHAPE_FLOATS + 4) - self.boxes.get(b * SHAPE_FLOATS + 1);
+                let sz : f32 = self.boxes.get(b * SHAPE_FLOATS + 5) - self.boxes.get(b * SHAPE_FLOATS + 2);
+                vol = vol + sx * sy * sz;
+                ax = ax + sy * sz;
+                ay = ay + sx * sz;
+                az = az + sx * sy;
+                at = at + 1;
+                self.count[id] = self.count[id] + 1;
+            }
+            if (self.count[id] > 0) {
+                self.volume[id] = vol;
+                let cover : f32 = (min(ax, 1.0 as f32) + min(ay, 1.0 as f32) + min(az, 1.0 as f32))
+                    / (3.0 as f32);
+                self.open[id] = (1.0 as f32) - cover;
+            }
+        }
+        self.flat = flat;
+    }
+
+    /** True when blocks of id `id` are made of boxes rather than filling their cell. */
+    pub fn shaped(self, id : i32) : bool {
+        return id >= 0 && id < self.blocks && self.count[id] > 0;
+    }
+
+    /** The share of its cell block `id` fills, 0 to 1 (1 for a block with no shape: it fills the cell). */
+    pub fn volumeOf(self, id : i32) : f32 {
+        return self.volume[id];
+    }
+
+    /** The share of diffuse light block `id`'s cell lets through, 0 to 1 (0 for a full block). */
+    pub fn openOf(self, id : i32) : f32 {
+        return self.open[id];
+    }
+
+    /**
+     * Where the ray from `o` along `d` meets the shape of block `id` in cell (`cx`, `cy`, `cz`), at a distance of at
+     * least `from` (the ray's entry into the cell): the nearest box face, or no hit.
+     */
+    pub fn intersect(
+        self,
+        id : i32,
+        cx : i32,
+        cy : i32,
+        cz : i32,
+        o : Vec3,
+        d : Vec3,
+        from : f32
+    ) : ShapeHit {
+        // What depends on the ray alone, once per call: the inverse direction and whether it is parallel to an axis.
+        let one : f32 = 1.0;
+        let parX : bool = d.x < SHAPE_PARALLEL && d.x > -SHAPE_PARALLEL;
+        let parY : bool = d.y < SHAPE_PARALLEL && d.y > -SHAPE_PARALLEL;
+        let parZ : bool = d.z < SHAPE_PARALLEL && d.z > -SHAPE_PARALLEL;
+        let invX : f32 = parX ? 0.0 as f32 : one / d.x;
+        let invY : f32 = parY ? 0.0 as f32 : one / d.y;
+        let invZ : f32 = parZ ? 0.0 as f32 : one / d.z;
+        let fx : f32 = cx as f32;
+        let fy : f32 = cy as f32;
+        let fz : f32 = cz as f32;
+        let flat : f32[] = self.flat;
+        let first : i32 = self.first[id];
+        let last : i32 = first + self.count[id];
+        let mut found : bool = false;
+        let mut bestT : f32 = 0.0;
+        let mut bestAxis : i32 = -1;
+        for (b of first..last) {
+            let at : i64 = (b as i64) * (SHAPE_FLOATS as i64);
+            let mut enter : f32 = -1000000000.0;
+            let mut leave : f32 = 1000000000.0;
+            let mut axis : i32 = -1;
+            // Each axis: parallel to its slabs, the ray is inside them all along or never; else the interval of t
+            // between its two planes narrows [enter, leave], and the axis entered last is the face struck.
+            let loX : f32 = fx + flat[at];
+            let hiX : f32 = fx + flat[at + 3];
+            if (parX) {
+                if (o.x < loX || o.x > hiX) {
+                    continue;
+                }
+            } else {
+                let t0 : f32 = (loX - o.x) * invX;
+                let t1 : f32 = (hiX - o.x) * invX;
+                enter = min(t0, t1);
+                leave = max(t0, t1);
+                axis = 0;
+            }
+            let loY : f32 = fy + flat[at + 1];
+            let hiY : f32 = fy + flat[at + 4];
+            if (parY) {
+                if (o.y < loY || o.y > hiY) {
+                    continue;
+                }
+            } else {
+                let t0 : f32 = (loY - o.y) * invY;
+                let t1 : f32 = (hiY - o.y) * invY;
+                let near : f32 = min(t0, t1);
+                if (near > enter) {
+                    enter = near;
+                    axis = 1;
+                }
+                leave = min(leave, max(t0, t1));
+            }
+            let loZ : f32 = fz + flat[at + 2];
+            let hiZ : f32 = fz + flat[at + 5];
+            if (parZ) {
+                if (o.z < loZ || o.z > hiZ) {
+                    continue;
+                }
+            } else {
+                let t0 : f32 = (loZ - o.z) * invZ;
+                let t1 : f32 = (hiZ - o.z) * invZ;
+                let near : f32 = min(t0, t1);
+                if (near > enter) {
+                    enter = near;
+                    axis = 2;
+                }
+                leave = min(leave, max(t0, t1));
+            }
+            if (axis < 0 || enter > leave || leave < from) {
+                continue;
+            }
+            // A ray that starts inside a box (enter before `from`) meets it where it entered the cell.
+            let t : f32 = max(enter, from);
+            if (found && t >= bestT) {
+                continue;
+            }
+            found = true;
+            bestT = t;
+            bestAxis = axis;
+        }
+        let mut hit : ShapeHit = ShapeHit { hit: found, t: bestT, nx: 0, ny: 0, nz: 0 };
+        if (bestAxis == 0) {
+            hit.nx = d.x > 0.0 ? -1 : 1;
+        } else if (bestAxis == 1) {
+            hit.ny = d.y > 0.0 ? -1 : 1;
+        } else if (bestAxis == 2) {
+            hit.nz = d.z > 0.0 ? -1 : 1;
+        }
+        return hit;
+    }
+}

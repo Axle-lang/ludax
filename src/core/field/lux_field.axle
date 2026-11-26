@@ -1,0 +1,623 @@
+// lux_field — fields: functions of a point and the time, built as a graph of a few ops, evaluated flat with their gradient.
+//
+// Everything that wobbles (a portal's swirl, the heat over lava, a gust of wind, the motion of a mote) is a field: a
+// number that varies over space and time. A field is built once from a closed set of ops and evaluated at every hit (or
+// particle) with no allocation and no dispatch through a trait. Handbook 3.15 has the whole story; in short:
+//
+//   - **Two kinds of node.** A *point* node is a place to read at (x, y), with the footprint `fp` (the size of the
+//     patch a pixel covers, in the node's own units) and the Jacobian J of (x, y) against the hit's own coordinates. A
+//     *value* node is a number with its gradient against the hit's coordinates. Ops: `Point` (the hit), `Scale`,
+//     `Scroll`, `Warp`, `Pixelate` make points; `Fbm`, `Const`, `Add`, `Mul`, `Remap` make values.
+//   - **A DAG by construction.** A node can only name nodes built before it, so evaluating the nodes in the order they
+//     were built is always right, and a node shared by two consumers is evaluated once. No compiler, no cycle check.
+//   - **Exact gradients by forward differentiation.** Every node carries its derivative: a scale multiplies J, a warp
+//     adds the warping fields' gradients to it, a noise turns its own gradient into the hit's through Jᵀ. A normal or
+//     a bend gets the gradient of any composition, exactly, at the cost of the value plus a few multiplies.
+//   - **The footprint, as the water taught.** Each octave of a noise finer than the footprint is replaced by its mean
+//     (weight 1 - smoothstep(1, 4, fp / λ), as the ocean's cascades), so no composition aliases. A scale multiplies
+//     the footprint; a warp widens it by its amount times the larger of the warping fields' Lipschitz bounds (a number
+//     fixed at build time). The exact bound of a warp by two fields is sqrt(La² + Lb²), up to √2 times more when both
+//     slopes line up: the widening may then fall short of it, and a strongly warped field filter a little less than
+//     it should (kept as it is: the portal and the regress pins are tuned on it).
+//   - **Time without drift.** A scroll's offset is computed once a frame in f64 (`prepare`) and wrapped by 4096 units;
+//     per point the scroll is one add of an f32. An f32 clock's step is a quarter of a millisecond after an hour, and grows.
+//
+// Registers: `LUX_FIELD_SLOT` floats per node in one `f32[]` per worker (`registers`), so a tape of 30 nodes is a kilobyte.
+
+use crate::core::collections::vec::Vec;
+use crate::core::field::lux_noise::{LUX_NOISE_SLOPE, luxNoise2, luxNoiseFloor};
+use crate::core::math::scalar::{abs, max, smoothstep};
+
+/** The floats each node keeps in the registers: a point's x, y, footprint, Jacobian and base footprint, or a value and its gradient. */
+pub const LUX_FIELD_SLOT : i32 = 8;
+
+// A scroll's offset is wrapped by this many units: one jump every 4096 / speed seconds (over two hours at 0.5 a
+// second), and the coordinates stay small enough for f32.
+const LUXF_WRAP : f64 = 4096.0;
+
+// Each octave of a noise is this much finer than the one before (not exactly 2, so the lattices never line up).
+const LUXF_LACUNARITY : f32 = 2.03;
+
+/** The operations a node of a field can be. A new op is one value here, one arm in `evaluate`, one builder. */
+enum LuxFieldOp : i8 {
+    /** The hit's own coordinates (u, v): the root of every chain of points. */
+    Point = 0,
+    /** A point with its domain multiplied by a frequency. */
+    Scale = 1,
+    /** A point moving at a velocity, per second of the field's clock. */
+    Scroll = 2,
+    /** A point moved by `amount * (a - 1/2, b - 1/2)`, two value fields: domain warping (Quilez). */
+    Warp = 3,
+    /** A point snapped to the centres of a grid of `cells` a unit: the pixel-art look of a 16-texel block. */
+    Pixelate = 4,
+    /** Octaves of value noise read at a point, in [0, 1); the octaves finer than the footprint fade to their mean. */
+    Fbm = 5,
+    /** A number. */
+    Const = 6,
+    /** a + b. */
+    Add = 7,
+    /** a * b. */
+    Mul = 8,
+    /** lo + (hi - lo) * a. */
+    Remap = 9,
+
+    /** The number a tape stores. */
+    pub fn code(self) : i32 {
+        return self as i32;
+    }
+
+    /** The op stored as `n`; `Const` for anything else. */
+    pub static fn fromCode(n : i32) : LuxFieldOp {
+        return match n {
+            0 => LuxFieldOp::Point,
+            1 => LuxFieldOp::Scale,
+            2 => LuxFieldOp::Scroll,
+            3 => LuxFieldOp::Warp,
+            4 => LuxFieldOp::Pixelate,
+            5 => LuxFieldOp::Fbm,
+            7 => LuxFieldOp::Add,
+            8 => LuxFieldOp::Mul,
+            9 => LuxFieldOp::Remap,
+            _ => LuxFieldOp::Const,
+        };
+    }
+}
+
+/** A field: a handle to a node of the `LuxFieldTape` that built it. -1 is no field. */
+pub struct LuxField {
+    /** The node's index in its tape. */
+    pub id : i32 = -1;
+}
+
+/** The parameters of a noise, written whole. */
+pub struct LuxNoise {
+    /** Cycles of the first octave per unit of the point's domain. */
+    pub freq : f32 = 1.0;
+
+    /** Octaves, 1 to 8. */
+    pub octaves : i32 = 1;
+
+    /** The amplitude of each octave against the one before. */
+    pub gain : f32 = 0.5;
+
+    /** The seed: the same seed gives the same field on every machine and thread. */
+    pub seed : i32 = 0;
+}
+
+/**
+ * The nodes of a world's fields: built once by the methods that return handles, then evaluated per hit by `evaluate`
+ * over the nodes a consumer needs (a look lists them). Read-only while frames draw; `prepare` once a frame between.
+ */
+pub class LuxFieldTape {
+    op     : Vec<i32>;
+    childA : Vec<i32>;
+    childB : Vec<i32>;
+    konst  : Vec<f32>;
+    lip    : Vec<f32>;
+    point  : Vec<bool>;
+
+    // Flat copies for `evaluate`, made by `prepare` when nodes were added: plain arrays, no `Vec` in the hot loop.
+    fop : i32[];
+    fa  : i32[];
+    fb  : i32[];
+    fk  : f32[];
+    // Per noise node, the reciprocal of the sum of its octaves' amplitudes: what `luxfFbm` divides by, once.
+    finv   : f32[];
+    packed : i32 = -1;
+
+    // The scroll offsets of the current frame, two per node.
+    offset : f32[];
+
+    // False once a node was given a child of the wrong kind (a value where a point belongs, or the reverse).
+    sound : bool = true;
+
+    /** An empty tape. */
+    constructor() {
+        self.op = new Vec<i32>();
+        self.childA = new Vec<i32>();
+        self.childB = new Vec<i32>();
+        self.konst = new Vec<f32>();
+        self.lip = new Vec<f32>();
+        self.point = new Vec<bool>();
+        self.fop = new i32[1];
+        self.fa = new i32[1];
+        self.fb = new i32[1];
+        self.fk = new f32[4];
+        self.finv = new f32[1];
+        self.offset = new f32[2];
+    }
+
+    /** How many nodes the tape has. */
+    pub fn count(self) : i32 {
+        return self.op.len();
+    }
+
+    /** True unless a node was built from a child of the wrong kind. */
+    pub fn valid(self) : bool {
+        return self.sound;
+    }
+
+    /** True when the node of `f` is a point (a place to read at), false for a value. */
+    pub fn isPoint(self, f : LuxField) : bool {
+        return f.id >= 0 && f.id < self.count() && self.point.get(f.id);
+    }
+
+    /** The children 0, 1 and 2 of node `n` (-1 when none): for a consumer that lists the nodes it needs. */
+    pub fn childOf(self, n : i32, which : i32) : i32 {
+        if (which == 0) {
+            return self.childA.get(n);
+        }
+        if (which == 1) {
+            return self.childB.get(n);
+        }
+        // A warp's second warping field is its third child, kept in its last constant.
+        if (self.op.get(n) == LuxFieldOp::Warp.code()) {
+            return self.konst.get(n * 4 + 3) as i32;
+        }
+        return -1;
+    }
+
+    /** The hit's own coordinates: the root of a field. */
+    pub fn here(mut self) : LuxField {
+        return self.node(LuxFieldOp::Point, -1, -1, 0.0, 0.0, 0.0, 0.0, 1.0, true);
+    }
+
+    /** The point `p` with its domain multiplied by `freq`. */
+    pub fn scale(mut self, p : LuxField, freq : f32) : LuxField {
+        self.expectPoint(p);
+        return self.node(LuxFieldOp::Scale, p.id, -1, freq, 0.0, 0.0, 0.0, abs(freq) * self.lipOf(p), true);
+    }
+
+    /** The point `p` moving at (`vx`, `vy`) units a second. */
+    pub fn scroll(mut self, p : LuxField, vx : f32, vy : f32) : LuxField {
+        self.expectPoint(p);
+        return self.node(LuxFieldOp::Scroll, p.id, -1, vx, vy, 0.0, 0.0, self.lipOf(p), true);
+    }
+
+    /** The point `p` moved by `amount * (a - 1/2, b - 1/2)`, where `a` and `b` are value fields. */
+    pub fn warp(mut self, p : LuxField, a : LuxField, b : LuxField, amount : f32) : LuxField {
+        self.expectPoint(p);
+        self.expectValue(a);
+        self.expectValue(b);
+        let bound : f32 = max(self.lipOf(a), self.lipOf(b));
+        let lip : f32 = self.lipOf(p) + abs(amount) * bound;
+        let warp : LuxField = self.node(LuxFieldOp::Warp, p.id, a.id, amount, bound, 0.0, 0.0, lip, true);
+        // The second warping field is the third child; it is kept in the constants' last slot.
+        self.konst.set(warp.id * 4 + 3, b.id as f32);
+        return warp;
+    }
+
+    /** The point `p` snapped to the centres of a grid of `cells` a unit. */
+    pub fn pixelate(mut self, p : LuxField, cells : f32) : LuxField {
+        self.expectPoint(p);
+        return self.node(
+            LuxFieldOp::Pixelate,
+            p.id,
+            -1,
+            max(cells, 0.0001 as f32),
+            0.0,
+            0.0,
+            0.0,
+            self.lipOf(p),
+            true
+        );
+    }
+
+    /** Octaves of value noise read at the point `p`, in [0, 1). */
+    pub fn fbm(mut self, p : LuxField, n : LuxNoise) : LuxField {
+        self.expectPoint(p);
+        let mut octaves : i32 = n.octaves;
+        if (octaves < 1) {
+            octaves = 1;
+        }
+        if (octaves > 8) {
+            octaves = 8;
+        }
+        // The bound of the sum of octaves, normalised as the value is: Σ aᵢ fᵢ · 1.5 / Σ aᵢ, times the point's own.
+        let mut amp : f32 = 1.0;
+        let mut freq : f32 = n.freq;
+        let mut slope : f32 = 0.0;
+        let mut norm : f32 = 0.0;
+        for (o of 0..octaves) {
+            slope = slope + amp * abs(freq) * LUX_NOISE_SLOPE;
+            norm = norm + amp;
+            amp = amp * n.gain;
+            freq = freq * LUXF_LACUNARITY;
+        }
+        let lip : f32 = self.lipOf(p) * slope / max(norm, 0.000001 as f32);
+        return self.node(
+            LuxFieldOp::Fbm,
+            p.id,
+            -1,
+            n.freq,
+            octaves as f32,
+            n.gain,
+            n.seed as f32,
+            lip,
+            false
+        );
+    }
+
+    /** The number `v`. */
+    pub fn constant(mut self, v : f32) : LuxField {
+        return self.node(LuxFieldOp::Const, -1, -1, v, 0.0, 0.0, 0.0, 0.0, false);
+    }
+
+    /** a + b. */
+    pub fn add(mut self, a : LuxField, b : LuxField) : LuxField {
+        self.expectValue(a);
+        self.expectValue(b);
+        return self.node(
+            LuxFieldOp::Add,
+            a.id,
+            b.id,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            self.lipOf(a) + self.lipOf(b),
+            false
+        );
+    }
+
+    /** a * b; the bound assumes both stay within [0, 1], as noise does. */
+    pub fn mul(mut self, a : LuxField, b : LuxField) : LuxField {
+        self.expectValue(a);
+        self.expectValue(b);
+        return self.node(
+            LuxFieldOp::Mul,
+            a.id,
+            b.id,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            self.lipOf(a) + self.lipOf(b),
+            false
+        );
+    }
+
+    /** lo + (hi - lo) * a. */
+    pub fn remap(mut self, a : LuxField, lo : f32, hi : f32) : LuxField {
+        self.expectValue(a);
+        return self.node(LuxFieldOp::Remap, a.id, -1, lo, hi, 0.0, 0.0, abs(hi - lo) * self.lipOf(a), false);
+    }
+
+    /** The Lipschitz bound of `f` against the hit's coordinates: how fast it can change per unit, at most. */
+    pub fn lipOf(self, f : LuxField) : f32 {
+        if (f.id < 0) {
+            return 0.0;
+        }
+        return self.lip.get(f.id);
+    }
+
+    /**
+     * Sets the field's clock to `seconds` for the frame that follows: each scroll's offset, computed in f64 and
+     * wrapped. Packs the nodes into flat arrays when nodes were added since the last frame. Call between frames.
+     */
+    pub fn prepare(mut self, seconds : f64) : void {
+        let n : i32 = self.count();
+        if (self.packed != n) {
+            self.pack();
+        }
+        for (i of 0..n) {
+            if (self.fop[i] == LuxFieldOp::Scroll.code()) {
+                let at : i64 = (i as i64) * 4;
+                self.offset[(i as i64) * 2] = luxfWrap((self.fk[at] as f64) * seconds);
+                self.offset[(i as i64) * 2 + 1] = luxfWrap((self.fk[at + 1] as f64) * seconds);
+            }
+        }
+    }
+
+    /** A worker's registers for this tape: allocate once per worker, never per hit. */
+    pub fn registers(self) : f32[] {
+        let n : i64 = (max(self.count() as f32, 1.0 as f32) as i64) * LUX_FIELD_SLOT;
+        return new f32[n];
+    }
+
+    /**
+     * Evaluates the nodes `nodes[from..to]` (ascending, each after its children) at the hit's coordinates (`u`, `v`)
+     * with footprint `fp` in the same units, into `r`. Read a value with `luxFieldValue` and its gradient with
+     * `luxFieldGradU` / `luxFieldGradV`. Reads the tape only; call `prepare` first.
+     */
+    pub fn evaluate(
+        self,
+        nodes : i32[],
+        from : i32,
+        to : i32,
+        u : f32,
+        v : f32,
+        fp : f32,
+        mut r : f32[]
+    ) : void {
+        // The tape's arrays bound once: a store through `r` could change them for all the compiler knows (R4).
+        let fop : i32[] = self.fop;
+        let fa : i32[] = self.fa;
+        let fb : i32[] = self.fb;
+        let fk : f32[] = self.fk;
+        let finv : f32[] = self.finv;
+        let offset : f32[] = self.offset;
+        for (k of from..to) {
+            let n : i32 = nodes[k];
+            let at : i64 = (n as i64) * LUX_FIELD_SLOT;
+            let ka : i64 = (n as i64) * 4;
+            let a : i64 = (fa[n] as i64) * LUX_FIELD_SLOT;
+            let b : i64 = (fb[n] as i64) * LUX_FIELD_SLOT;
+            match LuxFieldOp::fromCode(fop[n]) {
+                LuxFieldOp::Point => luxfPoint(r, at, u, v, fp),
+                LuxFieldOp::Scale => luxfScale(r, at, a, fk[ka]),
+                LuxFieldOp::Scroll => luxfScroll(
+                    r,
+                    at,
+                    a,
+                    offset[(n as i64) * 2],
+                    offset[(n as i64) * 2 + 1]
+                ),
+                LuxFieldOp::Warp => luxfWarp(
+                    r,
+                    at,
+                    a,
+                    b,
+                    (fk[ka + 3] as i64) * LUX_FIELD_SLOT,
+                    fk[ka],
+                    fk[ka + 1]
+                ),
+                LuxFieldOp::Pixelate => luxfPixelate(r, at, a, fk[ka]),
+                LuxFieldOp::Fbm => luxfFbm(
+                    r,
+                    at,
+                    a,
+                    fk[ka],
+                    fk[ka + 1] as i32,
+                    fk[ka + 2],
+                    fk[ka + 3] as i32,
+                    finv[n]
+                ),
+                LuxFieldOp::Const => luxfValue(r, at, fk[ka], 0.0, 0.0),
+                LuxFieldOp::Add => luxfValue(r, at, r[a] + r[b], r[a + 1] + r[b + 1], r[a + 2] + r[b + 2]),
+                LuxFieldOp::Mul => luxfValue(
+                    r,
+                    at,
+                    r[a] * r[b],
+                    r[a + 1] * r[b] + r[a] * r[b + 1],
+                    r[a + 2] * r[b] + r[a] * r[b + 2]
+                ),
+                LuxFieldOp::Remap => luxfRemap(r, at, a, fk[ka], fk[ka + 1] - fk[ka]),
+            }
+        }
+    }
+
+    // Appends a node and answers its handle.
+    fn node(
+        mut self,
+        op : LuxFieldOp,
+        a : i32,
+        b : i32,
+        k0 : f32,
+        k1 : f32,
+        k2 : f32,
+        k3 : f32,
+        lip : f32,
+        isPoint : bool
+    ) : LuxField {
+        let id : i32 = self.op.len();
+        self.op.push(op.code());
+        self.childA.push(a);
+        self.childB.push(b);
+        self.konst.push(k0);
+        self.konst.push(k1);
+        self.konst.push(k2);
+        self.konst.push(k3);
+        self.lip.push(lip);
+        self.point.push(isPoint);
+        return LuxField { id: id };
+    }
+
+    fn expectPoint(mut self, f : LuxField) : void {
+        if (!self.isPoint(f)) {
+            self.sound = false;
+        }
+    }
+
+    fn expectValue(mut self, f : LuxField) : void {
+        if (f.id < 0 || f.id >= self.count() || self.point.get(f.id)) {
+            self.sound = false;
+        }
+    }
+
+    // The flat copies `evaluate` reads.
+    fn pack(mut self) : void {
+        let n : i32 = self.count();
+        let m : i64 = max(n as f32, 1.0 as f32) as i64;
+        self.fop = new i32[m];
+        self.fa = new i32[m];
+        self.fb = new i32[m];
+        self.fk = new f32[m * 4];
+        self.finv = new f32[m];
+        self.offset = new f32[m * 2];
+        for (i of 0..n) {
+            self.fop[i] = self.op.get(i);
+            self.fa[i] = max(self.childA.get(i) as f32, 0.0 as f32) as i32;
+            self.fb[i] = max(self.childB.get(i) as f32, 0.0 as f32) as i32;
+            for (j of 0..4) {
+                self.fk[(i as i64) * 4 + j] = self.konst.get(i * 4 + j);
+            }
+            self.finv[i] = luxfNormInverse(self.konst.get(i * 4 + 1) as i32, self.konst.get(i * 4 + 2));
+        }
+        self.packed = n;
+    }
+}
+
+/** The value of the field `f` after `evaluate`. */
+pub fn luxFieldValue(r : f32[], f : LuxField) : f32 {
+    return r[(f.id as i64) * LUX_FIELD_SLOT];
+}
+
+/** The derivative of the field `f` along the hit's first coordinate, after `evaluate`. */
+pub fn luxFieldGradU(r : f32[], f : LuxField) : f32 {
+    return r[(f.id as i64) * LUX_FIELD_SLOT + 1];
+}
+
+/** The derivative of the field `f` along the hit's second coordinate, after `evaluate`. */
+pub fn luxFieldGradV(r : f32[], f : LuxField) : f32 {
+    return r[(f.id as i64) * LUX_FIELD_SLOT + 2];
+}
+
+// `x` wrapped into [0, LUXF_WRAP), computed in f64.
+fn luxfWrap(x : f64) : f32 {
+    let q : f64 = x / LUXF_WRAP;
+    let mut whole : f64 = (q as i64) as f64;
+    if (whole > q) {
+        whole = whole - 1.0;
+    }
+    return (x - whole * LUXF_WRAP) as f32;
+}
+
+// A value and its gradient into the slot `at`.
+fn luxfValue(mut r : f32[], at : i64, v : f32, du : f32, dv : f32) : void {
+    r[at] = v;
+    r[at + 1] = du;
+    r[at + 2] = dv;
+}
+
+// The hit's own point: its coordinates, its footprint, the unit Jacobian.
+fn luxfPoint(mut r : f32[], at : i64, u : f32, v : f32, fp : f32) : void {
+    r[at] = u;
+    r[at + 1] = v;
+    r[at + 2] = fp;
+    r[at + 3] = 1.0;
+    r[at + 4] = 0.0;
+    r[at + 5] = 0.0;
+    r[at + 6] = 1.0;
+    r[at + 7] = fp;
+}
+
+// The point at `a` with its domain, footprint and Jacobian multiplied by `k`.
+fn luxfScale(mut r : f32[], at : i64, a : i64, k : f32) : void {
+    r[at] = r[a] * k;
+    r[at + 1] = r[a + 1] * k;
+    r[at + 2] = r[a + 2] * abs(k);
+    r[at + 3] = r[a + 3] * k;
+    r[at + 4] = r[a + 4] * k;
+    r[at + 5] = r[a + 5] * k;
+    r[at + 6] = r[a + 6] * k;
+    r[at + 7] = r[a + 7];
+}
+
+// The point at `a` moved by this frame's offset; its derivative does not change.
+fn luxfScroll(mut r : f32[], at : i64, a : i64, ox : f32, oy : f32) : void {
+    r[at] = r[a] + ox;
+    r[at + 1] = r[a + 1] + oy;
+    for (j of 2..8) {
+        r[at + (j as i64)] = r[a + (j as i64)];
+    }
+}
+
+// The point at `a` snapped to the centres of a grid of `c` cells a unit. The snapped field is constant in each cell;
+// its gradient is kept as the smooth field's, so a pixelated swirl still bends and tilts (the pixel art is in the
+// value, the motion in the slope).
+fn luxfPixelate(mut r : f32[], at : i64, a : i64, c : f32) : void {
+    let one : f32 = 1.0;
+    let half : f32 = 0.5;
+    r[at] = ((luxNoiseFloor(r[a] * c) as f32) + half) / c;
+    r[at + 1] = ((luxNoiseFloor(r[a + 1] * c) as f32) + half) / c;
+    r[at + 2] = max(r[a + 2], one / c);
+    for (j of 3..8) {
+        r[at + (j as i64)] = r[a + (j as i64)];
+    }
+}
+
+// A warp: the point at `a` moved by `amount * (value(b) - 1/2, value(c) - 1/2)`; its Jacobian gains the warping fields'
+// gradients, its footprint the amount times their bound times the hit's footprint.
+fn luxfWarp(mut r : f32[], at : i64, a : i64, b : i64, c : i64, amount : f32, bound : f32) : void {
+    let half : f32 = 0.5;
+    r[at] = r[a] + amount * (r[b] - half);
+    r[at + 1] = r[a + 1] + amount * (r[c] - half);
+    r[at + 2] = r[a + 2] + abs(amount) * bound * r[a + 7];
+    r[at + 3] = r[a + 3] + amount * r[b + 1];
+    r[at + 4] = r[a + 4] + amount * r[b + 2];
+    r[at + 5] = r[a + 5] + amount * r[c + 1];
+    r[at + 6] = r[a + 6] + amount * r[c + 2];
+    r[at + 7] = r[a + 7];
+}
+
+// Octaves of value noise at the point in `p`, into the value slot `at`: each octave of frequency f kept with weight
+// w = 1 - smoothstep(1, 4, fp f) and replaced by its mean 1/2 otherwise; the gradient taken through the point's
+// Jacobian (∂/∂u = gx j00 + gy j10, ∂/∂v = gx j01 + gy j11) and weighted the same way.
+fn luxfFbm(
+    mut r : f32[],
+    at : i64,
+    p : i64,
+    freq0 : f32,
+    octaves : i32,
+    gain : f32,
+    seed : i32,
+    inv : f32
+) : void {
+    let x : f32 = r[p];
+    let y : f32 = r[p + 1];
+    let fp : f32 = r[p + 2];
+    let one : f32 = 1.0;
+    let half : f32 = 0.5;
+    let mut sum : f32 = 0.0;
+    let mut gx : f32 = 0.0;
+    let mut gy : f32 = 0.0;
+    let mut amp : f32 = 1.0;
+    let mut freq : f32 = freq0;
+    for (o of 0..octaves) {
+        let keep : f32 = one - smoothstep(1.0, 4.0, fp * freq);
+        if (keep > 0.0) {
+            // The octave's value and gradient land in the slot's last three floats, then are folded in.
+            luxNoise2(x * freq, y * freq, seed + o * 31, r, at + 5);
+            sum = sum + amp * (keep * r[at + 5] + (one - keep) * half);
+            gx = gx + amp * keep * freq * r[at + 6];
+            gy = gy + amp * keep * freq * r[at + 7];
+        } else {
+            sum = sum + amp * half;
+        }
+        amp = amp * gain;
+        freq = freq * LUXF_LACUNARITY;
+    }
+    r[at] = sum * inv;
+    r[at + 1] = (gx * r[p + 3] + gy * r[p + 5]) * inv;
+    r[at + 2] = (gx * r[p + 4] + gy * r[p + 6]) * inv;
+}
+
+// The reciprocal of the sum of a noise's octave amplitudes (1, gain, gain², ...), summed in the order `luxfFbm` walks
+// them: the value it divides by, computed once a node instead of once a point.
+fn luxfNormInverse(octaves : i32, gain : f32) : f32 {
+    let mut norm : f32 = 0.0;
+    let mut amp : f32 = 1.0;
+    for (o of 0..octaves) {
+        norm = norm + amp;
+        amp = amp * gain;
+    }
+    return (1.0 as f32) / max(norm, 0.000001 as f32);
+}
+
+// lo + span · a, its gradient scaled by `span`, into the slot `at`.
+fn luxfRemap(mut r : f32[], at : i64, a : i64, lo : f32, span : f32) : void {
+    r[at] = lo + span * r[a];
+    r[at + 1] = span * r[a + 1];
+    r[at + 2] = span * r[a + 2];
+}

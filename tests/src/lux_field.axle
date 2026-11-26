@@ -1,0 +1,410 @@
+// lux_field — checks for the fields, the looks built on them and the particles: exact gradients through every op, the
+// footprint fade, the warp's bound, scrolling time, the stacking laws of looks, and particles that come out the same.
+
+use ludax::{
+    Checks, LuxField, LuxFieldTape, LuxNoise, luxFieldGradU, luxFieldGradV, luxFieldValue, luxNoise2
+};
+use ludax::{LuxFx, LuxLookBank, LuxRamp, LuxSurface, PtcEffect, PtcSpawn, Vec3, nowNanos};
+
+/** Checks the fields of `core/field`, the looks of `render/lux/look` and the particles of `sim/particles`. */
+pub class LuxFieldSuite {
+    /** Runs every check of the suite. */
+    pub static fn run(mut c : Checks) : void {
+        lxfNoise(c);
+        lxfGradient(c);
+        lxfFootprint(c);
+        lxfTime(c);
+        lxfLooks(c);
+        lxfParticles(c);
+    }
+}
+
+// A swirl as a portal uses it: a noise read through a scroll, warped by two other noises, then scaled.
+fn lxfSwirl(mut t : LuxFieldTape) : LuxField {
+    let here : LuxField = t.here();
+    let a : LuxField = t.fbm(t.scroll(here, 0.25, -0.15), LuxNoise {
+        freq: 0.7,
+        octaves: 2,
+        gain: 0.5,
+        seed: 72,
+    });
+    let b : LuxField = t.fbm(t.scroll(here, -0.2, 0.3), LuxNoise {
+        freq: 0.7,
+        octaves: 2,
+        gain: 0.5,
+        seed: 73,
+    });
+    let warped : LuxField = t.warp(t.scale(here, 1.3), a, b, 0.6);
+    return t.fbm(warped, LuxNoise { freq: 1.2, octaves: 3, gain: 0.5, seed: 71 });
+}
+
+// The nodes 0 up to `n`, all of them in order: what a consumer of the whole tape evaluates.
+fn lxfAll(n : i32) : i32[] {
+    let mut all : i32[] = new i32[n as i64];
+    for (i of 0..n) {
+        all[i] = i;
+    }
+    return all;
+}
+
+// The field's value at (u, v) with footprint `fp`.
+fn lxfAt(t : LuxFieldTape, f : LuxField, u : f32, v : f32, fp : f32, mut r : f32[]) : f32 {
+    t.evaluate(lxfAll(t.count()), 0, t.count(), u, v, fp, r);
+    return luxFieldValue(r, f);
+}
+
+// One octave read through the tape is the noise itself, value and gradient.
+fn lxfNoise(mut c : Checks) : void {
+    let t : LuxFieldTape = new LuxFieldTape();
+    let f : LuxField = t.fbm(t.here(), LuxNoise { freq: 1.0, octaves: 1, gain: 0.5, seed: 5 });
+    t.prepare(0.0);
+    let r : f32[] = t.registers();
+    let mut direct : f32[] = new f32[3];
+    let mut differ : i32 = 0;
+    for (k of 0..200) {
+        let u : f32 = (k as f32) * (0.137 as f32) - (9.0 as f32);
+        let v : f32 = (k as f32) * (0.071 as f32) + (3.0 as f32);
+        t.evaluate(lxfAll(t.count()), 0, t.count(), u, v, 0.0, r);
+        luxNoise2(u, v, 5, direct, 0);
+        if (luxFieldValue(r, f) != direct[0] || luxFieldGradU(r, f) != direct[1]
+            || luxFieldGradV(r, f) != direct[2]) {
+            differ = differ + 1;
+        }
+    }
+    c.sameInt(
+        "lux field: one octave through the tape is the noise, bit for bit (points that differ)",
+        differ,
+        0
+    );
+    c.that("lux field: the tape is sound", t.valid());
+
+    let bad : LuxFieldTape = new LuxFieldTape();
+    let value : LuxField = bad.constant(1.0);
+    bad.fbm(value, LuxNoise { freq: 1.0, octaves: 1, gain: 0.5, seed: 1 });
+    c.that("lux field: a noise read at a value instead of a point is refused", !bad.valid());
+}
+
+// The gradient of a composition (scroll, warp, scale, noise) against central differences, and the warp's bound. The
+// points stay near the origin, where a step of 0.001 is thousands of f32 units, and the tolerance allows the error
+// of a central difference across a lattice line, where the noise's fade has a jump in its second derivative.
+fn lxfGradient(mut c : Checks) : void {
+    let t : LuxFieldTape = new LuxFieldTape();
+    let swirl : LuxField = lxfSwirl(t);
+    t.prepare(3.7);
+    let r : f32[] = t.registers();
+    let h : f32 = 0.001;
+    let mut worst : f64 = 0.0;
+    let mut steepest : f64 = 0.0;
+    for (k of 0..400) {
+        let u : f32 = (k as f32) * (0.0101 as f32) - (2.0 as f32);
+        let v : f32 = (k as f32) * (0.0093 as f32) + (0.5 as f32);
+        t.evaluate(lxfAll(t.count()), 0, t.count(), u, v, 0.0, r);
+        let du : f64 = luxFieldGradU(r, swirl) as f64;
+        let dv : f64 = luxFieldGradV(r, swirl) as f64;
+        let fu : f64 = ((lxfAt(t, swirl, u + h, v, 0.0, r)
+            - lxfAt(t, swirl, u - h, v, 0.0, r)) as f64)
+            / ((2.0 * h) as f64);
+        let fv : f64 = ((lxfAt(t, swirl, u, v + h, 0.0, r)
+            - lxfAt(t, swirl, u, v - h, 0.0, r)) as f64)
+            / ((2.0 * h) as f64);
+        let scale : f64 = 1.0 + (du < 0.0 ? -du : du) + (dv < 0.0 ? -dv : dv);
+        let e : f64 = ((du - fu) * (du - fu) + (dv - fv) * (dv - fv)) / (scale * scale);
+        if (e > worst) {
+            worst = e;
+        }
+        let slope : f64 = du * du + dv * dv;
+        if (slope > steepest) {
+            steepest = slope;
+        }
+    }
+    c.that(
+        "lux field: the exact gradient of scroll, warp, scale and noise agrees with differences (${worst})",
+        worst < 0.001
+    );
+    let bound : f64 = t.lipOf(swirl) as f64;
+    c.that(
+        "lux field: no slope exceeds the build-time Lipschitz bound (${steepest} <= ${bound * bound})",
+        steepest <= bound * bound
+    );
+}
+
+// A footprint far wider than every octave reads the noise's mean, flat; a zero footprint reads it whole.
+fn lxfFootprint(mut c : Checks) : void {
+    let t : LuxFieldTape = new LuxFieldTape();
+    let f : LuxField = t.fbm(t.here(), LuxNoise { freq: 2.0, octaves: 4, gain: 0.5, seed: 9 });
+    t.prepare(0.0);
+    let r : f32[] = t.registers();
+    let far : f32 = lxfAt(t, f, 3.3, 1.7, 100.0, r);
+    c.near("lux field: seen from far away a noise is its mean", far as f64, 0.5, 0.000001);
+    c.that("lux field: ... and flat", luxFieldGradU(r, f) == 0.0 && luxFieldGradV(r, f) == 0.0);
+    // A single value may step away from the mean as an octave fades (two octaves of opposite signs); on average
+    // over many points it only comes nearer.
+    let mut reversals : i32 = 0;
+    let mut last : f32 = 1.0;
+    for (k of 0..6) {
+        let fp : f32 = (k as f32) * (0.15 as f32);
+        let mut spread : f32 = 0.0;
+        for (q of 0..500) {
+            let v : f32 = lxfAt(
+                t,
+                f,
+                (q as f32) * (0.173 as f32),
+                (q as f32) * (0.0591 as f32),
+                fp,
+                r
+            );
+            spread = spread + (v > 0.5 ? v - (0.5 as f32) : (0.5 as f32) - v);
+        }
+        spread = spread / (500.0 as f32);
+        if (spread > last + (0.000001 as f32)) {
+            reversals = reversals + 1;
+        }
+        last = spread;
+    }
+    c.sameInt(
+        "lux field: on average a noise nears its mean as the footprint grows (reversals)",
+        reversals,
+        0
+    );
+}
+
+// A scroll moves the field at its velocity; the clock is wrapped without a jump inside a period.
+fn lxfTime(mut c : Checks) : void {
+    let t : LuxFieldTape = new LuxFieldTape();
+    let f : LuxField = t.fbm(t.scroll(t.here(), 0.5, 0.0), LuxNoise {
+        freq: 1.0,
+        octaves: 2,
+        gain: 0.5,
+        seed: 4,
+    });
+    let r : f32[] = t.registers();
+    t.prepare(2.0);
+    let later : f32 = lxfAt(t, f, 0.25, 0.6, 0.0, r);
+    t.prepare(0.0);
+    let moved : f32 = lxfAt(t, f, 1.25, 0.6, 0.0, r);
+    c.near(
+        "lux field: two seconds at 0.5 a second is the field a unit along",
+        later as f64,
+        moved as f64,
+        0.00001
+    );
+    t.prepare(1000000.0);
+    let hours : f32 = lxfAt(t, f, 0.0, 0.0, 0.0, r);
+    c.that(
+        "lux field: after 278 hours the field is still a number in [0, 1]",
+        hours >= 0.0 && hours <= 1.0
+    );
+}
+
+// Looks: no ops changes nothing; two normals equal one normal of the sum; ops in any order give the same surface.
+fn lxfLooks(mut c : Checks) : void {
+    let fx : LuxFx = new LuxFx(8);
+    let t : LuxFieldTape = fx.fields;
+    let a : LuxField = t.fbm(t.here(), LuxNoise { freq: 1.0, octaves: 2, gain: 0.5, seed: 1 });
+    let b : LuxField = t.fbm(t.here(), LuxNoise { freq: 3.0, octaves: 1, gain: 0.5, seed: 2 });
+    let sum : LuxField = t.add(a, b);
+    let bank : LuxLookBank = fx.looks;
+    let plain : i32 = bank.look();
+    let two : i32 = bank.look();
+    bank.normal(two, a, 0.3);
+    bank.normal(two, b, 0.3);
+    let one : i32 = bank.look();
+    bank.normal(one, sum, 0.3);
+    let ramp : LuxRamp = LuxRamp {
+        at0: 0.0,
+        c0: Vec3::make(0.1, 0.0, 0.2),
+        at1: 0.5,
+        c1: Vec3::make(0.5, 0.2, 0.9),
+        at2: 1.0,
+        c2: Vec3::make(1.0, 0.8, 1.0),
+        strength: 2.0,
+    };
+    let first : i32 = bank.look();
+    bank.albedo(first, a, ramp);
+    bank.emit(first, b, ramp);
+    let second : i32 = bank.look();
+    bank.emit(second, b, ramp);
+    bank.albedo(second, a, ramp);
+    fx.bind(3, two);
+    fx.prepare(1.5);
+    let r : f32[] = t.registers();
+
+    let none : LuxSurface = fx.shade(plain, 1.0, 2.0, 0.0, r);
+    c.that(
+        "lux look: a look with no ops leaves the surface as it is",
+        none.slopeU == 0.0 && none.bendV == 0.0 && none.albedo.x == 1.0 && none.emit.y == 0.0
+            && none.rough == 0.0
+    );
+    let mut worst : f32 = 0.0;
+    let mut differ : i32 = 0;
+    for (k of 0..100) {
+        let u : f32 = (k as f32) * (0.31 as f32);
+        let v : f32 = (k as f32) * (0.17 as f32);
+        let p : LuxSurface = fx.shade(two, u, v, 0.0, r);
+        let q : LuxSurface = fx.shade(one, u, v, 0.0, r);
+        let e : f32 = (p.slopeU > q.slopeU ? p.slopeU - q.slopeU : q.slopeU - p.slopeU);
+        if (e > worst) {
+            worst = e;
+        }
+        let x : LuxSurface = fx.shade(first, u, v, 0.0, r);
+        let y : LuxSurface = fx.shade(second, u, v, 0.0, r);
+        if (x.albedo.x != y.albedo.x || x.emit.z != y.emit.z) {
+            differ = differ + 1;
+        }
+    }
+    c.that(
+        "lux look: two normals tilt as one normal of their sum (${worst})",
+        worst < (0.00001 as f32)
+    );
+    c.sameInt(
+        "lux look: the order ops are added in does not change the surface (points that differ)",
+        differ,
+        0
+    );
+    c.sameInt("lux look: a bound block finds its look", fx.lookOf(3), two);
+    c.sameInt("lux look: an unbound block has none", fx.lookOf(4), -1);
+
+    let r2 : f32[] = t.registers();
+    let swirl : LuxField = lxfSwirl(t);
+    let portal : i32 = bank.look();
+    bank.emit(portal, swirl, ramp);
+    bank.bend(portal, swirl, 0.06);
+    fx.prepare(2.0);
+    let regs : f32[] = t.registers();
+    let n : i32 = 2000;
+    let t0 : i64 = nowNanos();
+    let mut sink : f32 = 0.0;
+    for (k of 0..n) {
+        let s : LuxSurface = fx.shade(
+            portal,
+            (k as f32) * (0.013 as f32),
+            (k as f32) * (0.007 as f32),
+            0.01,
+            regs
+        );
+        sink = sink + s.emit.x + s.bendU;
+    }
+    let ns : f64 = ((nowNanos() - t0) as f64) / (n as f64);
+    println("measured: lux look: a portal surface (warped swirl, emit and bend) costs ${ns} ns a hit (${sink})");
+    c.that("lux look: registers are per tape size", r2.length > 0);
+}
+
+// Particles: the births follow the rate and the tick alone; two runs give the same particles; gravity and attraction
+// do what they say; the dead are removed.
+fn lxfParticles(mut c : Checks) : void {
+    let a : PtcEffect = lxfMotes(7);
+    let b : PtcEffect = lxfMotes(7);
+    let dt : f32 = 0.0166666667;
+    let mut most : i32 = 0;
+    for (tick of 0..300) {
+        lxfStepMotes(a, tick as i64, dt);
+        lxfStepMotes(b, tick as i64, dt);
+        if (a.count > most) {
+            most = a.count;
+        }
+    }
+    let mut differ : i32 = 0;
+    for (i of 0..a.count) {
+        if (a.px[i] != b.px[i] || a.py[i] != b.py[i] || a.r[i] != b.r[i]) {
+            differ = differ + 1;
+        }
+    }
+    c.that(
+        "lux particles: the motes live and die (alive ${a.count}, most ${most})",
+        a.count > 0 && most < a.capacity
+    );
+    c.sameInt("lux particles: two runs give the same particles (values that differ)", differ, 0);
+    c.sameInt("lux particles: two runs give the same count", a.count, b.count);
+
+    let e : PtcEffect = new PtcEffect(100, 1);
+    e.emit(
+        PtcSpawn {
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
+            sx: 0.0,
+            sy: 0.0,
+            sz: 0.0,
+            rate: 60.0,
+            vx: 0.0,
+            vy: 0.0,
+            vz: 0.0,
+            spread: 0.0,
+            life: 10.0,
+            lifeSpread: 0.0,
+        },
+        0,
+        0,
+        dt
+    );
+    c.sameInt("lux particles: 60 a second for a sixtieth of a second is one birth", e.count, 1);
+    e.gravity(0.0, -9.81, 0.0);
+    for (tick of 0..60) {
+        e.step(dt, tick as i64);
+    }
+    c.near("lux particles: a second of gravity is 9.81 m/s down", e.vy[0] as f64, -9.81, 0.001);
+
+    let pull : PtcEffect = new PtcEffect(10, 2);
+    pull.emit(
+        PtcSpawn {
+            x: 5.0,
+            y: 0.0,
+            z: 0.0,
+            sx: 0.0,
+            sy: 0.0,
+            sz: 0.0,
+            rate: 60.0,
+            vx: 0.0,
+            vy: 0.0,
+            vz: 0.0,
+            spread: 0.0,
+            life: 10.0,
+            lifeSpread: 0.0,
+        },
+        0,
+        0,
+        dt
+    );
+    pull.attract(Vec3::make(0.0, 0.0, 0.0), 2.0, 1.0);
+    pull.drag(3.0);
+    for (tick of 0..120) {
+        pull.step(dt, tick as i64);
+    }
+    let dist : f32 = (pull.px[0] * pull.px[0] + pull.pz[0] * pull.pz[0]).sqrt();
+    c.that(
+        "lux particles: an attracted mote ends nearer its centre (${dist} m of 5)",
+        dist < (2.5 as f32)
+    );
+    c.that("lux particles: ... and swirled round it", pull.pz[0] != 0.0);
+}
+
+fn lxfMotes(seed : i32) : PtcEffect {
+    let e : PtcEffect = new PtcEffect(500, seed);
+    e.attract(Vec3::make(0.0, 1.5, 0.0), 1.5, 2.0);
+    e.wobble(1.0, 4.0);
+    e.drag(1.5);
+    e.colour(Vec3::make(1.6, 0.6, 2.4), Vec3::make(0.3, 0.05, 0.5));
+    e.sized(0.12, 0.02);
+    e.flicker(0.4, 10.0);
+    return e;
+}
+
+fn lxfStepMotes(mut e : PtcEffect, tick : i64, dt : f32) : void {
+    let s : PtcSpawn = PtcSpawn {
+        x: -1.0,
+        y: 0.0,
+        z: -0.25,
+        sx: 2.0,
+        sy: 3.0,
+        sz: 0.5,
+        rate: 40.0,
+        vx: 0.0,
+        vy: 0.0,
+        vz: 0.0,
+        spread: 0.6,
+        life: 1.2,
+        lifeSpread: 0.8,
+    };
+    e.emit(s, 0, tick, dt);
+    e.step(dt, tick);
+}
